@@ -11,4 +11,10 @@
         }
     },
     "remoteUser": "root"
+    "runArgs": [
+        "--privileged",
+        "--ulimit", "memlock=-1:-1",
+        "--cap-add", "SYS_NICE",
+        "--cap-add", "SYS_ADMIN"
+    ]
 }
