@@ -12,7 +12,7 @@ include(FetchContent)
 FetchContent_Declare(
   tokenizers_cpp
   GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp
-  GIT_TAG        master
+  GIT_TAG        main
 )
 FetchContent_MakeAvailable(tokenizers_cpp)
 
