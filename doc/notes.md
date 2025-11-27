@@ -1,3 +1,5 @@
+Rebuild Container: Press Cmd + Shift + P -> Dev Containers: Rebuild Container.
+
 mkdir build && cd build
 cmake .. -G Ninja
 ninja
