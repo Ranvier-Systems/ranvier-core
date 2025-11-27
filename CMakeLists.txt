@@ -4,10 +4,10 @@ project(ranvier)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 1. Seastar (Async Engine)
+# 1. Seastar Configuration
 find_package(Seastar REQUIRED)
 
-# 2. Tokenizers (HuggingFace Binding)
+# 2. Tokenizers-CPP Configuration (Downloads it automatically)
 include(FetchContent)
 FetchContent_Declare(
   tokenizers_cpp
@@ -16,5 +16,12 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tokenizers_cpp)
 
+# 3. Define the Executable
 add_executable(ranvier_server src/main.cpp)
-target_link_libraries(ranvier_server PRIVATE Seastar::seastar tokenizers_cpp)
+
+# 4. Link Libraries
+target_link_libraries(ranvier_server
+  PRIVATE
+  Seastar::seastar
+  tokenizers_cpp
+)
