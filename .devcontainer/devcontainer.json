@@ -1,0 +1,15 @@
+{
+    "name": "Ranvier Dev",
+    "image": "docker.io/fedora:39",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cmake-tools",
+                "twxs.cmake"
+            ]
+        }
+    },
+    "postCreateCommand": "dnf install -y git cmake gcc-c++ seastar-devel ninja-build openssl-devel rust cargo && git config --global --add safe.directory /workspaces/ranvier-core",
+    "remoteUser": "root"
+}
