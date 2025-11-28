@@ -47,6 +47,10 @@ int main(int argc, char** argv) {
 #include <memory>
 #include <tokenizers_cpp.h>
 
+#include <seastar/core/smp.hh> // For submit_to (Inter-core communication)
+#include <seastar/core/loop.hh> // For parallel_for_each
+#include <boost/range/irange.hpp> // To iterate over shards
+
 #include "radix_tree.hpp"
 
 using namespace seastar;
@@ -60,6 +64,94 @@ std::unique_ptr<tokenizers::Tokenizer> global_tokenizer;
 // Architecture note: Since Seastar is shared-nothing (threads don't share memory), we need to ensure our Radix Tree is safe. The easiest way for this MVP is to make the tree thread_local. This effectively gives every CPU core its own copy of the routing table (which is exactly how your final architecture will work anyway).
 thread_local ranvier::RadixTree local_tree;
 
+// Helper to replicate state across all CPU cores.
+future<> broadcast_route(std::vector<int32_t> tokens, int backend_id) {
+    // parallel_for_each executes the lambda on every item in the range (0..num_cpus)
+    // boost::irange creates a range [0, 1, 2, ... smp::count-1]
+    return do_with(std::move(tokens), [backend_id](std::vector<int32_t>& shared_tokens) {
+        return parallel_for_each(boost::irange(0u, smp::count), [backend_id, &shared_tokens] (unsigned shard_id) {
+            // smp::submit_to moves execution to the target shard
+            return smp::submit_to(shard_id, [backend_id, tokens = shared_tokens] {
+                // This code runs INSIDE the specific core
+                local_tree.insert(tokens, backend_id);
+                return make_ready_future<>();
+            });
+        });
+    });
+}
+
+// Helper: Allows using async lambdas (futures) in routes
+// function_handler is sync-only, so we need this for the Control Plane.
+template <typename Func>
+struct async_handler : public handler_base {
+    Func _func;
+    async_handler(Func&& f) : _func(std::move(f)) {}
+    future<std::unique_ptr<reply>> handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        return _func(std::move(req), std::move(rep));
+    }
+};
+
+void setup_routes(routes& r) {
+    // -------------------------------------------------------
+    // DATA PLANE: High Performance Routing
+    // DATA PLANE (Sync & Fast) -> function_handler
+    // -------------------------------------------------------
+    r.add(operation_type::POST, url("/v1/chat/completions"), new function_handler([](const_req req) {
+        std::string body = req.content;
+        if (!global_tokenizer) return std::string("{\"error\": \"Tokenizer not loaded\"}");
+
+        std::vector<int32_t> tokens = global_tokenizer->Encode(body);
+        auto backend_id = local_tree.lookup(tokens);
+
+        std::string message;
+        if (backend_id.has_value()) {
+            message = "⚡ CACHE HIT! Routed to GPU-" + std::to_string(backend_id.value());
+        } else {
+            message = "🐢 Cache Miss. Routing to random GPU.";
+        }
+        return "{\"choices\":[{\"message\":{\"content\":\"" + message + "\"}}]}";
+    }));
+
+    // -------------------------------------------------------
+    // CONTROL PLANE: Dynamic Configuration
+    // CONTROL PLANE (Async & Distributed) -> async_handler
+    // Usage: curl -X POST "http://localhost:8080/admin/routes?backend_id=5" -d "Prefix content..."
+    // -------------------------------------------------------
+    r.add(operation_type::POST, url("/admin/routes"), new async_handler([](std::unique_ptr<request> req, std::unique_ptr<reply> rep) {
+        // 1. Parse Query Param (backend_id)
+        // Seastar HTTP parsers return sstring, need to convert to int
+        sstring id_str = req->get_query_param("backend_id");
+
+        if (id_str.empty()) {
+            // Wrap synchronous errors in make_ready_future.
+            rep->write_body("json", "{\"error\": \"Missing backend_id query param\"}");
+            return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+        }
+
+        int backend_id = std::stoi(std::string(id_str));
+        std::string prefix_text = req->content; // Body contains the prompt text to cache
+
+        if (!global_tokenizer) {
+            // Wrap tokenizer error in make_ready_future.
+            rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
+            return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+        }
+
+        // 2. Tokenize (On the current core)
+        std::vector<int32_t> tokens = global_tokenizer->Encode(prefix_text);
+
+        // 4. Broadcast to ALL cores
+        // We must wait for the broadcast to finish before replying
+        return broadcast_route(tokens, backend_id).then([backend_id, rep = std::move(rep)]() mutable {
+             std::cout << "[Control Plane] Route added for GPU " << backend_id << " on all cores.\n";
+
+             rep->write_body("json", "{\"status\": \"ok\", \"backend\": " + std::to_string(backend_id) + "}");
+             return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+        });
+    }));
+}
+
+#if 0
 void setup_routes(routes& r) {
     // Mimic the "Finance Bot" learning (Pre-warm cache)
     if (global_tokenizer) {
@@ -95,6 +187,7 @@ void setup_routes(routes& r) {
         return "{\"choices\":[{\"message\":{\"content\":\"" + message + "\"}}]}";
     }));
 }
+#endif
 
 future<> run() {
     try {

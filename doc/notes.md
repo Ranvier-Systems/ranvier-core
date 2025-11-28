@@ -82,3 +82,54 @@ The HuggingFace library is very strict. It doesn't just treat the JSON as data; 
 By adding "merges": [], we are telling it: "This is a valid tokenizer that just happens to have zero merge rules."
 
 
+---
+In a standard web server (like Go or Node.js), memory is shared. If you update a variable routes, all threads see it. In Seastar, memory is sharded. Your local_tree is thread_local. If you receive a POST /admin/routes on Core 0 and update the tree, Core 1 will not know about it. Requests hitting Core 1 will still miss the cache.
+
+To implement a Control Plane, we must Broadcast the update to all CPU cores.
+How broadcast_route Works
+1. parallel_for_each: This spawns N futures (one for each core). It waits for all of them to complete.
+2. smp::submit_to(shard, lambda): This is the "teleportation" function. It packages up the lambda and sends it to the message queue of the target CPU.
+3. The Result: Even though RadixTree is thread_local (isolated), we have synchronized the state by replaying the command everywhere.
+
+Test the Dynamic Router
+1. Build and Run
+ninja
+./ranvier_server
+
+2: Verify it knows nothing (Cache Miss)
+curl -X POST -d "I need help with Python code." http://localhost:8080/v1/chat/completions
+Result: 🐢 Cache Miss.
+
+3: Teach it a new route (The "Coding Bot") We tell the router: "Any request starting with 'I need help with Python code' belongs on GPU-99."
+curl -X POST "http://localhost:8080/admin/routes?backend_id=99" -d "I need help with Python code."
+Result: {"status": "ok", "backend": 99}
+
+4: Verify the new knowledge Send the completion request again.
+curl -X POST -d "I need help with Python code. How do I sort a list?" http://localhost:8080/v1/chat/completions
+Result: ⚡ CACHE HIT! Routed to GPU-99
+
+The Distributed Control Plane runs inside a single process. If you check your server logs, you will see [Control Plane] Route added.... Crucially, because we used smp::submit_to, this route is now live on every single CPU core. No matter which thread handles the next request, it will find the route.
+
+---
+seastar::function_handler is a synchronous wrapper. It is trying to take your future and serialize the future object itself into JSON, rather than waiting for the future to complete. It was never designed for async workflows like broadcast_route.
+
+We need to drop down to the "Raw" Seastar API for the Control Plane. We will use a custom helper struct (AsyncHandler) that handles the request/reply objects directly.
+This simple wrapper allows you to write async lambdas for routes:
+// Helper: Allows using async lambdas (futures) in routes
+// function_handler is sync-only, so we need this for the Control Plane.
+template <typename Func>
+struct async_handler : public handler_base {
+    Func _func;
+    async_handler(Func&& f) : _func(std::move(f)) {}
+    future<std::unique_ptr<reply>> handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        return _func(std::move(req), std::move(rep));
+    }
+};
+
+Replace your setup_routes function with this version.
+* Data Plane: Keeps using function_handler (it's sync and fast).
+* Control Plane: Swaps to async_handler.
+Why this works
+* std::unique_ptr<reply>: Instead of returning a string (which Seastar tries to auto-convert), we take ownership of the reply object.
+* rep->write_body(...): We manually write the JSON string into the response buffer.
+* move(rep): We carry the response object through the async chain (.then) and return it at the very end. This is the "Native" Seastar way to handle async I/O.

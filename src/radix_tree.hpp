@@ -212,6 +212,42 @@ private:
         // 1. Check Prefix Match (Optimistic)
         size_t match_len = 0;
         while(match_len < node->prefix.size() && match_len < tokens.size()) {
+            if (node->prefix[match_len] != tokens[match_len]) return std::nullopt; // Divergence = No Match
+            match_len++;
+        }
+
+        // If the INPUT ran out before the NODE prefix finished, we didn't match this node.
+        // Example: Tree has "Apple", Input is "App". No match.
+        if (match_len < node->prefix.size()) return std::nullopt;
+
+        // We have matched THIS node completely.
+        auto remaining = tokens.subspan(match_len);
+
+        // 2. Try to go deeper (Greedy Match)
+        if (!remaining.empty()) {
+            TokenId next_token = remaining[0];
+            auto child = find_child(node, next_token);
+
+            if (child) {
+                // Recursively look for a LONGER match
+                auto result = lookup_recursive(child, remaining.subspan(1));
+
+                // If the child found a valid match, return it.
+                if (result.has_value()) {
+                    return result;
+                }
+            }
+        }
+
+        // 3. Fallback: If we couldn't go deeper (or the child failed),
+        // THIS node is the Longest Matching Prefix.
+        return node->leaf_value;
+    }
+    /*
+    std::optional<BackendId> lookup_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens) {
+        // 1. Check Prefix Match (Optimistic)
+        size_t match_len = 0;
+        while(match_len < node->prefix.size() && match_len < tokens.size()) {
             if (node->prefix[match_len] != tokens[match_len]) return std::nullopt; // Mismatch
             match_len++;
         }
@@ -235,6 +271,7 @@ private:
 
         return std::nullopt;
     }
+    */
 };
 
 } // namespace ranvier
