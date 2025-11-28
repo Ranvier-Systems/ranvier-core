@@ -133,3 +133,16 @@ Why this works
 * std::unique_ptr<reply>: Instead of returning a string (which Seastar tries to auto-convert), we take ownership of the reply object.
 * rep->write_body(...): We manually write the JSON string into the response buffer.
 * move(rep): We carry the response object through the async chain (.then) and return it at the very end. This is the "Native" Seastar way to handle async I/O.
+
+---
+Have two logical next steps for this weekend project:
+Option A: The "Refactor" (Recommended) Split main.cpp into a proper architecture (RouterService, TokenizerService, HttpController) so the code is clean, testable, and ready for new features.
+Why: It’s cleaner and makes adding the "Proxy" logic much easier later.
+
+Option B: The "Real Proxy" (The Feature) Stop returning mock JSON ("⚡ CACHE HIT") and actually implement the HTTP Client to forward the request to a real backend (or your Python mock) and stream the response back.
+Why: It proves the end-to-end latency reduction.
+
+We are going to split the application into Three Layers:
+* Infrastructure Layer (TokenizerService): Handles the raw AI logic.
+* Domain Layer (RouterService): Handles the business logic (Radix Tree, Broadcasting).
+* Presentation Layer (HttpController): Handles HTTP, JSON, and Routing.

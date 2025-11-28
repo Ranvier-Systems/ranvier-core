@@ -17,7 +17,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(tokenizers_cpp)
 
 # 3. Define the Executable
-add_executable(ranvier_server src/main.cpp)
+add_executable(ranvier_server
+  src/main.cpp
+  src/http_controller.cpp
+  src/router_service.cpp
+  src/tokenizer_service.cpp
+)
 
 # 4. Link Libraries
 target_link_libraries(ranvier_server

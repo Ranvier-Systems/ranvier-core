@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
 }
 */
 
+#if 0
 // Demo 2 - Integrate with RadixTree
 // This version does 3 new things:
 // - Instantiates a RadixTree on every core.
@@ -222,6 +223,93 @@ future<> run() {
     return do_with(http_server_control(), [](auto& server) {
         return server.start().then([&server] {
             return server.set_routes(setup_routes);
+        }).then([&server] {
+            return server.listen(socket_address(ipv4_addr("0.0.0.0", 8080)));
+        }).then([] {
+            std::cout << "⚡ Ranvier listening on port 8080... (Press Ctrl+C to stop)\n";
+
+            // 3. The Wait Loop
+            // Create a promise that we fulfill only when a signal is received
+            auto stop_signal = std::make_shared<promise<>>();
+
+            // We handle SIGINT/SIGTERM manually to ensure clean shutdown
+            engine().handle_signal(SIGINT, [stop_signal] { stop_signal->set_value(); });
+            engine().handle_signal(SIGTERM, [stop_signal] { stop_signal->set_value(); });
+
+            return stop_signal->get_future();
+        }).then([&server] {
+            // 4. Graceful Shutdown
+            std::cout << "\n🛑 Stopping Ranvier...\n";
+            return server.stop();
+        });
+    });
+}
+
+int main(int argc, char** argv) {
+    app_template app;
+    return app.run(argc, argv, run);
+}
+#endif
+
+// Demo 3 - Refactor into 3 layers:
+// 1. Infrastructure Layer (TokenizerService): Handles the raw AI logic.
+// 2. Domain Layer (RouterService): Handles the business logic (Radix Tree, Broadcasting).
+// 3. Presentation Layer (HttpController): Handles HTTP, JSON, and Routing.
+#include "tokenizer_service.hpp"
+#include "router_service.hpp"
+#include "http_controller.hpp"
+
+#include <iostream>
+
+#include <seastar/core/app-template.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/http/httpd.hh>
+#include <seastar/net/inet_address.hh>
+
+using namespace seastar;
+using namespace seastar::httpd;
+
+// Services (Global/Static Scope for MVP)
+ranvier::TokenizerService tokenizer;
+ranvier::RouterService router;
+ranvier::HttpController controller(tokenizer, router);
+
+future<> run() {
+    try {
+        // Note: This MUST conform to the Rust BPE parser requirements
+        // (e.g., "merges" key must exist, even if empty); otherwise,
+        // the Rust parser will panic and the program will abort.
+        std::string dummy_tokenizer_json = R"({
+            "version":"1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null, "pre_tokenizer": null,
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "merges": [],
+                "vocab": {
+                    "You": 0, "are": 1, "a": 2, "Finance": 3, "Bot": 4, ".": 5,
+                    "Answer": 6, "strictly": 7, "in": 8, "JSON": 9, "Hello": 10
+                }
+            }
+        })";
+
+        tokenizer.load_from_json(dummy_tokenizer_json);
+        std::cout << "✅ Tokenizer Engine Loaded.\n";
+    } catch (const std::exception& e) {
+        std::cerr << "❌ Failed to load tokenizer: " << e.what() << "\n";
+    }
+
+    // 2. Manage Server Lifecycle with do_with
+    // do_with ensures 'server' stays alive until the lambda chain finishes
+    return do_with(http_server_control(), [](auto& server) {
+        return server.start().then([&server] {
+            return server.set_routes([](routes& r) {
+                // Route setup is delegated to the Controller
+                controller.register_routes(r);
+            });
         }).then([&server] {
             return server.listen(socket_address(ipv4_addr("0.0.0.0", 8080)));
         }).then([] {
