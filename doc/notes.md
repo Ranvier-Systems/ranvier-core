@@ -146,3 +146,52 @@ We are going to split the application into Three Layers:
 * Infrastructure Layer (TokenizerService): Handles the raw AI logic.
 * Domain Layer (RouterService): Handles the business logic (Radix Tree, Broadcasting).
 * Presentation Layer (HttpController): Handles HTTP, JSON, and Routing.
+
+---
+Right now, the router returns ⚡ CACHE HIT!. To make it a product, it needs to actually forward the request to a backend and stream the answer back.
+
+In Seastar, this is done using seastar::http::client. We are going to turn your Router into a Reverse Proxy.
+
+We need something to route to. Since we don't have real H100s, let's create a tiny Python script that mimics a vLLM server on different ports.
+
+Open two new terminals in VS Code:
+python3 tools/mock_gpu.py --port 9001
+python3 tools/mock_gpu.py --port 9002
+
+
+Currently, RouterService only knows about Routes (Prefix → ID). We need to teach it about Backends (ID → IP:Port).
+Add a mechanism to map a BackendId (e.g., 99) to a socket_address (e.g., 127.0.0.1:9001).
+Add a thread_local map to store these addresses on every core, and update the broadcast logic to populate it.
+
+Replace the "⚡ CACHE HIT" string with a real network call.
+* Pre-requisites: Seastar's HTTP client is powerful but low-level. We need to:
+* Establish a connection to the target GPU.
+* Construct a POST request.
+* Stream the body.
+
+Now have built a working Layer 7 AI Proxy
+
+Once it builds:
+
+Start Ranvier: ./ranvier_server
+Start Mock GPU: python3 tools/mock_gpu.py --port 9001
+Configure:
+curl -X POST "http://localhost:8080/admin/backends?id=99&port=9001"
+curl -X POST "http://localhost:8080/admin/routes?backend_id=99" -d "Help me"
+Test Proxy:
+curl -X POST -d "Help me write C++" http://localhost:8080/v1/chat/completions
+Success Output: {"id": "chatcmpl-mock", "content": "Response from GPU running on port 9001"}
+
+[root@395562d44060 ranvier-core]# python3 tools/mock_gpu.py --port 9001
+🚀 Mock GPU online at http://localhost:9001
+[9001] Processing request: Help me write C++...
+
+
+You have just demonstrated the "Holy Grail" of AI Infrastructure: Content-Aware Request Forwarding.
+Control Plane: You dynamically registered Backend 99.
+Control Plane: You dynamically taught the router that "Help me" belongs to Backend 99.
+Data Plane: You sent a request ("Help me write C++").
+Logic: The Router tokenized it, walked the Radix Tree, matched the prefix "Help me", resolved the IP for Backend 99, and opened a TCP connection.
+Proxy: It forwarded the bits to your Python script.
+Target: The Python script received it and printed the log.
+You have a working end-to-end system.

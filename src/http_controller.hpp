@@ -4,6 +4,8 @@
 #include "tokenizer_service.hpp"
 
 #include <seastar/http/httpd.hh>
+#include <seastar/http/request.hh>
+#include <seastar/http/reply.hh>
 
 namespace ranvier {
 
@@ -20,7 +22,9 @@ private:
     RouterService& _router;
 
     // Helper handlers
-    seastar::future<std::unique_ptr<seastar::httpd::reply>> handle_broadcast(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep);
+	seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_broadcast_route(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 };
 
 } // namespace ranvier
