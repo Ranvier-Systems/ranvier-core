@@ -51,12 +51,15 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
 
     auto tokens = _tokenizer.encode(body);
+    std::cout << "Tokens size " << tokens.size() << "\n";
+
     auto route_hit = _router.lookup(tokens); // Did we find a route?
 
     BackendId target_id;
 
     if (route_hit.has_value()) {
         target_id = route_hit.value(); // Cache Hit
+        std::cout << "Cache Hit - Target ID=" << target_id << "\n";
     } else {
         // Cache Miss: Pick a random backend so we can start the work
         auto random_id = _router.get_random_backend();
@@ -65,6 +68,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
         }
         target_id = random_id.value();
+        std::cout << "Cache Miss - Random Target ID=" << target_id << "\n";
     }
 
     auto target_addr = _router.get_backend_address(target_id);
@@ -115,13 +119,19 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 // Looser Snooping Check
                 // We just look for " 200 " to allow HTTP/1.0 or HTTP/1.1
                 bool is_success = raw_response.find(" 200 ") != sstring::npos;
-                // Check for HTTP 200 OK (Simple check)
-                //bool is_success = raw_response.find("HTTP/1.1 200") != sstring::npos;
+
+                // Added Min-Length check (e.g., 4 tokens)
+                // In production, this should be configurable (e.g. 64)
+                const size_t kMinLengthThreshold = 4;
+                bool is_worth_caching = tokens.size() >= kMinLengthThreshold;
+                if (!is_worth_caching) {
+                    std::cout << "Not caching tokens of size " << tokens.size() << ", minTokenLimit=" << kMinLengthThreshold << "\n";
+                }
 
                 // ---------------------------------------------------------
                 // SNOOPING LOGIC
                 // ---------------------------------------------------------
-                if (is_success && !route_hit.has_value()) {
+                if (is_success && !route_hit.has_value() && is_worth_caching) {
                     // Fire-and-forget: Teach all cores that this backend now owns these tokens.
                     // We don't wait for this future; we just let it run in the background.
                     // ONLY learn if it was a Miss previously

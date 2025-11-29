@@ -30,3 +30,6 @@ target_link_libraries(ranvier_server
   Seastar::seastar
   tokenizers_cpp
 )
+
+# Copy the assets folder to the build directory automatically
+file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})

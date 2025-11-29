@@ -259,7 +259,9 @@ int main(int argc, char** argv) {
 #include "router_service.hpp"
 #include "http_controller.hpp"
 
+#include <fstream>
 #include <iostream>
+#include <streambuf>
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/reactor.hh>
@@ -272,13 +274,14 @@ using namespace seastar::httpd;
 // Services (Global/Static Scope for MVP)
 ranvier::TokenizerService tokenizer;
 ranvier::RouterService router;
-ranvier::HttpController controller(tokenizer, router);
+ranvier::HttpController controller{tokenizer, router};
 
 future<> run() {
     try {
         // Note: This MUST conform to the Rust BPE parser requirements
         // (e.g., "merges" key must exist, even if empty); otherwise,
         // the Rust parser will panic and the program will abort.
+/*
         std::string dummy_tokenizer_json = R"({
             "version":"1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null, "pre_tokenizer": null,
             "model": {
@@ -295,8 +298,31 @@ future<> run() {
                 }
             }
         })";
+        std::string dummy_tokenizer_json = R"({
+            "version":"1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {
+                "type": "Whitespace"
+            },
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false,
+                "merges": [],
+                "vocab": {
+                    "You": 0, "are": 1, "a": 2, "Finance": 3, "Bot": 4, ".": 5, "Answer": 6, "strictly": 7, "in": 8, "JSON": 9, "Hello": 10,
+                    "Help": 11, "me": 12, "write": 13, "C++": 14, "code": 15, "some": 16, "foo": 17, "bar": 18
+                }
+            }
+        })";
+*/
+        // Look in the auto-copied assets folder
+        std::ifstream tokenizer_stream("assets/gpt2.json");
+        if (!tokenizer_stream.is_open()) {
+            throw std::runtime_error("Could not find assets/gpt2.json (https://huggingface.co/gpt2/raw/main/tokenizer.json)");
+        }
 
-        tokenizer.load_from_json(dummy_tokenizer_json);
+        std::string tokenizer_json_str((std::istreambuf_iterator<char>(tokenizer_stream)),
+                              std::istreambuf_iterator<char>());
+        //tokenizer.load_from_json(dummy_tokenizer_json);
+        tokenizer.load_from_json(tokenizer_json_str);
         std::cout << "✅ Tokenizer Engine Loaded.\n";
     } catch (const std::exception& e) {
         std::cerr << "❌ Failed to load tokenizer: " << e.what() << "\n";
