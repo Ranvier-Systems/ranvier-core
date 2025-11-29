@@ -4,10 +4,10 @@ project(ranvier)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 1. Seastar Configuration
+# Seastar Configuration
 find_package(Seastar REQUIRED)
 
-# 2. Tokenizers-CPP Configuration (Downloads it automatically)
+# Tokenizers-CPP Configuration (Downloads it automatically)
 include(FetchContent)
 FetchContent_Declare(
   tokenizers_cpp
@@ -16,7 +16,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tokenizers_cpp)
 
-# 3. Define the Executable
+# Limit the Noise: Stop the compiler from printing 1,000 lines of "Candidate function not found" when it fails on the first one
+add_compile_options(-fmax-errors=3)
+
+# Define the Executable
 add_executable(ranvier_server
   src/main.cpp
   src/http_controller.cpp
@@ -24,7 +27,7 @@ add_executable(ranvier_server
   src/tokenizer_service.cpp
 )
 
-# 4. Link Libraries
+# Link Libraries
 target_link_libraries(ranvier_server
   PRIVATE
   Seastar::seastar
@@ -33,3 +36,4 @@ target_link_libraries(ranvier_server
 
 # Copy the assets folder to the build directory automatically
 file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
+

@@ -2,6 +2,7 @@
 
 #include <iostream>
 
+#include <seastar/core/iostream.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/net/api.hh>
@@ -41,6 +42,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 // ---------------------------------------------------------
 // PROXY HANDLER (Raw TCP Implementation)
 // ---------------------------------------------------------
+/*
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
     std::string body = req->content;
 
@@ -152,6 +154,118 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         });
     });
 }
+*/
+
+// ---------------------------------------------------------
+// STREAMING PROXY HANDLER
+// ---------------------------------------------------------
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    std::string body = req->content;
+
+    if (!_tokenizer.is_loaded()) {
+        rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    auto tokens = _tokenizer.encode(body);
+    auto route_hit = _router.lookup(tokens);
+
+    BackendId target_id;
+    if (route_hit.has_value()) {
+        target_id = route_hit.value();
+    } else {
+        auto random_id = _router.get_random_backend();
+        if (!random_id.has_value()) {
+            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
+        target_id = random_id.value();
+    }
+
+    auto target_addr_opt = _router.get_backend_address(target_id);
+    if (!target_addr_opt.has_value()) {
+        rep->write_body("json", "{\"error\": \"Backend registered but no IP found\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+    socket_address target_addr = target_addr_opt.value();
+
+    // STREAMING RESPONSE
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id](output_stream<char>& client_out) mutable {
+
+        // FIX: Removed 'do_with(out)' wrapper. We just capture '&client_out'.
+        return seastar::connect(target_addr).then([this, body, tokens, route_hit, target_id, &client_out](connected_socket fd) mutable {
+            auto backend_in = fd.input();
+            auto backend_out = fd.output();
+
+            sstring http_req =
+                "POST /v1/chat/completions HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: " + to_sstring(body.size()) + "\r\n"
+                "Connection: close\r\n\r\n" +
+                body;
+
+            return do_with(std::move(fd), std::move(backend_in), std::move(backend_out), std::move(http_req),
+                [this, tokens, route_hit, target_id, &client_out](auto& fd, auto& in, auto& out, auto& req_str) mutable {
+
+                return out.write(req_str).then([&out] {
+                    return out.flush();
+                }).then([&in, &client_out, this, tokens, route_hit, target_id] {
+
+                    // Read Loop: Strip Headers first, then Stream
+                    return do_with(false, sstring(), [&in, &client_out, this, tokens, route_hit, target_id](bool& headers_done, sstring& buffer) {
+                        return repeat([&in, &client_out, &headers_done, &buffer, this, tokens, route_hit, target_id] {
+                            return in.read().then([&in, &client_out, &headers_done, &buffer, this, tokens, route_hit, target_id](temporary_buffer<char> chunk) {
+                                if (chunk.empty()) return make_ready_future<stop_iteration>(stop_iteration::yes);
+
+                                if (headers_done) {
+                                    // Fast Path: Pipe data directly to client
+                                    return client_out.write(std::move(chunk)).then([&client_out] {
+                                        return client_out.flush(); // Flush to reduce latency!
+                                    }).then([] {
+                                        return stop_iteration::no;
+                                    });
+                                } else {
+                                    // Slow Path: Buffering headers
+                                    buffer.append(chunk.get(), chunk.size());
+                                    auto header_end = buffer.find("\r\n\r\n");
+
+                                    if (header_end != sstring::npos) {
+                                        headers_done = true;
+
+                                        sstring headers = buffer.substr(0, header_end);
+                                        bool is_success = headers.find(" 200 ") != sstring::npos;
+
+                                        if (is_success && !route_hit.has_value()) {
+                                            bool worth_caching = tokens.size() >= 4;
+                                            if (worth_caching) {
+                                                (void)_router.learn_route_global(tokens, target_id);
+                                                std::cout << "\n[Snoop] 🧠 LEARNED ROUTE: " << tokens.size() << " toks -> GPU-" << target_id << "\n";
+                                            }
+                                        }
+
+                                        if (header_end + 4 < buffer.size()) {
+                                            sstring initial_body = buffer.substr(header_end + 4);
+                                            return client_out.write(initial_body).then([&client_out] {
+                                                return client_out.flush();
+                                            }).then([] {
+                                                return stop_iteration::no;
+                                            });
+                                        }
+                                        return make_ready_future<stop_iteration>(stop_iteration::no);
+                                    }
+                                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                                }
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
 
 // ---------------------------------------------------------
 // CONTROL PLANE HANDLERS
@@ -174,21 +288,25 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 }
 
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434
     sstring id_str = req->get_query_param("id");
+    sstring ip_str = req->get_query_param("ip");
     sstring port_str = req->get_query_param("port");
 
-    if (id_str.empty() || port_str.empty()) {
-        rep->write_body("json", "{\"error\": \"Missing id or port\"}");
+    // Check for IP parameter
+    if (id_str.empty() || port_str.empty() || ip_str.empty()) {
+        rep->write_body("json", "{\"error\": \"Missing id, ip, or port\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
     int id = std::stoi(std::string(id_str));
     int port = std::stoi(std::string(port_str));
 
-    socket_address addr(ipv4_addr("127.0.0.1", port));
+    // Use the provided IP string
+    socket_address addr(ipv4_addr(std::string(ip_str), port));
 
-    return _router.register_backend_global(id, addr).then([id, port, rep = std::move(rep)]() mutable {
-        std::cout << "[Control Plane] Registered Backend " << id << " -> 127.0.0.1:" << port << "\n";
+    return _router.register_backend_global(id, addr).then([id, ip_str, port, rep = std::move(rep)]() mutable {
+        std::cout << "[Control Plane] Registered Backend " << id << " -> " << ip_str << ":" << port << "\n";
         rep->write_body("json", "{\"status\": \"ok\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     });

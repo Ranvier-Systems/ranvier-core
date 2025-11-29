@@ -336,3 +336,276 @@ Also, notice the Max latency on Viral_Context_Hit is 507ms. This is the "Smoking
 * The very first request for the Viral Context took 507ms (Cache Miss).
 * The Router snooped the success.
 * All subsequent 107 requests took ~18ms (Cache Hit).
+
+---
+This is the pivot point where Ranvier transitions from a "Science Project" to "Infrastructure Software."
+
+You have proven the Algorithm (Radix Tree + Snooping) works. Now you need to prove the System works in a hostile, real-world environment.
+
+Phase 1: The "Real AI" Validation (Priority #1)
+* Goal: Replace mock_gpu.py with a real LLM engine (Ollama or vLLM). Why: Mocks don't stream like real LLMs. Real engines use Chunked Transfer Encoding, Server-Sent Events (SSE), and Keep-Alive connections. Your current "Naive TCP Proxy" will likely break or hang against a real vLLM instance.
+
+* Step 1: Run Ollama locally on your Mac (it uses the M4 GPU).
+
+  * ollama serve (Runs on port 11434).
+
+  * Pull a small model: ollama pull llama3:8b.
+
+* Step 2: Point Ranvier at Ollama.
+
+  * curl ... /admin/backends?id=1&port=11434
+
+* Step 3: Fix the Protocol (The Hard Part).
+
+  * Ollama sends responses as SSE (data: {...}).
+
+  * Your current proxy waits for the connection to close or a specific string.
+
+  * Task: Update handle_proxy to properly forward HTTP Chunks in real-time without buffering the whole response. This decreases latency from "Wait for full generation" to "Time to First Token."
+
+* Phase 2: Protocol Hardening (HTTP/1.1 & Keep-Alive)
+
+* Goal: Stop opening a new TCP connection for every request. Why: Establishing a TCP handshake + SSL (eventually) takes 1-3ms. In HFT/Low-Latency terms, that is an eternity.
+
+  * Step 1: Implement a Connection Pool in RouterService.
+
+    * Instead of seastar::connect(), you ask pool.get_connection(backend_ip).
+
+  * Step 2: Update Proxy to support Keep-Alive.
+
+    * Don't send Connection: close.
+
+    * Keep the socket open and push it back into the pool after the request finishes.
+
+* Phase 3: The "Sidecar" (Auto-Discovery)
+
+  * Goal: Zero-touch configuration. Why: No DevOps engineer wants to manually curl /admin/backends.
+
+  * Task: Write a small Python script (sidecar.py) that runs alongside Ranvier.
+
+  * Logic:
+
+    * Polls the Docker Socket (/var/run/docker.sock) or Kubernetes API.
+
+    * Detects new containers labeled ranvier.backend=true.
+
+    * Extracts their IP/Port.
+
+    * POSTs to Ranvier's /admin/backends API automatically.
+
+* The Overall Plan (Visualized)
+
+Phase   Focus   Key Deliverable Complexity
+Current Core Logic  Radix Tree, Snooping, Mock TCP Proxy    ✅ Done
+Phase 1 Compatibility   Streaming Proxy support for Ollama/vLLM (SSE)   🟡 Medium
+Phase 2 Latency Connection Pooling & Keep-Alive 🔴 Hard
+Phase 3 Ops Auto-discovery Sidecar (Python/Go)  🟢 Easy
+Phase 4 Scale   DPDK (Kernel Bypass) & Full ART (Node256)   🟣 Very Hard
+
+---
+What's Next? (The "Next Weekend" Plan)
+You have two exciting paths forward when you come back to this:
+1. The "Real AI" Path:
+* Ditch the mock_gpu.py.
+* Run vLLM or Ollama on your Mac.
+* Point Ranvier to the real LLM ports.
+* Actually route real prompts and watch the token generation speed up.
+
+2. The "Integration" Path:
+* Write a Python Sidecar script.
+* Instead of curl /admin/backends, the sidecar watches Kubernetes/Docker, detects new GPU pods, and auto-registers them with Ranvier. This makes the system "Plug and Play."
+
+Congratulations. You identified a niche (KV Cache Routing), designed a Staff-Engineer level solution (Seastar + ART), and implemented a working prototype that demonstrates massive performance gains. This is a very strong portfolio project.
+
+---
+This is the start of Phase 1. We are going to replace your Python Mock scripts with Ollama, a production-grade inference server.
+
+This will expose the biggest flaw in your current "Raw TCP" proxy: Buffering.
+
+Right now, your C++ code waits to receive the entire response from the backend before sending a single byte to the user. For an LLM generating 500 tokens, this means the user stares at a blank screen for 5 seconds, then gets the whole paragraph at once. This kills the "Real-Time" feeling.
+
+Let's prove this behavior first, then fix it.
+
+Step 1: Install & Run Ollama (Host Machine)
+
+Do this on your Mac Terminal (not inside VS Code/Docker), since Ollama needs direct access to your M4 GPU/NPU.
+
+Download: ollama.com/download
+
+Pull a fast model: (Llama 3.2 1B is tiny and fast for testing)
+
+Bash
+ollama pull llama3.2:1b
+Run Server:
+
+Bash
+OLLAMA_HOST=0.0.0.0:11434 ollama serve
+(Note: We bind to 0.0.0.0 so the Docker container can see it).
+
+Step 2: The Networking Trick
+
+Your Ranvier server is inside Docker. Ollama is on your Mac. To talk to the Mac from Docker, you cannot use localhost. You must use the special DNS name: host.docker.internal.
+
+Restart Ranvier: (Inside VS Code terminal)
+
+Bash
+./ranvier_server
+Register Ollama: Since host.docker.internal resolves to an IP, we need to resolve it first or just trust that your Docker network handles it. For raw TCP ipv4_addr, Seastar expects an IP string (e.g., "192.168.x.x").
+
+Quick Hack: In a separate terminal on your Mac, find your IP: ipconfig getifaddr en0 (e.g., 192.168.1.50).
+
+Register that IP with Ranvier:
+
+Bash
+# Replace 192.168.1.50 with your actual Mac LAN IP
+curl -X POST "http://localhost:8080/admin/backends?id=1&port=11434"
+(Note: We can't use host.docker.internal directly in your current C++ code because ipv4_addr constructor expects a numeric IP string, not a hostname. Adding DNS resolution is a Phase 3 task).
+
+Step 3: The "Lag" Test
+
+Now, send a real request to Llama 3 via Ranvier.
+
+Bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "llama3.2:1b",
+    "messages": [
+        { "role": "user", "content": "Write a poem about C++ pointers." }
+          ],
+            "stream": true
+            }'
+
+What you will see:
+
+* The Pause: You will see... nothing. The cursor will hang for 2–3 seconds.
+* The Dump: Suddenly, a massive wall of text (raw HTTP chunks) will blast onto your screen.
+
+Why this happens
+    // Your current code:
+    return do_with(sstring(), [&in](auto& full_response) {
+        return repeat([&in, &full_response] {
+            return in.read().then([...](temporary_buffer<char> buf) {
+                // You accumulate EVERYTHING into 'full_response'
+                full_response += sstring(buf.get(), buf.size());
+                // You loop until EOF (connection closed)
+                return stop_iteration::no;
+            });
+        });
+    }).then(... sends full_response back to user ...);
+
+You have built a Store-and-Forward Proxy. For AI, we need a Streaming Proxy. We need to forward every chunk as soon as we receive it.
+
+Step 4: The Fix (Streaming Proxy)
+
+To fix this, we need to pipeline the in (from GPU) directly to the req (to User).
+
+However, Seastar's HTTP Server reply object doesn't easily support infinite streaming in the function_handler API we are using. It expects us to return a string or a fixed buffer.
+
+The "Staff Engineer" Realization: To support true streaming, we need to take control of the User's Output Stream. This requires changing our handler to write to the reply's output stream dynamically.
+
+Update src/http_controller.cpp to use the write_body stream interface.
+
+Modify handle_proxy (Concept): Instead of accumulate -> send, we want: read_chunk -> write_chunk_to_user -> flush -> repeat.
+
+This is significantly harder because we need to manage two streams simultaneously (Reading from GPU, Writing to User).
+
+---
+I am verifying the lag behavior first. I want to make sure I have it setup right. I installed olllama and did "ollama pull llama3.2:1b" which succeeded. I then started the server with "OLLAMA_HOST=0.0.0.0:11434 ollama serve" which is currently running.
+
+On my MacBook, not in Docker, I ran "ipconfig getifaddr en0" and it returned 192.168.4.51. In the same Mac terminal, I ran "curl -X POST "http://192.168.4.51:8080/admin/backends?id=1&port=11434"" but got "curl: (7) Failed to connect to 192.168.4.51 port 8080 after 1 ms: Couldn't connect to server"
+
+I also tried this in a Terminal in VS Code/Docker and also couldn't connect:
+# curl -X POST "http://192.168.4.51:8080/admin/backends?id=1&port=11434"
+curl: (7) Failed to connect to 192.168.4.51 port 8080 after 1 ms: Couldn't connect to server
+
+You are hitting a Networking Topology issue combined with a hardcoded value in our previous code.
+
+The Curl Error: You are trying to curl 192.168.4.51:8080.
+
+Why it fails: Your Ranvier server is inside a container. It is listening on the Container's IP, not your Mac's Wi-Fi IP (192.168.4.51). Even though Docker forwards ports, you should always access the server via localhost:8080 when you are on the same machine (or inside the VS Code terminal).
+
+The Code Logic Error: Even if you fix the curl command, Ranvier won't connect to Ollama.
+
+Why: In our previous "MVP" step for handle_broadcast_backend, we hardcoded the target IP to 127.0.0.1 (localhost).
+
+The Problem: 127.0.0.1 inside the container means the container itself. Ollama is not in the container; it is on the Host (192.168.4.51).
+
+The Fix
+
+We need to do two things:
+
+Update the Code: Allow POST /admin/backends to accept an ip query parameter so we can point it to your Mac's IP.
+
+Update the Curl: Talk to Ranvier on localhost, but tell it to route to 192.168.4.51.
+
+
+Modify handle_broadcast_backend to parse the ip parameter instead of hardcoding localhost.
+
+
+Now, perform the "Lag Test" with the correct addressing.
+Register Ollama: (Run this in the VS Code terminal)
+# We talk to Ranvier on 'localhost:8080'
+# We tell Ranvier to find Ollama at '192.168.4.51' (Your Mac's IP)
+curl -X POST "http://localhost:8080/admin/backends?id=1&ip=192.168.4.51&port=11434"
+
+Trigger the Lag:
+curl -X POST http://localhost:8080/v1/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "llama3.2:1b",
+  "messages": [
+    { "role": "user", "content": "Write a poem about C++ pointers." }
+  ],
+  "stream": true
+}'
+
+
+
+Took several seconds (~7) for the response.
+ollama final output:
+time=2025-11-29T17:29:05.398-05:00 level=INFO source=server.go:1332 msg="llama runner started in 6.94 seconds"
+[GIN] 2025/11/29 - 17:29:09 | 200 | 17.188442791s |    192.168.4.51 | POST     "/v1/chat/completions"
+
+
+curl final output:
+f1
+data: {"id":"chatcmpl-608","object":"chat.completion.chunk","created":1764455349,"model":"llama3.2:1b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+
+
+You have successfully reproduced the "Head-of-Line Blocking" behavior.
+
+Your logs confirm exactly what we suspected:
+
+Ollama takes 7 seconds to process the prompt (llama runner started in 6.94 seconds).
+
+Ranvier waits 7 seconds buffering the entire response.
+
+Curl receives everything at once (17.18s total time in the logs, likely including connection/handshake overheads).
+
+Also, notice the curl output: f1. That f1 is a Hexadecimal Chunk Size. Because we are proxying Raw TCP, we are accidentally forwarding the "Chunked Transfer Encoding" metadata from Ollama inside the JSON body we send to the user. We are sending "Double HTTP" artifacts.
+
+The Fix: Streaming Proxy with Header Stripping
+
+We need to rewrite handle_proxy to use Seastar's Streaming Response API.
+
+The Plan:
+
+Create the reply object immediately.
+
+Use rep->write_body("text/event-stream", ...) with a callback.
+
+Inside the callback:
+
+Connect to Ollama.
+
+Send Request.
+
+Read until \r\n\r\n (Headers). Stop. Parse "200 OK" for Snooping.
+
+Forward the rest (Body) directly to the user's output stream as it arrives.
+
+This fixes the "Lag" (by streaming) and the "Double Headers" (by stripping the backend headers).
