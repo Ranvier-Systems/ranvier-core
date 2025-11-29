@@ -51,21 +51,30 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
 
     auto tokens = _tokenizer.encode(body);
-    auto backend_id = _router.lookup(tokens);
+    auto route_hit = _router.lookup(tokens); // Did we find a route?
 
-    if (!backend_id.has_value()) {
-        rep->write_body("json", "{\"error\": \"🐢 Cache Miss (No route found)\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    BackendId target_id;
+
+    if (route_hit.has_value()) {
+        target_id = route_hit.value(); // Cache Hit
+    } else {
+        // Cache Miss: Pick a random backend so we can start the work
+        auto random_id = _router.get_random_backend();
+        if (!random_id.has_value()) {
+            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
+        target_id = random_id.value();
     }
 
-    auto target_addr = _router.get_backend_address(backend_id.value());
+    auto target_addr = _router.get_backend_address(target_id);
     if (!target_addr.has_value()) {
         rep->write_body("json", "{\"error\": \"Backend ID found, but no IP address registered!\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
     // 2. Connect via Raw TCP (Stable API)
-    return seastar::connect(target_addr.value()).then([body, rep = std::move(rep)](connected_socket fd) mutable {
+    return seastar::connect(target_addr.value()).then([this, tokens, route_hit, target_id, body, rep = std::move(rep)](connected_socket fd) mutable {
         auto out = fd.output();
         auto in = fd.input();
 
@@ -81,25 +90,51 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         // 4. Send & Receive
         return do_with(std::move(fd), std::move(out), std::move(in), std::move(http_req),
-            [rep = std::move(rep)](auto& fd, auto& out, auto& in, auto& http_req) mutable {
+            [this, tokens, route_hit, target_id, rep = std::move(rep)](auto& fd, auto& out, auto& in, auto& http_req) mutable {
 
             return out.write(http_req).then([&out] {
                 return out.flush();
             }).then([&in] {
-                // Read the response until EOF (simplified for MVP)
-                return in.read();
-            }).then([rep = std::move(rep)](temporary_buffer<char> buf) mutable {
-                // 5. Parse the Response (Naive)
-                // In a real app, you'd parse headers. For MVP, we just find the JSON body.
-                sstring raw_response(buf.get(), buf.size());
 
-                // Find where headers end (\r\n\r\n)
+                // Read Loop (Handle Fragmentation)
+                // We use a separate do_with for the accumulator string
+                return do_with(sstring(), [&in](auto& full_response) {
+                    return repeat([&in, &full_response] {
+                        return in.read().then([&full_response](temporary_buffer<char> buf) {
+                            if (buf.empty()) {
+                                return stop_iteration::yes; // EOF
+                            }
+                            full_response += sstring(buf.get(), buf.size());
+                            return stop_iteration::no;
+                        });
+                    }).then([&full_response] {
+                        return full_response; // Return the full accumulated string
+                    });
+                });
+            }).then([this, tokens, route_hit, target_id, rep = std::move(rep)](sstring raw_response) mutable {
+                // Looser Snooping Check
+                // We just look for " 200 " to allow HTTP/1.0 or HTTP/1.1
+                bool is_success = raw_response.find(" 200 ") != sstring::npos;
+                // Check for HTTP 200 OK (Simple check)
+                //bool is_success = raw_response.find("HTTP/1.1 200") != sstring::npos;
+
+                // ---------------------------------------------------------
+                // SNOOPING LOGIC
+                // ---------------------------------------------------------
+                if (is_success && !route_hit.has_value()) {
+                    // Fire-and-forget: Teach all cores that this backend now owns these tokens.
+                    // We don't wait for this future; we just let it run in the background.
+                    // ONLY learn if it was a Miss previously
+                    (void)_router.learn_route_global(tokens, target_id);
+                    std::cout << "[Snoop] Passively learned route for GPU-" << target_id << "\n";
+                }
+
+                // 2. Return Response to User
                 auto body_pos = raw_response.find("\r\n\r\n");
                 if (body_pos != sstring::npos) {
-                    sstring json_body = raw_response.substr(body_pos + 4);
-                    rep->write_body("json", json_body);
+                    rep->write_body("json", raw_response.substr(body_pos + 4));
                 } else {
-                    rep->write_body("json", raw_response); // Fallback
+                    rep->write_body("json", raw_response);
                 }
 
                 return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));

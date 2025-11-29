@@ -1,5 +1,6 @@
 #include "router_service.hpp"
 
+#include <random>
 #include <unordered_map>
 
 #include <boost/range/irange.hpp>
@@ -12,6 +13,10 @@ namespace ranvier {
 // Thread-local storage (One copy per CPU core)
 thread_local RadixTree local_tree;
 thread_local std::unordered_map<BackendId, seastar::socket_address> local_backends;
+
+// Thread-local RNG
+// We seed it once per core so every core has a unique random sequence.
+thread_local std::mt19937 rng(std::random_device{}());
 
 // ---------------------------------------------------------
 // DATA PLANE
@@ -54,6 +59,23 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
             });
         });
     });
+}
+
+std::optional<BackendId> RouterService::get_random_backend() {
+    if (local_backends.empty()) {
+        return std::nullopt;
+    }
+
+    // Pick a random index
+    std::uniform_int_distribution<size_t> dist(0, local_backends.size() - 1);
+    size_t random_index = dist(rng);
+
+    // Advance iterator (Standard map approach)
+    // Note: In production, you'd keep a separate vector<BackendId> for O(1) random access
+    auto it = local_backends.begin();
+    std::advance(it, random_index);
+
+    return it->first;
 }
 
 } // namespace ranvier

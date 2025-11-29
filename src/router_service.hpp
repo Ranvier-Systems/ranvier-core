@@ -25,6 +25,8 @@ public:
 
     // Teach the system a new server (ID -> IP:Port)
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr);
+
+    std::optional<BackendId> get_random_backend();
 };
 
 } // namespace ranvier

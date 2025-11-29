@@ -195,3 +195,104 @@ Logic: The Router tokenized it, walked the Radix Tree, matched the prefix "Help 
 Proxy: It forwarded the bits to your Python script.
 Target: The Python script received it and printed the log.
 You have a working end-to-end system.
+
+---
+Spinning up 3 Python scripts manually is annoying.
+
+However, since you are developing inside a Dev Container, using Docker Compose introduces a networking headache:
+
+* Your Environment: Ranvier is inside a Linux container.
+* Docker Compose: Would spin up other containers.
+* The Problem: localhost inside your Dev Container is not localhost for the Compose containers.
+
+The "VS Code Native" Solution: tasks.json Instead of Docker Compose, use VS Code's built-in Task runner to spin up your background services inside your existing Dev Container environment. This keeps networking on localhost simple
+
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Start Mock GPU Cluster",
+            "type": "shell",
+            "command": "python3 tools/mock_gpu.py --port 9001 & python3 tools/mock_gpu.py --port 9002 & python3 tools/mock_gpu.py --port 9003 & wait",
+            "isBackground": true,
+            "problemMatcher": [],
+            "presentation": {
+                "group": "test",
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "Kill Cluster",
+            "type": "shell",
+            "command": "pkill -f mock_gpu.py",
+            "problemMatcher": []
+        }
+    ]
+}
+
+* To Run: Cmd + Shift + P -> Tasks: Run Task -> Start Mock GPU Cluster.
+* Benefit: It launches 3 GPUs in the background of your current environment. Ranvier can talk to them on 127.0.0.1:9001, 9002, etc.
+
+---
+The "Snooping" Logic (Auto-Learning)
+
+This is the feature that makes Ranvier "Zero Config."
+
+The Logic: Currently, you have to manually POST /admin/routes. With Snooping, the router learns passively:
+1. Request: User sends "Help me..." → Router picks GPU-9001 (Randomly).
+2. Response: GPU-9001 replies "200 OK".
+3. Insight: If GPU-9001 successfully answered, it must have processed the prompt. Therefore, GPU-9001 now has "Help me..." in its VRAM.
+4. Action: The router automatically inserts ("Help me...", 9001) into the Radix Tree.
+
+Implementation Plan: We need to modify src/http_controller.cpp to trigger _router.learn_route_global after the proxy request succeeds.
+
+You no longer need to manually manage routes.
+
+1. You start the router.
+2. You register 3 Backends (/admin/backends).
+3. You just start sending traffic.
+  * Request 1 (Miss) → Randomly goes to GPU 1. Router learns "Prefix A -> GPU 1".
+  * Request 2 (Hit) → Router sees "Prefix A", sends to GPU 1.
+This is Self-Optimizing Infrastructure.
+
+
+two subtle bugs that are classic "Distributed Systems" headaches.
+
+The "Round Robin" Issue: Your Router isn't learning because Snooping is failing.
+
+Reason: Your Python Mock GPU sends HTTP/1.0 200 OK (the default). Your C++ code is strictly checking for HTTP/1.1 200. The check fails, so the router assumes the request failed and doesn't learn the route.
+
+The "Empty Output" Issue:
+
+Reason: The TCP Fragmentation. We used a single in.read() in the C++ proxy. The Python server often sends the Headers in one packet and the Body in a second packet. Your Proxy reads the first packet (Headers), sees no body, and returns an empty JSON string to the user.
+
+Fix: We will replace the single read() with a Read Loop (to gather all packets) and relax the snooping check to accept HTTP/1.0.
+
+
+[root@395562d44060 ranvier-core]# curl -X POST "http://localhost:8080/admin/backends?id=91&port=9001"
+{"status": "ok"}
+[root@395562d44060 ranvier-core]# curl -X POST "http://localhost:8080/admin/backends?id=92&port=9002"
+{"status": "ok"}
+[root@395562d44060 ranvier-core]# curl -X POST "http://localhost:8080/admin/backends?id=93&port=9003"
+{"status": "ok"}[root@395562d44060 ranvier-core]#
+
+[root@395562d44060 build]# ./ranvier_server
+✅ Tokenizer Engine Loaded.
+⚡ Ranvier listening on port 8080... (Press Ctrl+C to stop)
+[Control Plane] Registered Backend 91 -> 127.0.0.1:9001
+[Control Plane] Registered Backend 92 -> 127.0.0.1:9002
+[Control Plane] Registered Backend 93 -> 127.0.0.1:9003
+
+
+[root@395562d44060 ranvier-core]# curl -X POST -d "Help me write C++" http://localhost:8080/v1/chat/completions
+{"id": "chatcmpl-mock", "choices": [{"message": {"role": "assistant", "content": "Response from GPU running on port 9003"}}]}
+[root@395562d44060 ranvier-core]# curl -X POST -d "Help me write C++" http://localhost:8080/v1/chat/completions
+{"id": "chatcmpl-mock", "choices": [{"message": {"role": "assistant", "content": "Response from GPU running on port 9003"}}]}
+[root@395562d44060 ranvier-core]# curl -X POST -d "Help me write C++" http://localhost:8080/v1/chat/completions
+{"id": "chatcmpl-mock", "choices": [{"message": {"role": "assistant", "content": "Response from GPU running on port 9003"}}]}
+
+
+[9003] Processing request: Help me write C++...
+[9003] Processing request: Help me write C++...
+[9003] Processing request: Help me write C++...
