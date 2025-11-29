@@ -9,19 +9,19 @@ VIRAL_CONTEXT = "The Ranvier node is a gap in the myelin sheath of a nerve, betw
 class AIUser(HttpUser):
     wait_time = between(0.1, 0.5) # Fast users
 
-    @task(4) # 4x more likely to be a "Viral" request
+    @task(4)
     def viral_query(self):
-        # Users asking different questions about the SAME context
-        # This SHOULD hit the cache
+        # The System Prompt is CONSTANT (Prefix)
+        # The User Query varies (Suffix)
         question = ''.join(random.choices(string.ascii_lowercase, k=10))
         payload = {
             "model": "gpt2",
             "messages": [
+                # This matches the logic in Mock GPU (It hashes the first message)
                 {"role": "system", "content": VIRAL_CONTEXT},
                 {"role": "user", "content": f"Explain this: {question}"}
             ]
         }
-        # We tag this request as "viral" to track it separately in logs
         self.client.post("/v1/chat/completions", json=payload, name="Viral_Context_Hit")
 
     @task(1)

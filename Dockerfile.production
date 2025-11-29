@@ -1,0 +1,43 @@
+# ---------------------------------------------------------
+# STAGE 1: Builder (Heavy, contains GCC, CMake, Rust)
+# ---------------------------------------------------------
+FROM fedora:39 AS builder
+
+# Install Build Deps
+RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install Seastar (This takes time, but Docker caches it)
+WORKDIR /tmp
+RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
+    cd seastar && \
+    ./install-dependencies.sh && \
+    ./configure.py --mode=release --prefix=/usr/local --c++-standard=20 && \
+    ninja -j4 -C build/release install
+
+# Build Ranvier
+WORKDIR /src
+COPY . .
+RUN mkdir build && cd build && \
+    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
+    ninja
+
+# ---------------------------------------------------------
+# STAGE 2: Runner (Lightweight, Runtime only)
+# ---------------------------------------------------------
+FROM fedora:39-slim
+
+# Install Runtime Shared Libraries (Seastar needs these)
+RUN dnf install -y libaio libasan libubsan yaml-cpp hwloc openssl && dnf clean all
+
+# Copy Binary and Assets
+WORKDIR /app
+COPY --from=builder /src/build/ranvier_server .
+COPY --from=builder /src/assets ./assets
+
+# Expose HTTP Port
+EXPOSE 8080
+
+# Run (Seastar needs memory locking)
+CMD ["./ranvier_server", "--smp", "1", "--memory", "1G"]
