@@ -1,4 +1,5 @@
-# tools/mock_gpu.py
+#!/usr/bin/env python3
+
 import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -9,16 +10,16 @@ class MockGPUHandler(BaseHTTPRequestHandler):
         # 1. Read the request
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length).decode('utf-8')
-        
+
         # 2. Simulate "Inference"
         print(f"[{self.server.server_address[1]}] Processing request: {post_data[:50]}...")
         time.sleep(0.5) # Simulate latency
-        
+
         # 3. Send Response (OpenAI Format)
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
         self.end_headers()
-        
+
         response = {
             "id": "chatcmpl-mock",
             "choices": [{
@@ -37,6 +38,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()
-    
+
     print(f"🚀 Mock GPU online at http://localhost:{args.port}")
     HTTPServer(('localhost', args.port), MockGPUHandler).serve_forever()
