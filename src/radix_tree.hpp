@@ -72,12 +72,21 @@ struct Node4 : public Node {
 
 // 5. Node256: Largest Node (Direct Access)
 // Used when a node is very hot (e.g. the root of the tree)
-struct Node256 : public Node {
+//struct Node256 : public Node {
     // A hash map or direct array could go here.
     // For v0.1, we can just use a larger vector or map.
     // In production ART, this is usually `Node* children[256]` mapped by byte.
     // Since tokens are 32-bit, we might use a std::map for the "Root" mostly.
     // (Implementation deferred for v0.1)
+//};
+struct Node256 : public Node {
+    // Direct mapping: children[token_byte] -> Node*
+    // We use std::array for safety, initialized to nullptr
+    std::array<std::shared_ptr<Node>, 256> children;
+
+    Node256() : Node(NodeType::Node256) {
+        children.fill(nullptr);
+    }
 };
 
 // 6. The Tree Manager
@@ -160,6 +169,7 @@ private:
         return nullptr;
     }
 
+/*
     // Helper: Add child to Node4 (Naive implementation without resizing)
     void add_child(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
          if (parent->type == NodeType::Node4) {
@@ -167,6 +177,42 @@ private:
             // TODO: In real ART, check size < 4. If full, grow to Node16.
             n4->keys.push_back(key);
             n4->children.push_back(child);
+        }
+    }
+*/
+    void add_child(std::shared_ptr<Node>& parent, TokenId key, std::shared_ptr<Node> child) {
+        // 1. Check if Node4 is full
+        if (parent->type == NodeType::Node4) {
+            auto* n4 = static_cast<Node4*>(parent.get());
+            if (n4->keys.size() < 4) {
+                n4->keys.push_back(key);
+                n4->children.push_back(child);
+                return;
+            }
+
+            // 2. GROW: Node4 -> Node256 (Skipping 16/48 for brevity)
+            auto n256 = std::make_shared<Node256>();
+            // Copy existing prefix/value
+            n256->prefix = n4->prefix;
+            n256->leaf_value = n4->leaf_value;
+
+            // Migrate existing children
+            for(size_t i=0; i<n4->keys.size(); i++) {
+                // Map the key (byte) to the array index
+                // Note: In real ART, we cast TokenId to uint8_t
+                uint8_t index = static_cast<uint8_t>(n4->keys[i]);
+                n256->children[index] = n4->children[i];
+            }
+
+            // Add the NEW child
+            n256->children[static_cast<uint8_t>(key)] = child;
+
+            // Replace the parent pointer in the tree
+            parent = n256;
+        }
+        else if (parent->type == NodeType::Node256) {
+            auto* n256 = static_cast<Node256*>(parent.get());
+            n256->children[static_cast<uint8_t>(key)] = child;
         }
     }
 
