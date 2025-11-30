@@ -892,3 +892,51 @@ Radix Router    🟢 Production Ready O(k) lookups, Thread-local replication
 Control Plane   🟢 Production Ready smp::submit_to broadcasting updates
 Protocol Handling   🟢 Production Ready HTTP/1.1, De-chunking State Machine, Keep-Alive
 Intelligence    🟢 Production Ready Passive Snooping & Route Learning
+
+What are the phases again? I think it was these:
+Phase 1 Compatibility   Streaming Proxy support for Ollama/vLLM (SSE)     Medium
+Phase 2 Latency Connection Pooling & Keep-Alive v Hard
+Phase 3 Ops Auto-discovery Sidecar (Python/Go)  ) Easy
+Phase 4 Scale   DPDK (Kernel Bypass) & Full ART (Node256)     Very Hard
+
+Sounds like we have Phase 1 and 2 complete?
+
+
+
+Yes, exactly. You have effectively completed Phase 1 and Phase 2.
+
+Here is the "State of the Union" for Ranvier Core:
+
+✅ Phase 1: Compatibility (Streaming) - COMPLETE
+
+Goal: Stop buffering; support real LLM protocols.
+
+Evidence: You implemented the StreamParser state machine. You successfully proxied Ollama responses byte-by-byte without waiting for the full generation. The f1 chunk artifacts were removed, and the [Snoop] logic works even on streamed headers.
+
+✅ Phase 2: Latency (Connection Pooling) - COMPLETE
+
+Goal: Eliminate TCP handshake overhead.
+
+Evidence: You implemented src/connection_pool.hpp and refactored the controller to use Coroutines (co_await). Your logs show [Pool] ♻️ Reusing warm connection, proving that subsequent requests to the same GPU are skipping the handshake.
+
+🚧 Phase 3: Ops (Auto-Discovery) - NEXT
+
+Status: Not Started.
+
+The Pain Point: Right now, if you restart Ollama or add a new GPU, you have to manually run that long curl ... /admin/backends command. If the GPU crashes and restarts on a new IP, Ranvier is broken until you fix it manually.
+
+The Fix: A lightweight Python/Go sidecar that watches the environment (Docker/K8s) and calls the API for you.
+
+🔮 Phase 4: Scale (DPDK & Full ART) - FUTURE
+
+Status: Not Started.
+
+The Pain Point: Currently, Node4 is fine for small vocabularies, but if you routed on the entire unicode set, performance would degrade. Also, you are still using the Linux Kernel network stack (Standard TCP), which has a context-switch overhead.
+
+The Fix: Implementing Node256 for the Radix Tree and compiling Seastar with DPDK support to bypass the kernel.
+
+Recommendation
+
+Since you have a solid, high-performance core (Phases 1 & 2), moving to Phase 3 (The Sidecar) is the best way to make this project "usable" for others or for a demo video. It transforms the project from "Code you have to manage" to "Infrastructure that manages itself."
+
+Would you like to start sketching out the Python Sidecar to auto-detect your Ollama container?
