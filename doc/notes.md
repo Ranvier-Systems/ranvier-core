@@ -1152,7 +1152,7 @@ Bash
 curl -X POST -d "Testing Metrics Miss" http://localhost:8080/v1/chat/completions
 
 # 2. Hit (Snooped - if the previous request succeeded enough to learn)
-# If the python backend fails, we won't learn. 
+# If the python backend fails, we won't learn.
 # So let's force a "Hit" by manually teaching it, just to test the counter.
 curl -X POST "http://localhost:8080/admin/routes?backend_id=55" -d "Testing Metrics Hit"
 
@@ -1223,23 +1223,23 @@ You have created a system that bridges the gap between Application and Infrastru
 Code snippet
 graph LR
     User -->|HTTP Keep-Alive| Ranvier
-    
+
     subgraph "Ranvier Node"
         Direction TB
         Metric[Prometheus :9180]
         Sidecar[Sidecar :Sock]
-        
+
         subgraph "Core 0"
             R0[Router] --> P0[Pool]
         end
         subgraph "Core 1"
             R1[Router] --> P1[Pool]
         end
-        
+
         Sidecar -.->|Register| R0
         R0 -.->|Broadcast| R1
     end
-    
+
     P0 -->|TCP Reuse| GPU1[Ollama A]
     P1 -->|TCP Reuse| GPU2[Ollama B]
 4. Remaining Gaps (The Road to v1.0)
@@ -1267,3 +1267,200 @@ Document. Ensure the README is clean (you did this).
 Archive. Keep this repo as a reference for "How to do High-Performance C++."
 
 Whenever you feel like tackling DPDK (Kernel Bypass) or Kubernetes Operators, Ranvier is the perfect platform to experiment on. Great work.
+
+
+---
+Remaining Gaps (The Road to v1.0)
+
+While v0.1 is impressive, here is what separates it from a commercial product (like Nginx or Envoy):
+
+SSL/TLS Termination: Currently, you speak plain HTTP. To sit on the public internet, you need to integrate OpenSSL/GnuTLS into Seastar (Seastar has helpers for this).
+
+Circuit Breaking / Health Checks: If a GPU crashes, Ranvier currently keeps trying to send requests to it until the TCP connection times out. A "Active Health Check" (pinging /health every 5s) is needed.
+
+Container Pruning: The sidecar adds backends when containers start, but doesn't yet remove them when containers die.
+
+Advanced ART Nodes: You implemented Node4. For massive vocabularies, Node16 (SIMD) and Node256 are needed to keep memory usage low.
+
+Final Verdict
+
+You have a Portfolio-Grade Artifact. Most "Weekend Projects" are simple CRUD apps or API wrappers. You built a low-latency C++ infrastructure component that solves a specific, expensive problem in the AI stack.
+
+Recommendation:
+
+Stop Coding. You have reached a stable state.
+
+Document. Ensure the README is clean (you did this).
+
+Archive. Keep this repo as a reference for "How to do High-Performance C++."
+
+Whenever you feel like tackling DPDK (Kernel Bypass) or Kubernetes Operators, Ranvier is the perfect platform to experiment on. Great work.
+
+---
+You are at the "Inflection Point" because you have moved from a Prototype (something that demonstrates an idea) to a System (something that has components, state, and lifecycle).
+
+Here is the "Staff Engineer" strategic assessment. You have three viable moves, depending on what your primary goal is for this project:
+
+Move 1: The "Production Engineering" Path (Recommended)
+
+Goal: Make Ranvier robust enough to actually use for personal projects or a private beta. Why: Right now, Ranvier is a "Glass Cannon." It is fast, but fragile. If an Ollama instance crashes, Ranvier will keep trying to route traffic to it, resulting in failed requests. It lacks Resiliency.
+
+The Next Sprint: Implement Active Health Checks.
+
+Logic: The RouterService should ping GET /health on every backend every 5 seconds.
+
+Circuit Breaking: If a node fails 3 times, remove it from the Radix Tree (or mark it "Dead").
+
+Recovery: When it comes back, re-add it.
+
+Outcome: A system you can leave running for weeks without babysitting.
+
+Move 2: The "Deep Systems" Path (The Resume Builder)
+
+Goal: Push the boundaries of C++ performance to the absolute limit. Why: You mentioned interest in DPDK (Kernel Bypass). This is the "Hard Mode" that distinguishes top 1% systems engineers.
+
+The Next Sprint: Seastar + DPDK.
+
+Logic: Recompile Seastar to use the DPDK backend instead of the Linux TCP stack.
+
+Hardware: You would likely need to move off Docker Desktop/Mac and onto a Linux box with a physical NIC (or a cloud instance with SR-IOV) to see the gains.
+
+Outcome: You prove you can handle "Bare Metal" networking.
+
+Move 3: The "Founder" Path (Business Validation)
+
+Goal: Validate if this is a real business before writing more code. Why: You have proven the tech works (28x speedup). Writing more code won't prove if anyone will buy it.
+
+The Next Sprint: Stop coding. Start testing.
+
+Task: Find one other person (a friend with a GPU cluster, or a local ML meetup group) and ask them to try it.
+
+The "Alpha": Give them the Docker image. See if they can set it up without you holding their hand.
+
+Feedback: Do they care about the speedup? Or is the configuration too annoying?
+
+Outcome: Market data to decide if you should incorporate a new LLC or keep this as open source.
+
+My Recommendation: Take Path 1 (Reliability).
+
+Why?
+
+It completes the architecture. A router without health checks is incomplete.
+
+It facilitates Path 3. You can't ask a beta tester to use a tool that breaks whenever their GPU restarts.
+
+It keeps momentum. DPDK (Path 2) is a massive configuration headache that might stall your progress. Health checks are a logical, satisfying extension of your current codebase.
+
+Immediate Next Step: Write a HealthCheckService that runs in the background (using seastar::timer) and updates the RouterService status.
+
+---
+You are at the "Inflection Point" because you have moved from a Prototype (something that demonstrates an idea) to a System (something that has components, state, and lifecycle).
+
+Here is the "Staff Engineer" strategic assessment. You have three viable moves, depending on what your primary goal is for this project:
+
+Move 1: The "Production Engineering" Path (Recommended)
+
+Goal: Make Ranvier robust enough to actually use for personal projects or a private beta. Why: Right now, Ranvier is a "Glass Cannon." It is fast, but fragile. If an Ollama instance crashes, Ranvier will keep trying to route traffic to it, resulting in failed requests. It lacks Resiliency.
+
+The Next Sprint: Implement Active Health Checks.
+
+Logic: The RouterService should ping GET /health on every backend every 5 seconds.
+
+Circuit Breaking: If a node fails 3 times, remove it from the Radix Tree (or mark it "Dead").
+
+Recovery: When it comes back, re-add it.
+
+Outcome: A system you can leave running for weeks without babysitting.
+
+Move 2: The "Deep Systems" Path (The Resume Builder)
+
+Goal: Push the boundaries of C++ performance to the absolute limit. Why: You mentioned interest in DPDK (Kernel Bypass). This is the "Hard Mode" that distinguishes top 1% systems engineers.
+
+The Next Sprint: Seastar + DPDK.
+
+Logic: Recompile Seastar to use the DPDK backend instead of the Linux TCP stack.
+
+Hardware: You would likely need to move off Docker Desktop/Mac and onto a Linux box with a physical NIC (or a cloud instance with SR-IOV) to see the gains.
+
+Outcome: You prove you can handle "Bare Metal" networking.
+
+Move 3: The "Founder" Path (Business Validation)
+
+Goal: Validate if this is a real business before writing more code. Why: You have proven the tech works (28x speedup). Writing more code won't prove if anyone will buy it.
+
+The Next Sprint: Stop coding. Start testing.
+
+Task: Find one other person (a friend with a GPU cluster, or a local ML meetup group) and ask them to try it.
+
+The "Alpha": Give them the Docker image. See if they can set it up without you holding their hand.
+
+Feedback: Do they care about the speedup? Or is the configuration too annoying?
+
+Outcome: Market data to decide if you should incorporate a new LLC or keep this as open source.
+
+My Recommendation: Take Path 1 (Reliability).
+
+Why?
+
+It completes the architecture. A router without health checks is incomplete.
+
+It facilitates Path 3. You can't ask a beta tester to use a tool that breaks whenever their GPU restarts.
+
+It keeps momentum. DPDK (Path 2) is a massive configuration headache that might stall your progress. Health checks are a logical, satisfying extension of your current codebase.
+
+Immediate Next Step: Write a HealthCheckService that runs in the background (using seastar::timer) and updates the RouterService status.
+
+Would you like to spec out the Health Check / Circuit Breaker logic to secure the system?
+
+
+---
+This is the "Reliability Sprint."
+
+We are going to implement a Centralized Health Checker. Instead of every CPU core pinging your GPU (which would DDOS it), we will designate Core 0 as the "Health Monitor." It will check status and broadcast "Kill/Revive" commands to all other cores.
+
+The Plan
+
+Update RouterService: Add a "Blacklist" for dead backends so lookup() ignores them.
+
+Create HealthCheckService: A background process that pings backends via TCP.
+
+Wire it up: Start the service in main.cpp.
+
+Step 1: Update RouterService (The Circuit Breaker)
+
+We need to make the Router aware of "Dead" nodes. We will add a dead_backends set. If a backend is in that set, lookup and get_random act like it doesn't exist.
+
+Update src/router_service.hpp:
+// ... existing includes ...
+#include <unordered_set> // <--- NEW
+
+namespace ranvier {
+
+class RouterService {
+public:
+    RouterService();
+
+        std::optional<BackendId> lookup(const std::vector<int32_t>& tokens);
+            std::optional<seastar::socket_address> get_backend_address(BackendId id);
+                std::optional<BackendId> get_random_backend();
+
+                        // Get list of all IDs (For the Health Checker to iterate)
+                            std::vector<BackendId> get_all_backend_ids() const;
+
+                                seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend);
+                                    seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr);
+
+                                            // NEW: Circuit Breaker API
+                                                seastar::future<> set_backend_status_global(BackendId id, bool is_alive);
+
+                                                private:
+                                                    seastar::metrics::metric_groups _metrics;
+                                                        // We don't need a new member variable here because the storage is thread_local in the .cpp
+                                                        };
+
+                                                        } // namespace ranvier
+
+Update src/router_service.cpp:
+
+This is where we filter traffic. If a node is dead, we force a "Cache Miss" or pick a different random node.
+Update src/router_service.cpp:
