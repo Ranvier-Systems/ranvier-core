@@ -1,5 +1,6 @@
 #include "http_controller.hpp"
 
+#include <algorithm>
 #include <iostream>
 
 #include <seastar/core/iostream.hh>
@@ -156,6 +157,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 }
 */
 
+// Helper Enum for the State Machine
+enum class ProxyState {
+    Headers,    // Waiting for \r\n\r\n
+    ChunkSize,  // Waiting for "f1\r\n"
+    ChunkData,  // Waiting for N bytes of data
+    Done
+};
+
 // ---------------------------------------------------------
 // STREAMING PROXY HANDLER
 // ---------------------------------------------------------
@@ -192,7 +201,6 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // STREAMING RESPONSE
     rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id](output_stream<char>& client_out) mutable {
 
-        // FIX: Removed 'do_with(out)' wrapper. We just capture '&client_out'.
         return seastar::connect(target_addr).then([this, body, tokens, route_hit, target_id, &client_out](connected_socket fd) mutable {
             auto backend_in = fd.input();
             auto backend_out = fd.output();
@@ -205,58 +213,93 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 "Connection: close\r\n\r\n" +
                 body;
 
-            return do_with(std::move(fd), std::move(backend_in), std::move(backend_out), std::move(http_req),
-                [this, tokens, route_hit, target_id, &client_out](auto& fd, auto& in, auto& out, auto& req_str) mutable {
+            // STATE MACHINE:
+            // We maintain a buffer ('accum') and a state ('state')
+            // 'bytes_needed' tracks how much data we are waiting for in ChunkData mode
+            return do_with(std::move(fd), std::move(backend_in), std::move(backend_out), std::move(http_req), sstring(), ProxyState::Headers, size_t(0),
+                [this, tokens, route_hit, target_id, &client_out](auto& fd, auto& in, auto& out, auto& req_str, sstring& accum, ProxyState& state, size_t& bytes_needed) mutable {
 
                 return out.write(req_str).then([&out] {
                     return out.flush();
-                }).then([&in, &client_out, this, tokens, route_hit, target_id] {
+                }).then([&in, &client_out, &accum, &state, &bytes_needed, this, tokens, route_hit, target_id] {
 
-                    // Read Loop: Strip Headers first, then Stream
-                    return do_with(false, sstring(), [&in, &client_out, this, tokens, route_hit, target_id](bool& headers_done, sstring& buffer) {
-                        return repeat([&in, &client_out, &headers_done, &buffer, this, tokens, route_hit, target_id] {
-                            return in.read().then([&in, &client_out, &headers_done, &buffer, this, tokens, route_hit, target_id](temporary_buffer<char> chunk) {
-                                if (chunk.empty()) return make_ready_future<stop_iteration>(stop_iteration::yes);
+                    return repeat([&in, &client_out, &accum, &state, &bytes_needed, this, tokens, route_hit, target_id] {
+                        return in.read().then([&client_out, &accum, &state, &bytes_needed, this, tokens, route_hit, target_id](temporary_buffer<char> chunk) {
+                            if (chunk.empty()) return make_ready_future<stop_iteration>(stop_iteration::yes); // EOF
 
-                                if (headers_done) {
-                                    // Fast Path: Pipe data directly to client
-                                    return client_out.write(std::move(chunk)).then([&client_out] {
-                                        return client_out.flush(); // Flush to reduce latency!
-                                    }).then([] {
-                                        return stop_iteration::no;
-                                    });
-                                } else {
-                                    // Slow Path: Buffering headers
-                                    buffer.append(chunk.get(), chunk.size());
-                                    auto header_end = buffer.find("\r\n\r\n");
+                            // Append new data to our persistent buffer
+                            accum.append(chunk.get(), chunk.size());
 
+                            // Process Buffer Loop
+                            // We loop here because one read() might contain multiple chunks (Size+Data+Size...)
+                            bool keep_processing = true;
+                            while (keep_processing && !accum.empty()) {
+                                keep_processing = false; // Default to stop unless we make progress
+
+                                if (state == ProxyState::Headers) {
+                                    auto header_end = accum.find("\r\n\r\n");
                                     if (header_end != sstring::npos) {
-                                        headers_done = true;
+                                        // 1. Headers Found
+                                        sstring headers = accum.substr(0, header_end);
 
-                                        sstring headers = buffer.substr(0, header_end);
-                                        bool is_success = headers.find(" 200 ") != sstring::npos;
-
-                                        if (is_success && !route_hit.has_value()) {
-                                            bool worth_caching = tokens.size() >= 4;
-                                            if (worth_caching) {
-                                                (void)_router.learn_route_global(tokens, target_id);
-                                                std::cout << "\n[Snoop] 🧠 LEARNED ROUTE: " << tokens.size() << " toks -> GPU-" << target_id << "\n";
-                                            }
+                                        // Snooping
+                                        if (headers.find(" 200 ") != sstring::npos && !route_hit.has_value() && tokens.size() >= 4) {
+                                            (void)_router.learn_route_global(tokens, target_id);
+                                            std::cout << "\n[Snoop] 🧠 LEARNED ROUTE: " << tokens.size() << " toks -> GPU-" << target_id << "\n";
                                         }
 
-                                        if (header_end + 4 < buffer.size()) {
-                                            sstring initial_body = buffer.substr(header_end + 4);
-                                            return client_out.write(initial_body).then([&client_out] {
-                                                return client_out.flush();
-                                            }).then([] {
-                                                return stop_iteration::no;
-                                            });
-                                        }
-                                        return make_ready_future<stop_iteration>(stop_iteration::no);
+                                        // Remove headers from buffer
+                                        accum = accum.substr(header_end + 4);
+                                        state = ProxyState::ChunkSize;
+                                        keep_processing = true;
                                     }
-                                    return make_ready_future<stop_iteration>(stop_iteration::no);
                                 }
-                            });
+                                else if (state == ProxyState::ChunkSize) {
+                                    auto line_end = accum.find("\r\n");
+                                    if (line_end != sstring::npos) {
+                                        // 2. Size Line Found (e.g. "f1\r\n")
+                                        sstring size_line = accum.substr(0, line_end);
+
+                                        // Parse Hex
+                                        try {
+                                            bytes_needed = std::stoul(size_line, nullptr, 16);
+                                        } catch(...) { bytes_needed = 0; }
+
+                                        // Consume line
+                                        accum = accum.substr(line_end + 2);
+
+                                        if (bytes_needed == 0) {
+                                            state = ProxyState::Done;
+                                            return make_ready_future<stop_iteration>(stop_iteration::yes);
+                                        }
+
+                                        state = ProxyState::ChunkData;
+                                        keep_processing = true;
+                                    }
+                                }
+                                else if (state == ProxyState::ChunkData) {
+                                    // 3. Data Block (Need 'bytes_needed' + 2 for trailing \r\n)
+                                    if (accum.size() >= bytes_needed + 2) {
+                                        // We have the full chunk!
+                                        sstring data = accum.substr(0, bytes_needed);
+
+                                        // Consume data + \r\n
+                                        accum = accum.substr(bytes_needed + 2);
+                                        state = ProxyState::ChunkSize; // Back to size mode
+                                        keep_processing = true;
+
+                                        // Write clean data to user
+                                        // IMPORTANT: We must wait for this write before looping again
+                                        return client_out.write(data).then([&client_out] {
+                                            return client_out.flush();
+                                        }).then([] {
+                                            return stop_iteration::no; // Continue outer repeat loop
+                                        });
+                                    }
+                                }
+                            }
+
+                            return make_ready_future<stop_iteration>(stop_iteration::no);
                         });
                     });
                 });

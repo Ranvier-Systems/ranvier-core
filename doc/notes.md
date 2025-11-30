@@ -609,3 +609,110 @@ Read until \r\n\r\n (Headers). Stop. Parse "200 OK" for Snooping.
 Forward the rest (Body) directly to the user's output stream as it arrives.
 
 This fixes the "Lag" (by streaming) and the "Double Headers" (by stripping the backend headers).
+
+
+
+
+That fixed the build, and is much faster.
+
+Ollama:
+time=2025-11-29T17:50:22.645-05:00 level=INFO source=server.go:1332 msg="llama runner started in 1.58 seconds"
+[GIN] 2025/11/29 - 17:50:27 | 200 |  7.071944417s |    192.168.4.51 | POST     "/v1/chat/completions"
+
+Curl:
+f1
+data: {"id":"chatcmpl-203","object":"chat.completion.chunk","created":1764456627,"model":"llama3.2:1b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+
+0
+
+
+The "f1" you see is a Chunk Artifact (Hexadecimal for 241 bytes). You have successfully built a "Double Chunked" proxy.
+
+Here is the physics of what is happening:
+
+Ollama (Upstream) sends HTTP/1.1 Chunked response.
+
+Wire: f1\r\n + JSON Payload + \r\n
+
+Ranvier (Your Proxy) strips the Headers (HTTP/1.1 200 OK...), but keeps the body as-is.
+
+Ranvier Stream: f1\r\n + JSON Payload + \r\n
+
+Ranvier (Downstream) wraps this stream in its own HTTP Response (rep->write_body). Seastar also applies Chunked Encoding to this stream.
+
+Curl (Client) decodes the outer layer (Ranvier's chunks) but prints the inner payload, which still contains Ollama's raw chunk headers (f1).
+
+The Solution: The "De-Chunker" State Machine
+
+To be a transparent proxy, you must decode the upstream chunks before re-encoding them for the user.
+
+Fortunately, Seastar's input_stream has a superpower: read_until and read_exactly. We can replace the naive read() loop with a structured parser that understands HTTP Chunking.
+
+1. Update src/http_controller.cpp
+
+Replace the handle_proxy function with this logic. I have replaced the generic read() loop with a Chunk Parsing Loop that handles the Size -> Data -> CRLF sequence.
+
+
+---
+Trick 2: Use the VS Code "Problems" Tab Instead of reading the raw terminal output, press Cmd + Shift + M (or click the "X" and "!" icons in the bottom status bar).
+
+VS Code parses the log and shows you just the file and line number of the error.
+
+Clicking it jumps to the code.
+
+Ignore the "notes": Usually, only the top-most Error is the real one. The rest is the compiler explaining why every other function didn't fit.
+
+---
+This code implements a robust parser inside the loop:
+
+State Persistence: do_with(..., sstring(), ProxyState::Headers, ...) keeps the buffer and state alive across multiple network packets.
+
+Inner Loop: The while(keep_processing) loop ensures that if we receive one massive TCP packet containing 5 chunks, we process all of them immediately instead of waiting for the next network event.
+
+De-Chunking: By parsing the hex size and stripping the \r\n wrappers, we extract the pure JSON. When client_out.write(data) sends it, Seastar wraps it in new chunks, resulting in a valid HTTP stream for the user.
+
+
+
+---
+You have crossed the finish line for Phase 1.
+
+You now have a Layer 7 Streaming AI Proxy that:
+
+* Parses incoming prompts dynamically using a GPT-2 tokenizer.
+
+* Routes requests based on semantic content (Radix Tree).
+
+* Proxies to a real production inference engine (Ollama).
+
+* Streams tokens in real-time (De-chunking/Re-chunking state machine).
+
+* Learns from the traffic ([Snoop]).
+
+The log msg="llama runner started in 1.57 seconds" vs 4.38s total duration confirms exactly why Ranvier is needed. That 1.57s was likely the "Cold Start / Prefill" penalty. If you had a second Ollama instance, Ranvier would now know to route that specific prompt back to this instance to skip that 1.57s penalty next time.
+
+The Fork in the Road: What's Next?
+
+You have a working "MVP." To make it "Production Ready," you have two distinct paths depending on what skill you want to sharpen next.
+
+* Path A: The "Systems Engineer" Path (Performance Hardening)
+Goal: Implement Connection Pooling & Keep-Alive.
+The Problem: Currently, your code calls seastar::connect() for every request. This performs a full TCP Handshake (SYN/SYN-ACK/ACK). In high-throughput environments, this adds latency and exhausts OS file descriptors (ephemeral ports).
+The Fix: Create a BackendConnectionPool class.
+Logic: "Do I have an open socket to 192.168.4.51? Yes? Use it. No? Connect."
+Difficulty: High (Complex Seastar state management).
+Value: Essential for beating Nginx benchmarks.
+
+* Path B: The "DevOps / Product" Path (The Sidecar)
+Goal: Implement Auto-Discovery.
+The Problem: Manually curl-ing /admin/backends is tedious and doesn't scale.
+The Fix: Write a Python sidecar that watches Docker/Kubernetes.
+Logic: "Oh, a new pod ollama-gpu-2 just started? Grab its IP and POST it to Ranvier automatically."
+Difficulty: Low/Medium (Python).
+Value: Makes the project "Plug-and-Play" for users.
+
+Recommendation
+Since you are in the flow of C++ Systems Work, I strongly recommend Path A (Connection Pooling).
+It is the final piece of "Deep Tech" that separates a toy proxy from high-performance infrastructure. It will force you to learn how Seastar manages resource lifetimes (keepalive) across requests.
