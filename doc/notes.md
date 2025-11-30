@@ -729,3 +729,78 @@ The Refactor Plan
 Extract the Parser: Move the messy "De-chunking State Machine" into a helper class StreamParser.
 
 Switch to Coroutines: Rewrite handle_proxy to use co_await instead of .then().
+
+---
+This is exactly why we refactored. Implementing Connection Pooling with callbacks is a nightmare (managing the "return to pool" logic in finally blocks is prone to leaks). With Coroutines (RAII), it becomes manageable.
+
+The Goal: "Keep-Alive"
+
+Currently, your proxy does this:
+
+connect() (SYN/ACK - expensive)
+
+Send Request (Connection: close)
+
+Read Response
+
+close() (FIN/ACK)
+
+We want to change this to:
+
+Check Pool. (Have a socket for 127.0.0.1:11434?)
+
+Reuse or Connect.
+
+Send Request (Connection: keep-alive).
+
+Read Response.
+
+Return to Pool (Don't close!).
+
+Step 1: Create src/connection_pool.hpp
+
+We need a class to manage these sockets. Since Seastar streams (input_stream, output_stream) are tightly coupled to the socket, our pool needs to store the whole bundle, not just the file descriptor.
+
+
+We need to modify the handle_proxy logic to use the pool and, crucially, change the HTTP headers.
+
+Key Changes:
+
+Replace seastar::connect() with _pool.get().
+
+Change Connection: close to Connection: keep-alive.
+
+Wrap the logic in a try/catch block to handle connection errors cleanly (marking the bundle invalid).
+
+Call _pool.put() at the end instead of close().
+
+Important Nuance: "Why res.done matters"
+
+In a Keep-Alive world, you cannot just read() until the socket closes (EOF), because the socket won't close! The server keeps it open for the next request.
+
+Your loop must know exactly when the current HTTP response ends.
+
+Fortunately, our StreamParser already has if (bytes_needed == 0) res.done = true.
+
+This allows us to break out of the read loop while the socket is still alive, and return it to the pool.
+
+
+Verify it works: Run your curl test multiple times.
+* Request 1: Should take connect() time + Inference time.
+* Request 2: Should be instant (no TCP handshake). You might notice the "Time to First Token" drop by another 2-5ms (depending on OS overhead). The llama runner started logs in Ollama will look identical, but the network overhead will vanish.
+
+
+You are "Good." In fact, you are better than good—you have a Production-Grade Core.
+
+The logs confirm three critical victories:
+
+Protocol Compliance: Ollama accepted your request, processed it, and returned 200 OK.
+
+Streaming Integrity: curl received clean data: JSON chunks and the [DONE] signal. This means your De-Chunker state machine is perfectly parsing the raw TCP stream.
+
+End-to-End Latency: The 8.1s total time is driven by the GPU generation speed (Ollama is slow on CPU/Integrated graphics compared to H100s), but the network overhead is now minimized.
+
+
+1. The Final "Trust but Verify" Step
+
+To be 100% certain the Connection Pool is actually saving you time (and not just silently creating new connections every time), add a tiny log trace to src/connection_pool.hpp.

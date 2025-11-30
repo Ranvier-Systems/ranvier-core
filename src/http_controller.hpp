@@ -1,5 +1,6 @@
 #pragma once
 
+#include "connection_pool.hpp"
 #include "router_service.hpp"
 #include "tokenizer_service.hpp"
 
@@ -20,6 +21,7 @@ public:
 private:
     TokenizerService& _tokenizer;
     RouterService& _router;
+    ConnectionPool _pool;
 
     // Helper handlers
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);

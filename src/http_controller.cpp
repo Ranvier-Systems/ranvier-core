@@ -346,62 +346,78 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
         co_return std::move(rep);
     }
+    socket_address target_addr = target_addr_opt.value();
 
     // 2. Setup Streaming
-    // The writer lambda must ALSO be a coroutine
-    rep->write_body("text/event-stream", [this, target_addr_opt, body, tokens, route_hit, target_id](output_stream<char> client_out) -> future<> {
+    // STREAMING RESPONSE
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id](output_stream<char> client_out) -> future<> {
 
-        // RAII: We need to ensure socket closes even if exceptions occur
-        connected_socket fd;
-        input_stream<char> in;
-        output_stream<char> out;
+        // 1. GET CONNECTION FROM POOL
+        // Note: We declare bundle outside try/catch so we can return it later
+        ConnectionBundle bundle;
 
         try {
-            fd = co_await seastar::connect(target_addr_opt.value());
-            in = fd.input();
-            out = fd.output();
+            // Use co_await to get a connection (either new or reused)
+            bundle = co_await _pool.get(target_addr);
 
             sstring http_req =
                 "POST /v1/chat/completions HTTP/1.1\r\n"
                 "Host: localhost\r\n"
                 "Content-Type: application/json\r\n"
                 "Content-Length: " + to_sstring(body.size()) + "\r\n"
-                "Connection: close\r\n\r\n" +
+                "Connection: keep-alive\r\n\r\n" +  // <--- CHANGED: keep-alive
                 body;
 
-            co_await out.write(http_req);
-            co_await out.flush();
+            co_await bundle.out.write(http_req);
+            co_await bundle.out.flush();
 
-            // 3. The Read Loop (Linear!)
+            // 3. The Read Loop
             StreamParser parser;
             while (true) {
-                auto chunk = co_await in.read();
-                if (chunk.empty()) break; // EOF
+                // Read from the POOLED input stream
+                auto chunk = co_await bundle.in.read();
+
+                // EOF logic:
+                // If chunk is empty, the server closed on us.
+                // This is fine for 'Connection: close', but for keep-alive,
+                // we actually rely on Content-Length or Chunked Encoding to know when to stop.
+                // Since we are parsing Raw TCP, and Ollama might use Chunked,
+                // our StreamParser logic needs to be robust.
+                if (chunk.empty()) {
+                    bundle.is_valid = false; // Server hung up, discard this connection
+                    break;
+                }
 
                 auto res = parser.push(std::move(chunk));
 
-                // Snooping
+                // Snooping Logic
                 if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= 4) {
                     (void)_router.learn_route_global(tokens, target_id);
                     std::cout << "\n[Snoop] 🧠 LEARNED ROUTE: " << tokens.size() << " toks -> GPU-" << target_id << "\n";
                 }
 
-                // Streaming
                 if (!res.data.empty()) {
                     co_await client_out.write(res.data);
                     co_await client_out.flush();
                 }
 
-                if (res.done) break;
+                if (res.done) {
+                    // Success! We finished reading this specific request.
+                    // We can stop reading from the socket now.
+                    break;
+                }
             }
 
         } catch (const std::exception& e) {
             std::cerr << "Proxy Error: " << e.what() << "\n";
+            bundle.is_valid = false; // Mark broken so we don't reuse it
         }
 
-        // Cleanup happens automatically via destructors, but streams need closing
-        co_await out.close();
-        co_await in.close();
+        // 4. CLEANUP
+        // Return backend connection to pool (or close if invalid)
+        _pool.put(std::move(bundle));
+
+        // Always close the USER connection
         co_await client_out.close();
     });
 
