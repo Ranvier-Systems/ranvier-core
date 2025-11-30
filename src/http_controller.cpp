@@ -407,7 +407,6 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     break;
                 }
             }
-
         } catch (const std::exception& e) {
             std::cerr << "Proxy Error: " << e.what() << "\n";
             bundle.is_valid = false; // Mark broken so we don't reuse it
