@@ -1,8 +1,11 @@
 #include "http_controller.hpp"
 
+#include "stream_parser.hpp"
+
 #include <algorithm>
 #include <iostream>
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
@@ -157,6 +160,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 }
 */
 
+/*
 // Helper Enum for the State Machine
 enum class ProxyState {
     Headers,    // Waiting for \r\n\r\n
@@ -308,6 +312,100 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     });
 
     return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+*/
+// ---------------------------------------------------------
+// PROXY HANDLER (Coroutine Version)
+// ---------------------------------------------------------
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    std::string body = req->content;
+
+    // 1. Validation
+    if (!_tokenizer.is_loaded()) {
+        rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
+        co_return std::move(rep);
+    }
+
+    auto tokens = _tokenizer.encode(body);
+    auto route_hit = _router.lookup(tokens);
+
+    BackendId target_id;
+    if (route_hit.has_value()) {
+        target_id = route_hit.value();
+    } else {
+        auto random_id = _router.get_random_backend();
+        if (!random_id.has_value()) {
+            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+            co_return std::move(rep);
+        }
+        target_id = random_id.value();
+    }
+
+    auto target_addr_opt = _router.get_backend_address(target_id);
+    if (!target_addr_opt.has_value()) {
+        rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
+        co_return std::move(rep);
+    }
+
+    // 2. Setup Streaming
+    // The writer lambda must ALSO be a coroutine
+    rep->write_body("text/event-stream", [this, target_addr_opt, body, tokens, route_hit, target_id](output_stream<char> client_out) -> future<> {
+
+        // RAII: We need to ensure socket closes even if exceptions occur
+        connected_socket fd;
+        input_stream<char> in;
+        output_stream<char> out;
+
+        try {
+            fd = co_await seastar::connect(target_addr_opt.value());
+            in = fd.input();
+            out = fd.output();
+
+            sstring http_req =
+                "POST /v1/chat/completions HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: " + to_sstring(body.size()) + "\r\n"
+                "Connection: close\r\n\r\n" +
+                body;
+
+            co_await out.write(http_req);
+            co_await out.flush();
+
+            // 3. The Read Loop (Linear!)
+            StreamParser parser;
+            while (true) {
+                auto chunk = co_await in.read();
+                if (chunk.empty()) break; // EOF
+
+                auto res = parser.push(std::move(chunk));
+
+                // Snooping
+                if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= 4) {
+                    (void)_router.learn_route_global(tokens, target_id);
+                    std::cout << "\n[Snoop] 🧠 LEARNED ROUTE: " << tokens.size() << " toks -> GPU-" << target_id << "\n";
+                }
+
+                // Streaming
+                if (!res.data.empty()) {
+                    co_await client_out.write(res.data);
+                    co_await client_out.flush();
+                }
+
+                if (res.done) break;
+            }
+
+        } catch (const std::exception& e) {
+            std::cerr << "Proxy Error: " << e.what() << "\n";
+        }
+
+        // Cleanup happens automatically via destructors, but streams need closing
+        co_await out.close();
+        co_await in.close();
+        co_await client_out.close();
+    });
+
+    co_return std::move(rep);
 }
 
 // ---------------------------------------------------------

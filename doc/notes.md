@@ -716,3 +716,16 @@ Value: Makes the project "Plug-and-Play" for users.
 Recommendation
 Since you are in the flow of C++ Systems Work, I strongly recommend Path A (Connection Pooling).
 It is the final piece of "Deep Tech" that separates a toy proxy from high-performance infrastructure. It will force you to learn how Seastar manages resource lifetimes (keepalive) across requests.
+
+--
+The code is suffering from "Callback Hell" (nested .then() lambdas). This makes adding logic like "Connection Pooling" (which requires try/catch/finally semantics) extremely difficult.
+
+The "Staff Engineer" move here is to switch to C++20 Coroutines.
+
+Seastar fully supports co_await. This allows you to write asynchronous code that looks synchronous. Loops become while(), error handling becomes try/catch, and the nesting vanishes.
+
+The Refactor Plan
+
+Extract the Parser: Move the messy "De-chunking State Machine" into a helper class StreamParser.
+
+Switch to Coroutines: Rewrite handle_proxy to use co_await instead of .then().

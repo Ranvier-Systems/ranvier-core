@@ -24,6 +24,7 @@ add_executable(ranvier_server
   src/main.cpp
   src/http_controller.cpp
   src/router_service.cpp
+  src/stream_parser.cpp
   src/tokenizer_service.cpp
 )
 
