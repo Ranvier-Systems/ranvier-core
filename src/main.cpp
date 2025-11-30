@@ -264,6 +264,7 @@ int main(int argc, char** argv) {
 #include <streambuf>
 
 #include <seastar/core/app-template.hh>
+#include <seastar/core/prometheus.hh>"
 #include <seastar/core/reactor.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
@@ -276,6 +277,7 @@ ranvier::TokenizerService tokenizer;
 ranvier::RouterService router;
 ranvier::HttpController controller{tokenizer, router};
 
+#if 0
 future<> run() {
     try {
         // Note: This MUST conform to the Rust BPE parser requirements
@@ -324,14 +326,22 @@ future<> run() {
         //tokenizer.load_from_json(dummy_tokenizer_json);
         tokenizer.load_from_json(tokenizer_json_str);
         std::cout << "✅ Tokenizer Engine Loaded.\n";
-    } catch (const std::exception& e) {
-        std::cerr << "❌ Failed to load tokenizer: " << e.what() << "\n";
-    }
+
+        // Start Prometheus Exporter on Port 9180
+        // seastar::prometheus::config holds the settings
+        seastar::prometheus::config pconf;
+        pconf.port_number = 9180; // Standard Prometheus port
+        pconf.metric_help = "Ranvier AI Router Metrics";
 
     // 2. Manage Server Lifecycle with do_with
     // do_with ensures 'server' stays alive until the lambda chain finishes
     return do_with(http_server_control(), [](auto& server) {
         return server.start().then([&server] {
+            // We start the prometheus server asynchronously
+            // We use do_with to keep the server alive, or just let Seastar manage it
+            // The simple 'start()' function attaches it to the engine.
+            std::cout << "📊 Prometheus Metrics listening on port 9180\n";
+
             return server.set_routes([](routes& r) {
                 // Route setup is delegated to the Controller
                 controller.register_routes(r);
@@ -354,6 +364,66 @@ future<> run() {
             // 4. Graceful Shutdown
             std::cout << "\n🛑 Stopping Ranvier...\n";
             return server.stop();
+        });
+    });
+}
+#endif
+
+future<> run() {
+    // 1. Init Infrastructure
+    try {
+        std::ifstream t("assets/gpt2.json");
+        if (!t.is_open()) {
+            throw std::runtime_error("Could not find assets/gpt2.json");
+        }
+        std::string json_str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
+        tokenizer.load_from_json(json_str);
+        std::cout << "✅ Services Initialized (GPT-2 Tokenizer).\n";
+    } catch (const std::exception& e) {
+        std::cerr << "❌ Service Init Failed: " << e.what() << "\n";
+        return make_ready_future<>();
+    }
+
+    // 2. Start Servers (Metrics + API)
+    // We use do_with to manage TWO servers now.
+    return do_with(http_server_control(), http_server_control(), [](auto& prom_server, auto& api_server) {
+
+        // A. Setup Prometheus Server (Port 9180)
+        return prom_server.start().then([&prom_server] {
+            seastar::prometheus::config pconf;
+            pconf.metric_help = "Ranvier AI Router";
+            // Attach Prometheus routes to this specific server instance
+            return seastar::prometheus::start(prom_server, pconf);
+        }).then([&prom_server] {
+            return prom_server.listen(socket_address(ipv4_addr("0.0.0.0", 9180)));
+        }).then([] {
+            std::cout << "📊 Prometheus Metrics listening on port 9180\n";
+
+            // B. Setup Main API Server (Port 8080)
+            // We chain this AFTER Prometheus is ready
+            return make_ready_future<>();
+        }).then([&api_server] {
+            return api_server.start();
+        }).then([&api_server] {
+            return api_server.set_routes([](routes& r) {
+                controller.register_routes(r);
+            });
+        }).then([&api_server] {
+            return api_server.listen(socket_address(ipv4_addr("0.0.0.0", 8080)));
+        }).then([] {
+            std::cout << "⚡ Ranvier listening on port 8080... (Ctrl+C to stop)\n";
+
+            // C. Wait Loop
+            auto stop_signal = std::make_shared<promise<>>();
+            engine().handle_signal(SIGINT, [stop_signal] { stop_signal->set_value(); });
+            engine().handle_signal(SIGTERM, [stop_signal] { stop_signal->set_value(); });
+            return stop_signal->get_future();
+        }).then([&api_server, &prom_server] {
+            std::cout << "\n🛑 Stopping Ranvier...\n";
+            // D. Shutdown Sequence (Stop both)
+            return api_server.stop().then([&prom_server] {
+                return prom_server.stop();
+            });
         });
     });
 }

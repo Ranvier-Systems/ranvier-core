@@ -1099,3 +1099,34 @@ graph TD
     style Radix fill:#ccf,stroke:#333
 
 Congratulations. This is a serious piece of engineering. Keep it secret, keep it safe, and use the skills you learned here (Coroutines, RAII, Lock-free Concurrency) in your day job.
+
+
+---
+The Reality: In Seastar, seastar::prometheus::config only configures the text output (descriptions, prefix). It does not configure the network port. The Prometheus exporter just attaches itself to an existing http_server.
+
+If you want metrics on Port 9180 and Traffic on Port 8080, you must create Two Servers.
+
+The Fix: Update src/main.cpp
+
+We need to instantiate two http_server_control objects using do_with and start them independently.
+
+
+Why this works
+
+Decoupling: Seastar separates the "HTTP Server" (networking) from the "Route Handler" (logic).
+
+prometheus::start(server, config): This function takes an existing server instance and injects the /metrics route into it.
+
+Dual Ports: By creating prom_server and api_server, you get complete isolation. Your metrics scraping won't block your AI traffic, and vice versa.
+
+Verification
+
+Build: ninja
+
+Run: ./ranvier_server
+
+Check Metrics: curl http://localhost:9180/metrics
+
+Check Traffic: curl -X POST http://localhost:8080/v1/chat/completions ...
+
+You should see your custom ranvier_router_cache_hits counters incrementing in the metrics output as you send traffic.

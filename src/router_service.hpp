@@ -6,12 +6,15 @@
 #include <vector>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/metrics_registration.hh>
 #include <seastar/net/socket_defs.hh>
 
 namespace ranvier {
 
 class RouterService {
 public:
+    RouterService();
+
     // 1. DATA PLANE (Fast Lookups)
     // Find which Backend ID owns this prefix
     std::optional<BackendId> lookup(const std::vector<int32_t>& tokens);
@@ -27,6 +30,11 @@ public:
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr);
 
     std::optional<BackendId> get_random_backend();
+
+private:
+    // Thread-local metrics group
+    // This holds the handle that keeps the metrics alive
+    seastar::metrics::metric_groups _metrics;
 };
 
 } // namespace ranvier
