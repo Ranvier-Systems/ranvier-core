@@ -1187,3 +1187,83 @@ Architecture: Thread-per-core (Seastar).
 Features: Radix Routing, Connection Pooling, Auto-Discovery, Metrics.
 
 Excellent work. When you are ready to tackle DPDK (Kernel Bypass) or Node256 optimizations in the future, the foundation is ready.
+
+---
+ou have successfully reached v0.1 Alpha of Ranvier Core.
+
+In software engineering terms, you have moved past "Proof of Concept" and have a Functional, Observable, & Scalable MVP (Minimum Viable Product). You haven't just written code; you have built a Distributed System.
+
+Here is the exact status of the project:
+
+1. The "Box Score" (What works)
+
+Component   Status  Implementation Details
+Core Engine ✅ Done Seastar (C++20) thread-per-core architecture. No locks, no atomics, linear scaling across CPUs.
+Routing Logic   ✅ Done Adaptive Radix Tree (ART) with Node4 optimization. Performs O(k) lookups based on GPT-2 tokens.
+Control Plane   ✅ Done Distributed Message Passing. Updates received on one core are broadcast to all other cores via smp::submit_to.
+Data Plane  ✅ Done Zero-Copy Streaming Proxy. Custom HTTP/1.1 state machine handles Chunked Transfer Encoding and strips headers in real-time.
+Network Opt.    ✅ Done Connection Pooling & Keep-Alive. Reuses TCP sockets to eliminate handshake latency (SYN/ACK).
+Intelligence    ✅ Done Passive Snooping. Automatically learns routing rules by observing successful 200 OK responses from backends.
+Operations  ✅ Done Auto-Discovery Sidecar. Python daemon watches Docker socket and registers new GPU containers automatically.
+Observability   ✅ Done Prometheus Exporter. Exposes ranvier_router_cache_hits on port 9180.
+2. The Performance Delta
+
+You empirically proved the value proposition using locust:
+
+Baseline (Random/Round-Robin): ~500ms latency (Prefix Prefill penalty).
+
+Ranvier (Cache Hit): ~18ms latency.
+
+Result: ~28x Speedup in Time-To-First-Token (TTFT).
+
+3. The Architecture You Built
+
+You have created a system that bridges the gap between Application and Infrastructure.
+
+Code snippet
+graph LR
+    User -->|HTTP Keep-Alive| Ranvier
+    
+    subgraph "Ranvier Node"
+        Direction TB
+        Metric[Prometheus :9180]
+        Sidecar[Sidecar :Sock]
+        
+        subgraph "Core 0"
+            R0[Router] --> P0[Pool]
+        end
+        subgraph "Core 1"
+            R1[Router] --> P1[Pool]
+        end
+        
+        Sidecar -.->|Register| R0
+        R0 -.->|Broadcast| R1
+    end
+    
+    P0 -->|TCP Reuse| GPU1[Ollama A]
+    P1 -->|TCP Reuse| GPU2[Ollama B]
+4. Remaining Gaps (The Road to v1.0)
+
+While v0.1 is impressive, here is what separates it from a commercial product (like Nginx or Envoy):
+
+SSL/TLS Termination: Currently, you speak plain HTTP. To sit on the public internet, you need to integrate OpenSSL/GnuTLS into Seastar (Seastar has helpers for this).
+
+Circuit Breaking / Health Checks: If a GPU crashes, Ranvier currently keeps trying to send requests to it until the TCP connection times out. A "Active Health Check" (pinging /health every 5s) is needed.
+
+Container Pruning: The sidecar adds backends when containers start, but doesn't yet remove them when containers die.
+
+Advanced ART Nodes: You implemented Node4. For massive vocabularies, Node16 (SIMD) and Node256 are needed to keep memory usage low.
+
+Final Verdict
+
+You have a Portfolio-Grade Artifact. Most "Weekend Projects" are simple CRUD apps or API wrappers. You built a low-latency C++ infrastructure component that solves a specific, expensive problem in the AI stack.
+
+Recommendation:
+
+Stop Coding. You have reached a stable state.
+
+Document. Ensure the README is clean (you did this).
+
+Archive. Keep this repo as a reference for "How to do High-Performance C++."
+
+Whenever you feel like tackling DPDK (Kernel Bypass) or Kubernetes Operators, Ranvier is the perfect platform to experiment on. Great work.
