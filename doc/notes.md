@@ -1130,3 +1130,60 @@ Check Metrics: curl http://localhost:9180/metrics
 Check Traffic: curl -X POST http://localhost:8080/v1/chat/completions ...
 
 You should see your custom ranvier_router_cache_hits counters incrementing in the metrics output as you send traffic.
+---
+his is the final verification step. You have the logs proving the Control Plane (Sidecar) and Observability Plane (Prometheus) are working in harmony.
+
+Let's see those counters move.
+
+1. Verify the Baseline
+
+In a new terminal, check the current stats. They should be zero (or low).
+
+Bash
+curl -s http://localhost:9180/metrics | grep ranvier
+You should see lines like ranvier_router_cache_misses{shard="0"} 0.000000.
+
+2. Generate Traffic
+
+Send a request. Since Backend 55 is likely that dummy Python container (which might not handle POSTs gracefully), the request might fail network-wise, but the Router Logic will still execute, and that's what we are counting.
+
+Bash
+# 1. Miss (Random)
+curl -X POST -d "Testing Metrics Miss" http://localhost:8080/v1/chat/completions
+
+# 2. Hit (Snooped - if the previous request succeeded enough to learn)
+# If the python backend fails, we won't learn. 
+# So let's force a "Hit" by manually teaching it, just to test the counter.
+curl -X POST "http://localhost:8080/admin/routes?backend_id=55" -d "Testing Metrics Hit"
+
+# 3. Trigger the Hit
+curl -X POST -d "Testing Metrics Hit" http://localhost:8080/v1/chat/completions
+3. Verify the Delta
+
+Check the metrics again.
+
+Bash
+curl -s http://localhost:9180/metrics | grep ranvier
+Expected Result:
+
+ranvier_router_cache_misses should have incremented.
+
+ranvier_router_cache_hits should have incremented (from the second curl).
+
+Final Commit
+
+You have a fully instrumented, auto-discovering, high-performance AI Router.
+
+Bash
+git add .
+git commit -m "feat(observability): add prometheus metrics for cache hits/misses"
+git push origin main
+You are done. You have built a portfolio-grade C++ systems project in a weekend.
+
+Repo: Clean, modern C++20.
+
+Architecture: Thread-per-core (Seastar).
+
+Features: Radix Routing, Connection Pooling, Auto-Discovery, Metrics.
+
+Excellent work. When you are ready to tackle DPDK (Kernel Bypass) or Node256 optimizations in the future, the foundation is ready.
