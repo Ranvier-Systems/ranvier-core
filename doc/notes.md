@@ -940,3 +940,162 @@ Recommendation
 Since you have a solid, high-performance core (Phases 1 & 2), moving to Phase 3 (The Sidecar) is the best way to make this project "usable" for others or for a demo video. It transforms the project from "Code you have to manage" to "Infrastructure that manages itself."
 
 Would you like to start sketching out the Python Sidecar to auto-detect your Ollama container?
+
+
+---
+You have effectively completed Phase 1 and Phase 2.
+
+Here is the "State of the Union" for Ranvier Core:
+
+✅ Phase 1: Compatibility (Streaming) - COMPLETE
+
+Goal: Stop buffering; support real LLM protocols.
+
+Evidence: You implemented the StreamParser state machine. You successfully proxied Ollama responses byte-by-byte without waiting for the full generation. The f1 chunk artifacts were removed, and the [Snoop] logic works even on streamed headers.
+
+✅ Phase 2: Latency (Connection Pooling) - COMPLETE
+
+Goal: Eliminate TCP handshake overhead.
+
+Evidence: You implemented src/connection_pool.hpp and refactored the controller to use Coroutines (co_await). Your logs show [Pool] ♻️ Reusing warm connection, proving that subsequent requests to the same GPU are skipping the handshake.
+
+🚧 Phase 3: Ops (Auto-Discovery) - NEXT
+
+Status: Not Started.
+
+The Pain Point: Right now, if you restart Ollama or add a new GPU, you have to manually run that long curl ... /admin/backends command. If the GPU crashes and restarts on a new IP, Ranvier is broken until you fix it manually.
+
+The Fix: A lightweight Python/Go sidecar that watches the environment (Docker/K8s) and calls the API for you.
+
+🔮 Phase 4: Scale (DPDK & Full ART) - FUTURE
+
+Status: Not Started.
+
+The Pain Point: Currently, Node4 is fine for small vocabularies, but if you routed on the entire unicode set, performance would degrade. Also, you are still using the Linux Kernel network stack (Standard TCP), which has a context-switch overhead.
+
+The Fix: Implementing Node256 for the Radix Tree and compiling Seastar with DPDK support to bypass the kernel.
+
+Recommendation
+
+Since you have a solid, high-performance core (Phases 1 & 2), moving to Phase 3 (The Sidecar) is the best way to make this project "usable" for others or for a demo video. It transforms the project from "Code you have to manage" to "Infrastructure that manages itself."
+
+
+---
+This moves us into the realm of DevOps Engineering.
+
+Right now, your architecture is "Push-based" (Humans manually tell the router what exists). We are building a "Pull-based" Reconciliation Loop. The Sidecar watches the source of truth (Docker/Kubernetes) and ensures Ranvier matches reality.
+
+The Architecture: "The Sidecar Pattern"
+
+We will write a small Python daemon (tools/sidecar.py) that runs alongside Ranvier.
+
+Watch: It connects to the Docker Socket (/var/run/docker.sock).
+
+Filter: It looks for any container with the label ranvier.backend=true.
+
+Sync: It extracts that container's IP and Port, then calls Ranvier's /admin/backends API.
+
+Step 1: Install Dependencies
+
+inside your dev container terminal:
+pip3 install docker requests
+
+
+Your Dev Container needs to talk to the Host's Docker Daemon. You need to update devcontainer.json to mount the socket file.
+
+Update .devcontainer/devcontainer.json: Add the mounts section.
+
+// ADD THIS:
+    "mounts": [
+            "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+    ]
+
+
+Action:
+
+Rebuild Container (Cmd+Shift+P -> Rebuild Container).
+
+Verify: Inside the terminal, run ls -l /var/run/docker.sock. It should exist.
+
+Step 4: The "Integration Test"
+
+Now, let's spin up a container and watch Ranvier find it automatically.
+
+Start Ranvier: ./ranvier_server
+
+Start the Sidecar: (New Terminal) python3 tools/sidecar.py
+
+Output: 🔍 Scanning for Ranvier backends...
+
+Start a "Labeled" Mock Backend: (New Terminal) We will use python:3.9-slim to run a quick web server, labeling it for Ranvier.
+
+
+---
+From macOS:
+docker run --rm -d \
+  --name dynamic-gpu-1 \
+  --label ranvier.backend=true \
+  --label ranvier.port=8000 \
+  --label ranvier.id=55 \
+  python:3.9-slim python3 -m http.server 8000
+
+
+This confirms that Phase 3 is complete.
+You have achieved Cross-Boundary Auto-Discovery.
+
+1. The Event: You started a container on your Mac Host.
+2. The Observation: The Sidecar (inside the Dev Container) saw the event via the mounted Docker Socket.
+3. The Action: It extracted the internal Docker IP (172.17.0.3) and registered it with Ranvier.
+This is exactly how systems like Kubernetes (via Ingress Controllers) work under the hood. You just built a mini-Kubernetes Ingress for AI.
+
+Cleanup
+Since that dynamic-gpu-1 container is just a dummy Python server, you can kill it from your Mac terminal:
+docker stop dynamic-gpu-1
+Ranvier won't automatically deregister it (we didn't implement the "remove" logic in the sidecar yet), but that's a feature for v0.2.
+
+---
+🏁 Weekend Project Retrospective
+
+You started this weekend asking about KeyDB and Redis. You ended up building Ranvier, a specialized, high-performance infrastructure component.
+
+Here is the "Staff Engineer" Resume Bullet Point for what you just built:
+
+Ranvier Systems (C++20, Seastar, Docker): Architected and built a high-performance, shared-nothing Layer 7 Load Balancer for LLM inference.
+
+Performance: Achieved 28x reduction in Time-To-First-Token (TTFT) by implementing content-aware routing that maximizes KV-Cache locality.
+
+Scalability: Implemented a thread-per-core architecture using Seastar with a custom Distributed Control Plane (broadcast messaging) to scale linearly with CPU cores.
+
+Networking: Engineered a zero-copy TCP proxy with a custom HTTP/1.1 state machine to support Chunked Transfer Encoding and Connection Pooling (Keep-Alive), eliminating handshake overhead.
+
+Ops: Built a Python sidecar for zero-touch auto-discovery of GPU nodes via the Docker API.
+
+Final Advice: The "Portfolio" Polish
+
+Before you close VS Code, do one last thing to make the repo "Executive Ready":
+
+Add an Architecture Diagram to your README. Since you can't embed the images we used here, use MermaidJS (GitHub supports it natively). Paste this into your README.md:
+graph TD
+    User[User / Client] -->|HTTP POST| Router[Ranvier Router]
+
+    subgraph "Ranvier Core (C++ Seastar)"
+        Router -->|Parse| Tokenizer[GPT-2 Tokenizer]
+        Tokenizer -->|Tokens| Radix[Radix Tree]
+        Radix -->|Lookup| Cache{Known Prefix?}
+        Cache -- Yes --> BackendID
+        Cache -- No --> LB[Random Load Balancer]
+        LB --> BackendID
+    end
+
+    subgraph "Infrastructure"
+        Sidecar[Python Sidecar] -.->|Watch| DockerDaemon
+        Sidecar -.->|Register| Router
+    end
+
+    Router == Keep-Alive Connection ==> GPU1[GPU 1 (Context A)]
+    Router == Keep-Alive Connection ==> GPU2[GPU 2 (Context B)]
+
+    style Router fill:#f9f,stroke:#333,stroke-width:4px
+    style Radix fill:#ccf,stroke:#333
+
+Congratulations. This is a serious piece of engineering. Keep it secret, keep it safe, and use the skills you learned here (Coroutines, RAII, Lock-free Concurrency) in your day job.

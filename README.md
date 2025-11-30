@@ -48,7 +48,30 @@ routes:
     backend_pool: "h100-cluster-a"
     # Ranvier uses this to tokenize the raw HTTP body
     tokenizer_config: "./tokenizers/llama-3.json"
-    
+
     # Optimization settings
     min_prefix_length: 64   # Don't route on "Hello", wait for context
     block_alignment: 16     # Align with vLLM PagedAttention blocks
+
+graph TD
+    User[User / Client] -->|HTTP POST| Router[Ranvier Router]
+
+    subgraph "Ranvier Core (C++ Seastar)"
+        Router -->|Parse| Tokenizer[GPT-2 Tokenizer]
+        Tokenizer -->|Tokens| Radix[Radix Tree]
+        Radix -->|Lookup| Cache{Known Prefix?}
+        Cache -- Yes --> BackendID
+        Cache -- No --> LB[Random Load Balancer]
+        LB --> BackendID
+    end
+
+    subgraph "Infrastructure"
+        Sidecar[Python Sidecar] -.->|Watch| DockerDaemon
+        Sidecar -.->|Register| Router
+    end
+
+    Router == Keep-Alive Connection ==> GPU1[GPU 1 (Context A)]
+    Router == Keep-Alive Connection ==> GPU2[GPU 2 (Context B)]
+
+    style Router fill:#f9f,stroke:#333,stroke-width:4px
+    style Radix fill:#ccf,stroke:#333

@@ -16,5 +16,8 @@
         "--ulimit", "memlock=-1:-1",
         "--cap-add", "SYS_NICE",
         "--cap-add", "SYS_ADMIN"
+    ],
+    "mounts": [
+        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
     ]
 }
