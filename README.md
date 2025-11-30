@@ -52,7 +52,9 @@ routes:
     # Optimization settings
     min_prefix_length: 64   # Don't route on "Hello", wait for context
     block_alignment: 16     # Align with vLLM PagedAttention blocks
+```
 
+```mermaid
 graph TD
     User[User / Client] -->|HTTP POST| Router[Ranvier Router]
 
@@ -75,3 +77,4 @@ graph TD
 
     style Router fill:#f9f,stroke:#333,stroke-width:4px
     style Radix fill:#ccf,stroke:#333
+```
