@@ -1464,3 +1464,37 @@ Update src/router_service.cpp:
 
 This is where we filter traffic. If a node is dead, we force a "Cache Miss" or pick a different random node.
 Update src/router_service.cpp:
+
+---
+Health Service
+Rebuild: ninja
+
+Run: ./ranvier_server & Mock GPU.
+
+Wait: You should see zero logs after the initial registration (because the steady state is "UP").
+
+Kill Mock: Wait 5s. You see one DOWN 🔴 log.
+
+Wait: Silence (even though it's still dead).
+
+Revive Mock: Wait 5s. You see one UP 🟢 log.
+
+
+
+1. Orchestrator: sidecar.py watches Docker and pushes config to Ranvier.
+2. Controller: HttpController parses HTTP/1.1 streams and de-chunks data.
+3. Router: RouterService performs O(k) lookups and load balancing.
+4. Network: ConnectionPool reuses TCP sockets for microsecond latency.
+5. Resiliency: HealthService quarantines dead nodes automatically.
+6. Observability: Prometheus tracks hit rates per CPU core.
+
+
+
+You have successfully reached v0.2 Beta.
+In software engineering terms, you have moved past a "Proof of Concept" and built a Distributed System with observability, resiliency, and self-healing. This is a portfolio-grade artifact.
+
+Your Repo Status:
+✅ Core: High-performance, thread-per-core C++20.
+✅ Logic: Adaptive Radix Tree routing + Connection Pooling.
+✅ Ops: Auto-discovery sidecar + Prometheus metrics.
+✅ Safety: Circuit breaking + thread-local state.

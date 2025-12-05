@@ -118,6 +118,9 @@ thread_local RadixTree local_tree;
 thread_local std::unordered_map<BackendId, seastar::socket_address> local_backends;
 thread_local std::vector<BackendId> local_backend_ids;
 
+// The "Blacklist"
+thread_local std::unordered_set<BackendId> local_dead_backends;
+
 // 1. Define the Thread-Local Counters
 thread_local uint64_t stats_cache_hits = 0;
 thread_local uint64_t stats_cache_misses = 0;
@@ -142,7 +145,13 @@ RouterService::RouterService() {
 std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens) {
     auto result = local_tree.lookup(tokens);
 
+    // CIRCUIT BREAKER LOGIC:
+    // If the cache hit points to a dead node, treat it as a miss.
     if (result.has_value()) {
+        if (local_dead_backends.contains(result.value())) {
+            stats_cache_misses++; // Technically a miss because we can't use it
+            return std::nullopt;
+        }
         stats_cache_hits++;
     } else {
         stats_cache_misses++;
@@ -152,6 +161,12 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 }
 
 std::optional<seastar::socket_address> RouterService::get_backend_address(BackendId id) {
+    // We need to resolve the address even if it's dead, so the HealthService can ping it.
+    // If it's dead, pretend it doesn't exist
+    //if (local_dead_backends.contains(id)) {
+        //return std::nullopt;
+    //}
+
     auto it = local_backends.find(id);
     if (it != local_backends.end()) {
         return it->second;
@@ -160,12 +175,21 @@ std::optional<seastar::socket_address> RouterService::get_backend_address(Backen
 }
 
 std::optional<BackendId> RouterService::get_random_backend() {
-    if (local_backend_ids.empty()) return std::nullopt;
+    if (local_backend_ids.empty()) {
+        return std::nullopt;
+    }
 
-    std::uniform_int_distribution<size_t> dist(0, local_backend_ids.size() - 1);
-    size_t random_index = dist(rng);
+    // Simple retry loop to find a live node
+    // In production, you'd maintain a separate "live_backends" vector for O(1)
+    for (int i = 0; i < 5; ++i) { // Try 5 times to find a live one
+        std::uniform_int_distribution<size_t> dist(0, local_backend_ids.size() - 1);
+        BackendId candidate = local_backend_ids[dist(rng)];
 
-    return local_backend_ids[random_index];
+        if (!local_dead_backends.contains(candidate)) {
+            return candidate;
+        }
+    }
+    return std::nullopt; // All nodes might be dead
 }
 
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend) {
@@ -196,6 +220,41 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
 
                 return seastar::make_ready_future<>();
             });
+        });
+    });
+}
+
+std::vector<BackendId> RouterService::get_all_backend_ids() const {
+    return local_backend_ids;
+}
+
+seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is_alive) {
+    // 1. Check Local State (Core 0) to dedup
+    // local_dead_backends contains the ID if it is currently marked DOWN.
+    bool is_currently_marked_dead = local_dead_backends.contains(id);
+
+    // If the backend is Alive and NOT marked dead -> It's already healthy. Do nothing.
+    // If the backend is Dead and IS marked dead -> It's already dead. Do nothing.
+    if (is_alive != is_currently_marked_dead) {
+        return seastar::make_ready_future<>();
+    }
+
+    // 2. State Change Detected! Log it.
+    if (is_alive) {
+        std::cout << "[CircuitBreaker] Backend " << id << " is UP 🟢 (Recovered)\n";
+    } else {
+        std::cout << "[CircuitBreaker] Backend " << id << " is DOWN 🔴 (Quarantined)\n";
+    }
+
+    // 3. Broadcast to all cores
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, is_alive] (unsigned shard_id) {
+        return seastar::smp::submit_to(shard_id, [id, is_alive] {
+            if (is_alive) {
+                local_dead_backends.erase(id);
+            } else {
+                local_dead_backends.insert(id);
+            }
+            return seastar::make_ready_future<>();
         });
     });
 }

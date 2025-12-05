@@ -255,9 +255,10 @@ int main(int argc, char** argv) {
 // 1. Infrastructure Layer (TokenizerService): Handles the raw AI logic.
 // 2. Domain Layer (RouterService): Handles the business logic (Radix Tree, Broadcasting).
 // 3. Presentation Layer (HttpController): Handles HTTP, JSON, and Routing.
-#include "tokenizer_service.hpp"
-#include "router_service.hpp"
+#include "health_service.hpp"
 #include "http_controller.hpp"
+#include "router_service.hpp"
+#include "tokenizer_service.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -276,6 +277,7 @@ using namespace seastar::httpd;
 ranvier::TokenizerService tokenizer;
 ranvier::RouterService router;
 ranvier::HttpController controller{tokenizer, router};
+ranvier::HealthService health_checker{router};
 
 #if 0
 future<> run() {
@@ -384,6 +386,9 @@ future<> run() {
         return make_ready_future<>();
     }
 
+    // Start Health Checker
+    health_checker.start();
+
     // 2. Start Servers (Metrics + API)
     // We use do_with to manage TWO servers now.
     return do_with(http_server_control(), http_server_control(), [](auto& prom_server, auto& api_server) {
@@ -420,9 +425,13 @@ future<> run() {
             return stop_signal->get_future();
         }).then([&api_server, &prom_server] {
             std::cout << "\n🛑 Stopping Ranvier...\n";
-            // D. Shutdown Sequence (Stop both)
-            return api_server.stop().then([&prom_server] {
-                return prom_server.stop();
+
+            // Stop Health Checker FIRST
+            return health_checker.stop().then([&api_server, &prom_server] {
+                // D. Shutdown Sequence (Stop both)
+                return api_server.stop().then([&prom_server] {
+                    return prom_server.stop();
+                });
             });
         });
     });

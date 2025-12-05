@@ -22,6 +22,7 @@ add_compile_options(-fmax-errors=3)
 # Define the Executable
 add_executable(ranvier_server
   src/main.cpp
+  src/health_service.cpp
   src/http_controller.cpp
   src/router_service.cpp
   src/stream_parser.cpp

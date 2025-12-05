@@ -1,10 +1,12 @@
 #pragma once
-#include <seastar/core/reactor.hh>
-#include <seastar/net/api.hh>
-#include <seastar/core/iostream.hh>
+
 #include <unordered_map>
 #include <vector>
 #include <iostream>
+
+#include <seastar/core/iostream.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/net/api.hh>
 
 namespace ranvier {
 

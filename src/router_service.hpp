@@ -3,6 +3,7 @@
 #include "radix_tree.hpp"
 
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -30,6 +31,12 @@ public:
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr);
 
     std::optional<BackendId> get_random_backend();
+
+    // Get list of all IDs (For the Health Checker to iterate)
+    std::vector<BackendId> get_all_backend_ids() const;
+
+    // Circuit Breaker API
+    seastar::future<> set_backend_status_global(BackendId id, bool is_alive);
 
 private:
     // Thread-local metrics group
