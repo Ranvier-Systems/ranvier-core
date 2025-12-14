@@ -99,7 +99,7 @@ public:
     // INSERT
     // O(k) where k is the number of tokens
     void insert(std::span<const TokenId> tokens, BackendId backend) {
-        insert_recursive(root, tokens, backend);
+        root = insert_recursive(root, tokens, backend);
     }
 
     // LOOKUP
@@ -112,7 +112,8 @@ private:
     std::shared_ptr<Node> root;
 
     // Recursive Insert Logic (The "Hard" Part)
-    void insert_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens, BackendId backend) {
+    // Returns the (possibly new) node to handle node growth/replacement
+    std::shared_ptr<Node> insert_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens, BackendId backend) {
         // 1. Calculate matching prefix length between Node's stored prefix and Input
         size_t match_len = 0;
         while(match_len < node->prefix.size() && match_len < tokens.size()) {
@@ -132,7 +133,7 @@ private:
         // CASE B: Exact Match / End of Input
         if (remaining_tokens.empty()) {
             node->leaf_value = backend;
-            return;
+            return node;
         }
 
         // CASE C: Need to traverse to a child
@@ -140,8 +141,11 @@ private:
         auto child = find_child(node, next_token);
 
         if (child) {
-            // Recurse down
-            insert_recursive(child, remaining_tokens.subspan(1), backend);
+            // Recurse down and update child pointer in case it was replaced
+            auto new_child = insert_recursive(child, remaining_tokens.subspan(1), backend);
+            if (new_child != child) {
+                set_child(node, next_token, new_child);
+            }
         } else {
             // Create new child (Lazy Expansion)
             auto new_child = std::make_shared<Node4>();
@@ -153,41 +157,52 @@ private:
             }
 
             new_child->leaf_value = backend;
-            add_child(node, next_token, new_child);
+            node = add_child(node, next_token, new_child);
         }
+        return node;
     }
 
-    // Helper: Find child by TokenID in a Node4
+    // Helper: Find child by TokenID
     std::shared_ptr<Node> find_child(std::shared_ptr<Node> node, TokenId key) {
-        // We assume Node4 for now. In full impl, switch(node->type)
         if (node->type == NodeType::Node4) {
             auto* n4 = static_cast<Node4*>(node.get());
             for (size_t i = 0; i < n4->keys.size(); i++) {
                 if (n4->keys[i] == key) return n4->children[i];
             }
+        } else if (node->type == NodeType::Node256) {
+            auto* n256 = static_cast<Node256*>(node.get());
+            // Direct lookup using lower 8 bits of key as index
+            uint8_t index = static_cast<uint8_t>(key);
+            return n256->children[index];
         }
         return nullptr;
     }
 
-/*
-    // Helper: Add child to Node4 (Naive implementation without resizing)
-    void add_child(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
-         if (parent->type == NodeType::Node4) {
-            auto* n4 = static_cast<Node4*>(parent.get());
-            // TODO: In real ART, check size < 4. If full, grow to Node16.
-            n4->keys.push_back(key);
-            n4->children.push_back(child);
+    // Helper: Set/update a child pointer in a node
+    void set_child(std::shared_ptr<Node> node, TokenId key, std::shared_ptr<Node> child) {
+        if (node->type == NodeType::Node4) {
+            auto* n4 = static_cast<Node4*>(node.get());
+            for (size_t i = 0; i < n4->keys.size(); i++) {
+                if (n4->keys[i] == key) {
+                    n4->children[i] = child;
+                    return;
+                }
+            }
+        } else if (node->type == NodeType::Node256) {
+            auto* n256 = static_cast<Node256*>(node.get());
+            n256->children[static_cast<uint8_t>(key)] = child;
         }
     }
-*/
-    void add_child(std::shared_ptr<Node>& parent, TokenId key, std::shared_ptr<Node> child) {
+
+    // Helper: Add child to node, returns (possibly new) parent if growth occurred
+    std::shared_ptr<Node> add_child(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
         // 1. Check if Node4 is full
         if (parent->type == NodeType::Node4) {
             auto* n4 = static_cast<Node4*>(parent.get());
             if (n4->keys.size() < 4) {
                 n4->keys.push_back(key);
                 n4->children.push_back(child);
-                return;
+                return parent;
             }
 
             // 2. GROW: Node4 -> Node256 (Skipping 16/48 for brevity)
@@ -207,13 +222,14 @@ private:
             // Add the NEW child
             n256->children[static_cast<uint8_t>(key)] = child;
 
-            // Replace the parent pointer in the tree
-            parent = n256;
+            // Return the new node (caller must update their pointer)
+            return n256;
         }
         else if (parent->type == NodeType::Node256) {
             auto* n256 = static_cast<Node256*>(parent.get());
             n256->children[static_cast<uint8_t>(key)] = child;
         }
+        return parent;
     }
 
     // Helper: Split a node's prefix (The "Lazy" Cleanup)
@@ -235,22 +251,28 @@ private:
         }
 
         // 3. Move existing children/values to new child
-        // (If this were a full implementation, we'd copy children vectors here)
         new_child->leaf_value = node->leaf_value;
         node->leaf_value = std::nullopt; // Parent is no longer a leaf
+
+        // Move existing children from node to new_child (for Node4)
+        if (node->type == NodeType::Node4) {
+            auto* n4 = static_cast<Node4*>(node.get());
+            auto* new_n4 = static_cast<Node4*>(new_child.get());
+            new_n4->keys = std::move(n4->keys);
+            new_n4->children = std::move(n4->children);
+            n4->keys.clear();
+            n4->children.clear();
+        }
 
         // 4. Update Parent (The "Stub")
         // Parent now only has the prefix up to split point ("App")
         node->prefix.resize(split_point);
 
         // 5. Connect Parent -> New Child
-        // Using "naive" add_child for now. In reality, we must clear parent's children first.
-        // For v0.1 skeleton, we assume we are converting a "Leaf w/ Prefix" to "Inner Node".
         if (node->type == NodeType::Node4) {
-             auto* n4 = static_cast<Node4*>(node.get());
-             n4->keys.clear();
-             n4->children.clear();
-             add_child(node, split_edge_key, new_child);
+            auto* n4 = static_cast<Node4*>(node.get());
+            n4->keys.push_back(split_edge_key);
+            n4->children.push_back(new_child);
         }
     }
 
