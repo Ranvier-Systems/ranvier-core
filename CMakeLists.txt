@@ -59,6 +59,7 @@ endif()
 # Unit Tests
 # =============================================================================
 enable_testing()
+include(GoogleTest)
 
 # RadixTree Unit Tests (Pure C++, no Seastar dependency)
 add_executable(radix_tree_test
@@ -69,6 +70,7 @@ target_link_libraries(radix_tree_test
   PRIVATE
   GTest::gtest_main
 )
+gtest_discover_tests(radix_tree_test)
 
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)
@@ -84,7 +86,3 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(stream_parser_test)
 endif()
-
-# Register tests with CTest
-include(GoogleTest)
-gtest_discover_tests(radix_tree_test)
