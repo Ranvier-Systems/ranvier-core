@@ -1498,3 +1498,76 @@ Your Repo Status:
 ✅ Logic: Adaptive Radix Tree routing + Connection Pooling.
 ✅ Ops: Auto-discovery sidecar + Prometheus metrics.
 ✅ Safety: Circuit breaking + thread-local state.
+
+
+Running tests:
+cd build
+cmake ..
+cmake --build . --target radix_tree_test
+./radix_tree_test    # or: ctest --output-on-failure
+
+cmake --build . --target stream_parser_test
+./stream_parser_test
+
+-----
+The short answer is no, Ranvier is not "Semantic Caching."
+
+They solve similar problems (latency & cost) but sit at different layers of the stack and use completely different mechanisms. In fact, they are highly complementary—you could run both.
+
+Here is the breakdown of the difference:
+
+1. The Fundamental Difference
+
+Semantic Caching (Redis/GPTCache): Optimizes for Answer Reuse.
+
+Logic: "Has anyone asked a question similar to this before?"
+
+Mechanism: Embeddings + Vector Database (Cosine Similarity).
+
+Action: If yes, return the stored text response immediately. Skip the GPU entirely.
+
+Use Case: Chatbots where users ask "How do I reset my password?" vs "Reset password steps."
+
+Ranvier (Prefix-Aware Routing): Optimizes for Context Reuse.
+
+Logic: "Which GPU already has this specific 10,000-token document loaded in VRAM?"
+
+Mechanism: Radix Tree (Exact Token Matching).
+
+Action: Route the request to GPU-4. The GPU still has to generate the new answer, but it skips the "Prefill" phase (reading the document).
+
+Use Case: RAG, Document Q&A, Coding Agents where the context is shared but the questions are unique.
+
+Feature Semantic Caching    Ranvier (Prefix Routing)
+Matching    Fuzzy (Embeddings)  Exact (Tokens)
+Output  Stored Static Text  New Generated Tokens
+Latency ~50ms (Network + DB)    ~15ms + Generation Time
+Hardware    CPU / Vector DB GPU / Inference Engine
+Best For    FAQ / Repetitive Queries    RAG / Long-Context Analysis
+2. Why Ranvier is distinct
+
+Ranvier is a Layer 7 Load Balancer, not a Cache.
+
+Semantic Cache: Returns the same answer to similar questions.
+
+Ranvier: Returns a new answer to a new question, but does it 20x faster because the GPU didn't have to re-read the book.
+
+3. The "Staff Engineer" Move: Do Both
+
+In a mature architecture, you would chain them:
+
+Layer 1 (Semantic Cache): User asks "Summarize Q3 report."
+
+Hit: Return cached summary. (Cost: $0).
+
+Miss: Forward to Ranvier.
+
+Layer 2 (Ranvier): Request contains the full Q3 report context.
+
+Routing: Ranvier sees the Q3 report tokens.
+
+Action: Routes to GPU-2, which processed the Q3 report 5 minutes ago and has the KV-Cache hot.
+
+Result: GPU-2 generates a new summary instantly, skipping the prefill delay.
+
+You built Infrastructure (Ranvier). Semantic Caching is Application Logic. They are friends, but they are not the same.
