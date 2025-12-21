@@ -1,0 +1,68 @@
+# Ranvier Core Configuration
+# Copy this file to ranvier.yaml and customize as needed.
+# All values shown are defaults - you only need to specify values you want to change.
+# Environment variables override file settings (see comments for env var names).
+
+# Server configuration
+server:
+  # IP address to bind to (RANVIER_BIND_ADDRESS)
+  bind_address: "0.0.0.0"
+
+  # Main API port for /v1/chat/completions and /admin/* endpoints (RANVIER_API_PORT)
+  api_port: 8080
+
+  # Prometheus metrics port (RANVIER_METRICS_PORT)
+  metrics_port: 9180
+
+# Database/persistence configuration
+database:
+  # SQLite database file path (RANVIER_DB_PATH)
+  path: "ranvier.db"
+
+  # SQLite journal mode: WAL, DELETE, TRUNCATE, PERSIST, MEMORY, OFF (RANVIER_DB_JOURNAL_MODE)
+  journal_mode: "WAL"
+
+  # SQLite synchronous mode: FULL, NORMAL, OFF (RANVIER_DB_SYNCHRONOUS)
+  synchronous: "NORMAL"
+
+# Health check configuration
+health:
+  # Interval between health checks in seconds (RANVIER_HEALTH_CHECK_INTERVAL)
+  check_interval_seconds: 5
+
+  # Timeout for each health check connection in seconds (RANVIER_HEALTH_CHECK_TIMEOUT)
+  check_timeout_seconds: 3
+
+  # Number of consecutive failures before marking backend as down
+  failure_threshold: 3
+
+  # Number of consecutive successes before marking backend as up
+  recovery_threshold: 2
+
+# Connection pool configuration
+pool:
+  # Maximum idle connections per backend host (RANVIER_POOL_MAX_PER_HOST)
+  max_connections_per_host: 10
+
+  # Close idle connections after this many seconds (RANVIER_POOL_IDLE_TIMEOUT)
+  idle_timeout_seconds: 60
+
+  # Maximum total idle connections across all backends (RANVIER_POOL_MAX_TOTAL)
+  max_total_connections: 100
+
+  # Enable TCP_NODELAY for lower latency (disables Nagle's algorithm)
+  tcp_nodelay: true
+
+# Routing and caching configuration
+routing:
+  # Minimum number of tokens before a route is learned/cached (RANVIER_MIN_TOKEN_LENGTH)
+  # Set higher (e.g., 64) in production to avoid caching short prompts
+  min_token_length: 4
+
+  # Maximum attempts to find a live backend on cache miss
+  backend_retry_limit: 5
+
+# Asset paths
+assets:
+  # Path to GPT-2 tokenizer vocabulary JSON file (RANVIER_TOKENIZER_PATH)
+  tokenizer_path: "assets/gpt2.json"
