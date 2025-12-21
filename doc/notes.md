@@ -1574,3 +1574,15 @@ Action: Routes to GPU-2, which processed the Q3 report 5 minutes ago and has the
 Result: GPU-2 generates a new summary instantly, skipping the prefill delay.
 
 You built Infrastructure (Ranvier). Semantic Caching is Application Logic. They are friends, but they are not the same.
+
+
+
+---
+DELETE /admin/backends?id=X          - Remove backend and its routes
+DELETE /admin/routes?backend_id=X    - Remove routes for a specific backend
+POST   /admin/clear                  - Wipe all persisted data (dangerous)
+
+curl -X POST "http://localhost:8080/admin/backends?ip=127.0.0.1&id=91&port=9001"
+curl -X DELETE "http://localhost:8080/admin/backends?id=91"
+curl -X DELETE "http://localhost:8080/admin/routes?backend_id=91"
+curl -X POST "http://localhost:8080/admin/clear"
