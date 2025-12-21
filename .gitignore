@@ -2,3 +2,7 @@ build/
 .vscode/
 .cache/
 compile_commands.json
+# Ignore vim files:
+*~
+*.swp
+*.swo
