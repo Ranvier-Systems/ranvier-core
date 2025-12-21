@@ -24,7 +24,7 @@ if(NOT SQLite3_FOUND)
     FetchContent_Declare(
       sqlite3
       URL https://www.sqlite.org/2024/sqlite-amalgamation-3450000.zip
-      URL_HASH SHA256=e7e507839c0a83cb02c1f7d1e8d9cdac35f8e3c8f99b6f51b9d8c5f1c1e7b6a2
+      URL_HASH SHA256=bde30d13ebdf84926ddd5e8b6df145be03a577a48fd075a087a5dd815bcdf740
       DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_MakeAvailable(sqlite3)
