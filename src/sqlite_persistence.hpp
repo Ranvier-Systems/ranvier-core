@@ -30,6 +30,7 @@ public:
     // Route operations
     bool save_route(std::span<const TokenId> tokens, BackendId backend_id) override;
     bool remove_route(std::span<const TokenId> tokens) override;
+    bool remove_routes_for_backend(BackendId backend_id) override;
     std::vector<RouteRecord> load_routes() override;
 
     // Bulk operations

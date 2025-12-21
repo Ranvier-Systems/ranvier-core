@@ -33,13 +33,26 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_proxy(std::move(req), std::move(rep));
     }));
 
-    // 2. CONTROL PLANE
+    // 2. CONTROL PLANE - Create/Update
     r.add(operation_type::POST, url("/admin/routes"), new async_handler([this](auto req, auto rep) {
         return this->handle_broadcast_route(std::move(req), std::move(rep));
     }));
 
     r.add(operation_type::POST, url("/admin/backends"), new async_handler([this](auto req, auto rep) {
         return this->handle_broadcast_backend(std::move(req), std::move(rep));
+    }));
+
+    // 3. CONTROL PLANE - Delete
+    r.add(operation_type::DELETE, url("/admin/backends"), new async_handler([this](auto req, auto rep) {
+        return this->handle_delete_backend(std::move(req), std::move(rep));
+    }));
+
+    r.add(operation_type::DELETE, url("/admin/routes"), new async_handler([this](auto req, auto rep) {
+        return this->handle_delete_routes(std::move(req), std::move(rep));
+    }));
+
+    r.add(operation_type::POST, url("/admin/clear"), new async_handler([this](auto req, auto rep) {
+        return this->handle_clear_all(std::move(req), std::move(rep));
     }));
 }
 
@@ -481,6 +494,72 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         rep->write_body("json", "{\"status\": \"ok\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     });
+}
+
+// ---------------------------------------------------------
+// ADMIN DELETE HANDLERS
+// ---------------------------------------------------------
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_backend(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Usage: DELETE /admin/backends?id=1
+    sstring id_str = req->get_query_param("id");
+
+    if (id_str.empty()) {
+        rep->write_body("json", "{\"error\": \"Missing id parameter\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    int id = std::stoi(std::string(id_str));
+
+    // Remove from persistence first
+    if (_persistence) {
+        _persistence->remove_routes_for_backend(id);
+        _persistence->remove_backend(id);
+    }
+
+    // Remove from in-memory state across all shards
+    return _router.unregister_backend_global(id).then([id, rep = std::move(rep)]() mutable {
+        log_control.info("Deleted Backend {} and its persisted routes", id);
+        rep->write_body("json", "{\"status\": \"ok\", \"backend_deleted\": " + std::to_string(id) + "}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    });
+}
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_routes(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Usage: DELETE /admin/routes?backend_id=1
+    sstring id_str = req->get_query_param("backend_id");
+
+    if (id_str.empty()) {
+        rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    int backend_id = std::stoi(std::string(id_str));
+
+    // Remove routes from persistence
+    if (_persistence) {
+        _persistence->remove_routes_for_backend(backend_id);
+    }
+
+    // Note: In-memory routes in the RadixTree are not removed immediately.
+    // They will be gone after restart. For full removal, we'd need to
+    // traverse the entire tree which is expensive.
+    log_control.info("Deleted persisted routes for Backend {} (in-memory routes cleared on restart)", backend_id);
+    rep->write_body("json", "{\"status\": \"ok\", \"routes_deleted_for_backend\": " + std::to_string(backend_id) + ", \"note\": \"In-memory routes will be cleared on restart\"}");
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Usage: POST /admin/clear
+    // WARNING: This is destructive!
+
+    if (_persistence) {
+        _persistence->clear_all();
+    }
+
+    log_control.warn("Cleared all persisted data (backends and routes). Restart required to clear in-memory state.");
+    rep->write_body("json", "{\"status\": \"ok\", \"warning\": \"All persisted data cleared. Restart to clear in-memory state.\"}");
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
 }
 
 } // namespace ranvier

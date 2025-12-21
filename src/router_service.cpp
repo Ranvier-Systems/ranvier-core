@@ -6,6 +6,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/metrics.hh>
 #include <boost/range/irange.hpp>
+#include <algorithm>
 #include <unordered_map>
 #include <random>
 #include <chrono>
@@ -108,6 +109,26 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
 
                 return seastar::make_ready_future<>();
             });
+        });
+    });
+}
+
+seastar::future<> RouterService::unregister_backend_global(BackendId id) {
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id] (unsigned shard_id) {
+        return seastar::smp::submit_to(shard_id, [id] {
+            // Remove from backends map
+            local_backends.erase(id);
+
+            // Remove from backend IDs vector
+            auto it = std::find(local_backend_ids.begin(), local_backend_ids.end(), id);
+            if (it != local_backend_ids.end()) {
+                local_backend_ids.erase(it);
+            }
+
+            // Also remove from dead backends set if present
+            local_dead_backends.erase(id);
+
+            return seastar::make_ready_future<>();
         });
     });
 }

@@ -42,6 +42,7 @@ public:
     // Route operations
     virtual bool save_route(std::span<const TokenId> tokens, BackendId backend_id) = 0;
     virtual bool remove_route(std::span<const TokenId> tokens) = 0;
+    virtual bool remove_routes_for_backend(BackendId backend_id) = 0;
     virtual std::vector<RouteRecord> load_routes() = 0;
 
     // Bulk operations for efficiency

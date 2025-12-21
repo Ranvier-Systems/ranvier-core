@@ -35,30 +35,39 @@ std::unique_ptr<ranvier::PersistenceStore> persistence;
 // Helper to load persisted state into the router
 future<> load_persisted_state() {
     if (!persistence || !persistence->is_open()) {
+        ranvier::log_main.info("No persistence store - starting with empty state");
         return make_ready_future<>();
     }
 
     // Load backends first
     auto backends = persistence->load_backends();
-    ranvier::log_main.info("Loading {} backends from persistence", backends.size());
+    auto routes = persistence->load_routes();
 
-    return do_with(std::move(backends), [](auto& backends) {
+    if (backends.empty() && routes.empty()) {
+        ranvier::log_main.info("Persistence store is empty - starting fresh");
+        return make_ready_future<>();
+    }
+
+    ranvier::log_main.info("Restoring state from persistence:");
+    ranvier::log_main.info("  Backends: {}", backends.size());
+    ranvier::log_main.info("  Routes:   {}", routes.size());
+
+    // Log each backend at info level for visibility
+    for (const auto& rec : backends) {
+        ranvier::log_main.info("  - Backend {} -> {}:{}", rec.id, rec.ip, rec.port);
+    }
+
+    return do_with(std::move(backends), std::move(routes), [](auto& backends, auto& routes) {
         return do_for_each(backends, [](const ranvier::BackendRecord& rec) {
             socket_address addr(ipv4_addr(rec.ip, rec.port));
-            ranvier::log_main.debug("Restoring backend {} -> {}:{}", rec.id, rec.ip, rec.port);
             return router.register_backend_global(rec.id, addr);
-        });
-    }).then([] {
-        // Then load routes
-        auto routes = persistence->load_routes();
-        ranvier::log_main.info("Loading {} routes from persistence", routes.size());
-
-        return do_with(std::move(routes), [](auto& routes) {
+        }).then([&routes] {
             return do_for_each(routes, [](const ranvier::RouteRecord& rec) {
-                ranvier::log_main.debug("Restoring route ({} tokens) -> backend {}", rec.tokens.size(), rec.backend_id);
                 return router.learn_route_global(rec.tokens, rec.backend_id);
             });
         });
+    }).then([] {
+        ranvier::log_main.info("State restoration complete");
     });
 }
 
@@ -130,8 +139,11 @@ future<> run() {
                     });
                 });
             }).finally([] {
-                // Close persistence store on shutdown
-                if (persistence) {
+                // Log shutdown summary and close persistence
+                if (persistence && persistence->is_open()) {
+                    ranvier::log_main.info("Shutdown summary:");
+                    ranvier::log_main.info("  Persisted backends: {}", persistence->backend_count());
+                    ranvier::log_main.info("  Persisted routes:   {}", persistence->route_count());
                     persistence->close();
                     ranvier::log_main.info("Persistence store closed");
                 }
