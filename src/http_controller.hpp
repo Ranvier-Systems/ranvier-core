@@ -15,6 +15,8 @@ namespace ranvier {
 struct HttpControllerConfig {
     ConnectionPoolConfig pool;
     size_t min_token_length = 4;  // Minimum tokens before caching a route
+    std::chrono::seconds connect_timeout{5};    // Timeout for backend connection
+    std::chrono::seconds request_timeout{300};  // Total timeout for request
 };
 
 class HttpController {
