@@ -200,17 +200,16 @@ TEST_F(RadixTreeTest, CommonPrefixWithDifferentSuffixes) {
 }
 
 // =============================================================================
-// Node Growth Tests (Node4 -> Node256)
+// Node Growth Tests (Node4 -> Node16 -> Node48 -> Node256)
 // =============================================================================
 
-TEST_F(RadixTreeTest, NodeGrowthBeyondFourChildren) {
-    // Insert 5 routes with same first token but different second tokens
-    // This should trigger Node4 -> Node256 growth
+TEST_F(RadixTreeTest, Node4ToNode16Growth) {
+    // Insert 5 routes - triggers Node4 -> Node16 growth
     tree.insert(tokens({1, 10}), 10);
     tree.insert(tokens({1, 20}), 20);
     tree.insert(tokens({1, 30}), 30);
     tree.insert(tokens({1, 40}), 40);
-    tree.insert(tokens({1, 50}), 50);  // 5th child triggers growth
+    tree.insert(tokens({1, 50}), 50);  // 5th child triggers growth to Node16
 
     // All should still be retrievable
     EXPECT_EQ(tree.lookup(tokens({1, 10})).value(), 10);
@@ -220,17 +219,99 @@ TEST_F(RadixTreeTest, NodeGrowthBeyondFourChildren) {
     EXPECT_EQ(tree.lookup(tokens({1, 50})).value(), 50);
 }
 
-TEST_F(RadixTreeTest, ManyChildrenAfterGrowth) {
-    // Insert many routes to stress test node growth
+TEST_F(RadixTreeTest, Node16ToNode48Growth) {
+    // Insert 17 routes - triggers Node4 -> Node16 -> Node48 growth
+    for (int i = 0; i < 17; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Verify all are retrievable
+    for (int i = 0; i < 17; i++) {
+        auto result = tree.lookup(tokens({1, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+}
+
+TEST_F(RadixTreeTest, Node48ToNode256Growth) {
+    // Insert 49 routes - triggers full growth chain to Node256
+    for (int i = 0; i < 49; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i % 128));
+    }
+
+    // Verify all are retrievable
+    for (int i = 0; i < 49; i++) {
+        auto result = tree.lookup(tokens({1, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i % 128));
+    }
+}
+
+TEST_F(RadixTreeTest, FullNode256) {
+    // Insert 100 routes to stress Node256
+    for (int i = 0; i < 100; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i % 128));
+    }
+
+    // Verify all are retrievable
+    for (int i = 0; i < 100; i++) {
+        auto result = tree.lookup(tokens({1, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i % 128));
+    }
+}
+
+TEST_F(RadixTreeTest, MixedDepthWithNodeGrowth) {
+    // Test node growth at different tree depths
+    // First level: many children (triggers growth)
+    for (int i = 0; i < 20; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}), static_cast<BackendId>(i));
+    }
+
+    // Second level: add more children under one branch
+    for (int i = 0; i < 20; i++) {
+        tree.insert(tokens({0, static_cast<TokenId>(i + 100), 2}), static_cast<BackendId>(i + 50));
+    }
+
+    // Verify first level routes
+    for (int i = 0; i < 20; i++) {
+        auto result = tree.lookup(tokens({static_cast<TokenId>(i), 1, 2}));
+        ASSERT_TRUE(result.has_value()) << "First level failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+
+    // Verify second level routes
+    for (int i = 0; i < 20; i++) {
+        auto result = tree.lookup(tokens({0, static_cast<TokenId>(i + 100), 2}));
+        ASSERT_TRUE(result.has_value()) << "Second level failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i + 50));
+    }
+}
+
+TEST_F(RadixTreeTest, NodeGrowthWithChildUpdates) {
+    // Insert routes, trigger growth, then update children
     for (int i = 0; i < 20; i++) {
         tree.insert(tokens({1, static_cast<TokenId>(i * 10)}), static_cast<BackendId>(i));
     }
 
-    // Verify all are retrievable
+    // Now insert deeper routes that require updating child pointers
+    for (int i = 0; i < 20; i++) {
+        // Add longer routes under existing prefixes
+        tree.insert(tokens({1, static_cast<TokenId>(i * 10), 99, 100}), static_cast<BackendId>(i + 100));
+    }
+
+    // Verify shorter routes still work (longest prefix match)
     for (int i = 0; i < 20; i++) {
         auto result = tree.lookup(tokens({1, static_cast<TokenId>(i * 10)}));
-        ASSERT_TRUE(result.has_value()) << "Failed for i=" << i;
+        ASSERT_TRUE(result.has_value()) << "Short route failed for i=" << i;
         EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+
+    // Verify longer routes work
+    for (int i = 0; i < 20; i++) {
+        auto result = tree.lookup(tokens({1, static_cast<TokenId>(i * 10), 99, 100}));
+        ASSERT_TRUE(result.has_value()) << "Long route failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i + 100));
     }
 }
 
