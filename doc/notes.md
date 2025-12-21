@@ -1512,6 +1512,9 @@ cmake --build . --target stream_parser_test
 cmake --build . --target persistence_test
 ./persistence_test
 
+cmake --build . --target config_test
+./config_test
+
 -----
 The short answer is no, Ranvier is not "Semantic Caching."
 
@@ -1586,3 +1589,14 @@ curl -X POST "http://localhost:8080/admin/backends?ip=127.0.0.1&id=91&port=9001"
 curl -X DELETE "http://localhost:8080/admin/backends?id=91"
 curl -X DELETE "http://localhost:8080/admin/routes?backend_id=91"
 curl -X POST "http://localhost:8080/admin/clear"
+
+
+# Use default config (ranvier.yaml if exists, else built-in defaults)
+./ranvier_server
+
+# Specify custom config
+./ranvier_server --config /etc/ranvier/production.yaml
+
+# Override with environment variables
+RANVIER_API_PORT=9000 RANVIER_MIN_TOKEN_LENGTH=64 ./ranvier_server
+
