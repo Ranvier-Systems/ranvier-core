@@ -202,6 +202,25 @@ bool SqlitePersistence::remove_route(std::span<const TokenId> tokens) {
     return rc == SQLITE_DONE;
 }
 
+bool SqlitePersistence::remove_routes_for_backend(BackendId backend_id) {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (!_db) return false;
+
+    const char* sql = "DELETE FROM routes WHERE backend_id = ?";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return false;
+
+    sqlite3_bind_int(stmt, 1, backend_id);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    return rc == SQLITE_DONE;
+}
+
 std::vector<RouteRecord> SqlitePersistence::load_routes() {
     std::lock_guard<std::mutex> lock(_mutex);
 

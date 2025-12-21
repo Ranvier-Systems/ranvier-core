@@ -163,6 +163,38 @@ TEST_F(PersistenceTest, RemoveRoute) {
     EXPECT_EQ(routes[0].tokens, tokens2);
 }
 
+TEST_F(PersistenceTest, RemoveRoutesForBackend) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Create routes for multiple backends
+    std::vector<TokenId> tokens1 = {100, 200, 300};
+    std::vector<TokenId> tokens2 = {400, 500, 600};
+    std::vector<TokenId> tokens3 = {700, 800, 900};
+    std::vector<TokenId> tokens4 = {111, 222, 333};
+
+    store_->save_route(tokens1, 1);  // Backend 1
+    store_->save_route(tokens2, 1);  // Backend 1
+    store_->save_route(tokens3, 2);  // Backend 2
+    store_->save_route(tokens4, 3);  // Backend 3
+
+    EXPECT_EQ(store_->route_count(), 4);
+
+    // Remove all routes for backend 1
+    EXPECT_TRUE(store_->remove_routes_for_backend(1));
+    EXPECT_EQ(store_->route_count(), 2);
+
+    // Verify only backends 2 and 3 routes remain
+    auto routes = store_->load_routes();
+    ASSERT_EQ(routes.size(), 2);
+    for (const auto& route : routes) {
+        EXPECT_NE(route.backend_id, 1);
+    }
+
+    // Remove non-existent backend should still succeed
+    EXPECT_TRUE(store_->remove_routes_for_backend(999));
+    EXPECT_EQ(store_->route_count(), 2);
+}
+
 TEST_F(PersistenceTest, LongTokenSequence) {
     ASSERT_TRUE(store_->open(test_db_path_));
 

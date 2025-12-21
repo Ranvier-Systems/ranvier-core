@@ -30,6 +30,9 @@ public:
     // Teach the system a new server (ID -> IP:Port)
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr);
 
+    // Remove a backend from all shards
+    seastar::future<> unregister_backend_global(BackendId id);
+
     std::optional<BackendId> get_random_backend();
 
     // Get list of all IDs (For the Health Checker to iterate)
