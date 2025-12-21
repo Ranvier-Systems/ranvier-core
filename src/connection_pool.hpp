@@ -1,7 +1,8 @@
 #pragma once
 
+#include <deque>
 #include <unordered_map>
-#include <vector>
+#include <chrono>
 #include <iostream>
 
 #include <seastar/core/iostream.hh>
@@ -10,68 +11,182 @@
 
 namespace ranvier {
 
-// A bundle representing an active connection
+// Configuration for connection pool behavior
+struct ConnectionPoolConfig {
+    size_t max_connections_per_host = 10;      // Max idle connections per backend
+    std::chrono::seconds idle_timeout{60};      // Close connections idle longer than this
+    size_t max_total_connections = 100;         // Max total idle connections across all backends
+};
+
+// A bundle representing an active connection with timestamp tracking
 struct ConnectionBundle {
     seastar::connected_socket fd;
     seastar::input_stream<char> in;
     seastar::output_stream<char> out;
     seastar::socket_address addr;
-    bool is_valid = true; // Mark false if an error occurs
+    bool is_valid = true;
+    std::chrono::steady_clock::time_point last_used;
 
-    // Helper to close everything if we destroy a bad connection
+    ConnectionBundle() : last_used(std::chrono::steady_clock::now()) {}
+
+    ConnectionBundle(seastar::connected_socket&& socket,
+                     seastar::input_stream<char>&& input,
+                     seastar::output_stream<char>&& output,
+                     seastar::socket_address address)
+        : fd(std::move(socket))
+        , in(std::move(input))
+        , out(std::move(output))
+        , addr(address)
+        , is_valid(true)
+        , last_used(std::chrono::steady_clock::now()) {}
+
+    // Close the connection
     seastar::future<> close() {
         if (!is_valid) return seastar::make_ready_future<>();
+        is_valid = false;
         return out.close().then([this] {
             return in.close();
-        }).handle_exception([](auto ep) {}); // Ignore errors on close
+        }).handle_exception([](auto) {}); // Ignore errors on close
+    }
+
+    // Check if connection has been idle too long
+    bool is_expired(std::chrono::seconds timeout) const {
+        auto now = std::chrono::steady_clock::now();
+        return (now - last_used) > timeout;
+    }
+
+    // Update last used timestamp
+    void touch() {
+        last_used = std::chrono::steady_clock::now();
     }
 };
 
 class ConnectionPool {
 public:
-    // GET: Reuse existing or create new
+    explicit ConnectionPool(ConnectionPoolConfig config = {})
+        : _config(config) {}
+
+    // GET: Reuse existing or create new connection
     seastar::future<ConnectionBundle> get(seastar::socket_address addr) {
         auto& pool = _pools[addr];
 
-        std::cout << "[Pool] 🆕 Opening NEW connection to " << addr << "\n";
-        if (!pool.empty()) {
-            std::cout << "[Pool] ♻️  Reusing warm connection to " << addr << "\n";
+        // Try to find a valid, non-expired connection (LIFO for cache locality)
+        while (!pool.empty()) {
             auto bundle = std::move(pool.back());
             pool.pop_back();
+            _total_idle_connections--;
+
+            // Skip expired connections
+            if (bundle.is_expired(_config.idle_timeout)) {
+                (void)bundle.close(); // Fire-and-forget close
+                continue;
+            }
+
+            // Found a good connection
+            bundle.touch();
             return seastar::make_ready_future<ConnectionBundle>(std::move(bundle));
         }
 
-        if (!pool.empty()) {
-            // LIFO (Last-In-First-Out) is better for cache locality and checking dead connections
-            auto bundle = std::move(pool.back());
-            pool.pop_back();
-            // Optional: Check if socket is closed by peer? (Advanced)
-            return seastar::make_ready_future<ConnectionBundle>(std::move(bundle));
-        }
-
-        // Create new connection
+        // No pooled connection available, create new one
         return seastar::connect(addr).then([addr](seastar::connected_socket fd) {
-            // Disable Nagle's algorithm for lower latency
-            fd.set_nodelay(true);
+            fd.set_nodelay(true); // Disable Nagle's algorithm for lower latency
             auto in = fd.input();
             auto out = fd.output();
             return ConnectionBundle{std::move(fd), std::move(in), std::move(out), addr};
         });
     }
 
-    // RETURN: Put back into pool
+    // PUT: Return connection to pool
     void put(ConnectionBundle&& bundle) {
         if (!bundle.is_valid) {
-            // If marked invalid (e.g. read error), fire-and-forget close
             (void)bundle.close();
             return;
         }
-        _pools[bundle.addr].push_back(std::move(bundle));
+
+        bundle.touch();
+        auto& pool = _pools[bundle.addr];
+
+        // Check per-host limit
+        if (pool.size() >= _config.max_connections_per_host) {
+            // Pool full - evict oldest (front of deque)
+            auto& oldest = pool.front();
+            (void)oldest.close();
+            pool.pop_front();
+            _total_idle_connections--;
+        }
+
+        // Check total limit
+        if (_total_idle_connections >= _config.max_total_connections) {
+            // Find and evict the globally oldest connection
+            evict_oldest_global();
+        }
+
+        pool.push_back(std::move(bundle));
+        _total_idle_connections++;
+    }
+
+    // Get pool statistics
+    struct Stats {
+        size_t total_idle_connections;
+        size_t num_backends;
+        size_t max_per_host;
+        size_t max_total;
+    };
+
+    Stats stats() const {
+        return Stats{
+            _total_idle_connections,
+            _pools.size(),
+            _config.max_connections_per_host,
+            _config.max_total_connections
+        };
+    }
+
+    // Cleanup expired connections (call periodically)
+    size_t cleanup_expired() {
+        size_t closed = 0;
+        for (auto& [addr, pool] : _pools) {
+            auto it = pool.begin();
+            while (it != pool.end()) {
+                if (it->is_expired(_config.idle_timeout)) {
+                    (void)it->close();
+                    it = pool.erase(it);
+                    _total_idle_connections--;
+                    closed++;
+                } else {
+                    ++it;
+                }
+            }
+        }
+        return closed;
     }
 
 private:
-    // Map IP:Port -> List of Idle Connections
-    std::unordered_map<seastar::socket_address, std::vector<ConnectionBundle>> _pools;
+    ConnectionPoolConfig _config;
+    std::unordered_map<seastar::socket_address, std::deque<ConnectionBundle>> _pools;
+    size_t _total_idle_connections = 0;
+
+    // Evict the oldest connection across all pools
+    void evict_oldest_global() {
+        seastar::socket_address* oldest_addr = nullptr;
+        std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::now();
+
+        for (auto& [addr, pool] : _pools) {
+            if (!pool.empty() && pool.front().last_used < oldest_time) {
+                oldest_time = pool.front().last_used;
+                oldest_addr = const_cast<seastar::socket_address*>(&addr);
+            }
+        }
+
+        if (oldest_addr) {
+            auto& pool = _pools[*oldest_addr];
+            if (!pool.empty()) {
+                (void)pool.front().close();
+                pool.pop_front();
+                _total_idle_connections--;
+            }
+        }
+    }
 };
 
 } // namespace ranvier
