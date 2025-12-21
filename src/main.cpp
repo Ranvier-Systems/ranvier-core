@@ -97,6 +97,8 @@ future<> run() {
     ctrl_config.pool.idle_timeout = g_config.pool.idle_timeout;
     ctrl_config.pool.max_total_connections = g_config.pool.max_total_connections;
     ctrl_config.min_token_length = g_config.routing.min_token_length;
+    ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
+    ctrl_config.request_timeout = g_config.timeouts.request_timeout;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
 
     // 3. Init Persistence
@@ -201,6 +203,8 @@ int main(int argc, char** argv) {
         std::cout << "  Health Check: " << g_config.health.check_interval.count() << "s interval\n";
         std::cout << "  Pool Size:    " << g_config.pool.max_connections_per_host << " per host, "
                   << g_config.pool.max_total_connections << " total\n";
+        std::cout << "  Timeouts:     " << g_config.timeouts.connect_timeout.count() << "s connect, "
+                  << g_config.timeouts.request_timeout.count() << "s request\n";
         std::cout << "  Min Tokens:   " << g_config.routing.min_token_length << "\n";
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
