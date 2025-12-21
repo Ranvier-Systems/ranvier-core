@@ -1509,6 +1509,9 @@ cmake --build . --target radix_tree_test
 cmake --build . --target stream_parser_test
 ./stream_parser_test
 
+cmake --build . --target persistence_test
+./persistence_test
+
 -----
 The short answer is no, Ranvier is not "Semantic Caching."
 
