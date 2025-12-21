@@ -16,6 +16,17 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
+# yaml-cpp Configuration (for config file parsing)
+FetchContent_Declare(
+  yaml-cpp
+  GIT_REPOSITORY https://github.com/jbeder/yaml-cpp
+  GIT_TAG        0.8.0
+)
+set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(yaml-cpp)
+
 # SQLite3 Configuration
 # Try system SQLite first, fall back to building from source
 find_package(SQLite3 QUIET)
@@ -74,6 +85,7 @@ if(Seastar_FOUND)
       Seastar::seastar
       tokenizers_cpp
       ${SQLITE3_LIBRARIES}
+      yaml-cpp::yaml-cpp
     )
 
     # Copy the assets folder to the build directory automatically
@@ -111,6 +123,18 @@ target_link_libraries(persistence_test
   ${SQLITE3_LIBRARIES}
 )
 gtest_discover_tests(persistence_test)
+
+# Config Unit Tests (Pure C++, no Seastar dependency)
+add_executable(config_test
+  tests/unit/config_test.cpp
+)
+target_include_directories(config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(config_test
+  PRIVATE
+  GTest::gtest_main
+  yaml-cpp::yaml-cpp
+)
+gtest_discover_tests(config_test)
 
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)

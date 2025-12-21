@@ -6,6 +6,7 @@
 // 3. Presentation Layer (HttpController): Handles HTTP endpoints
 // 4. Persistence Layer (SqlitePersistence): Handles durable storage of routes/backends
 
+#include "config.hpp"
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "logging.hpp"
@@ -23,13 +24,17 @@
 #include <seastar/net/inet_address.hh>
 
 using namespace seastar;
-using namespace seastar::httpd;
+
+// Global configuration (loaded before Seastar starts)
+static ranvier::RanvierConfig g_config;
 
 // Services (Global/Static Scope for MVP)
 ranvier::TokenizerService tokenizer;
 ranvier::RouterService router;
-ranvier::HttpController controller{tokenizer, router};
-ranvier::HealthService health_checker{router};
+
+// These are initialized in run() after config is loaded
+std::unique_ptr<ranvier::HttpController> controller;
+std::unique_ptr<ranvier::HealthService> health_checker;
 std::unique_ptr<ranvier::PersistenceStore> persistence;
 
 // Helper to load persisted state into the router
@@ -72,57 +77,75 @@ future<> load_persisted_state() {
 }
 
 future<> run() {
-    // 1. Init Infrastructure
+    // 1. Init Infrastructure (Tokenizer)
     try {
-        std::ifstream t("assets/gpt2.json");
+        std::ifstream t(g_config.assets.tokenizer_path);
         if (!t.is_open()) {
-            throw std::runtime_error("Could not find assets/gpt2.json");
+            throw std::runtime_error("Could not find tokenizer: " + g_config.assets.tokenizer_path);
         }
         std::string json_str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
         tokenizer.load_from_json(json_str);
-        ranvier::log_main.info("Services initialized (GPT-2 Tokenizer)");
+        ranvier::log_main.info("Services initialized (Tokenizer: {})", g_config.assets.tokenizer_path);
     } catch (const std::exception& e) {
         ranvier::log_main.error("Service init failed: {}", e.what());
         return make_ready_future<>();
     }
 
-    // 2. Init Persistence
+    // 2. Init Controller with config
+    ranvier::HttpControllerConfig ctrl_config;
+    ctrl_config.pool.max_connections_per_host = g_config.pool.max_connections_per_host;
+    ctrl_config.pool.idle_timeout = g_config.pool.idle_timeout;
+    ctrl_config.pool.max_total_connections = g_config.pool.max_total_connections;
+    ctrl_config.min_token_length = g_config.routing.min_token_length;
+    controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
+
+    // 3. Init Persistence
     persistence = ranvier::create_persistence_store();
-    if (persistence->open("ranvier.db")) {
-        ranvier::log_main.info("Persistence initialized (SQLite: ranvier.db)");
-        controller.set_persistence(persistence.get());
+    if (persistence->open(g_config.database.path)) {
+        ranvier::log_main.info("Persistence initialized (SQLite: {})", g_config.database.path);
+        controller->set_persistence(persistence.get());
     } else {
         ranvier::log_main.warn("Failed to open persistence store - running without persistence");
     }
 
-    // Start Health Checker
-    health_checker.start();
+    // 4. Init Health Checker with config
+    ranvier::HealthServiceConfig health_config;
+    health_config.check_interval = g_config.health.check_interval;
+    health_config.check_timeout = g_config.health.check_timeout;
+    health_config.failure_threshold = g_config.health.failure_threshold;
+    health_config.recovery_threshold = g_config.health.recovery_threshold;
+    health_checker = std::make_unique<ranvier::HealthService>(router, health_config);
+    health_checker->start();
 
-    // 3. Load persisted state, then start servers
+    // 5. Load persisted state, then start servers
     return load_persisted_state().then([] {
-        // 4. Start Servers (Metrics + API)
+        // 6. Start Servers (Metrics + API)
         return do_with(http_server_control(), http_server_control(), [](auto& prom_server, auto& api_server) {
 
-            // A. Setup Prometheus Server (Port 9180)
+            // A. Setup Prometheus Server
             return prom_server.start().then([&prom_server] {
                 seastar::prometheus::config pconf;
                 pconf.metric_help = "Ranvier AI Router";
                 return seastar::prometheus::start(prom_server, pconf);
             }).then([&prom_server] {
-                return prom_server.listen(socket_address(ipv4_addr("0.0.0.0", 9180)));
+                auto addr = socket_address(ipv4_addr(g_config.server.bind_address, g_config.server.metrics_port));
+                return prom_server.listen(addr);
             }).then([] {
-                ranvier::log_main.info("Prometheus metrics listening on port 9180");
+                ranvier::log_main.info("Prometheus metrics listening on {}:{}",
+                    g_config.server.bind_address, g_config.server.metrics_port);
                 return make_ready_future<>();
             }).then([&api_server] {
                 return api_server.start();
             }).then([&api_server] {
                 return api_server.set_routes([](routes& r) {
-                    controller.register_routes(r);
+                    controller->register_routes(r);
                 });
             }).then([&api_server] {
-                return api_server.listen(socket_address(ipv4_addr("0.0.0.0", 8080)));
+                auto addr = socket_address(ipv4_addr(g_config.server.bind_address, g_config.server.api_port));
+                return api_server.listen(addr);
             }).then([] {
-                ranvier::log_main.info("Ranvier listening on port 8080");
+                ranvier::log_main.info("Ranvier listening on {}:{}",
+                    g_config.server.bind_address, g_config.server.api_port);
 
                 // Wait Loop
                 auto stop_signal = std::make_shared<promise<>>();
@@ -133,7 +156,7 @@ future<> run() {
                 ranvier::log_main.info("Stopping Ranvier...");
 
                 // Stop Health Checker FIRST
-                return health_checker.stop().then([&api_server, &prom_server] {
+                return health_checker->stop().then([&api_server, &prom_server] {
                     return api_server.stop().then([&prom_server] {
                         return prom_server.stop();
                     });
@@ -153,6 +176,37 @@ future<> run() {
 }
 
 int main(int argc, char** argv) {
+    // Load configuration BEFORE Seastar starts
+    // This allows us to use config values for server initialization
+    std::string config_path = "ranvier.yaml";
+
+    // Check for --config argument
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            config_path = argv[i + 1];
+        } else if (arg.rfind("--config=", 0) == 0) {
+            config_path = arg.substr(9);
+        }
+    }
+
+    try {
+        g_config = ranvier::RanvierConfig::load(config_path);
+
+        // Log config summary (before Seastar logger is available)
+        std::cout << "Ranvier Core - Configuration loaded\n";
+        std::cout << "  API Port:     " << g_config.server.api_port << "\n";
+        std::cout << "  Metrics Port: " << g_config.server.metrics_port << "\n";
+        std::cout << "  Database:     " << g_config.database.path << "\n";
+        std::cout << "  Health Check: " << g_config.health.check_interval.count() << "s interval\n";
+        std::cout << "  Pool Size:    " << g_config.pool.max_connections_per_host << " per host, "
+                  << g_config.pool.max_total_connections << " total\n";
+        std::cout << "  Min Tokens:   " << g_config.routing.min_token_length << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to load config: " << e.what() << "\n";
+        return 1;
+    }
+
     app_template app;
     return app.run(argc, argv, run);
 }

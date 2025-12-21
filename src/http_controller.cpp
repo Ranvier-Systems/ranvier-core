@@ -404,7 +404,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 auto res = parser.push(std::move(chunk));
 
                 // Snooping Logic
-                if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= 4) {
+                if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= _config.min_token_length) {
                     (void)_router.learn_route_global(tokens, target_id);
                     log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
 

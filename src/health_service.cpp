@@ -12,7 +12,8 @@ using namespace seastar;
 
 namespace ranvier {
 
-HealthService::HealthService(RouterService& router) : _router(router) {}
+HealthService::HealthService(RouterService& router, HealthServiceConfig config)
+    : _router(router), _config(config) {}
 
 void HealthService::start() {
     _running = true;
@@ -51,8 +52,8 @@ future<> HealthService::run_loop() {
                 co_await _router.set_backend_status_global(id, is_alive);
             }
 
-            // 5. Sleep for 5 seconds
-            co_await seastar::sleep(std::chrono::seconds(5));
+            // 5. Sleep for configured interval
+            co_await seastar::sleep(_config.check_interval);
         }
     } catch (...) {
         // Gate closed exception is normal on shutdown

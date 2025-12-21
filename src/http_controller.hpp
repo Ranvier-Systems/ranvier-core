@@ -11,10 +11,16 @@
 
 namespace ranvier {
 
+// HTTP controller configuration
+struct HttpControllerConfig {
+    ConnectionPoolConfig pool;
+    size_t min_token_length = 4;  // Minimum tokens before caching a route
+};
+
 class HttpController {
 public:
-    HttpController(TokenizerService& t, RouterService& r)
-        : _tokenizer(t), _router(r), _persistence(nullptr) {}
+    HttpController(TokenizerService& t, RouterService& r, HttpControllerConfig config = {})
+        : _tokenizer(t), _router(r), _pool(config.pool), _config(config), _persistence(nullptr) {}
 
     // Set optional persistence store (call before serving requests)
     void set_persistence(PersistenceStore* store) { _persistence = store; }
@@ -26,6 +32,7 @@ private:
     TokenizerService& _tokenizer;
     RouterService& _router;
     ConnectionPool _pool;
+    HttpControllerConfig _config;
     PersistenceStore* _persistence;
 
     // Helper handlers
