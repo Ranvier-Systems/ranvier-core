@@ -62,6 +62,15 @@ routing:
   # Maximum attempts to find a live backend on cache miss
   backend_retry_limit: 5
 
+# Timeout configuration
+timeouts:
+  # Timeout for establishing connection to backend in seconds (RANVIER_CONNECT_TIMEOUT)
+  connect_timeout_seconds: 5
+
+  # Total timeout for entire request in seconds (RANVIER_REQUEST_TIMEOUT)
+  # Set high enough for LLM inference - 5 minutes default handles most generation tasks
+  request_timeout_seconds: 300
+
 # Asset paths
 assets:
   # Path to GPT-2 tokenizer vocabulary JSON file (RANVIER_TOKENIZER_PATH)

@@ -1,4 +1,5 @@
 #include "health_service.hpp"
+#include "logging.hpp"
 
 #include <iostream>
 
@@ -6,6 +7,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
 
 using namespace seastar;
@@ -61,13 +63,22 @@ future<> HealthService::run_loop() {
 }
 
 future<bool> HealthService::check_backend(socket_address addr) {
-    return seastar::connect(addr).then([](seastar::connected_socket fd) {
-        // Success
-        // When 'fd' goes out of scope here, the destructor closes the socket.
-        return true;
-    }).handle_exception([](auto ep) {
-        return false; // Connection Refused / Timeout
-    });
+    // Use configured timeout for health check connections
+    auto deadline = lowres_clock::now() + _config.check_timeout;
+
+    return with_timeout(deadline, seastar::connect(addr))
+        .then([](std::optional<seastar::connected_socket> result) {
+            if (result) {
+                // Success - connection will be closed when result goes out of scope
+                return true;
+            }
+            // Timeout
+            return false;
+        })
+        .handle_exception([](auto ep) {
+            // Connection refused, network error, etc.
+            return false;
+        });
 }
 
 } // namespace ranvier
