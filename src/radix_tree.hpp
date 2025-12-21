@@ -8,6 +8,8 @@
 #include <span>
 #include <algorithm>
 
+#include "types.hpp"
+
 /*
 Adaptive Radix Tree (ART) Implementation
 
@@ -24,11 +26,6 @@ Node Types:
 */
 
 namespace ranvier {
-
-// Token IDs are 32-bit integers from the Tokenizer
-using TokenId = int32_t;
-// Backend ID is the GPU Pool ID (0, 1, 2...)
-using BackendId = int16_t;
 
 // Node Types for Adaptive Radix Tree
 enum class NodeType : uint8_t {
