@@ -394,6 +394,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= 4) {
                     (void)_router.learn_route_global(tokens, target_id);
                     log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
+
+                    // Persist the learned route
+                    if (_persistence) {
+                        _persistence->save_route(tokens, target_id);
+                    }
                 }
 
                 if (!res.data.empty()) {
@@ -437,6 +442,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     int backend_id = std::stoi(std::string(id_str));
     auto tokens = _tokenizer.encode(req->content);
 
+    // Persist the route
+    if (_persistence) {
+        _persistence->save_route(tokens, backend_id);
+    }
+
     return _router.learn_route_global(tokens, backend_id).then([backend_id, rep = std::move(rep)]() mutable {
          rep->write_body("json", "{\"status\": \"ok\", \"route_added\": " + std::to_string(backend_id) + "}");
          return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -460,6 +470,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
     // Use the provided IP string
     socket_address addr(ipv4_addr(std::string(ip_str), port));
+
+    // Persist the backend registration
+    if (_persistence) {
+        _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port));
+    }
 
     return _router.register_backend_global(id, addr).then([id, ip_str, port, rep = std::move(rep)]() mutable {
         log_control.info("Registered Backend {} -> {}:{}", id, ip_str, port);
