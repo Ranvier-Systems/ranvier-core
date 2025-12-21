@@ -7,10 +7,9 @@
 #include <string>
 #include <vector>
 
-namespace ranvier {
+#include "types.hpp"
 
-using TokenId = int32_t;
-using BackendId = int32_t;
+namespace ranvier {
 
 // Record types for bulk loading
 struct BackendRecord {
