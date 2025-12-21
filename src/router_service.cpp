@@ -1,4 +1,5 @@
 #include "router_service.hpp"
+#include "logging.hpp"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/loop.hh>
@@ -126,9 +127,9 @@ seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is
 
     // State change detected - log it
     if (is_alive) {
-        std::cout << "[CircuitBreaker] Backend " << id << " is UP (Recovered)\n";
+        log_health.info("Backend {} is UP (Recovered)", id);
     } else {
-        std::cout << "[CircuitBreaker] Backend " << id << " is DOWN (Quarantined)\n";
+        log_health.warn("Backend {} is DOWN (Quarantined)", id);
     }
 
     // Broadcast to all cores

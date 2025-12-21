@@ -1,9 +1,9 @@
 #include "http_controller.hpp"
+#include "logging.hpp"
 
 #include "stream_parser.hpp"
 
 #include <algorithm>
-#include <iostream>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
@@ -393,7 +393,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 // Snooping Logic
                 if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= 4) {
                     (void)_router.learn_route_global(tokens, target_id);
-                    std::cout << "\n[Snoop] 🧠 LEARNED ROUTE: " << tokens.size() << " toks -> GPU-" << target_id << "\n";
+                    log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
                 }
 
                 if (!res.data.empty()) {
@@ -408,7 +408,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
             }
         } catch (const std::exception& e) {
-            std::cerr << "Proxy Error: " << e.what() << "\n";
+            log_proxy.error("Proxy error: {}", e.what());
             bundle.is_valid = false; // Mark broken so we don't reuse it
         }
 
@@ -462,7 +462,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     socket_address addr(ipv4_addr(std::string(ip_str), port));
 
     return _router.register_backend_global(id, addr).then([id, ip_str, port, rep = std::move(rep)]() mutable {
-        std::cout << "[Control Plane] Registered Backend " << id << " -> " << ip_str << ":" << port << "\n";
+        log_control.info("Registered Backend {} -> {}:{}", id, ip_str, port);
         rep->write_body("json", "{\"status\": \"ok\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     });
