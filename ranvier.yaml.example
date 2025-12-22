@@ -117,3 +117,19 @@ rate_limit:
   # Allow short bursts above the rate limit (RANVIER_RATE_LIMIT_BURST)
   # Clients can make up to burst_size requests instantly before being limited
   burst_size: 50
+
+# Retry configuration for transient backend failures
+# Automatically retry connection attempts with exponential backoff
+retry:
+  # Maximum number of retry attempts (RANVIER_RETRY_MAX)
+  # Set to 0 to disable retries
+  max_retries: 3
+
+  # Initial backoff delay in milliseconds (RANVIER_RETRY_INITIAL_BACKOFF_MS)
+  initial_backoff_ms: 100
+
+  # Maximum backoff delay in milliseconds (RANVIER_RETRY_MAX_BACKOFF_MS)
+  max_backoff_ms: 5000
+
+  # Exponential backoff multiplier (each retry waits multiplier * previous_delay)
+  backoff_multiplier: 2.0

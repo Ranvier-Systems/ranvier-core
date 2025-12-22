@@ -104,6 +104,10 @@ future<> run() {
     ctrl_config.rate_limit.enabled = g_config.rate_limit.enabled;
     ctrl_config.rate_limit.requests_per_second = g_config.rate_limit.requests_per_second;
     ctrl_config.rate_limit.burst_size = g_config.rate_limit.burst_size;
+    ctrl_config.retry.max_retries = g_config.retry.max_retries;
+    ctrl_config.retry.initial_backoff = g_config.retry.initial_backoff;
+    ctrl_config.retry.max_backoff = g_config.retry.max_backoff;
+    ctrl_config.retry.backoff_multiplier = g_config.retry.backoff_multiplier;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
 
     // 3. Init Persistence
@@ -257,6 +261,13 @@ int main(int argc, char** argv) {
                       << " req/s, burst " << g_config.rate_limit.burst_size << "\n";
         } else {
             std::cout << "  Rate Limit:   disabled\n";
+        }
+        if (g_config.retry.max_retries > 0) {
+            std::cout << "  Retry:        " << g_config.retry.max_retries << " retries, "
+                      << g_config.retry.initial_backoff.count() << "-"
+                      << g_config.retry.max_backoff.count() << "ms backoff\n";
+        } else {
+            std::cout << "  Retry:        disabled\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";

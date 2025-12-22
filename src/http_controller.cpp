@@ -192,12 +192,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
     socket_address target_addr = target_addr_opt.value();
 
-    // 2. Setup Streaming with Timeout
-    // Capture timeout config for the lambda
+    // 2. Setup Streaming with Timeout and Retry
+    // Capture config for the lambda
     auto connect_timeout = _config.connect_timeout;
     auto request_timeout = _config.request_timeout;
+    auto retry_config = _config.retry;
 
-    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -206,18 +207,55 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         bool timed_out = false;
         bool connection_failed = false;
 
-        // 1. GET CONNECTION FROM POOL (with connect timeout)
-        auto connect_deadline = lowres_clock::now() + connect_timeout;
-        auto conn_future = with_timeout(connect_deadline, _pool.get(target_addr));
+        // 1. GET CONNECTION FROM POOL (with connect timeout and retry)
+        uint32_t retry_attempt = 0;
+        auto current_backoff = retry_config.initial_backoff;
 
-        bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
-            log_proxy.warn("Connect timeout or error to backend");
-            connection_failed = true;
-            return ConnectionBundle{}; // Return empty bundle
-        });
+        while (retry_attempt <= retry_config.max_retries) {
+            // Check if we've exceeded overall request deadline
+            if (lowres_clock::now() >= request_deadline) {
+                log_proxy.warn("Request deadline exceeded during connection retry");
+                connection_failed = true;
+                break;
+            }
+
+            auto connect_deadline = lowres_clock::now() + connect_timeout;
+            auto conn_future = with_timeout(connect_deadline, _pool.get(target_addr));
+
+            bool this_attempt_failed = false;
+            bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
+                this_attempt_failed = true;
+                return ConnectionBundle{}; // Return empty bundle
+            });
+
+            if (!this_attempt_failed) {
+                // Connection successful
+                connection_failed = false;
+                break;
+            }
+
+            // Connection failed - check if we should retry
+            if (retry_attempt < retry_config.max_retries) {
+                log_proxy.warn("Connection attempt {} failed, retrying in {}ms",
+                    retry_attempt + 1, current_backoff.count());
+
+                // Wait with exponential backoff before retry
+                co_await seastar::sleep(current_backoff);
+
+                // Increase backoff for next attempt (with cap)
+                auto next_backoff = std::chrono::milliseconds(
+                    static_cast<int64_t>(current_backoff.count() * retry_config.backoff_multiplier));
+                current_backoff = std::min(next_backoff, retry_config.max_backoff);
+            } else {
+                log_proxy.warn("Connection failed after {} retries", retry_config.max_retries + 1);
+                connection_failed = true;
+            }
+
+            retry_attempt++;
+        }
 
         if (connection_failed) {
-            sstring error_msg = "data: {\"error\": \"Connect timeout\"}\n\n";
+            sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
             co_await client_out.write(error_msg);
             co_await client_out.flush();
             co_await client_out.close();

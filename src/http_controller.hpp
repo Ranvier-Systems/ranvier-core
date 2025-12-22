@@ -12,6 +12,14 @@
 
 namespace ranvier {
 
+// Retry configuration
+struct RetrySettings {
+    uint32_t max_retries = 3;
+    std::chrono::milliseconds initial_backoff{100};
+    std::chrono::milliseconds max_backoff{5000};
+    double backoff_multiplier = 2.0;
+};
+
 // HTTP controller configuration
 struct HttpControllerConfig {
     ConnectionPoolConfig pool;
@@ -20,6 +28,7 @@ struct HttpControllerConfig {
     std::chrono::seconds request_timeout{300};  // Total timeout for request
     std::string admin_api_key = "";             // API key for admin endpoints (empty = no auth)
     RateLimiterConfig rate_limit;               // Rate limiting configuration
+    RetrySettings retry;                        // Retry configuration
 };
 
 class HttpController {
