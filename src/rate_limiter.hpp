@@ -46,8 +46,13 @@ public:
         if (it == _buckets.end()) {
             // New client - create bucket with burst_size tokens
             _buckets.emplace(client_ip, TokenBucket(_config.burst_size));
+
             // First request always allowed
-            _buckets[client_ip].tokens -= 1.0;
+            auto iter = _buckets.find(client_ip);
+            if (iter != _buckets.end()) {
+                auto& bucket = iter->second;
+                bucket.tokens -= 1.0;
+            }
             return true;
         }
 
