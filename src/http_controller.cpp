@@ -104,11 +104,14 @@ auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
 }
 
 // Helper to create a rate-limited handler
-template <typename Func>
-auto make_rate_limited_handler(HttpController* ctrl, Func&& handler) {
-    return new async_handler([ctrl, handler = std::forward<Func>(handler)](auto req, auto rep) mutable
+template <typename RateLimitCheck, typename Func>
+auto make_rate_limited_handler(RateLimitCheck&& rate_limit_check, Func&& handler) {
+    return new async_handler([
+        rate_limit_check = std::forward<RateLimitCheck>(rate_limit_check),
+        handler = std::forward<Func>(handler)
+    ](auto req, auto rep) mutable
         -> future<std::unique_ptr<seastar::httpd::reply>> {
-        if (!ctrl->check_rate_limit(*req)) {
+        if (!rate_limit_check(*req)) {
             rep->set_status(seastar::http::reply::status_type::service_unavailable);
             rep->add_header("Retry-After", "1");
             rep->write_body("json", "{\"error\": \"Rate limit exceeded - try again later\"}");
@@ -121,8 +124,11 @@ auto make_rate_limited_handler(HttpController* ctrl, Func&& handler) {
 void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
+    // Define the check once as a local lambda to keep the calls clean.
+    auto rate_limit_check = [this](const auto& req) { return this->check_rate_limit(req); };
+
     // 1. DATA PLANE (rate limited)
-    r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(rate_limit_check, [this](auto req, auto rep) {
         return this->handle_proxy(std::move(req), std::move(rep));
     }));
 
