@@ -34,6 +34,45 @@ struct async_handler : public seastar::httpd::handler_base {
     }
 };
 
+// Check admin authentication - returns true if authorized
+bool HttpController::check_admin_auth(const seastar::http::request& req) const {
+    // If no API key configured, allow all requests (auth disabled)
+    if (_config.admin_api_key.empty()) {
+        return true;
+    }
+
+    // Check Authorization header: "Bearer <token>"
+    auto auth_it = req._headers.find("Authorization");
+    if (auth_it == req._headers.end()) {
+        return false;
+    }
+
+    const auto& auth_header = auth_it->second;
+    const std::string bearer_prefix = "Bearer ";
+    if (auth_header.size() <= bearer_prefix.size() ||
+        auth_header.substr(0, bearer_prefix.size()) != bearer_prefix) {
+        return false;
+    }
+
+    std::string token = auth_header.substr(bearer_prefix.size());
+    return token == _config.admin_api_key;
+}
+
+// Helper to create an auth-protected admin handler
+template <typename Func>
+auto make_admin_handler(HttpController* ctrl, Func&& handler) {
+    return new async_handler([ctrl, handler = std::forward<Func>(handler)](auto req, auto rep) mutable
+        -> future<std::unique_ptr<seastar::httpd::reply>> {
+        if (!ctrl->check_admin_auth(*req)) {
+            rep->set_status(seastar::http::reply::status_type::unauthorized);
+            rep->add_header("WWW-Authenticate", "Bearer");
+            rep->write_body("json", "{\"error\": \"Unauthorized - valid API key required\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
+        return handler(std::move(req), std::move(rep));
+    });
+}
+
 void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
@@ -42,25 +81,25 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_proxy(std::move(req), std::move(rep));
     }));
 
-    // 2. CONTROL PLANE - Create/Update
-    r.add(operation_type::POST, url("/admin/routes"), new async_handler([this](auto req, auto rep) {
+    // 2. CONTROL PLANE - Create/Update (auth protected)
+    r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(this, [this](auto req, auto rep) {
         return this->handle_broadcast_route(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::POST, url("/admin/backends"), new async_handler([this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/backends"), make_admin_handler(this, [this](auto req, auto rep) {
         return this->handle_broadcast_backend(std::move(req), std::move(rep));
     }));
 
-    // 3. CONTROL PLANE - Delete
-    r.add(operation_type::DELETE, url("/admin/backends"), new async_handler([this](auto req, auto rep) {
+    // 3. CONTROL PLANE - Delete (auth protected)
+    r.add(operation_type::DELETE, url("/admin/backends"), make_admin_handler(this, [this](auto req, auto rep) {
         return this->handle_delete_backend(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::DELETE, url("/admin/routes"), new async_handler([this](auto req, auto rep) {
+    r.add(operation_type::DELETE, url("/admin/routes"), make_admin_handler(this, [this](auto req, auto rep) {
         return this->handle_delete_routes(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::POST, url("/admin/clear"), new async_handler([this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(this, [this](auto req, auto rep) {
         return this->handle_clear_all(std::move(req), std::move(rep));
     }));
 }
