@@ -67,16 +67,12 @@ future<bool> HealthService::check_backend(socket_address addr) {
     auto deadline = lowres_clock::now() + _config.check_timeout;
 
     return with_timeout(deadline, seastar::connect(addr))
-        .then([](std::optional<seastar::connected_socket> result) {
-            if (result) {
-                // Success - connection will be closed when result goes out of scope
-                return true;
-            }
-            // Timeout
-            return false;
+        .then([](seastar::connected_socket fd) {
+            // Success - connection will be closed when fd goes out of scope
+            return true;
         })
         .handle_exception([](auto ep) {
-            // Connection refused, network error, etc.
+            // Timeout, connection refused, network error, etc.
             return false;
         });
 }

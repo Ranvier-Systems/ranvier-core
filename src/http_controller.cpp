@@ -387,13 +387,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         try {
             // 1. GET CONNECTION FROM POOL (with connect timeout)
             auto connect_deadline = lowres_clock::now() + connect_timeout;
-            auto conn_result = co_await with_timeout(connect_deadline, _pool.get(target_addr));
-
-            if (!conn_result) {
+            try {
+                bundle = co_await with_timeout(connect_deadline, _pool.get(target_addr));
+            } catch (const seastar::timed_out_error&) {
                 log_proxy.warn("Connect timeout after {}s to backend", connect_timeout.count());
                 throw request_timeout_error();
             }
-            bundle = std::move(*conn_result);
 
             // 2. SEND REQUEST (with timeout check)
             if (lowres_clock::now() >= request_deadline) {
@@ -427,16 +426,15 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 auto read_timeout = std::min(remaining, std::chrono::seconds(30));
                 auto read_deadline = lowres_clock::now() + read_timeout;
 
-                auto chunk_result = co_await with_timeout(read_deadline, bundle.in.read());
-
-                if (!chunk_result) {
+                temporary_buffer<char> chunk;
+                try {
+                    chunk = co_await with_timeout(read_deadline, bundle.in.read());
+                } catch (const seastar::timed_out_error&) {
                     log_proxy.warn("Read timeout waiting for backend response");
                     timed_out = true;
                     bundle.is_valid = false;
                     break;
                 }
-
-                auto chunk = std::move(*chunk_result);
 
                 // EOF logic
                 if (chunk.empty()) {
