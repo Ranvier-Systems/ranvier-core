@@ -23,6 +23,9 @@ protected:
         unsetenv("RANVIER_TLS_CERT_PATH");
         unsetenv("RANVIER_TLS_KEY_PATH");
         unsetenv("RANVIER_ADMIN_API_KEY");
+        unsetenv("RANVIER_RATE_LIMIT_ENABLED");
+        unsetenv("RANVIER_RATE_LIMIT_RPS");
+        unsetenv("RANVIER_RATE_LIMIT_BURST");
     }
 
     void TearDown() override {
@@ -83,6 +86,11 @@ TEST_F(ConfigTest, DefaultsReturnExpectedValues) {
 
     // Auth defaults
     EXPECT_EQ(config.auth.admin_api_key, "");
+
+    // Rate limit defaults
+    EXPECT_FALSE(config.rate_limit.enabled);
+    EXPECT_EQ(config.rate_limit.requests_per_second, 100u);
+    EXPECT_EQ(config.rate_limit.burst_size, 50u);
 }
 
 // Test loading a complete YAML config file
@@ -128,6 +136,11 @@ tls:
 
 auth:
   admin_api_key: "test-secret-key-12345"
+
+rate_limit:
+  enabled: true
+  requests_per_second: 200
+  burst_size: 100
 )");
 
     auto config = RanvierConfig::load("test_config.yaml");
@@ -172,6 +185,11 @@ auth:
 
     // Auth
     EXPECT_EQ(config.auth.admin_api_key, "test-secret-key-12345");
+
+    // Rate limit
+    EXPECT_TRUE(config.rate_limit.enabled);
+    EXPECT_EQ(config.rate_limit.requests_per_second, 200u);
+    EXPECT_EQ(config.rate_limit.burst_size, 100u);
 }
 
 // Test that partial config files work (missing sections use defaults)
@@ -313,6 +331,11 @@ TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
 
     AuthConfig auth;
     EXPECT_EQ(auth.admin_api_key, "");
+
+    RateLimitConfig rate_limit;
+    EXPECT_FALSE(rate_limit.enabled);
+    EXPECT_EQ(rate_limit.requests_per_second, 100u);
+    EXPECT_EQ(rate_limit.burst_size, 50u);
 }
 
 // Test TLS environment variable overrides
@@ -353,6 +376,19 @@ TEST_F(ConfigTest, AuthEnvironmentVariableOverride) {
     auto config = RanvierConfig::defaults();
 
     EXPECT_EQ(config.auth.admin_api_key, "env-secret-key");
+}
+
+// Test rate limit environment variable overrides
+TEST_F(ConfigTest, RateLimitEnvironmentVariablesOverride) {
+    setenv("RANVIER_RATE_LIMIT_ENABLED", "true", 1);
+    setenv("RANVIER_RATE_LIMIT_RPS", "500", 1);
+    setenv("RANVIER_RATE_LIMIT_BURST", "250", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_TRUE(config.rate_limit.enabled);
+    EXPECT_EQ(config.rate_limit.requests_per_second, 500u);
+    EXPECT_EQ(config.rate_limit.burst_size, 250u);
 }
 
 int main(int argc, char** argv) {
