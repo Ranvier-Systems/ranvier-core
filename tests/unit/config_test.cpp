@@ -22,6 +22,7 @@ protected:
         unsetenv("RANVIER_TLS_ENABLED");
         unsetenv("RANVIER_TLS_CERT_PATH");
         unsetenv("RANVIER_TLS_KEY_PATH");
+        unsetenv("RANVIER_ADMIN_API_KEY");
     }
 
     void TearDown() override {
@@ -79,6 +80,9 @@ TEST_F(ConfigTest, DefaultsReturnExpectedValues) {
     EXPECT_FALSE(config.tls.enabled);
     EXPECT_EQ(config.tls.cert_path, "");
     EXPECT_EQ(config.tls.key_path, "");
+
+    // Auth defaults
+    EXPECT_EQ(config.auth.admin_api_key, "");
 }
 
 // Test loading a complete YAML config file
@@ -121,6 +125,9 @@ tls:
   enabled: true
   cert_path: "/certs/server.crt"
   key_path: "/certs/server.key"
+
+auth:
+  admin_api_key: "test-secret-key-12345"
 )");
 
     auto config = RanvierConfig::load("test_config.yaml");
@@ -162,6 +169,9 @@ tls:
     EXPECT_TRUE(config.tls.enabled);
     EXPECT_EQ(config.tls.cert_path, "/certs/server.crt");
     EXPECT_EQ(config.tls.key_path, "/certs/server.key");
+
+    // Auth
+    EXPECT_EQ(config.auth.admin_api_key, "test-secret-key-12345");
 }
 
 // Test that partial config files work (missing sections use defaults)
@@ -300,6 +310,9 @@ TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
     EXPECT_FALSE(tls.enabled);
     EXPECT_EQ(tls.cert_path, "");
     EXPECT_EQ(tls.key_path, "");
+
+    AuthConfig auth;
+    EXPECT_EQ(auth.admin_api_key, "");
 }
 
 // Test TLS environment variable overrides
@@ -331,6 +344,15 @@ TEST_F(ConfigTest, TlsEnabledAcceptsMultipleValues) {
     setenv("RANVIER_TLS_ENABLED", "false", 1);
     auto config3 = RanvierConfig::defaults();
     EXPECT_FALSE(config3.tls.enabled);
+}
+
+// Test auth environment variable override
+TEST_F(ConfigTest, AuthEnvironmentVariableOverride) {
+    setenv("RANVIER_ADMIN_API_KEY", "env-secret-key", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_EQ(config.auth.admin_api_key, "env-secret-key");
 }
 
 int main(int argc, char** argv) {

@@ -100,6 +100,7 @@ future<> run() {
     ctrl_config.min_token_length = g_config.routing.min_token_length;
     ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
     ctrl_config.request_timeout = g_config.timeouts.request_timeout;
+    ctrl_config.admin_api_key = g_config.auth.admin_api_key;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
 
     // 3. Init Persistence
@@ -242,6 +243,11 @@ int main(int argc, char** argv) {
             std::cout << "  TLS:          enabled (cert: " << g_config.tls.cert_path << ")\n";
         } else {
             std::cout << "  TLS:          disabled\n";
+        }
+        if (!g_config.auth.admin_api_key.empty()) {
+            std::cout << "  Admin Auth:   enabled (API key configured)\n";
+        } else {
+            std::cout << "  Admin Auth:   disabled (no API key)\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
