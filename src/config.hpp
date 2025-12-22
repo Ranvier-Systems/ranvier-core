@@ -77,6 +77,21 @@ struct AuthConfig {
     std::string admin_api_key = "";           // API key for admin endpoints (empty = no auth)
 };
 
+// Rate limiting configuration
+struct RateLimitConfig {
+    bool enabled = false;                     // Enable rate limiting
+    uint32_t requests_per_second = 100;       // Max requests per second per client
+    uint32_t burst_size = 50;                 // Allow burst above rate limit
+};
+
+// Retry configuration for transient failures
+struct RetryConfig {
+    uint32_t max_retries = 3;                         // Maximum retry attempts (0 = no retries)
+    std::chrono::milliseconds initial_backoff{100};   // Initial backoff delay
+    std::chrono::milliseconds max_backoff{5000};      // Maximum backoff delay
+    double backoff_multiplier = 2.0;                  // Exponential backoff multiplier
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -88,6 +103,8 @@ struct RanvierConfig {
     AssetsConfig assets;
     TlsConfig tls;
     AuthConfig auth;
+    RateLimitConfig rate_limit;
+    RetryConfig retry;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -188,6 +205,28 @@ inline void RanvierConfig::apply_env_overrides() {
 
     // Auth overrides
     if (auto v = get_env("RANVIER_ADMIN_API_KEY")) auth.admin_api_key = *v;
+
+    // Rate limit overrides
+    if (auto v = get_env("RANVIER_RATE_LIMIT_ENABLED")) {
+        rate_limit.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_RATE_LIMIT_RPS")) {
+        rate_limit.requests_per_second = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_RATE_LIMIT_BURST")) {
+        rate_limit.burst_size = *v;
+    }
+
+    // Retry overrides
+    if (auto v = get_env_as<uint32_t>("RANVIER_RETRY_MAX")) {
+        retry.max_retries = *v;
+    }
+    if (auto v = get_env_as<int>("RANVIER_RETRY_INITIAL_BACKOFF_MS")) {
+        retry.initial_backoff = std::chrono::milliseconds(*v);
+    }
+    if (auto v = get_env_as<int>("RANVIER_RETRY_MAX_BACKOFF_MS")) {
+        retry.max_backoff = std::chrono::milliseconds(*v);
+    }
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -299,6 +338,27 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
         if (yaml["auth"]) {
             YAML::Node a = yaml["auth"];
             if (a["admin_api_key"]) config.auth.admin_api_key = a["admin_api_key"].as<std::string>();
+        }
+
+        // Rate limit section
+        if (yaml["rate_limit"]) {
+            YAML::Node r = yaml["rate_limit"];
+            if (r["enabled"]) config.rate_limit.enabled = r["enabled"].as<bool>();
+            if (r["requests_per_second"]) config.rate_limit.requests_per_second = r["requests_per_second"].as<uint32_t>();
+            if (r["burst_size"]) config.rate_limit.burst_size = r["burst_size"].as<uint32_t>();
+        }
+
+        // Retry section
+        if (yaml["retry"]) {
+            YAML::Node r = yaml["retry"];
+            if (r["max_retries"]) config.retry.max_retries = r["max_retries"].as<uint32_t>();
+            if (r["initial_backoff_ms"]) {
+                config.retry.initial_backoff = std::chrono::milliseconds(r["initial_backoff_ms"].as<int>());
+            }
+            if (r["max_backoff_ms"]) {
+                config.retry.max_backoff = std::chrono::milliseconds(r["max_backoff_ms"].as<int>());
+            }
+            if (r["backoff_multiplier"]) config.retry.backoff_multiplier = r["backoff_multiplier"].as<double>();
         }
 
     } catch (const YAML::Exception& e) {

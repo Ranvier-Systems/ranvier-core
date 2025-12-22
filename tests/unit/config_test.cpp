@@ -23,6 +23,12 @@ protected:
         unsetenv("RANVIER_TLS_CERT_PATH");
         unsetenv("RANVIER_TLS_KEY_PATH");
         unsetenv("RANVIER_ADMIN_API_KEY");
+        unsetenv("RANVIER_RATE_LIMIT_ENABLED");
+        unsetenv("RANVIER_RATE_LIMIT_RPS");
+        unsetenv("RANVIER_RATE_LIMIT_BURST");
+        unsetenv("RANVIER_RETRY_MAX");
+        unsetenv("RANVIER_RETRY_INITIAL_BACKOFF_MS");
+        unsetenv("RANVIER_RETRY_MAX_BACKOFF_MS");
     }
 
     void TearDown() override {
@@ -83,6 +89,17 @@ TEST_F(ConfigTest, DefaultsReturnExpectedValues) {
 
     // Auth defaults
     EXPECT_EQ(config.auth.admin_api_key, "");
+
+    // Rate limit defaults
+    EXPECT_FALSE(config.rate_limit.enabled);
+    EXPECT_EQ(config.rate_limit.requests_per_second, 100u);
+    EXPECT_EQ(config.rate_limit.burst_size, 50u);
+
+    // Retry defaults
+    EXPECT_EQ(config.retry.max_retries, 3u);
+    EXPECT_EQ(config.retry.initial_backoff.count(), 100);
+    EXPECT_EQ(config.retry.max_backoff.count(), 5000);
+    EXPECT_DOUBLE_EQ(config.retry.backoff_multiplier, 2.0);
 }
 
 // Test loading a complete YAML config file
@@ -128,6 +145,17 @@ tls:
 
 auth:
   admin_api_key: "test-secret-key-12345"
+
+rate_limit:
+  enabled: true
+  requests_per_second: 200
+  burst_size: 100
+
+retry:
+  max_retries: 5
+  initial_backoff_ms: 200
+  max_backoff_ms: 10000
+  backoff_multiplier: 3.0
 )");
 
     auto config = RanvierConfig::load("test_config.yaml");
@@ -172,6 +200,17 @@ auth:
 
     // Auth
     EXPECT_EQ(config.auth.admin_api_key, "test-secret-key-12345");
+
+    // Rate limit
+    EXPECT_TRUE(config.rate_limit.enabled);
+    EXPECT_EQ(config.rate_limit.requests_per_second, 200u);
+    EXPECT_EQ(config.rate_limit.burst_size, 100u);
+
+    // Retry
+    EXPECT_EQ(config.retry.max_retries, 5u);
+    EXPECT_EQ(config.retry.initial_backoff.count(), 200);
+    EXPECT_EQ(config.retry.max_backoff.count(), 10000);
+    EXPECT_DOUBLE_EQ(config.retry.backoff_multiplier, 3.0);
 }
 
 // Test that partial config files work (missing sections use defaults)
@@ -313,6 +352,17 @@ TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
 
     AuthConfig auth;
     EXPECT_EQ(auth.admin_api_key, "");
+
+    RateLimitConfig rate_limit;
+    EXPECT_FALSE(rate_limit.enabled);
+    EXPECT_EQ(rate_limit.requests_per_second, 100u);
+    EXPECT_EQ(rate_limit.burst_size, 50u);
+
+    RetryConfig retry;
+    EXPECT_EQ(retry.max_retries, 3u);
+    EXPECT_EQ(retry.initial_backoff.count(), 100);
+    EXPECT_EQ(retry.max_backoff.count(), 5000);
+    EXPECT_DOUBLE_EQ(retry.backoff_multiplier, 2.0);
 }
 
 // Test TLS environment variable overrides
@@ -353,6 +403,41 @@ TEST_F(ConfigTest, AuthEnvironmentVariableOverride) {
     auto config = RanvierConfig::defaults();
 
     EXPECT_EQ(config.auth.admin_api_key, "env-secret-key");
+}
+
+// Test rate limit environment variable overrides
+TEST_F(ConfigTest, RateLimitEnvironmentVariablesOverride) {
+    setenv("RANVIER_RATE_LIMIT_ENABLED", "true", 1);
+    setenv("RANVIER_RATE_LIMIT_RPS", "500", 1);
+    setenv("RANVIER_RATE_LIMIT_BURST", "250", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_TRUE(config.rate_limit.enabled);
+    EXPECT_EQ(config.rate_limit.requests_per_second, 500u);
+    EXPECT_EQ(config.rate_limit.burst_size, 250u);
+}
+
+// Test retry environment variable overrides
+TEST_F(ConfigTest, RetryEnvironmentVariablesOverride) {
+    setenv("RANVIER_RETRY_MAX", "10", 1);
+    setenv("RANVIER_RETRY_INITIAL_BACKOFF_MS", "500", 1);
+    setenv("RANVIER_RETRY_MAX_BACKOFF_MS", "30000", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_EQ(config.retry.max_retries, 10u);
+    EXPECT_EQ(config.retry.initial_backoff.count(), 500);
+    EXPECT_EQ(config.retry.max_backoff.count(), 30000);
+}
+
+// Test retry with zero max_retries (disabled)
+TEST_F(ConfigTest, RetryDisabledWithZeroMaxRetries) {
+    setenv("RANVIER_RETRY_MAX", "0", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_EQ(config.retry.max_retries, 0u);
 }
 
 int main(int argc, char** argv) {

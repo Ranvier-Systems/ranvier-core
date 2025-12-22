@@ -58,12 +58,42 @@ bool HttpController::check_admin_auth(const seastar::http::request& req) const {
     return token == _config.admin_api_key;
 }
 
+// Get client IP from request, checking X-Forwarded-For for proxied requests
+std::string HttpController::get_client_ip(const seastar::http::request& req) {
+    // Check X-Forwarded-For header first (for proxied requests)
+    auto xff_it = req._headers.find("X-Forwarded-For");
+    if (xff_it != req._headers.end() && !xff_it->second.empty()) {
+        // X-Forwarded-For can contain multiple IPs; take the first (original client)
+        auto& xff = xff_it->second;
+        auto comma_pos = xff.find(',');
+        if (comma_pos != std::string::npos) {
+            return std::string(xff.substr(0, comma_pos));
+        }
+        return std::string(xff);
+    }
+
+    // Fall back to direct client address
+    // Note: In Seastar, we'd need the connection info which isn't directly available here
+    // For now, return a default that will work for non-proxied setups
+    return "direct";
+}
+
+// Check rate limit for a request
+bool HttpController::check_rate_limit(const seastar::http::request& req) {
+    std::string client_ip = get_client_ip(req);
+    return _rate_limiter.allow(client_ip);
+}
+
 // Helper to create an auth-protected admin handler
-template <typename Func>
-auto make_admin_handler(HttpController* ctrl, Func&& handler) {
-    return new async_handler([ctrl, handler = std::forward<Func>(handler)](auto req, auto rep) mutable
-        -> future<std::unique_ptr<seastar::httpd::reply>> {
-        if (!ctrl->check_admin_auth(*req)) {
+template <typename AuthCheck, typename Func>
+auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
+    return new async_handler([
+        auth_check = std::forward<AuthCheck>(auth_check),
+        handler = std::forward<Func>(handler)
+    ](auto req, auto rep) mutable -> future<std::unique_ptr<seastar::httpd::reply>> {
+
+        // Execute the captured private check
+        if (!auth_check(*req)) {
             rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->add_header("WWW-Authenticate", "Bearer");
             rep->write_body("json", "{\"error\": \"Unauthorized - valid API key required\"}");
@@ -73,33 +103,51 @@ auto make_admin_handler(HttpController* ctrl, Func&& handler) {
     });
 }
 
+// Helper to create a rate-limited handler
+template <typename Func>
+auto make_rate_limited_handler(HttpController* ctrl, Func&& handler) {
+    return new async_handler([ctrl, handler = std::forward<Func>(handler)](auto req, auto rep) mutable
+        -> future<std::unique_ptr<seastar::httpd::reply>> {
+        if (!ctrl->check_rate_limit(*req)) {
+            rep->set_status(seastar::http::reply::status_type::service_unavailable);
+            rep->add_header("Retry-After", "1");
+            rep->write_body("json", "{\"error\": \"Rate limit exceeded - try again later\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
+        return handler(std::move(req), std::move(rep));
+    });
+}
+
 void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
-    // 1. DATA PLANE
-    r.add(operation_type::POST, url("/v1/chat/completions"), new async_handler([this](auto req, auto rep) {
+    // 1. DATA PLANE (rate limited)
+    r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(this, [this](auto req, auto rep) {
         return this->handle_proxy(std::move(req), std::move(rep));
     }));
 
+    // Define the check once as a local lambda to keep the calls clean.
+    auto auth_check = [this](const auto& req) { return this->check_admin_auth(req); };
+
     // 2. CONTROL PLANE - Create/Update (auth protected)
-    r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_broadcast_route(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::POST, url("/admin/backends"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_broadcast_backend(std::move(req), std::move(rep));
     }));
 
     // 3. CONTROL PLANE - Delete (auth protected)
-    r.add(operation_type::DELETE, url("/admin/backends"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::DELETE, url("/admin/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_delete_backend(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::DELETE, url("/admin/routes"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::DELETE, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_delete_routes(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_clear_all(std::move(req), std::move(rep));
     }));
 }
@@ -138,12 +186,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
     socket_address target_addr = target_addr_opt.value();
 
-    // 2. Setup Streaming with Timeout
-    // Capture timeout config for the lambda
+    // 2. Setup Streaming with Timeout and Retry
+    // Capture config for the lambda
     auto connect_timeout = _config.connect_timeout;
     auto request_timeout = _config.request_timeout;
+    auto retry_config = _config.retry;
 
-    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -152,18 +201,55 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         bool timed_out = false;
         bool connection_failed = false;
 
-        // 1. GET CONNECTION FROM POOL (with connect timeout)
-        auto connect_deadline = lowres_clock::now() + connect_timeout;
-        auto conn_future = with_timeout(connect_deadline, _pool.get(target_addr));
+        // 1. GET CONNECTION FROM POOL (with connect timeout and retry)
+        uint32_t retry_attempt = 0;
+        auto current_backoff = retry_config.initial_backoff;
 
-        bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
-            log_proxy.warn("Connect timeout or error to backend");
-            connection_failed = true;
-            return ConnectionBundle{}; // Return empty bundle
-        });
+        while (retry_attempt <= retry_config.max_retries) {
+            // Check if we've exceeded overall request deadline
+            if (lowres_clock::now() >= request_deadline) {
+                log_proxy.warn("Request deadline exceeded during connection retry");
+                connection_failed = true;
+                break;
+            }
+
+            auto connect_deadline = lowres_clock::now() + connect_timeout;
+            auto conn_future = with_timeout(connect_deadline, _pool.get(target_addr));
+
+            bool this_attempt_failed = false;
+            bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
+                this_attempt_failed = true;
+                return ConnectionBundle{}; // Return empty bundle
+            });
+
+            if (!this_attempt_failed) {
+                // Connection successful
+                connection_failed = false;
+                break;
+            }
+
+            // Connection failed - check if we should retry
+            if (retry_attempt < retry_config.max_retries) {
+                log_proxy.warn("Connection attempt {} failed, retrying in {}ms",
+                    retry_attempt + 1, current_backoff.count());
+
+                // Wait with exponential backoff before retry
+                co_await seastar::sleep(current_backoff);
+
+                // Increase backoff for next attempt (with cap)
+                auto next_backoff = std::chrono::milliseconds(
+                    static_cast<int64_t>(current_backoff.count() * retry_config.backoff_multiplier));
+                current_backoff = std::min(next_backoff, retry_config.max_backoff);
+            } else {
+                log_proxy.warn("Connection failed after {} retries", retry_config.max_retries + 1);
+                connection_failed = true;
+            }
+
+            retry_attempt++;
+        }
 
         if (connection_failed) {
-            sstring error_msg = "data: {\"error\": \"Connect timeout\"}\n\n";
+            sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
             co_await client_out.write(error_msg);
             co_await client_out.flush();
             co_await client_out.close();
