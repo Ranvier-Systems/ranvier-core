@@ -122,7 +122,7 @@ future<> run() {
     // 5. Load persisted state, then start servers
     return load_persisted_state().then([] {
         // 6. Start Servers (Metrics + API)
-        return do_with(http_server_control(), http_server_control(), [](auto& prom_server, auto& api_server) {
+        return do_with(seastar::httpd::http_server_control(), seastar::httpd::http_server_control(), [](auto& prom_server, auto& api_server) {
 
             // A. Setup Prometheus Server
             return prom_server.start().then([&prom_server] {
@@ -139,7 +139,7 @@ future<> run() {
             }).then([&api_server] {
                 return api_server.start();
             }).then([&api_server] {
-                return api_server.set_routes([](routes& r) {
+                return api_server.set_routes([](seastar::httpd::routes& r) {
                     controller->register_routes(r);
                 });
             }).then([&api_server] {
