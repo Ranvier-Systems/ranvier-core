@@ -18,6 +18,12 @@ using namespace seastar;
 
 namespace ranvier {
 
+// Custom exception for request timeouts
+class request_timeout_error : public std::runtime_error {
+public:
+    request_timeout_error() : std::runtime_error("Request timed out") {}
+};
+
 // Helper: explicit seastar::httpd:: (Server) types
 template <typename Func>
 struct async_handler : public seastar::httpd::handler_base {
