@@ -7,6 +7,9 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/net/api.hh>
@@ -14,6 +17,12 @@
 using namespace seastar;
 
 namespace ranvier {
+
+// Custom exception for request timeouts
+class request_timeout_error : public std::runtime_error {
+public:
+    request_timeout_error() : std::runtime_error("Request timed out") {}
+};
 
 // Helper: explicit seastar::httpd:: (Server) types
 template <typename Func>
@@ -361,43 +370,77 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
     socket_address target_addr = target_addr_opt.value();
 
-    // 2. Setup Streaming
-    // STREAMING RESPONSE
-    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id](output_stream<char> client_out) -> future<> {
+    // 2. Setup Streaming with Timeout
+    // Capture timeout config for the lambda
+    auto connect_timeout = _config.connect_timeout;
+    auto request_timeout = _config.request_timeout;
 
-        // 1. GET CONNECTION FROM POOL
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout](output_stream<char> client_out) -> future<> {
+
+        // Calculate request deadline
+        auto request_deadline = lowres_clock::now() + request_timeout;
+
         // Note: We declare bundle outside try/catch so we can return it later
         ConnectionBundle bundle;
+        bool timed_out = false;
 
         try {
-            // Use co_await to get a connection (either new or reused)
-            bundle = co_await _pool.get(target_addr);
+            // 1. GET CONNECTION FROM POOL (with connect timeout)
+            auto connect_deadline = lowres_clock::now() + connect_timeout;
+            auto conn_result = co_await with_timeout(connect_deadline, _pool.get(target_addr));
+
+            if (!conn_result) {
+                log_proxy.warn("Connect timeout after {}s to backend", connect_timeout.count());
+                throw request_timeout_error();
+            }
+            bundle = std::move(*conn_result);
+
+            // 2. SEND REQUEST (with timeout check)
+            if (lowres_clock::now() >= request_deadline) {
+                throw request_timeout_error();
+            }
 
             sstring http_req =
                 "POST /v1/chat/completions HTTP/1.1\r\n"
                 "Host: localhost\r\n"
                 "Content-Type: application/json\r\n"
                 "Content-Length: " + to_sstring(body.size()) + "\r\n"
-                "Connection: keep-alive\r\n\r\n" +  // <--- CHANGED: keep-alive
+                "Connection: keep-alive\r\n\r\n" +
                 body;
 
             co_await bundle.out.write(http_req);
             co_await bundle.out.flush();
 
-            // 3. The Read Loop
+            // 3. The Read Loop (with timeout)
             StreamParser parser;
             while (true) {
-                // Read from the POOLED input stream
-                auto chunk = co_await bundle.in.read();
+                // Check request timeout before each read
+                if (lowres_clock::now() >= request_deadline) {
+                    log_proxy.warn("Request timeout after {}s", request_timeout.count());
+                    timed_out = true;
+                    bundle.is_valid = false;
+                    break;
+                }
 
-                // EOF logic:
-                // If chunk is empty, the server closed on us.
-                // This is fine for 'Connection: close', but for keep-alive,
-                // we actually rely on Content-Length or Chunked Encoding to know when to stop.
-                // Since we are parsing Raw TCP, and Ollama might use Chunked,
-                // our StreamParser logic needs to be robust.
+                // Read with per-chunk timeout (use remaining time, capped at 30s per read)
+                auto remaining = std::chrono::duration_cast<std::chrono::seconds>(request_deadline - lowres_clock::now());
+                auto read_timeout = std::min(remaining, std::chrono::seconds(30));
+                auto read_deadline = lowres_clock::now() + read_timeout;
+
+                auto chunk_result = co_await with_timeout(read_deadline, bundle.in.read());
+
+                if (!chunk_result) {
+                    log_proxy.warn("Read timeout waiting for backend response");
+                    timed_out = true;
+                    bundle.is_valid = false;
+                    break;
+                }
+
+                auto chunk = std::move(*chunk_result);
+
+                // EOF logic
                 if (chunk.empty()) {
-                    bundle.is_valid = false; // Server hung up, discard this connection
+                    bundle.is_valid = false;
                     break;
                 }
 
@@ -408,7 +451,6 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     (void)_router.learn_route_global(tokens, target_id);
                     log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
 
-                    // Persist the learned route
                     if (_persistence) {
                         _persistence->save_route(tokens, target_id);
                     }
@@ -420,21 +462,30 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
 
                 if (res.done) {
-                    // Success! We finished reading this specific request.
-                    // We can stop reading from the socket now.
                     break;
                 }
             }
+
+            // Send timeout error to client if we timed out mid-stream
+            if (timed_out) {
+                sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            }
+
+        } catch (const request_timeout_error& e) {
+            log_proxy.warn("Request timeout: {}", e.what());
+            bundle.is_valid = false;
+            sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
+            co_await client_out.write(error_msg);
+            co_await client_out.flush();
         } catch (const std::exception& e) {
             log_proxy.error("Proxy error: {}", e.what());
-            bundle.is_valid = false; // Mark broken so we don't reuse it
+            bundle.is_valid = false;
         }
 
         // 4. CLEANUP
-        // Return backend connection to pool (or close if invalid)
         _pool.put(std::move(bundle));
-
-        // Always close the USER connection
         co_await client_out.close();
     });
 

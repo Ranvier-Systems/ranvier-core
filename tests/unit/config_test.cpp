@@ -65,6 +65,10 @@ TEST_F(ConfigTest, DefaultsReturnExpectedValues) {
     EXPECT_EQ(config.routing.min_token_length, 4u);
     EXPECT_EQ(config.routing.backend_retry_limit, 5u);
 
+    // Timeout defaults
+    EXPECT_EQ(config.timeouts.connect_timeout.count(), 5);
+    EXPECT_EQ(config.timeouts.request_timeout.count(), 300);
+
     // Assets defaults
     EXPECT_EQ(config.assets.tokenizer_path, "assets/gpt2.json");
 }
@@ -98,6 +102,10 @@ routing:
   min_token_length: 64
   backend_retry_limit: 10
 
+timeouts:
+  connect_timeout_seconds: 10
+  request_timeout_seconds: 600
+
 assets:
   tokenizer_path: "/models/tokenizer.json"
 )");
@@ -129,6 +137,10 @@ assets:
     // Routing
     EXPECT_EQ(config.routing.min_token_length, 64u);
     EXPECT_EQ(config.routing.backend_retry_limit, 10u);
+
+    // Timeouts
+    EXPECT_EQ(config.timeouts.connect_timeout.count(), 10);
+    EXPECT_EQ(config.timeouts.request_timeout.count(), 600);
 
     // Assets
     EXPECT_EQ(config.assets.tokenizer_path, "/models/tokenizer.json");
@@ -258,6 +270,10 @@ TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
 
     RoutingConfig routing;
     EXPECT_EQ(routing.min_token_length, 4u);
+
+    TimeoutConfig timeouts;
+    EXPECT_EQ(timeouts.connect_timeout.count(), 5);
+    EXPECT_EQ(timeouts.request_timeout.count(), 300);
 
     AssetsConfig assets;
     EXPECT_EQ(assets.tokenizer_path, "assets/gpt2.json");

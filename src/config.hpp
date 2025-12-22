@@ -54,6 +54,12 @@ struct RoutingConfig {
     uint32_t backend_retry_limit = 5;  // Max attempts to find a live backend
 };
 
+// Timeout configuration
+struct TimeoutConfig {
+    std::chrono::seconds connect_timeout{5};      // Timeout for establishing backend connection
+    std::chrono::seconds request_timeout{300};    // Total timeout for entire request (5 min for LLM inference)
+};
+
 // Tokenizer/assets configuration
 struct AssetsConfig {
     std::string tokenizer_path = "assets/gpt2.json";
@@ -66,6 +72,7 @@ struct RanvierConfig {
     HealthConfig health;
     PoolConfig pool;
     RoutingConfig routing;
+    TimeoutConfig timeouts;
     AssetsConfig assets;
 
     // Load configuration from YAML file
@@ -145,6 +152,14 @@ inline void RanvierConfig::apply_env_overrides() {
     // Routing overrides
     if (auto v = get_env_as<size_t>("RANVIER_MIN_TOKEN_LENGTH")) {
         routing.min_token_length = *v;
+    }
+
+    // Timeout overrides
+    if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
+        timeouts.connect_timeout = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env_as<int>("RANVIER_REQUEST_TIMEOUT")) {
+        timeouts.request_timeout = std::chrono::seconds(*v);
     }
 
     // Assets overrides
@@ -228,6 +243,17 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["backend_retry_limit"]) {
                 config.routing.backend_retry_limit = r["backend_retry_limit"].as<uint32_t>();
+            }
+        }
+
+        // Timeouts section
+        if (yaml["timeouts"]) {
+            YAML::Node t = yaml["timeouts"];
+            if (t["connect_timeout_seconds"]) {
+                config.timeouts.connect_timeout = std::chrono::seconds(t["connect_timeout_seconds"].as<int>());
+            }
+            if (t["request_timeout_seconds"]) {
+                config.timeouts.request_timeout = std::chrono::seconds(t["request_timeout_seconds"].as<int>());
             }
         }
 
