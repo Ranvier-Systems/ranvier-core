@@ -380,106 +380,114 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
 
-        // Note: We declare bundle outside try/catch so we can return it later
         ConnectionBundle bundle;
         bool timed_out = false;
+        bool connection_failed = false;
 
-        try {
-            // 1. GET CONNECTION FROM POOL (with connect timeout)
-            auto connect_deadline = lowres_clock::now() + connect_timeout;
-            try {
-                bundle = co_await with_timeout(connect_deadline, _pool.get(target_addr));
-            } catch (const seastar::timed_out_error&) {
-                log_proxy.warn("Connect timeout after {}s to backend", connect_timeout.count());
-                throw request_timeout_error();
-            }
+        // 1. GET CONNECTION FROM POOL (with connect timeout)
+        auto connect_deadline = lowres_clock::now() + connect_timeout;
+        auto conn_future = with_timeout(connect_deadline, _pool.get(target_addr));
 
-            // 2. SEND REQUEST (with timeout check)
-            if (lowres_clock::now() >= request_deadline) {
-                throw request_timeout_error();
-            }
+        bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
+            log_proxy.warn("Connect timeout or error to backend");
+            connection_failed = true;
+            return ConnectionBundle{}; // Return empty bundle
+        });
 
-            sstring http_req =
-                "POST /v1/chat/completions HTTP/1.1\r\n"
-                "Host: localhost\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: " + to_sstring(body.size()) + "\r\n"
-                "Connection: keep-alive\r\n\r\n" +
-                body;
+        if (connection_failed) {
+            sstring error_msg = "data: {\"error\": \"Connect timeout\"}\n\n";
+            co_await client_out.write(error_msg);
+            co_await client_out.flush();
+            co_await client_out.close();
+            co_return;
+        }
 
-            co_await bundle.out.write(http_req);
-            co_await bundle.out.flush();
-
-            // 3. The Read Loop (with timeout)
-            StreamParser parser;
-            while (true) {
-                // Check request timeout before each read
-                if (lowres_clock::now() >= request_deadline) {
-                    log_proxy.warn("Request timeout after {}s", request_timeout.count());
-                    timed_out = true;
-                    bundle.is_valid = false;
-                    break;
-                }
-
-                // Read with per-chunk timeout (use remaining time, capped at 30s per read)
-                auto remaining = std::chrono::duration_cast<std::chrono::seconds>(request_deadline - lowres_clock::now());
-                auto read_timeout = std::min(remaining, std::chrono::seconds(30));
-                auto read_deadline = lowres_clock::now() + read_timeout;
-
-                temporary_buffer<char> chunk;
-                try {
-                    chunk = co_await with_timeout(read_deadline, bundle.in.read());
-                } catch (const seastar::timed_out_error&) {
-                    log_proxy.warn("Read timeout waiting for backend response");
-                    timed_out = true;
-                    bundle.is_valid = false;
-                    break;
-                }
-
-                // EOF logic
-                if (chunk.empty()) {
-                    bundle.is_valid = false;
-                    break;
-                }
-
-                auto res = parser.push(std::move(chunk));
-
-                // Snooping Logic
-                if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= _config.min_token_length) {
-                    (void)_router.learn_route_global(tokens, target_id);
-                    log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
-
-                    if (_persistence) {
-                        _persistence->save_route(tokens, target_id);
-                    }
-                }
-
-                if (!res.data.empty()) {
-                    co_await client_out.write(res.data);
-                    co_await client_out.flush();
-                }
-
-                if (res.done) {
-                    break;
-                }
-            }
-
-            // Send timeout error to client if we timed out mid-stream
-            if (timed_out) {
-                sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
-                co_await client_out.write(error_msg);
-                co_await client_out.flush();
-            }
-
-        } catch (const request_timeout_error& e) {
-            log_proxy.warn("Request timeout: {}", e.what());
+        // 2. SEND REQUEST (with timeout check)
+        if (lowres_clock::now() >= request_deadline) {
+            log_proxy.warn("Request timeout before sending");
             bundle.is_valid = false;
+            _pool.put(std::move(bundle));
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
             co_await client_out.write(error_msg);
             co_await client_out.flush();
-        } catch (const std::exception& e) {
-            log_proxy.error("Proxy error: {}", e.what());
-            bundle.is_valid = false;
+            co_await client_out.close();
+            co_return;
+        }
+
+        sstring http_req =
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: " + to_sstring(body.size()) + "\r\n"
+            "Connection: keep-alive\r\n\r\n" +
+            body;
+
+        co_await bundle.out.write(http_req);
+        co_await bundle.out.flush();
+
+        // 3. The Read Loop (with timeout)
+        StreamParser parser;
+        while (true) {
+            // Check request timeout before each read
+            if (lowres_clock::now() >= request_deadline) {
+                log_proxy.warn("Request timeout after {}s", request_timeout.count());
+                timed_out = true;
+                bundle.is_valid = false;
+                break;
+            }
+
+            // Read with per-chunk timeout (use remaining time, capped at 30s per read)
+            auto remaining = std::chrono::duration_cast<std::chrono::seconds>(request_deadline - lowres_clock::now());
+            auto read_timeout = std::min(remaining, std::chrono::seconds(30));
+            auto read_deadline = lowres_clock::now() + read_timeout;
+
+            bool read_failed = false;
+            auto read_future = with_timeout(read_deadline, bundle.in.read());
+            temporary_buffer<char> chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
+                log_proxy.warn("Read timeout waiting for backend response");
+                read_failed = true;
+                return temporary_buffer<char>{}; // Return empty buffer
+            });
+
+            if (read_failed) {
+                timed_out = true;
+                bundle.is_valid = false;
+                break;
+            }
+
+            // EOF logic
+            if (chunk.empty()) {
+                bundle.is_valid = false;
+                break;
+            }
+
+            auto res = parser.push(std::move(chunk));
+
+            // Snooping Logic
+            if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= _config.min_token_length) {
+                (void)_router.learn_route_global(tokens, target_id);
+                log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
+
+                if (_persistence) {
+                    _persistence->save_route(tokens, target_id);
+                }
+            }
+
+            if (!res.data.empty()) {
+                co_await client_out.write(res.data);
+                co_await client_out.flush();
+            }
+
+            if (res.done) {
+                break;
+            }
+        }
+
+        // Send timeout error to client if needed
+        if (timed_out) {
+            sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
+            co_await client_out.write(error_msg);
+            co_await client_out.flush();
         }
 
         // 4. CLEANUP
