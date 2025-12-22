@@ -104,3 +104,16 @@ auth:
   # Example usage with curl:
   #   curl -X POST http://localhost:8080/admin/backends?id=1&ip=192.168.1.100&port=11434 \
   #     -H "Authorization: Bearer your-secret-api-key-here"
+
+# Rate limiting configuration
+# Prevent abuse by limiting requests per client IP
+rate_limit:
+  # Enable rate limiting (RANVIER_RATE_LIMIT_ENABLED)
+  enabled: false
+
+  # Maximum sustained requests per second per client (RANVIER_RATE_LIMIT_RPS)
+  requests_per_second: 100
+
+  # Allow short bursts above the rate limit (RANVIER_RATE_LIMIT_BURST)
+  # Clients can make up to burst_size requests instantly before being limited
+  burst_size: 50
