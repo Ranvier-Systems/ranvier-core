@@ -72,6 +72,11 @@ struct TlsConfig {
     std::string key_path = "";                // Path to private key file (PEM)
 };
 
+// Authentication configuration
+struct AuthConfig {
+    std::string admin_api_key = "";           // API key for admin endpoints (empty = no auth)
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -82,6 +87,7 @@ struct RanvierConfig {
     TimeoutConfig timeouts;
     AssetsConfig assets;
     TlsConfig tls;
+    AuthConfig auth;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -179,6 +185,9 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env("RANVIER_TLS_CERT_PATH")) tls.cert_path = *v;
     if (auto v = get_env("RANVIER_TLS_KEY_PATH")) tls.key_path = *v;
+
+    // Auth overrides
+    if (auto v = get_env("RANVIER_ADMIN_API_KEY")) auth.admin_api_key = *v;
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -284,6 +293,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (t["enabled"]) config.tls.enabled = t["enabled"].as<bool>();
             if (t["cert_path"]) config.tls.cert_path = t["cert_path"].as<std::string>();
             if (t["key_path"]) config.tls.key_path = t["key_path"].as<std::string>();
+        }
+
+        // Auth section
+        if (yaml["auth"]) {
+            YAML::Node a = yaml["auth"];
+            if (a["admin_api_key"]) config.auth.admin_api_key = a["admin_api_key"].as<std::string>();
         }
 
     } catch (const YAML::Exception& e) {

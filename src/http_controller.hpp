@@ -17,6 +17,7 @@ struct HttpControllerConfig {
     size_t min_token_length = 4;  // Minimum tokens before caching a route
     std::chrono::seconds connect_timeout{5};    // Timeout for backend connection
     std::chrono::seconds request_timeout{300};  // Total timeout for request
+    std::string admin_api_key = "";             // API key for admin endpoints (empty = no auth)
 };
 
 class HttpController {
@@ -46,6 +47,9 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_routes(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Auth helper - returns true if authorized, false otherwise
+    bool check_admin_auth(const seastar::http::request& req) const;
 };
 
 } // namespace ranvier

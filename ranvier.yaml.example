@@ -92,3 +92,15 @@ tls:
   #   openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
   #
   # For production, use certificates from a trusted CA (e.g., Let's Encrypt)
+
+# Authentication configuration
+# Protect admin endpoints (/admin/*) with API key authentication
+auth:
+  # API key for admin endpoints (RANVIER_ADMIN_API_KEY)
+  # When set, all /admin/* requests must include: Authorization: Bearer <api_key>
+  # Leave empty to disable authentication (not recommended for production)
+  # admin_api_key: "your-secret-api-key-here"
+
+  # Example usage with curl:
+  #   curl -X POST http://localhost:8080/admin/backends?id=1&ip=192.168.1.100&port=11434 \
+  #     -H "Authorization: Bearer your-secret-api-key-here"
