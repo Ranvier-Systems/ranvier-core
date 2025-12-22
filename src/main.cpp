@@ -172,13 +172,8 @@ future<> run() {
             }).then([&api_server, &tls_creds] {
                 auto addr = socket_address(ipv4_addr(g_config.server.bind_address, g_config.server.api_port));
                 if (tls_creds) {
-                    // Set TLS credentials on the server
-                    return api_server.invoke_on_all([&tls_creds](httpd::http_server& server) {
-                        server.set_tls_credentials(tls_creds);
-                        return make_ready_future<>();
-                    }).then([&api_server, addr] {
-                        return api_server.listen(addr);
-                    });
+                    // Pass TLS credentials directly to listen()
+                    return api_server.listen(addr, tls_creds);
                 }
                 return api_server.listen(addr);
             }).then([] {
