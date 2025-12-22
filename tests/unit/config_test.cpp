@@ -19,6 +19,9 @@ protected:
         unsetenv("RANVIER_MIN_TOKEN_LENGTH");
         unsetenv("RANVIER_POOL_MAX_PER_HOST");
         unsetenv("RANVIER_TOKENIZER_PATH");
+        unsetenv("RANVIER_TLS_ENABLED");
+        unsetenv("RANVIER_TLS_CERT_PATH");
+        unsetenv("RANVIER_TLS_KEY_PATH");
     }
 
     void TearDown() override {
@@ -71,6 +74,11 @@ TEST_F(ConfigTest, DefaultsReturnExpectedValues) {
 
     // Assets defaults
     EXPECT_EQ(config.assets.tokenizer_path, "assets/gpt2.json");
+
+    // TLS defaults
+    EXPECT_FALSE(config.tls.enabled);
+    EXPECT_EQ(config.tls.cert_path, "");
+    EXPECT_EQ(config.tls.key_path, "");
 }
 
 // Test loading a complete YAML config file
@@ -108,6 +116,11 @@ timeouts:
 
 assets:
   tokenizer_path: "/models/tokenizer.json"
+
+tls:
+  enabled: true
+  cert_path: "/certs/server.crt"
+  key_path: "/certs/server.key"
 )");
 
     auto config = RanvierConfig::load("test_config.yaml");
@@ -144,6 +157,11 @@ assets:
 
     // Assets
     EXPECT_EQ(config.assets.tokenizer_path, "/models/tokenizer.json");
+
+    // TLS
+    EXPECT_TRUE(config.tls.enabled);
+    EXPECT_EQ(config.tls.cert_path, "/certs/server.crt");
+    EXPECT_EQ(config.tls.key_path, "/certs/server.key");
 }
 
 // Test that partial config files work (missing sections use defaults)
@@ -277,6 +295,42 @@ TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
 
     AssetsConfig assets;
     EXPECT_EQ(assets.tokenizer_path, "assets/gpt2.json");
+
+    TlsConfig tls;
+    EXPECT_FALSE(tls.enabled);
+    EXPECT_EQ(tls.cert_path, "");
+    EXPECT_EQ(tls.key_path, "");
+}
+
+// Test TLS environment variable overrides
+TEST_F(ConfigTest, TlsEnvironmentVariablesOverride) {
+    setenv("RANVIER_TLS_ENABLED", "true", 1);
+    setenv("RANVIER_TLS_CERT_PATH", "/env/cert.pem", 1);
+    setenv("RANVIER_TLS_KEY_PATH", "/env/key.pem", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_TRUE(config.tls.enabled);
+    EXPECT_EQ(config.tls.cert_path, "/env/cert.pem");
+    EXPECT_EQ(config.tls.key_path, "/env/key.pem");
+}
+
+// Test TLS enabled values (1, true, yes all work)
+TEST_F(ConfigTest, TlsEnabledAcceptsMultipleValues) {
+    // Test "1"
+    setenv("RANVIER_TLS_ENABLED", "1", 1);
+    auto config1 = RanvierConfig::defaults();
+    EXPECT_TRUE(config1.tls.enabled);
+
+    // Test "yes"
+    setenv("RANVIER_TLS_ENABLED", "yes", 1);
+    auto config2 = RanvierConfig::defaults();
+    EXPECT_TRUE(config2.tls.enabled);
+
+    // Test "false" (should remain false)
+    setenv("RANVIER_TLS_ENABLED", "false", 1);
+    auto config3 = RanvierConfig::defaults();
+    EXPECT_FALSE(config3.tls.enabled);
 }
 
 int main(int argc, char** argv) {

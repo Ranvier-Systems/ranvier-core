@@ -75,3 +75,20 @@ timeouts:
 assets:
   # Path to GPT-2 tokenizer vocabulary JSON file (RANVIER_TOKENIZER_PATH)
   tokenizer_path: "assets/gpt2.json"
+
+# TLS/HTTPS configuration
+# Enable TLS for secure HTTPS connections to the API server
+tls:
+  # Enable TLS (RANVIER_TLS_ENABLED) - set to true to enable HTTPS
+  enabled: false
+
+  # Path to TLS certificate file in PEM format (RANVIER_TLS_CERT_PATH)
+  # cert_path: "/path/to/cert.pem"
+
+  # Path to TLS private key file in PEM format (RANVIER_TLS_KEY_PATH)
+  # key_path: "/path/to/key.pem"
+
+  # Example for self-signed certificate (development only):
+  #   openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+  #
+  # For production, use certificates from a trusted CA (e.g., Let's Encrypt)

@@ -65,6 +65,13 @@ struct AssetsConfig {
     std::string tokenizer_path = "assets/gpt2.json";
 };
 
+// TLS configuration
+struct TlsConfig {
+    bool enabled = false;                     // Enable TLS for API server
+    std::string cert_path = "";               // Path to certificate file (PEM)
+    std::string key_path = "";                // Path to private key file (PEM)
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -74,6 +81,7 @@ struct RanvierConfig {
     RoutingConfig routing;
     TimeoutConfig timeouts;
     AssetsConfig assets;
+    TlsConfig tls;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -164,6 +172,13 @@ inline void RanvierConfig::apply_env_overrides() {
 
     // Assets overrides
     if (auto v = get_env("RANVIER_TOKENIZER_PATH")) assets.tokenizer_path = *v;
+
+    // TLS overrides
+    if (auto v = get_env("RANVIER_TLS_ENABLED")) {
+        tls.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_TLS_CERT_PATH")) tls.cert_path = *v;
+    if (auto v = get_env("RANVIER_TLS_KEY_PATH")) tls.key_path = *v;
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -261,6 +276,14 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
         if (yaml["assets"]) {
             YAML::Node a = yaml["assets"];
             if (a["tokenizer_path"]) config.assets.tokenizer_path = a["tokenizer_path"].as<std::string>();
+        }
+
+        // TLS section
+        if (yaml["tls"]) {
+            YAML::Node t = yaml["tls"];
+            if (t["enabled"]) config.tls.enabled = t["enabled"].as<bool>();
+            if (t["cert_path"]) config.tls.cert_path = t["cert_path"].as<std::string>();
+            if (t["key_path"]) config.tls.key_path = t["key_path"].as<std::string>();
         }
 
     } catch (const YAML::Exception& e) {

@@ -22,6 +22,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/net/tls.hh>
 
 using namespace seastar;
 
@@ -122,10 +123,36 @@ future<> run() {
     // 5. Load persisted state, then start servers
     return load_persisted_state().then([] {
         // 6. Start Servers (Metrics + API)
-        return do_with(seastar::httpd::http_server_control(), seastar::httpd::http_server_control(), [](auto& prom_server, auto& api_server) {
+        return do_with(seastar::httpd::http_server_control(), seastar::httpd::http_server_control(),
+            seastar::shared_ptr<tls::server_credentials>(),
+            [](auto& prom_server, auto& api_server, auto& tls_creds) {
 
-            // A. Setup Prometheus Server
-            return prom_server.start().then([&prom_server] {
+            // Setup TLS credentials if enabled
+            future<> tls_setup = make_ready_future<>();
+            if (g_config.tls.enabled) {
+                if (g_config.tls.cert_path.empty() || g_config.tls.key_path.empty()) {
+                    ranvier::log_main.error("TLS enabled but cert_path or key_path not configured");
+                    return make_exception_future<>(std::runtime_error("TLS configuration incomplete"));
+                }
+
+                auto creds_builder = seastar::make_shared<tls::credentials_builder>();
+                tls_setup = creds_builder->set_x509_key_file(
+                    g_config.tls.cert_path,
+                    g_config.tls.key_path,
+                    tls::x509_crt_format::PEM
+                ).then([creds_builder, &tls_creds] {
+                    tls_creds = creds_builder->build_server_credentials();
+                    ranvier::log_main.info("TLS credentials loaded successfully");
+                }).handle_exception([](auto ep) {
+                    ranvier::log_main.error("Failed to load TLS credentials");
+                    return make_exception_future<>(ep);
+                });
+            }
+
+            return tls_setup.then([&prom_server] {
+                // A. Setup Prometheus Server
+                return prom_server.start();
+            }).then([&prom_server] {
                 seastar::prometheus::config pconf;
                 pconf.metric_help = "Ranvier AI Router";
                 return seastar::prometheus::start(prom_server, pconf);
@@ -142,12 +169,22 @@ future<> run() {
                 return api_server.set_routes([](seastar::httpd::routes& r) {
                     controller->register_routes(r);
                 });
-            }).then([&api_server] {
+            }).then([&api_server, &tls_creds] {
                 auto addr = socket_address(ipv4_addr(g_config.server.bind_address, g_config.server.api_port));
+                if (tls_creds) {
+                    // Set TLS credentials on the server
+                    return api_server.invoke_on_all([&tls_creds](httpd::http_server& server) {
+                        server.set_tls_credentials(tls_creds);
+                        return make_ready_future<>();
+                    }).then([&api_server, addr] {
+                        return api_server.listen(addr);
+                    });
+                }
                 return api_server.listen(addr);
             }).then([] {
-                ranvier::log_main.info("Ranvier listening on {}:{}",
-                    g_config.server.bind_address, g_config.server.api_port);
+                auto protocol = g_config.tls.enabled ? "https" : "http";
+                ranvier::log_main.info("Ranvier listening on {}://{}:{}",
+                    protocol, g_config.server.bind_address, g_config.server.api_port);
 
                 // Wait Loop
                 auto stop_signal = std::make_shared<promise<>>();
@@ -206,6 +243,11 @@ int main(int argc, char** argv) {
         std::cout << "  Timeouts:     " << g_config.timeouts.connect_timeout.count() << "s connect, "
                   << g_config.timeouts.request_timeout.count() << "s request\n";
         std::cout << "  Min Tokens:   " << g_config.routing.min_token_length << "\n";
+        if (g_config.tls.enabled) {
+            std::cout << "  TLS:          enabled (cert: " << g_config.tls.cert_path << ")\n";
+        } else {
+            std::cout << "  TLS:          disabled\n";
+        }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
         return 1;
