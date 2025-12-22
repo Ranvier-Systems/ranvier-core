@@ -58,6 +58,32 @@ bool HttpController::check_admin_auth(const seastar::http::request& req) const {
     return token == _config.admin_api_key;
 }
 
+// Get client IP from request, checking X-Forwarded-For for proxied requests
+std::string HttpController::get_client_ip(const seastar::http::request& req) {
+    // Check X-Forwarded-For header first (for proxied requests)
+    auto xff_it = req._headers.find("X-Forwarded-For");
+    if (xff_it != req._headers.end() && !xff_it->second.empty()) {
+        // X-Forwarded-For can contain multiple IPs; take the first (original client)
+        auto& xff = xff_it->second;
+        auto comma_pos = xff.find(',');
+        if (comma_pos != std::string::npos) {
+            return std::string(xff.substr(0, comma_pos));
+        }
+        return std::string(xff);
+    }
+
+    // Fall back to direct client address
+    // Note: In Seastar, we'd need the connection info which isn't directly available here
+    // For now, return a default that will work for non-proxied setups
+    return "direct";
+}
+
+// Check rate limit for a request
+bool HttpController::check_rate_limit(const seastar::http::request& req) {
+    std::string client_ip = get_client_ip(req);
+    return _rate_limiter.allow(client_ip);
+}
+
 // Helper to create an auth-protected admin handler
 template <typename AuthCheck, typename Func>
 auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
@@ -77,11 +103,32 @@ auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
     });
 }
 
+// Helper to create a rate-limited handler
+template <typename RateLimitCheck, typename Func>
+auto make_rate_limited_handler(RateLimitCheck&& rate_limit_check, Func&& handler) {
+    return new async_handler([
+        rate_limit_check = std::forward<RateLimitCheck>(rate_limit_check),
+        handler = std::forward<Func>(handler)
+    ](auto req, auto rep) mutable
+        -> future<std::unique_ptr<seastar::httpd::reply>> {
+        if (!rate_limit_check(*req)) {
+            rep->set_status(seastar::http::reply::status_type::service_unavailable);
+            rep->add_header("Retry-After", "1");
+            rep->write_body("json", "{\"error\": \"Rate limit exceeded - try again later\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
+        return handler(std::move(req), std::move(rep));
+    });
+}
+
 void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
-    // 1. DATA PLANE
-    r.add(operation_type::POST, url("/v1/chat/completions"), new async_handler([this](auto req, auto rep) {
+    // Define the check once as a local lambda to keep the calls clean.
+    auto rate_limit_check = [this](const auto& req) { return this->check_rate_limit(req); };
+
+    // 1. DATA PLANE (rate limited)
+    r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(rate_limit_check, [this](auto req, auto rep) {
         return this->handle_proxy(std::move(req), std::move(rep));
     }));
 

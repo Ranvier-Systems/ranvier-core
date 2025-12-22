@@ -77,6 +77,13 @@ struct AuthConfig {
     std::string admin_api_key = "";           // API key for admin endpoints (empty = no auth)
 };
 
+// Rate limiting configuration
+struct RateLimitConfig {
+    bool enabled = false;                     // Enable rate limiting
+    uint32_t requests_per_second = 100;       // Max requests per second per client
+    uint32_t burst_size = 50;                 // Allow burst above rate limit
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -88,6 +95,7 @@ struct RanvierConfig {
     AssetsConfig assets;
     TlsConfig tls;
     AuthConfig auth;
+    RateLimitConfig rate_limit;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -188,6 +196,17 @@ inline void RanvierConfig::apply_env_overrides() {
 
     // Auth overrides
     if (auto v = get_env("RANVIER_ADMIN_API_KEY")) auth.admin_api_key = *v;
+
+    // Rate limit overrides
+    if (auto v = get_env("RANVIER_RATE_LIMIT_ENABLED")) {
+        rate_limit.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_RATE_LIMIT_RPS")) {
+        rate_limit.requests_per_second = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_RATE_LIMIT_BURST")) {
+        rate_limit.burst_size = *v;
+    }
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -299,6 +318,14 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
         if (yaml["auth"]) {
             YAML::Node a = yaml["auth"];
             if (a["admin_api_key"]) config.auth.admin_api_key = a["admin_api_key"].as<std::string>();
+        }
+
+        // Rate limit section
+        if (yaml["rate_limit"]) {
+            YAML::Node r = yaml["rate_limit"];
+            if (r["enabled"]) config.rate_limit.enabled = r["enabled"].as<bool>();
+            if (r["requests_per_second"]) config.rate_limit.requests_per_second = r["requests_per_second"].as<uint32_t>();
+            if (r["burst_size"]) config.rate_limit.burst_size = r["burst_size"].as<uint32_t>();
         }
 
     } catch (const YAML::Exception& e) {
