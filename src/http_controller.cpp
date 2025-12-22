@@ -59,11 +59,15 @@ bool HttpController::check_admin_auth(const seastar::http::request& req) const {
 }
 
 // Helper to create an auth-protected admin handler
-template <typename Func>
-auto make_admin_handler(HttpController* ctrl, Func&& handler) {
-    return new async_handler([ctrl, handler = std::forward<Func>(handler)](auto req, auto rep) mutable
-        -> future<std::unique_ptr<seastar::httpd::reply>> {
-        if (!ctrl->check_admin_auth(*req)) {
+template <typename AuthCheck, typename Func>
+auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
+    return new async_handler([
+        auth_check = std::forward<AuthCheck>(auth_check),
+        handler = std::forward<Func>(handler)
+    ](auto req, auto rep) mutable -> future<std::unique_ptr<seastar::httpd::reply>> {
+
+        // Execute the captured private check
+        if (!auth_check(*req)) {
             rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->add_header("WWW-Authenticate", "Bearer");
             rep->write_body("json", "{\"error\": \"Unauthorized - valid API key required\"}");
@@ -81,25 +85,28 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_proxy(std::move(req), std::move(rep));
     }));
 
+    // Define the check once as a local lambda to keep the calls clean.
+    auto auth_check = [this](const auto& req) { return this->check_admin_auth(req); };
+
     // 2. CONTROL PLANE - Create/Update (auth protected)
-    r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_broadcast_route(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::POST, url("/admin/backends"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_broadcast_backend(std::move(req), std::move(rep));
     }));
 
     // 3. CONTROL PLANE - Delete (auth protected)
-    r.add(operation_type::DELETE, url("/admin/backends"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::DELETE, url("/admin/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_delete_backend(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::DELETE, url("/admin/routes"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::DELETE, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_delete_routes(std::move(req), std::move(rep));
     }));
 
-    r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(this, [this](auto req, auto rep) {
+    r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_clear_all(std::move(req), std::move(rep));
     }));
 }
