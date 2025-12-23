@@ -1,0 +1,16 @@
+# Ignore massive token-heavy data
+assets/*.json
+assets/gpt2.json
+
+# Ignore build and system files
+build/
+dist/
+.git/
+node_modules/
+
+# Optional: Ignore all docs by default to save tokens
+# You can tell Claude: "Read doc/CLAUDE_CONTEXT.md" specifically
+doc/architecture.md
+doc/request-flow.md
+doc/api-reference.md
+doc/notes.md
