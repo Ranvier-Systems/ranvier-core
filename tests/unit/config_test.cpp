@@ -29,6 +29,11 @@ protected:
         unsetenv("RANVIER_RETRY_MAX");
         unsetenv("RANVIER_RETRY_INITIAL_BACKOFF_MS");
         unsetenv("RANVIER_RETRY_MAX_BACKOFF_MS");
+        unsetenv("RANVIER_CIRCUIT_BREAKER_ENABLED");
+        unsetenv("RANVIER_CIRCUIT_BREAKER_FAILURE_THRESHOLD");
+        unsetenv("RANVIER_CIRCUIT_BREAKER_SUCCESS_THRESHOLD");
+        unsetenv("RANVIER_CIRCUIT_BREAKER_RECOVERY_TIMEOUT");
+        unsetenv("RANVIER_CIRCUIT_BREAKER_FALLBACK");
     }
 
     void TearDown() override {
@@ -100,6 +105,13 @@ TEST_F(ConfigTest, DefaultsReturnExpectedValues) {
     EXPECT_EQ(config.retry.initial_backoff.count(), 100);
     EXPECT_EQ(config.retry.max_backoff.count(), 5000);
     EXPECT_DOUBLE_EQ(config.retry.backoff_multiplier, 2.0);
+
+    // Circuit breaker defaults
+    EXPECT_TRUE(config.circuit_breaker.enabled);
+    EXPECT_EQ(config.circuit_breaker.failure_threshold, 5u);
+    EXPECT_EQ(config.circuit_breaker.success_threshold, 2u);
+    EXPECT_EQ(config.circuit_breaker.recovery_timeout.count(), 30);
+    EXPECT_TRUE(config.circuit_breaker.fallback_enabled);
 }
 
 // Test loading a complete YAML config file
@@ -156,6 +168,13 @@ retry:
   initial_backoff_ms: 200
   max_backoff_ms: 10000
   backoff_multiplier: 3.0
+
+circuit_breaker:
+  enabled: true
+  failure_threshold: 10
+  success_threshold: 3
+  recovery_timeout_seconds: 60
+  fallback_enabled: true
 )");
 
     auto config = RanvierConfig::load("test_config.yaml");
@@ -211,6 +230,13 @@ retry:
     EXPECT_EQ(config.retry.initial_backoff.count(), 200);
     EXPECT_EQ(config.retry.max_backoff.count(), 10000);
     EXPECT_DOUBLE_EQ(config.retry.backoff_multiplier, 3.0);
+
+    // Circuit breaker
+    EXPECT_TRUE(config.circuit_breaker.enabled);
+    EXPECT_EQ(config.circuit_breaker.failure_threshold, 10u);
+    EXPECT_EQ(config.circuit_breaker.success_threshold, 3u);
+    EXPECT_EQ(config.circuit_breaker.recovery_timeout.count(), 60);
+    EXPECT_TRUE(config.circuit_breaker.fallback_enabled);
 }
 
 // Test that partial config files work (missing sections use defaults)
@@ -363,6 +389,13 @@ TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
     EXPECT_EQ(retry.initial_backoff.count(), 100);
     EXPECT_EQ(retry.max_backoff.count(), 5000);
     EXPECT_DOUBLE_EQ(retry.backoff_multiplier, 2.0);
+
+    CircuitBreakerConfig cb;
+    EXPECT_TRUE(cb.enabled);
+    EXPECT_EQ(cb.failure_threshold, 5u);
+    EXPECT_EQ(cb.success_threshold, 2u);
+    EXPECT_EQ(cb.recovery_timeout.count(), 30);
+    EXPECT_TRUE(cb.fallback_enabled);
 }
 
 // Test TLS environment variable overrides
@@ -438,6 +471,32 @@ TEST_F(ConfigTest, RetryDisabledWithZeroMaxRetries) {
     auto config = RanvierConfig::defaults();
 
     EXPECT_EQ(config.retry.max_retries, 0u);
+}
+
+// Test circuit breaker environment variable overrides
+TEST_F(ConfigTest, CircuitBreakerEnvironmentVariablesOverride) {
+    setenv("RANVIER_CIRCUIT_BREAKER_ENABLED", "false", 1);
+    setenv("RANVIER_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "10", 1);
+    setenv("RANVIER_CIRCUIT_BREAKER_SUCCESS_THRESHOLD", "5", 1);
+    setenv("RANVIER_CIRCUIT_BREAKER_RECOVERY_TIMEOUT", "120", 1);
+    setenv("RANVIER_CIRCUIT_BREAKER_FALLBACK", "false", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_FALSE(config.circuit_breaker.enabled);
+    EXPECT_EQ(config.circuit_breaker.failure_threshold, 10u);
+    EXPECT_EQ(config.circuit_breaker.success_threshold, 5u);
+    EXPECT_EQ(config.circuit_breaker.recovery_timeout.count(), 120);
+    EXPECT_FALSE(config.circuit_breaker.fallback_enabled);
+}
+
+// Test circuit breaker disabled via env
+TEST_F(ConfigTest, CircuitBreakerDisabledViaEnv) {
+    setenv("RANVIER_CIRCUIT_BREAKER_ENABLED", "0", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_FALSE(config.circuit_breaker.enabled);
 }
 
 int main(int argc, char** argv) {

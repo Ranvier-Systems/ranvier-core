@@ -1,5 +1,6 @@
 #pragma once
 
+#include "circuit_breaker.hpp"
 #include "connection_pool.hpp"
 #include "persistence.hpp"
 #include "rate_limiter.hpp"
@@ -20,6 +21,15 @@ struct RetrySettings {
     double backoff_multiplier = 2.0;
 };
 
+// Circuit breaker settings
+struct CircuitBreakerSettings {
+    bool enabled = true;
+    uint32_t failure_threshold = 5;
+    uint32_t success_threshold = 2;
+    std::chrono::seconds recovery_timeout{30};
+    bool fallback_enabled = true;
+};
+
 // HTTP controller configuration
 struct HttpControllerConfig {
     ConnectionPoolConfig pool;
@@ -29,13 +39,21 @@ struct HttpControllerConfig {
     std::string admin_api_key = "";             // API key for admin endpoints (empty = no auth)
     RateLimiterConfig rate_limit;               // Rate limiting configuration
     RetrySettings retry;                        // Retry configuration
+    CircuitBreakerSettings circuit_breaker;     // Circuit breaker configuration
 };
 
 class HttpController {
 public:
     HttpController(TokenizerService& t, RouterService& r, HttpControllerConfig config = {})
         : _tokenizer(t), _router(r), _pool(config.pool), _config(config),
-          _rate_limiter(config.rate_limit), _persistence(nullptr) {}
+          _rate_limiter(config.rate_limit),
+          _circuit_breaker(CircuitBreakerConfig{
+              config.circuit_breaker.failure_threshold,
+              config.circuit_breaker.success_threshold,
+              config.circuit_breaker.recovery_timeout,
+              config.circuit_breaker.enabled
+          }),
+          _persistence(nullptr) {}
 
     // Set optional persistence store (call before serving requests)
     void set_persistence(PersistenceStore* store) { _persistence = store; }
@@ -43,12 +61,16 @@ public:
     // Register all endpoints
     void register_routes(seastar::httpd::routes& r);
 
+    // Rate limit helper - public for handler wrapper access
+    bool check_rate_limit(const seastar::http::request& req);
+
 private:
     TokenizerService& _tokenizer;
     RouterService& _router;
     ConnectionPool _pool;
     HttpControllerConfig _config;
     RateLimiter _rate_limiter;
+    CircuitBreaker _circuit_breaker;
     PersistenceStore* _persistence;
 
     // Helper handlers
@@ -64,11 +86,11 @@ private:
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;
 
-    // Rate limit helper - returns true if allowed, false if rate limited
-    bool check_rate_limit(const seastar::http::request& req);
-
     // Get client IP from request (checks X-Forwarded-For header)
     static std::string get_client_ip(const seastar::http::request& req);
+
+    // Try to get an alternative backend when primary fails (fallback routing)
+    std::optional<BackendId> get_fallback_backend(BackendId failed_id);
 };
 
 } // namespace ranvier
