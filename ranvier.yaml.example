@@ -151,3 +151,35 @@ circuit_breaker:
 
   # Enable fallback to alternative backends when primary fails (RANVIER_CIRCUIT_BREAKER_FALLBACK)
   fallback_enabled: true
+
+# =============================================================================
+# Backend Weights and Priorities (API Configuration)
+# =============================================================================
+# Backends support weight and priority parameters for heterogeneous clusters.
+# These are configured per-backend via the admin API, not in this config file.
+#
+# Weight (default: 100):
+#   Relative load balancing weight. Higher weight = more traffic.
+#   A backend with weight=200 receives 2x traffic compared to weight=100.
+#   Useful for directing more traffic to more powerful GPUs.
+#
+# Priority (default: 0):
+#   Priority group for failover. Lower number = higher priority.
+#   Ranvier routes to the highest priority group (lowest number) first.
+#   If all backends in that group are down, it falls back to the next group.
+#   Useful for primary/secondary/tertiary backend pools.
+#
+# Example API usage:
+#   # Register a high-capacity backend (weight=200, priority=0 - primary)
+#   curl -X POST "http://localhost:8080/admin/backends?id=1&ip=192.168.1.100&port=11434&weight=200&priority=0"
+#
+#   # Register a medium-capacity backend (weight=100, priority=0 - primary)
+#   curl -X POST "http://localhost:8080/admin/backends?id=2&ip=192.168.1.101&port=11434&weight=100&priority=0"
+#
+#   # Register a fallback backend (weight=100, priority=1 - secondary)
+#   curl -X POST "http://localhost:8080/admin/backends?id=3&ip=192.168.1.102&port=11434&weight=100&priority=1"
+#
+# Traffic distribution with above config (all backends healthy):
+#   - Backend 1: 66% of traffic (200/300)
+#   - Backend 2: 33% of traffic (100/300)
+#   - Backend 3: 0% (only used if backends 1 and 2 are both down)

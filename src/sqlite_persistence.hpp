@@ -23,7 +23,8 @@ public:
     bool is_open() const override;
 
     // Backend operations
-    bool save_backend(BackendId id, const std::string& ip, uint16_t port) override;
+    bool save_backend(BackendId id, const std::string& ip, uint16_t port,
+                      uint32_t weight = 100, uint32_t priority = 0) override;
     bool remove_backend(BackendId id) override;
     std::vector<BackendRecord> load_backends() override;
 

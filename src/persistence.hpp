@@ -16,6 +16,8 @@ struct BackendRecord {
     BackendId id;
     std::string ip;
     uint16_t port;
+    uint32_t weight = 100;    // Relative weight for load balancing (default 100)
+    uint32_t priority = 0;    // Priority group (0 = highest, higher = lower priority)
 };
 
 struct RouteRecord {
@@ -35,7 +37,8 @@ public:
     virtual bool is_open() const = 0;
 
     // Backend operations
-    virtual bool save_backend(BackendId id, const std::string& ip, uint16_t port) = 0;
+    virtual bool save_backend(BackendId id, const std::string& ip, uint16_t port,
+                              uint32_t weight = 100, uint32_t priority = 0) = 0;
     virtual bool remove_backend(BackendId id) = 0;
     virtual std::vector<BackendRecord> load_backends() = 0;
 

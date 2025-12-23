@@ -7,14 +7,22 @@
 #include <seastar/core/metrics.hh>
 #include <boost/range/irange.hpp>
 #include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <random>
 #include <chrono>
 
 namespace ranvier {
 
+// Backend info including weight and priority
+struct BackendInfo {
+    seastar::socket_address addr;
+    uint32_t weight = 100;
+    uint32_t priority = 0;
+};
+
 thread_local RadixTree local_tree;
-thread_local std::unordered_map<BackendId, seastar::socket_address> local_backends;
+thread_local std::unordered_map<BackendId, BackendInfo> local_backends;
 thread_local std::vector<BackendId> local_backend_ids;
 
 // The "Blacklist" for circuit breaker
@@ -59,7 +67,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 std::optional<seastar::socket_address> RouterService::get_backend_address(BackendId id) {
     auto it = local_backends.find(id);
     if (it != local_backends.end()) {
-        return it->second;
+        return it->second.addr;
     }
     return std::nullopt;
 }
@@ -69,16 +77,55 @@ std::optional<BackendId> RouterService::get_random_backend() {
         return std::nullopt;
     }
 
-    // Simple retry loop to find a live backend
-    for (int i = 0; i < 5; ++i) {
-        std::uniform_int_distribution<size_t> dist(0, local_backend_ids.size() - 1);
-        BackendId candidate = local_backend_ids[dist(rng)];
+    // Collect live backends grouped by priority
+    // Priority 0 = highest, backends with lower priority number are tried first
+    std::map<uint32_t, std::vector<std::pair<BackendId, uint32_t>>> priority_groups;
 
-        if (!local_dead_backends.contains(candidate)) {
-            return candidate;
+    for (BackendId id : local_backend_ids) {
+        if (local_dead_backends.contains(id)) {
+            continue;  // Skip dead backends
+        }
+        auto it = local_backends.find(id);
+        if (it == local_backends.end()) {
+            continue;
+        }
+        const auto& info = it->second;
+        if (info.weight > 0) {
+            priority_groups[info.priority].emplace_back(id, info.weight);
         }
     }
-    return std::nullopt;
+
+    if (priority_groups.empty()) {
+        return std::nullopt;  // No live backends available
+    }
+
+    // Get the highest priority group (lowest priority number)
+    const auto& candidates = priority_groups.begin()->second;
+
+    // Calculate total weight
+    uint64_t total_weight = 0;
+    for (const auto& [id, weight] : candidates) {
+        total_weight += weight;
+    }
+
+    if (total_weight == 0) {
+        return std::nullopt;
+    }
+
+    // Weighted random selection
+    std::uniform_int_distribution<uint64_t> dist(0, total_weight - 1);
+    uint64_t roll = dist(rng);
+
+    uint64_t cumulative = 0;
+    for (const auto& [id, weight] : candidates) {
+        cumulative += weight;
+        if (roll < cumulative) {
+            return id;
+        }
+    }
+
+    // Fallback (shouldn't reach here)
+    return candidates.back().first;
 }
 
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend) {
@@ -92,11 +139,17 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     });
 }
 
-seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr) {
-    return seastar::do_with(addr, [id](seastar::socket_address& shared_addr) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, &shared_addr] (unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [id, addr = shared_addr] {
-                local_backends[id] = addr;
+seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
+                                                          uint32_t weight, uint32_t priority) {
+    return seastar::do_with(addr, weight, priority, [id](seastar::socket_address& shared_addr,
+                                                          uint32_t& shared_weight,
+                                                          uint32_t& shared_priority) {
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            [id, &shared_addr, &shared_weight, &shared_priority] (unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
+                                                       weight = shared_weight,
+                                                       priority = shared_priority] {
+                local_backends[id] = BackendInfo{addr, weight, priority};
 
                 // Update vector (check for duplicates)
                 bool exists = false;

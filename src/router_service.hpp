@@ -27,12 +27,16 @@ public:
     // Teach the tree a new prefix (Prefix -> ID)
     seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend);
 
-    // Teach the system a new server (ID -> IP:Port)
-    seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr);
+    // Teach the system a new server (ID -> IP:Port) with optional weight and priority
+    // Weight: relative load balancing weight (default 100, higher = more traffic)
+    // Priority: priority group (default 0 = highest, lower priority backends used for fallback)
+    seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr,
+                                               uint32_t weight = 100, uint32_t priority = 0);
 
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id);
 
+    // Get a backend using weighted random selection within the highest available priority group
     std::optional<BackendId> get_random_backend();
 
     // Get list of all IDs (For the Health Checker to iterate)

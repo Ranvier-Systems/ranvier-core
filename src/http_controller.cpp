@@ -490,12 +490,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 }
 
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
-    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434
+    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
     sstring port_str = req->get_query_param("port");
+    sstring weight_str = req->get_query_param("weight");
+    sstring priority_str = req->get_query_param("priority");
 
-    // Check for IP parameter
+    // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
         rep->write_body("json", "{\"error\": \"Missing id, ip, or port\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -504,17 +506,30 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     int id = std::stoi(std::string(id_str));
     int port = std::stoi(std::string(port_str));
 
+    // Parse optional weight and priority (defaults: weight=100, priority=0)
+    uint32_t weight = 100;
+    uint32_t priority = 0;
+    if (!weight_str.empty()) {
+        weight = static_cast<uint32_t>(std::stoi(std::string(weight_str)));
+    }
+    if (!priority_str.empty()) {
+        priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
+    }
+
     // Use the provided IP string
     socket_address addr(ipv4_addr(std::string(ip_str), port));
 
     // Persist the backend registration
     if (_persistence) {
-        _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port));
+        _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
     }
 
-    return _router.register_backend_global(id, addr).then([id, ip_str, port, rep = std::move(rep)]() mutable {
-        log_control.info("Registered Backend {} -> {}:{}", id, ip_str, port);
-        rep->write_body("json", "{\"status\": \"ok\"}");
+    return _router.register_backend_global(id, addr, weight, priority).then(
+        [id, ip_str, port, weight, priority, rep = std::move(rep)]() mutable {
+        log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={})",
+            id, ip_str, port, weight, priority);
+        rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
+            ", \"priority\": " + std::to_string(priority) + "}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     });
 }
