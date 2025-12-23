@@ -62,13 +62,14 @@ future<> load_persisted_state() {
 
     // Log each backend at info level for visibility
     for (const auto& rec : backends) {
-        ranvier::log_main.info("  - Backend {} -> {}:{}", rec.id, rec.ip, rec.port);
+        ranvier::log_main.info("  - Backend {} -> {}:{} (weight={}, priority={})",
+            rec.id, rec.ip, rec.port, rec.weight, rec.priority);
     }
 
     return do_with(std::move(backends), std::move(routes), [](auto& backends, auto& routes) {
         return do_for_each(backends, [](const ranvier::BackendRecord& rec) {
             socket_address addr(ipv4_addr(rec.ip, rec.port));
-            return router.register_backend_global(rec.id, addr);
+            return router.register_backend_global(rec.id, addr, rec.weight, rec.priority);
         }).then([&routes] {
             return do_for_each(routes, [](const ranvier::RouteRecord& rec) {
                 return router.learn_route_global(rec.tokens, rec.backend_id);

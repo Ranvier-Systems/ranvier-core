@@ -46,12 +46,14 @@ bool SqlitePersistence::is_open() const {
 }
 
 bool SqlitePersistence::create_tables() {
-    // Backends table
+    // Backends table with weight and priority for heterogeneous clusters
     const char* backends_sql = R"(
         CREATE TABLE IF NOT EXISTS backends (
             id INTEGER PRIMARY KEY,
             ip TEXT NOT NULL,
-            port INTEGER NOT NULL
+            port INTEGER NOT NULL,
+            weight INTEGER NOT NULL DEFAULT 100,
+            priority INTEGER NOT NULL DEFAULT 0
         )
     )";
 
@@ -69,7 +71,16 @@ bool SqlitePersistence::create_tables() {
         ON routes(backend_id)
     )";
 
-    return exec_sql(backends_sql) && exec_sql(routes_sql) && exec_sql(index_sql);
+    if (!exec_sql(backends_sql) || !exec_sql(routes_sql) || !exec_sql(index_sql)) {
+        return false;
+    }
+
+    // Schema migration: add weight and priority columns if they don't exist
+    // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so we check first
+    exec_sql("ALTER TABLE backends ADD COLUMN weight INTEGER NOT NULL DEFAULT 100");
+    exec_sql("ALTER TABLE backends ADD COLUMN priority INTEGER NOT NULL DEFAULT 0");
+
+    return true;
 }
 
 bool SqlitePersistence::exec_sql(const char* sql) {
@@ -84,12 +95,13 @@ bool SqlitePersistence::exec_sql(const char* sql) {
     return true;
 }
 
-bool SqlitePersistence::save_backend(BackendId id, const std::string& ip, uint16_t port) {
+bool SqlitePersistence::save_backend(BackendId id, const std::string& ip, uint16_t port,
+                                     uint32_t weight, uint32_t priority) {
     std::lock_guard<std::mutex> lock(_mutex);
 
     if (!_db) return false;
 
-    const char* sql = "INSERT OR REPLACE INTO backends (id, ip, port) VALUES (?, ?, ?)";
+    const char* sql = "INSERT OR REPLACE INTO backends (id, ip, port, weight, priority) VALUES (?, ?, ?, ?, ?)";
     sqlite3_stmt* stmt = nullptr;
 
     int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
@@ -98,6 +110,8 @@ bool SqlitePersistence::save_backend(BackendId id, const std::string& ip, uint16
     sqlite3_bind_int(stmt, 1, id);
     sqlite3_bind_text(stmt, 2, ip.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 3, port);
+    sqlite3_bind_int(stmt, 4, static_cast<int>(weight));
+    sqlite3_bind_int(stmt, 5, static_cast<int>(priority));
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -130,7 +144,7 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
     std::vector<BackendRecord> results;
     if (!_db) return results;
 
-    const char* sql = "SELECT id, ip, port FROM backends";
+    const char* sql = "SELECT id, ip, port, weight, priority FROM backends";
     sqlite3_stmt* stmt = nullptr;
 
     int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
@@ -141,6 +155,8 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
         record.id = sqlite3_column_int(stmt, 0);
         record.ip = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         record.port = static_cast<uint16_t>(sqlite3_column_int(stmt, 2));
+        record.weight = static_cast<uint32_t>(sqlite3_column_int(stmt, 3));
+        record.priority = static_cast<uint32_t>(sqlite3_column_int(stmt, 4));
         results.push_back(std::move(record));
     }
 

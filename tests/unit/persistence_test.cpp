@@ -327,3 +327,87 @@ TEST_F(PersistenceTest, NegativeTokenIds) {
     ASSERT_EQ(routes.size(), 1);
     EXPECT_EQ(routes[0].tokens, tokens);
 }
+
+// =============================================================================
+// Backend Weight and Priority Tests
+// =============================================================================
+
+TEST_F(PersistenceTest, BackendWeightAndPriority) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Save backends with different weights and priorities
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434, 200, 0));  // High capacity, primary
+    EXPECT_TRUE(store_->save_backend(2, "192.168.1.101", 11434, 100, 0));  // Normal capacity, primary
+    EXPECT_TRUE(store_->save_backend(3, "192.168.1.102", 11434, 50, 1));   // Low capacity, secondary
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 3);
+
+    // Find and verify backend 1
+    auto it = std::find_if(backends.begin(), backends.end(),
+        [](const BackendRecord& r) { return r.id == 1; });
+    ASSERT_NE(it, backends.end());
+    EXPECT_EQ(it->weight, 200);
+    EXPECT_EQ(it->priority, 0);
+
+    // Find and verify backend 2
+    it = std::find_if(backends.begin(), backends.end(),
+        [](const BackendRecord& r) { return r.id == 2; });
+    ASSERT_NE(it, backends.end());
+    EXPECT_EQ(it->weight, 100);
+    EXPECT_EQ(it->priority, 0);
+
+    // Find and verify backend 3
+    it = std::find_if(backends.begin(), backends.end(),
+        [](const BackendRecord& r) { return r.id == 3; });
+    ASSERT_NE(it, backends.end());
+    EXPECT_EQ(it->weight, 50);
+    EXPECT_EQ(it->priority, 1);
+}
+
+TEST_F(PersistenceTest, BackendDefaultWeightAndPriority) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Save backend with default weight and priority
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1);
+    EXPECT_EQ(backends[0].weight, 100);    // Default weight
+    EXPECT_EQ(backends[0].priority, 0);    // Default priority
+}
+
+TEST_F(PersistenceTest, UpdateBackendWeightAndPriority) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Initial registration
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434, 100, 0));
+
+    // Update with new weight and priority
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434, 300, 2));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1);
+    EXPECT_EQ(backends[0].weight, 300);
+    EXPECT_EQ(backends[0].priority, 2);
+}
+
+TEST_F(PersistenceTest, BackendWeightAndPrioritySurviveReopen) {
+    // First session - write data with weights/priorities
+    {
+        ASSERT_TRUE(store_->open(test_db_path_));
+        store_->save_backend(1, "192.168.1.100", 11434, 250, 1);
+        store_->close();
+    }
+
+    // Second session - verify weights/priorities persisted
+    {
+        auto store2 = create_persistence_store();
+        ASSERT_TRUE(store2->open(test_db_path_));
+
+        auto backends = store2->load_backends();
+        ASSERT_EQ(backends.size(), 1);
+        EXPECT_EQ(backends[0].weight, 250);
+        EXPECT_EQ(backends[0].priority, 1);
+    }
+}
