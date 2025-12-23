@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
+id=$@
+
 # DELETE /admin/backends?id=X          - Remove backend and its routes
-curl -X DELETE "http://localhost:8080/admin/backends?id=91"
+curl -X DELETE "http://localhost:8080/admin/backends?id=${id}"
 echo ''
 
 # DELETE /admin/routes?backend_id=X    - Remove routes for a specific backend
