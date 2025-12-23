@@ -19,7 +19,8 @@ using namespace ranvier;
 
 class RadixTreeTest : public ::testing::Test {
 protected:
-    RadixTree tree;
+    // Use block_alignment=1 to disable alignment for existing tests
+    RadixTree tree{1};
 
     // Helper to create token vectors
     std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
@@ -442,4 +443,211 @@ TEST_F(RadixTreeTest, LookupWithSubspan) {
     auto result = tree.lookup(subspan);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value(), 42);
+}
+
+// =============================================================================
+// Block Alignment Tests (vLLM PagedAttention compatibility)
+// =============================================================================
+
+class RadixTreeBlockAlignmentTest : public ::testing::Test {
+protected:
+    // Helper to create token vectors
+    std::vector<TokenId> tokens(size_t count, TokenId start = 1) {
+        std::vector<TokenId> result;
+        result.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            result.push_back(start + static_cast<TokenId>(i));
+        }
+        return result;
+    }
+};
+
+TEST_F(RadixTreeBlockAlignmentTest, DefaultBlockAlignmentIs16) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert 16 tokens - should succeed (exactly one block)
+    auto vec16 = tokens(16);
+    tree.insert(vec16, 1);
+
+    auto result = tree.lookup(vec16);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 1);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, TokensBelowBlockAlignmentNotInserted) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert fewer than 16 tokens - should be skipped
+    auto vec10 = tokens(10);
+    tree.insert(vec10, 1);
+
+    // Lookup should return nullopt since nothing was inserted
+    auto result = tree.lookup(vec10);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, TokensTruncatedToBlockBoundary) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert 20 tokens - should truncate to 16
+    auto vec20 = tokens(20);
+    tree.insert(vec20, 42);
+
+    // Lookup with exactly 16 tokens should find it
+    auto vec16 = tokens(16);
+    auto result16 = tree.lookup(vec16);
+    ASSERT_TRUE(result16.has_value());
+    EXPECT_EQ(result16.value(), 42);
+
+    // Lookup with 20 tokens should also match (longest prefix)
+    auto result20 = tree.lookup(vec20);
+    ASSERT_TRUE(result20.has_value());
+    EXPECT_EQ(result20.value(), 42);
+
+    // Lookup with 17 tokens should match at 16
+    auto vec17 = tokens(17);
+    auto result17 = tree.lookup(vec17);
+    ASSERT_TRUE(result17.has_value());
+    EXPECT_EQ(result17.value(), 42);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, MultipleBlocksInserted) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert 32 tokens (exactly 2 blocks)
+    auto vec32 = tokens(32);
+    tree.insert(vec32, 1);
+
+    // Should be inserted at full 32 length
+    auto result = tree.lookup(vec32);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 1);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, TokensTruncatedToMultipleBlocks) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert 47 tokens - should truncate to 32 (2 full blocks)
+    auto vec47 = tokens(47);
+    tree.insert(vec47, 99);
+
+    // Lookup at 32 should find it
+    auto vec32 = tokens(32);
+    auto result32 = tree.lookup(vec32);
+    ASSERT_TRUE(result32.has_value());
+    EXPECT_EQ(result32.value(), 99);
+
+    // Lookup at 33-47 should also match via longest prefix
+    auto result47 = tree.lookup(vec47);
+    ASSERT_TRUE(result47.has_value());
+    EXPECT_EQ(result47.value(), 99);
+
+    // Lookup at 48 (different tokens beyond 47) should still match at 32
+    auto vec48 = tokens(48);
+    auto result48 = tree.lookup(vec48);
+    ASSERT_TRUE(result48.has_value());
+    EXPECT_EQ(result48.value(), 99);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, CustomBlockAlignment) {
+    RadixTree tree(8);  // Custom block_alignment = 8
+
+    // Insert 10 tokens - should truncate to 8
+    auto vec10 = tokens(10);
+    tree.insert(vec10, 1);
+
+    // Lookup at 8 should find it
+    auto vec8 = tokens(8);
+    auto result = tree.lookup(vec8);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 1);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, BlockAlignmentOf1DisablesAlignment) {
+    RadixTree tree(1);  // block_alignment = 1 effectively disables alignment
+
+    // Any length should work
+    auto vec3 = tokens(3);
+    tree.insert(vec3, 1);
+
+    auto result = tree.lookup(vec3);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 1);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, MultipleRoutesWithAlignment) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert routes at different aligned lengths
+    auto vec16 = tokens(16, 1);
+    auto vec32 = tokens(32, 1);
+    auto vec48 = tokens(48, 1);
+
+    tree.insert(vec16, 1);
+    tree.insert(vec32, 2);
+    tree.insert(vec48, 3);
+
+    // Each should be found at exact length
+    EXPECT_EQ(tree.lookup(vec16).value(), 1);
+    EXPECT_EQ(tree.lookup(vec32).value(), 2);
+    EXPECT_EQ(tree.lookup(vec48).value(), 3);
+
+    // Lookup with 20 tokens should match at 16
+    auto vec20 = tokens(20, 1);
+    EXPECT_EQ(tree.lookup(vec20).value(), 1);
+
+    // Lookup with 40 tokens should match at 32
+    auto vec40 = tokens(40, 1);
+    EXPECT_EQ(tree.lookup(vec40).value(), 2);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, OverwriteAtAlignedBoundary) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Insert 20 tokens -> stored at 16
+    auto vec20 = tokens(20);
+    tree.insert(vec20, 1);
+
+    // Insert 18 tokens -> also stored at 16 (overwrites)
+    auto vec18 = tokens(18);
+    tree.insert(vec18, 99);
+
+    // Both truncate to 16, so lookup at 16 should return 99
+    auto vec16 = tokens(16);
+    auto result = tree.lookup(vec16);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 99);
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, EmptyInsertWithAlignment) {
+    RadixTree tree;  // Default block_alignment = 16
+
+    // Empty token sequence should not insert anything
+    std::vector<TokenId> empty;
+    tree.insert(empty, 1);
+
+    auto result = tree.lookup(empty);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeBlockAlignmentTest, LargeBlockAlignment) {
+    RadixTree tree(64);  // Large block alignment
+
+    // 63 tokens should not insert
+    auto vec63 = tokens(63);
+    tree.insert(vec63, 1);
+    EXPECT_FALSE(tree.lookup(vec63).has_value());
+
+    // 64 tokens should insert
+    auto vec64 = tokens(64);
+    tree.insert(vec64, 2);
+    ASSERT_TRUE(tree.lookup(vec64).has_value());
+    EXPECT_EQ(tree.lookup(vec64).value(), 2);
+
+    // 100 tokens should truncate to 64
+    auto vec100 = tokens(100);
+    tree.insert(vec100, 3);
+    auto result = tree.lookup(vec64);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 3);  // Overwrote previous value
 }
