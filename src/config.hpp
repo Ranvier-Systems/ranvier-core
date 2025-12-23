@@ -92,6 +92,15 @@ struct RetryConfig {
     double backoff_multiplier = 2.0;                  // Exponential backoff multiplier
 };
 
+// Circuit breaker configuration for graceful degradation
+struct CircuitBreakerConfig {
+    bool enabled = true;                              // Enable circuit breaker
+    uint32_t failure_threshold = 5;                   // Failures before opening circuit
+    uint32_t success_threshold = 2;                   // Successes in half-open to close
+    std::chrono::seconds recovery_timeout{30};        // Time before trying half-open
+    bool fallback_enabled = true;                     // Try alternative backends on failure
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -105,6 +114,7 @@ struct RanvierConfig {
     AuthConfig auth;
     RateLimitConfig rate_limit;
     RetryConfig retry;
+    CircuitBreakerConfig circuit_breaker;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -226,6 +236,23 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<int>("RANVIER_RETRY_MAX_BACKOFF_MS")) {
         retry.max_backoff = std::chrono::milliseconds(*v);
+    }
+
+    // Circuit breaker overrides
+    if (auto v = get_env("RANVIER_CIRCUIT_BREAKER_ENABLED")) {
+        circuit_breaker.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_CIRCUIT_BREAKER_FAILURE_THRESHOLD")) {
+        circuit_breaker.failure_threshold = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_CIRCUIT_BREAKER_SUCCESS_THRESHOLD")) {
+        circuit_breaker.success_threshold = *v;
+    }
+    if (auto v = get_env_as<int>("RANVIER_CIRCUIT_BREAKER_RECOVERY_TIMEOUT")) {
+        circuit_breaker.recovery_timeout = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env("RANVIER_CIRCUIT_BREAKER_FALLBACK")) {
+        circuit_breaker.fallback_enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
 }
 
@@ -359,6 +386,18 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.retry.max_backoff = std::chrono::milliseconds(r["max_backoff_ms"].as<int>());
             }
             if (r["backoff_multiplier"]) config.retry.backoff_multiplier = r["backoff_multiplier"].as<double>();
+        }
+
+        // Circuit breaker section
+        if (yaml["circuit_breaker"]) {
+            YAML::Node cb = yaml["circuit_breaker"];
+            if (cb["enabled"]) config.circuit_breaker.enabled = cb["enabled"].as<bool>();
+            if (cb["failure_threshold"]) config.circuit_breaker.failure_threshold = cb["failure_threshold"].as<uint32_t>();
+            if (cb["success_threshold"]) config.circuit_breaker.success_threshold = cb["success_threshold"].as<uint32_t>();
+            if (cb["recovery_timeout_seconds"]) {
+                config.circuit_breaker.recovery_timeout = std::chrono::seconds(cb["recovery_timeout_seconds"].as<int>());
+            }
+            if (cb["fallback_enabled"]) config.circuit_breaker.fallback_enabled = cb["fallback_enabled"].as<bool>();
         }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults

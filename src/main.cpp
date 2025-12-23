@@ -108,6 +108,11 @@ future<> run() {
     ctrl_config.retry.initial_backoff = g_config.retry.initial_backoff;
     ctrl_config.retry.max_backoff = g_config.retry.max_backoff;
     ctrl_config.retry.backoff_multiplier = g_config.retry.backoff_multiplier;
+    ctrl_config.circuit_breaker.enabled = g_config.circuit_breaker.enabled;
+    ctrl_config.circuit_breaker.failure_threshold = g_config.circuit_breaker.failure_threshold;
+    ctrl_config.circuit_breaker.success_threshold = g_config.circuit_breaker.success_threshold;
+    ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
+    ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
 
     // 3. Init Persistence
@@ -268,6 +273,16 @@ int main(int argc, char** argv) {
                       << g_config.retry.max_backoff.count() << "ms backoff\n";
         } else {
             std::cout << "  Retry:        disabled\n";
+        }
+        if (g_config.circuit_breaker.enabled) {
+            std::cout << "  Circuit:      " << g_config.circuit_breaker.failure_threshold << " failures, "
+                      << g_config.circuit_breaker.recovery_timeout.count() << "s recovery";
+            if (g_config.circuit_breaker.fallback_enabled) {
+                std::cout << " (fallback on)";
+            }
+            std::cout << "\n";
+        } else {
+            std::cout << "  Circuit:      disabled\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";

@@ -133,3 +133,21 @@ retry:
 
   # Exponential backoff multiplier (each retry waits multiplier * previous_delay)
   backoff_multiplier: 2.0
+
+# Circuit breaker configuration for graceful degradation
+# Automatically stops routing to failing backends and falls back to alternatives
+circuit_breaker:
+  # Enable circuit breaker (RANVIER_CIRCUIT_BREAKER_ENABLED)
+  enabled: true
+
+  # Number of consecutive failures before opening circuit (RANVIER_CIRCUIT_BREAKER_FAILURE_THRESHOLD)
+  failure_threshold: 5
+
+  # Number of consecutive successes in half-open state to close circuit (RANVIER_CIRCUIT_BREAKER_SUCCESS_THRESHOLD)
+  success_threshold: 2
+
+  # Time in seconds before attempting to recover (half-open state) (RANVIER_CIRCUIT_BREAKER_RECOVERY_TIMEOUT)
+  recovery_timeout_seconds: 30
+
+  # Enable fallback to alternative backends when primary fails (RANVIER_CIRCUIT_BREAKER_FALLBACK)
+  fallback_enabled: true

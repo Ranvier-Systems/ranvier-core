@@ -84,6 +84,22 @@ bool HttpController::check_rate_limit(const seastar::http::request& req) {
     return _rate_limiter.allow(client_ip);
 }
 
+// Get a fallback backend when primary fails
+std::optional<BackendId> HttpController::get_fallback_backend(BackendId failed_id) {
+    if (!_config.circuit_breaker.fallback_enabled) {
+        return std::nullopt;
+    }
+
+    // Try to get a different backend
+    auto all_backends = _router.get_all_backend_ids();
+    for (auto id : all_backends) {
+        if (id != failed_id && _circuit_breaker.allow_request(id)) {
+            return id;
+        }
+    }
+    return std::nullopt;
+}
+
 // Helper to create an auth-protected admin handler
 template <typename AuthCheck, typename Func>
 auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
@@ -185,6 +201,19 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         target_id = random_id.value();
     }
 
+    // Circuit breaker check - try fallback if circuit is open
+    if (!_circuit_breaker.allow_request(target_id)) {
+        log_proxy.info("Circuit open for backend {}, trying fallback", target_id);
+        auto fallback = get_fallback_backend(target_id);
+        if (fallback.has_value()) {
+            target_id = fallback.value();
+            log_proxy.info("Using fallback backend {}", target_id);
+        } else {
+            rep->write_body("json", "{\"error\": \"All backends unavailable (circuit breaker open)\"}");
+            co_return std::move(rep);
+        }
+    }
+
     auto target_addr_opt = _router.get_backend_address(target_id);
     if (!target_addr_opt.has_value()) {
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
@@ -192,13 +221,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
     socket_address target_addr = target_addr_opt.value();
 
-    // 2. Setup Streaming with Timeout and Retry
+    // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
     // Capture config for the lambda
     auto connect_timeout = _config.connect_timeout;
     auto request_timeout = _config.request_timeout;
     auto retry_config = _config.retry;
+    auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
 
-    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -206,21 +236,26 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         ConnectionBundle bundle;
         bool timed_out = false;
         bool connection_failed = false;
+        BackendId current_backend = target_id;
+        socket_address current_addr = target_addr;
 
-        // 1. GET CONNECTION FROM POOL (with connect timeout and retry)
+        // 1. GET CONNECTION FROM POOL (with connect timeout, retry, and fallback)
         uint32_t retry_attempt = 0;
         auto current_backoff = retry_config.initial_backoff;
+        uint32_t fallback_attempts = 0;
+        const uint32_t max_fallback_attempts = 3;
 
         while (retry_attempt <= retry_config.max_retries) {
             // Check if we've exceeded overall request deadline
             if (lowres_clock::now() >= request_deadline) {
                 log_proxy.warn("Request deadline exceeded during connection retry");
                 connection_failed = true;
+                _circuit_breaker.record_failure(current_backend);
                 break;
             }
 
             auto connect_deadline = lowres_clock::now() + connect_timeout;
-            auto conn_future = with_timeout(connect_deadline, _pool.get(target_addr));
+            auto conn_future = with_timeout(connect_deadline, _pool.get(current_addr));
 
             bool this_attempt_failed = false;
             bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
@@ -234,7 +269,26 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 break;
             }
 
-            // Connection failed - check if we should retry
+            // Record failure for circuit breaker
+            _circuit_breaker.record_failure(current_backend);
+
+            // Try fallback to a different backend before retrying
+            if (fallback_enabled && fallback_attempts < max_fallback_attempts) {
+                auto fallback = get_fallback_backend(current_backend);
+                if (fallback.has_value()) {
+                    auto fallback_addr = _router.get_backend_address(fallback.value());
+                    if (fallback_addr.has_value()) {
+                        log_proxy.info("Falling back from backend {} to {}", current_backend, fallback.value());
+                        current_backend = fallback.value();
+                        current_addr = fallback_addr.value();
+                        fallback_attempts++;
+                        // Don't increment retry_attempt for fallback - this is a different backend
+                        continue;
+                    }
+                }
+            }
+
+            // No fallback available - check if we should retry same backend
             if (retry_attempt < retry_config.max_retries) {
                 log_proxy.warn("Connection attempt {} failed, retrying in {}ms",
                     retry_attempt + 1, current_backoff.count());
@@ -247,7 +301,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     static_cast<int64_t>(current_backoff.count() * retry_config.backoff_multiplier));
                 current_backoff = std::min(next_backoff, retry_config.max_backoff);
             } else {
-                log_proxy.warn("Connection failed after {} retries", retry_config.max_retries + 1);
+                log_proxy.warn("Connection failed after {} retries and {} fallbacks",
+                    retry_config.max_retries + 1, fallback_attempts);
                 connection_failed = true;
             }
 
@@ -323,13 +378,18 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             auto res = parser.push(std::move(chunk));
 
-            // Snooping Logic
-            if (res.header_snoop_success && !route_hit.has_value() && tokens.size() >= _config.min_token_length) {
-                (void)_router.learn_route_global(tokens, target_id);
-                log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), target_id);
+            // Snooping Logic - record success and learn route
+            if (res.header_snoop_success) {
+                // Backend responded successfully - record for circuit breaker
+                _circuit_breaker.record_success(current_backend);
 
-                if (_persistence) {
-                    _persistence->save_route(tokens, target_id);
+                if (!route_hit.has_value() && tokens.size() >= _config.min_token_length) {
+                    (void)_router.learn_route_global(tokens, current_backend);
+                    log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), current_backend);
+
+                    if (_persistence) {
+                        _persistence->save_route(tokens, current_backend);
+                    }
                 }
             }
 
@@ -345,6 +405,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         // Send timeout error to client if needed
         if (timed_out) {
+            // Record failure for circuit breaker on timeout
+            _circuit_breaker.record_failure(current_backend);
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
             co_await client_out.write(error_msg);
             co_await client_out.flush();
