@@ -10,6 +10,7 @@
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "logging.hpp"
+#include "metrics_service.hpp"
 #include "router_service.hpp"
 #include "sqlite_persistence.hpp"
 #include "tokenizer_service.hpp"
@@ -20,6 +21,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/tls.hh>
@@ -114,6 +116,9 @@ future<> run() {
     ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
     ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
+
+    // 2a. Initialize metrics on all shards
+    ranvier::init_metrics();
 
     // 3. Init Persistence
     persistence = ranvier::create_persistence_store();
