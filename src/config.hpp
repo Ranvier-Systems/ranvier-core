@@ -52,6 +52,7 @@ struct PoolConfig {
 struct RoutingConfig {
     size_t min_token_length = 4;  // Minimum tokens before caching a route
     uint32_t backend_retry_limit = 5;  // Max attempts to find a live backend
+    uint32_t block_alignment = 16;  // vLLM PagedAttention block size for route alignment
 };
 
 // Timeout configuration
@@ -194,6 +195,9 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_MIN_TOKEN_LENGTH")) {
         routing.min_token_length = *v;
     }
+    if (auto v = get_env_as<uint32_t>("RANVIER_BLOCK_ALIGNMENT")) {
+        routing.block_alignment = *v;
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -333,6 +337,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["backend_retry_limit"]) {
                 config.routing.backend_retry_limit = r["backend_retry_limit"].as<uint32_t>();
+            }
+            if (r["block_alignment"]) {
+                config.routing.block_alignment = r["block_alignment"].as<uint32_t>();
             }
         }
 
