@@ -39,6 +39,34 @@ inline std::vector<double> latency_buckets() {
 // Thread-local metrics for the HTTP controller
 // Each shard has its own counters/histograms (shared-nothing model)
 class MetricsService {
+    struct MetricHistogram {
+        seastar::metrics::histogram data;
+
+        // Initialize with boundaries
+        MetricHistogram(const std::vector<double>& boundaries) {
+            data.sample_count = 0;
+            data.sample_sum = 0;
+            for (double b : boundaries) {
+                data.buckets.push_back({b, 0});
+            }
+        }
+
+        void record(double value) {
+            // 1. Update the global totals
+            data.sample_count++;
+            data.sample_sum += value;
+
+            // 2. Update the individual buckets
+            // In a cumulative histogram, a value of 0.05s belongs in
+            // the 0.05 bucket, the 0.1 bucket, the 0.5 bucket, etc.
+            for (auto& bucket : data.buckets) {
+                if (value <= bucket.upper_bound) {
+                    bucket.count++;
+                }
+            }
+        }
+    };
+
 public:
     MetricsService() {
         // Register metrics group
@@ -68,23 +96,19 @@ public:
             // Latency histograms
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
-                latency_buckets(),
-                [this] { return _request_latency.get_histogram(); }),
+                [this] { return _request_latency.data; }),
 
             seastar::metrics::make_histogram("backend_connect_duration_seconds",
                 seastar::metrics::description("Backend connection establishment duration in seconds"),
-                latency_buckets(),
-                [this] { return _connect_latency.get_histogram(); }),
+                [this] { return _connect_latency.data; }),
 
             seastar::metrics::make_histogram("backend_response_duration_seconds",
                 seastar::metrics::description("Time to first byte from backend in seconds"),
-                latency_buckets(),
-                [this] { return _response_latency.get_histogram(); }),
+                [this] { return _response_latency.data; }),
 
             seastar::metrics::make_histogram("backend_total_duration_seconds",
                 seastar::metrics::description("Total backend request duration in seconds"),
-                latency_buckets(),
-                [this] { return _backend_total_latency.get_histogram(); })
+                [this] { return _backend_total_latency.data; })
         });
     }
 
@@ -103,19 +127,19 @@ public:
 
     // Record latencies (in seconds)
     void record_request_latency(double seconds) {
-        _request_latency.add(seconds);
+        _request_latency.record(seconds);
     }
 
     void record_connect_latency(double seconds) {
-        _connect_latency.add(seconds);
+        _connect_latency.record(seconds);
     }
 
     void record_response_latency(double seconds) {
-        _response_latency.add(seconds);
+        _response_latency.record(seconds);
     }
 
     void record_backend_total_latency(double seconds) {
-        _backend_total_latency.add(seconds);
+        _backend_total_latency.record(seconds);
     }
 
     // Helper to convert chrono duration to seconds
@@ -137,10 +161,10 @@ private:
     uint64_t _fallback_attempts = 0;
 
     // Histogram accumulators
-    seastar::metrics::histogram _request_latency;
-    seastar::metrics::histogram _connect_latency;
-    seastar::metrics::histogram _response_latency;
-    seastar::metrics::histogram _backend_total_latency;
+    MetricHistogram _request_latency{latency_buckets()};
+    MetricHistogram _connect_latency{latency_buckets()};
+    MetricHistogram _response_latency{latency_buckets()};
+    MetricHistogram _backend_total_latency{latency_buckets()};
 };
 
 // Global thread-local metrics instance
