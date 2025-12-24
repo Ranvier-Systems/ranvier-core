@@ -155,24 +155,17 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
 }
 
 seastar::future<> GossipService::receive_loop() {
-    return seastar::do_until([this] { return !_running; }, [this] {
-        if (!_channel) {
-            return seastar::sleep(std::chrono::milliseconds(100));
+    try {
+        while (_running) {
+            auto dgram = co_await _channel->receive();
+            co_await handle_packet(std::move(dgram));
         }
-
-        return _channel->receive().then([this](seastar::net::udp_datagram dgram) {
-            return handle_packet(std::move(dgram));
-        }).handle_exception([this](auto ep) {
-            if (_running) {
-                try {
-                    std::rethrow_exception(ep);
-                } catch (const std::exception& e) {
-                    log_gossip.debug("Receive error: {}", e.what());
-                }
-            }
-            return seastar::make_ready_future<>();
-        });
-    });
+    } catch (const std::exception& e) {
+        if (_running) {
+            log_gossip.error("Receive loop fatal error: {}", e.what());
+        }
+    }
+    co_return;
 }
 
 seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgram) {
