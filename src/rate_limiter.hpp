@@ -92,6 +92,12 @@ public:
 
     bool is_enabled() const { return _config.enabled; }
 
+    // Hot-reload: Update configuration at runtime
+    void update_config(const RateLimiterConfig& config) {
+        _config = config;
+        // Note: Existing buckets are preserved to maintain rate limit state
+    }
+
 private:
     RateLimiterConfig _config;
     std::unordered_map<std::string, TokenBucket> _buckets;

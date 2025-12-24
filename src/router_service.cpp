@@ -298,4 +298,26 @@ seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is
     });
 }
 
+seastar::future<> RouterService::update_routing_config(const RoutingConfig& config) {
+    // Update local config on shard 0
+    _config = config;
+
+    // Capture values to broadcast
+    size_t max_routes = config.max_routes;
+    auto ttl_seconds = config.ttl_seconds;
+
+    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s)",
+                  max_routes, ttl_seconds.count());
+
+    // Broadcast to all shards using Seastar's async message passing
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+        [max_routes, ttl_seconds](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds] {
+                local_max_routes = max_routes;
+                local_ttl_seconds = ttl_seconds;
+                return seastar::make_ready_future<>();
+            });
+        });
+}
+
 } // namespace ranvier

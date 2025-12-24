@@ -15,6 +15,7 @@
 #include "sqlite_persistence.hpp"
 #include "tokenizer_service.hpp"
 
+#include <csignal>
 #include <fstream>
 #include <streambuf>
 
@@ -30,6 +31,7 @@ using namespace seastar;
 
 // Global configuration (loaded before Seastar starts)
 static ranvier::RanvierConfig g_config;
+static std::string g_config_path;
 
 // Services (Global/Static Scope for MVP)
 ranvier::TokenizerService tokenizer;
@@ -78,6 +80,76 @@ future<> load_persisted_state() {
     }).then([] {
         ranvier::log_main.info("State restoration complete");
     });
+}
+
+// Hot-reload configuration on SIGHUP
+future<> reload_config() {
+    ranvier::log_main.info("SIGHUP received - reloading configuration from {}", g_config_path);
+
+    try {
+        // Load new configuration
+        auto new_config = ranvier::RanvierConfig::load(g_config_path);
+
+        // Validate the new configuration
+        auto validation_error = ranvier::RanvierConfig::validate(new_config);
+        if (validation_error) {
+            ranvier::log_main.error("Config reload failed - validation error: {}", *validation_error);
+            return make_ready_future<>();
+        }
+
+        // Log warnings for settings that cannot be hot-reloaded
+        if (new_config.server.api_port != g_config.server.api_port ||
+            new_config.server.metrics_port != g_config.server.metrics_port ||
+            new_config.server.bind_address != g_config.server.bind_address) {
+            ranvier::log_main.warn("Config reload: server.* changes require restart to take effect");
+        }
+        if (new_config.database.path != g_config.database.path) {
+            ranvier::log_main.warn("Config reload: database.path changes require restart to take effect");
+        }
+        if (new_config.tls.enabled != g_config.tls.enabled ||
+            new_config.tls.cert_path != g_config.tls.cert_path ||
+            new_config.tls.key_path != g_config.tls.key_path) {
+            ranvier::log_main.warn("Config reload: tls.* changes require restart to take effect");
+        }
+        if (new_config.assets.tokenizer_path != g_config.assets.tokenizer_path) {
+            ranvier::log_main.warn("Config reload: assets.tokenizer_path changes require restart to take effect");
+        }
+
+        // Update global config
+        g_config = new_config;
+
+        // Update HttpController config (runs on current shard, controller handles thread-safety)
+        ranvier::HttpControllerConfig ctrl_config;
+        ctrl_config.pool.max_connections_per_host = g_config.pool.max_connections_per_host;
+        ctrl_config.pool.idle_timeout = g_config.pool.idle_timeout;
+        ctrl_config.pool.max_total_connections = g_config.pool.max_total_connections;
+        ctrl_config.min_token_length = g_config.routing.min_token_length;
+        ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
+        ctrl_config.request_timeout = g_config.timeouts.request_timeout;
+        ctrl_config.admin_api_key = g_config.auth.admin_api_key;
+        ctrl_config.rate_limit.enabled = g_config.rate_limit.enabled;
+        ctrl_config.rate_limit.requests_per_second = g_config.rate_limit.requests_per_second;
+        ctrl_config.rate_limit.burst_size = g_config.rate_limit.burst_size;
+        ctrl_config.retry.max_retries = g_config.retry.max_retries;
+        ctrl_config.retry.initial_backoff = g_config.retry.initial_backoff;
+        ctrl_config.retry.max_backoff = g_config.retry.max_backoff;
+        ctrl_config.retry.backoff_multiplier = g_config.retry.backoff_multiplier;
+        ctrl_config.circuit_breaker.enabled = g_config.circuit_breaker.enabled;
+        ctrl_config.circuit_breaker.failure_threshold = g_config.circuit_breaker.failure_threshold;
+        ctrl_config.circuit_breaker.success_threshold = g_config.circuit_breaker.success_threshold;
+        ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
+        ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
+        controller->update_config(ctrl_config);
+
+        // Update routing config on all shards
+        return router.update_routing_config(g_config.routing).then([] {
+            ranvier::log_main.info("Configuration reloaded successfully");
+        });
+
+    } catch (const std::exception& e) {
+        ranvier::log_main.error("Config reload failed: {}", e.what());
+        return make_ready_future<>();
+    }
 }
 
 future<> run() {
@@ -200,6 +272,19 @@ future<> run() {
                 ranvier::log_main.info("Ranvier listening on {}://{}:{}",
                     protocol, g_config.server.bind_address, g_config.server.api_port);
 
+                // Setup SIGHUP handler for config hot-reload
+                engine().handle_signal(SIGHUP, [] {
+                    // Spawn reload as a background task (fire-and-forget with error handling)
+                    (void)reload_config().handle_exception([](auto ep) {
+                        try {
+                            std::rethrow_exception(ep);
+                        } catch (const std::exception& e) {
+                            ranvier::log_main.error("Config reload exception: {}", e.what());
+                        }
+                    });
+                });
+                ranvier::log_main.info("SIGHUP handler registered for config hot-reload");
+
                 // Wait Loop
                 auto stop_signal = std::make_shared<promise<>>();
                 engine().handle_signal(SIGINT, [stop_signal] { stop_signal->set_value(); });
@@ -245,6 +330,7 @@ int main(int argc, char** argv) {
 
     try {
         g_config = ranvier::RanvierConfig::load(config_path);
+        g_config_path = config_path;  // Store for hot-reload
 
         // Log config summary (before Seastar logger is available)
         std::cout << "Ranvier Core - Configuration loaded\n";
