@@ -8,6 +8,9 @@
 #include "router_service.hpp"
 #include "tokenizer_service.hpp"
 
+#include <atomic>
+
+#include <seastar/core/gate.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/request.hh>
 #include <seastar/http/reply.hh>
@@ -41,6 +44,7 @@ struct HttpControllerConfig {
     RateLimiterConfig rate_limit;               // Rate limiting configuration
     RetrySettings retry;                        // Retry configuration
     CircuitBreakerSettings circuit_breaker;     // Circuit breaker configuration
+    std::chrono::seconds drain_timeout{30};     // Max time to wait for in-flight requests during shutdown
 };
 
 class HttpController {
@@ -77,6 +81,15 @@ public:
     // Rate limit helper - public for handler wrapper access
     bool check_rate_limit(const seastar::http::request& req);
 
+    // Graceful shutdown: Start draining (reject new requests)
+    void start_draining();
+
+    // Graceful shutdown: Wait for in-flight requests to complete or timeout
+    seastar::future<> wait_for_drain();
+
+    // Check if currently draining
+    bool is_draining() const;
+
 private:
     TokenizerService& _tokenizer;
     RouterService& _router;
@@ -85,6 +98,10 @@ private:
     RateLimiter _rate_limiter;
     CircuitBreaker _circuit_breaker;
     PersistenceStore* _persistence;
+
+    // Graceful shutdown state
+    std::atomic<bool> _draining{false};  // Set to true to reject new requests
+    seastar::gate _request_gate;         // Tracks in-flight requests
 
     // Helper handlers
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);

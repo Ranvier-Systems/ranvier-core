@@ -104,6 +104,11 @@ struct CircuitBreakerConfig {
     bool fallback_enabled = true;                     // Try alternative backends on failure
 };
 
+// Shutdown configuration for graceful drain
+struct ShutdownConfig {
+    std::chrono::seconds drain_timeout{30};           // Max time to wait for in-flight requests
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -118,6 +123,7 @@ struct RanvierConfig {
     RateLimitConfig rate_limit;
     RetryConfig retry;
     CircuitBreakerConfig circuit_breaker;
+    ShutdownConfig shutdown;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -268,6 +274,11 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env("RANVIER_CIRCUIT_BREAKER_FALLBACK")) {
         circuit_breaker.fallback_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+
+    // Shutdown overrides
+    if (auto v = get_env_as<int>("RANVIER_SHUTDOWN_DRAIN_TIMEOUT")) {
+        shutdown.drain_timeout = std::chrono::seconds(*v);
     }
 }
 
@@ -423,6 +434,14 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (cb["fallback_enabled"]) config.circuit_breaker.fallback_enabled = cb["fallback_enabled"].as<bool>();
         }
+
+        // Shutdown section
+        if (yaml["shutdown"]) {
+            YAML::Node s = yaml["shutdown"];
+            if (s["drain_timeout_seconds"]) {
+                config.shutdown.drain_timeout = std::chrono::seconds(s["drain_timeout_seconds"].as<int>());
+            }
+        }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -502,6 +521,11 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
         if (config.circuit_breaker.success_threshold == 0) {
             return "circuit_breaker.success_threshold must be positive";
         }
+    }
+
+    // Validate shutdown settings
+    if (config.shutdown.drain_timeout.count() == 0) {
+        return "shutdown.drain_timeout must be positive";
     }
 
     return std::nullopt;  // Valid

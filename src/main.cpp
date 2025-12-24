@@ -139,6 +139,7 @@ future<> reload_config() {
         ctrl_config.circuit_breaker.success_threshold = g_config.circuit_breaker.success_threshold;
         ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
         ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
+        ctrl_config.drain_timeout = g_config.shutdown.drain_timeout;
         controller->update_config(ctrl_config);
 
         // Update routing config on all shards
@@ -188,6 +189,7 @@ future<> run() {
     ctrl_config.circuit_breaker.success_threshold = g_config.circuit_breaker.success_threshold;
     ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
     ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
+    ctrl_config.drain_timeout = g_config.shutdown.drain_timeout;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
 
     // 2a. Initialize metrics on all shards
@@ -285,13 +287,35 @@ future<> run() {
                 });
                 ranvier::log_main.info("SIGHUP handler registered for config hot-reload");
 
-                // Wait Loop
+                // Wait Loop with Graceful Shutdown
                 auto stop_signal = std::make_shared<promise<>>();
-                engine().handle_signal(SIGINT, [stop_signal] { stop_signal->set_value(); });
-                engine().handle_signal(SIGTERM, [stop_signal] { stop_signal->set_value(); });
+
+                // Graceful shutdown handler: drain then signal stop
+                auto graceful_shutdown = [stop_signal]() {
+                    ranvier::log_main.info("Shutdown signal received - initiating graceful shutdown");
+
+                    // Start draining (reject new requests)
+                    controller->start_draining();
+
+                    // Wait for in-flight requests to complete, then signal stop
+                    (void)controller->wait_for_drain().then([stop_signal] {
+                        stop_signal->set_value();
+                    }).handle_exception([stop_signal](auto ep) {
+                        try {
+                            std::rethrow_exception(ep);
+                        } catch (const std::exception& e) {
+                            ranvier::log_main.error("Error during drain: {}", e.what());
+                        }
+                        // Still proceed with shutdown even on error
+                        stop_signal->set_value();
+                    });
+                };
+
+                engine().handle_signal(SIGINT, graceful_shutdown);
+                engine().handle_signal(SIGTERM, graceful_shutdown);
                 return stop_signal->get_future();
             }).then([&api_server, &prom_server] {
-                ranvier::log_main.info("Stopping Ranvier...");
+                ranvier::log_main.info("Drain complete - stopping Ranvier...");
 
                 // Stop Health Checker FIRST
                 return health_checker->stop().then([&api_server, &prom_server] {
@@ -376,6 +400,7 @@ int main(int argc, char** argv) {
         } else {
             std::cout << "  Circuit:      disabled\n";
         }
+        std::cout << "  Drain Timeout: " << g_config.shutdown.drain_timeout.count() << "s\n";
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
         return 1;
