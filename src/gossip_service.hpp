@@ -159,6 +159,8 @@ private:
     // UDP channel for gossip
     std::optional<seastar::net::udp_channel> _channel;
 
+    seastar::socket_address _my_address;
+
     // Parsed peer addresses
     std::vector<seastar::socket_address> _peer_addresses;
 

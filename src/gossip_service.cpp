@@ -59,6 +59,7 @@ seastar::future<> GossipService::start() {
     try {
         // Synchronously create the channel.
         _channel = seastar::engine().net().make_bound_datagram_channel(bind_addr);
+        _my_address = bind_addr;
         _running = true;
 
         log_gossip.info("Gossip UDP channel opened on port {}", _config.gossip_port);
@@ -142,6 +143,12 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
     // We do NOT capture base_packet by value if the copy constructor is deleted.
     // Instead, we use the shared-pointer-like behavior of Seastar packets.
     return seastar::parallel_for_each(_peer_addresses, [this, p = base_packet.share()](const seastar::socket_address& peer) mutable {
+        // Basic loopback prevention: Don't send gossip to ourselves
+        // Note: You may need to store 'bind_addr' as a member variable during start()
+        if (peer == _my_address) {
+            return seastar::make_ready_future<>();
+        }
+
         // .share() increments the internal reference count.
         // We move the shared instance into the send call.
         return _channel->send(peer, p.share()).then([this] {
