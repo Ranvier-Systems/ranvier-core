@@ -3,6 +3,7 @@
 #include "radix_tree.hpp"
 #include "config.hpp"
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -53,6 +54,10 @@ public:
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id);
 
+    // Start draining a backend (stops new requests, allows existing cache hits)
+    // After backend_drain_timeout, the backend will be fully removed
+    seastar::future<> drain_backend_global(BackendId id);
+
     // Get a backend using weighted random selection within the highest available priority group
     std::optional<BackendId> get_random_backend();
 
@@ -65,6 +70,18 @@ public:
     // Hot-reload: Update routing configuration on all shards
     seastar::future<> update_routing_config(const RoutingConfig& config);
 
+    // Callback type for pool cleanup when a backend is removed
+    using PoolCleanupCallback = std::function<void(seastar::socket_address)>;
+
+    // Set callback to be invoked when a backend is fully removed (for pool cleanup)
+    void set_pool_cleanup_callback(PoolCleanupCallback callback);
+
+    // Start the draining reaper timer (call after Seastar is initialized)
+    void start_draining_reaper();
+
+    // Stop the draining reaper timer (call before shutdown)
+    void stop_draining_reaper();
+
 private:
     // Thread-local metrics group
     // This holds the handle that keeps the metrics alive
@@ -76,8 +93,17 @@ private:
     // TTL cleanup timer (runs on shard 0, broadcasts to all shards)
     seastar::timer<> _ttl_timer;
 
+    // Draining reaper timer (runs on shard 0, checks for expired draining backends)
+    seastar::timer<> _draining_reaper_timer;
+
+    // Callback for pool cleanup when a backend is fully removed
+    PoolCleanupCallback _pool_cleanup_callback;
+
     // Perform TTL cleanup on all shards
     void run_ttl_cleanup();
+
+    // Check for backends that have been draining long enough and fully remove them
+    void run_draining_reaper();
 };
 
 } // namespace ranvier

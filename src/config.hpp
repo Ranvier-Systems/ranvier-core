@@ -55,6 +55,7 @@ struct RoutingConfig {
     uint32_t block_alignment = 16;  // vLLM PagedAttention block size for route alignment
     size_t max_routes = 100000;  // Maximum number of routes in the prefix cache (0 = unlimited)
     std::chrono::seconds ttl_seconds{3600};  // TTL for cached routes (1 hour default)
+    std::chrono::seconds backend_drain_timeout{60};  // Time to wait before fully removing a draining backend
 };
 
 // Timeout configuration
@@ -215,6 +216,9 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_ROUTE_TTL_SECONDS")) {
         routing.ttl_seconds = std::chrono::seconds(*v);
     }
+    if (auto v = get_env_as<int>("RANVIER_BACKEND_DRAIN_TIMEOUT")) {
+        routing.backend_drain_timeout = std::chrono::seconds(*v);
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -369,6 +373,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["ttl_seconds"]) {
                 config.routing.ttl_seconds = std::chrono::seconds(r["ttl_seconds"].as<int>());
             }
+            if (r["backend_drain_timeout_seconds"]) {
+                config.routing.backend_drain_timeout = std::chrono::seconds(r["backend_drain_timeout_seconds"].as<int>());
+            }
         }
 
         // Timeouts section
@@ -488,6 +495,9 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
     // Validate routing settings
     if (config.routing.block_alignment == 0) {
         return "routing.block_alignment must be positive";
+    }
+    if (config.routing.backend_drain_timeout.count() == 0) {
+        return "routing.backend_drain_timeout must be positive";
     }
 
     // Validate timeout settings

@@ -62,6 +62,11 @@ routing:
   # Maximum attempts to find a live backend on cache miss
   backend_retry_limit: 5
 
+  # Time in seconds to wait before fully removing a draining backend (RANVIER_BACKEND_DRAIN_TIMEOUT)
+  # During this period, existing cache hits can still route to the backend (to leverage KV cache)
+  # but new requests will not be assigned to the draining backend
+  backend_drain_timeout_seconds: 60
+
 # Timeout configuration
 timeouts:
   # Timeout for establishing connection to backend in seconds (RANVIER_CONNECT_TIMEOUT)
