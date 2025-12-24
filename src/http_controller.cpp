@@ -179,9 +179,17 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 // PROXY HANDLER
 // ---------------------------------------------------------
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Extract or generate request ID for distributed tracing
+    std::string request_id = extract_request_id(req->_headers);
+    if (request_id.empty()) {
+        request_id = generate_request_id();
+    }
+
     // Check if we're draining - reject new requests with 503
     if (_draining.load(std::memory_order_relaxed)) {
+        log_proxy.info("[{}] Request rejected - server is draining", request_id);
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("X-Request-ID", request_id);
         rep->add_header("Retry-After", "5");
         rep->write_body("json", "{\"error\": \"Server is shutting down\"}");
         co_return std::move(rep);
@@ -193,7 +201,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         gate_holder = _request_gate.hold();
     } catch (const seastar::gate_closed_exception&) {
         // Gate already closed during shutdown
+        log_proxy.info("[{}] Request rejected - gate closed", request_id);
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("X-Request-ID", request_id);
         rep->add_header("Retry-After", "5");
         rep->write_body("json", "{\"error\": \"Server is shutting down\"}");
         co_return std::move(rep);
@@ -204,41 +214,53 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     metrics().record_request();
 
     std::string body = req->content;
+    std::string client_ip = get_client_ip(*req);
+
+    log_proxy.info("[{}] Request received from {} ({} bytes)",
+                   request_id, client_ip, body.size());
 
     // 1. Validation
     if (!_tokenizer.is_loaded()) {
+        log_proxy.warn("[{}] Tokenizer not loaded", request_id);
         metrics().record_failure();
+        rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
         co_return std::move(rep);
     }
 
     auto tokens = _tokenizer.encode(body);
-    auto route_hit = _router.lookup(tokens);
+    auto route_hit = _router.lookup(tokens, request_id);
 
     BackendId target_id;
     if (route_hit.has_value()) {
         target_id = route_hit.value();
+        log_proxy.debug("[{}] Route cache hit -> backend {}", request_id, target_id);
     } else {
         auto random_id = _router.get_random_backend();
         if (!random_id.has_value()) {
+            log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
+            rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
         }
         target_id = random_id.value();
+        log_proxy.debug("[{}] Route cache miss, using random backend {}", request_id, target_id);
     }
 
     // Circuit breaker check - try fallback if circuit is open
     if (!_circuit_breaker.allow_request(target_id)) {
-        log_proxy.info("Circuit open for backend {}, trying fallback", target_id);
+        log_proxy.info("[{}] Circuit open for backend {}, trying fallback", request_id, target_id);
         metrics().record_circuit_open();
         auto fallback = get_fallback_backend(target_id);
         if (fallback.has_value()) {
             target_id = fallback.value();
             metrics().record_fallback();
-            log_proxy.info("Using fallback backend {}", target_id);
+            log_proxy.info("[{}] Using fallback backend {}", request_id, target_id);
         } else {
+            log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
             metrics().record_failure();
+            rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"All backends unavailable (circuit breaker open)\"}");
             co_return std::move(rep);
         }
@@ -246,11 +268,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     auto target_addr_opt = _router.get_backend_address(target_id);
     if (!target_addr_opt.has_value()) {
+        log_proxy.warn("[{}] Backend {} IP not found", request_id, target_id);
         metrics().record_failure();
+        rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
         co_return std::move(rep);
     }
     socket_address target_addr = target_addr_opt.value();
+    log_proxy.debug("[{}] Routing to backend {} at {}", request_id, target_id, target_addr);
 
     // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
     // Capture config for the lambda
@@ -259,7 +284,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto retry_config = _config.retry;
     auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
 
-    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start](output_stream<char> client_out) -> future<> {
+    // Add X-Request-ID to response headers before streaming
+    rep->add_header("X-Request-ID", request_id);
+
+    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -283,14 +311,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         while (retry_attempt <= retry_config.max_retries) {
             // Check if we've exceeded overall request deadline
             if (lowres_clock::now() >= request_deadline) {
-                log_proxy.warn("Request deadline exceeded during connection retry");
+                log_proxy.warn("[{}] Request deadline exceeded during connection retry", request_id);
                 connection_failed = true;
                 _circuit_breaker.record_failure(current_backend);
                 break;
             }
 
             auto connect_deadline = lowres_clock::now() + connect_timeout;
-            auto conn_future = with_timeout(connect_deadline, _pool.get(current_addr));
+            auto conn_future = with_timeout(connect_deadline, _pool.get(current_addr, request_id));
 
             bool this_attempt_failed = false;
             bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
@@ -304,6 +332,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 metrics().record_connect_latency(
                     MetricsService::to_seconds(connect_end - connect_start));
                 connection_failed = false;
+                log_proxy.debug("[{}] Connection established to backend {}", request_id, current_backend);
                 break;
             }
 
@@ -316,7 +345,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 if (fallback.has_value()) {
                     auto fallback_addr = _router.get_backend_address(fallback.value());
                     if (fallback_addr.has_value()) {
-                        log_proxy.info("Falling back from backend {} to {}", current_backend, fallback.value());
+                        log_proxy.info("[{}] Falling back from backend {} to {}", request_id, current_backend, fallback.value());
                         current_backend = fallback.value();
                         current_addr = fallback_addr.value();
                         fallback_attempts++;
@@ -328,8 +357,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             // No fallback available - check if we should retry same backend
             if (retry_attempt < retry_config.max_retries) {
-                log_proxy.warn("Connection attempt {} failed, retrying in {}ms",
-                    retry_attempt + 1, current_backoff.count());
+                log_proxy.warn("[{}] Connection attempt {} failed, retrying in {}ms",
+                    request_id, retry_attempt + 1, current_backoff.count());
 
                 // Wait with exponential backoff before retry
                 co_await seastar::sleep(current_backoff);
@@ -339,8 +368,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     static_cast<int64_t>(current_backoff.count() * retry_config.backoff_multiplier));
                 current_backoff = std::min(next_backoff, retry_config.max_backoff);
             } else {
-                log_proxy.warn("Connection failed after {} retries and {} fallbacks",
-                    retry_config.max_retries + 1, fallback_attempts);
+                log_proxy.warn("[{}] Connection failed after {} retries and {} fallbacks",
+                    request_id, retry_config.max_retries + 1, fallback_attempts);
                 connection_failed = true;
             }
 
@@ -348,6 +377,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
 
         if (connection_failed) {
+            log_proxy.error("[{}] Backend connection failed after retries", request_id);
             metrics().record_failure();
             sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
             co_await client_out.write(error_msg);
@@ -358,10 +388,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         // 2. SEND REQUEST (with timeout check)
         if (lowres_clock::now() >= request_deadline) {
-            log_proxy.warn("Request timeout before sending");
+            log_proxy.warn("[{}] Request timeout before sending", request_id);
             metrics().record_timeout();
             bundle.is_valid = false;
-            _pool.put(std::move(bundle));
+            _pool.put(std::move(bundle), request_id);
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
             co_await client_out.write(error_msg);
             co_await client_out.flush();
@@ -369,14 +399,17 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             co_return;
         }
 
+        // Build HTTP request with X-Request-ID header for backend tracing
         sstring http_req =
             "POST /v1/chat/completions HTTP/1.1\r\n"
             "Host: localhost\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: " + to_sstring(body.size()) + "\r\n"
+            "X-Request-ID: " + request_id + "\r\n"
             "Connection: keep-alive\r\n\r\n" +
             body;
 
+        log_proxy.debug("[{}] Sending request to backend ({} bytes)", request_id, body.size());
         co_await bundle.out.write(http_req);
         co_await bundle.out.flush();
 
@@ -385,7 +418,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         while (true) {
             // Check request timeout before each read
             if (lowres_clock::now() >= request_deadline) {
-                log_proxy.warn("Request timeout after {}s", request_timeout.count());
+                log_proxy.warn("[{}] Request timeout after {}s", request_id, request_timeout.count());
                 timed_out = true;
                 bundle.is_valid = false;
                 break;
@@ -399,7 +432,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             bool read_failed = false;
             auto read_future = with_timeout(read_deadline, bundle.in.read());
             temporary_buffer<char> chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
-                log_proxy.warn("Read timeout waiting for backend response");
+                log_proxy.warn("[{}] Read timeout waiting for backend response", request_id);
                 read_failed = true;
                 return temporary_buffer<char>{}; // Return empty buffer
             });
@@ -412,6 +445,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             // EOF logic
             if (chunk.empty()) {
+                log_proxy.debug("[{}] Backend response complete (EOF)", request_id);
                 bundle.is_valid = false;
                 break;
             }
@@ -429,11 +463,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     metrics().record_response_latency(
                         MetricsService::to_seconds(response_time - connect_start));
                     response_latency_recorded = true;
+                    log_proxy.debug("[{}] First byte received from backend", request_id);
                 }
 
                 if (!route_hit.has_value() && tokens.size() >= _config.min_token_length) {
-                    (void)_router.learn_route_global(tokens, current_backend);
-                    log_router.info("Learned route: {} tokens -> GPU-{}", tokens.size(), current_backend);
+                    (void)_router.learn_route_global(tokens, current_backend, request_id);
 
                     if (_persistence) {
                         _persistence->save_route(tokens, current_backend);
@@ -447,6 +481,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             }
 
             if (res.done) {
+                log_proxy.debug("[{}] Stream complete", request_id);
                 break;
             }
         }
@@ -454,6 +489,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         // Send timeout error to client if needed
         if (timed_out) {
             // Record failure for circuit breaker on timeout
+            log_proxy.warn("[{}] Request timed out", request_id);
             _circuit_breaker.record_failure(current_backend);
             metrics().record_timeout();
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
@@ -461,6 +497,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             co_await client_out.flush();
         } else if (!connection_failed) {
             // Request completed successfully
+            log_proxy.info("[{}] Request completed successfully", request_id);
             metrics().record_success();
         }
 
@@ -472,7 +509,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
 
         // 4. CLEANUP
-        _pool.put(std::move(bundle));
+        _pool.put(std::move(bundle), request_id);
         co_await client_out.close();
 
         // Record total request duration

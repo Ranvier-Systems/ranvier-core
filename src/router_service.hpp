@@ -4,6 +4,7 @@
 #include "config.hpp"
 
 #include <optional>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -30,14 +31,18 @@ public:
 
     // 1. DATA PLANE (Fast Lookups)
     // Find which Backend ID owns this prefix
-    std::optional<BackendId> lookup(const std::vector<int32_t>& tokens);
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    std::optional<BackendId> lookup(const std::vector<int32_t>& tokens,
+                                     const std::string& request_id = "");
 
     // Resolve ID -> IP:Port
     std::optional<seastar::socket_address> get_backend_address(BackendId id);
 
     // 2. CONTROL PLANE (Async Broadcasts)
     // Teach the tree a new prefix (Prefix -> ID) with LRU eviction
-    seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend);
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend,
+                                          const std::string& request_id = "");
 
     // Teach the system a new server (ID -> IP:Port) with optional weight and priority
     // Weight: relative load balancing weight (default 100, higher = more traffic)

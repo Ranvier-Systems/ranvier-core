@@ -4,10 +4,13 @@
 #include <unordered_map>
 #include <chrono>
 #include <iostream>
+#include <string>
 
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/net/api.hh>
+
+#include "logging.hpp"
 
 namespace ranvier {
 
@@ -67,7 +70,9 @@ public:
         : _config(config) {}
 
     // GET: Reuse existing or create new connection
-    seastar::future<ConnectionBundle> get(seastar::socket_address addr) {
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    seastar::future<ConnectionBundle> get(seastar::socket_address addr,
+                                           const std::string& request_id = "") {
         auto& pool = _pools[addr];
 
         // Try to find a valid, non-expired connection (LIFO for cache locality)
@@ -78,16 +83,26 @@ public:
 
             // Skip expired connections
             if (bundle.is_expired(_config.idle_timeout)) {
+                if (!request_id.empty()) {
+                    log_pool.debug("[{}] Closing expired pooled connection to {}",
+                                   request_id, addr);
+                }
                 (void)bundle.close(); // Fire-and-forget close
                 continue;
             }
 
             // Found a good connection
+            if (!request_id.empty()) {
+                log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
+            }
             bundle.touch();
             return seastar::make_ready_future<ConnectionBundle>(std::move(bundle));
         }
 
         // No pooled connection available, create new one
+        if (!request_id.empty()) {
+            log_pool.debug("[{}] Creating new connection to {}", request_id, addr);
+        }
         return seastar::connect(addr).then([addr](seastar::connected_socket fd) {
             fd.set_nodelay(true); // Disable Nagle's algorithm for lower latency
             auto in = fd.input();
@@ -97,8 +112,13 @@ public:
     }
 
     // PUT: Return connection to pool
-    void put(ConnectionBundle&& bundle) {
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    void put(ConnectionBundle&& bundle, const std::string& request_id = "") {
         if (!bundle.is_valid) {
+            if (!request_id.empty()) {
+                log_pool.debug("[{}] Closing invalid connection to {}",
+                               request_id, bundle.addr);
+            }
             (void)bundle.close();
             return;
         }
@@ -121,6 +141,10 @@ public:
             evict_oldest_global();
         }
 
+        if (!request_id.empty()) {
+            log_pool.debug("[{}] Returning connection to pool for {}",
+                           request_id, bundle.addr);
+        }
         pool.push_back(std::move(bundle));
         _total_idle_connections++;
     }
