@@ -179,6 +179,26 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 // PROXY HANDLER
 // ---------------------------------------------------------
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Check if we're draining - reject new requests with 503
+    if (_draining.load(std::memory_order_relaxed)) {
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("Retry-After", "5");
+        rep->write_body("json", "{\"error\": \"Server is shutting down\"}");
+        co_return std::move(rep);
+    }
+
+    // Enter the request gate to track this in-flight request
+    seastar::gate::holder gate_holder;
+    try {
+        gate_holder = _request_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        // Gate already closed during shutdown
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("Retry-After", "5");
+        rep->write_body("json", "{\"error\": \"Server is shutting down\"}");
+        co_return std::move(rep);
+    }
+
     // Track request start time for latency metrics
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
@@ -598,6 +618,38 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(
     log_control.warn("Cleared all persisted data (backends and routes). Restart required to clear in-memory state.");
     rep->write_body("json", "{\"status\": \"ok\", \"warning\": \"All persisted data cleared. Restart to clear in-memory state.\"}");
     return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+
+// ---------------------------------------------------------
+// GRACEFUL SHUTDOWN
+// ---------------------------------------------------------
+
+void HttpController::start_draining() {
+    _draining.store(true, std::memory_order_relaxed);
+    log_proxy.info("Draining started - rejecting new requests");
+}
+
+future<> HttpController::wait_for_drain() {
+    auto drain_timeout = _config.drain_timeout;
+    log_proxy.info("Waiting for in-flight requests to complete (timeout: {}s)", drain_timeout.count());
+
+    // Close the gate and wait for all holders to be released
+    auto gate_close_future = _request_gate.close();
+
+    // Race between gate closing and timeout
+    auto deadline = lowres_clock::now() + drain_timeout;
+
+    return with_timeout(deadline, std::move(gate_close_future))
+        .then([] {
+            log_proxy.info("All in-flight requests completed");
+        })
+        .handle_exception_type([](const seastar::timed_out_error&) {
+            log_proxy.warn("Drain timeout reached - some requests may be interrupted");
+        });
+}
+
+bool HttpController::is_draining() const {
+    return _draining.load(std::memory_order_relaxed);
 }
 
 } // namespace ranvier
