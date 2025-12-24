@@ -178,6 +178,7 @@ private:
     uint64_t _packets_sent = 0;
     uint64_t _packets_received = 0;
     uint64_t _packets_invalid = 0;
+    uint64_t _packets_untrusted = 0;
     uint64_t _stats_cluster_peers_alive = 0;
 
     // Seastar metrics registration

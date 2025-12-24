@@ -4,6 +4,8 @@
 
 #include "gossip_service.hpp"
 
+#include <algorithm>
+
 #include <boost/range/irange.hpp>
 
 #include <seastar/core/app-template.hh>
@@ -42,6 +44,8 @@ GossipService::GossipService(const ClusterConfig& config)
             seastar::metrics::description("Total number of gossip packets received from cluster peers")),
         seastar::metrics::make_counter("router_cluster_sync_invalid", _packets_invalid,
             seastar::metrics::description("Total number of invalid gossip packets received")),
+        seastar::metrics::make_counter("router_cluster_sync_untrusted", _packets_untrusted,
+            seastar::metrics::description("Total number of gossip packets received from unknown peers")),
         seastar::metrics::make_gauge("cluster_peers_alive", _stats_cluster_peers_alive,
             seastar::metrics::description("Number of cluster peers currently alive"))
     });
@@ -210,6 +214,14 @@ seastar::future<> GossipService::receive_loop() {
 
 seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgram) {
     auto src_addr = dgram.get_src();
+
+    // Verify source is a known peer before any processing
+    auto it = std::find(_peer_addresses.begin(), _peer_addresses.end(), src_addr);
+    if (it == _peer_addresses.end()) {
+        ++_packets_untrusted;
+        return seastar::make_ready_future<>();
+    }
+
     update_peer_liveness(src_addr);
 
     // Move the packet out and linearize it
