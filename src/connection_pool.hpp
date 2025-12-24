@@ -244,6 +244,29 @@ public:
         };
     }
 
+    // Clear all idle connections for a specific backend address
+    // Call this when a backend is being removed to release resources
+    size_t clear_pool(seastar::socket_address addr) {
+        auto it = _pools.find(addr);
+        if (it == _pools.end()) {
+            return 0;
+        }
+
+        size_t closed = 0;
+        auto& pool = it->second;
+        for (auto& bundle : pool) {
+            (void)bundle.close();
+            closed++;
+        }
+        _total_idle_connections -= pool.size();
+        _pools.erase(it);
+
+        if (closed > 0) {
+            log_pool.info("Cleared {} pooled connections for removed backend {}", closed, addr);
+        }
+        return closed;
+    }
+
     // Cleanup expired and half-open connections (call periodically)
     size_t cleanup_expired() {
         size_t closed = 0;

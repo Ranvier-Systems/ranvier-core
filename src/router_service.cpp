@@ -14,11 +14,13 @@
 
 namespace ranvier {
 
-// Backend info including weight and priority
+// Backend info including weight, priority, and draining state
 struct BackendInfo {
     seastar::socket_address addr;
     uint32_t weight = 100;
     uint32_t priority = 0;
+    bool is_draining = false;
+    std::chrono::steady_clock::time_point drain_start_time;
 };
 
 // Thread-local RadixTree pointer (initialized per-shard with config)
@@ -38,6 +40,7 @@ thread_local uint64_t stats_routes_expired = 0;
 // Thread-local routing configuration (set during shard initialization)
 thread_local size_t local_max_routes = 100000;
 thread_local std::chrono::seconds local_ttl_seconds{3600};
+thread_local std::chrono::seconds local_backend_drain_timeout{60};
 
 thread_local std::mt19937 rng([]() {
     std::random_device rd;
@@ -52,6 +55,7 @@ RouterService::RouterService(const RoutingConfig& config) : _config(config) {
     local_tree = std::make_unique<RadixTree>(config.block_alignment);
     local_max_routes = config.max_routes;
     local_ttl_seconds = config.ttl_seconds;
+    local_backend_drain_timeout = config.backend_drain_timeout;
 
     _metrics.add_group("ranvier", {
         seastar::metrics::make_counter("router_cache_hits", stats_cache_hits,
@@ -70,13 +74,15 @@ seastar::future<> RouterService::initialize_shards() {
     uint32_t block_alignment = _config.block_alignment;
     size_t max_routes = _config.max_routes;
     auto ttl_seconds = _config.ttl_seconds;
+    auto drain_timeout = _config.backend_drain_timeout;
 
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
-        [block_alignment, max_routes, ttl_seconds](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds] {
+        [block_alignment, max_routes, ttl_seconds, drain_timeout](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout] {
                 local_tree = std::make_unique<RadixTree>(block_alignment);
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
+                local_backend_drain_timeout = drain_timeout;
                 return seastar::make_ready_future<>();
             });
         });
@@ -168,6 +174,9 @@ std::optional<BackendId> RouterService::get_random_backend() {
             continue;
         }
         const auto& info = it->second;
+        if (info.is_draining) {
+            continue;  // Skip draining backends for new requests
+        }
         if (info.weight > 0) {
             priority_groups[info.priority].emplace_back(id, info.weight);
         }
@@ -324,19 +333,92 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     // Capture values to broadcast
     size_t max_routes = config.max_routes;
     auto ttl_seconds = config.ttl_seconds;
+    auto drain_timeout = config.backend_drain_timeout;
 
-    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s)",
-                  max_routes, ttl_seconds.count());
+    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s)",
+                  max_routes, ttl_seconds.count(), drain_timeout.count());
 
     // Broadcast to all shards using Seastar's async message passing
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-        [max_routes, ttl_seconds](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds] {
+        [max_routes, ttl_seconds, drain_timeout](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds, drain_timeout] {
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
+                local_backend_drain_timeout = drain_timeout;
                 return seastar::make_ready_future<>();
             });
         });
+}
+
+seastar::future<> RouterService::drain_backend_global(BackendId id) {
+    // Check if backend exists and get its address for logging
+    auto it = local_backends.find(id);
+    if (it == local_backends.end()) {
+        log_router.warn("Cannot drain backend {}: not found", id);
+        return seastar::make_ready_future<>();
+    }
+
+    log_router.info("Starting drain for backend {} (timeout: {}s)", id, _config.backend_drain_timeout.count());
+
+    auto now = std::chrono::steady_clock::now();
+
+    // Broadcast draining state to all shards
+    return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, now](unsigned shard_id) {
+        return seastar::smp::submit_to(shard_id, [id, now] {
+            auto it = local_backends.find(id);
+            if (it != local_backends.end()) {
+                it->second.is_draining = true;
+                it->second.drain_start_time = now;
+            }
+            return seastar::make_ready_future<>();
+        });
+    });
+}
+
+void RouterService::set_pool_cleanup_callback(PoolCleanupCallback callback) {
+    _pool_cleanup_callback = std::move(callback);
+}
+
+void RouterService::start_draining_reaper() {
+    // Run the draining reaper every 5 seconds
+    _draining_reaper_timer.set_callback([this] { run_draining_reaper(); });
+    _draining_reaper_timer.arm_periodic(std::chrono::seconds(5));
+    log_main.info("Backend draining reaper started (interval: 5s, timeout: {}s)",
+                  _config.backend_drain_timeout.count());
+}
+
+void RouterService::stop_draining_reaper() {
+    _draining_reaper_timer.cancel();
+    log_main.info("Backend draining reaper stopped");
+}
+
+void RouterService::run_draining_reaper() {
+    auto now = std::chrono::steady_clock::now();
+
+    // Find backends on shard 0 that have been draining longer than the timeout
+    std::vector<std::pair<BackendId, seastar::socket_address>> to_remove;
+
+    for (const auto& [id, info] : local_backends) {
+        if (info.is_draining) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - info.drain_start_time);
+            if (elapsed >= local_backend_drain_timeout) {
+                to_remove.emplace_back(id, info.addr);
+            }
+        }
+    }
+
+    // Remove each expired draining backend
+    for (const auto& [id, addr] : to_remove) {
+        log_router.info("Backend {} drain timeout expired, removing from all shards", id);
+
+        // Call pool cleanup callback before removing (if set)
+        if (_pool_cleanup_callback) {
+            _pool_cleanup_callback(addr);
+        }
+
+        // Fire-and-forget the unregister (runs asynchronously)
+        (void)unregister_backend_global(id);
+    }
 }
 
 } // namespace ranvier
