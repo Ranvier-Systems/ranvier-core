@@ -6,6 +6,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/when_all.hh>
 #include <boost/range/irange.hpp>
 #include <algorithm>
 #include <map>

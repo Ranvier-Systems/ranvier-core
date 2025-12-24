@@ -7,6 +7,7 @@
 // 4. Persistence Layer (SqlitePersistence): Handles durable storage of routes/backends
 
 #include "config.hpp"
+#include "gossip_service.hpp"
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "logging.hpp"

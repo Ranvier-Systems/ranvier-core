@@ -4,14 +4,21 @@
 
 #include "gossip_service.hpp"
 
+#include <seastar/core/app-template.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/net/ip.hh>
+#include <seastar/net/udp.hh>
 
 namespace ranvier {
 
 GossipService::GossipService(const ClusterConfig& config)
-    : _config(config) {
+    : _config(config),
+    _receive_loop_future(seastar::make_ready_future<>()) {
 
     // Parse peer addresses at construction
     for (const auto& peer : _config.peers) {
@@ -47,18 +54,18 @@ seastar::future<> GossipService::start() {
 
     log_gossip.info("Starting gossip service on port {}", _config.gossip_port);
     log_gossip.info("Configured peers: {}", _peer_addresses.size());
-
-    // Create UDP channel bound to gossip port
     seastar::socket_address bind_addr(seastar::ipv4_addr("0.0.0.0", _config.gossip_port));
 
-    return seastar::net::make_udp_channel(bind_addr).then([this](seastar::net::udp_channel channel) {
-        _channel = std::move(channel);
+    try {
+        // Synchronously create the channel.
+        _channel = seastar::engine().net().make_bound_datagram_channel(bind_addr);
         _running = true;
 
         log_gossip.info("Gossip UDP channel opened on port {}", _config.gossip_port);
 
-        // Start receive loop in background (fire-and-forget)
-        (void)receive_loop().handle_exception([](auto ep) {
+        // Start receive loop in background (fire-and-forget).
+        // It returns a future, but we don't wait for it to 'finish' because it runs for the lifetime of the service.
+        _receive_loop_future = receive_loop().handle_exception([](auto ep) {
             try {
                 std::rethrow_exception(ep);
             } catch (const std::exception& e) {
@@ -66,32 +73,46 @@ seastar::future<> GossipService::start() {
             }
         });
 
+        // Return a ready future to signal the service has 'started' successfully.
         return seastar::make_ready_future<>();
-    }).handle_exception([this](auto ep) {
-        try {
-            std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
-            log_gossip.error("Failed to start gossip service: {}", e.what());
-        }
-        return seastar::make_ready_future<>();
-    });
+    } catch (...) {
+        // If bind fails (e.g. EADDRINUSE), convert the exception to a failed future.
+        return seastar::make_exception_future<>(std::current_exception());
+    }
 }
+
+#include <seastar/core/coroutine.hh>
 
 seastar::future<> GossipService::stop() {
     if (!_running) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     log_gossip.info("Stopping gossip service");
     _running = false;
 
+    // Important: Shutdown the channel first.
+    // This wakes up the pending _channel->receive() call with an exception.
     if (_channel) {
+        // Stop incoming traffic (unblocks receive_loop)
+        // This is the "alarm clock" that wakes up the receive() call
         _channel->shutdown_input();
+
+        // Stop outgoing traffic
         _channel->shutdown_output();
-        _channel = std::nullopt;
     }
 
-    return seastar::make_ready_future<>();
+    // Move the future so we can await it
+    try {
+        co_await std::move(_receive_loop_future);
+    } catch (...) {
+        // We expect an exception here (ECONNABORTED) because we shut down the channel
+        log_gossip.debug("Gossip loop exited");
+    }
+
+    // Cleanup to release the port back to the system.
+    _channel = std::nullopt;
+    co_return;
 }
 
 void GossipService::set_route_learn_callback(RouteLearnCallback callback) {
@@ -155,25 +176,27 @@ seastar::future<> GossipService::receive_loop() {
 }
 
 seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgram) {
-    auto& data = dgram.get_data();
+    // Move the packet out and linearize it
+    seastar::net::packet data = std::move(dgram.get_data());
 
-    // Parse the packet
-    auto pkt = RouteAnnouncementPacket::deserialize(
-        reinterpret_cast<const uint8_t*>(data.get()), data.len());
+    // This ensures data.fragments()[0] contains the ENTIRE packet
+    data.linearize();
+
+    // Now it is safe to access the full length from the first fragment
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
+    auto pkt = RouteAnnouncementPacket::deserialize(ptr, data.len());
 
     if (!pkt) {
         _packets_invalid++;
-        log_gossip.debug("Received invalid gossip packet from {}", dgram.get_src());
         return seastar::make_ready_future<>();
     }
 
     _packets_received++;
 
-    log_gossip.debug("Received route announcement: {} tokens -> backend {} from {}",
-                     pkt->tokens.size(), pkt->backend_id, dgram.get_src());
-
-    // Call the route learn callback if set
+    // Ensure RouteAnnouncementPacket::deserialize creates OWNED data (like std::vector<int>)
+    // and not views into the 'ptr' buffer.
     if (_route_learn_callback) {
+        // We move pkt->tokens because the callback likely takes ownership
         return _route_learn_callback(std::move(pkt->tokens), pkt->backend_id);
     }
 

@@ -173,6 +173,8 @@ private:
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;
 
+    seastar::future<> _receive_loop_future;
+
     // Receive loop (runs continuously while service is active)
     seastar::future<> receive_loop();
 
