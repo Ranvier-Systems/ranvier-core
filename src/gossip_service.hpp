@@ -177,11 +177,17 @@ private:
 
     seastar::future<> _receive_loop_future;
 
+    // Timer to trigger periodic heartbeats
+    seastar::timer<> _heartbeat_timer;
+
     // Receive loop (runs continuously while service is active)
     seastar::future<> receive_loop();
 
     // Handle a received packet
     seastar::future<> handle_packet(seastar::net::udp_datagram&& dgram);
+
+    // Internal method to send a heartbeat to all peers
+    seastar::future<> broadcast_heartbeat();
 
     // Parse peer address string "IP:Port" to socket_address
     static std::optional<seastar::socket_address> parse_peer_address(const std::string& peer);
