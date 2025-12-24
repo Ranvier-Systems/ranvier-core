@@ -85,6 +85,12 @@ seastar::future<> GossipService::start() {
             }
         });
 
+        // Trigger a heartbeat every 5 seconds (configurable)
+        _heartbeat_timer.set_callback([this] {
+            (void)broadcast_heartbeat();
+        });
+        _heartbeat_timer.arm_periodic(std::chrono::seconds(5));
+
         // Return a ready future to signal the service has 'started' successfully.
         return seastar::make_ready_future<>();
     } catch (...) {
@@ -124,6 +130,10 @@ seastar::future<> GossipService::stop() {
 
     // Cleanup to release the port back to the system.
     _channel = std::nullopt;
+
+    // Stop the heartbeat generator
+    _heartbeat_timer.cancel();
+
     co_return;
 }
 
@@ -197,8 +207,20 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
 
     // Now it is safe to access the full length from the first fragment
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
-    auto pkt = RouteAnnouncementPacket::deserialize(ptr, data.len());
 
+    // Identify packet type
+    GossipPacketType type = static_cast<GossipPacketType>(ptr[0]);
+
+    if (type == GossipPacketType::HEARTBEAT) {
+        // Change get_src_address() to get_src()
+        log_gossip.debug("Received heartbeat from {}", dgram.get_src());
+
+        // Logic: You would typically update a 'last_seen' timestamp for this peer
+        // in a peer-management table here.
+        return seastar::make_ready_future<>();
+    }
+
+    auto pkt = RouteAnnouncementPacket::deserialize(ptr, data.len());
     if (!pkt) {
         _packets_invalid++;
         return seastar::make_ready_future<>();
@@ -221,6 +243,30 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     }
 
     return seastar::make_ready_future<>();
+}
+
+seastar::future<> GossipService::broadcast_heartbeat() {
+    if (!_channel || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Prepare a small 2-byte heartbeat (Type + Version)
+    std::vector<uint8_t> payload = {
+        static_cast<uint8_t>(GossipPacketType::HEARTBEAT),
+        RouteAnnouncementPacket::PROTOCOL_VERSION
+    };
+
+    seastar::net::packet pb(seastar::temporary_buffer<char>(
+        reinterpret_cast<const char*>(payload.data()), payload.size()));
+
+    return seastar::parallel_for_each(_peer_addresses, [this, p = pb.share()](const seastar::socket_address& peer) mutable {
+        if (peer == _my_address) {
+            return seastar::make_ready_future<>();
+        }
+
+        // Send and ignore individual results
+        return _channel->send(peer, p.share()).discard_result();
+    });
 }
 
 std::optional<seastar::socket_address> GossipService::parse_peer_address(const std::string& peer) {
