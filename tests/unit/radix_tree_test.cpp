@@ -63,9 +63,9 @@ TEST_F(RadixTreeTest, LookupNonexistentKeyReturnsNullopt) {
 TEST_F(RadixTreeTest, InsertEmptyTokenSequence) {
     tree.insert(tokens({}), 1);
 
+    // Empty sequence should not create a route (no tokens to match)
     auto result = tree.lookup(tokens({}));
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result.value(), 1);
+    EXPECT_FALSE(result.has_value());
 }
 
 // =============================================================================
