@@ -7,6 +7,8 @@
 #include <memory>
 #include <span>
 #include <algorithm>
+#include <chrono>
+#include <functional>
 
 #include "types.hpp"
 
@@ -46,7 +48,11 @@ struct Node {
     // Leaf Data: If this node terminates a valid route, this has a value.
     std::optional<BackendId> leaf_value;
 
-    Node(NodeType t) : type(t) {}
+    // LRU tracking: timestamp of last access (for TTL and eviction)
+    // This is shard-local so no atomics needed (Seastar's shared-nothing model)
+    std::chrono::steady_clock::time_point last_accessed;
+
+    Node(NodeType t) : type(t), last_accessed(std::chrono::steady_clock::now()) {}
     virtual ~Node() = default;
 };
 
@@ -101,6 +107,13 @@ struct Node256 : public Node {
     }
 };
 
+// Entry info for LRU management
+struct RouteEntry {
+    std::vector<TokenId> tokens;
+    BackendId backend;
+    std::chrono::steady_clock::time_point last_accessed;
+};
+
 // The Tree Manager
 class RadixTree {
 public:
@@ -119,6 +132,7 @@ public:
         }
         auto aligned_tokens = tokens.subspan(0, aligned_len);
         root = insert_recursive(root, aligned_tokens, backend);
+        route_count_++;
     }
 
     // LOOKUP - Returns the BackendId if found, or nullopt
@@ -126,9 +140,42 @@ public:
         return lookup_recursive(root, tokens);
     }
 
+    // Get approximate route count (may be slightly inaccurate due to overwrites)
+    size_t route_count() const {
+        return route_count_;
+    }
+
+    // Traverse all leaf nodes and call callback with entry info
+    // Callback signature: void(const RouteEntry&)
+    template<typename Callback>
+    void for_each_leaf(Callback&& callback) const {
+        std::vector<TokenId> path;
+        for_each_leaf_recursive(root, path, std::forward<Callback>(callback));
+    }
+
+    // Remove routes older than the given time point
+    // Returns the number of routes removed
+    size_t remove_expired(std::chrono::steady_clock::time_point cutoff) {
+        size_t removed = 0;
+        remove_expired_recursive(root, cutoff, removed);
+        route_count_ = (route_count_ > removed) ? route_count_ - removed : 0;
+        return removed;
+    }
+
+    // Evict the oldest route (for LRU eviction when at capacity)
+    // Returns true if a route was evicted
+    bool evict_oldest() {
+        if (find_and_remove_oldest(root)) {
+            if (route_count_ > 0) route_count_--;
+            return true;
+        }
+        return false;
+    }
+
 private:
     std::shared_ptr<Node> root;
     uint32_t block_alignment_;  // vLLM PagedAttention block size
+    size_t route_count_ = 0;
 
     // Get the byte index for a token (lower 8 bits)
     static uint8_t key_byte(TokenId key) {
@@ -475,13 +522,186 @@ private:
             if (child) {
                 auto result = lookup_recursive(child, remaining.subspan(1));
                 if (result.has_value()) {
+                    // Touch timestamp on the matched child (LRU tracking)
+                    child->last_accessed = std::chrono::steady_clock::now();
                     return result;
                 }
             }
         }
 
+        // Touch timestamp if this node has a leaf value (LRU tracking)
+        if (node->leaf_value.has_value()) {
+            node->last_accessed = std::chrono::steady_clock::now();
+        }
+
         // Return this node's value (longest prefix match)
         return node->leaf_value;
+    }
+
+    // Helper: Traverse all leaves recursively
+    template<typename Callback>
+    void for_each_leaf_recursive(std::shared_ptr<Node> node, std::vector<TokenId>& path, Callback&& callback) const {
+        if (!node) return;
+
+        // Add this node's prefix to path
+        size_t prefix_start = path.size();
+        path.insert(path.end(), node->prefix.begin(), node->prefix.end());
+
+        // If this node has a leaf value, call the callback
+        if (node->leaf_value.has_value()) {
+            RouteEntry entry;
+            entry.tokens = path;
+            entry.backend = node->leaf_value.value();
+            entry.last_accessed = node->last_accessed;
+            callback(entry);
+        }
+
+        // Traverse children
+        auto visit_children = [&](auto& keys, auto& children) {
+            for (size_t i = 0; i < keys.size(); i++) {
+                path.push_back(keys[i]);
+                for_each_leaf_recursive(children[i], path, callback);
+                path.pop_back();
+            }
+        };
+
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node.get());
+                visit_children(n->keys, n->children);
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node.get());
+                visit_children(n->keys, n->children);
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node.get());
+                visit_children(n->keys, n->children);
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node.get());
+                for (int i = 0; i < 256; i++) {
+                    if (n->children[i]) {
+                        path.push_back(static_cast<TokenId>(i));
+                        for_each_leaf_recursive(n->children[i], path, callback);
+                        path.pop_back();
+                    }
+                }
+                break;
+            }
+        }
+
+        // Remove this node's prefix from path
+        path.resize(prefix_start);
+    }
+
+    // Helper: Remove expired leaf values recursively
+    void remove_expired_recursive(std::shared_ptr<Node> node, std::chrono::steady_clock::time_point cutoff, size_t& removed) {
+        if (!node) return;
+
+        // Check if this node's leaf value is expired
+        if (node->leaf_value.has_value() && node->last_accessed < cutoff) {
+            node->leaf_value = std::nullopt;
+            removed++;
+        }
+
+        // Traverse children
+        auto visit_children = [&](auto& children) {
+            for (auto& child : children) {
+                if (child) {
+                    remove_expired_recursive(child, cutoff, removed);
+                }
+            }
+        };
+
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+        }
+    }
+
+    // Helper: Find and remove the oldest leaf value
+    // Returns true if a leaf was removed
+    bool find_and_remove_oldest(std::shared_ptr<Node> node) {
+        if (!node) return false;
+
+        std::shared_ptr<Node> oldest_node = nullptr;
+        std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::time_point::max();
+
+        // Find the oldest leaf
+        find_oldest_recursive(node, oldest_node, oldest_time);
+
+        // Remove the oldest leaf's value
+        if (oldest_node && oldest_node->leaf_value.has_value()) {
+            oldest_node->leaf_value = std::nullopt;
+            return true;
+        }
+        return false;
+    }
+
+    // Helper: Find the oldest leaf node
+    void find_oldest_recursive(std::shared_ptr<Node> node, std::shared_ptr<Node>& oldest_node,
+                               std::chrono::steady_clock::time_point& oldest_time) {
+        if (!node) return;
+
+        // Check if this node has a leaf value and is older than current oldest
+        if (node->leaf_value.has_value() && node->last_accessed < oldest_time) {
+            oldest_time = node->last_accessed;
+            oldest_node = node;
+        }
+
+        // Traverse children
+        auto visit_children = [&](auto& children) {
+            for (auto& child : children) {
+                if (child) {
+                    find_oldest_recursive(child, oldest_node, oldest_time);
+                }
+            }
+        };
+
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+        }
     }
 };
 

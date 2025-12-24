@@ -21,7 +21,8 @@ struct BackendInfo {
     uint32_t priority = 0;
 };
 
-thread_local RadixTree local_tree;
+// Thread-local RadixTree pointer (initialized per-shard with config)
+thread_local std::unique_ptr<RadixTree> local_tree;
 thread_local std::unordered_map<BackendId, BackendInfo> local_backends;
 thread_local std::vector<BackendId> local_backend_ids;
 
@@ -31,6 +32,12 @@ thread_local std::unordered_set<BackendId> local_dead_backends;
 // Thread-local counters for metrics
 thread_local uint64_t stats_cache_hits = 0;
 thread_local uint64_t stats_cache_misses = 0;
+thread_local uint64_t stats_routes_evicted = 0;
+thread_local uint64_t stats_routes_expired = 0;
+
+// Thread-local routing configuration (set during shard initialization)
+thread_local size_t local_max_routes = 100000;
+thread_local std::chrono::seconds local_ttl_seconds{3600};
 
 thread_local std::mt19937 rng([]() {
     std::random_device rd;
@@ -38,17 +45,76 @@ thread_local std::mt19937 rng([]() {
     return std::mt19937(rd() ^ time_seed);
 }());
 
-RouterService::RouterService() {
+RouterService::RouterService() : RouterService(RoutingConfig{}) {}
+
+RouterService::RouterService(const RoutingConfig& config) : _config(config) {
+    // Initialize shard 0's local_tree immediately
+    local_tree = std::make_unique<RadixTree>(config.block_alignment);
+    local_max_routes = config.max_routes;
+    local_ttl_seconds = config.ttl_seconds;
+
     _metrics.add_group("ranvier", {
         seastar::metrics::make_counter("router_cache_hits", stats_cache_hits,
             seastar::metrics::description("Total number of prefix cache hits")),
         seastar::metrics::make_counter("router_cache_misses", stats_cache_misses,
-            seastar::metrics::description("Total number of prefix cache misses"))
+            seastar::metrics::description("Total number of prefix cache misses")),
+        seastar::metrics::make_counter("router_routes_evicted", stats_routes_evicted,
+            seastar::metrics::description("Total number of routes evicted due to capacity limits")),
+        seastar::metrics::make_counter("router_routes_expired", stats_routes_expired,
+            seastar::metrics::description("Total number of routes expired due to TTL"))
+    });
+}
+
+seastar::future<> RouterService::initialize_shards() {
+    // Initialize RadixTree on all other shards with the config from shard 0
+    uint32_t block_alignment = _config.block_alignment;
+    size_t max_routes = _config.max_routes;
+    auto ttl_seconds = _config.ttl_seconds;
+
+    return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
+        [block_alignment, max_routes, ttl_seconds](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds] {
+                local_tree = std::make_unique<RadixTree>(block_alignment);
+                local_max_routes = max_routes;
+                local_ttl_seconds = ttl_seconds;
+                return seastar::make_ready_future<>();
+            });
+        });
+}
+
+void RouterService::start_ttl_timer() {
+    // Set up the timer to fire every 60 seconds
+    _ttl_timer.set_callback([this] { run_ttl_cleanup(); });
+    _ttl_timer.arm_periodic(std::chrono::seconds(60));
+    log_main.info("TTL cleanup timer started (interval: 60s, TTL: {}s)", _config.ttl_seconds.count());
+}
+
+void RouterService::stop_ttl_timer() {
+    _ttl_timer.cancel();
+    log_main.info("TTL cleanup timer stopped");
+}
+
+void RouterService::run_ttl_cleanup() {
+    auto cutoff = std::chrono::steady_clock::now() - local_ttl_seconds;
+
+    // Run cleanup on all shards
+    (void)seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
+        return seastar::smp::submit_to(shard_id, [cutoff] {
+            if (local_tree) {
+                size_t removed = local_tree->remove_expired(cutoff);
+                if (removed > 0) {
+                    stats_routes_expired += removed;
+                    log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
+                }
+            }
+            return seastar::make_ready_future<>();
+        });
     });
 }
 
 std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens) {
-    auto result = local_tree.lookup(tokens);
+    if (!local_tree) return std::nullopt;
+    auto result = local_tree->lookup(tokens);
 
     // Circuit breaker: if cache hit points to dead backend, treat as miss
     if (result.has_value()) {
@@ -132,7 +198,20 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     return seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
-                local_tree.insert(tokens, backend);
+                if (!local_tree) return seastar::make_ready_future<>();
+
+                // LRU eviction: if at capacity, evict oldest routes first
+                if (local_max_routes > 0) {
+                    while (local_tree->route_count() >= local_max_routes) {
+                        if (local_tree->evict_oldest()) {
+                            stats_routes_evicted++;
+                        } else {
+                            break;  // No more routes to evict
+                        }
+                    }
+                }
+
+                local_tree->insert(tokens, backend);
                 return seastar::make_ready_future<>();
             });
         });

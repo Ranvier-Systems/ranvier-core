@@ -14,6 +14,8 @@
 
 #include <vector>
 #include <optional>
+#include <thread>
+#include <chrono>
 
 using namespace ranvier;
 
@@ -650,4 +652,398 @@ TEST_F(RadixTreeBlockAlignmentTest, LargeBlockAlignment) {
     auto result = tree.lookup(vec64);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value(), 3);  // Overwrote previous value
+}
+
+// =============================================================================
+// LRU Infrastructure Tests (route_count, for_each_leaf, TTL, eviction)
+// =============================================================================
+
+class RadixTreeLRUTest : public ::testing::Test {
+protected:
+    // Use block_alignment=1 to disable alignment for cleaner tests
+    RadixTree tree{1};
+
+    // Helper to create token vectors
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+
+    std::vector<TokenId> tokens(size_t count, TokenId start = 1) {
+        std::vector<TokenId> result;
+        result.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            result.push_back(start + static_cast<TokenId>(i));
+        }
+        return result;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// route_count() Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, RouteCountStartsAtZero) {
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+TEST_F(RadixTreeLRUTest, RouteCountIncrementsOnInsert) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    tree.insert(tokens({4, 5, 6}), 2);
+    EXPECT_EQ(tree.route_count(), 2u);
+
+    tree.insert(tokens({7, 8, 9}), 3);
+    EXPECT_EQ(tree.route_count(), 3u);
+}
+
+TEST_F(RadixTreeLRUTest, RouteCountIncrementsOnOverwrite) {
+    // Note: route_count is approximate - it doesn't detect overwrites
+    tree.insert(tokens({1, 2, 3}), 1);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    tree.insert(tokens({1, 2, 3}), 99);  // Overwrite
+    // Count increases even on overwrite (documented as approximate)
+    EXPECT_EQ(tree.route_count(), 2u);
+}
+
+TEST_F(RadixTreeLRUTest, RouteCountManyRoutes) {
+    for (int i = 0; i < 100; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}), static_cast<BackendId>(i));
+    }
+    EXPECT_EQ(tree.route_count(), 100u);
+}
+
+// -----------------------------------------------------------------------------
+// for_each_leaf() Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, ForEachLeafEmptyTree) {
+    int count = 0;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        count++;
+    });
+    EXPECT_EQ(count, 0);
+}
+
+TEST_F(RadixTreeLRUTest, ForEachLeafSingleRoute) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    std::vector<RouteEntry> entries;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        entries.push_back(entry);
+    });
+
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_EQ(entries[0].backend, 42);
+    EXPECT_EQ(entries[0].tokens, tokens({1, 2, 3}));
+}
+
+TEST_F(RadixTreeLRUTest, ForEachLeafMultipleRoutes) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+    tree.insert(tokens({7, 8, 9}), 3);
+
+    std::vector<BackendId> backends;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        backends.push_back(entry.backend);
+    });
+
+    EXPECT_EQ(backends.size(), 3u);
+    // Sort to check all backends are present (traversal order may vary)
+    std::sort(backends.begin(), backends.end());
+    EXPECT_EQ(backends, (std::vector<BackendId>{1, 2, 3}));
+}
+
+TEST_F(RadixTreeLRUTest, ForEachLeafWithSharedPrefix) {
+    // Routes with shared prefix
+    tree.insert(tokens({1, 2, 10}), 10);
+    tree.insert(tokens({1, 2, 20}), 20);
+    tree.insert(tokens({1, 2, 30}), 30);
+
+    std::vector<BackendId> backends;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        backends.push_back(entry.backend);
+    });
+
+    EXPECT_EQ(backends.size(), 3u);
+    std::sort(backends.begin(), backends.end());
+    EXPECT_EQ(backends, (std::vector<BackendId>{10, 20, 30}));
+}
+
+TEST_F(RadixTreeLRUTest, ForEachLeafHierarchicalRoutes) {
+    // Hierarchical routes (short and long prefixes)
+    tree.insert(tokens({1, 2}), 1);
+    tree.insert(tokens({1, 2, 3, 4}), 2);
+
+    std::vector<RouteEntry> entries;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        entries.push_back(entry);
+    });
+
+    EXPECT_EQ(entries.size(), 2u);
+}
+
+// -----------------------------------------------------------------------------
+// last_accessed Timestamp Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, LastAccessedUpdatedOnLookup) {
+    tree.insert(tokens({1, 2, 3}), 1);
+
+    // Get initial timestamp
+    std::chrono::steady_clock::time_point initial_time;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        initial_time = entry.last_accessed;
+    });
+
+    // Small delay to ensure time difference
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Perform lookup
+    tree.lookup(tokens({1, 2, 3}));
+
+    // Check timestamp was updated
+    std::chrono::steady_clock::time_point after_lookup;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        after_lookup = entry.last_accessed;
+    });
+
+    EXPECT_GT(after_lookup, initial_time);
+}
+
+TEST_F(RadixTreeLRUTest, LastAccessedUpdatedOnLongestPrefixMatch) {
+    tree.insert(tokens({1, 2}), 1);
+
+    // Get initial timestamp
+    std::chrono::steady_clock::time_point initial_time;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        initial_time = entry.last_accessed;
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Lookup with longer sequence (triggers longest prefix match)
+    tree.lookup(tokens({1, 2, 3, 4, 5}));
+
+    // Check timestamp was updated
+    std::chrono::steady_clock::time_point after_lookup;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        after_lookup = entry.last_accessed;
+    });
+
+    EXPECT_GT(after_lookup, initial_time);
+}
+
+// -----------------------------------------------------------------------------
+// remove_expired() Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredNoExpiredRoutes) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    // Cutoff in the past - nothing should be expired
+    auto past = std::chrono::steady_clock::now() - std::chrono::hours(1);
+    size_t removed = tree.remove_expired(past);
+
+    EXPECT_EQ(removed, 0u);
+    EXPECT_EQ(tree.route_count(), 2u);
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredAllExpired) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    // Cutoff in the future - all should be expired
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    size_t removed = tree.remove_expired(future);
+
+    EXPECT_EQ(removed, 2u);
+    EXPECT_EQ(tree.route_count(), 0u);
+
+    // Verify routes are gone
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredPartialExpiration) {
+    tree.insert(tokens({1, 2, 3}), 1);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    auto middle = std::chrono::steady_clock::now();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    // Only the first route should be expired
+    size_t removed = tree.remove_expired(middle);
+
+    EXPECT_EQ(removed, 1u);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    // First route should be gone, second should remain
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredUpdatesRouteCount) {
+    for (int i = 0; i < 10; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}), static_cast<BackendId>(i));
+    }
+    EXPECT_EQ(tree.route_count(), 10u);
+
+    // Expire all
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    size_t removed = tree.remove_expired(future);
+
+    EXPECT_EQ(removed, 10u);
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+// -----------------------------------------------------------------------------
+// evict_oldest() Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, EvictOldestEmptyTree) {
+    bool evicted = tree.evict_oldest();
+    EXPECT_FALSE(evicted);
+}
+
+TEST_F(RadixTreeLRUTest, EvictOldestSingleRoute) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    bool evicted = tree.evict_oldest();
+
+    EXPECT_TRUE(evicted);
+    EXPECT_EQ(tree.route_count(), 0u);
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, EvictOldestEvictsOldest) {
+    tree.insert(tokens({1, 2, 3}), 1);  // Oldest
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    tree.insert(tokens({4, 5, 6}), 2);  // Newer
+
+    EXPECT_EQ(tree.route_count(), 2u);
+
+    bool evicted = tree.evict_oldest();
+
+    EXPECT_TRUE(evicted);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    // Oldest (backend 1) should be evicted, newer (backend 2) should remain
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, EvictOldestUpdatesRouteCount) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+    tree.insert(tokens({7, 8, 9}), 3);
+    EXPECT_EQ(tree.route_count(), 3u);
+
+    tree.evict_oldest();
+    EXPECT_EQ(tree.route_count(), 2u);
+
+    tree.evict_oldest();
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    tree.evict_oldest();
+    EXPECT_EQ(tree.route_count(), 0u);
+
+    // No more to evict
+    bool evicted = tree.evict_oldest();
+    EXPECT_FALSE(evicted);
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+TEST_F(RadixTreeLRUTest, EvictOldestRespectsLookupUpdates) {
+    // Insert three routes with delays
+    tree.insert(tokens({1, 2, 3}), 1);  // Initially oldest
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    tree.insert(tokens({4, 5, 6}), 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    tree.insert(tokens({7, 8, 9}), 3);  // Initially newest
+
+    // Access the oldest route to make it newest
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    tree.lookup(tokens({1, 2, 3}));
+
+    // Now route 2 should be the oldest
+    tree.evict_oldest();
+
+    // Route 2 should be evicted, routes 1 and 3 should remain
+    EXPECT_TRUE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({7, 8, 9})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, EvictOldestWithManyRoutes) {
+    // Insert 100 routes
+    for (int i = 0; i < 100; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}), static_cast<BackendId>(i));
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    EXPECT_EQ(tree.route_count(), 100u);
+
+    // Evict 50 routes
+    for (int i = 0; i < 50; i++) {
+        EXPECT_TRUE(tree.evict_oldest());
+    }
+
+    EXPECT_EQ(tree.route_count(), 50u);
+}
+
+// -----------------------------------------------------------------------------
+// Combined LRU Operations Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, CombinedExpireAndEvict) {
+    // Insert routes at different times
+    tree.insert(tokens({1, 2, 3}), 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    tree.insert(tokens({4, 5, 6}), 2);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    auto cutoff = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    tree.insert(tokens({7, 8, 9}), 3);
+
+    EXPECT_EQ(tree.route_count(), 3u);
+
+    // Expire old routes
+    size_t expired = tree.remove_expired(cutoff);
+    EXPECT_EQ(expired, 2u);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    // Only newest route should remain
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({7, 8, 9})).has_value());
+
+    // Evict the remaining route
+    EXPECT_TRUE(tree.evict_oldest());
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+TEST_F(RadixTreeLRUTest, RouteEntryContainsCorrectData) {
+    tree.insert(tokens({10, 20, 30}), 42);
+
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        EXPECT_EQ(entry.backend, 42);
+        EXPECT_EQ(entry.tokens.size(), 3u);
+        EXPECT_EQ(entry.tokens[0], 10);
+        EXPECT_EQ(entry.tokens[1], 20);
+        EXPECT_EQ(entry.tokens[2], 30);
+        // Timestamp should be recent
+        auto now = std::chrono::steady_clock::now();
+        auto age = now - entry.last_accessed;
+        EXPECT_LT(age, std::chrono::seconds(1));
+    });
 }
