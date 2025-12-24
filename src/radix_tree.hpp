@@ -104,13 +104,21 @@ struct Node256 : public Node {
 // The Tree Manager
 class RadixTree {
 public:
-    RadixTree() {
+    explicit RadixTree(uint32_t block_alignment = 16)
+        : block_alignment_(block_alignment) {
         root = std::make_shared<Node4>();
     }
 
     // INSERT - O(k) where k is the number of tokens
+    // Tokens are truncated to block_alignment boundary for vLLM PagedAttention compatibility
     void insert(std::span<const TokenId> tokens, BackendId backend) {
-        root = insert_recursive(root, tokens, backend);
+        // Align to block boundary - only insert at multiples of block_alignment
+        size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
+        if (aligned_len == 0) {
+            return;  // Not enough tokens for a full block
+        }
+        auto aligned_tokens = tokens.subspan(0, aligned_len);
+        root = insert_recursive(root, aligned_tokens, backend);
     }
 
     // LOOKUP - Returns the BackendId if found, or nullopt
@@ -120,6 +128,7 @@ public:
 
 private:
     std::shared_ptr<Node> root;
+    uint32_t block_alignment_;  // vLLM PagedAttention block size
 
     // Get the byte index for a token (lower 8 bits)
     static uint8_t key_byte(TokenId key) {
