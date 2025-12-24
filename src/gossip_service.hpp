@@ -107,7 +107,7 @@ struct RouteAnnouncementPacket {
 
         // Validate packet size
         size_t expected_size = HEADER_SIZE + pkt.token_count * sizeof(TokenId);
-        if (len < expected_size || pkt.token_count > MAX_TOKENS) {
+        if (len != expected_size || pkt.token_count > MAX_TOKENS) {
             return std::nullopt;
         }
 
