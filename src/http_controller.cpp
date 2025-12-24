@@ -4,6 +4,7 @@
 #include "stream_parser.hpp"
 
 #include <algorithm>
+#include <system_error>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/iostream.hh>
@@ -23,6 +24,44 @@ class request_timeout_error : public std::runtime_error {
 public:
     request_timeout_error() : std::runtime_error("Request timed out") {}
 };
+
+// Helper to check if an exception is a connection error (broken pipe or connection reset)
+// These errors occur when the backend closes the connection unexpectedly
+enum class ConnectionErrorType {
+    NONE,
+    BROKEN_PIPE,      // EPIPE - write to closed socket
+    CONNECTION_RESET  // ECONNRESET - connection reset by peer
+};
+
+inline ConnectionErrorType classify_connection_error(std::exception_ptr ep) {
+    if (!ep) return ConnectionErrorType::NONE;
+
+    try {
+        std::rethrow_exception(ep);
+    } catch (const std::system_error& e) {
+        // Check for EPIPE (broken pipe) - occurs when writing to a closed socket
+        if (e.code() == std::errc::broken_pipe ||
+            e.code().value() == EPIPE) {
+            return ConnectionErrorType::BROKEN_PIPE;
+        }
+        // Check for ECONNRESET (connection reset by peer)
+        if (e.code() == std::errc::connection_reset ||
+            e.code().value() == ECONNRESET) {
+            return ConnectionErrorType::CONNECTION_RESET;
+        }
+    } catch (...) {
+        // Not a system_error, not a connection error we handle specially
+    }
+    return ConnectionErrorType::NONE;
+}
+
+inline const char* connection_error_to_string(ConnectionErrorType type) {
+    switch (type) {
+        case ConnectionErrorType::BROKEN_PIPE: return "broken pipe (EPIPE)";
+        case ConnectionErrorType::CONNECTION_RESET: return "connection reset (ECONNRESET)";
+        default: return "unknown";
+    }
+}
 
 // Helper: explicit seastar::httpd:: (Server) types
 template <typename Func>
@@ -410,11 +449,40 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             body;
 
         log_proxy.debug("[{}] Sending request to backend ({} bytes)", request_id, body.size());
-        co_await bundle.out.write(http_req);
-        co_await bundle.out.flush();
 
-        // 3. The Read Loop (with timeout)
+        // Send request with broken pipe/connection reset handling
+        bool write_failed = false;
+        try {
+            co_await bundle.out.write(http_req);
+            co_await bundle.out.flush();
+        } catch (...) {
+            auto err_type = classify_connection_error(std::current_exception());
+            if (err_type != ConnectionErrorType::NONE) {
+                log_proxy.warn("[{}] Backend write failed: {} - closing connection",
+                               request_id, connection_error_to_string(err_type));
+                write_failed = true;
+                bundle.is_valid = false;
+                _circuit_breaker.record_failure(current_backend);
+                metrics().record_connection_error();
+            } else {
+                // Re-throw non-connection errors
+                throw;
+            }
+        }
+
+        if (write_failed) {
+            // Clean up and send error to client
+            co_await bundle.close();
+            sstring error_msg = "data: {\"error\": \"Backend connection lost during request\"}\n\n";
+            co_await client_out.write(error_msg);
+            co_await client_out.flush();
+            co_await client_out.close();
+            co_return;
+        }
+
+        // 3. The Read Loop (with timeout and connection error handling)
         StreamParser parser;
+        bool connection_error = false;
         while (true) {
             // Check request timeout before each read
             if (lowres_clock::now() >= request_deadline) {
@@ -430,16 +498,44 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             auto read_deadline = lowres_clock::now() + read_timeout;
 
             bool read_failed = false;
-            auto read_future = with_timeout(read_deadline, bundle.in.read());
-            temporary_buffer<char> chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
-                log_proxy.warn("[{}] Read timeout waiting for backend response", request_id);
-                read_failed = true;
-                return temporary_buffer<char>{}; // Return empty buffer
-            });
+            temporary_buffer<char> chunk;
+            try {
+                auto read_future = with_timeout(read_deadline, bundle.in.read());
+                chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
+                    // Check for connection errors first
+                    auto err_type = classify_connection_error(ep);
+                    if (err_type != ConnectionErrorType::NONE) {
+                        log_proxy.warn("[{}] Backend read failed: {}",
+                                       request_id, connection_error_to_string(err_type));
+                        connection_error = true;
+                    } else {
+                        log_proxy.warn("[{}] Read timeout waiting for backend response", request_id);
+                    }
+                    read_failed = true;
+                    return temporary_buffer<char>{}; // Return empty buffer
+                });
+            } catch (...) {
+                // Catch any exceptions that weren't handled by handle_exception
+                auto err_type = classify_connection_error(std::current_exception());
+                if (err_type != ConnectionErrorType::NONE) {
+                    log_proxy.warn("[{}] Backend read failed: {}",
+                                   request_id, connection_error_to_string(err_type));
+                    connection_error = true;
+                    read_failed = true;
+                    bundle.is_valid = false;
+                } else {
+                    throw; // Re-throw non-connection errors
+                }
+            }
 
             if (read_failed) {
-                timed_out = true;
-                bundle.is_valid = false;
+                if (connection_error) {
+                    bundle.is_valid = false;
+                    _circuit_breaker.record_failure(current_backend);
+                } else {
+                    timed_out = true;
+                    bundle.is_valid = false;
+                }
                 break;
             }
 
@@ -475,9 +571,22 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
             }
 
+            // Write to client with broken pipe handling
             if (!res.data.empty()) {
-                co_await client_out.write(res.data);
-                co_await client_out.flush();
+                try {
+                    co_await client_out.write(res.data);
+                    co_await client_out.flush();
+                } catch (...) {
+                    auto err_type = classify_connection_error(std::current_exception());
+                    if (err_type != ConnectionErrorType::NONE) {
+                        log_proxy.warn("[{}] Client write failed: {} - client disconnected",
+                                       request_id, connection_error_to_string(err_type));
+                        // Client disconnected, clean up backend connection and exit
+                        bundle.is_valid = false;
+                        break;
+                    }
+                    throw; // Re-throw non-connection errors
+                }
             }
 
             if (res.done) {
@@ -486,15 +595,38 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             }
         }
 
-        // Send timeout error to client if needed
+        // Send error to client if needed
         if (timed_out) {
             // Record failure for circuit breaker on timeout
             log_proxy.warn("[{}] Request timed out", request_id);
             _circuit_breaker.record_failure(current_backend);
             metrics().record_timeout();
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Client may have disconnected, ignore write errors
+                auto err_type = classify_connection_error(std::current_exception());
+                if (err_type == ConnectionErrorType::NONE) {
+                    log_proxy.debug("[{}] Failed to send timeout error to client", request_id);
+                }
+            }
+        } else if (connection_error) {
+            // Backend connection was lost unexpectedly
+            log_proxy.warn("[{}] Backend connection error occurred", request_id);
+            metrics().record_connection_error();
+            sstring error_msg = "data: {\"error\": \"Backend connection lost\"}\n\n";
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Client may have disconnected, ignore write errors
+                auto err_type = classify_connection_error(std::current_exception());
+                if (err_type == ConnectionErrorType::NONE) {
+                    log_proxy.debug("[{}] Failed to send error to client", request_id);
+                }
+            }
         } else if (!connection_failed) {
             // Request completed successfully
             log_proxy.info("[{}] Request completed successfully", request_id);
@@ -502,15 +634,30 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
 
         // Record backend total latency (from connection start to completion)
-        if (!connection_failed) {
+        if (!connection_failed && !connection_error) {
             auto backend_end = std::chrono::steady_clock::now();
             metrics().record_backend_total_latency(
                 MetricsService::to_seconds(backend_end - connect_start));
         }
 
-        // 4. CLEANUP
-        _pool.put(std::move(bundle), request_id);
-        co_await client_out.close();
+        // 4. CLEANUP - Always ensure proper resource recovery
+        // For failed connections, explicitly close the bundle instead of pooling
+        if (connection_failed || connection_error || timed_out || !bundle.is_valid) {
+            // Don't return broken connections to the pool
+            bundle.is_valid = false;
+            co_await bundle.close();
+        } else {
+            // Return healthy connection to pool
+            _pool.put(std::move(bundle), request_id);
+        }
+
+        // Close client output stream
+        try {
+            co_await client_out.close();
+        } catch (...) {
+            // Ignore errors closing client connection
+            log_proxy.trace("[{}] Error closing client output stream", request_id);
+        }
 
         // Record total request duration
         auto request_end = std::chrono::steady_clock::now();

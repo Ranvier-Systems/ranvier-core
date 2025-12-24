@@ -87,6 +87,9 @@ public:
             seastar::metrics::make_counter("http_requests_rate_limited", _requests_rate_limited,
                 seastar::metrics::description("Total number of rate-limited HTTP requests")),
 
+            seastar::metrics::make_counter("http_requests_connection_error", _requests_connection_error,
+                seastar::metrics::description("Total number of requests failed due to connection errors (broken pipe, reset)")),
+
             seastar::metrics::make_counter("circuit_breaker_opens", _circuit_opens,
                 seastar::metrics::description("Total number of circuit breaker opens")),
 
@@ -120,6 +123,7 @@ public:
     void record_failure() { _requests_failed++; }
     void record_timeout() { _requests_timeout++; }
     void record_rate_limited() { _requests_rate_limited++; }
+    void record_connection_error() { _requests_connection_error++; }
 
     // Record circuit breaker events
     void record_circuit_open() { _circuit_opens++; }
@@ -157,6 +161,7 @@ private:
     uint64_t _requests_failed = 0;
     uint64_t _requests_timeout = 0;
     uint64_t _requests_rate_limited = 0;
+    uint64_t _requests_connection_error = 0;
     uint64_t _circuit_opens = 0;
     uint64_t _fallback_attempts = 0;
 
