@@ -14,7 +14,6 @@
 
 #include <chrono>
 #include <unordered_map>
-#include <mutex>
 
 namespace ranvier {
 
