@@ -200,6 +200,12 @@ public:
 
     const Config& config() const { return _config; }
 
+    // Hot-reload: Update configuration at runtime
+    void update_config(const Config& config) {
+        _config = config;
+        // Note: Existing circuit states are preserved
+    }
+
 private:
     Config _config;
     std::unordered_map<BackendId, BackendCircuit> _circuits;

@@ -125,6 +125,9 @@ struct RanvierConfig {
     // Load with defaults (no file)
     static RanvierConfig defaults();
 
+    // Validate configuration, returns error message if invalid, nullopt if valid
+    static std::optional<std::string> validate(const RanvierConfig& config);
+
 private:
     // Apply environment variable overrides
     void apply_env_overrides();
@@ -430,6 +433,78 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
     // Environment variables override file settings
     config.apply_env_overrides();
     return config;
+}
+
+inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) {
+    // Validate server ports
+    if (config.server.api_port == 0) {
+        return "server.api_port must be non-zero";
+    }
+    if (config.server.metrics_port == 0) {
+        return "server.metrics_port must be non-zero";
+    }
+    if (config.server.api_port == config.server.metrics_port) {
+        return "server.api_port and server.metrics_port must be different";
+    }
+
+    // Validate health check settings
+    if (config.health.check_interval.count() == 0) {
+        return "health.check_interval must be positive";
+    }
+    if (config.health.check_timeout.count() == 0) {
+        return "health.check_timeout must be positive";
+    }
+    if (config.health.failure_threshold == 0) {
+        return "health.failure_threshold must be positive";
+    }
+
+    // Validate pool settings
+    if (config.pool.max_connections_per_host == 0) {
+        return "pool.max_connections_per_host must be positive";
+    }
+    if (config.pool.max_total_connections == 0) {
+        return "pool.max_total_connections must be positive";
+    }
+
+    // Validate routing settings
+    if (config.routing.block_alignment == 0) {
+        return "routing.block_alignment must be positive";
+    }
+
+    // Validate timeout settings
+    if (config.timeouts.connect_timeout.count() == 0) {
+        return "timeouts.connect_timeout must be positive";
+    }
+    if (config.timeouts.request_timeout.count() == 0) {
+        return "timeouts.request_timeout must be positive";
+    }
+
+    // Validate TLS settings (if enabled)
+    if (config.tls.enabled) {
+        if (config.tls.cert_path.empty()) {
+            return "tls.cert_path is required when TLS is enabled";
+        }
+        if (config.tls.key_path.empty()) {
+            return "tls.key_path is required when TLS is enabled";
+        }
+    }
+
+    // Validate retry settings
+    if (config.retry.backoff_multiplier < 1.0) {
+        return "retry.backoff_multiplier must be >= 1.0";
+    }
+
+    // Validate circuit breaker settings
+    if (config.circuit_breaker.enabled) {
+        if (config.circuit_breaker.failure_threshold == 0) {
+            return "circuit_breaker.failure_threshold must be positive";
+        }
+        if (config.circuit_breaker.success_threshold == 0) {
+            return "circuit_breaker.success_threshold must be positive";
+        }
+    }
+
+    return std::nullopt;  // Valid
 }
 
 }  // namespace ranvier

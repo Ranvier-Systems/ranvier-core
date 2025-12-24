@@ -57,6 +57,9 @@ public:
     // Circuit Breaker API
     seastar::future<> set_backend_status_global(BackendId id, bool is_alive);
 
+    // Hot-reload: Update routing configuration on all shards
+    seastar::future<> update_routing_config(const RoutingConfig& config);
+
 private:
     // Thread-local metrics group
     // This holds the handle that keeps the metrics alive

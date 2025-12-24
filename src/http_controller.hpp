@@ -59,6 +59,18 @@ public:
     // Set optional persistence store (call before serving requests)
     void set_persistence(PersistenceStore* store) { _persistence = store; }
 
+    // Hot-reload: Update configuration at runtime
+    void update_config(const HttpControllerConfig& config) {
+        _config = config;
+        _rate_limiter.update_config(config.rate_limit);
+        _circuit_breaker.update_config(CircuitBreaker::Config{
+            config.circuit_breaker.failure_threshold,
+            config.circuit_breaker.success_threshold,
+            config.circuit_breaker.recovery_timeout,
+            config.circuit_breaker.enabled
+        });
+    }
+
     // Register all endpoints
     void register_routes(seastar::httpd::routes& r);
 
