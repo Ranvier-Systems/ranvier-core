@@ -152,6 +152,13 @@ public:
     // Check if gossip is enabled
     bool is_enabled() const { return _config.enabled; }
 
+    // Callback type for pruning routes
+    using RoutePruneCallback = std::function<seastar::future<>(BackendId)>;
+
+    void set_route_prune_callback(RoutePruneCallback callback) {
+        _route_prune_callback = std::move(callback);
+    }
+
 private:
     ClusterConfig _config;
     RouteLearnCallback _route_learn_callback;
@@ -179,6 +186,25 @@ private:
 
     // Timer to trigger periodic heartbeats
     seastar::timer<> _heartbeat_timer;
+
+    struct PeerState {
+        seastar::lowres_clock::time_point last_seen;
+        bool is_alive = true;
+        std::optional<BackendId> associated_backend; // Track which backend this peer represents
+    };
+
+    RoutePruneCallback _route_prune_callback;
+
+    // Shard-local table (only populated on Shard 0)
+    std::unordered_map<seastar::socket_address, PeerState> _peer_table;
+
+    // Threshold: Mark dead if no contact for 15s
+    static constexpr std::chrono::seconds PEER_TIMEOUT = std::chrono::seconds(15);
+
+    seastar::timer<> _liveness_timer;
+
+    void update_peer_liveness(const seastar::socket_address& addr);
+    void check_liveness();
 
     // Receive loop (runs continuously while service is active)
     seastar::future<> receive_loop();

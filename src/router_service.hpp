@@ -98,6 +98,8 @@ public:
     // Stop the draining reaper timer (call before shutdown)
     void stop_draining_reaper();
 
+    seastar::future<> remove_routes_for_backend(BackendId b_id);
+
 private:
     // Thread-local metrics group
     // This holds the handle that keeps the metrics alive
