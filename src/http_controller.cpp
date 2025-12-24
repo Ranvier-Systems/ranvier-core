@@ -248,9 +248,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         co_return std::move(rep);
     }
 
-    // Track request start time for latency metrics
+    // Track request start time for latency metrics (ingress timestamp)
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
+    metrics().increment_active_requests();
 
     std::string body = req->content;
     std::string client_ip = get_client_ip(*req);
@@ -262,10 +263,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     if (!_tokenizer.is_loaded()) {
         log_proxy.warn("[{}] Tokenizer not loaded", request_id);
         metrics().record_failure();
+        metrics().decrement_active_requests();
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
         co_return std::move(rep);
     }
+
+    // Timing: capture routing decision start
+    auto routing_start = std::chrono::steady_clock::now();
 
     auto tokens = _tokenizer.encode(body);
     auto route_hit = _router.lookup(tokens, request_id);
@@ -279,6 +284,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (!random_id.has_value()) {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
+            metrics().decrement_active_requests();
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
@@ -286,6 +292,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         target_id = random_id.value();
         log_proxy.debug("[{}] Route cache miss, using random backend {}", request_id, target_id);
     }
+
+    // Timing: record routing decision latency (post-routing timestamp)
+    auto routing_end = std::chrono::steady_clock::now();
+    metrics().record_routing_latency(
+        MetricsService::to_seconds(routing_end - routing_start));
 
     // Circuit breaker check - try fallback if circuit is open
     if (!_circuit_breaker.allow_request(target_id)) {
@@ -299,6 +310,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         } else {
             log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
             metrics().record_failure();
+            metrics().decrement_active_requests();
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"All backends unavailable (circuit breaker open)\"}");
             co_return std::move(rep);
@@ -309,6 +321,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     if (!target_addr_opt.has_value()) {
         log_proxy.warn("[{}] Backend {} IP not found", request_id, target_id);
         metrics().record_failure();
+        metrics().decrement_active_requests();
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
         co_return std::move(rep);
@@ -418,6 +431,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (connection_failed) {
             log_proxy.error("[{}] Backend connection failed after retries", request_id);
             metrics().record_failure();
+            metrics().decrement_active_requests();
             sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
             co_await client_out.write(error_msg);
             co_await client_out.flush();
@@ -429,6 +443,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (lowres_clock::now() >= request_deadline) {
             log_proxy.warn("[{}] Request timeout before sending", request_id);
             metrics().record_timeout();
+            metrics().decrement_active_requests();
             bundle.is_valid = false;
             _pool.put(std::move(bundle), request_id);
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
@@ -472,6 +487,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         if (write_failed) {
             // Clean up and send error to client
+            metrics().decrement_active_requests();
             co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Backend connection lost during request\"}\n\n";
             co_await client_out.write(error_msg);
@@ -556,10 +572,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 // Record response latency (time to first byte)
                 if (!response_latency_recorded) {
                     auto response_time = std::chrono::steady_clock::now();
-                    metrics().record_response_latency(
-                        MetricsService::to_seconds(response_time - connect_start));
+                    auto first_byte_latency = MetricsService::to_seconds(response_time - connect_start);
+                    // Record in legacy histogram
+                    metrics().record_response_latency(first_byte_latency);
+                    // Record in per-backend histogram for GPU model comparison
+                    metrics().record_first_byte_latency_by_id(current_backend, first_byte_latency);
                     response_latency_recorded = true;
-                    log_proxy.debug("[{}] First byte received from backend", request_id);
+                    log_proxy.debug("[{}] First byte received from backend {} (latency: {:.3f}s)",
+                                    request_id, current_backend, first_byte_latency);
                 }
 
                 if (!route_hit.has_value() && tokens.size() >= _config.min_token_length) {
@@ -636,8 +656,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         // Record backend total latency (from connection start to completion)
         if (!connection_failed && !connection_error) {
             auto backend_end = std::chrono::steady_clock::now();
-            metrics().record_backend_total_latency(
-                MetricsService::to_seconds(backend_end - connect_start));
+            auto backend_latency = MetricsService::to_seconds(backend_end - connect_start);
+            // Record in legacy histogram
+            metrics().record_backend_total_latency(backend_latency);
+            // Record in per-backend histogram for GPU model comparison (e.g., H100 vs A100)
+            metrics().record_backend_latency_by_id(current_backend, backend_latency);
         }
 
         // 4. CLEANUP - Always ensure proper resource recovery
@@ -659,10 +682,16 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             log_proxy.trace("[{}] Error closing client output stream", request_id);
         }
 
-        // Record total request duration
+        // Record total request duration (end-to-end from ingress to completion)
         auto request_end = std::chrono::steady_clock::now();
-        metrics().record_request_latency(
-            MetricsService::to_seconds(request_end - request_start));
+        auto total_latency = MetricsService::to_seconds(request_end - request_start);
+        // Record in legacy histogram
+        metrics().record_request_latency(total_latency);
+        // Record in new advanced histogram with optimized buckets
+        metrics().record_router_total_latency(total_latency);
+
+        // Decrement active request counter
+        metrics().decrement_active_requests();
     });
 
     co_return std::move(rep);
