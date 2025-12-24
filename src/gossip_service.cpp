@@ -4,11 +4,14 @@
 
 #include "gossip_service.hpp"
 
+#include <boost/range/irange.hpp>
+
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ip.hh>
@@ -52,6 +55,15 @@ seastar::future<> GossipService::start() {
         log_gossip.warn("Gossip enabled but no valid peers configured");
     }
 
+    // Mark as running on ALL shards so stop() logic remains consistent
+    _running = true;
+
+    // Only Shard 0 manages the physical hardware/UDP port
+    if (seastar::this_shard_id() != 0) {
+        log_gossip.debug("Gossip service started on worker shard {}", seastar::this_shard_id());
+        return seastar::make_ready_future<>();
+    }
+
     log_gossip.info("Starting gossip service on port {}", _config.gossip_port);
     log_gossip.info("Configured peers: {}", _peer_addresses.size());
     seastar::socket_address bind_addr(seastar::ipv4_addr("0.0.0.0", _config.gossip_port));
@@ -60,7 +72,6 @@ seastar::future<> GossipService::start() {
         // Synchronously create the channel.
         _channel = seastar::engine().net().make_bound_datagram_channel(bind_addr);
         _my_address = bind_addr;
-        _running = true;
 
         log_gossip.info("Gossip UDP channel opened on port {}", _config.gossip_port);
 
@@ -193,13 +204,20 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
         return seastar::make_ready_future<>();
     }
 
-    _packets_received++;
+    ++_packets_received;
 
-    // Ensure RouteAnnouncementPacket::deserialize creates OWNED data (like std::vector<int>)
-    // and not views into the 'ptr' buffer.
     if (_route_learn_callback) {
-        // We move pkt->tokens because the callback likely takes ownership
-        return _route_learn_callback(std::move(pkt->tokens), pkt->backend_id);
+        auto shared_tokens = std::make_shared<std::vector<TokenId>>(std::move(pkt->tokens));
+        auto b_id = pkt->backend_id;
+
+        // Use an integer range from 0 to seastar::smp::count
+        return seastar::parallel_for_each(
+                boost::irange<unsigned>(0, seastar::smp::count),
+                [this, shared_tokens, b_id](unsigned shard_id) {
+                return seastar::smp::submit_to(shard_id, [this, shared_tokens, b_id] {
+                        return _route_learn_callback(*shared_tokens, b_id);
+                        });
+                });
     }
 
     return seastar::make_ready_future<>();
