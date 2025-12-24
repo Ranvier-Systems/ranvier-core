@@ -124,7 +124,6 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
         return seastar::make_ready_future<>();
     }
 
-    // Build the announcement packet
     RouteAnnouncementPacket pkt;
     pkt.backend_id = backend;
     pkt.tokens = tokens;
@@ -133,16 +132,19 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
 
     auto serialized = pkt.serialize();
 
+    // Create the base packet once.
+    seastar::net::packet base_packet(seastar::temporary_buffer<char>(
+        reinterpret_cast<const char*>(serialized.data()), serialized.size()));
+
     log_gossip.debug("Broadcasting route: {} tokens -> backend {} to {} peers",
                      tokens.size(), backend, _peer_addresses.size());
 
-    // Send to all peers in parallel
-    return seastar::parallel_for_each(_peer_addresses, [this, serialized](const seastar::socket_address& peer) {
-        // Create a temporary buffer for this send
-        auto frag = seastar::temporary_buffer<char>(serialized.size());
-        std::memcpy(frag.get_write(), serialized.data(), serialized.size());
-
-        return _channel->send(peer, seastar::net::packet(std::move(frag))).then([this] {
+    // We do NOT capture base_packet by value if the copy constructor is deleted.
+    // Instead, we use the shared-pointer-like behavior of Seastar packets.
+    return seastar::parallel_for_each(_peer_addresses, [this, p = base_packet.share()](const seastar::socket_address& peer) mutable {
+        // .share() increments the internal reference count.
+        // We move the shared instance into the send call.
+        return _channel->send(peer, p.share()).then([this] {
             _packets_sent++;
         }).handle_exception([peer](auto ep) {
             try {
