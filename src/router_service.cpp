@@ -112,18 +112,30 @@ void RouterService::run_ttl_cleanup() {
     });
 }
 
-std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens) {
+std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens,
+                                                 const std::string& request_id) {
     if (!local_tree) return std::nullopt;
     auto result = local_tree->lookup(tokens);
 
     // Circuit breaker: if cache hit points to dead backend, treat as miss
     if (result.has_value()) {
         if (local_dead_backends.contains(result.value())) {
+            if (!request_id.empty()) {
+                log_router.debug("[{}] Cache hit for dead backend {}, treating as miss",
+                                 request_id, result.value());
+            }
             stats_cache_misses++;
             return std::nullopt;
         }
+        if (!request_id.empty()) {
+            log_router.debug("[{}] Cache hit: {} tokens -> backend {}",
+                             request_id, tokens.size(), result.value());
+        }
         stats_cache_hits++;
     } else {
+        if (!request_id.empty()) {
+            log_router.debug("[{}] Cache miss for {} tokens", request_id, tokens.size());
+        }
         stats_cache_misses++;
     }
 
@@ -194,7 +206,14 @@ std::optional<BackendId> RouterService::get_random_backend() {
     return candidates.back().first;
 }
 
-seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend) {
+seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
+                                                       const std::string& request_id) {
+    // Log route learning with request_id on shard 0 before broadcasting
+    if (!request_id.empty()) {
+        log_router.info("[{}] Learning route: {} tokens -> backend {}",
+                        request_id, tokens.size(), backend);
+    }
+
     return seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
