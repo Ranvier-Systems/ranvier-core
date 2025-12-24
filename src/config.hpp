@@ -110,6 +110,14 @@ struct ShutdownConfig {
     std::chrono::seconds drain_timeout{30};           // Max time to wait for in-flight requests
 };
 
+// Cluster configuration for distributed mode (gossip-based state sync)
+struct ClusterConfig {
+    bool enabled = false;                                  // Enable distributed mode
+    uint16_t gossip_port = 9190;                          // UDP port for gossip protocol
+    std::vector<std::string> peers;                       // Static list of peer addresses (IP:Port)
+    std::chrono::milliseconds gossip_interval{1000};      // Interval between gossip rounds
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -125,6 +133,7 @@ struct RanvierConfig {
     RetryConfig retry;
     CircuitBreakerConfig circuit_breaker;
     ShutdownConfig shutdown;
+    ClusterConfig cluster;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -283,6 +292,31 @@ inline void RanvierConfig::apply_env_overrides() {
     // Shutdown overrides
     if (auto v = get_env_as<int>("RANVIER_SHUTDOWN_DRAIN_TIMEOUT")) {
         shutdown.drain_timeout = std::chrono::seconds(*v);
+    }
+
+    // Cluster overrides
+    if (auto v = get_env("RANVIER_CLUSTER_ENABLED")) {
+        cluster.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint16_t>("RANVIER_CLUSTER_GOSSIP_PORT")) {
+        cluster.gossip_port = *v;
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_PEERS")) {
+        // Parse comma-separated peer list
+        cluster.peers.clear();
+        std::istringstream iss(*v);
+        std::string peer;
+        while (std::getline(iss, peer, ',')) {
+            // Trim whitespace
+            size_t start = peer.find_first_not_of(" \t");
+            size_t end = peer.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                cluster.peers.push_back(peer.substr(start, end - start + 1));
+            }
+        }
+    }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_INTERVAL_MS")) {
+        cluster.gossip_interval = std::chrono::milliseconds(*v);
     }
 }
 
@@ -449,6 +483,22 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.shutdown.drain_timeout = std::chrono::seconds(s["drain_timeout_seconds"].as<int>());
             }
         }
+
+        // Cluster section
+        if (yaml["cluster"]) {
+            YAML::Node c = yaml["cluster"];
+            if (c["enabled"]) config.cluster.enabled = c["enabled"].as<bool>();
+            if (c["gossip_port"]) config.cluster.gossip_port = c["gossip_port"].as<uint16_t>();
+            if (c["gossip_interval_ms"]) {
+                config.cluster.gossip_interval = std::chrono::milliseconds(c["gossip_interval_ms"].as<int>());
+            }
+            if (c["peers"]) {
+                config.cluster.peers.clear();
+                for (const auto& peer : c["peers"]) {
+                    config.cluster.peers.push_back(peer.as<std::string>());
+                }
+            }
+        }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -536,6 +586,22 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
     // Validate shutdown settings
     if (config.shutdown.drain_timeout.count() == 0) {
         return "shutdown.drain_timeout must be positive";
+    }
+
+    // Validate cluster settings (if enabled)
+    if (config.cluster.enabled) {
+        if (config.cluster.gossip_port == 0) {
+            return "cluster.gossip_port must be non-zero";
+        }
+        if (config.cluster.gossip_port == config.server.api_port) {
+            return "cluster.gossip_port must be different from server.api_port";
+        }
+        if (config.cluster.gossip_port == config.server.metrics_port) {
+            return "cluster.gossip_port must be different from server.metrics_port";
+        }
+        if (config.cluster.gossip_interval.count() < 100) {
+            return "cluster.gossip_interval must be at least 100ms";
+        }
     }
 
     return std::nullopt;  // Valid

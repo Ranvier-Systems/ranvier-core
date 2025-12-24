@@ -29,6 +29,14 @@ Node Types:
 
 namespace ranvier {
 
+// Route origin for distributed mode
+// LOCAL routes are learned from direct requests
+// REMOTE routes are learned from cluster gossip
+enum class RouteOrigin : uint8_t {
+    LOCAL = 0,   // Learned from direct request on this node
+    REMOTE = 1   // Learned from cluster gossip (can be evicted more aggressively)
+};
+
 // Node Types for Adaptive Radix Tree
 enum class NodeType : uint8_t {
     Node4,
@@ -47,6 +55,10 @@ struct Node {
 
     // Leaf Data: If this node terminates a valid route, this has a value.
     std::optional<BackendId> leaf_value;
+
+    // Route origin: LOCAL (direct request) or REMOTE (cluster gossip)
+    // REMOTE routes can be evicted more aggressively than LOCAL routes
+    RouteOrigin origin = RouteOrigin::LOCAL;
 
     // LRU tracking: timestamp of last access (for TTL and eviction)
     // This is shard-local so no atomics needed (Seastar's shared-nothing model)
@@ -111,6 +123,7 @@ struct Node256 : public Node {
 struct RouteEntry {
     std::vector<TokenId> tokens;
     BackendId backend;
+    RouteOrigin origin;
     std::chrono::steady_clock::time_point last_accessed;
 };
 
@@ -124,14 +137,16 @@ public:
 
     // INSERT - O(k) where k is the number of tokens
     // Tokens are truncated to block_alignment boundary for vLLM PagedAttention compatibility
-    void insert(std::span<const TokenId> tokens, BackendId backend) {
+    // origin: LOCAL for direct requests, REMOTE for cluster gossip
+    void insert(std::span<const TokenId> tokens, BackendId backend,
+                RouteOrigin origin = RouteOrigin::LOCAL) {
         // Align to block boundary - only insert at multiples of block_alignment
         size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
         if (aligned_len == 0) {
             return;  // Not enough tokens for a full block
         }
         auto aligned_tokens = tokens.subspan(0, aligned_len);
-        root = insert_recursive(root, aligned_tokens, backend);
+        root = insert_recursive(root, aligned_tokens, backend, origin);
         route_count_++;
     }
 
@@ -172,6 +187,19 @@ public:
         return false;
     }
 
+    // Evict the oldest REMOTE route first (more aggressive eviction for gossip-learned routes)
+    // Falls back to evicting any oldest route if no REMOTE routes exist
+    // Returns true if a route was evicted
+    bool evict_oldest_remote() {
+        // First try to evict oldest remote route
+        if (find_and_remove_oldest_by_origin(root, RouteOrigin::REMOTE)) {
+            if (route_count_ > 0) route_count_--;
+            return true;
+        }
+        // Fall back to evicting any oldest route
+        return evict_oldest();
+    }
+
 private:
     std::shared_ptr<Node> root;
     uint32_t block_alignment_;  // vLLM PagedAttention block size
@@ -183,7 +211,8 @@ private:
     }
 
     // Recursive Insert Logic
-    std::shared_ptr<Node> insert_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens, BackendId backend) {
+    std::shared_ptr<Node> insert_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens,
+                                           BackendId backend, RouteOrigin origin) {
         // 1. Calculate matching prefix length
         size_t match_len = 0;
         while (match_len < node->prefix.size() && match_len < tokens.size()) {
@@ -201,6 +230,8 @@ private:
         // CASE B: Exact match - set leaf value
         if (remaining_tokens.empty()) {
             node->leaf_value = backend;
+            node->origin = origin;
+            node->last_accessed = std::chrono::steady_clock::now();
             return node;
         }
 
@@ -209,7 +240,7 @@ private:
         auto child = find_child(node, next_token);
 
         if (child) {
-            auto new_child = insert_recursive(child, remaining_tokens.subspan(1), backend);
+            auto new_child = insert_recursive(child, remaining_tokens.subspan(1), backend, origin);
             if (new_child != child) {
                 set_child(node, next_token, new_child);
             }
@@ -220,6 +251,7 @@ private:
                 new_child->prefix.assign(suffix.begin(), suffix.end());
             }
             new_child->leaf_value = backend;
+            new_child->origin = origin;
             node = add_child(node, next_token, new_child);
         }
         return node;
@@ -552,6 +584,7 @@ private:
             RouteEntry entry;
             entry.tokens = path;
             entry.backend = node->leaf_value.value();
+            entry.origin = node->origin;
             entry.last_accessed = node->last_accessed;
             callback(entry);
         }
@@ -660,6 +693,25 @@ private:
         return false;
     }
 
+    // Helper: Find and remove the oldest leaf value with specific origin
+    // Returns true if a leaf was removed
+    bool find_and_remove_oldest_by_origin(std::shared_ptr<Node> node, RouteOrigin target_origin) {
+        if (!node) return false;
+
+        std::shared_ptr<Node> oldest_node = nullptr;
+        std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::time_point::max();
+
+        // Find the oldest leaf with matching origin
+        find_oldest_by_origin_recursive(node, oldest_node, oldest_time, target_origin);
+
+        // Remove the oldest leaf's value
+        if (oldest_node && oldest_node->leaf_value.has_value()) {
+            oldest_node->leaf_value = std::nullopt;
+            return true;
+        }
+        return false;
+    }
+
     // Helper: Find the oldest leaf node
     void find_oldest_recursive(std::shared_ptr<Node> node, std::shared_ptr<Node>& oldest_node,
                                std::chrono::steady_clock::time_point& oldest_time) {
@@ -676,6 +728,53 @@ private:
             for (auto& child : children) {
                 if (child) {
                     find_oldest_recursive(child, oldest_node, oldest_time);
+                }
+            }
+        };
+
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+        }
+    }
+
+    // Helper: Find the oldest leaf node with specific origin
+    void find_oldest_by_origin_recursive(std::shared_ptr<Node> node, std::shared_ptr<Node>& oldest_node,
+                                         std::chrono::steady_clock::time_point& oldest_time,
+                                         RouteOrigin target_origin) {
+        if (!node) return;
+
+        // Check if this node has a leaf value with matching origin and is older than current oldest
+        if (node->leaf_value.has_value() &&
+            node->origin == target_origin &&
+            node->last_accessed < oldest_time) {
+            oldest_time = node->last_accessed;
+            oldest_node = node;
+        }
+
+        // Traverse children
+        auto visit_children = [&](auto& children) {
+            for (auto& child : children) {
+                if (child) {
+                    find_oldest_by_origin_recursive(child, oldest_node, oldest_time, target_origin);
                 }
             }
         };
