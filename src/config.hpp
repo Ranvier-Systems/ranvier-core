@@ -116,6 +116,8 @@ struct ClusterConfig {
     uint16_t gossip_port = 9190;                          // UDP port for gossip protocol
     std::vector<std::string> peers;                       // Static list of peer addresses (IP:Port)
     std::chrono::milliseconds gossip_interval{1000};      // Interval between gossip rounds
+    std::chrono::seconds gossip_heartbeat_interval{5};    // Interval between heartbeat broadcasts
+    std::chrono::seconds gossip_peer_timeout{15};         // Time before marking a peer as dead
 };
 
 // Top-level configuration
@@ -318,6 +320,12 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_INTERVAL_MS")) {
         cluster.gossip_interval = std::chrono::milliseconds(*v);
     }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL")) {
+        cluster.gossip_heartbeat_interval = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT")) {
+        cluster.gossip_peer_timeout = std::chrono::seconds(*v);
+    }
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -498,6 +506,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
                     config.cluster.peers.push_back(peer.as<std::string>());
                 }
             }
+            if (c["gossip_heartbeat_interval_seconds"]) {
+                config.cluster.gossip_heartbeat_interval = std::chrono::seconds(c["gossip_heartbeat_interval_seconds"].as<int>());
+            }
+            if (c["gossip_peer_timeout_seconds"]) {
+                config.cluster.gossip_peer_timeout = std::chrono::seconds(c["gossip_peer_timeout_seconds"].as<int>());
+            }
         }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
@@ -601,6 +615,15 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
         }
         if (config.cluster.gossip_interval.count() < 100) {
             return "cluster.gossip_interval must be at least 100ms";
+        }
+        if (config.cluster.gossip_heartbeat_interval.count() == 0) {
+            return "cluster.gossip_heartbeat_interval must be positive";
+        }
+        if (config.cluster.gossip_peer_timeout.count() == 0) {
+            return "cluster.gossip_peer_timeout must be positive";
+        }
+        if (config.cluster.gossip_peer_timeout < 2 * config.cluster.gossip_heartbeat_interval) {
+            return "cluster.gossip_peer_timeout must be at least twice gossip_heartbeat_interval";
         }
     }
 
