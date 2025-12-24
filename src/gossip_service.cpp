@@ -41,7 +41,9 @@ GossipService::GossipService(const ClusterConfig& config)
         seastar::metrics::make_counter("router_cluster_sync_received", _packets_received,
             seastar::metrics::description("Total number of gossip packets received from cluster peers")),
         seastar::metrics::make_counter("router_cluster_sync_invalid", _packets_invalid,
-            seastar::metrics::description("Total number of invalid gossip packets received"))
+            seastar::metrics::description("Total number of invalid gossip packets received")),
+        seastar::metrics::make_gauge("cluster_peers_alive", _stats_cluster_peers_alive,
+            seastar::metrics::description("Number of cluster peers currently alive"))
     });
 }
 
@@ -301,12 +303,12 @@ void GossipService::update_peer_liveness(const seastar::socket_address& addr) {
 
 void GossipService::check_liveness() {
     auto now = seastar::lowres_clock::now();
+    uint64_t alive_count = 0;
 
     for (auto& [addr, state] : _peer_table) {
         if (state.is_alive && (now - state.last_seen) > _config.gossip_peer_timeout) {
             state.is_alive = false;
-            log_gossip.warn("Peer {} timed out. Pruning routes for backend {}.", 
-                             addr, state.associated_backend.value_or(0));
+            log_gossip.warn("Peer marked dead: socket_address={}", addr);
 
             if (state.associated_backend && _route_prune_callback) {
                 BackendId b_id = *state.associated_backend;
@@ -320,7 +322,13 @@ void GossipService::check_liveness() {
                     });
             }
         }
+
+        if (state.is_alive) {
+            ++alive_count;
+        }
     }
+
+    _stats_cluster_peers_alive = alive_count;
 }
 
 std::optional<seastar::socket_address> GossipService::parse_peer_address(const std::string& peer) {
