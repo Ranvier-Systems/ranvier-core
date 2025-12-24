@@ -200,6 +200,16 @@ public:
         return evict_oldest();
     }
 
+    // Remove all routes matching a specific backend and origin
+    // Used for cluster-wide route pruning when a peer fails
+    // Returns the number of routes removed
+    size_t remove_routes_by_backend(BackendId backend, RouteOrigin origin) {
+        size_t removed = 0;
+        remove_routes_by_backend_recursive(root, backend, origin, removed);
+        route_count_ = (route_count_ > removed) ? route_count_ - removed : 0;
+        return removed;
+    }
+
 private:
     std::shared_ptr<Node> root;
     uint32_t block_alignment_;  // vLLM PagedAttention block size
@@ -775,6 +785,52 @@ private:
             for (auto& child : children) {
                 if (child) {
                     find_oldest_by_origin_recursive(child, oldest_node, oldest_time, target_origin);
+                }
+            }
+        };
+
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node.get());
+                visit_children(n->children);
+                break;
+            }
+        }
+    }
+
+    // Helper: Remove routes matching a specific backend and origin
+    void remove_routes_by_backend_recursive(std::shared_ptr<Node> node, BackendId backend,
+                                            RouteOrigin target_origin, size_t& removed) {
+        if (!node) return;
+
+        // Check if this node has a leaf value matching both backend and origin
+        if (node->leaf_value.has_value() &&
+            node->leaf_value.value() == backend &&
+            node->origin == target_origin) {
+            node->leaf_value = std::nullopt;
+            removed++;
+        }
+
+        // Traverse children
+        auto visit_children = [&](auto& children) {
+            for (auto& child : children) {
+                if (child) {
+                    remove_routes_by_backend_recursive(child, backend, target_origin, removed);
                 }
             }
         };

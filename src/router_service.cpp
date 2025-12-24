@@ -38,6 +38,7 @@ thread_local uint64_t stats_cache_hits = 0;
 thread_local uint64_t stats_cache_misses = 0;
 thread_local uint64_t stats_routes_evicted = 0;
 thread_local uint64_t stats_routes_expired = 0;
+thread_local uint64_t stats_cluster_routes_pruned = 0;
 
 // Thread-local routing configuration (set during shard initialization)
 thread_local size_t local_max_routes = 100000;
@@ -72,6 +73,11 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             return learn_route_remote(std::move(tokens), backend);
         });
 
+        // Set up callback to prune routes when a peer fails
+        _gossip->set_route_prune_callback([this](BackendId backend) {
+            return remove_routes_for_backend(backend);
+        });
+
         log_router.info("Cluster mode enabled with {} peers", _cluster_config.peers.size());
     }
 
@@ -83,7 +89,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_routes_evicted", stats_routes_evicted,
             seastar::metrics::description("Total number of routes evicted due to capacity limits")),
         seastar::metrics::make_counter("router_routes_expired", stats_routes_expired,
-            seastar::metrics::description("Total number of routes expired due to TTL"))
+            seastar::metrics::description("Total number of routes expired due to TTL")),
+        seastar::metrics::make_counter("router_cluster_routes_pruned", stats_cluster_routes_pruned,
+            seastar::metrics::description("Total number of routes pruned when cluster peer fails"))
     });
 }
 
@@ -492,6 +500,23 @@ void RouterService::run_draining_reaper() {
         // Fire-and-forget the unregister (runs asynchronously)
         (void)unregister_backend_global(id);
     }
+}
+
+seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
+    // Remove all REMOTE routes pointing to this backend
+    // This is called when a cluster peer fails and we need to prune orphaned routes
+    if (!local_tree) {
+        return seastar::make_ready_future<>();
+    }
+
+    size_t removed = local_tree->remove_routes_by_backend(b_id, RouteOrigin::REMOTE);
+    if (removed > 0) {
+        stats_cluster_routes_pruned += removed;
+        log_router.info("Shard {}: Pruned {} orphaned routes for failed peer backend {}",
+                        seastar::this_shard_id(), removed, b_id);
+    }
+
+    return seastar::make_ready_future<>();
 }
 
 } // namespace ranvier
