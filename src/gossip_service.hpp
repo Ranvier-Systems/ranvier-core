@@ -198,9 +198,6 @@ private:
     // Shard-local table (only populated on Shard 0)
     std::unordered_map<seastar::socket_address, PeerState> _peer_table;
 
-    // Threshold: Mark dead if no contact for 15s
-    static constexpr std::chrono::seconds PEER_TIMEOUT = std::chrono::seconds(15);
-
     seastar::timer<> _liveness_timer;
 
     void update_peer_liveness(const seastar::socket_address& addr);

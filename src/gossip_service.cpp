@@ -85,15 +85,15 @@ seastar::future<> GossipService::start() {
             }
         });
 
-        // Trigger a heartbeat every 5 seconds (configurable)
+        // Trigger periodic heartbeats using configured interval
         _heartbeat_timer.set_callback([this] {
             (void)broadcast_heartbeat();
         });
-        _heartbeat_timer.arm_periodic(std::chrono::seconds(5));
+        _heartbeat_timer.arm_periodic(_config.gossip_heartbeat_interval);
 
-        // Check every 5s if anyone has timed out
+        // Check for peer timeouts at the heartbeat interval
         _liveness_timer.set_callback([this] { check_liveness(); });
-        _liveness_timer.arm_periodic(std::chrono::seconds(5));
+        _liveness_timer.arm_periodic(_config.gossip_heartbeat_interval);
 
         for (const auto& addr : _peer_addresses) {
             _peer_table[addr] = { seastar::lowres_clock::now(), true };
@@ -303,7 +303,7 @@ void GossipService::check_liveness() {
     auto now = seastar::lowres_clock::now();
 
     for (auto& [addr, state] : _peer_table) {
-        if (state.is_alive && (now - state.last_seen) > PEER_TIMEOUT) {
+        if (state.is_alive && (now - state.last_seen) > _config.gossip_peer_timeout) {
             state.is_alive = false;
             log_gossip.warn("Peer {} timed out. Pruning routes for backend {}.", 
                              addr, state.associated_backend.value_or(0));
