@@ -7,3 +7,4 @@ Testing/
 *~
 *.swp
 *.swo
+.DS_Store
