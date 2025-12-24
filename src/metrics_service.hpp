@@ -2,12 +2,15 @@
 //
 // Provides Prometheus metrics for monitoring Ranvier performance.
 // Includes histograms for latency tracking and counters for request stats.
+// Supports per-backend metrics for comparing GPU model performance.
 
 #pragma once
 
 #include "types.hpp"
 
 #include <chrono>
+#include <functional>
+#include <unordered_map>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/metrics_registration.hh>
 
@@ -19,6 +22,67 @@ inline std::vector<double> latency_buckets() {
     return {
         0.001,   // 1ms
         0.005,   // 5ms
+        0.01,    // 10ms
+        0.025,   // 25ms
+        0.05,    // 50ms
+        0.1,     // 100ms
+        0.25,    // 250ms
+        0.5,     // 500ms
+        1.0,     // 1s
+        2.5,     // 2.5s
+        5.0,     // 5s
+        10.0,    // 10s
+        30.0,    // 30s
+        60.0,    // 1min
+        120.0,   // 2min
+        300.0    // 5min
+    };
+}
+
+// Optimized routing latency buckets: 10μs to 100ms
+// Designed for microsecond-scale routing decisions
+inline std::vector<double> routing_latency_buckets() {
+    return {
+        0.00001,  // 10μs
+        0.000025, // 25μs
+        0.00005,  // 50μs
+        0.0001,   // 100μs
+        0.00025,  // 250μs
+        0.0005,   // 500μs
+        0.001,    // 1ms
+        0.0025,   // 2.5ms
+        0.005,    // 5ms
+        0.01,     // 10ms
+        0.025,    // 25ms
+        0.05,     // 50ms
+        0.1       // 100ms
+    };
+}
+
+// Backend latency buckets: 50ms to 10s
+// Optimized for LLM prefill/generation workloads (second-scale inference)
+inline std::vector<double> backend_latency_buckets() {
+    return {
+        0.05,    // 50ms
+        0.1,     // 100ms
+        0.25,    // 250ms
+        0.5,     // 500ms
+        0.75,    // 750ms
+        1.0,     // 1s
+        1.5,     // 1.5s
+        2.0,     // 2s
+        3.0,     // 3s
+        4.0,     // 4s
+        5.0,     // 5s
+        7.5,     // 7.5s
+        10.0     // 10s
+    };
+}
+
+// Total request latency buckets: full end-to-end time
+// Covers the complete request lifecycle from ingress to completion
+inline std::vector<double> total_request_latency_buckets() {
+    return {
         0.01,    // 10ms
         0.025,   // 25ms
         0.05,    // 50ms
@@ -67,9 +131,20 @@ class MetricsService {
         }
     };
 
+    // Per-backend histogram storage for labeled metrics
+    struct BackendMetrics {
+        MetricHistogram backend_latency;
+        MetricHistogram first_byte_latency;
+        bool registered = false;
+
+        BackendMetrics()
+            : backend_latency(backend_latency_buckets())
+            , first_byte_latency(backend_latency_buckets()) {}
+    };
+
 public:
     MetricsService() {
-        // Register metrics group
+        // Register metrics group with core metrics
         _metrics.add_group("ranvier", {
             // Request counters
             seastar::metrics::make_counter("http_requests_total", _requests_total,
@@ -96,7 +171,7 @@ public:
             seastar::metrics::make_counter("fallback_attempts", _fallback_attempts,
                 seastar::metrics::description("Total number of fallback routing attempts")),
 
-            // Latency histograms
+            // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
                 [this] { return _request_latency.data; }),
@@ -111,7 +186,24 @@ public:
 
             seastar::metrics::make_histogram("backend_total_duration_seconds",
                 seastar::metrics::description("Total backend request duration in seconds"),
-                [this] { return _backend_total_latency.data; })
+                [this] { return _backend_total_latency.data; }),
+
+            // New advanced histograms with optimized buckets
+            seastar::metrics::make_histogram("router_routing_latency_seconds",
+                seastar::metrics::description("Router lookup/decision latency in seconds (10μs-100ms buckets)"),
+                [this] { return _routing_latency.data; }),
+
+            seastar::metrics::make_histogram("router_backend_latency_seconds",
+                seastar::metrics::description("Backend processing latency for LLM inference in seconds (50ms-10s buckets)"),
+                [this] { return _router_backend_latency.data; }),
+
+            seastar::metrics::make_histogram("router_request_total_latency_seconds",
+                seastar::metrics::description("Full end-to-end request latency in seconds"),
+                [this] { return _router_total_latency.data; }),
+
+            // Active proxy requests gauge
+            seastar::metrics::make_gauge("active_proxy_requests", _active_requests,
+                seastar::metrics::description("Current number of in-flight proxy requests"))
         });
     }
 
@@ -129,7 +221,12 @@ public:
     void record_circuit_open() { _circuit_opens++; }
     void record_fallback() { _fallback_attempts++; }
 
-    // Record latencies (in seconds)
+    // Active request tracking
+    void increment_active_requests() { _active_requests++; }
+    void decrement_active_requests() { _active_requests--; }
+    uint64_t get_active_requests() const { return _active_requests; }
+
+    // Record latencies (in seconds) - legacy methods for backwards compatibility
     void record_request_latency(double seconds) {
         _request_latency.record(seconds);
     }
@@ -146,6 +243,37 @@ public:
         _backend_total_latency.record(seconds);
     }
 
+    // New advanced histogram recording methods
+
+    // Record routing decision latency (time to lookup and select backend)
+    void record_routing_latency(double seconds) {
+        _routing_latency.record(seconds);
+    }
+
+    // Record backend processing latency (optimized for LLM inference timescales)
+    void record_router_backend_latency(double seconds) {
+        _router_backend_latency.record(seconds);
+    }
+
+    // Record total end-to-end request latency
+    void record_router_total_latency(double seconds) {
+        _router_total_latency.record(seconds);
+    }
+
+    // Record latency with backend_id label for GPU model comparison
+    void record_backend_latency_by_id(BackendId backend_id, double seconds) {
+        auto& backend_metrics = get_or_create_backend_metrics(backend_id);
+        backend_metrics.backend_latency.record(seconds);
+        // Also record in the aggregate histogram
+        _router_backend_latency.record(seconds);
+    }
+
+    // Record first-byte latency with backend_id label
+    void record_first_byte_latency_by_id(BackendId backend_id, double seconds) {
+        auto& backend_metrics = get_or_create_backend_metrics(backend_id);
+        backend_metrics.first_byte_latency.record(seconds);
+    }
+
     // Helper to convert chrono duration to seconds
     template<typename Duration>
     static double to_seconds(Duration d) {
@@ -154,6 +282,7 @@ public:
 
 private:
     seastar::metrics::metric_groups _metrics;
+    seastar::metrics::metric_groups _backend_metrics;
 
     // Counters
     uint64_t _requests_total = 0;
@@ -165,11 +294,50 @@ private:
     uint64_t _circuit_opens = 0;
     uint64_t _fallback_attempts = 0;
 
-    // Histogram accumulators
+    // Active requests gauge
+    uint64_t _active_requests = 0;
+
+    // Legacy histogram accumulators
     MetricHistogram _request_latency{latency_buckets()};
     MetricHistogram _connect_latency{latency_buckets()};
     MetricHistogram _response_latency{latency_buckets()};
     MetricHistogram _backend_total_latency{latency_buckets()};
+
+    // New advanced histogram accumulators with optimized buckets
+    MetricHistogram _routing_latency{routing_latency_buckets()};
+    MetricHistogram _router_backend_latency{backend_latency_buckets()};
+    MetricHistogram _router_total_latency{total_request_latency_buckets()};
+
+    // Per-backend metrics for GPU model comparison
+    std::unordered_map<BackendId, BackendMetrics> _per_backend_metrics;
+
+    // Get or create per-backend metrics and register with Seastar
+    BackendMetrics& get_or_create_backend_metrics(BackendId backend_id) {
+        auto it = _per_backend_metrics.find(backend_id);
+        if (it != _per_backend_metrics.end()) {
+            return it->second;
+        }
+
+        // Create new backend metrics
+        auto& metrics = _per_backend_metrics[backend_id];
+
+        // Register per-backend histograms with Seastar metrics
+        std::string backend_id_str = std::to_string(backend_id);
+        _backend_metrics.add_group("ranvier", {
+            seastar::metrics::make_histogram("router_backend_latency_by_id_seconds",
+                seastar::metrics::description("Backend processing latency by backend ID (for GPU model comparison)"),
+                {{"backend_id", backend_id_str}},
+                [&metrics] { return metrics.backend_latency.data; }),
+
+            seastar::metrics::make_histogram("router_first_byte_latency_by_id_seconds",
+                seastar::metrics::description("Time to first byte from backend by backend ID"),
+                {{"backend_id", backend_id_str}},
+                [&metrics] { return metrics.first_byte_latency.data; })
+        });
+
+        metrics.registered = true;
+        return metrics;
+    }
 };
 
 // Global thread-local metrics instance
