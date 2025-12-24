@@ -4,6 +4,7 @@
 #include "config.hpp"
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -16,10 +17,14 @@
 
 namespace ranvier {
 
+// Forward declaration
+class GossipService;
+
 class RouterService {
 public:
     RouterService();
     explicit RouterService(const RoutingConfig& config);
+    RouterService(const RoutingConfig& routing_config, const ClusterConfig& cluster_config);
 
     // Initialize all shards with the routing config (must be called on shard 0)
     seastar::future<> initialize_shards();
@@ -42,8 +47,19 @@ public:
     // 2. CONTROL PLANE (Async Broadcasts)
     // Teach the tree a new prefix (Prefix -> ID) with LRU eviction
     // request_id: Optional request ID for tracing (empty string if not tracing)
+    // Also broadcasts to cluster peers if gossip is enabled
     seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                           const std::string& request_id = "");
+
+    // Learn a route from a remote cluster peer (marks as REMOTE origin)
+    // REMOTE routes can be evicted more aggressively than LOCAL routes
+    seastar::future<> learn_route_remote(std::vector<int32_t> tokens, BackendId backend);
+
+    // Start the gossip service (call after Seastar is initialized)
+    seastar::future<> start_gossip();
+
+    // Stop the gossip service (call before shutdown)
+    seastar::future<> stop_gossip();
 
     // Teach the system a new server (ID -> IP:Port) with optional weight and priority
     // Weight: relative load balancing weight (default 100, higher = more traffic)
@@ -89,6 +105,12 @@ private:
 
     // Routing configuration (LRU parameters)
     RoutingConfig _config;
+
+    // Cluster configuration for distributed mode
+    ClusterConfig _cluster_config;
+
+    // Gossip service for cluster state sync (only on shard 0)
+    std::unique_ptr<GossipService> _gossip;
 
     // TTL cleanup timer (runs on shard 0, broadcasts to all shards)
     seastar::timer<> _ttl_timer;

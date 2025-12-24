@@ -1,4 +1,5 @@
 #include "router_service.hpp"
+#include "gossip_service.hpp"
 #include "logging.hpp"
 
 #include <seastar/core/smp.hh>
@@ -50,12 +51,28 @@ thread_local std::mt19937 rng([]() {
 
 RouterService::RouterService() : RouterService(RoutingConfig{}) {}
 
-RouterService::RouterService(const RoutingConfig& config) : _config(config) {
+RouterService::RouterService(const RoutingConfig& config)
+    : RouterService(config, ClusterConfig{}) {}
+
+RouterService::RouterService(const RoutingConfig& routing_config, const ClusterConfig& cluster_config)
+    : _config(routing_config), _cluster_config(cluster_config) {
     // Initialize shard 0's local_tree immediately
-    local_tree = std::make_unique<RadixTree>(config.block_alignment);
-    local_max_routes = config.max_routes;
-    local_ttl_seconds = config.ttl_seconds;
-    local_backend_drain_timeout = config.backend_drain_timeout;
+    local_tree = std::make_unique<RadixTree>(routing_config.block_alignment);
+    local_max_routes = routing_config.max_routes;
+    local_ttl_seconds = routing_config.ttl_seconds;
+    local_backend_drain_timeout = routing_config.backend_drain_timeout;
+
+    // Create GossipService if cluster mode is enabled
+    if (_cluster_config.enabled) {
+        _gossip = std::make_unique<GossipService>(_cluster_config);
+
+        // Set up callback to handle incoming route announcements
+        _gossip->set_route_learn_callback([this](std::vector<TokenId> tokens, BackendId backend) {
+            return learn_route_remote(std::move(tokens), backend);
+        });
+
+        log_router.info("Cluster mode enabled with {} peers", _cluster_config.peers.size());
+    }
 
     _metrics.add_group("ranvier", {
         seastar::metrics::make_counter("router_cache_hits", stats_cache_hits,
@@ -223,7 +240,15 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
                         request_id, tokens.size(), backend);
     }
 
-    return seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
+    // Broadcast to cluster peers if gossip is enabled
+    seastar::future<> gossip_future = seastar::make_ready_future<>();
+    if (_gossip && _gossip->is_enabled()) {
+        // Copy tokens for gossip broadcast (tokens will be moved for shard broadcast)
+        gossip_future = _gossip->broadcast_route(tokens, backend);
+    }
+
+    // Broadcast to all local shards with LOCAL origin
+    auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
                 if (!local_tree) return seastar::make_ready_future<>();
@@ -239,11 +264,58 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
                     }
                 }
 
-                local_tree->insert(tokens, backend);
+                // Insert with LOCAL origin (direct request on this node)
+                local_tree->insert(tokens, backend, RouteOrigin::LOCAL);
                 return seastar::make_ready_future<>();
             });
         });
     });
+
+    // Wait for both gossip broadcast and shard updates
+    return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
+}
+
+seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
+    // Learn route from cluster peer - mark as REMOTE origin
+    // REMOTE routes can be evicted more aggressively than LOCAL routes
+    log_router.debug("Learning remote route: {} tokens -> backend {}", tokens.size(), backend);
+
+    return seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
+                if (!local_tree) return seastar::make_ready_future<>();
+
+                // LRU eviction: prefer evicting REMOTE routes first when at capacity
+                if (local_max_routes > 0) {
+                    while (local_tree->route_count() >= local_max_routes) {
+                        if (local_tree->evict_oldest_remote()) {
+                            stats_routes_evicted++;
+                        } else {
+                            break;  // No more routes to evict
+                        }
+                    }
+                }
+
+                // Insert with REMOTE origin (learned from cluster gossip)
+                local_tree->insert(tokens, backend, RouteOrigin::REMOTE);
+                return seastar::make_ready_future<>();
+            });
+        });
+    });
+}
+
+seastar::future<> RouterService::start_gossip() {
+    if (_gossip) {
+        return _gossip->start();
+    }
+    return seastar::make_ready_future<>();
+}
+
+seastar::future<> RouterService::stop_gossip() {
+    if (_gossip) {
+        return _gossip->stop();
+    }
+    return seastar::make_ready_future<>();
 }
 
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,

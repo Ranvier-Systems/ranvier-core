@@ -35,7 +35,7 @@ static std::string g_config_path;
 
 // Services (Global/Static Scope for MVP)
 ranvier::TokenizerService tokenizer;
-ranvier::RouterService router;
+std::unique_ptr<ranvier::RouterService> router;
 
 // These are initialized in run() after config is loaded
 std::unique_ptr<ranvier::HttpController> controller;
@@ -71,10 +71,10 @@ future<> load_persisted_state() {
     return do_with(std::move(backends), std::move(routes), [](auto& backends, auto& routes) {
         return do_for_each(backends, [](const ranvier::BackendRecord& rec) {
             socket_address addr(ipv4_addr(rec.ip, rec.port));
-            return router.register_backend_global(rec.id, addr, rec.weight, rec.priority);
+            return router->register_backend_global(rec.id, addr, rec.weight, rec.priority);
         }).then([&routes] {
             return do_for_each(routes, [](const ranvier::RouteRecord& rec) {
-                return router.learn_route_global(rec.tokens, rec.backend_id);
+                return router->learn_route_global(rec.tokens, rec.backend_id);
             });
         });
     }).then([] {
@@ -143,7 +143,7 @@ future<> reload_config() {
         controller->update_config(ctrl_config);
 
         // Update routing config on all shards
-        return router.update_routing_config(g_config.routing).then([] {
+        return router->update_routing_config(g_config.routing).then([] {
             ranvier::log_main.info("Configuration reloaded successfully");
         });
 
@@ -168,6 +168,13 @@ future<> run() {
         return make_ready_future<>();
     }
 
+    // 1a. Init Router with routing and cluster config
+    router = std::make_unique<ranvier::RouterService>(g_config.routing, g_config.cluster);
+    if (g_config.cluster.enabled) {
+        ranvier::log_main.info("Cluster mode: {} peers on port {}",
+            g_config.cluster.peers.size(), g_config.cluster.gossip_port);
+    }
+
     // 2. Init Controller with config
     ranvier::HttpControllerConfig ctrl_config;
     ctrl_config.pool.max_connections_per_host = g_config.pool.max_connections_per_host;
@@ -190,7 +197,7 @@ future<> run() {
     ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
     ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
     ctrl_config.drain_timeout = g_config.shutdown.drain_timeout;
-    controller = std::make_unique<ranvier::HttpController>(tokenizer, router, ctrl_config);
+    controller = std::make_unique<ranvier::HttpController>(tokenizer, *router, ctrl_config);
 
     // 2a. Initialize metrics on all shards
     ranvier::init_metrics();
@@ -210,12 +217,15 @@ future<> run() {
     health_config.check_timeout = g_config.health.check_timeout;
     health_config.failure_threshold = g_config.health.failure_threshold;
     health_config.recovery_threshold = g_config.health.recovery_threshold;
-    health_checker = std::make_unique<ranvier::HealthService>(router, health_config);
+    health_checker = std::make_unique<ranvier::HealthService>(*router, health_config);
     health_checker->start();
 
-    // 5. Load persisted state, then start servers
-    return load_persisted_state().then([] {
-        // 6. Start Servers (Metrics + API)
+    // 5. Start gossip service if cluster mode is enabled
+    return router->start_gossip().then([] {
+        // 6. Load persisted state
+        return load_persisted_state();
+    }).then([] {
+        // 7. Start Servers (Metrics + API)
         return do_with(seastar::httpd::http_server_control(), seastar::httpd::http_server_control(),
             seastar::shared_ptr<tls::server_credentials>(),
             [](auto& prom_server, auto& api_server, auto& tls_creds) {
@@ -319,8 +329,11 @@ future<> run() {
 
                 // Stop Health Checker FIRST
                 return health_checker->stop().then([&api_server, &prom_server] {
-                    return api_server.stop().then([&prom_server] {
-                        return prom_server.stop();
+                    // Stop gossip service
+                    return router->stop_gossip().then([&api_server, &prom_server] {
+                        return api_server.stop().then([&prom_server] {
+                            return prom_server.stop();
+                        });
                     });
                 });
             }).finally([] {
@@ -401,6 +414,12 @@ int main(int argc, char** argv) {
             std::cout << "  Circuit:      disabled\n";
         }
         std::cout << "  Drain Timeout: " << g_config.shutdown.drain_timeout.count() << "s\n";
+        if (g_config.cluster.enabled) {
+            std::cout << "  Cluster:      port " << g_config.cluster.gossip_port
+                      << ", " << g_config.cluster.peers.size() << " peers\n";
+        } else {
+            std::cout << "  Cluster:      disabled (standalone mode)\n";
+        }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
         return 1;
