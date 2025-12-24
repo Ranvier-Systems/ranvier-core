@@ -91,6 +91,14 @@ seastar::future<> GossipService::start() {
         });
         _heartbeat_timer.arm_periodic(std::chrono::seconds(5));
 
+        // Check every 5s if anyone has timed out
+        _liveness_timer.set_callback([this] { check_liveness(); });
+        _liveness_timer.arm_periodic(std::chrono::seconds(5));
+
+        for (const auto& addr : _peer_addresses) {
+            _peer_table[addr] = { seastar::lowres_clock::now(), true };
+        }
+
         // Return a ready future to signal the service has 'started' successfully.
         return seastar::make_ready_future<>();
     } catch (...) {
@@ -199,6 +207,9 @@ seastar::future<> GossipService::receive_loop() {
 }
 
 seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgram) {
+    auto src_addr = dgram.get_src();
+    update_peer_liveness(src_addr);
+
     // Move the packet out and linearize it
     seastar::net::packet data = std::move(dgram.get_data());
 
@@ -224,6 +235,14 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     if (!pkt) {
         _packets_invalid++;
         return seastar::make_ready_future<>();
+    }
+
+    // Map this peer address to the backend ID it just announced
+    if (seastar::this_shard_id() == 0) {
+        auto it = _peer_table.find(src_addr);
+        if (it != _peer_table.end()) {
+            it->second.associated_backend = pkt->backend_id;
+        }
     }
 
     ++_packets_received;
@@ -267,6 +286,41 @@ seastar::future<> GossipService::broadcast_heartbeat() {
         // Send and ignore individual results
         return _channel->send(peer, p.share()).discard_result();
     });
+}
+
+void GossipService::update_peer_liveness(const seastar::socket_address& addr) {
+    auto it = _peer_table.find(addr);
+    if (it != _peer_table.end()) {
+        it->second.last_seen = seastar::lowres_clock::now();
+        if (!it->second.is_alive) {
+            log_gossip.info("Peer {} recovered", addr);
+            it->second.is_alive = true;
+        }
+    }
+}
+
+void GossipService::check_liveness() {
+    auto now = seastar::lowres_clock::now();
+
+    for (auto& [addr, state] : _peer_table) {
+        if (state.is_alive && (now - state.last_seen) > PEER_TIMEOUT) {
+            state.is_alive = false;
+            log_gossip.warn("Peer {} timed out. Pruning routes for backend {}.", 
+                             addr, state.associated_backend.value_or(0));
+
+            if (state.associated_backend && _route_prune_callback) {
+                BackendId b_id = *state.associated_backend;
+
+                // Broadcast the prune command to ALL shards
+                (void)seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
+                    [this, b_id](unsigned shard_id) {
+                        return seastar::smp::submit_to(shard_id, [this, b_id] {
+                            return _route_prune_callback(b_id);
+                        });
+                    });
+            }
+        }
+    }
 }
 
 std::optional<seastar::socket_address> GossipService::parse_peer_address(const std::string& peer) {
