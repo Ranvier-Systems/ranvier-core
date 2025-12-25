@@ -235,6 +235,8 @@ future<> run() {
         k8s_config.ca_cert_path = g_config.k8s_discovery.ca_cert_path;
         k8s_config.poll_interval = g_config.k8s_discovery.poll_interval;
         k8s_config.watch_timeout = g_config.k8s_discovery.watch_timeout;
+        k8s_config.watch_reconnect_delay = g_config.k8s_discovery.watch_reconnect_delay;
+        k8s_config.watch_reconnect_max_delay = g_config.k8s_discovery.watch_reconnect_max_delay;
         k8s_config.verify_tls = g_config.k8s_discovery.verify_tls;
         k8s_config.label_selector = g_config.k8s_discovery.label_selector;
 
