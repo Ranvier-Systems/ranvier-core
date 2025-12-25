@@ -27,6 +27,23 @@ set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(yaml-cpp)
 
+# RapidJSON Configuration
+FetchContent_Declare(
+  rapidjson
+  GIT_REPOSITORY https://github.com/Tencent/rapidjson
+  GIT_TAG        v1.1.0
+)
+set(RAPIDJSON_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(RAPIDJSON_BUILD_THIRDPARTY_GTEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(rapidjson)
+
+# RapidJSON is header-only. We must define the include path for the project.
+# The headers are located in the 'include' subdirectory of the fetched source.
+add_library(rapidjson_interface INTERFACE)
+target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
+
 # SQLite3 Configuration
 # Try system SQLite first, fall back to building from source
 find_package(SQLite3 QUIET)
@@ -88,6 +105,7 @@ if(Seastar_FOUND)
       tokenizers_cpp
       ${SQLITE3_LIBRARIES}
       yaml-cpp::yaml-cpp
+      rapidjson_interface
     )
 
     # Copy the assets folder to the build directory automatically
@@ -159,6 +177,7 @@ target_include_directories(k8s_discovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(k8s_discovery_test
   PRIVATE
   GTest::gtest_main
+  rapidjson_interface
 )
 gtest_discover_tests(k8s_discovery_test)
 

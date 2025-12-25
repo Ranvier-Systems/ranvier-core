@@ -9,6 +9,10 @@
 #include <regex>
 #include <sstream>
 
+#include <rapidjson/error/en.h>
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/metrics.hh>
@@ -380,154 +384,55 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
         co_return;
     }
 
-    log_k8s.debug("Periodic sync starting...");
+    log_k8s.info("Synchronizing endpoints for service: {}", _config.service_name);
 
     std::string path = "/apis/discovery.k8s.io/v1/namespaces/" + _config.namespace_name
                      + "/endpointslices?labelSelector=kubernetes.io/service-name=" + _config.service_name;
 
     std::string response = co_await k8s_get(path);
 
-    // Capture the latest Resource Version
-    auto metadata = k8s_json::get_object(response, "metadata");
-    if (metadata) {
-        auto rv = k8s_json::get_string(*metadata, "resourceVersion");
-        if (rv) _resource_version = *rv;
+    rapidjson::Document doc;
+    if (doc.Parse(response.c_str()).HasParseError()) {
+        log_k8s.error("Failed to parse sync response: {}", rapidjson::GetParseError_En(doc.GetParseError()));
+        co_return;
     }
 
-    auto items = k8s_json::get_array(response, "items");
+    // Extract the Resource Version from List metadata
+    if (doc.HasMember("metadata") && doc["metadata"].IsObject()) {
+        const auto& meta = doc["metadata"];
+        if (meta.HasMember("resourceVersion") && meta["resourceVersion"].IsString()) {
+            _resource_version = meta["resourceVersion"].GetString();
+            log_k8s.debug("Initial resourceVersion set to {}", _resource_version);
+        }
+    }
+
+    // Process Items
     std::unordered_set<std::string> current_uids;
 
-    for (const auto& item_json : items) {
-        auto discovered = parse_endpoint_slice(item_json);
-        for (const auto& ep : discovered) {
-            current_uids.insert(ep.uid);
-
-            auto it = _endpoints.find(ep.uid);
-            if (it == _endpoints.end()) {
-                co_await handle_endpoint_added(ep);
-            } else {
-                // If it exists, update it in case weights/annotations changed
-                co_await handle_endpoint_modified(ep);
+    if (doc.HasMember("items") && doc["items"].IsArray()) {
+        for (const auto& item : doc["items"].GetArray()) {
+            auto discovered = parse_endpoint_slice(item);
+            for (const auto& ep : discovered) {
+                current_uids.insert(ep.uid);
+                if (_endpoints.find(ep.uid) == _endpoints.end()) {
+                    co_await handle_endpoint_added(ep);
+                } else {
+                    co_await handle_endpoint_modified(ep);
+                }
             }
         }
     }
 
-    // Garbage collect endpoints that disappeared from K8s
+    // Garbage collect endpoints no longer present in K8s
     for (auto it = _endpoints.begin(); it != _endpoints.end(); ) {
         if (current_uids.find(it->first) == current_uids.end()) {
             std::string uid_to_remove = it->first;
-            it++; // Advance iterator before deletion
+            it++;
             co_await handle_endpoint_removed(uid_to_remove);
         } else {
             it++;
         }
     }
-}
-
-std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slices(const std::string& json) {
-    std::vector<K8sEndpoint> endpoints;
-
-    // Get the items array from the EndpointSliceList
-    auto items = k8s_json::get_array(json, "items");
-
-    for (const auto& item : items) {
-        auto slice_endpoints = parse_endpoint_slice(item);
-        endpoints.insert(endpoints.end(), slice_endpoints.begin(), slice_endpoints.end());
-    }
-
-    log_k8s.debug("Parsed {} endpoints from {} EndpointSlices", endpoints.size(), items.size());
-    return endpoints;
-}
-
-std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const std::string& json) {
-    std::vector<K8sEndpoint> endpoints;
-
-    // Get metadata for annotations
-    auto metadata = k8s_json::get_object(json, "metadata");
-    uint32_t default_weight = K8S_DEFAULT_WEIGHT;
-    uint32_t default_priority = K8S_DEFAULT_PRIORITY;
-
-    if (metadata) {
-        auto annotations = k8s_json::get_object(*metadata, "annotations");
-        if (annotations) {
-            auto weight_str = k8s_json::get_string(*annotations, K8S_ANNOTATION_WEIGHT);
-            if (weight_str) {
-                try {
-                    default_weight = static_cast<uint32_t>(std::stoul(*weight_str));
-                } catch (...) {
-                    log_k8s.warn("Invalid weight annotation: {}", *weight_str);
-                }
-            }
-
-            auto priority_str = k8s_json::get_string(*annotations, K8S_ANNOTATION_PRIORITY);
-            if (priority_str) {
-                try {
-                    default_priority = static_cast<uint32_t>(std::stoul(*priority_str));
-                } catch (...) {
-                    log_k8s.warn("Invalid priority annotation: {}", *priority_str);
-                }
-            }
-        }
-    }
-
-    // Get ports to find the target port
-    uint16_t port = _config.target_port;
-    auto ports = k8s_json::get_array(json, "ports");
-    for (const auto& p : ports) {
-        auto port_num = k8s_json::get_int(p, "port");
-        if (port_num) {
-            port = static_cast<uint16_t>(*port_num);
-            break;  // Use first port
-        }
-    }
-
-    // Get endpoints array
-    auto endpoint_items = k8s_json::get_array(json, "endpoints");
-
-    for (const auto& ep : endpoint_items) {
-        // Check if endpoint is ready
-        auto conditions = k8s_json::get_object(ep, "conditions");
-        bool ready = true;
-        if (conditions) {
-            auto ready_val = k8s_json::get_bool(*conditions, "ready");
-            if (ready_val) {
-                ready = *ready_val;
-            }
-        }
-
-        // Get target reference for UID
-        std::string uid;
-        auto target_ref = k8s_json::get_object(ep, "targetRef");
-        if (target_ref) {
-            auto ref_uid = k8s_json::get_string(*target_ref, "uid");
-            if (ref_uid) {
-                uid = *ref_uid;
-            }
-        }
-
-        // Get addresses
-        auto addresses = k8s_json::get_array(ep, "addresses");
-        for (const auto& addr : addresses) {
-            // addr is just a string in the array
-            std::string address = addr;
-            // Remove quotes if present
-            if (address.size() >= 2 && address.front() == '"' && address.back() == '"') {
-                address = address.substr(1, address.size() - 2);
-            }
-
-            K8sEndpoint endpoint;
-            endpoint.uid = uid.empty() ? address : uid + "-" + address;
-            endpoint.address = address;
-            endpoint.port = port;
-            endpoint.ready = ready;
-            endpoint.weight = default_weight;
-            endpoint.priority = default_priority;
-
-            endpoints.push_back(std::move(endpoint));
-        }
-    }
-
-    return endpoints;
 }
 
 seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discovered) {
@@ -686,65 +591,146 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             path << "&resourceVersion=" << _resource_version;
         }
 
-        // We use a helper that processes the stream line by line
+        // --- THE CO_AWAIT MUST BE INSIDE THIS FUNCTION ---
         co_await k8s_watch(path.str(), [this](const std::string& line) -> seastar::future<bool> {
             if (line.empty()) co_return true;
 
-            // K8s Watch events are objects like: {"type": "ADDED", "object": {...}}
-            auto type = k8s_json::get_string(line, "type");
-            auto object = k8s_json::get_object(line, "object");
+            rapidjson::Document event;
+            if (event.Parse(line.c_str()).HasParseError()) co_return true;
 
-            if (!type || !object) {
-                // Check if it's an error/expired resource version
-                if (k8s_json::is_error(line)) {
-                    log_k8s.warn("Watch error: {}", k8s_json::get_error_message(line));
-                    co_return false; // Break the watch to trigger a full resync
-                }
-                co_return true;
+            if (event.HasMember("kind") && std::string(event["kind"].GetString()) == "Status") {
+                log_k8s.warn("Watch error: {}", event["message"].GetString());
+                co_return false;
             }
 
-            // Update resource version to ensure we resume from this point if disconnected
-            auto metadata = k8s_json::get_object(*object, "metadata");
-            if (metadata) {
-                auto rv = k8s_json::get_string(*metadata, "resourceVersion");
-                if (rv) _resource_version = *rv;
+            if (!event.HasMember("type") || !event.HasMember("object")) co_return true;
+
+            std::string type = event["type"].GetString();
+            const auto& obj = event["object"];
+
+            if (obj.HasMember("metadata") && obj["metadata"].HasMember("resourceVersion")) {
+                _resource_version = obj["metadata"]["resourceVersion"].GetString();
             }
 
-            // Parse the endpoints from the object (it's a single EndpointSlice)
-            auto discovered = parse_endpoint_slice(*object);
+            auto discovered = parse_endpoint_slice(obj);
 
-            if (*type == "ADDED" || *type == "MODIFIED") {
-                // Reconcile this specific slice
+            if (type == "ADDED" || type == "MODIFIED") {
                 for (const auto& ep : discovered) {
                     auto it = _endpoints.find(ep.uid);
-                    if (it == _endpoints.end()) {
-                        co_await handle_endpoint_added(ep);
-                    } else {
-                        co_await handle_endpoint_modified(ep);
-                    }
+                    if (it == _endpoints.end()) co_await handle_endpoint_added(ep);
+                    else co_await handle_endpoint_modified(ep);
                 }
-            } else if (*type == "DELETED") {
+            } else if (type == "DELETED") {
                 for (const auto& ep : discovered) {
                     co_await handle_endpoint_removed(ep.uid);
                 }
             }
 
-            co_return true; // Keep watching
-        });
+            co_return true;
+        }); // End of lambda and k8s_watch call
+
     } catch (const std::exception& e) {
-        log_k8s.error("Watch connection failed: {}. Retrying in {}s...",
-                      e.what(), _config.watch_reconnect_delay.count());
+        log_k8s.error("Watch connection failed: {}. Will retry in 5s...", e.what());
         should_retry_delay = true;
     }
 
     if (should_retry_delay && _running) {
-        co_await seastar::sleep(_config.watch_reconnect_delay);
+        co_await seastar::sleep(std::chrono::seconds(5));
     }
 
-    // If we are still running, restart the watch
     if (_running) {
         _watch_future = watch_endpoints();
     }
+}
+
+std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slices(const std::string& json) {
+    std::vector<K8sEndpoint> all_endpoints;
+    rapidjson::Document doc;
+
+    if (doc.Parse(json.c_str()).HasParseError()) {
+        log_k8s.error("JSON parse error: {} at offset {}",
+                      rapidjson::GetParseError_En(doc.GetParseError()),
+                      doc.GetErrorOffset());
+        return all_endpoints;
+    }
+
+    if (doc.HasMember("items") && doc["items"].IsArray()) {
+        for (const auto& item : doc["items"].GetArray()) {
+            auto discovered = parse_endpoint_slice(item);
+            all_endpoints.insert(all_endpoints.end(),
+                                 std::make_move_iterator(discovered.begin()),
+                                 std::make_move_iterator(discovered.end()));
+        }
+    }
+    return all_endpoints;
+}
+
+std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjson::Value& doc) {
+    std::vector<K8sEndpoint> endpoints;
+
+    uint32_t base_weight = K8S_DEFAULT_WEIGHT;
+    uint32_t base_priority = K8S_DEFAULT_PRIORITY;
+
+    // 1. Extract Annotations (Weight/Priority)
+    if (doc.HasMember("metadata") && doc["metadata"].IsObject()) {
+        const auto& meta = doc["metadata"];
+        if (meta.HasMember("annotations") && meta["annotations"].IsObject()) {
+            const auto& ann = meta["annotations"];
+            if (ann.HasMember(K8S_ANNOTATION_WEIGHT) && ann[K8S_ANNOTATION_WEIGHT].IsString()) {
+                try { base_weight = std::stoul(ann[K8S_ANNOTATION_WEIGHT].GetString()); } catch (...) {}
+            }
+            if (ann.HasMember(K8S_ANNOTATION_PRIORITY) && ann[K8S_ANNOTATION_PRIORITY].IsString()) {
+                try { base_priority = std::stoul(ann[K8S_ANNOTATION_PRIORITY].GetString()); } catch (...) {}
+            }
+        }
+    }
+
+    // 2. Extract Port
+    uint16_t target_port = _config.target_port;
+    if (doc.HasMember("ports") && doc["ports"].IsArray() && doc["ports"].Size() > 0) {
+        const auto& p = doc["ports"][0];
+        if (p.HasMember("port") && p["port"].IsInt()) {
+            target_port = static_cast<uint16_t>(p["port"].GetInt());
+        }
+    }
+
+    // 3. Process Endpoints
+    if (doc.HasMember("endpoints") && doc["endpoints"].IsArray()) {
+        for (const auto& ep : doc["endpoints"].GetArray()) {
+            bool ready = true;
+            if (ep.HasMember("conditions") && ep["conditions"].IsObject()) {
+                const auto& cond = ep["conditions"];
+                if (cond.HasMember("ready") && cond["ready"].IsBool()) {
+                    ready = cond["ready"].GetBool();
+                }
+            }
+
+            std::string pod_uid;
+            if (ep.HasMember("targetRef") && ep["targetRef"].IsObject()) {
+                const auto& ref = ep["targetRef"];
+                if (ref.HasMember("uid") && ref["uid"].IsString()) {
+                    pod_uid = ref["uid"].GetString();
+                }
+            }
+
+            if (ep.HasMember("addresses") && ep["addresses"].IsArray()) {
+                for (const auto& addr_node : ep["addresses"].GetArray()) {
+                    if (addr_node.IsString()) {
+                        K8sEndpoint endpoint;
+                        endpoint.address = addr_node.GetString();
+                        // Stability: Use Pod UID if available, otherwise fallback to address
+                        endpoint.uid = pod_uid.empty() ? endpoint.address : pod_uid;
+                        endpoint.port = target_port;
+                        endpoint.ready = ready;
+                        endpoint.weight = base_weight;
+                        endpoint.priority = base_priority;
+                        endpoints.push_back(std::move(endpoint));
+                    }
+                }
+            }
+        }
+    }
+    return endpoints;
 }
 
 seastar::future<> K8sDiscoveryService::k8s_watch(
@@ -805,212 +791,5 @@ seastar::future<> K8sDiscoveryService::k8s_watch(
     co_await out.close();
     co_await in.close();
 }
-
-// =============================================================================
-// Minimal JSON Parser Implementation
-// =============================================================================
-
-namespace k8s_json {
-
-// Find the end of a JSON string (handles escapes)
-static size_t find_string_end(const std::string& json, size_t start) {
-    size_t pos = start;
-    while (pos < json.size()) {
-        if (json[pos] == '\\') {
-            pos += 2;  // Skip escaped char
-        } else if (json[pos] == '"') {
-            return pos;
-        } else {
-            ++pos;
-        }
-    }
-    return std::string::npos;
-}
-
-// Find matching bracket/brace
-static size_t find_matching(const std::string& json, size_t start, char open, char close) {
-    int depth = 1;
-    size_t pos = start;
-    while (pos < json.size() && depth > 0) {
-        if (json[pos] == '"') {
-            pos = find_string_end(json, pos + 1);
-            if (pos == std::string::npos) return std::string::npos;
-        } else if (json[pos] == open) {
-            ++depth;
-        } else if (json[pos] == close) {
-            --depth;
-            if (depth == 0) return pos;
-        }
-        ++pos;
-    }
-    return std::string::npos;
-}
-
-// Find key in JSON object
-static std::optional<std::pair<size_t, size_t>> find_key_value(const std::string& json, const std::string& key) {
-    std::string search_key = "\"" + key + "\"";
-    size_t pos = 0;
-
-    while (pos < json.size()) {
-        pos = json.find(search_key, pos);
-        if (pos == std::string::npos) return std::nullopt;
-
-        // Find colon after key
-        size_t colon = json.find(':', pos + search_key.size());
-        if (colon == std::string::npos) return std::nullopt;
-
-        // Skip whitespace after colon
-        size_t value_start = colon + 1;
-        while (value_start < json.size() && std::isspace(json[value_start])) {
-            ++value_start;
-        }
-
-        if (value_start >= json.size()) return std::nullopt;
-
-        // Determine value end based on value type
-        size_t value_end;
-        char c = json[value_start];
-
-        if (c == '"') {
-            // String value
-            value_end = find_string_end(json, value_start + 1);
-            if (value_end != std::string::npos) ++value_end;
-        } else if (c == '{') {
-            // Object value
-            value_end = find_matching(json, value_start + 1, '{', '}');
-            if (value_end != std::string::npos) ++value_end;
-        } else if (c == '[') {
-            // Array value
-            value_end = find_matching(json, value_start + 1, '[', ']');
-            if (value_end != std::string::npos) ++value_end;
-        } else {
-            // Number, boolean, or null
-            value_end = value_start;
-            while (value_end < json.size() &&
-                   !std::isspace(json[value_end]) &&
-                   json[value_end] != ',' &&
-                   json[value_end] != '}' &&
-                   json[value_end] != ']') {
-                ++value_end;
-            }
-        }
-
-        if (value_end != std::string::npos && value_end > value_start) {
-            return std::make_pair(value_start, value_end);
-        }
-
-        pos += search_key.size();
-    }
-
-    return std::nullopt;
-}
-
-std::optional<std::string> get_string(const std::string& json, const std::string& key) {
-    auto result = find_key_value(json, key);
-    if (!result) return std::nullopt;
-
-    auto [start, end] = *result;
-    if (start >= json.size() || json[start] != '"') return std::nullopt;
-
-    // Extract string content (without quotes)
-    return json.substr(start + 1, end - start - 2);
-}
-
-std::optional<int64_t> get_int(const std::string& json, const std::string& key) {
-    auto result = find_key_value(json, key);
-    if (!result) return std::nullopt;
-
-    auto [start, end] = *result;
-    std::string value = json.substr(start, end - start);
-
-    try {
-        return std::stoll(value);
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
-std::optional<bool> get_bool(const std::string& json, const std::string& key) {
-    auto result = find_key_value(json, key);
-    if (!result) return std::nullopt;
-
-    auto [start, end] = *result;
-    std::string value = json.substr(start, end - start);
-
-    if (value == "true") return true;
-    if (value == "false") return false;
-    return std::nullopt;
-}
-
-std::vector<std::string> get_array(const std::string& json, const std::string& key) {
-    std::vector<std::string> items;
-
-    auto result = find_key_value(json, key);
-    if (!result) return items;
-
-    auto [start, end] = *result;
-    if (start >= json.size() || json[start] != '[') return items;
-
-    // Parse array elements
-    size_t pos = start + 1;
-    while (pos < end - 1) {
-        // Skip whitespace
-        while (pos < end && std::isspace(json[pos])) ++pos;
-        if (pos >= end - 1 || json[pos] == ']') break;
-
-        // Find element
-        size_t elem_start = pos;
-        size_t elem_end;
-        char c = json[pos];
-
-        if (c == '"') {
-            elem_end = find_string_end(json, pos + 1);
-            if (elem_end != std::string::npos) ++elem_end;
-        } else if (c == '{') {
-            elem_end = find_matching(json, pos + 1, '{', '}');
-            if (elem_end != std::string::npos) ++elem_end;
-        } else if (c == '[') {
-            elem_end = find_matching(json, pos + 1, '[', ']');
-            if (elem_end != std::string::npos) ++elem_end;
-        } else {
-            elem_end = pos;
-            while (elem_end < end && json[elem_end] != ',' && json[elem_end] != ']') {
-                ++elem_end;
-            }
-        }
-
-        if (elem_end != std::string::npos && elem_end > elem_start) {
-            items.push_back(json.substr(elem_start, elem_end - elem_start));
-        }
-
-        // Skip comma
-        pos = elem_end;
-        while (pos < end && (std::isspace(json[pos]) || json[pos] == ',')) ++pos;
-    }
-
-    return items;
-}
-
-std::optional<std::string> get_object(const std::string& json, const std::string& key) {
-    auto result = find_key_value(json, key);
-    if (!result) return std::nullopt;
-
-    auto [start, end] = *result;
-    if (start >= json.size() || json[start] != '{') return std::nullopt;
-
-    return json.substr(start, end - start);
-}
-
-bool is_error(const std::string& json) {
-    auto kind = get_string(json, "kind");
-    return kind && *kind == "Status";
-}
-
-std::string get_error_message(const std::string& json) {
-    auto message = get_string(json, "message");
-    return message.value_or("Unknown error");
-}
-
-}  // namespace k8s_json
 
 }  // namespace ranvier
