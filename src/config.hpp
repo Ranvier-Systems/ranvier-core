@@ -148,6 +148,10 @@ struct K8sDiscoveryConfig {
     std::chrono::seconds poll_interval{30};                // Interval between full syncs
     std::chrono::seconds watch_timeout{300};               // Watch connection timeout
 
+    // Watch reconnection settings
+    std::chrono::seconds watch_reconnect_delay{5};         // Delay before reconnecting watch after failure
+    std::chrono::seconds watch_reconnect_max_delay{60};    // Maximum reconnect delay (for exponential backoff)
+
     // TLS settings
     bool verify_tls = true;                                // Verify server certificate
 
@@ -406,6 +410,12 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_K8S_WATCH_TIMEOUT")) {
         k8s_discovery.watch_timeout = std::chrono::seconds(*v);
     }
+    if (auto v = get_env_as<int>("RANVIER_K8S_WATCH_RECONNECT_DELAY")) {
+        k8s_discovery.watch_reconnect_delay = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env_as<int>("RANVIER_K8S_WATCH_RECONNECT_MAX_DELAY")) {
+        k8s_discovery.watch_reconnect_max_delay = std::chrono::seconds(*v);
+    }
     if (auto v = get_env("RANVIER_K8S_VERIFY_TLS")) {
         k8s_discovery.verify_tls = (*v == "1" || *v == "true" || *v == "yes");
     }
@@ -631,6 +641,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (k["watch_timeout_seconds"]) {
                 config.k8s_discovery.watch_timeout = std::chrono::seconds(k["watch_timeout_seconds"].as<int>());
+            }
+            if (k["watch_reconnect_delay_seconds"]) {
+                config.k8s_discovery.watch_reconnect_delay = std::chrono::seconds(k["watch_reconnect_delay_seconds"].as<int>());
+            }
+            if (k["watch_reconnect_max_delay_seconds"]) {
+                config.k8s_discovery.watch_reconnect_max_delay = std::chrono::seconds(k["watch_reconnect_max_delay_seconds"].as<int>());
             }
             if (k["verify_tls"]) config.k8s_discovery.verify_tls = k["verify_tls"].as<bool>();
             if (k["label_selector"]) config.k8s_discovery.label_selector = k["label_selector"].as<std::string>();

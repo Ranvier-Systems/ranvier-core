@@ -732,12 +732,13 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             co_return true; // Keep watching
         });
     } catch (const std::exception& e) {
-        log_k8s.error("Watch connection failed: {}. Retrying in 5s...", e.what());
+        log_k8s.error("Watch connection failed: {}. Retrying in {}s...",
+                      e.what(), _config.watch_reconnect_delay.count());
         should_retry_delay = true;
     }
 
     if (should_retry_delay && _running) {
-        co_await seastar::sleep(std::chrono::seconds(5));
+        co_await seastar::sleep(_config.watch_reconnect_delay);
     }
 
     // If we are still running, restart the watch
