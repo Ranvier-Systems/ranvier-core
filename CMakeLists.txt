@@ -74,6 +74,7 @@ if(Seastar_FOUND)
       src/gossip_service.cpp
       src/health_service.cpp
       src/http_controller.cpp
+      src/k8s_discovery_service.cpp
       src/router_service.cpp
       src/stream_parser.cpp
       src/tokenizer_service.cpp
@@ -148,6 +149,18 @@ target_link_libraries(gossip_protocol_test
   GTest::gtest_main
 )
 gtest_discover_tests(gossip_protocol_test)
+
+# K8s Discovery Unit Tests (Pure C++, no Seastar dependency)
+# Tests for K8s EndpointSlice parsing and JSON helpers
+add_executable(k8s_discovery_test
+  tests/unit/k8s_discovery_test.cpp
+)
+target_include_directories(k8s_discovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(k8s_discovery_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(k8s_discovery_test)
 
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)

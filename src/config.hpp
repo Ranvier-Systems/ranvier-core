@@ -132,6 +132,29 @@ struct ClusterConfig {
     std::chrono::seconds discovery_refresh_interval{30};   // Interval between DNS refresh queries
 };
 
+// Kubernetes service discovery configuration
+struct K8sDiscoveryConfig {
+    bool enabled = false;                                  // Enable K8s discovery
+    std::string api_server = "https://kubernetes.default.svc";  // K8s API server URL
+    std::string namespace_name = "default";                // Namespace to watch
+    std::string service_name;                              // Service name to watch (required if enabled)
+    uint16_t target_port = 8080;                          // Target port for GPU backends
+
+    // Authentication (uses in-cluster service account by default)
+    std::string token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token";
+    std::string ca_cert_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+
+    // Polling configuration
+    std::chrono::seconds poll_interval{30};                // Interval between full syncs
+    std::chrono::seconds watch_timeout{300};               // Watch connection timeout
+
+    // TLS settings
+    bool verify_tls = true;                                // Verify server certificate
+
+    // Label selector (optional, filters EndpointSlices)
+    std::string label_selector;
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -148,6 +171,7 @@ struct RanvierConfig {
     CircuitBreakerConfig circuit_breaker;
     ShutdownConfig shutdown;
     ClusterConfig cluster;
+    K8sDiscoveryConfig k8s_discovery;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -353,6 +377,41 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_CLUSTER_DISCOVERY_REFRESH_INTERVAL")) {
         cluster.discovery_refresh_interval = std::chrono::seconds(*v);
     }
+
+    // K8s discovery overrides
+    if (auto v = get_env("RANVIER_K8S_DISCOVERY_ENABLED")) {
+        k8s_discovery.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_K8S_API_SERVER")) {
+        k8s_discovery.api_server = *v;
+    }
+    if (auto v = get_env("RANVIER_K8S_NAMESPACE")) {
+        k8s_discovery.namespace_name = *v;
+    }
+    if (auto v = get_env("RANVIER_K8S_SERVICE_NAME")) {
+        k8s_discovery.service_name = *v;
+    }
+    if (auto v = get_env_as<uint16_t>("RANVIER_K8S_TARGET_PORT")) {
+        k8s_discovery.target_port = *v;
+    }
+    if (auto v = get_env("RANVIER_K8S_TOKEN_PATH")) {
+        k8s_discovery.token_path = *v;
+    }
+    if (auto v = get_env("RANVIER_K8S_CA_CERT_PATH")) {
+        k8s_discovery.ca_cert_path = *v;
+    }
+    if (auto v = get_env_as<int>("RANVIER_K8S_POLL_INTERVAL")) {
+        k8s_discovery.poll_interval = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env_as<int>("RANVIER_K8S_WATCH_TIMEOUT")) {
+        k8s_discovery.watch_timeout = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env("RANVIER_K8S_VERIFY_TLS")) {
+        k8s_discovery.verify_tls = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_K8S_LABEL_SELECTOR")) {
+        k8s_discovery.label_selector = *v;
+    }
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -556,6 +615,26 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.cluster.discovery_refresh_interval = std::chrono::seconds(c["discovery_refresh_interval_seconds"].as<int>());
             }
         }
+
+        // K8s discovery section
+        if (yaml["k8s_discovery"]) {
+            YAML::Node k = yaml["k8s_discovery"];
+            if (k["enabled"]) config.k8s_discovery.enabled = k["enabled"].as<bool>();
+            if (k["api_server"]) config.k8s_discovery.api_server = k["api_server"].as<std::string>();
+            if (k["namespace"]) config.k8s_discovery.namespace_name = k["namespace"].as<std::string>();
+            if (k["service_name"]) config.k8s_discovery.service_name = k["service_name"].as<std::string>();
+            if (k["target_port"]) config.k8s_discovery.target_port = k["target_port"].as<uint16_t>();
+            if (k["token_path"]) config.k8s_discovery.token_path = k["token_path"].as<std::string>();
+            if (k["ca_cert_path"]) config.k8s_discovery.ca_cert_path = k["ca_cert_path"].as<std::string>();
+            if (k["poll_interval_seconds"]) {
+                config.k8s_discovery.poll_interval = std::chrono::seconds(k["poll_interval_seconds"].as<int>());
+            }
+            if (k["watch_timeout_seconds"]) {
+                config.k8s_discovery.watch_timeout = std::chrono::seconds(k["watch_timeout_seconds"].as<int>());
+            }
+            if (k["verify_tls"]) config.k8s_discovery.verify_tls = k["verify_tls"].as<bool>();
+            if (k["label_selector"]) config.k8s_discovery.label_selector = k["label_selector"].as<std::string>();
+        }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -676,6 +755,25 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
             if (config.cluster.discovery_refresh_interval.count() < 5) {
                 return "cluster.discovery_refresh_interval must be at least 5 seconds";
             }
+        }
+    }
+
+    // Validate K8s discovery settings (if enabled)
+    if (config.k8s_discovery.enabled) {
+        if (config.k8s_discovery.service_name.empty()) {
+            return "k8s_discovery.service_name is required when K8s discovery is enabled";
+        }
+        if (config.k8s_discovery.namespace_name.empty()) {
+            return "k8s_discovery.namespace must be non-empty";
+        }
+        if (config.k8s_discovery.target_port == 0) {
+            return "k8s_discovery.target_port must be non-zero";
+        }
+        if (config.k8s_discovery.poll_interval.count() < 5) {
+            return "k8s_discovery.poll_interval must be at least 5 seconds";
+        }
+        if (config.k8s_discovery.api_server.empty()) {
+            return "k8s_discovery.api_server must be non-empty";
         }
     }
 
