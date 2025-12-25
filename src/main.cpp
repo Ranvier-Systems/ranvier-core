@@ -10,6 +10,7 @@
 #include "gossip_service.hpp"
 #include "health_service.hpp"
 #include "http_controller.hpp"
+#include "k8s_discovery_service.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
 #include "router_service.hpp"
@@ -42,6 +43,7 @@ std::unique_ptr<ranvier::RouterService> router;
 std::unique_ptr<ranvier::HttpController> controller;
 std::unique_ptr<ranvier::HealthService> health_checker;
 std::unique_ptr<ranvier::PersistenceStore> persistence;
+std::unique_ptr<ranvier::K8sDiscoveryService> k8s_discovery;
 
 // Helper to load persisted state into the router
 future<> load_persisted_state() {
@@ -221,10 +223,47 @@ future<> run() {
     health_checker = std::make_unique<ranvier::HealthService>(*router, health_config);
     health_checker->start();
 
+    // 4a. Init K8s Discovery Service if enabled
+    if (g_config.k8s_discovery.enabled) {
+        ranvier::K8sDiscoveryConfig k8s_config;
+        k8s_config.enabled = g_config.k8s_discovery.enabled;
+        k8s_config.api_server = g_config.k8s_discovery.api_server;
+        k8s_config.namespace_name = g_config.k8s_discovery.namespace_name;
+        k8s_config.service_name = g_config.k8s_discovery.service_name;
+        k8s_config.target_port = g_config.k8s_discovery.target_port;
+        k8s_config.token_path = g_config.k8s_discovery.token_path;
+        k8s_config.ca_cert_path = g_config.k8s_discovery.ca_cert_path;
+        k8s_config.poll_interval = g_config.k8s_discovery.poll_interval;
+        k8s_config.watch_timeout = g_config.k8s_discovery.watch_timeout;
+        k8s_config.verify_tls = g_config.k8s_discovery.verify_tls;
+        k8s_config.label_selector = g_config.k8s_discovery.label_selector;
+
+        k8s_discovery = std::make_unique<ranvier::K8sDiscoveryService>(k8s_config);
+
+        // Connect K8s discovery to router
+        k8s_discovery->set_register_callback(
+            [](ranvier::BackendId id, socket_address addr, uint32_t weight, uint32_t priority) {
+                return router->register_backend_global(id, addr, weight, priority);
+            });
+        k8s_discovery->set_drain_callback(
+            [](ranvier::BackendId id) {
+                return router->drain_backend_global(id);
+            });
+
+        ranvier::log_main.info("K8s discovery configured for {}/{}",
+            g_config.k8s_discovery.namespace_name, g_config.k8s_discovery.service_name);
+    }
+
     // 5. Start gossip service if cluster mode is enabled
     return router->start_gossip().then([] {
         // 6. Load persisted state
         return load_persisted_state();
+    }).then([] {
+        // 6a. Start K8s discovery service if enabled
+        if (k8s_discovery && k8s_discovery->is_enabled()) {
+            return k8s_discovery->start();
+        }
+        return make_ready_future<>();
     }).then([] {
         // 7. Start Servers (Metrics + API)
         return do_with(seastar::httpd::http_server_control(), seastar::httpd::http_server_control(),
@@ -330,6 +369,17 @@ future<> run() {
 
                 // Stop Health Checker FIRST
                 return health_checker->stop().then([&api_server, &prom_server] {
+                    // Stop K8s discovery service
+                    if (k8s_discovery && k8s_discovery->is_enabled()) {
+                        return k8s_discovery->stop().then([&api_server, &prom_server] {
+                            // Stop gossip service
+                            return router->stop_gossip().then([&api_server, &prom_server] {
+                                return api_server.stop().then([&prom_server] {
+                                    return prom_server.stop();
+                                });
+                            });
+                        });
+                    }
                     // Stop gossip service
                     return router->stop_gossip().then([&api_server, &prom_server] {
                         return api_server.stop().then([&prom_server] {
@@ -420,6 +470,13 @@ int main(int argc, char** argv) {
                       << ", " << g_config.cluster.peers.size() << " peers\n";
         } else {
             std::cout << "  Cluster:      disabled (standalone mode)\n";
+        }
+        if (g_config.k8s_discovery.enabled) {
+            std::cout << "  K8s Discovery: " << g_config.k8s_discovery.namespace_name
+                      << "/" << g_config.k8s_discovery.service_name
+                      << " (port " << g_config.k8s_discovery.target_port << ")\n";
+        } else {
+            std::cout << "  K8s Discovery: disabled\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
