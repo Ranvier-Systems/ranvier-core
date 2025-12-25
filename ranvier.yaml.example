@@ -188,3 +188,77 @@ circuit_breaker:
 #   - Backend 1: 66% of traffic (200/300)
 #   - Backend 2: 33% of traffic (100/300)
 #   - Backend 3: 0% (only used if backends 1 and 2 are both down)
+
+# =============================================================================
+# Cluster Configuration (Distributed Mode)
+# =============================================================================
+# Enable gossip-based state synchronization between multiple Ranvier instances.
+# This allows route cache sharing across a cluster for horizontal scaling.
+cluster:
+  # Enable cluster mode (RANVIER_CLUSTER_ENABLED)
+  enabled: false
+
+  # UDP port for gossip protocol (RANVIER_CLUSTER_GOSSIP_PORT)
+  gossip_port: 9190
+
+  # Static list of peer addresses (RANVIER_CLUSTER_PEERS - comma-separated)
+  # Format: "IP:Port" for each peer
+  peers:
+    # - "192.168.1.100:9190"
+    # - "192.168.1.101:9190"
+
+  # Interval between gossip rounds in milliseconds (RANVIER_CLUSTER_GOSSIP_INTERVAL_MS)
+  gossip_interval_ms: 1000
+
+  # Interval between heartbeat broadcasts in seconds (RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL)
+  gossip_heartbeat_interval_seconds: 5
+
+  # Time in seconds before marking a peer as dead (RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT)
+  # Must be at least twice the heartbeat interval
+  gossip_peer_timeout_seconds: 15
+
+  # =============================================================================
+  # DNS-based Peer Discovery
+  # =============================================================================
+  # Automatically discover peers via DNS queries (useful for Kubernetes deployments)
+  # When enabled, Ranvier queries the configured DNS name periodically to find peers.
+
+  # DNS name to query for peer discovery (RANVIER_CLUSTER_DISCOVERY_DNS_NAME)
+  # For Kubernetes headless services: "<service-name>.<namespace>.svc.cluster.local"
+  # discovery_dns_name: "ranvier-headless.default.svc.cluster.local"
+
+  # Type of DNS records to query (RANVIER_CLUSTER_DISCOVERY_TYPE)
+  # Options:
+  #   - "STATIC": Use only static peer list (default)
+  #   - "A": Query A/AAAA records, use gossip_port for all discovered IPs
+  #   - "SRV": Query SRV records for _gossip._udp service, use port from SRV record
+  # discovery_type: "A"
+
+  # Interval between DNS refresh queries in seconds (RANVIER_CLUSTER_DISCOVERY_REFRESH_INTERVAL)
+  # Must be at least 5 seconds
+  discovery_refresh_interval_seconds: 30
+
+  # Example Kubernetes deployment with DNS discovery:
+  # ---
+  # apiVersion: v1
+  # kind: Service
+  # metadata:
+  #   name: ranvier-headless
+  # spec:
+  #   clusterIP: None  # Headless service for DNS discovery
+  #   selector:
+  #     app: ranvier
+  #   ports:
+  #     - name: gossip
+  #       port: 9190
+  #       protocol: UDP
+  # ---
+  # Then configure:
+  #   discovery_dns_name: "ranvier-headless.default.svc.cluster.local"
+  #   discovery_type: "A"
+  #   discovery_refresh_interval_seconds: 30
+
+# Graceful shutdown configuration
+shutdown:
+  # Maximum time in seconds to wait for in-flight requests during shutdown (RANVIER_SHUTDOWN_DRAIN_TIMEOUT)
+  drain_timeout_seconds: 30

@@ -5,6 +5,7 @@
 #include "gossip_service.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include <boost/range/irange.hpp>
 
@@ -23,7 +24,8 @@ namespace ranvier {
 
 GossipService::GossipService(const ClusterConfig& config)
     : _config(config),
-    _receive_loop_future(seastar::make_ready_future<>()) {
+    _receive_loop_future(seastar::make_ready_future<>()),
+    _discovery_future(seastar::make_ready_future<>()) {
 
     // Parse peer addresses at construction
     for (const auto& peer : _config.peers) {
@@ -47,7 +49,11 @@ GossipService::GossipService(const ClusterConfig& config)
         seastar::metrics::make_counter("router_cluster_sync_untrusted", _packets_untrusted,
             seastar::metrics::description("Total number of gossip packets received from unknown peers")),
         seastar::metrics::make_gauge("cluster_peers_alive", _stats_cluster_peers_alive,
-            seastar::metrics::description("Number of cluster peers currently alive"))
+            seastar::metrics::description("Number of cluster peers currently alive")),
+        seastar::metrics::make_counter("cluster_dns_discovery_success", _dns_discovery_success,
+            seastar::metrics::description("Total number of successful DNS peer discovery operations")),
+        seastar::metrics::make_counter("cluster_dns_discovery_failure", _dns_discovery_failure,
+            seastar::metrics::description("Total number of failed DNS peer discovery operations"))
     });
 }
 
@@ -105,6 +111,38 @@ seastar::future<> GossipService::start() {
             _peer_table[addr] = { seastar::lowres_clock::now(), true };
         }
 
+        // Set up DNS discovery if configured
+        if (_config.discovery_type != DiscoveryType::STATIC && !_config.discovery_dns_name.empty()) {
+            _discovery_enabled = true;
+            log_gossip.info("DNS peer discovery enabled: type={}, dns_name={}, refresh_interval={}s",
+                            _config.discovery_type == DiscoveryType::SRV ? "SRV" : "A",
+                            _config.discovery_dns_name,
+                            _config.discovery_refresh_interval.count());
+
+            // Perform initial discovery
+            _discovery_future = refresh_peers().handle_exception([](auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    log_gossip.error("Initial DNS discovery failed: {}", e.what());
+                }
+            });
+
+            // Set up periodic discovery refresh
+            _discovery_timer.set_callback([this] {
+                if (_discovery_enabled && _running) {
+                    (void)refresh_peers().handle_exception([](auto ep) {
+                        try {
+                            std::rethrow_exception(ep);
+                        } catch (const std::exception& e) {
+                            log_gossip.warn("Periodic DNS discovery failed: {}", e.what());
+                        }
+                    });
+                }
+            });
+            _discovery_timer.arm_periodic(_config.discovery_refresh_interval);
+        }
+
         // Return a ready future to signal the service has 'started' successfully.
         return seastar::make_ready_future<>();
     } catch (...) {
@@ -147,6 +185,27 @@ seastar::future<> GossipService::stop() {
 
     // Stop the heartbeat generator
     _heartbeat_timer.cancel();
+
+    // Stop the liveness checker
+    _liveness_timer.cancel();
+
+    // Stop DNS discovery
+    _discovery_enabled = false;
+    _discovery_timer.cancel();
+
+    // Wait for any in-flight discovery to complete
+    try {
+        co_await std::move(_discovery_future);
+    } catch (...) {
+        log_gossip.debug("Discovery future completed with exception during shutdown");
+    }
+
+    // Close DNS resolver
+    try {
+        co_await _dns_resolver.close();
+    } catch (...) {
+        log_gossip.debug("DNS resolver closed with exception during shutdown");
+    }
 
     co_return;
 }
@@ -363,6 +422,133 @@ std::optional<seastar::socket_address> GossipService::parse_peer_address(const s
         log_gossip.debug("Failed to parse peer '{}': {}", peer, e.what());
         return std::nullopt;
     }
+}
+
+seastar::future<> GossipService::refresh_peers() {
+    if (!_discovery_enabled || seastar::this_shard_id() != 0) {
+        co_return;
+    }
+
+    log_gossip.debug("Refreshing peers from DNS: {}", _config.discovery_dns_name);
+
+    try {
+        std::vector<seastar::socket_address> discovered_addresses;
+
+        if (_config.discovery_type == DiscoveryType::SRV) {
+            // Query SRV records - returns service records with priority, weight, port, and target
+            auto srv_records = co_await _dns_resolver.get_srv_records(
+                seastar::net::dns_resolver::srv_proto::udp,
+                "_gossip",
+                _config.discovery_dns_name);
+
+            for (const auto& srv : srv_records) {
+                // Resolve each SRV target to IP addresses
+                try {
+                    // Use get_host_by_name to get all addresses for the target
+                    auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
+                    for (const auto& addr : host_entry.addr_list) {
+                        discovered_addresses.emplace_back(addr, srv.port);
+                        log_gossip.debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                    }
+                } catch (const std::exception& e) {
+                    log_gossip.warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
+                }
+            }
+        } else if (_config.discovery_type == DiscoveryType::A) {
+            // Query A/AAAA records - use default gossip port
+            // Use get_host_by_name to get all addresses
+            auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
+
+            for (const auto& addr : host_entry.addr_list) {
+                discovered_addresses.emplace_back(addr, _config.gossip_port);
+                log_gossip.debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
+            }
+        }
+
+        if (discovered_addresses.empty()) {
+            log_gossip.debug("DNS discovery returned no addresses");
+            co_return;
+        }
+
+        // Merge discovered addresses with existing peer list
+        // Use a set for deduplication
+        std::unordered_set<seastar::socket_address> new_peer_set;
+
+        // Keep static peers (from config)
+        for (const auto& peer : _config.peers) {
+            auto addr = parse_peer_address(peer);
+            if (addr) {
+                new_peer_set.insert(*addr);
+            }
+        }
+
+        // Add discovered peers
+        for (const auto& addr : discovered_addresses) {
+            new_peer_set.insert(addr);
+        }
+
+        // Build new peer address list
+        std::vector<seastar::socket_address> new_peer_addresses(new_peer_set.begin(), new_peer_set.end());
+
+        // Graceful merge: preserve existing PeerState for peers that are still present
+        auto now = seastar::lowres_clock::now();
+        std::unordered_map<seastar::socket_address, PeerState> new_peer_table;
+
+        for (const auto& addr : new_peer_addresses) {
+            auto it = _peer_table.find(addr);
+            if (it != _peer_table.end()) {
+                // Preserve existing state (last_seen, is_alive, associated_backend)
+                new_peer_table[addr] = it->second;
+            } else {
+                // New peer - initialize with current time
+                new_peer_table[addr] = { now, true, std::nullopt };
+                log_gossip.info("DNS discovery: new peer added: {}", addr);
+            }
+        }
+
+        // Log peers that were removed
+        for (const auto& [addr, state] : _peer_table) {
+            if (new_peer_table.find(addr) == new_peer_table.end()) {
+                log_gossip.info("DNS discovery: peer removed: {}", addr);
+
+                // Prune routes for removed peers if they had an associated backend
+                if (state.associated_backend && _route_prune_callback) {
+                    BackendId b_id = *state.associated_backend;
+                    (void)seastar::parallel_for_each(
+                        boost::irange<unsigned>(0, seastar::smp::count),
+                        [this, b_id](unsigned shard_id) {
+                            return seastar::smp::submit_to(shard_id, [this, b_id] {
+                                return _route_prune_callback(b_id);
+                            });
+                        });
+                }
+            }
+        }
+
+        // Update the peer structures
+        _peer_addresses = std::move(new_peer_addresses);
+        _peer_table = std::move(new_peer_table);
+
+        // Update alive count metric
+        uint64_t alive_count = 0;
+        for (const auto& [addr, state] : _peer_table) {
+            if (state.is_alive) {
+                ++alive_count;
+            }
+        }
+        _stats_cluster_peers_alive = alive_count;
+
+        log_gossip.info("DNS discovery complete: {} peers ({} from DNS)",
+                        _peer_addresses.size(), discovered_addresses.size());
+
+        ++_dns_discovery_success;
+
+    } catch (const std::exception& e) {
+        log_gossip.warn("DNS discovery failed: {}", e.what());
+        ++_dns_discovery_failure;
+    }
+
+    co_return;
 }
 
 }  // namespace ranvier
