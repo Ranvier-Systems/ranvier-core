@@ -181,6 +181,19 @@ target_link_libraries(k8s_discovery_test
 )
 gtest_discover_tests(k8s_discovery_test)
 
+# Request Rewriter Unit Tests (Pure C++, no Seastar dependency)
+# Tests for JSON request parsing and token ID injection
+add_executable(request_rewriter_test
+  tests/unit/request_rewriter_test.cpp
+)
+target_include_directories(request_rewriter_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(request_rewriter_test
+  PRIVATE
+  GTest::gtest_main
+  rapidjson_interface
+)
+gtest_discover_tests(request_rewriter_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)
     add_executable(stream_parser_test
