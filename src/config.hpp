@@ -110,6 +110,13 @@ struct ShutdownConfig {
     std::chrono::seconds drain_timeout{30};           // Max time to wait for in-flight requests
 };
 
+// Discovery type for DNS-based peer discovery
+enum class DiscoveryType {
+    STATIC,  // Use static peer list only (default)
+    A,       // Use DNS A records (IPs only, use default gossip_port)
+    SRV      // Use DNS SRV records (IPs and ports)
+};
+
 // Cluster configuration for distributed mode (gossip-based state sync)
 struct ClusterConfig {
     bool enabled = false;                                  // Enable distributed mode
@@ -118,6 +125,11 @@ struct ClusterConfig {
     std::chrono::milliseconds gossip_interval{1000};      // Interval between gossip rounds
     std::chrono::seconds gossip_heartbeat_interval{5};    // Interval between heartbeat broadcasts
     std::chrono::seconds gossip_peer_timeout{15};         // Time before marking a peer as dead
+
+    // DNS-based peer discovery
+    std::string discovery_dns_name;                        // DNS name to query for peer discovery (empty = disabled)
+    DiscoveryType discovery_type = DiscoveryType::STATIC;  // Type of DNS records to query
+    std::chrono::seconds discovery_refresh_interval{30};   // Interval between DNS refresh queries
 };
 
 // Top-level configuration
@@ -326,6 +338,21 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT")) {
         cluster.gossip_peer_timeout = std::chrono::seconds(*v);
     }
+    if (auto v = get_env("RANVIER_CLUSTER_DISCOVERY_DNS_NAME")) {
+        cluster.discovery_dns_name = *v;
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_DISCOVERY_TYPE")) {
+        if (*v == "A" || *v == "a") {
+            cluster.discovery_type = DiscoveryType::A;
+        } else if (*v == "SRV" || *v == "srv") {
+            cluster.discovery_type = DiscoveryType::SRV;
+        } else {
+            cluster.discovery_type = DiscoveryType::STATIC;
+        }
+    }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_DISCOVERY_REFRESH_INTERVAL")) {
+        cluster.discovery_refresh_interval = std::chrono::seconds(*v);
+    }
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -512,6 +539,22 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (c["gossip_peer_timeout_seconds"]) {
                 config.cluster.gossip_peer_timeout = std::chrono::seconds(c["gossip_peer_timeout_seconds"].as<int>());
             }
+            if (c["discovery_dns_name"]) {
+                config.cluster.discovery_dns_name = c["discovery_dns_name"].as<std::string>();
+            }
+            if (c["discovery_type"]) {
+                std::string dtype = c["discovery_type"].as<std::string>();
+                if (dtype == "A" || dtype == "a") {
+                    config.cluster.discovery_type = DiscoveryType::A;
+                } else if (dtype == "SRV" || dtype == "srv") {
+                    config.cluster.discovery_type = DiscoveryType::SRV;
+                } else {
+                    config.cluster.discovery_type = DiscoveryType::STATIC;
+                }
+            }
+            if (c["discovery_refresh_interval_seconds"]) {
+                config.cluster.discovery_refresh_interval = std::chrono::seconds(c["discovery_refresh_interval_seconds"].as<int>());
+            }
         }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
@@ -624,6 +667,15 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
         }
         if (config.cluster.gossip_peer_timeout < 2 * config.cluster.gossip_heartbeat_interval) {
             return "cluster.gossip_peer_timeout must be at least twice gossip_heartbeat_interval";
+        }
+        // Validate DNS discovery settings
+        if (config.cluster.discovery_type != DiscoveryType::STATIC) {
+            if (config.cluster.discovery_dns_name.empty()) {
+                return "cluster.discovery_dns_name is required when discovery_type is not STATIC";
+            }
+            if (config.cluster.discovery_refresh_interval.count() < 5) {
+                return "cluster.discovery_refresh_interval must be at least 5 seconds";
+            }
         }
     }
 

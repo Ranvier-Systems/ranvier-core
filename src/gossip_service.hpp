@@ -20,6 +20,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/udp.hh>
 
@@ -180,6 +181,8 @@ private:
     uint64_t _packets_invalid = 0;
     uint64_t _packets_untrusted = 0;
     uint64_t _stats_cluster_peers_alive = 0;
+    uint64_t _dns_discovery_success = 0;
+    uint64_t _dns_discovery_failure = 0;
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;
@@ -202,6 +205,12 @@ private:
 
     seastar::timer<> _liveness_timer;
 
+    // DNS-based peer discovery members (shard 0 only)
+    seastar::net::dns_resolver _dns_resolver;
+    seastar::timer<> _discovery_timer;
+    bool _discovery_enabled = false;
+    seastar::future<> _discovery_future;
+
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
 
@@ -213,6 +222,10 @@ private:
 
     // Internal method to send a heartbeat to all peers
     seastar::future<> broadcast_heartbeat();
+
+    // DNS-based peer discovery: refresh peer list from DNS
+    // Only runs on shard 0, broadcasts updates to other shards
+    seastar::future<> refresh_peers();
 
     // Parse peer address string "IP:Port" to socket_address
     static std::optional<seastar::socket_address> parse_peer_address(const std::string& peer);
