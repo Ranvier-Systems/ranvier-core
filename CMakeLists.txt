@@ -137,6 +137,18 @@ target_link_libraries(config_test
 )
 gtest_discover_tests(config_test)
 
+# Gossip Protocol Unit Tests (Pure C++, no Seastar dependency)
+# Tests for gossip wire format, packet serialization/deserialization
+add_executable(gossip_protocol_test
+  tests/unit/gossip_protocol_test.cpp
+)
+target_include_directories(gossip_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gossip_protocol_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_protocol_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)
     add_executable(stream_parser_test
