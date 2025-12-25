@@ -1,5 +1,6 @@
 #include "http_controller.hpp"
 #include "logging.hpp"
+#include "request_rewriter.hpp"
 
 #include "stream_parser.hpp"
 
@@ -272,7 +273,34 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Timing: capture routing decision start
     auto routing_start = std::chrono::steady_clock::now();
 
-    auto tokens = _tokenizer.encode(body);
+    // Extract text from request body for tokenization (prompt or messages content)
+    // This ensures we tokenize exactly what we use for routing, not metadata
+    std::vector<int32_t> tokens;
+    auto extracted_text = RequestRewriter::extract_text(body);
+    if (extracted_text.has_value()) {
+        tokens = _tokenizer.encode(extracted_text.value());
+    } else {
+        // Fallback: tokenize the entire body (legacy behavior)
+        tokens = _tokenizer.encode(body);
+    }
+
+    // Rewrite request body with token IDs if enabled
+    // This allows vLLM backends to skip tokenization (prompt_token_ids)
+    std::string forwarded_body = body;
+    bool body_rewritten = false;
+    if (_config.enable_token_forwarding && !tokens.empty()) {
+        auto rewrite_result = RequestRewriter::rewrite(body, tokens);
+        if (rewrite_result.success) {
+            forwarded_body = std::move(rewrite_result.body);
+            body_rewritten = true;
+            log_proxy.debug("[{}] Request rewritten with {} token IDs ({} -> {} bytes)",
+                           request_id, tokens.size(), body.size(), forwarded_body.size());
+        } else {
+            log_proxy.debug("[{}] Request rewrite skipped: {}",
+                           request_id, rewrite_result.error);
+        }
+    }
+
     auto route_hit = _router.lookup(tokens, request_id);
 
     BackendId target_id;
@@ -339,7 +367,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Add X-Request-ID to response headers before streaming
     rep->add_header("X-Request-ID", request_id);
 
-    rep->write_body("text/event-stream", [this, target_addr, body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -454,16 +482,17 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
 
         // Build HTTP request with X-Request-ID header for backend tracing
+        // Use forwarded_body which may include prompt_token_ids if token forwarding is enabled
         sstring http_req =
             "POST /v1/chat/completions HTTP/1.1\r\n"
             "Host: localhost\r\n"
             "Content-Type: application/json\r\n"
-            "Content-Length: " + to_sstring(body.size()) + "\r\n"
+            "Content-Length: " + to_sstring(forwarded_body.size()) + "\r\n"
             "X-Request-ID: " + request_id + "\r\n"
             "Connection: keep-alive\r\n\r\n" +
-            body;
+            forwarded_body;
 
-        log_proxy.debug("[{}] Sending request to backend ({} bytes)", request_id, body.size());
+        log_proxy.debug("[{}] Sending request to backend ({} bytes)", request_id, forwarded_body.size());
 
         // Send request with broken pipe/connection reset handling
         bool write_failed = false;

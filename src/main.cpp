@@ -143,6 +143,7 @@ future<> reload_config() {
         ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
         ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
         ctrl_config.drain_timeout = g_config.shutdown.drain_timeout;
+        ctrl_config.enable_token_forwarding = g_config.routing.enable_token_forwarding;
         controller->update_config(ctrl_config);
 
         // Update routing config on all shards
@@ -200,6 +201,7 @@ future<> run() {
     ctrl_config.circuit_breaker.recovery_timeout = g_config.circuit_breaker.recovery_timeout;
     ctrl_config.circuit_breaker.fallback_enabled = g_config.circuit_breaker.fallback_enabled;
     ctrl_config.drain_timeout = g_config.shutdown.drain_timeout;
+    ctrl_config.enable_token_forwarding = g_config.routing.enable_token_forwarding;
     controller = std::make_unique<ranvier::HttpController>(tokenizer, *router, ctrl_config);
 
     // 2a. Initialize metrics on all shards

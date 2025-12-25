@@ -45,6 +45,7 @@ struct HttpControllerConfig {
     RetrySettings retry;                        // Retry configuration
     CircuitBreakerSettings circuit_breaker;     // Circuit breaker configuration
     std::chrono::seconds drain_timeout{30};     // Max time to wait for in-flight requests during shutdown
+    bool enable_token_forwarding = false;       // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
 };
 
 class HttpController {

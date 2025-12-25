@@ -56,6 +56,7 @@ struct RoutingConfig {
     size_t max_routes = 100000;  // Maximum number of routes in the prefix cache (0 = unlimited)
     std::chrono::seconds ttl_seconds{3600};  // TTL for cached routes (1 hour default)
     std::chrono::seconds backend_drain_timeout{60};  // Time to wait before fully removing a draining backend
+    bool enable_token_forwarding = false;  // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
 };
 
 // Timeout configuration
@@ -269,6 +270,9 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<int>("RANVIER_BACKEND_DRAIN_TIMEOUT")) {
         routing.backend_drain_timeout = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env("RANVIER_ENABLE_TOKEN_FORWARDING")) {
+        routing.enable_token_forwarding = (*v == "1" || *v == "true" || *v == "yes");
     }
 
     // Timeout overrides
@@ -513,6 +517,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["backend_drain_timeout_seconds"]) {
                 config.routing.backend_drain_timeout = std::chrono::seconds(r["backend_drain_timeout_seconds"].as<int>());
+            }
+            if (r["enable_token_forwarding"]) {
+                config.routing.enable_token_forwarding = r["enable_token_forwarding"].as<bool>();
             }
         }
 
