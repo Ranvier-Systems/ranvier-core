@@ -75,38 +75,39 @@ seastar::future<> K8sDiscoveryService::start() {
     _running = true;
 
     try {
-        // Load service account credentials
+        // Load auth and TLS
         co_await load_service_account_token();
-
-        // Initialize TLS
         co_await init_tls();
 
-        // Perform initial sync
+        // Perform the initial full synchronization
+        // This populates _endpoints and sets _resource_version
         co_await sync_endpoints();
 
-        // Start poll timer for periodic resync
+        // Launch the background watch
+        // We do NOT co_await this here because it runs forever
+        _watch_future = watch_endpoints();
+
+        // Start the periodic resync timer
+        // This ensures state consistency even if the watch misses an event
         _poll_timer.set_callback([this] {
+            // We launch this into the background and don't wait for it
+            // but we use a gate or check _running to stay safe
             if (_running) {
                 (void)sync_endpoints().handle_exception([](auto ep) {
-                    try {
-                        std::rethrow_exception(ep);
-                    } catch (const std::exception& e) {
-                        log_k8s.warn("Periodic sync failed: {}", e.what());
-                    }
+                    log_k8s.warn("Periodic resync failed: {}", ep);
                 });
             }
         });
-        _poll_timer.arm_periodic(_config.poll_interval);
+
+        // Use the interval from config, or default to 60s
+        _poll_timer.arm_periodic(std::chrono::seconds(60));
 
         log_k8s.info("K8s discovery service started successfully");
-
     } catch (const std::exception& e) {
         log_k8s.error("Failed to start K8s discovery: {}", e.what());
         _running = false;
         throw;
     }
-
-    co_return;
 }
 
 seastar::future<> K8sDiscoveryService::stop() {
@@ -379,37 +380,48 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
         co_return;
     }
 
-    log_k8s.debug("Syncing K8s endpoints for {}/{}", _config.namespace_name, _config.service_name);
-    ++_syncs_total;
+    log_k8s.debug("Periodic sync starting...");
 
-    try {
-        // Build API path for EndpointSlices
-        // EndpointSlices are the modern replacement for Endpoints
-        std::ostringstream path;
-        path << "/apis/discovery.k8s.io/v1/namespaces/" << _config.namespace_name
-             << "/endpointslices?labelSelector=kubernetes.io/service-name=" << _config.service_name;
+    std::string path = "/apis/discovery.k8s.io/v1/namespaces/" + _config.namespace_name
+                     + "/endpointslices?labelSelector=kubernetes.io/service-name=" + _config.service_name;
 
-        if (!_config.label_selector.empty()) {
-            path << "," << _config.label_selector;
-        }
+    std::string response = co_await k8s_get(path);
 
-        std::string response = co_await k8s_get(path.str());
-
-        // Parse response
-        auto endpoints = parse_endpoint_slices(response);
-
-        // Reconcile with current state
-        co_await reconcile(std::move(endpoints));
-
-        log_k8s.info("K8s sync complete: {} endpoints for {}/{}",
-                     _endpoints.size(), _config.namespace_name, _config.service_name);
-
-    } catch (const std::exception& e) {
-        log_k8s.error("K8s sync failed: {}", e.what());
-        ++_syncs_failed;
+    // Capture the latest Resource Version
+    auto metadata = k8s_json::get_object(response, "metadata");
+    if (metadata) {
+        auto rv = k8s_json::get_string(*metadata, "resourceVersion");
+        if (rv) _resource_version = *rv;
     }
 
-    co_return;
+    auto items = k8s_json::get_array(response, "items");
+    std::unordered_set<std::string> current_uids;
+
+    for (const auto& item_json : items) {
+        auto discovered = parse_endpoint_slice(item_json);
+        for (const auto& ep : discovered) {
+            current_uids.insert(ep.uid);
+
+            auto it = _endpoints.find(ep.uid);
+            if (it == _endpoints.end()) {
+                co_await handle_endpoint_added(ep);
+            } else {
+                // If it exists, update it in case weights/annotations changed
+                co_await handle_endpoint_modified(ep);
+            }
+        }
+    }
+
+    // Garbage collect endpoints that disappeared from K8s
+    for (auto it = _endpoints.begin(); it != _endpoints.end(); ) {
+        if (current_uids.find(it->first) == current_uids.end()) {
+            std::string uid_to_remove = it->first;
+            it++; // Advance iterator before deletion
+            co_await handle_endpoint_removed(uid_to_remove);
+        } else {
+            it++;
+        }
+    }
 }
 
 std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slices(const std::string& json) {
@@ -653,6 +665,144 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
     }
 
     co_return;
+}
+
+seastar::future<> K8sDiscoveryService::watch_endpoints() {
+    if (!_running) {
+        co_return;
+    }
+
+    log_k8s.info("Starting K8s watch for EndpointSlices (resourceVersion: {})", _resource_version);
+    _watch_reconnects++;
+
+    bool should_retry_delay = false;
+
+    try {
+        std::ostringstream path;
+        path << "/apis/discovery.k8s.io/v1/namespaces/" << _config.namespace_name
+             << "/endpointslices?watch=true&labelSelector=kubernetes.io/service-name=" << _config.service_name;
+
+        if (!_resource_version.empty()) {
+            path << "&resourceVersion=" << _resource_version;
+        }
+
+        // We use a helper that processes the stream line by line
+        co_await k8s_watch(path.str(), [this](const std::string& line) -> seastar::future<bool> {
+            if (line.empty()) co_return true;
+
+            // K8s Watch events are objects like: {"type": "ADDED", "object": {...}}
+            auto type = k8s_json::get_string(line, "type");
+            auto object = k8s_json::get_object(line, "object");
+
+            if (!type || !object) {
+                // Check if it's an error/expired resource version
+                if (k8s_json::is_error(line)) {
+                    log_k8s.warn("Watch error: {}", k8s_json::get_error_message(line));
+                    co_return false; // Break the watch to trigger a full resync
+                }
+                co_return true;
+            }
+
+            // Update resource version to ensure we resume from this point if disconnected
+            auto metadata = k8s_json::get_object(*object, "metadata");
+            if (metadata) {
+                auto rv = k8s_json::get_string(*metadata, "resourceVersion");
+                if (rv) _resource_version = *rv;
+            }
+
+            // Parse the endpoints from the object (it's a single EndpointSlice)
+            auto discovered = parse_endpoint_slice(*object);
+
+            if (*type == "ADDED" || *type == "MODIFIED") {
+                // Reconcile this specific slice
+                for (const auto& ep : discovered) {
+                    auto it = _endpoints.find(ep.uid);
+                    if (it == _endpoints.end()) {
+                        co_await handle_endpoint_added(ep);
+                    } else {
+                        co_await handle_endpoint_modified(ep);
+                    }
+                }
+            } else if (*type == "DELETED") {
+                for (const auto& ep : discovered) {
+                    co_await handle_endpoint_removed(ep.uid);
+                }
+            }
+
+            co_return true; // Keep watching
+        });
+    } catch (const std::exception& e) {
+        log_k8s.error("Watch connection failed: {}. Retrying in 5s...", e.what());
+        should_retry_delay = true;
+    }
+
+    if (should_retry_delay && _running) {
+        co_await seastar::sleep(std::chrono::seconds(5));
+    }
+
+    // If we are still running, restart the watch
+    if (_running) {
+        _watch_future = watch_endpoints();
+    }
+}
+
+seastar::future<> K8sDiscoveryService::k8s_watch(
+    const std::string& path,
+    std::function<seastar::future<bool>(const std::string&)> on_event) {
+
+    auto [host, port] = parse_api_server();
+    bool use_tls = _config.api_server.starts_with("https://");
+
+    seastar::socket_address addr(seastar::net::inet_address(host), port);
+
+    seastar::connected_socket sock;
+    if (use_tls && _tls_creds) {
+        seastar::tls::tls_options opts;
+        opts.server_name = host;
+        sock = co_await seastar::tls::connect(_tls_creds, addr, std::move(opts));
+    } else {
+        sock = co_await seastar::connect(addr);
+    }
+
+    auto out = sock.output();
+    auto in = sock.input();
+
+    // Send HTTP Request
+    std::ostringstream req;
+    req << "GET " << path << " HTTP/1.1\r\n"
+        << "Host: " << host << "\r\n"
+        << "Authorization: Bearer " << _bearer_token << "\r\n"
+        << "Accept: application/json\r\n"
+        << "Connection: keep-alive\r\n\r\n";
+
+    co_await out.write(req.str());
+    co_await out.flush();
+
+    // Simple line-based processing for the stream
+    // Note: K8s sends one JSON object per line in watch mode
+    bool keep_going = true;
+    std::string buffer;
+
+    while (keep_going && !in.eof()) {
+        auto buf = co_await in.read();
+        if (buf.empty()) break;
+
+        buffer.append(buf.get(), buf.size());
+
+        size_t pos;
+        while ((pos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+
+            if (!line.empty() && line != "\r") {
+                keep_going = co_await on_event(line);
+                if (!keep_going) break;
+            }
+        }
+    }
+
+    co_await out.close();
+    co_await in.close();
 }
 
 // =============================================================================
