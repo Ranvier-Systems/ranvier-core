@@ -333,23 +333,37 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
 
         // Handle chunked transfer encoding
         if (headers.find("Transfer-Encoding: chunked") != std::string::npos) {
-            // Simple chunked decoding
             std::string decoded;
             size_t pos = 0;
-            while (pos < body.size()) {
-                // Read chunk size (hex)
-                auto line_end = body.find("\r\n", pos);
-                if (line_end == std::string::npos) break;
+            try {
+                while (pos < body.size()) {
+                    size_t line_end = body.find("\r\n", pos);
+                    if (line_end == std::string::npos) break;
 
-                std::string size_str = body.substr(pos, line_end - pos);
-                size_t chunk_size = std::stoul(size_str, nullptr, 16);
-                if (chunk_size == 0) break;
+                    std::string size_line = body.substr(pos, line_end - pos);
+                    if (size_line.empty()) { // Skip empty lines between chunks
+                        pos = line_end + 2;
+                        continue;
+                    }
 
-                pos = line_end + 2;
-                decoded.append(body.substr(pos, chunk_size));
-                pos += chunk_size + 2;  // Skip chunk data and trailing \r\n
+                    // Handle potential chunk extensions by finding the first non-hex char
+                    size_t ext_pos = size_line.find_first_not_of("0123456789abcdefABCDEF");
+                    size_t chunk_size = std::stoul(size_line.substr(0, ext_pos), nullptr, 16);
+
+                    if (chunk_size == 0) break; // End of stream
+
+                    pos = line_end + 2;
+                    if (pos + chunk_size > body.size()) {
+                        throw std::runtime_error("Incomplete chunk data");
+                    }
+
+                    decoded.append(body.data() + pos, chunk_size);
+                    pos += chunk_size + 2; // Move past data and the trailing \r\n
+                }
+                body = std::move(decoded);
+            } catch (const std::exception& e) {
+                throw std::runtime_error("Failed to decode chunked response: " + std::string(e.what()));
             }
-            body = std::move(decoded);
         }
 
         co_return body;
