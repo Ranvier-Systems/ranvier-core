@@ -24,6 +24,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include <rapidjson/document.h>
+#include <rapidjson/error/en.h>
+
 #include <seastar/core/future.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/gate.hh>
@@ -152,7 +155,7 @@ private:
     std::vector<K8sEndpoint> parse_endpoint_slices(const std::string& json);
 
     // Parse single EndpointSlice object
-    std::vector<K8sEndpoint> parse_endpoint_slice(const std::string& json);
+    std::vector<K8sEndpoint> parse_endpoint_slice(const rapidjson::Value& doc);
 
     // Handle endpoint changes
     seastar::future<> handle_endpoint_added(const K8sEndpoint& endpoint);
@@ -165,7 +168,7 @@ private:
     // HTTP helpers for K8s API
     seastar::future<std::string> k8s_get(const std::string& path);
     seastar::future<> k8s_watch(const std::string& path,
-                                 std::function<seastar::future<bool>(const std::string&)> on_event);
+                                std::function<seastar::future<bool>(const std::string&)> on_event);
 
     // Build full URL for K8s API endpoint
     std::string build_url(const std::string& path) const;
@@ -173,29 +176,5 @@ private:
     // Parse host and port from API server URL
     std::pair<std::string, uint16_t> parse_api_server() const;
 };
-
-// Helper functions for JSON parsing (minimal, no external JSON library required)
-namespace k8s_json {
-    // Extract string value for a key from JSON object
-    std::optional<std::string> get_string(const std::string& json, const std::string& key);
-
-    // Extract integer value for a key from JSON object
-    std::optional<int64_t> get_int(const std::string& json, const std::string& key);
-
-    // Extract boolean value for a key from JSON object
-    std::optional<bool> get_bool(const std::string& json, const std::string& key);
-
-    // Extract array as vector of JSON object strings
-    std::vector<std::string> get_array(const std::string& json, const std::string& key);
-
-    // Extract nested object as JSON string
-    std::optional<std::string> get_object(const std::string& json, const std::string& key);
-
-    // Check if JSON represents an error response
-    bool is_error(const std::string& json);
-
-    // Get error message from K8s error response
-    std::string get_error_message(const std::string& json);
-}
 
 }  // namespace ranvier
