@@ -1,0 +1,72 @@
+# Ranvier Node 1 Configuration for Integration Testing
+# This node is used as the primary for backend registration tests
+
+server:
+  bind_address: "0.0.0.0"
+  api_port: 8080
+  metrics_port: 9180
+
+database:
+  path: "/tmp/ranvier-node1.db"
+  journal_mode: "WAL"
+  synchronous: "NORMAL"
+
+health:
+  check_interval_seconds: 2
+  check_timeout_seconds: 2
+  failure_threshold: 2
+  recovery_threshold: 1
+
+pool:
+  max_connections_per_host: 5
+  idle_timeout_seconds: 30
+  max_total_connections: 20
+  tcp_nodelay: true
+
+routing:
+  # Low token length for testing (allows learning short prompts)
+  min_token_length: 2
+  backend_retry_limit: 3
+  backend_drain_timeout_seconds: 10
+
+timeouts:
+  connect_timeout_seconds: 5
+  request_timeout_seconds: 30
+
+assets:
+  tokenizer_path: "/app/assets/gpt2.json"
+
+tls:
+  enabled: false
+
+rate_limit:
+  enabled: false
+
+retry:
+  max_retries: 2
+  initial_backoff_ms: 100
+  max_backoff_ms: 1000
+  backoff_multiplier: 2.0
+
+circuit_breaker:
+  enabled: true
+  failure_threshold: 3
+  success_threshold: 1
+  recovery_timeout_seconds: 5
+  fallback_enabled: true
+
+# Cluster configuration - enable gossip for route propagation
+cluster:
+  enabled: true
+  gossip_port: 9190
+  # Peer addresses (Node 2 and Node 3)
+  peers:
+    - "172.28.2.2:9190"
+    - "172.28.2.3:9190"
+  gossip_interval_ms: 500
+  gossip_heartbeat_interval_seconds: 2
+  # Short timeout for faster test execution
+  gossip_peer_timeout_seconds: 6
+
+shutdown:
+  drain_timeout_seconds: 5

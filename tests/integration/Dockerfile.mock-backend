@@ -1,0 +1,12 @@
+# Lightweight mock backend for integration testing
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY mock_backend.py .
+
+# Make executable
+RUN chmod +x mock_backend.py
+
+EXPOSE 8000
+
+CMD ["python3", "mock_backend.py"]

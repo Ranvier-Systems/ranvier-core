@@ -1,0 +1,116 @@
+# Docker Compose for Multi-Node Integration Testing
+# Sets up 3 Ranvier nodes and 2 mock backends for cluster testing
+version: '3.8'
+
+networks:
+  ranvier-test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  # Mock backend servers (simulating vLLM endpoints)
+  backend1:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: backend1
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.1.10
+    ports:
+      - "11434:8000"
+    environment:
+      - BACKEND_ID=1
+
+  backend2:
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: backend2
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.1.11
+    ports:
+      - "11435:8000"
+    environment:
+      - BACKEND_ID=2
+
+  # Ranvier Node 1 (Primary for registration tests)
+  ranvier1:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier1
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.2.1
+    ports:
+      - "8081:8080"
+      - "9181:9180"
+    volumes:
+      - ./tests/integration/configs/node1.yaml:/app/ranvier.yaml:ro
+      - ./assets:/app/assets:ro
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--config", "/app/ranvier.yaml"]
+    depends_on:
+      - backend1
+      - backend2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Ranvier Node 2
+  ranvier2:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier2
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.2.2
+    ports:
+      - "8082:8080"
+      - "9182:9180"
+    volumes:
+      - ./tests/integration/configs/node2.yaml:/app/ranvier.yaml:ro
+      - ./assets:/app/assets:ro
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--config", "/app/ranvier.yaml"]
+    depends_on:
+      - backend1
+      - backend2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Ranvier Node 3
+  ranvier3:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier3
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.2.3
+    ports:
+      - "8083:8080"
+      - "9183:9180"
+    volumes:
+      - ./tests/integration/configs/node3.yaml:/app/ranvier.yaml:ro
+      - ./assets:/app/assets:ro
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--config", "/app/ranvier.yaml"]
+    depends_on:
+      - backend1
+      - backend2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
