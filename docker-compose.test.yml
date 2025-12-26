@@ -153,8 +153,7 @@ services:
       dockerfile: Dockerfile.locust
     container_name: locust
     networks:
-      ranvier-test:
-        ipv4_address: 172.28.3.1
+      - ranvier-test
     ports:
       - "8089:8089"   # Web UI
       - "8090:8090"   # Secondary port for metrics export
