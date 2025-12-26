@@ -7,7 +7,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include <seastar/core/future.hh>

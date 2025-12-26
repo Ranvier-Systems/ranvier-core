@@ -407,7 +407,8 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
     }
 
     // Process Items
-    std::unordered_set<std::string> current_uids;
+    // Using absl::flat_hash_set for SIMD-accelerated UID tracking
+    absl::flat_hash_set<std::string> current_uids;
 
     if (doc.HasMember("items") && doc["items"].IsArray()) {
         for (const auto& item : doc["items"].GetArray()) {
@@ -437,7 +438,8 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
 
 seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discovered) {
     // Build set of discovered UIDs
-    std::unordered_set<std::string> discovered_uids;
+    // Using absl::flat_hash_set for SIMD-accelerated UID tracking
+    absl::flat_hash_set<std::string> discovered_uids;
     for (const auto& ep : discovered) {
         discovered_uids.insert(ep.uid);
     }

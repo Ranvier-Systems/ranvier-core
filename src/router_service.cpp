@@ -8,9 +8,10 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/core/when_all.hh>
 #include <boost/range/irange.hpp>
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <algorithm>
 #include <map>
-#include <unordered_map>
 #include <random>
 #include <chrono>
 
@@ -27,11 +28,14 @@ struct BackendInfo {
 
 // Thread-local RadixTree pointer (initialized per-shard with config)
 thread_local std::unique_ptr<RadixTree> local_tree;
-thread_local std::unordered_map<BackendId, BackendInfo> local_backends;
+// Using absl::flat_hash_map for SIMD-accelerated lookups and better cache locality
+// These remain shard-local to maintain Ranvier's lock-free architecture
+thread_local absl::flat_hash_map<BackendId, BackendInfo> local_backends;
 thread_local std::vector<BackendId> local_backend_ids;
 
 // The "Blacklist" for circuit breaker
-thread_local std::unordered_set<BackendId> local_dead_backends;
+// Using absl::flat_hash_set for O(1) SIMD-accelerated membership checks
+thread_local absl::flat_hash_set<BackendId> local_dead_backends;
 
 // Thread-local counters for metrics
 thread_local uint64_t stats_cache_hits = 0;

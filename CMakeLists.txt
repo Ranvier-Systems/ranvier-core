@@ -27,6 +27,16 @@ set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(yaml-cpp)
 
+# Abseil Configuration (High-performance containers)
+FetchContent_Declare(
+  abseil-cpp
+  GIT_REPOSITORY https://github.com/abseil/abseil-cpp
+  GIT_TAG        20240116.1
+)
+set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(abseil-cpp)
+
 # RapidJSON Configuration
 FetchContent_Declare(
   rapidjson
@@ -106,6 +116,8 @@ if(Seastar_FOUND)
       ${SQLITE3_LIBRARIES}
       yaml-cpp::yaml-cpp
       rapidjson_interface
+      absl::flat_hash_map
+      absl::flat_hash_set
     )
 
     # Copy the assets folder to the build directory automatically
@@ -178,6 +190,7 @@ target_link_libraries(k8s_discovery_test
   PRIVATE
   GTest::gtest_main
   rapidjson_interface
+  absl::flat_hash_set
 )
 gtest_discover_tests(k8s_discovery_test)
 
