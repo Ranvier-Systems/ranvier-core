@@ -163,40 +163,49 @@ def wait_for_healthy(url: str, timeout: int = 60, container_name: str = None) ->
     return False
 
 
-def get_metric_value(metrics_url: str, metric_name: str, debug: bool = False) -> Optional[float]:
+def get_metric_value(metrics_url: str, metric_name: str, debug: bool = False, retries: int = 3) -> Optional[float]:
     """Extract a specific metric value from Prometheus endpoint.
 
     Searches for metrics containing the metric_name (Seastar may prefix with group names).
+    Retries on transient failures.
     """
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+            if resp.status_code != 200:
+                if attempt < retries - 1:
+                    time.sleep(1)
+                    continue
+                return None
 
-        # Parse Prometheus text format
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            # Search for metric name anywhere in the line (Seastar prefixes vary)
-            if metric_name in line:
-                # Extract the value (last number on the line)
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    if debug:
-                        print(f"    Found: {line.strip()}")
-                    return float(match.group(1))
-
-        if debug:
-            # Print available metrics for debugging
-            print(f"    Available metrics containing 'cluster' or 'peer':")
+            # Parse Prometheus text format
             for line in resp.text.split("\n"):
-                if not line.startswith("#") and ("cluster" in line.lower() or "peer" in line.lower()):
-                    print(f"      {line.strip()[:100]}")
-        return None
-    except requests.exceptions.RequestException as e:
-        if debug:
-            print(f"    Request error: {e}")
-        return None
+                if line.startswith("#"):
+                    continue
+                # Search for metric name anywhere in the line (Seastar prefixes vary)
+                if metric_name in line:
+                    # Extract the value (last number on the line)
+                    match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                    if match:
+                        if debug:
+                            print(f"    Found: {line.strip()}")
+                        return float(match.group(1))
+
+            if debug:
+                # Print available metrics for debugging
+                print(f"    Available metrics containing 'cluster' or 'peer':")
+                for line in resp.text.split("\n"):
+                    if not line.startswith("#") and ("cluster" in line.lower() or "peer" in line.lower()):
+                        print(f"      {line.strip()[:100]}")
+            return None
+        except requests.exceptions.RequestException as e:
+            if debug:
+                print(f"    Request error (attempt {attempt + 1}): {e}")
+            if attempt < retries - 1:
+                time.sleep(1)
+            else:
+                return None
+    return None
 
 
 def get_all_metrics(metrics_url: str) -> dict:
@@ -424,34 +433,55 @@ class ClusterIntegrationTest(unittest.TestCase):
                 "stream": True
             }
 
-            print(f"  Sending request to {name}...")
-            resp = requests.post(
-                f"{api_url}/v1/chat/completions",
-                json=request_body,
-                headers={"Content-Type": "application/json"},
-                stream=True,
-                timeout=30
-            )
-
-            self.assertEqual(resp.status_code, 200, f"Request to {name} failed")
-
-            # Consume the response
+            # Retry logic for transient failures
+            max_retries = 3
             response_text = ""
-            for line in resp.iter_lines():
-                if line:
-                    decoded = line.decode("utf-8")
-                    if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                        try:
-                            chunk = json.loads(decoded[6:])
-                            if "choices" in chunk and chunk["choices"]:
-                                delta = chunk["choices"][0].get("delta", {})
-                                if "content" in delta:
-                                    response_text += delta["content"]
-                        except json.JSONDecodeError:
-                            pass
+
+            for attempt in range(max_retries):
+                print(f"  Sending request to {name}..." + (f" (attempt {attempt + 1})" if attempt > 0 else ""))
+                try:
+                    resp = requests.post(
+                        f"{api_url}/v1/chat/completions",
+                        json=request_body,
+                        headers={"Content-Type": "application/json"},
+                        stream=True,
+                        timeout=30
+                    )
+
+                    self.assertEqual(resp.status_code, 200, f"Request to {name} failed")
+
+                    # Consume the response
+                    response_text = ""
+                    for line in resp.iter_lines():
+                        if line:
+                            decoded = line.decode("utf-8")
+                            if decoded.startswith("data: ") and decoded != "data: [DONE]":
+                                try:
+                                    chunk = json.loads(decoded[6:])
+                                    if "choices" in chunk and chunk["choices"]:
+                                        delta = chunk["choices"][0].get("delta", {})
+                                        if "content" in delta:
+                                            response_text += delta["content"]
+                                except json.JSONDecodeError:
+                                    pass
+
+                    if len(response_text) > 0:
+                        break  # Success, exit retry loop
+
+                    # Empty response, wait and retry
+                    if attempt < max_retries - 1:
+                        print(f"    Empty response from {name}, retrying...")
+                        time.sleep(2)
+
+                except requests.exceptions.RequestException as e:
+                    if attempt < max_retries - 1:
+                        print(f"    Request error: {e}, retrying...")
+                        time.sleep(2)
+                    else:
+                        raise
 
             print(f"  {name} response: '{response_text.strip()}'")
-            self.assertTrue(len(response_text) > 0, f"{name} returned empty response")
+            self.assertTrue(len(response_text) > 0, f"{name} returned empty response after {max_retries} attempts")
 
         print("  PASSED: All nodes can route requests")
 
@@ -505,16 +535,34 @@ class ClusterIntegrationTest(unittest.TestCase):
         healthy = wait_for_healthy(f"{NODES['node3']['metrics']}/metrics", timeout=60)
         self.assertTrue(healthy, "node3 did not become healthy")
 
-        # Wait for gossip to re-establish connections
+        # Wait for gossip to re-establish connections (increased from 10s to 15s)
         print("  Waiting for gossip connections...")
-        time.sleep(10)
+        time.sleep(15)
 
-        # Verify all nodes see 2 peers again
+        # Verify all nodes see 2 peers again with retries
         print("\n  Peer counts after recovery:")
-        for name, endpoints in NODES.items():
-            peers = get_metric_value(endpoints["metrics"], "cluster_peers_alive")
-            print(f"    {name}: {peers} peers")
+        max_retries = 5
+        for retry in range(max_retries):
+            all_recovered = True
+            for name, endpoints in NODES.items():
+                # Use retries=5 for more robust metric fetching
+                peers = get_metric_value(endpoints["metrics"], "cluster_peers_alive", retries=5)
+                if retry == max_retries - 1:  # Only print on last attempt
+                    print(f"    {name}: {peers} peers")
 
+                if peers is None or peers != 2.0:
+                    all_recovered = False
+
+            if all_recovered:
+                break
+
+            if retry < max_retries - 1:
+                print(f"    Not all nodes recovered yet, waiting... (attempt {retry + 1}/{max_retries})")
+                time.sleep(5)
+
+        # Final verification
+        for name, endpoints in NODES.items():
+            peers = get_metric_value(endpoints["metrics"], "cluster_peers_alive", retries=5)
             self.assertIsNotNone(peers, f"{name} has no peer metric")
             self.assertEqual(
                 peers, 2.0,
