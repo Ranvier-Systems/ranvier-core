@@ -1,5 +1,12 @@
 # Docker Compose for Multi-Node Integration Testing
 # Sets up 3 Ranvier nodes and 2 mock backends for cluster testing
+#
+# Usage:
+#   Pre-build for faster repeated runs:
+#     make docker-build
+#   Then run tests:
+#     make test-integration
+#
 version: '3.8'
 
 networks:
@@ -12,6 +19,7 @@ networks:
 services:
   # Mock backend servers (simulating vLLM endpoints)
   backend1:
+    image: ranvier-mock-backend:latest
     build:
       context: ./tests/integration
       dockerfile: Dockerfile.mock-backend
@@ -25,6 +33,7 @@ services:
       - BACKEND_ID=1
 
   backend2:
+    image: ranvier-mock-backend:latest
     build:
       context: ./tests/integration
       dockerfile: Dockerfile.mock-backend
@@ -39,6 +48,7 @@ services:
 
   # Ranvier Node 1 (Primary for registration tests)
   ranvier1:
+    image: ranvier:latest
     build:
       context: .
       dockerfile: Dockerfile.production
@@ -65,6 +75,7 @@ services:
 
   # Ranvier Node 2
   ranvier2:
+    image: ranvier:latest
     build:
       context: .
       dockerfile: Dockerfile.production
@@ -91,6 +102,7 @@ services:
 
   # Ranvier Node 3
   ranvier3:
+    image: ranvier:latest
     build:
       context: .
       dockerfile: Dockerfile.production
