@@ -249,22 +249,28 @@ class ClusterIntegrationTest(unittest.TestCase):
         skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
 
         if not skip_build:
-            # Check if the required Docker images already exist
-            # We check for both ranvier:latest and ranvier-mock-backend:latest
-            ranvier_check = subprocess.run(
-                ["docker", "images", "-q", "ranvier:latest"],
-                capture_output=True, text=True
-            )
-            backend_check = subprocess.run(
-                ["docker", "images", "-q", "ranvier-mock-backend:latest"],
-                capture_output=True, text=True
-            )
-            images_exist = bool(ranvier_check.stdout.strip()) and bool(backend_check.stdout.strip())
-
-            if images_exist:
-                print("\nDocker images already exist. Skipping build.")
-                print("  (Set SKIP_BUILD=0 to force rebuild, or run 'make docker-build')")
-                skip_build = True
+            # Check if the required Docker images already exist by trying to create
+            # containers without building. If images exist, this succeeds quickly.
+            try:
+                compose_cmd = get_compose_cmd()
+                create_result = subprocess.run(
+                    compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
+                                   "create", "--no-build"],
+                    capture_output=True, text=True, timeout=30
+                )
+                if create_result.returncode == 0:
+                    print("\nDocker images already exist. Skipping build.")
+                    print("  (Set SKIP_BUILD=0 to force rebuild)")
+                    skip_build = True
+                    # Clean up the created containers so 'up -d' works fresh
+                    subprocess.run(
+                        compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
+                                       "rm", "-f"],
+                        capture_output=True, timeout=30
+                    )
+            except (subprocess.TimeoutExpired, Exception):
+                # If check fails, just proceed with build
+                pass
 
         if not skip_build:
             print("\nBuilding containers (this may take a while on first run)...")
