@@ -144,3 +144,38 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+
+  # Locust load testing service
+  locust:
+    image: locustio/locust:2.24.0
+    container_name: locust
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.3.1
+    ports:
+      - "8089:8089"   # Web UI
+      - "8090:8090"   # Secondary port for metrics export
+    volumes:
+      - ./tests/integration:/mnt/locust:ro
+    environment:
+      - LOCUST_HOST=http://172.28.2.1:8080
+      - LOCUST_LOCUSTFILE=/mnt/locust/locustfile.py
+      - RANVIER_NODE1=http://172.28.2.1:8080
+      - RANVIER_NODE2=http://172.28.2.2:8080
+      - RANVIER_NODE3=http://172.28.2.3:8080
+      - RANVIER_METRICS1=http://172.28.2.1:9180
+      - RANVIER_METRICS2=http://172.28.2.2:9180
+      - RANVIER_METRICS3=http://172.28.2.3:9180
+      - BACKEND1_IP=172.28.1.10
+      - BACKEND1_PORT=8000
+      - BACKEND2_IP=172.28.1.11
+      - BACKEND2_PORT=8000
+    depends_on:
+      ranvier1:
+        condition: service_healthy
+      ranvier2:
+        condition: service_healthy
+      ranvier3:
+        condition: service_healthy
+    profiles:
+      - benchmark
