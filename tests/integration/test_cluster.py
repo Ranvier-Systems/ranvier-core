@@ -119,14 +119,16 @@ def run_compose(args: list[str], check: bool = True, show_output: bool = False) 
 def check_container_running(container_name: str) -> bool:
     """Check if a container is still running (not exited/crashed)."""
     try:
+        compose_cmd = get_compose_cmd()
         result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "ps", "-q", container_name],
             capture_output=True,
             text=True
         )
-        return result.returncode == 0 and "true" in result.stdout.lower()
-    except FileNotFoundError:
-        # docker command not available, skip check
+        # If container is running, ps -q returns its ID; if exited, returns empty
+        return result.returncode == 0 and len(result.stdout.strip()) > 0
+    except (FileNotFoundError, RuntimeError):
+        # compose command not available, skip check
         return True
 
 
