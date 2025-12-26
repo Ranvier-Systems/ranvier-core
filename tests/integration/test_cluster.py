@@ -36,11 +36,24 @@ except ImportError:
 COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.test.yml")
 PROJECT_NAME = "ranvier-integration-test"
 
+# Detect if running in Docker (use host.docker.internal) or native (use localhost)
+def get_docker_host() -> str:
+    """Get the hostname to reach Docker-exposed ports."""
+    # Check if host.docker.internal resolves (Docker Desktop / DinD)
+    import socket
+    try:
+        socket.gethostbyname("host.docker.internal")
+        return "host.docker.internal"
+    except socket.gaierror:
+        return "localhost"
+
+DOCKER_HOST = get_docker_host()
+
 # Node endpoints (mapped ports from docker-compose)
 NODES = {
-    "node1": {"api": "http://localhost:8081", "metrics": "http://localhost:9181"},
-    "node2": {"api": "http://localhost:8082", "metrics": "http://localhost:9182"},
-    "node3": {"api": "http://localhost:8083", "metrics": "http://localhost:9183"},
+    "node1": {"api": f"http://{DOCKER_HOST}:8081", "metrics": f"http://{DOCKER_HOST}:9181"},
+    "node2": {"api": f"http://{DOCKER_HOST}:8082", "metrics": f"http://{DOCKER_HOST}:9182"},
+    "node3": {"api": f"http://{DOCKER_HOST}:8083", "metrics": f"http://{DOCKER_HOST}:9183"},
 }
 
 # Backend addresses (as seen from inside the Docker network)
@@ -499,6 +512,7 @@ def main():
     try:
         compose_cmd = get_compose_cmd()
         print(f"Using: {' '.join(compose_cmd)}")
+        print(f"Docker host: {DOCKER_HOST}")
     except RuntimeError as e:
         print(f"Error: {e}")
         sys.exit(1)
