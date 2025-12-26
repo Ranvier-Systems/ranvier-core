@@ -355,7 +355,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         co_return std::move(rep);
     }
     socket_address target_addr = target_addr_opt.value();
-    log_proxy.debug("[{}] Routing to backend {} at {}", request_id, target_id, target_addr);
+    log_proxy.info("[{}] Routing to backend {} at {}", request_id, target_id, target_addr);
 
     // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
     // Capture config for the lambda
@@ -412,7 +412,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 metrics().record_connect_latency(
                     MetricsService::to_seconds(connect_end - connect_start));
                 connection_failed = false;
-                log_proxy.debug("[{}] Connection established to backend {}", request_id, current_backend);
+                log_proxy.info("[{}] Connection established to backend {} at {}", request_id, current_backend, current_addr);
                 break;
             }
 
@@ -492,7 +492,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             "Connection: keep-alive\r\n\r\n" +
             forwarded_body;
 
-        log_proxy.debug("[{}] Sending request to backend ({} bytes)", request_id, forwarded_body.size());
+        log_proxy.info("[{}] Sending request to backend ({} bytes)", request_id, forwarded_body.size());
 
         // Send request with broken pipe/connection reset handling
         bool write_failed = false;
@@ -528,6 +528,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         // 3. The Read Loop (with timeout and connection error handling)
         StreamParser parser;
         bool connection_error = false;
+        size_t chunks_received = 0;
         while (true) {
             // Check request timeout before each read
             if (lowres_clock::now() >= request_deadline) {
@@ -586,10 +587,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             // EOF logic
             if (chunk.empty()) {
-                log_proxy.debug("[{}] Backend response complete (EOF)", request_id);
+                log_proxy.info("[{}] Backend response complete (EOF after {} chunks)", request_id, chunks_received);
                 bundle.is_valid = false;
                 break;
             }
+            chunks_received++;
+            log_proxy.debug("[{}] Received chunk #{} ({} bytes)", request_id, chunks_received, chunk.size());
 
             auto res = parser.push(std::move(chunk));
 
@@ -607,7 +610,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     // Record in per-backend histogram for GPU model comparison
                     metrics().record_first_byte_latency_by_id(current_backend, first_byte_latency);
                     response_latency_recorded = true;
-                    log_proxy.debug("[{}] First byte received from backend {} (latency: {:.3f}s)",
+                    log_proxy.info("[{}] First byte received from backend {} (latency: {:.3f}s)",
                                     request_id, current_backend, first_byte_latency);
                 }
 

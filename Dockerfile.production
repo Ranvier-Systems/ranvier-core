@@ -19,25 +19,33 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
 # Build Ranvier
 WORKDIR /src
 COPY . .
-RUN mkdir build && cd build && \
+RUN rm -rf build && mkdir build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
     ninja
 
 # ---------------------------------------------------------
 # STAGE 2: Runner (Lightweight, Runtime only)
 # ---------------------------------------------------------
-FROM fedora:39-slim
+FROM fedora:39
 
 # Install Runtime Shared Libraries (Seastar needs these)
-RUN dnf install -y libaio libasan libubsan yaml-cpp hwloc openssl && dnf clean all
+# curl is needed for Docker healthchecks
+# boost, c-ares, fmt, lz4, libatomic, numactl are required by Seastar at runtime
+RUN dnf install -y \
+    libaio libasan libubsan yaml-cpp hwloc openssl curl \
+    boost-program-options boost-thread boost-system \
+    c-ares fmt lz4-libs liburing libatomic numactl-libs \
+    gnutls protobuf protobuf-lite libxml2 cryptopp \
+    lksctp-tools libunistring libtasn1 nettle p11-kit zlib systemd-libs && \
+    dnf clean all
 
 # Copy Binary and Assets
 WORKDIR /app
 COPY --from=builder /src/build/ranvier_server .
 COPY --from=builder /src/assets ./assets
 
-# Expose HTTP Port
-EXPOSE 8080
+# Expose HTTP API and Metrics ports
+EXPOSE 8080 9180
 
 # Run (Seastar needs memory locking)
 CMD ["./ranvier_server", "--smp", "1", "--memory", "1G"]

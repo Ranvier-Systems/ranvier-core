@@ -1,0 +1,146 @@
+# Docker Compose for Multi-Node Integration Testing
+# Sets up 3 Ranvier nodes and 2 mock backends for cluster testing
+#
+# Usage:
+#   Pre-build for faster repeated runs:
+#     make docker-build
+#   Then run tests:
+#     make test-integration
+
+networks:
+  ranvier-test:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+services:
+  # Mock backend servers (simulating vLLM endpoints)
+  backend1:
+    image: ranvier-mock-backend:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: backend1
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.1.10
+    ports:
+      - "21434:8000"
+    environment:
+      - BACKEND_ID=1
+
+  backend2:
+    image: ranvier-mock-backend:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: backend2
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.1.11
+    ports:
+      - "21435:8000"
+    environment:
+      - BACKEND_ID=2
+
+  # Ranvier Node 1 (Primary for registration tests)
+  ranvier1:
+    image: ranvier:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier1
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.2.1
+    ports:
+      - "8081:8080"
+      - "9181:9180"
+    environment:
+      # Cluster configuration via environment variables
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.28.2.2:9190,172.28.2.3:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      # Routing config for testing
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
+    depends_on:
+      - backend1
+      - backend2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Ranvier Node 2
+  ranvier2:
+    image: ranvier:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier2
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.2.2
+    ports:
+      - "8082:8080"
+      - "9182:9180"
+    environment:
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.28.2.1:9190,172.28.2.3:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
+    depends_on:
+      - backend1
+      - backend2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Ranvier Node 3
+  ranvier3:
+    image: ranvier:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier3
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.2.3
+    ports:
+      - "8083:8080"
+      - "9183:9180"
+    environment:
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.28.2.1:9190,172.28.2.2:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
+    depends_on:
+      - backend1
+      - backend2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s

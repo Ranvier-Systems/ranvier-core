@@ -1,0 +1,25 @@
+# Exclude local build artifacts
+build/
+cmake-build-*/
+
+# Exclude git
+.git/
+.gitignore
+
+# Exclude IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Exclude devcontainer
+.devcontainer/
+
+# Exclude documentation
+doc/
+*.md
+
+# Exclude test databases
+*.db
+*.db-wal
+*.db-shm
