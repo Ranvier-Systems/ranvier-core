@@ -423,8 +423,18 @@ class ClusterIntegrationTest(unittest.TestCase):
 
         for name in ["node2", "node3"]:
             api_url = NODES[name]["api"]
+            metrics_url = NODES[name]["metrics"]
 
-            # Send a similar request that should match the learned route
+            # Check node health before sending proxy request
+            print(f"  Checking {name} health...")
+            try:
+                health_resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+                if health_resp.status_code != 200:
+                    print(f"    WARNING: {name} metrics returned {health_resp.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"    WARNING: {name} health check failed: {e}")
+
+            # Send a request
             request_body = {
                 "model": "test-model",
                 "messages": [
@@ -448,7 +458,12 @@ class ClusterIntegrationTest(unittest.TestCase):
                         timeout=30
                     )
 
-                    self.assertEqual(resp.status_code, 200, f"Request to {name} failed")
+                    if resp.status_code != 200:
+                        print(f"    {name} returned status {resp.status_code}: {resp.text[:200]}")
+                        if attempt < max_retries - 1:
+                            time.sleep(2)
+                            continue
+                        self.fail(f"Request to {name} failed with status {resp.status_code}")
 
                     # Consume the response
                     response_text = ""
@@ -478,6 +493,11 @@ class ClusterIntegrationTest(unittest.TestCase):
                         print(f"    Request error: {e}, retrying...")
                         time.sleep(2)
                     else:
+                        # On final failure, check container status
+                        print(f"    Checking {name} container status...")
+                        container_ok = check_container_running(f"ranvier{name[-1]}")
+                        if not container_ok:
+                            self.fail(f"{name} container has crashed!")
                         raise
 
             print(f"  {name} response: '{response_text.strip()}'")

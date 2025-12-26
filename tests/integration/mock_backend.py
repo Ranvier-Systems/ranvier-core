@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse
 
 # Force unbuffered stdout for Docker logs
@@ -110,10 +111,12 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         print(f"[Backend {BACKEND_ID}] Request {request_id}: prompt='{prompt[:50]}...'", flush=True)
 
         # Send streaming response with chunked transfer encoding
+        # Use Connection: close to prevent blocking on single-threaded server
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")  # Prevent keep-alive blocking
         self.send_header("X-Request-ID", request_id)
         self.send_header("X-Backend-ID", BACKEND_ID)
         self.end_headers()
@@ -155,8 +158,13 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         self.end_chunked()
 
 
-class LoggingHTTPServer(HTTPServer):
-    """HTTP server with connection logging."""
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Threaded HTTP server that handles each request in a new thread."""
+    daemon_threads = True  # Don't wait for threads on shutdown
+
+
+class LoggingHTTPServer(ThreadedHTTPServer):
+    """Threaded HTTP server with connection logging."""
 
     def get_request(self):
         """Override to log incoming connections."""
