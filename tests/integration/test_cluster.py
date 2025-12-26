@@ -249,13 +249,17 @@ class ClusterIntegrationTest(unittest.TestCase):
         skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
 
         if not skip_build:
-            # Check if images already exist
-            compose_cmd = get_compose_cmd()
-            check_result = subprocess.run(
-                compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "images", "-q"],
+            # Check if the required Docker images already exist
+            # We check for both ranvier:latest and ranvier-mock-backend:latest
+            ranvier_check = subprocess.run(
+                ["docker", "images", "-q", "ranvier:latest"],
                 capture_output=True, text=True
             )
-            images_exist = bool(check_result.stdout.strip())
+            backend_check = subprocess.run(
+                ["docker", "images", "-q", "ranvier-mock-backend:latest"],
+                capture_output=True, text=True
+            )
+            images_exist = bool(ranvier_check.stdout.strip()) and bool(backend_check.stdout.strip())
 
             if images_exist:
                 print("\nDocker images already exist. Skipping build.")
