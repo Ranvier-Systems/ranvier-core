@@ -39,11 +39,12 @@ test-integration:
 	@echo "======================================"
 	@echo ""
 	@echo "Prerequisites:"
-	@echo "  - Docker and docker-compose installed"
+	@echo "  - Docker with Compose (plugin or standalone)"
 	@echo "  - Python 3 with 'requests' library"
 	@echo ""
-	@if ! command -v docker-compose >/dev/null 2>&1; then \
-		echo "Error: docker-compose is not installed"; \
+	@if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1) && \
+	    ! command -v docker-compose >/dev/null 2>&1; then \
+		echo "Error: Neither 'docker compose' nor 'docker-compose' found"; \
 		exit 1; \
 	fi
 	@if ! python3 -c "import requests" 2>/dev/null; then \
@@ -51,15 +52,16 @@ test-integration:
 		pip3 install --user requests || pip install --user requests; \
 	fi
 	@echo "Starting integration tests..."
-	@python3 tests/integration/test_cluster.py || \
-		(echo "Tests failed. Cleaning up..." && \
-		docker-compose -f docker-compose.test.yml -p ranvier-integration-test down -v --remove-orphans && \
-		exit 1)
+	@python3 tests/integration/test_cluster.py
+
+# Helper to detect docker compose command
+DOCKER_COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; fi)
+COMPOSE_ARGS := -f docker-compose.test.yml -p ranvier-integration-test
 
 # Start the integration test cluster (for manual testing/debugging)
 integration-up:
 	@echo "Starting integration test cluster..."
-	@docker-compose -f docker-compose.test.yml -p ranvier-integration-test up -d --build
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) up -d --build
 	@echo ""
 	@echo "Cluster started. Endpoints:"
 	@echo "  Node 1: http://localhost:8081 (metrics: http://localhost:9181)"
@@ -74,15 +76,15 @@ integration-up:
 # Stop the integration test cluster
 integration-down:
 	@echo "Stopping integration test cluster..."
-	@docker-compose -f docker-compose.test.yml -p ranvier-integration-test down -v --remove-orphans
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) down -v --remove-orphans
 
 # View logs from the integration test cluster
 integration-logs:
-	@docker-compose -f docker-compose.test.yml -p ranvier-integration-test logs -f
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) logs -f
 
 # View logs from a specific service (usage: make integration-log-SERVICE SERVICE=ranvier1)
 integration-log-%:
-	@docker-compose -f docker-compose.test.yml -p ranvier-integration-test logs -f $*
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) logs -f $*
 
 # Build Docker production image
 docker-build:

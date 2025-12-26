@@ -54,12 +54,66 @@ STARTUP_TIMEOUT = 120  # seconds to wait for cluster to start
 PROPAGATION_TIMEOUT = 15  # seconds to wait for gossip propagation
 PEER_TIMEOUT = 10  # seconds for peer failure detection
 
+# Detect docker compose command (plugin vs standalone)
+COMPOSE_CMD = None
 
-def run_compose(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+
+def get_compose_cmd() -> list[str]:
+    """Detect and return the docker compose command."""
+    global COMPOSE_CMD
+    if COMPOSE_CMD is not None:
+        return COMPOSE_CMD
+
+    # Try 'docker compose' (plugin) first
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            COMPOSE_CMD = ["docker", "compose"]
+            return COMPOSE_CMD
+    except FileNotFoundError:
+        pass
+
+    # Fall back to 'docker-compose' (standalone)
+    try:
+        result = subprocess.run(
+            ["docker-compose", "--version"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            COMPOSE_CMD = ["docker-compose"]
+            return COMPOSE_CMD
+    except FileNotFoundError:
+        pass
+
+    raise RuntimeError(
+        "Neither 'docker compose' nor 'docker-compose' found. "
+        "Please install Docker with Compose plugin or docker-compose standalone."
+    )
+
+
+def run_compose(args: list[str], check: bool = True, show_output: bool = False) -> subprocess.CompletedProcess:
     """Run docker-compose command with the test configuration."""
-    cmd = ["docker-compose", "-f", COMPOSE_FILE, "-p", PROJECT_NAME] + args
+    compose_cmd = get_compose_cmd()
+    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME] + args
     print(f"  Running: {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if show_output or result.returncode != 0:
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr)
+
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+
+    return result
 
 
 def wait_for_healthy(url: str, timeout: int = 60) -> bool:
@@ -135,15 +189,13 @@ class ClusterIntegrationTest(unittest.TestCase):
 
         # Build and start the cluster
         print("\nBuilding containers (this may take a while on first run)...")
-        result = run_compose(["build"])
+        result = run_compose(["build"], check=False, show_output=True)
         if result.returncode != 0:
-            print(f"Build failed: {result.stderr}")
             raise RuntimeError("Failed to build containers")
 
         print("\nStarting cluster...")
-        result = run_compose(["up", "-d"])
+        result = run_compose(["up", "-d"], check=False, show_output=True)
         if result.returncode != 0:
-            print(f"Startup failed: {result.stderr}")
             raise RuntimeError("Failed to start cluster")
 
         # Wait for all nodes to become healthy
@@ -160,7 +212,7 @@ class ClusterIntegrationTest(unittest.TestCase):
         if not all_healthy:
             # Print logs for debugging
             print("\nContainer logs:")
-            run_compose(["logs", "--tail=50"])
+            run_compose(["logs", "--tail=50"], check=False, show_output=True)
             raise RuntimeError("Not all nodes became healthy")
 
         # Give gossip time to establish peer connections
@@ -420,11 +472,12 @@ def main():
     print("Ranvier Core Multi-Node Integration Tests")
     print("=" * 60)
 
-    # Check if docker-compose is available
+    # Check if docker compose is available
     try:
-        subprocess.run(["docker-compose", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("Error: docker-compose is not installed or not in PATH")
+        compose_cmd = get_compose_cmd()
+        print(f"Using: {' '.join(compose_cmd)}")
+    except RuntimeError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
     # Check if compose file exists
