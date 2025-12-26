@@ -50,7 +50,7 @@ BACKENDS = {
 }
 
 # Timeouts
-STARTUP_TIMEOUT = 120  # seconds to wait for cluster to start
+STARTUP_TIMEOUT = 30  # seconds to wait for cluster to start
 PROPAGATION_TIMEOUT = 15  # seconds to wait for gossip propagation
 PEER_TIMEOUT = 10  # seconds for peer failure detection
 
@@ -116,10 +116,28 @@ def run_compose(args: list[str], check: bool = True, show_output: bool = False) 
     return result
 
 
-def wait_for_healthy(url: str, timeout: int = 60) -> bool:
+def check_container_running(container_name: str) -> bool:
+    """Check if a container is still running (not exited/crashed)."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0 and "true" in result.stdout.lower()
+    except FileNotFoundError:
+        # docker command not available, skip check
+        return True
+
+
+def wait_for_healthy(url: str, timeout: int = 60, container_name: str = None) -> bool:
     """Wait for an endpoint to become healthy."""
     start = time.time()
     while time.time() - start < timeout:
+        # Check if container crashed (fast fail)
+        if container_name and not check_container_running(container_name):
+            print(f"    Container {container_name} has exited!")
+            return False
         try:
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
@@ -201,9 +219,12 @@ class ClusterIntegrationTest(unittest.TestCase):
         # Wait for all nodes to become healthy
         print("\nWaiting for nodes to become healthy...")
         all_healthy = True
+        # Map node names to container names
+        container_names = {"node1": "ranvier1", "node2": "ranvier2", "node3": "ranvier3"}
         for name, endpoints in NODES.items():
             print(f"  Waiting for {name}...")
-            if not wait_for_healthy(f"{endpoints['metrics']}/metrics", timeout=STARTUP_TIMEOUT):
+            container = container_names.get(name)
+            if not wait_for_healthy(f"{endpoints['metrics']}/metrics", timeout=STARTUP_TIMEOUT, container_name=container):
                 print(f"  ERROR: {name} did not become healthy")
                 all_healthy = False
             else:
