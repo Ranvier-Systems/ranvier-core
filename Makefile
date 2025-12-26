@@ -86,10 +86,11 @@ integration-logs:
 integration-log-%:
 	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) logs -f $*
 
-# Build Docker production image
+# Build Docker production image (uses docker-compose to work in devcontainers)
 docker-build:
 	@echo "Building production Docker image..."
-	@docker build -f Dockerfile.production -t ranvier:latest .
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) build ranvier1
+	@echo "Image built and tagged. Subsequent test runs will use cached image."
 
 # Format C++ code (requires clang-format)
 format:
