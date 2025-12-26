@@ -147,7 +147,10 @@ services:
 
   # Locust load testing service
   locust:
-    image: locustio/locust:2.24.0
+    image: ranvier-locust:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.locust
     container_name: locust
     networks:
       ranvier-test:
@@ -155,8 +158,6 @@ services:
     ports:
       - "8089:8089"   # Web UI
       - "8090:8090"   # Secondary port for metrics export
-    volumes:
-      - ./tests/integration:/mnt/locust:ro
     environment:
       - LOCUST_HOST=http://172.28.2.1:8080
       - LOCUST_LOCUSTFILE=/mnt/locust/locustfile.py

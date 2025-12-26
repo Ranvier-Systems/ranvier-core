@@ -113,13 +113,13 @@ benchmark:
 	fi
 	@mkdir -p $(BENCHMARK_REPORT_DIR)
 	@echo "Starting test cluster..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) up -d --build
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build
 	@echo "Waiting for cluster to become healthy..."
 	@sleep 15
 	@echo ""
 	@echo "Starting Locust load test..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run --rm \
-		-v $(PWD)/$(BENCHMARK_REPORT_DIR):/mnt/reports \
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run \
+		--name ranvier-benchmark-run \
 		locust \
 		-f /mnt/locust/locustfile.py \
 		--host=http://172.28.2.1:8080 \
@@ -127,12 +127,19 @@ benchmark:
 		--spawn-rate $(BENCHMARK_SPAWN_RATE) \
 		--run-time $(BENCHMARK_DURATION) \
 		--headless \
-		--csv=/mnt/reports/benchmark \
-		--html=/mnt/reports/benchmark.html \
+		--csv=/tmp/benchmark \
+		--html=/tmp/benchmark.html \
 		--only-summary \
 		--exit-code-on-error 1 \
 	; LOCUST_EXIT=$$?; \
 	echo ""; \
+	echo "Extracting reports..."; \
+	docker cp ranvier-benchmark-run:/tmp/benchmark.html $(BENCHMARK_REPORT_DIR)/benchmark.html 2>/dev/null || true; \
+	docker cp ranvier-benchmark-run:/tmp/benchmark_stats.csv $(BENCHMARK_REPORT_DIR)/benchmark_stats.csv 2>/dev/null || true; \
+	docker cp ranvier-benchmark-run:/tmp/benchmark_stats_history.csv $(BENCHMARK_REPORT_DIR)/benchmark_stats_history.csv 2>/dev/null || true; \
+	docker cp ranvier-benchmark-run:/tmp/benchmark_failures.csv $(BENCHMARK_REPORT_DIR)/benchmark_failures.csv 2>/dev/null || true; \
+	docker cp ranvier-benchmark-run:/tmp/benchmark_exceptions.csv $(BENCHMARK_REPORT_DIR)/benchmark_exceptions.csv 2>/dev/null || true; \
+	docker rm ranvier-benchmark-run 2>/dev/null || true; \
 	echo "Stopping test cluster..."; \
 	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans; \
 	echo ""; \
