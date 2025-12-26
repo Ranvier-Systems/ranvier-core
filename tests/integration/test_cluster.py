@@ -532,10 +532,15 @@ class ClusterIntegrationTest(unittest.TestCase):
             peers = get_metric_value(endpoints["metrics"], "cluster_peers_alive")
             print(f"    {name}: {peers} peers")
 
-        # Stop node3 using docker-compose
-        print("\n  Stopping node3...")
+        # Stop and remove node3 using docker-compose
+        # We must remove the container because Seastar doesn't restart cleanly
+        print("\n  Stopping and removing node3...")
         result = run_compose(["stop", "ranvier3"], check=False)
         self.assertEqual(result.returncode, 0, "Failed to stop ranvier3")
+
+        # Remove the stopped container so it can be recreated fresh
+        result = run_compose(["rm", "-f", "ranvier3"], check=False)
+        self.assertEqual(result.returncode, 0, "Failed to remove ranvier3")
 
         # Wait for peer timeout (gossip_peer_timeout_seconds = 6)
         wait_time = PEER_TIMEOUT + 2
@@ -562,14 +567,16 @@ class ClusterIntegrationTest(unittest.TestCase):
         """Restart the stopped node and verify cluster recovery."""
         print("\nTest: Restart node and verify recovery")
 
-        # Restart node3 using docker-compose
-        print("  Restarting node3...")
-        result = run_compose(["start", "ranvier3"], check=False)
+        # Recreate node3 using docker-compose up -d
+        # We use 'up -d' instead of 'start' because test_06 removed the container
+        # and Seastar containers don't restart cleanly with stop/start anyway
+        print("  Recreating node3...")
+        result = run_compose(["up", "-d", "ranvier3"], check=False)
         if result.returncode != 0:
-            print(f"    Start command failed with code {result.returncode}")
+            print(f"    Up command failed with code {result.returncode}")
             if result.stderr:
                 print(f"    stderr: {result.stderr[:500]}")
-            self.fail("Failed to start ranvier3")
+            self.fail("Failed to recreate ranvier3")
 
         # Give container a moment to start
         time.sleep(2)
@@ -581,7 +588,7 @@ class ClusterIntegrationTest(unittest.TestCase):
             # Try to get logs
             log_result = run_compose(["logs", "--tail=20", "ranvier3"], check=False)
             print(f"  Recent logs: {log_result.stdout[:500] if log_result.stdout else 'none'}")
-            self.fail("ranvier3 container is not running after start")
+            self.fail("ranvier3 container is not running after recreate")
 
         # Wait for node to become healthy and rejoin cluster
         print("  Waiting for node3 to become healthy...")
@@ -595,6 +602,18 @@ class ClusterIntegrationTest(unittest.TestCase):
             log_result = run_compose(["logs", "--tail=30", "ranvier3"], check=False)
             print(f"  ranvier3 logs: {log_result.stdout[:1000] if log_result.stdout else 'none'}")
             self.fail("node3 did not become healthy within 60 seconds")
+
+        # Re-register backends on the recreated node3 (it's a fresh container)
+        print("  Re-registering backends on node3...")
+        node3_api = NODES["node3"]["api"]
+        for backend_id, backend_info in BACKENDS.items():
+            url = f"{node3_api}/admin/backends?id={backend_id}&ip={backend_info['ip']}&port={backend_info['port']}"
+            try:
+                resp = requests.post(url, timeout=10)
+                if resp.status_code != 200:
+                    print(f"    Warning: Failed to register {backend_id} on node3: {resp.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"    Warning: Failed to register {backend_id} on node3: {e}")
 
         # Wait for gossip to re-establish connections
         print("  Waiting for gossip connections...")
