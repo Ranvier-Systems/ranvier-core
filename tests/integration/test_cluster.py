@@ -355,7 +355,9 @@ class ClusterIntegrationTest(unittest.TestCase):
         # Collect the streaming response
         response_text = ""
         line_count = 0
+        raw_content = b""
         for line in resp.iter_lines():
+            raw_content += line + b"\n"
             line_count += 1
             if line:
                 decoded = line.decode("utf-8")
@@ -371,6 +373,9 @@ class ClusterIntegrationTest(unittest.TestCase):
                     except json.JSONDecodeError:
                         pass
 
+        print(f"  Total lines: {line_count}, raw bytes: {len(raw_content)}")
+        if raw_content:
+            print(f"  Raw content (first 500 bytes): {raw_content[:500]}")
         print(f"  Response received: '{response_text.strip()}'")
         self.assertIn("backend", response_text.lower(), "Response should mention backend")
         print("  PASSED: Route learned successfully")
