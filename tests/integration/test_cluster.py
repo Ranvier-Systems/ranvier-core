@@ -349,11 +349,18 @@ class ClusterIntegrationTest(unittest.TestCase):
             timeout=30
         )
 
+        print(f"  Response status: {resp.status_code}")
+        print(f"  Response headers: {dict(resp.headers)}")
+
         # Collect the streaming response
         response_text = ""
+        line_count = 0
         for line in resp.iter_lines():
+            line_count += 1
             if line:
                 decoded = line.decode("utf-8")
+                if line_count <= 5:  # Print first few lines for debugging
+                    print(f"  Line {line_count}: {decoded[:100]}")
                 if decoded.startswith("data: ") and decoded != "data: [DONE]":
                     try:
                         chunk = json.loads(decoded[6:])
