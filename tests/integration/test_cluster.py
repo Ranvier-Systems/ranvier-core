@@ -163,8 +163,11 @@ def wait_for_healthy(url: str, timeout: int = 60, container_name: str = None) ->
     return False
 
 
-def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint."""
+def get_metric_value(metrics_url: str, metric_name: str, debug: bool = False) -> Optional[float]:
+    """Extract a specific metric value from Prometheus endpoint.
+
+    Searches for metrics containing the metric_name (Seastar may prefix with group names).
+    """
     try:
         resp = requests.get(f"{metrics_url}/metrics", timeout=5)
         if resp.status_code != 200:
@@ -174,12 +177,25 @@ def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
         for line in resp.text.split("\n"):
             if line.startswith("#"):
                 continue
-            # Match metric name (with optional labels)
-            match = re.match(rf"^{re.escape(metric_name)}(?:\{{[^}}]*\}})?\s+([\d.eE+-]+)", line)
-            if match:
-                return float(match.group(1))
+            # Search for metric name anywhere in the line (Seastar prefixes vary)
+            if metric_name in line:
+                # Extract the value (last number on the line)
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    if debug:
+                        print(f"    Found: {line.strip()}")
+                    return float(match.group(1))
+
+        if debug:
+            # Print available metrics for debugging
+            print(f"    Available metrics containing 'cluster' or 'peer':")
+            for line in resp.text.split("\n"):
+                if not line.startswith("#") and ("cluster" in line.lower() or "peer" in line.lower()):
+                    print(f"      {line.strip()[:100]}")
         return None
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        if debug:
+            print(f"    Request error: {e}")
         return None
 
 
@@ -272,7 +288,9 @@ class ClusterIntegrationTest(unittest.TestCase):
         print("\nTest: Cluster peers connected")
 
         for name, endpoints in NODES.items():
-            peers_alive = get_metric_value(endpoints["metrics"], "cluster_peers_alive")
+            # Use debug=True on first node to see available metrics
+            debug = (name == "node1")
+            peers_alive = get_metric_value(endpoints["metrics"], "cluster_peers_alive", debug=debug)
             print(f"  {name}: cluster_peers_alive = {peers_alive}")
 
             # Each node should see 2 peers (the other 2 nodes)
@@ -435,13 +453,9 @@ class ClusterIntegrationTest(unittest.TestCase):
             peers = get_metric_value(endpoints["metrics"], "cluster_peers_alive")
             print(f"    {name}: {peers} peers")
 
-        # Stop node3
+        # Stop node3 using docker-compose
         print("\n  Stopping node3...")
-        result = subprocess.run(
-            ["docker", "stop", "ranvier3"],
-            capture_output=True,
-            text=True
-        )
+        result = run_compose(["stop", "ranvier3"], check=False)
         self.assertEqual(result.returncode, 0, "Failed to stop ranvier3")
 
         # Wait for peer timeout (gossip_peer_timeout_seconds = 6)
@@ -469,13 +483,9 @@ class ClusterIntegrationTest(unittest.TestCase):
         """Restart the stopped node and verify cluster recovery."""
         print("\nTest: Restart node and verify recovery")
 
-        # Restart node3
+        # Restart node3 using docker-compose
         print("  Restarting node3...")
-        result = subprocess.run(
-            ["docker", "start", "ranvier3"],
-            capture_output=True,
-            text=True
-        )
+        result = run_compose(["start", "ranvier3"], check=False)
         self.assertEqual(result.returncode, 0, "Failed to start ranvier3")
 
         # Wait for node to become healthy and rejoin cluster
