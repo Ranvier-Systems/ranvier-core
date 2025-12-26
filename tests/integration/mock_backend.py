@@ -16,9 +16,14 @@ This allows integration tests to verify:
 
 import json
 import os
+import sys
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
+
+# Force unbuffered stdout for Docker logs
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 BACKEND_ID = os.environ.get("BACKEND_ID", "unknown")
 
@@ -28,7 +33,11 @@ class MockBackendHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         """Override to add backend ID to logs."""
-        print(f"[Backend {BACKEND_ID}] {args[0]}")
+        print(f"[Backend {BACKEND_ID}] {args[0]}", flush=True)
+
+    def log_request(self, code='-', size='-'):
+        """Override to log all requests with details."""
+        print(f"[Backend {BACKEND_ID}] {self.requestline} -> {code}", flush=True)
 
     def do_GET(self):
         """Handle GET requests for health checks."""
@@ -46,11 +55,13 @@ class MockBackendHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Handle POST requests for chat completions."""
+        print(f"[Backend {BACKEND_ID}] POST received: {self.path}", flush=True)
         parsed = urlparse(self.path)
 
         if parsed.path == "/v1/chat/completions":
             self._handle_chat_completion()
         else:
+            print(f"[Backend {BACKEND_ID}] Unknown path: {parsed.path}", flush=True)
             self.send_response(404)
             self.end_headers()
 
@@ -79,7 +90,7 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             last_message = messages[-1]
             prompt = last_message.get("content", "")[:100]  # First 100 chars
 
-        print(f"[Backend {BACKEND_ID}] Request {request_id}: prompt='{prompt[:50]}...'")
+        print(f"[Backend {BACKEND_ID}] Request {request_id}: prompt='{prompt[:50]}...'", flush=True)
 
         # Send streaming response
         self.send_response(200)
@@ -125,11 +136,22 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class LoggingHTTPServer(HTTPServer):
+    """HTTP server with connection logging."""
+
+    def get_request(self):
+        """Override to log incoming connections."""
+        conn, addr = super().get_request()
+        print(f"[Backend {BACKEND_ID}] Connection from {addr}", flush=True)
+        return conn, addr
+
+
 def main():
     """Start the mock backend server."""
     port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(("0.0.0.0", port), MockBackendHandler)
-    print(f"[Backend {BACKEND_ID}] Mock backend server starting on port {port}")
+    print(f"[Backend {BACKEND_ID}] Starting mock backend server on port {port}...", flush=True)
+    server = LoggingHTTPServer(("0.0.0.0", port), MockBackendHandler)
+    print(f"[Backend {BACKEND_ID}] Server started, listening on 0.0.0.0:{port}", flush=True)
     server.serve_forever()
 
 

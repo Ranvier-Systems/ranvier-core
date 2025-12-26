@@ -7,6 +7,9 @@ COPY mock_backend.py .
 # Make executable
 RUN chmod +x mock_backend.py
 
+# Disable Python output buffering for Docker logs
+ENV PYTHONUNBUFFERED=1
+
 EXPOSE 8000
 
-CMD ["python3", "mock_backend.py"]
+CMD ["python3", "-u", "mock_backend.py"]
