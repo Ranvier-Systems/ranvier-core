@@ -548,14 +548,38 @@ class ClusterIntegrationTest(unittest.TestCase):
         # Restart node3 using docker-compose
         print("  Restarting node3...")
         result = run_compose(["start", "ranvier3"], check=False)
-        self.assertEqual(result.returncode, 0, "Failed to start ranvier3")
+        if result.returncode != 0:
+            print(f"    Start command failed with code {result.returncode}")
+            if result.stderr:
+                print(f"    stderr: {result.stderr[:500]}")
+            self.fail("Failed to start ranvier3")
+
+        # Give container a moment to start
+        time.sleep(2)
+
+        # Check container status
+        container_running = check_container_running("ranvier3")
+        print(f"  Container ranvier3 running: {container_running}")
+        if not container_running:
+            # Try to get logs
+            log_result = run_compose(["logs", "--tail=20", "ranvier3"], check=False)
+            print(f"  Recent logs: {log_result.stdout[:500] if log_result.stdout else 'none'}")
+            self.fail("ranvier3 container is not running after start")
 
         # Wait for node to become healthy and rejoin cluster
         print("  Waiting for node3 to become healthy...")
-        healthy = wait_for_healthy(f"{NODES['node3']['metrics']}/metrics", timeout=60)
-        self.assertTrue(healthy, "node3 did not become healthy")
+        healthy = wait_for_healthy(
+            f"{NODES['node3']['metrics']}/metrics",
+            timeout=60,
+            container_name="ranvier3"
+        )
+        if not healthy:
+            # Get logs on failure
+            log_result = run_compose(["logs", "--tail=30", "ranvier3"], check=False)
+            print(f"  ranvier3 logs: {log_result.stdout[:1000] if log_result.stdout else 'none'}")
+            self.fail("node3 did not become healthy within 60 seconds")
 
-        # Wait for gossip to re-establish connections (increased from 10s to 15s)
+        # Wait for gossip to re-establish connections
         print("  Waiting for gossip connections...")
         time.sleep(15)
 
