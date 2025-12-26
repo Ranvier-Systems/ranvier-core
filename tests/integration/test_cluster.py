@@ -245,11 +245,28 @@ class ClusterIntegrationTest(unittest.TestCase):
         # Ensure clean state
         run_compose(["down", "-v", "--remove-orphans"], check=False)
 
-        # Build and start the cluster
-        print("\nBuilding containers (this may take a while on first run)...")
-        result = run_compose(["build"], check=False, show_output=True)
-        if result.returncode != 0:
-            raise RuntimeError("Failed to build containers")
+        # Check if we should skip building (env var or images already exist)
+        skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
+
+        if not skip_build:
+            # Check if images already exist
+            compose_cmd = get_compose_cmd()
+            check_result = subprocess.run(
+                compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "images", "-q"],
+                capture_output=True, text=True
+            )
+            images_exist = bool(check_result.stdout.strip())
+
+            if images_exist:
+                print("\nDocker images already exist. Skipping build.")
+                print("  (Set SKIP_BUILD=0 to force rebuild, or run 'make docker-build')")
+                skip_build = True
+
+        if not skip_build:
+            print("\nBuilding containers (this may take a while on first run)...")
+            result = run_compose(["build"], check=False, show_output=True)
+            if result.returncode != 0:
+                raise RuntimeError("Failed to build containers")
 
         print("\nStarting cluster...")
         result = run_compose(["up", "-d"], check=False, show_output=True)
