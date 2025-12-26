@@ -26,7 +26,7 @@ The integration tests use Docker Compose to spin up a 3-node Ranvier cluster wit
   │   │                           │    │                            │  │          │
   │   │  ┌─────────┐ ┌─────────┐  │    │ ┌────────┐ ┌────────┐     │  │          │
   │   │  │Backend 1│ │Backend 2│  │    │ │ Node 1 │◄─►│ Node 2 │    │  │          │
-  │   │  │:11434   │ │:11435   │  │    │ │ :8081  │ │ :8082  │     │  │          │
+  │   │  │:21434   │ │:21435   │  │    │ │ :8081  │ │ :8082  │     │  │          │
   │   │  │         │ │         │  │    │ └────┬───┘ └───┬────┘     │  │          │
   │   │  └─────────┘ └─────────┘  │    │      │  Gossip │          │  │          │
   │   │      172.28.1.10/11       │    │      │   UDP   │          │  │          │
@@ -45,7 +45,7 @@ The integration tests use Docker Compose to spin up a 3-node Ranvier cluster wit
       External Ports:                                                              │
       - 8081-8083: Ranvier API                                                    │
       - 9181-9183: Prometheus Metrics                                             │
-      - 11434-11435: Mock Backends                                                │
+      - 21434-21435: Mock Backends                                                │
 ```
 
 ## Prerequisites
@@ -66,6 +66,24 @@ make test-integration
 python3 tests/integration/test_cluster.py
 ```
 
+### Build Optimization
+
+The test script automatically skips building if Docker images already exist:
+
+```bash
+# First run builds images (slow)
+make test-integration
+
+# Subsequent runs skip build (fast)
+make test-integration
+
+# Force rebuild
+SKIP_BUILD=0 make test-integration
+
+# Pre-build images only
+make docker-build
+```
+
 ### Manual Testing
 
 For debugging or manual testing, you can start the cluster separately:
@@ -82,6 +100,12 @@ python3 tests/integration/test_cluster.py
 
 # Clean up
 make integration-down
+
+# View live logs from cluster
+docker-compose -f docker-compose.test.yml -p ranvier-integration-test logs -f
+
+# Run a specific test
+python3 -m pytest tests/integration/test_cluster.py::ClusterIntegrationTest::test_03_send_request_to_learn_route -v
 ```
 
 ### Example: Manual API Testing
@@ -109,12 +133,12 @@ curl http://localhost:9182/metrics | grep router_cluster_sync
 | Test | Description |
 |------|-------------|
 | `test_01_cluster_peers_connected` | Verifies all nodes see 2 peers each |
-| `test_02_register_backend_on_node1` | Registers mock backends via admin API |
+| `test_02_register_backend_on_node1` | Registers mock backends on all nodes via admin API |
 | `test_03_send_request_to_learn_route` | Sends request to learn a route prefix |
-| `test_04_verify_route_propagation` | Checks gossip metrics for propagation |
+| `test_04_verify_route_propagation` | Verifies cluster health after route learning |
 | `test_05_request_on_other_nodes` | Verifies other nodes can route requests |
 | `test_06_stop_node_and_verify_peer_count` | Stops a node, checks peer count drops |
-| `test_07_restart_node_and_verify_recovery` | Restarts node, verifies cluster recovery |
+| `test_07_restart_node_and_verify_recovery` | Recreates node, verifies cluster recovery |
 
 ## Configuration
 
