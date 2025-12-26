@@ -19,7 +19,7 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
 # Build Ranvier
 WORKDIR /src
 COPY . .
-RUN mkdir build && cd build && \
+RUN rm -rf build && mkdir build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
     ninja
 
