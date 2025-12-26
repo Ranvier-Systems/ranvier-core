@@ -6,8 +6,6 @@
 #     make docker-build
 #   Then run tests:
 #     make test-integration
-#
-version: '3.8'
 
 networks:
   ranvier-test:
@@ -28,7 +26,7 @@ services:
       ranvier-test:
         ipv4_address: 172.28.1.10
     ports:
-      - "11434:8000"
+      - "21434:8000"
     environment:
       - BACKEND_ID=1
 
@@ -42,7 +40,7 @@ services:
       ranvier-test:
         ipv4_address: 172.28.1.11
     ports:
-      - "11435:8000"
+      - "21435:8000"
     environment:
       - BACKEND_ID=2
 
