@@ -31,6 +31,9 @@ BACKEND_ID = os.environ.get("BACKEND_ID", "unknown")
 class MockBackendHandler(BaseHTTPRequestHandler):
     """Handler for mock vLLM endpoints."""
 
+    # Use HTTP/1.1 for chunked transfer encoding support
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format, *args):
         """Override to add backend ID to logs."""
         print(f"[Backend {BACKEND_ID}] {args[0]}", flush=True)
@@ -38,6 +41,20 @@ class MockBackendHandler(BaseHTTPRequestHandler):
     def log_request(self, code='-', size='-'):
         """Override to log all requests with details."""
         print(f"[Backend {BACKEND_ID}] {self.requestline} -> {code}", flush=True)
+
+    def send_chunk(self, data):
+        """Send a single chunk in HTTP chunked transfer encoding format."""
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        # Chunked format: <hex size>\r\n<data>\r\n
+        chunk = f"{len(data):x}\r\n".encode() + data + b"\r\n"
+        self.wfile.write(chunk)
+        self.wfile.flush()
+
+    def end_chunked(self):
+        """Send the final empty chunk to end chunked transfer."""
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def do_GET(self):
         """Handle GET requests for health checks."""
@@ -92,10 +109,11 @@ class MockBackendHandler(BaseHTTPRequestHandler):
 
         print(f"[Backend {BACKEND_ID}] Request {request_id}: prompt='{prompt[:50]}...'", flush=True)
 
-        # Send streaming response
+        # Send streaming response with chunked transfer encoding
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
         self.send_header("X-Request-ID", request_id)
         self.send_header("X-Backend-ID", BACKEND_ID)
         self.end_headers()
@@ -119,8 +137,7 @@ class MockBackendHandler(BaseHTTPRequestHandler):
                 ],
             }
             sse_line = f"data: {json.dumps(chunk_data)}\n\n"
-            self.wfile.write(sse_line.encode())
-            self.wfile.flush()
+            self.send_chunk(sse_line)
             time.sleep(0.01)  # Small delay to simulate streaming
 
         # Send final chunk with finish_reason
@@ -131,9 +148,11 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             "model": f"mock-model-backend-{BACKEND_ID}",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
-        self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self.send_chunk(f"data: {json.dumps(final_chunk)}\n\n")
+        self.send_chunk("data: [DONE]\n\n")
+
+        # End chunked transfer
+        self.end_chunked()
 
 
 class LoggingHTTPServer(HTTPServer):
