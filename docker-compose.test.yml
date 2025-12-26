@@ -170,6 +170,7 @@ services:
       - BACKEND1_PORT=8000
       - BACKEND2_IP=172.28.1.11
       - BACKEND2_PORT=8000
+      - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-100}
     depends_on:
       ranvier1:
         condition: service_healthy

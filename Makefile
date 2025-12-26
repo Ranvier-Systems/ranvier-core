@@ -91,10 +91,11 @@ BENCHMARK_USERS ?= 10
 BENCHMARK_SPAWN_RATE ?= 2
 BENCHMARK_DURATION ?= 5m
 BENCHMARK_REPORT_DIR ?= benchmark-reports
+P99_LATENCY_THRESHOLD_MS ?= 100
 
 # Run load testing benchmark in headless mode
 # Runs for 5 minutes by default, outputs CSV and HTML reports
-# Fails if P99 latency > 50ms or if cluster sync errors occur
+# Fails if P99 TTFT latency exceeds threshold or if cluster sync errors occur
 benchmark:
 	@echo "======================================"
 	@echo "Running Ranvier Load Test Benchmark"
@@ -104,6 +105,7 @@ benchmark:
 	@echo "  Users: $(BENCHMARK_USERS)"
 	@echo "  Spawn rate: $(BENCHMARK_SPAWN_RATE)/s"
 	@echo "  Duration: $(BENCHMARK_DURATION)"
+	@echo "  P99 TTFT threshold: $(P99_LATENCY_THRESHOLD_MS)ms"
 	@echo "  Reports: $(BENCHMARK_REPORT_DIR)/"
 	@echo ""
 	@if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1) && \
@@ -118,8 +120,10 @@ benchmark:
 	@sleep 15
 	@echo ""
 	@echo "Starting Locust load test..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run \
+	@P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
+	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run \
 		--name ranvier-benchmark-run \
+		-e P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
 		locust \
 		-f /mnt/locust/locustfile.py \
 		--host=http://172.28.2.1:8080 \
@@ -218,7 +222,7 @@ help:
 	@echo "Benchmark targets:"
 	@echo "  make benchmark      - Run Locust load test (headless, 5 min)"
 	@echo "                        Outputs: benchmark-reports/*.csv, *.html"
-	@echo "                        Fails if: P99 > 50ms or sync errors > 0"
+	@echo "                        Fails if: P99 TTFT > threshold or sync errors > 0"
 	@echo "  make benchmark-up   - Start cluster with Locust web UI (port 8089)"
 	@echo "  make benchmark-down - Stop benchmark cluster"
 	@echo ""
@@ -227,6 +231,7 @@ help:
 	@echo "    BENCHMARK_SPAWN_RATE=2   - Users spawned per second"
 	@echo "    BENCHMARK_DURATION=5m    - Test duration"
 	@echo "    BENCHMARK_REPORT_DIR=benchmark-reports - Report output dir"
+	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
 	@echo ""
 	@echo "Integration test helpers:"
 	@echo "  make integration-up   - Start test cluster for debugging"

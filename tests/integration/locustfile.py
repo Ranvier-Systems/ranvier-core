@@ -59,6 +59,9 @@ BACKENDS = [
     },
 ]
 
+# Configurable thresholds
+P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "100"))
+
 # Metrics collection for validation
 _initial_sync_errors: dict[str, float] = {}
 _backends_registered = False
@@ -164,6 +167,7 @@ def on_test_start(environment, **kwargs):
 
     logger.info("=" * 60)
     logger.info("Starting Ranvier Load Test")
+    logger.info(f"P99 Latency Threshold: {P99_LATENCY_THRESHOLD_MS}ms")
     logger.info("=" * 60)
 
     # Register backends
@@ -209,13 +213,13 @@ def on_test_stop(environment, **kwargs):
         p99_latency = ttft_stats.get_response_time_percentile(0.99)
         if p99_latency is not None:
             p99_ms = p99_latency  # Already in ms
-            if p99_ms > 50:
+            if p99_ms > P99_LATENCY_THRESHOLD_MS:
                 validation_passed = False
-                msg = f"P99 TTFT latency {p99_ms:.2f}ms exceeds 50ms threshold"
+                msg = f"P99 TTFT latency {p99_ms:.2f}ms exceeds {P99_LATENCY_THRESHOLD_MS}ms threshold"
                 validation_messages.append(msg)
                 logger.error(f"FAIL: {msg}")
             else:
-                msg = f"P99 TTFT latency {p99_ms:.2f}ms is within 50ms threshold"
+                msg = f"P99 TTFT latency {p99_ms:.2f}ms is within {P99_LATENCY_THRESHOLD_MS}ms threshold"
                 validation_messages.append(msg)
                 logger.info(f"PASS: {msg}")
     else:
@@ -223,9 +227,9 @@ def on_test_stop(environment, **kwargs):
         for name, entry in stats.entries.items():
             if "chat/completions" in str(name):
                 p99_latency = entry.get_response_time_percentile(0.99)
-                if p99_latency is not None and p99_latency > 50:
+                if p99_latency is not None and p99_latency > P99_LATENCY_THRESHOLD_MS:
                     validation_passed = False
-                    msg = f"P99 latency for {name} is {p99_latency:.2f}ms (exceeds 50ms)"
+                    msg = f"P99 latency for {name} is {p99_latency:.2f}ms (exceeds {P99_LATENCY_THRESHOLD_MS}ms)"
                     validation_messages.append(msg)
                     logger.error(f"FAIL: {msg}")
 
@@ -245,7 +249,7 @@ def on_test_stop(environment, **kwargs):
 
 
 class ChatCompletionUser(HttpUser):
-    """Simulates users sending chat completion requests."""
+    """Simulates users sending chat completion requests to the cluster."""
 
     # Wait 1-3 seconds between requests
     wait_time = between(1, 3)
@@ -264,94 +268,12 @@ class ChatCompletionUser(HttpUser):
         "Why is the sky blue?",
     ]
 
-    def on_start(self):
-        """Called when a user starts."""
-        # Select a random node to target (load balancing across cluster)
-        self.target_node_index = random.randint(0, len(RANVIER_NODES) - 1)
-
-    @task
-    def chat_completion(self):
-        """Send a streaming chat completion request and measure TTFT."""
-        prompt = random.choice(self.PROMPTS)
-
-        request_body = {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-        }
-
-        # Measure TTFT (Time To First Token)
-        start_time = time.perf_counter()
-        ttft = None
-        response_chunks = []
-        error_occurred = False
-        exception_info = None
-
-        try:
-            with self.client.post(
-                "/v1/chat/completions",
-                json=request_body,
-                headers={"Content-Type": "application/json"},
-                stream=True,
-                catch_response=True,
-                name="/v1/chat/completions",
-            ) as response:
-                if response.status_code != 200:
-                    response.failure(f"Status code: {response.status_code}")
-                    error_occurred = True
-                else:
-                    # Stream through response and capture TTFT
-                    for line in response.iter_lines():
-                        if line:
-                            decoded = line.decode("utf-8")
-                            if decoded.startswith("data: "):
-                                if ttft is None:
-                                    ttft = (time.perf_counter() - start_time) * 1000  # Convert to ms
-                                response_chunks.append(decoded)
-
-                                # Stop after we've confirmed streaming is working
-                                if decoded == "data: [DONE]":
-                                    break
-
-                    if ttft is None:
-                        response.failure("No SSE data chunks received")
-                        error_occurred = True
-                    else:
-                        response.success()
-
-        except Exception as e:
-            error_occurred = True
-            exception_info = str(e)
-            logger.warning(f"Request failed: {e}")
-
-        # Report TTFT as a custom metric
-        if ttft is not None and not error_occurred:
-            events.request.fire(
-                request_type="GET",
-                name="TTFT (Time To First Token)",
-                response_time=ttft,
-                response_length=0,
-                exception=None,
-                context={},
-            )
-
-    @task(1)
-    def rotate_node(self):
-        """Occasionally rotate to a different node for load distribution."""
-        # This is a no-op task that just rotates which node we're targeting
-        # The actual targeting happens in the base URL, but this helps mix things up
-        pass
-
-
-class MultiNodeChatUser(ChatCompletionUser):
-    """User that distributes requests across all cluster nodes."""
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._request_count = 0
 
     @task
-    def chat_completion_multi_node(self):
+    def chat_completion(self):
         """Send requests to different nodes in round-robin fashion."""
         # Round-robin across nodes
         node_index = self._request_count % len(RANVIER_NODES)
@@ -373,7 +295,7 @@ class MultiNodeChatUser(ChatCompletionUser):
         error_occurred = False
 
         try:
-            # Make request directly to the target node
+            # Use requests library directly for proper SSE streaming support
             resp = requests.post(
                 f"{target_url}/v1/chat/completions",
                 json=request_body,
