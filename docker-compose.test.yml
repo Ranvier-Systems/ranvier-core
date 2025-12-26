@@ -57,10 +57,18 @@ services:
     ports:
       - "8081:8080"
       - "9181:9180"
-    volumes:
-      - ./tests/integration/configs/node1.yaml:/app/ranvier.yaml:ro
-      - ./assets:/app/assets:ro
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--config", "/app/ranvier.yaml"]
+    environment:
+      # Cluster configuration via environment variables
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.28.2.2:9190,172.28.2.3:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      # Routing config for testing
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
     depends_on:
       - backend1
       - backend2
@@ -84,10 +92,16 @@ services:
     ports:
       - "8082:8080"
       - "9182:9180"
-    volumes:
-      - ./tests/integration/configs/node2.yaml:/app/ranvier.yaml:ro
-      - ./assets:/app/assets:ro
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--config", "/app/ranvier.yaml"]
+    environment:
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.28.2.1:9190,172.28.2.3:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
     depends_on:
       - backend1
       - backend2
@@ -111,10 +125,16 @@ services:
     ports:
       - "8083:8080"
       - "9183:9180"
-    volumes:
-      - ./tests/integration/configs/node3.yaml:/app/ranvier.yaml:ro
-      - ./assets:/app/assets:ro
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--config", "/app/ranvier.yaml"]
+    environment:
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.28.2.1:9190,172.28.2.2:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      - RANVIER_MIN_TOKEN_LENGTH=2
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
     depends_on:
       - backend1
       - backend2
