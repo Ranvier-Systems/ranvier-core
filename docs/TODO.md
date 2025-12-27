@@ -66,6 +66,62 @@ if (doc.HasMember("prompt_token_ids") && config.accept_client_tokens) {
 
 ---
 
+### Absolute performance benchmarking
+
+**Status:** Proposed
+**Priority:** Medium
+**Complexity:** Low-Medium
+
+#### Summary
+
+Extend the existing Locust benchmark infrastructure (`make benchmark`) to support absolute performance measurements against real vLLM backends, not just relative comparisons using the mock backend.
+
+#### Current Behavior
+
+The benchmark setup measures TTFT (Time To First Token) using a mock backend that responds instantly. This is useful for:
+- A/B comparisons (e.g., token forwarding on vs off)
+- Detecting regressions in router overhead
+- Testing under load
+
+But the numbers are **relative** - they don't represent real-world inference performance.
+
+#### Proposed Changes
+
+1. **Add comprehensive metrics to locustfile.py:**
+   - Tokens per second (throughput)
+   - Inter-token latency (time between consecutive SSE chunks)
+   - Total generation time
+   - Input/output token counts (parse from SSE `usage` field)
+
+2. **Create `docker-compose.benchmark.yml`** as a template for real backend benchmarking:
+   - Environment variables for external vLLM endpoints
+   - No mock backend dependency
+   - Documentation for required backend configuration
+
+3. **Add `make benchmark-external` target** that:
+   - Skips mock backend startup
+   - Requires `VLLM_ENDPOINTS` environment variable
+   - Outputs all metrics to CSV
+
+4. **Update tests/integration/README.md** with:
+   - Requirements for reproducible absolute benchmarks (hardware, environment)
+   - Standardized workload recommendations (prompt lengths, models)
+   - How to interpret absolute vs relative numbers
+
+#### Benefits
+
+- Measure real inference performance through the router
+- Compare against direct vLLM access (router overhead)
+- Publishable benchmark numbers for documentation
+
+#### Considerations
+
+- Requires access to real vLLM instances with loaded models
+- Results vary by hardware - document reference environment
+- May want standardized prompt sets (short, medium, long)
+
+---
+
 ## Completed
 
 _Move completed items here with completion date._
