@@ -104,3 +104,62 @@ sequenceDiagram
     RS-->>HTTP: success
     HTTP-->>Admin: {"status": "ok", "backend_deleted": 1}
 ```
+
+## Token Forwarding Flow
+
+This diagram shows how the router injects pre-computed `prompt_token_ids` into requests, reducing backend CPU load by eliminating redundant tokenization.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant HTTP as HttpController
+    participant TOK as Tokenizer
+    participant RS as RouterService
+    participant RW as RequestRewriter
+    participant GPU as Backend GPU
+
+    Client->>HTTP: POST /v1/chat/completions<br/>{"prompt": "Hello world", ...}
+
+    alt Client provides prompt_token_ids
+        Note over HTTP: accept_client_tokens=true
+        HTTP->>HTTP: extract_prompt_token_ids()
+        Note over HTTP: Validate token bounds [0, max_token_id]
+        HTTP->>RS: lookup(client_tokens)
+    else Router tokenizes
+        HTTP->>TOK: encode(body)
+        TOK-->>HTTP: tokens[]
+        HTTP->>RS: lookup(tokens)
+    end
+
+    RS-->>HTTP: backend_id
+
+    alt Token Forwarding Enabled
+        Note over HTTP: enable_token_forwarding=true
+        HTTP->>RW: rewrite(body, tokens)
+        RW-->>HTTP: {"prompt": "...", "prompt_token_ids": [15496, 995], ...}
+        Note over RW: Inject token array into JSON body
+    end
+
+    HTTP->>GPU: proxy request with prompt_token_ids
+
+    Note over GPU: Backend skips tokenization<br/>(vLLM/SGLang optimization)
+
+    GPU-->>HTTP: response (streaming)
+    HTTP-->>Client: response
+```
+
+### Token Forwarding Benefits
+
+1. **Reduced Backend CPU**: Backends like vLLM skip internal tokenization when `prompt_token_ids` is present, reducing CPU overhead by 10-15%.
+2. **Guaranteed Routing Consistency**: Same tokens used for cache lookup are sent to the backend, ensuring KV-cache hits align with routing decisions.
+3. **Pre-tokenized Client Support**: High-throughput clients can send pre-computed tokens (with `accept_client_tokens=true`) to skip router tokenization entirely.
+
+### Configuration
+
+Enable token forwarding in `ranvier.yaml`:
+```yaml
+router:
+  enable_token_forwarding: true   # Inject tokens into backend requests
+  accept_client_tokens: false     # Accept client-provided tokens (optional)
+  max_token_id: 100000            # Security: reject out-of-range tokens
+```
