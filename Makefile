@@ -93,6 +93,7 @@ BENCHMARK_DURATION ?= 5m
 BENCHMARK_REPORT_DIR ?= benchmark-reports
 P99_LATENCY_THRESHOLD_MS ?= 100
 BENCHMARK_RUN_NAME ?= $(shell date +%Y%m%d_%H%M%S)
+BENCHMARK_BUILD ?= 1
 
 # Run load testing benchmark in headless mode
 # Runs for 5 minutes by default, outputs CSV and HTML reports
@@ -116,7 +117,12 @@ benchmark:
 	fi
 	@mkdir -p $(BENCHMARK_REPORT_DIR)
 	@echo "Starting test cluster..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build
+	@if [ "$(BENCHMARK_BUILD)" = "1" ]; then \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build; \
+	else \
+		echo "  (using cached images, set BENCHMARK_BUILD=1 to rebuild)"; \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d; \
+	fi
 	@echo "Waiting for cluster to become healthy..."
 	@sleep 15
 	@echo ""
@@ -166,7 +172,12 @@ benchmark:
 # After starting, open http://localhost:8089 to access Locust web UI
 benchmark-up:
 	@echo "Starting benchmark cluster with Locust web UI..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build
+	@if [ "$(BENCHMARK_BUILD)" = "1" ]; then \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build; \
+	else \
+		echo "  (using cached images, set BENCHMARK_BUILD=1 to rebuild)"; \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d; \
+	fi
 	@echo ""
 	@echo "Cluster started. Endpoints:"
 	@echo "  Locust Web UI: http://localhost:8089"
@@ -231,6 +242,7 @@ help:
 	@echo "    BENCHMARK_REPORT_DIR=benchmark-reports - Report output dir"
 	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
 	@echo "    BENCHMARK_RUN_NAME=<timestamp> - Custom name for this run"
+	@echo "    BENCHMARK_BUILD=1        - Set to 0 to skip rebuilding images"
 	@echo ""
 	@echo "  Compare benchmark results:"
 	@echo "    python3 tests/integration/compare_results.py <baseline.csv> <new.csv>"
