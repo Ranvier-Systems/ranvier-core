@@ -65,6 +65,33 @@ public:
     //   The extracted text, or nullopt if no tokenizable content found
     static std::optional<std::string> extract_text(std::string_view body);
 
+    // Result of extracting prompt_token_ids from a request
+    struct TokenExtractionResult {
+        std::vector<int32_t> tokens;  // Extracted token IDs (empty if not found)
+        bool found;                    // Whether prompt_token_ids field was present
+        bool valid;                    // Whether tokens passed validation
+        std::string error;             // Error message if validation failed
+    };
+
+    // Extract pre-tokenized prompt_token_ids from a request body
+    //
+    // Clients can send pre-computed token IDs to skip router tokenization.
+    // This is useful for high-throughput clients that want to guarantee
+    // consistency with their own tokenization.
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //   max_token_id: Maximum valid token ID for security validation
+    //
+    // Returns:
+    //   TokenExtractionResult with extracted tokens and validation status
+    //
+    // Security notes:
+    //   - Token IDs are validated to be within [0, max_token_id]
+    //   - Negative token IDs are rejected
+    //   - Array must not be empty if present
+    static TokenExtractionResult extract_prompt_token_ids(std::string_view body, int32_t max_token_id);
+
 private:
     // Internal helper to write token array to JSON
     static void write_token_array(rapidjson::Writer<rapidjson::StringBuffer>& writer,
@@ -167,6 +194,76 @@ inline std::optional<std::string> RequestRewriter::extract_text(std::string_view
     }
 
     return std::nullopt;
+}
+
+inline RequestRewriter::TokenExtractionResult RequestRewriter::extract_prompt_token_ids(
+    std::string_view body, int32_t max_token_id) {
+
+    TokenExtractionResult result;
+    result.found = false;
+    result.valid = false;
+
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        result.error = "Invalid JSON";
+        return result;
+    }
+
+    // Check if prompt_token_ids field exists
+    if (!doc.HasMember("prompt_token_ids")) {
+        // Not found is not an error - just means we should tokenize normally
+        return result;
+    }
+
+    result.found = true;
+
+    const auto& token_array = doc["prompt_token_ids"];
+    if (!token_array.IsArray()) {
+        result.error = "prompt_token_ids must be an array";
+        return result;
+    }
+
+    if (token_array.Empty()) {
+        result.error = "prompt_token_ids array is empty";
+        return result;
+    }
+
+    // Reserve space for tokens
+    result.tokens.reserve(token_array.Size());
+
+    // Extract and validate each token
+    for (rapidjson::SizeType i = 0; i < token_array.Size(); ++i) {
+        const auto& elem = token_array[i];
+
+        if (!elem.IsInt()) {
+            result.error = "prompt_token_ids[" + std::to_string(i) + "] is not an integer";
+            result.tokens.clear();
+            return result;
+        }
+
+        int32_t token_id = elem.GetInt();
+
+        // Security validation: check token ID bounds
+        if (token_id < 0) {
+            result.error = "prompt_token_ids[" + std::to_string(i) + "] is negative: " + std::to_string(token_id);
+            result.tokens.clear();
+            return result;
+        }
+
+        if (token_id > max_token_id) {
+            result.error = "prompt_token_ids[" + std::to_string(i) + "] exceeds max_token_id (" +
+                           std::to_string(token_id) + " > " + std::to_string(max_token_id) + ")";
+            result.tokens.clear();
+            return result;
+        }
+
+        result.tokens.push_back(token_id);
+    }
+
+    result.valid = true;
+    return result;
 }
 
 inline void RequestRewriter::write_token_array(

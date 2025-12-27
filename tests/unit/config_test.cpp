@@ -40,6 +40,9 @@ protected:
         unsetenv("RANVIER_CLUSTER_DISCOVERY_REFRESH_INTERVAL");
         unsetenv("RANVIER_CLUSTER_ENABLED");
         unsetenv("RANVIER_CLUSTER_GOSSIP_PORT");
+        // Client token env vars
+        unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
+        unsetenv("RANVIER_MAX_TOKEN_ID");
     }
 
     void TearDown() override {
@@ -797,6 +800,93 @@ TEST_F(ConfigTest, DiscoveryTypeEnumValues) {
     EXPECT_NE(DiscoveryType::STATIC, DiscoveryType::A);
     EXPECT_NE(DiscoveryType::STATIC, DiscoveryType::SRV);
     EXPECT_NE(DiscoveryType::A, DiscoveryType::SRV);
+}
+
+// =============================================================================
+// Pre-tokenized Client Input Configuration Tests
+// =============================================================================
+
+TEST_F(ConfigTest, AcceptClientTokensDefaults) {
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_FALSE(config.routing.accept_client_tokens);
+    EXPECT_EQ(config.routing.max_token_id, 100000);
+}
+
+TEST_F(ConfigTest, AcceptClientTokensFromYaml) {
+    writeTestConfig("test_config.yaml", R"(
+routing:
+  accept_client_tokens: true
+  max_token_id: 50257
+)");
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    EXPECT_TRUE(config.routing.accept_client_tokens);
+    EXPECT_EQ(config.routing.max_token_id, 50257);
+}
+
+TEST_F(ConfigTest, AcceptClientTokensEnvironmentVariables) {
+    setenv("RANVIER_ACCEPT_CLIENT_TOKENS", "true", 1);
+    setenv("RANVIER_MAX_TOKEN_ID", "32000", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_TRUE(config.routing.accept_client_tokens);
+    EXPECT_EQ(config.routing.max_token_id, 32000);
+
+    // Clean up
+    unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
+    unsetenv("RANVIER_MAX_TOKEN_ID");
+}
+
+TEST_F(ConfigTest, AcceptClientTokensEnvOverridesYaml) {
+    writeTestConfig("test_config.yaml", R"(
+routing:
+  accept_client_tokens: false
+  max_token_id: 50257
+)");
+
+    setenv("RANVIER_ACCEPT_CLIENT_TOKENS", "1", 1);
+    setenv("RANVIER_MAX_TOKEN_ID", "100000", 1);
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    // Env vars should override YAML
+    EXPECT_TRUE(config.routing.accept_client_tokens);
+    EXPECT_EQ(config.routing.max_token_id, 100000);
+
+    // Clean up
+    unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
+    unsetenv("RANVIER_MAX_TOKEN_ID");
+}
+
+TEST_F(ConfigTest, AcceptClientTokensYesValue) {
+    setenv("RANVIER_ACCEPT_CLIENT_TOKENS", "yes", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_TRUE(config.routing.accept_client_tokens);
+
+    unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
+}
+
+TEST_F(ConfigTest, AcceptClientTokensFalseValue) {
+    setenv("RANVIER_ACCEPT_CLIENT_TOKENS", "false", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_FALSE(config.routing.accept_client_tokens);
+
+    unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
+}
+
+TEST_F(ConfigTest, RoutingConfigStructDefaults) {
+    RoutingConfig routing;
+
+    EXPECT_FALSE(routing.accept_client_tokens);
+    EXPECT_EQ(routing.max_token_id, 100000);
+    EXPECT_FALSE(routing.enable_token_forwarding);
 }
 
 int main(int argc, char** argv) {

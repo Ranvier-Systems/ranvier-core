@@ -276,3 +276,161 @@ TEST_F(RequestRewriterTest, RewriteProducesValidJson) {
     EXPECT_FALSE(doc.HasParseError());
     EXPECT_TRUE(doc.IsObject());
 }
+
+// =============================================================================
+// extract_prompt_token_ids tests
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsBasic) {
+    std::string body = R"({"prompt": "Hello", "prompt_token_ids": [1, 2, 3, 4, 5]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.valid);
+    EXPECT_TRUE(result.error.empty());
+    EXPECT_EQ(result.tokens.size(), 5);
+    EXPECT_EQ(result.tokens[0], 1);
+    EXPECT_EQ(result.tokens[4], 5);
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsNotFound) {
+    std::string body = R"({"prompt": "Hello", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_FALSE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_TRUE(result.tokens.empty());
+    EXPECT_TRUE(result.error.empty());  // Not found is not an error
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_FALSE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "Invalid JSON");
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsNotArray) {
+    std::string body = R"({"prompt_token_ids": "not an array"})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids must be an array");
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsEmptyArray) {
+    std::string body = R"({"prompt_token_ids": []})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids array is empty");
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsNonIntegerElement) {
+    std::string body = R"({"prompt_token_ids": [1, 2, "three", 4]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids[2] is not an integer");
+    EXPECT_TRUE(result.tokens.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsNegativeValue) {
+    std::string body = R"({"prompt_token_ids": [1, 2, -5, 4]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids[2] is negative: -5");
+    EXPECT_TRUE(result.tokens.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsExceedsMax) {
+    std::string body = R"({"prompt_token_ids": [1, 2, 999999, 4]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 50000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids[2] exceeds max_token_id (999999 > 50000)");
+    EXPECT_TRUE(result.tokens.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsBoundaryValid) {
+    std::string body = R"({"prompt_token_ids": [0, 50000]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 50000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.valid);
+    EXPECT_EQ(result.tokens.size(), 2);
+    EXPECT_EQ(result.tokens[0], 0);
+    EXPECT_EQ(result.tokens[1], 50000);
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsBoundaryInvalid) {
+    std::string body = R"({"prompt_token_ids": [0, 50001]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 50000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids[1] exceeds max_token_id (50001 > 50000)");
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsLargeArray) {
+    // Build a large token array
+    std::string body = R"({"prompt_token_ids": [)";
+    for (int i = 0; i < 10000; ++i) {
+        if (i > 0) body += ",";
+        body += std::to_string(i);
+    }
+    body += "]}";
+
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.valid);
+    EXPECT_EQ(result.tokens.size(), 10000);
+    EXPECT_EQ(result.tokens[0], 0);
+    EXPECT_EQ(result.tokens[9999], 9999);
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsWithOtherFields) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "prompt": "Hello world",
+        "prompt_token_ids": [15496, 995],
+        "max_tokens": 100,
+        "temperature": 0.7
+    })";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.valid);
+    EXPECT_EQ(result.tokens.size(), 2);
+    EXPECT_EQ(result.tokens[0], 15496);
+    EXPECT_EQ(result.tokens[1], 995);
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsZeroMaxTokenId) {
+    // Edge case: max_token_id of 0 means only token ID 0 is valid
+    std::string body = R"({"prompt_token_ids": [0]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 0);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.valid);
+    EXPECT_EQ(result.tokens.size(), 1);
+    EXPECT_EQ(result.tokens[0], 0);
+}
+
+TEST_F(RequestRewriterTest, ExtractPromptTokenIdsFloatInArray) {
+    std::string body = R"({"prompt_token_ids": [1, 2.5, 3]})";
+    auto result = RequestRewriter::extract_prompt_token_ids(body, 100000);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "prompt_token_ids[1] is not an integer");
+}

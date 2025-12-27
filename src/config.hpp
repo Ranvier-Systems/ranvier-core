@@ -57,6 +57,8 @@ struct RoutingConfig {
     std::chrono::seconds ttl_seconds{3600};  // TTL for cached routes (1 hour default)
     std::chrono::seconds backend_drain_timeout{60};  // Time to wait before fully removing a draining backend
     bool enable_token_forwarding = false;  // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
+    bool accept_client_tokens = false;  // Accept pre-tokenized prompt_token_ids from clients for routing
+    int32_t max_token_id = 100000;  // Maximum valid token ID for validation (security: reject out-of-range tokens)
 };
 
 // Timeout configuration
@@ -273,6 +275,12 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env("RANVIER_ENABLE_TOKEN_FORWARDING")) {
         routing.enable_token_forwarding = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_ACCEPT_CLIENT_TOKENS")) {
+        routing.accept_client_tokens = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<int32_t>("RANVIER_MAX_TOKEN_ID")) {
+        routing.max_token_id = *v;
     }
 
     // Timeout overrides
@@ -520,6 +528,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["enable_token_forwarding"]) {
                 config.routing.enable_token_forwarding = r["enable_token_forwarding"].as<bool>();
+            }
+            if (r["accept_client_tokens"]) {
+                config.routing.accept_client_tokens = r["accept_client_tokens"].as<bool>();
+            }
+            if (r["max_token_id"]) {
+                config.routing.max_token_id = r["max_token_id"].as<int32_t>();
             }
         }
 

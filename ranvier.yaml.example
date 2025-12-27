@@ -67,6 +67,25 @@ routing:
   # but new requests will not be assigned to the draining backend
   backend_drain_timeout_seconds: 60
 
+  # Accept pre-tokenized prompt_token_ids from clients for routing (RANVIER_ACCEPT_CLIENT_TOKENS)
+  # When enabled, clients can send pre-computed token IDs to skip router tokenization.
+  # Benefits:
+  #   - Skip redundant tokenization for high-throughput clients
+  #   - Guarantee consistency - client controls exact tokens used for routing
+  #   - Support token-native systems that already have tokens
+  # Requirements:
+  #   - Client must use the same tokenizer as the router (GPT-2)
+  #   - Token IDs are validated against max_token_id for security
+  # Example request with prompt_token_ids:
+  #   {"prompt": "Hello world", "prompt_token_ids": [15496, 995], ...}
+  accept_client_tokens: false
+
+  # Maximum valid token ID for security validation (RANVIER_MAX_TOKEN_ID)
+  # When accept_client_tokens is enabled, all token IDs must be in [0, max_token_id].
+  # Set to your tokenizer's vocabulary size for strict validation.
+  # GPT-2 has 50257 tokens, but we use a higher default for safety.
+  max_token_id: 100000
+
 # Timeout configuration
 timeouts:
   # Timeout for establishing connection to backend in seconds (RANVIER_CONNECT_TIMEOUT)

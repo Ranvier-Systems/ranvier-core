@@ -273,22 +273,50 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Timing: capture routing decision start
     auto routing_start = std::chrono::steady_clock::now();
 
-    // Extract text from request body for tokenization (prompt or messages content)
-    // This ensures we tokenize exactly what we use for routing, not metadata
+    // Get tokens for routing - either from client or by tokenizing locally
     std::vector<int32_t> tokens;
-    auto extracted_text = RequestRewriter::extract_text(body);
-    if (extracted_text.has_value()) {
-        tokens = _tokenizer.encode(extracted_text.value());
-    } else {
-        // Fallback: tokenize the entire body (legacy behavior)
-        tokens = _tokenizer.encode(body);
+    bool used_client_tokens = false;
+
+    // First, check if client provided pre-tokenized prompt_token_ids
+    if (_config.accept_client_tokens) {
+        auto token_result = RequestRewriter::extract_prompt_token_ids(body, _config.max_token_id);
+        if (token_result.found) {
+            if (token_result.valid) {
+                tokens = std::move(token_result.tokens);
+                used_client_tokens = true;
+                log_proxy.debug("[{}] Using {} client-provided token IDs for routing",
+                               request_id, tokens.size());
+            } else {
+                // Client provided invalid tokens - reject the request
+                log_proxy.warn("[{}] Invalid client tokens: {}", request_id, token_result.error);
+                metrics().record_failure();
+                metrics().decrement_active_requests();
+                rep->add_header("X-Request-ID", request_id);
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
+                co_return std::move(rep);
+            }
+        }
     }
 
-    // Rewrite request body with token IDs if enabled
-    // This allows vLLM backends to skip tokenization (prompt_token_ids)
+    // If no client tokens, tokenize locally
+    if (!used_client_tokens) {
+        // Extract text from request body for tokenization (prompt or messages content)
+        // This ensures we tokenize exactly what we use for routing, not metadata
+        auto extracted_text = RequestRewriter::extract_text(body);
+        if (extracted_text.has_value()) {
+            tokens = _tokenizer.encode(extracted_text.value());
+        } else {
+            // Fallback: tokenize the entire body (legacy behavior)
+            tokens = _tokenizer.encode(body);
+        }
+    }
+
+    // Rewrite request body with token IDs if enabled and we tokenized locally
+    // Skip rewriting if client already provided prompt_token_ids (it's already in the body)
     std::string forwarded_body = body;
-    bool body_rewritten = false;
-    if (_config.enable_token_forwarding && !tokens.empty()) {
+    bool body_rewritten = used_client_tokens;  // Client tokens means body already has them
+    if (_config.enable_token_forwarding && !tokens.empty() && !used_client_tokens) {
         auto rewrite_result = RequestRewriter::rewrite(body, tokens);
         if (rewrite_result.success) {
             forwarded_body = std::move(rewrite_result.body);
