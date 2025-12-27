@@ -68,6 +68,7 @@ services:
       # Routing config for testing
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
     depends_on:
       - backend1
@@ -101,6 +102,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
     depends_on:
       - backend1
@@ -134,6 +136,7 @@ services:
       - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
     depends_on:
       - backend1
@@ -144,3 +147,39 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+
+  # Locust load testing service
+  locust:
+    image: ranvier-locust:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.locust
+    container_name: locust
+    networks:
+      - ranvier-test
+    ports:
+      - "8089:8089"   # Web UI
+      - "8090:8090"   # Secondary port for metrics export
+    environment:
+      - LOCUST_HOST=http://172.28.2.1:8080
+      - LOCUST_LOCUSTFILE=/mnt/locust/locustfile.py
+      - RANVIER_NODE1=http://172.28.2.1:8080
+      - RANVIER_NODE2=http://172.28.2.2:8080
+      - RANVIER_NODE3=http://172.28.2.3:8080
+      - RANVIER_METRICS1=http://172.28.2.1:9180
+      - RANVIER_METRICS2=http://172.28.2.2:9180
+      - RANVIER_METRICS3=http://172.28.2.3:9180
+      - BACKEND1_IP=172.28.1.10
+      - BACKEND1_PORT=8000
+      - BACKEND2_IP=172.28.1.11
+      - BACKEND2_PORT=8000
+      - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-100}
+    depends_on:
+      ranvier1:
+        condition: service_healthy
+      ranvier2:
+        condition: service_healthy
+      ranvier3:
+        condition: service_healthy
+    profiles:
+      - benchmark

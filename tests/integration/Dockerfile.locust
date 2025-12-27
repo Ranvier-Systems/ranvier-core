@@ -1,0 +1,10 @@
+# Dockerfile for Locust load testing service
+# Copies the locustfile into the container to avoid volume mount issues in DinD environments
+
+FROM locustio/locust:2.24.0
+
+# Copy the locustfile into the container
+COPY locustfile.py /mnt/locust/locustfile.py
+
+# Set working directory
+WORKDIR /mnt/locust

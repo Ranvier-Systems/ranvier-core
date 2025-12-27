@@ -1,7 +1,7 @@
 # Ranvier Core Makefile
 # Build and test targets for the Ranvier LLM routing layer
 
-.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs help
+.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down help
 
 # Default target
 all: build
@@ -86,6 +86,123 @@ integration-logs:
 integration-log-%:
 	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) logs -f $*
 
+# Benchmark configuration
+BENCHMARK_USERS ?= 10
+BENCHMARK_SPAWN_RATE ?= 2
+BENCHMARK_DURATION ?= 5m
+BENCHMARK_REPORT_DIR ?= benchmark-reports
+P99_LATENCY_THRESHOLD_MS ?= 100
+BENCHMARK_BUILD ?= 1
+BENCHMARK_TOKEN_FORWARDING ?= 0
+
+# Benchmark run naming: combines optional label with timestamp
+# Usage: make benchmark BENCHMARK_LABEL=token_on → token_on_20251227_012810_*
+#        make benchmark                          → 20251227_012810_*
+BENCHMARK_TIMESTAMP := $(shell date +%Y%m%d_%H%M%S)
+BENCHMARK_LABEL ?=
+BENCHMARK_RUN_NAME := $(if $(BENCHMARK_LABEL),$(BENCHMARK_LABEL)_$(BENCHMARK_TIMESTAMP),$(BENCHMARK_TIMESTAMP))
+
+# Run load testing benchmark in headless mode
+# Runs for 5 minutes by default, outputs CSV and HTML reports
+# Fails if P99 TTFT latency exceeds threshold or if cluster sync errors occur
+benchmark:
+	@echo "======================================"
+	@echo "Running Ranvier Load Test Benchmark"
+	@echo "======================================"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  Users: $(BENCHMARK_USERS)"
+	@echo "  Spawn rate: $(BENCHMARK_SPAWN_RATE)/s"
+	@echo "  Duration: $(BENCHMARK_DURATION)"
+	@echo "  P99 TTFT threshold: $(P99_LATENCY_THRESHOLD_MS)ms"
+	@echo "  Token forwarding: $(BENCHMARK_TOKEN_FORWARDING)"
+	@echo "  Reports: $(BENCHMARK_REPORT_DIR)/"
+	@echo ""
+	@if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1) && \
+	    ! command -v docker-compose >/dev/null 2>&1; then \
+		echo "Error: Neither 'docker compose' nor 'docker-compose' found"; \
+		exit 1; \
+	fi
+	@mkdir -p $(BENCHMARK_REPORT_DIR)
+	@echo "Starting test cluster..."
+	@if [ "$(BENCHMARK_BUILD)" = "1" ]; then \
+		RANVIER_ENABLE_TOKEN_FORWARDING=$(BENCHMARK_TOKEN_FORWARDING) \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build; \
+	else \
+		echo "  (using cached images, set BENCHMARK_BUILD=1 to rebuild)"; \
+		RANVIER_ENABLE_TOKEN_FORWARDING=$(BENCHMARK_TOKEN_FORWARDING) \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d; \
+	fi
+	@echo "Waiting for cluster to become healthy..."
+	@sleep 15
+	@echo ""
+	@echo "Starting Locust load test..."
+	@echo "Run name: $(BENCHMARK_RUN_NAME)"
+	@P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
+	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run --rm \
+		-e P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
+		-e BENCHMARK_RUN_NAME=$(BENCHMARK_RUN_NAME) \
+		locust \
+		-f /mnt/locust/locustfile.py \
+		--host=http://172.28.2.1:8080 \
+		--users $(BENCHMARK_USERS) \
+		--spawn-rate $(BENCHMARK_SPAWN_RATE) \
+		--run-time $(BENCHMARK_DURATION) \
+		--headless \
+		--only-summary \
+		--exit-code-on-error 1 \
+		2>&1 | tee $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_output.log \
+	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
+	echo ""; \
+	echo "Parsing results..."; \
+	python3 tests/integration/parse_locust_output.py \
+		$(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_output.log \
+		$(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv \
+		2>/dev/null || echo "  (parser not available, raw log saved)"; \
+	echo "Stopping test cluster..."; \
+	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans; \
+	echo ""; \
+	if [ $$LOCUST_EXIT -ne 0 ]; then \
+		echo "======================================"; \
+		echo "BENCHMARK FAILED (exit code: $$LOCUST_EXIT)"; \
+		echo "======================================"; \
+		echo "Results saved to: $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_*"; \
+		exit $$LOCUST_EXIT; \
+	else \
+		echo "======================================"; \
+		echo "BENCHMARK PASSED"; \
+		echo "======================================"; \
+		echo "Results saved to: $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_*"; \
+		echo ""; \
+		echo "Compare with previous runs:"; \
+		echo "  python3 tests/integration/compare_results.py $(BENCHMARK_REPORT_DIR)/<old>_stats.csv $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv"; \
+	fi
+
+# Start benchmark cluster for interactive testing via web UI
+# After starting, open http://localhost:8089 to access Locust web UI
+benchmark-up:
+	@echo "Starting benchmark cluster with Locust web UI..."
+	@if [ "$(BENCHMARK_BUILD)" = "1" ]; then \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build; \
+	else \
+		echo "  (using cached images, set BENCHMARK_BUILD=1 to rebuild)"; \
+		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d; \
+	fi
+	@echo ""
+	@echo "Cluster started. Endpoints:"
+	@echo "  Locust Web UI: http://localhost:8089"
+	@echo "  Node 1: http://localhost:8081 (metrics: http://localhost:9181)"
+	@echo "  Node 2: http://localhost:8082 (metrics: http://localhost:9182)"
+	@echo "  Node 3: http://localhost:8083 (metrics: http://localhost:9183)"
+	@echo ""
+	@echo "Use 'make benchmark-down' to stop the cluster"
+
+# Stop benchmark cluster
+benchmark-down:
+	@echo "Stopping benchmark cluster..."
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans
+	@echo "Cleanup complete"
+
 # Build Docker production image (uses docker-compose to work in devcontainers)
 docker-build:
 	@echo "Building production Docker image..."
@@ -120,6 +237,26 @@ help:
 	@echo "  make test           - Run all tests (currently: unit tests)"
 	@echo "  make test-unit      - Run unit tests"
 	@echo "  make test-integration - Run multi-node integration tests"
+	@echo ""
+	@echo "Benchmark targets:"
+	@echo "  make benchmark      - Run Locust load test (headless, 5 min)"
+	@echo "                        Outputs: benchmark-reports/*.csv, *.html"
+	@echo "                        Fails if: P99 TTFT > threshold or sync errors > 0"
+	@echo "  make benchmark-up   - Start cluster with Locust web UI (port 8089)"
+	@echo "  make benchmark-down - Stop benchmark cluster"
+	@echo ""
+	@echo "  Benchmark variables (override with make benchmark VAR=value):"
+	@echo "    BENCHMARK_USERS=10       - Number of concurrent users"
+	@echo "    BENCHMARK_SPAWN_RATE=2   - Users spawned per second"
+	@echo "    BENCHMARK_DURATION=5m    - Test duration"
+	@echo "    BENCHMARK_REPORT_DIR=benchmark-reports - Report output dir"
+	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
+	@echo "    BENCHMARK_LABEL=<name>   - Label prefix (e.g., token_on → token_on_YYYYMMDD_HHMMSS)"
+	@echo "    BENCHMARK_BUILD=1        - Set to 0 to skip rebuilding images"
+	@echo "    BENCHMARK_TOKEN_FORWARDING=0 - Set to 1 to enable token forwarding"
+	@echo ""
+	@echo "  Compare benchmark results:"
+	@echo "    python3 tests/integration/compare_results.py <baseline.csv> <new.csv>"
 	@echo ""
 	@echo "Integration test helpers:"
 	@echo "  make integration-up   - Start test cluster for debugging"
