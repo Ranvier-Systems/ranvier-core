@@ -92,9 +92,15 @@ BENCHMARK_SPAWN_RATE ?= 2
 BENCHMARK_DURATION ?= 5m
 BENCHMARK_REPORT_DIR ?= benchmark-reports
 P99_LATENCY_THRESHOLD_MS ?= 100
-BENCHMARK_RUN_NAME ?= $(shell date +%Y%m%d_%H%M%S)
 BENCHMARK_BUILD ?= 1
 BENCHMARK_TOKEN_FORWARDING ?= 0
+
+# Benchmark run naming: combines optional label with timestamp
+# Usage: make benchmark BENCHMARK_LABEL=token_on → token_on_20251227_012810_*
+#        make benchmark                          → 20251227_012810_*
+BENCHMARK_TIMESTAMP := $(shell date +%Y%m%d_%H%M%S)
+BENCHMARK_LABEL ?=
+BENCHMARK_RUN_NAME := $(if $(BENCHMARK_LABEL),$(BENCHMARK_LABEL)_$(BENCHMARK_TIMESTAMP),$(BENCHMARK_TIMESTAMP))
 
 # Run load testing benchmark in headless mode
 # Runs for 5 minutes by default, outputs CSV and HTML reports
@@ -245,7 +251,7 @@ help:
 	@echo "    BENCHMARK_DURATION=5m    - Test duration"
 	@echo "    BENCHMARK_REPORT_DIR=benchmark-reports - Report output dir"
 	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
-	@echo "    BENCHMARK_RUN_NAME=<timestamp> - Custom name for this run"
+	@echo "    BENCHMARK_LABEL=<name>   - Label prefix (e.g., token_on → token_on_YYYYMMDD_HHMMSS)"
 	@echo "    BENCHMARK_BUILD=1        - Set to 0 to skip rebuilding images"
 	@echo "    BENCHMARK_TOKEN_FORWARDING=0 - Set to 1 to enable token forwarding"
 	@echo ""
