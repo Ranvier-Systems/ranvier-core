@@ -191,11 +191,166 @@ docker build -f Dockerfile.production -t ranvier:test .
 ```
 tests/integration/
 ├── README.md                    # This file
-├── test_cluster.py             # Main test script
-├── mock_backend.py             # Mock vLLM backend
-├── Dockerfile.mock-backend     # Dockerfile for mock backend
+├── test_cluster.py              # Main integration test script
+├── mock_backend.py              # Mock vLLM backend
+├── Dockerfile.mock-backend      # Dockerfile for mock backend
+├── locustfile.py                # Locust load testing scenarios
+├── Dockerfile.locust            # Dockerfile for Locust service
+├── parse_locust_output.py       # Parser for extracting stats from Locust output
+├── compare_results.py           # Tool for comparing benchmark results
 └── configs/
-    ├── node1.yaml              # Node 1 configuration
-    ├── node2.yaml              # Node 2 configuration
-    └── node3.yaml              # Node 3 configuration
+    ├── node1.yaml               # Node 1 configuration
+    ├── node2.yaml               # Node 2 configuration
+    └── node3.yaml               # Node 3 configuration
 ```
+
+---
+
+## Load Testing / Benchmarking
+
+In addition to functional integration tests, this directory contains a Locust-based load testing framework for performance benchmarking.
+
+### Overview
+
+The load testing framework:
+- Uses [Locust](https://locust.io/) to simulate concurrent users
+- Measures **TTFT (Time To First Token)** - time from request start to first SSE chunk
+- Validates P99 latency thresholds and cluster sync errors
+- Supports A/B comparisons between configurations
+
+### Quick Start
+
+```bash
+# Run a 5-minute benchmark (default settings)
+make benchmark
+
+# Run with a descriptive label (creates timestamped files)
+make benchmark BENCHMARK_LABEL=baseline
+
+# Skip rebuilding images for faster iteration
+make benchmark BENCHMARK_BUILD=0 BENCHMARK_LABEL=quick_test
+
+# Run with token forwarding enabled for A/B comparison
+make benchmark BENCHMARK_LABEL=token_off BENCHMARK_TOKEN_FORWARDING=0
+make benchmark BENCHMARK_LABEL=token_on BENCHMARK_TOKEN_FORWARDING=1 BENCHMARK_BUILD=0
+```
+
+### Configuration Options
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_USERS` | 10 | Number of concurrent simulated users |
+| `BENCHMARK_SPAWN_RATE` | 2 | Users spawned per second |
+| `BENCHMARK_DURATION` | 5m | Test duration (e.g., `1m`, `5m`, `1h`) |
+| `BENCHMARK_LABEL` | _(empty)_ | Label prefix for output files |
+| `BENCHMARK_BUILD` | 1 | Set to `0` to skip rebuilding Docker images |
+| `BENCHMARK_TOKEN_FORWARDING` | 0 | Set to `1` to enable token forwarding |
+| `P99_LATENCY_THRESHOLD_MS` | 100 | P99 TTFT threshold in milliseconds |
+| `BENCHMARK_REPORT_DIR` | benchmark-reports | Output directory for results |
+
+### Output Files
+
+Each benchmark run creates timestamped files in `benchmark-reports/`:
+
+```
+benchmark-reports/
+├── baseline_20251227_123456_output.log   # Raw Locust output
+├── baseline_20251227_123456_stats.csv    # Parsed statistics
+├── token_on_20251227_124500_output.log
+├── token_on_20251227_124500_stats.csv
+└── ...
+```
+
+### Comparing Results
+
+Use the comparison script to analyze A/B test results:
+
+```bash
+python3 tests/integration/compare_results.py \
+  benchmark-reports/token_off_20251227_123456_stats.csv \
+  benchmark-reports/token_on_20251227_124500_stats.csv
+```
+
+Example output:
+```
+================================================================================
+BENCHMARK COMPARISON
+================================================================================
+Baseline: benchmark-reports/token_off_20251227_123456_stats.csv
+New:      benchmark-reports/token_on_20251227_124500_stats.csv
+
+Metric                        Baseline          New                         Change
+--------------------------------------------------------------------------------
+P50 TTFT (ms)                    55.00        55.00             0.00 (0.0%) ~ SAME
+P99 TTFT (ms)                    66.00        61.00         -5.00 (-7.6%) ✓ BETTER
+Requests/sec                      6.76         7.29         +0.53 (+7.8%) ✓ BETTER
+...
+
+🎉 P99 TTFT improved by 7.6%
+================================================================================
+```
+
+### Validation Criteria
+
+The benchmark **fails** if:
+- P99 TTFT exceeds the threshold (`P99_LATENCY_THRESHOLD_MS`, default 100ms)
+- Any `router_cluster_sync_errors` occur during the run
+
+### Interactive Mode
+
+For debugging or exploratory testing, start the cluster with Locust's web UI:
+
+```bash
+# Start cluster with Locust web UI
+make benchmark-up
+
+# Open http://localhost:8089 in your browser
+# Configure users, spawn rate, and start the test
+
+# Stop when done
+make benchmark-down
+```
+
+### What is TTFT?
+
+**Time To First Token (TTFT)** measures the latency from when a client sends a request until it receives the first SSE `data:` chunk from the streaming response. This is a critical metric for LLM applications because:
+
+- It determines how quickly users see the first response
+- It includes router overhead, network latency, and backend startup time
+- Lower TTFT = more responsive user experience
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Docker Network (172.28.0.0/16)               │
+│                                                                  │
+│  ┌─────────────┐    ┌─────────────────────────────────────────┐ │
+│  │   Locust    │    │           Ranvier Cluster               │ │
+│  │  (Load Gen) │    │                                         │ │
+│  │             │───►│  ┌────────┐ ┌────────┐ ┌────────┐      │ │
+│  │ Simulates   │    │  │ Node 1 │ │ Node 2 │ │ Node 3 │      │ │
+│  │ N users     │    │  └───┬────┘ └───┬────┘ └───┬────┘      │ │
+│  └─────────────┘    │      │          │          │            │ │
+│                      │      └──────────┼──────────┘            │ │
+│                      │                 ▼                       │ │
+│                      │  ┌──────────────────────────────────┐  │ │
+│                      │  │         Mock Backends            │  │ │
+│                      │  │   Backend 1      Backend 2       │  │ │
+│                      │  └──────────────────────────────────┘  │ │
+│                      └─────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Performance Notes
+
+The benchmark runs in a Docker environment, so absolute numbers will differ from production. Use it for:
+
+- **Relative comparisons**: "Did this change improve or regress performance?"
+- **Regression detection**: CI can fail if P99 exceeds threshold
+- **A/B testing**: Compare configurations (e.g., token forwarding on/off)
+
+For production performance testing, use dedicated infrastructure with:
+- Native Linux (not Docker Desktop)
+- Adequate CPU/memory resources
+- Real vLLM backends instead of mock
