@@ -94,6 +94,7 @@ BENCHMARK_REPORT_DIR ?= benchmark-reports
 P99_LATENCY_THRESHOLD_MS ?= 100
 BENCHMARK_RUN_NAME ?= $(shell date +%Y%m%d_%H%M%S)
 BENCHMARK_BUILD ?= 1
+BENCHMARK_TOKEN_FORWARDING ?= 0
 
 # Run load testing benchmark in headless mode
 # Runs for 5 minutes by default, outputs CSV and HTML reports
@@ -108,6 +109,7 @@ benchmark:
 	@echo "  Spawn rate: $(BENCHMARK_SPAWN_RATE)/s"
 	@echo "  Duration: $(BENCHMARK_DURATION)"
 	@echo "  P99 TTFT threshold: $(P99_LATENCY_THRESHOLD_MS)ms"
+	@echo "  Token forwarding: $(BENCHMARK_TOKEN_FORWARDING)"
 	@echo "  Reports: $(BENCHMARK_REPORT_DIR)/"
 	@echo ""
 	@if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1) && \
@@ -118,9 +120,11 @@ benchmark:
 	@mkdir -p $(BENCHMARK_REPORT_DIR)
 	@echo "Starting test cluster..."
 	@if [ "$(BENCHMARK_BUILD)" = "1" ]; then \
+		RANVIER_ENABLE_TOKEN_FORWARDING=$(BENCHMARK_TOKEN_FORWARDING) \
 		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d --build; \
 	else \
 		echo "  (using cached images, set BENCHMARK_BUILD=1 to rebuild)"; \
+		RANVIER_ENABLE_TOKEN_FORWARDING=$(BENCHMARK_TOKEN_FORWARDING) \
 		$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark up -d; \
 	fi
 	@echo "Waiting for cluster to become healthy..."
@@ -243,6 +247,7 @@ help:
 	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
 	@echo "    BENCHMARK_RUN_NAME=<timestamp> - Custom name for this run"
 	@echo "    BENCHMARK_BUILD=1        - Set to 0 to skip rebuilding images"
+	@echo "    BENCHMARK_TOKEN_FORWARDING=0 - Set to 1 to enable token forwarding"
 	@echo ""
 	@echo "  Compare benchmark results:"
 	@echo "    python3 tests/integration/compare_results.py <baseline.csv> <new.csv>"
