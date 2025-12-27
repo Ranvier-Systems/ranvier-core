@@ -92,6 +92,7 @@ BENCHMARK_SPAWN_RATE ?= 2
 BENCHMARK_DURATION ?= 5m
 BENCHMARK_REPORT_DIR ?= benchmark-reports
 P99_LATENCY_THRESHOLD_MS ?= 100
+BENCHMARK_RUN_NAME ?= $(shell date +%Y%m%d_%H%M%S)
 
 # Run load testing benchmark in headless mode
 # Runs for 5 minutes by default, outputs CSV and HTML reports
@@ -120,10 +121,11 @@ benchmark:
 	@sleep 15
 	@echo ""
 	@echo "Starting Locust load test..."
+	@echo "Run name: $(BENCHMARK_RUN_NAME)"
 	@P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
-	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run \
-		--name ranvier-benchmark-run \
+	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark run --rm \
 		-e P99_LATENCY_THRESHOLD_MS=$(P99_LATENCY_THRESHOLD_MS) \
+		-e BENCHMARK_RUN_NAME=$(BENCHMARK_RUN_NAME) \
 		locust \
 		-f /mnt/locust/locustfile.py \
 		--host=http://172.28.2.1:8080 \
@@ -131,19 +133,16 @@ benchmark:
 		--spawn-rate $(BENCHMARK_SPAWN_RATE) \
 		--run-time $(BENCHMARK_DURATION) \
 		--headless \
-		--csv=/tmp/benchmark \
-		--html=/tmp/benchmark.html \
 		--only-summary \
 		--exit-code-on-error 1 \
-	; LOCUST_EXIT=$$?; \
+		2>&1 | tee $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_output.log \
+	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
 	echo ""; \
-	echo "Extracting reports..."; \
-	docker cp ranvier-benchmark-run:/tmp/benchmark.html $(BENCHMARK_REPORT_DIR)/benchmark.html 2>/dev/null || true; \
-	docker cp ranvier-benchmark-run:/tmp/benchmark_stats.csv $(BENCHMARK_REPORT_DIR)/benchmark_stats.csv 2>/dev/null || true; \
-	docker cp ranvier-benchmark-run:/tmp/benchmark_stats_history.csv $(BENCHMARK_REPORT_DIR)/benchmark_stats_history.csv 2>/dev/null || true; \
-	docker cp ranvier-benchmark-run:/tmp/benchmark_failures.csv $(BENCHMARK_REPORT_DIR)/benchmark_failures.csv 2>/dev/null || true; \
-	docker cp ranvier-benchmark-run:/tmp/benchmark_exceptions.csv $(BENCHMARK_REPORT_DIR)/benchmark_exceptions.csv 2>/dev/null || true; \
-	docker rm ranvier-benchmark-run 2>/dev/null || true; \
+	echo "Parsing results..."; \
+	python3 tests/integration/parse_locust_output.py \
+		$(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_output.log \
+		$(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv \
+		2>/dev/null || echo "  (parser not available, raw log saved)"; \
 	echo "Stopping test cluster..."; \
 	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans; \
 	echo ""; \
@@ -151,17 +150,16 @@ benchmark:
 		echo "======================================"; \
 		echo "BENCHMARK FAILED (exit code: $$LOCUST_EXIT)"; \
 		echo "======================================"; \
-		echo "Check $(BENCHMARK_REPORT_DIR)/ for detailed reports"; \
+		echo "Results saved to: $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_*"; \
 		exit $$LOCUST_EXIT; \
 	else \
 		echo "======================================"; \
 		echo "BENCHMARK PASSED"; \
 		echo "======================================"; \
-		echo "Reports available in $(BENCHMARK_REPORT_DIR)/"; \
-		echo "  - benchmark.html (HTML report)"; \
-		echo "  - benchmark_stats.csv (request statistics)"; \
-		echo "  - benchmark_stats_history.csv (time series)"; \
-		echo "  - benchmark_failures.csv (failure details)"; \
+		echo "Results saved to: $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_*"; \
+		echo ""; \
+		echo "Compare with previous runs:"; \
+		echo "  python3 tests/integration/compare_results.py $(BENCHMARK_REPORT_DIR)/<old>_stats.csv $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv"; \
 	fi
 
 # Start benchmark cluster for interactive testing via web UI
@@ -232,6 +230,10 @@ help:
 	@echo "    BENCHMARK_DURATION=5m    - Test duration"
 	@echo "    BENCHMARK_REPORT_DIR=benchmark-reports - Report output dir"
 	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
+	@echo "    BENCHMARK_RUN_NAME=<timestamp> - Custom name for this run"
+	@echo ""
+	@echo "  Compare benchmark results:"
+	@echo "    python3 tests/integration/compare_results.py <baseline.csv> <new.csv>"
 	@echo ""
 	@echo "Integration test helpers:"
 	@echo "  make integration-up   - Start test cluster for debugging"
