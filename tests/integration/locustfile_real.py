@@ -693,10 +693,14 @@ def on_test_stop(environment, **kwargs):
         logger.info(f"  Backend First Byte: {latency_breakdown['first_byte_latency_ms']:.2f}ms")
     if latency_breakdown["total_latency_ms"] is not None:
         logger.info(f"  Total Request: {latency_breakdown['total_latency_ms']:.2f}ms")
-        # Calculate Ranvier overhead (total - first_byte approximates routing + connect + overhead)
-        if latency_breakdown["first_byte_latency_ms"] is not None:
-            overhead = latency_breakdown["total_latency_ms"] - latency_breakdown["first_byte_latency_ms"]
-            logger.info(f"  Ranvier Overhead: {overhead:.2f}ms (excl. backend response)")
+
+    # Calculate actual Ranvier overhead (routing + connect)
+    routing = latency_breakdown.get("routing_latency_ms") or 0
+    connect = latency_breakdown.get("connect_latency_ms") or 0
+    if routing > 0 or connect > 0:
+        ranvier_overhead = routing + connect
+        logger.info(f"  Ranvier Overhead: {ranvier_overhead:.2f}ms (routing + connect)")
+        latency_breakdown["ranvier_overhead_ms"] = ranvier_overhead
 
     # Add to summary for JSON output
     summary.update(latency_breakdown)
