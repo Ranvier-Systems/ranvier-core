@@ -337,6 +337,92 @@ def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
         return None
 
 
+def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
+    """Get average value from a Prometheus histogram (sum/count)."""
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        sum_val = None
+        count_val = None
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            if f"{metric_name}_sum" in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    sum_val = float(match.group(1))
+            elif f"{metric_name}_count" in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    count_val = float(match.group(1))
+
+        if sum_val is not None and count_val is not None and count_val > 0:
+            return sum_val / count_val
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch histogram from {metrics_url}: {e}")
+        return None
+
+
+def get_ranvier_latency_breakdown() -> dict:
+    """Get Ranvier's internal latency breakdown from Prometheus metrics.
+
+    Returns average latencies in milliseconds for:
+    - routing_latency: Time spent making routing decision
+    - connect_latency: Time to establish backend connection
+    - first_byte_latency: Time to receive first byte from backend (TTFT)
+    - total_latency: Total request processing time
+    """
+    breakdown = {
+        "routing_latency_ms": None,
+        "connect_latency_ms": None,
+        "first_byte_latency_ms": None,
+        "total_latency_ms": None,
+    }
+
+    # Aggregate from all nodes
+    routing_sum, routing_count = 0.0, 0
+    connect_sum, connect_count = 0.0, 0
+    first_byte_sum, first_byte_count = 0.0, 0
+    total_sum, total_count = 0.0, 0
+
+    for metrics_url in RANVIER_METRICS:
+        routing = get_histogram_avg(metrics_url, "router_routing_latency_seconds")
+        if routing is not None:
+            routing_sum += routing
+            routing_count += 1
+
+        connect = get_histogram_avg(metrics_url, "backend_connect_duration_seconds")
+        if connect is not None:
+            connect_sum += connect
+            connect_count += 1
+
+        first_byte = get_histogram_avg(metrics_url, "backend_response_duration_seconds")
+        if first_byte is not None:
+            first_byte_sum += first_byte
+            first_byte_count += 1
+
+        total = get_histogram_avg(metrics_url, "router_request_total_latency_seconds")
+        if total is not None:
+            total_sum += total
+            total_count += 1
+
+    # Calculate averages across nodes (convert to ms)
+    if routing_count > 0:
+        breakdown["routing_latency_ms"] = (routing_sum / routing_count) * 1000
+    if connect_count > 0:
+        breakdown["connect_latency_ms"] = (connect_sum / connect_count) * 1000
+    if first_byte_count > 0:
+        breakdown["first_byte_latency_ms"] = (first_byte_sum / first_byte_count) * 1000
+    if total_count > 0:
+        breakdown["total_latency_ms"] = (total_sum / total_count) * 1000
+
+    return breakdown
+
+
 def register_backends_on_all_nodes():
     """Register backends on all Ranvier nodes."""
     global _backends_registered
@@ -595,6 +681,25 @@ def on_test_stop(environment, **kwargs):
     logger.info(f"  Total Prompt Tokens: {summary['total_prompt_tokens']}")
     logger.info(f"  Total Completion Tokens: {summary['total_completion_tokens']}")
     logger.info(f"  Tokens/Second: {summary['tokens_per_second']:.1f}")
+
+    # Print Ranvier internal latency breakdown
+    latency_breakdown = get_ranvier_latency_breakdown()
+    logger.info(f"\nRanvier Latency Breakdown (avg):")
+    if latency_breakdown["routing_latency_ms"] is not None:
+        logger.info(f"  Routing Decision: {latency_breakdown['routing_latency_ms']:.2f}ms")
+    if latency_breakdown["connect_latency_ms"] is not None:
+        logger.info(f"  Backend Connect: {latency_breakdown['connect_latency_ms']:.2f}ms")
+    if latency_breakdown["first_byte_latency_ms"] is not None:
+        logger.info(f"  Backend First Byte: {latency_breakdown['first_byte_latency_ms']:.2f}ms")
+    if latency_breakdown["total_latency_ms"] is not None:
+        logger.info(f"  Total Request: {latency_breakdown['total_latency_ms']:.2f}ms")
+        # Calculate Ranvier overhead (total - first_byte approximates routing + connect + overhead)
+        if latency_breakdown["first_byte_latency_ms"] is not None:
+            overhead = latency_breakdown["total_latency_ms"] - latency_breakdown["first_byte_latency_ms"]
+            logger.info(f"  Ranvier Overhead: {overhead:.2f}ms (excl. backend response)")
+
+    # Add to summary for JSON output
+    summary.update(latency_breakdown)
 
     # Check sync errors
     sync_passed, sync_msg = check_sync_errors()
