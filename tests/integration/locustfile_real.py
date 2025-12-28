@@ -685,7 +685,16 @@ class RealBackendUser(HttpUser):
             )
 
             # Get backend ID from response headers
+            # Note: Ranvier doesn't currently set X-Backend-ID, so we infer it
             metrics.backend_id = get_backend_from_response(dict(resp.headers))
+            if metrics.backend_id is None:
+                if SINGLE_BACKEND_MODE:
+                    # Single backend mode: all requests go to backend 1
+                    metrics.backend_id = "1"
+                else:
+                    # Multi-backend: can't track without X-Backend-ID header
+                    # Use node index as proxy (not accurate for prefix routing)
+                    metrics.backend_id = str((node_index % len(BACKENDS)) + 1)
 
             if resp.status_code != 200:
                 events.request.fire(

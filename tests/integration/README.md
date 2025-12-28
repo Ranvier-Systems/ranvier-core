@@ -384,19 +384,37 @@ Mock backends respond instantly, which is useful for measuring router latency bu
 ### Quick Start
 
 ```bash
-# With external vLLM endpoints
+# Single-GPU sanity check (recommended starting point)
+HF_TOKEN=your_token make benchmark-single-gpu
+
+# With external vLLM endpoints (2+ GPUs)
 VLLM_ENDPOINT_1=http://gpu-server1:8000 \
 VLLM_ENDPOINT_2=http://gpu-server2:8000 \
 make benchmark-real
 
-# With local vLLM (requires GPU)
+# With local vLLM (requires 2+ GPUs)
 make benchmark-real-local
 
-# A/B comparison: prefix-aware vs round-robin
+# A/B comparison: prefix-aware vs round-robin (requires 2+ GPUs)
 VLLM_ENDPOINT_1=http://gpu1:8000 \
 VLLM_ENDPOINT_2=http://gpu2:8000 \
 make benchmark-comparison
 ```
+
+### Known Limitations
+
+**Multi-shard mode bug**: The Ranvier server crashes with a segfault when running
+with `--smp 2` (multi-shard) and real vLLM backends. The benchmark infrastructure
+uses `--smp 1` as a workaround. This is tracked as a known issue.
+
+**Cache hit tracking**: Accurate cache hit tracking requires Ranvier to inject an
+`X-Backend-ID` header into responses. Until this is implemented:
+- Single-backend mode: Cache hits are tracked correctly (all requests go to backend 1)
+- Multi-backend mode: Cache hits are approximated based on request distribution
+
+**Single-GPU testing**: With only 1 GPU, you can run sanity checks but cannot
+perform A/B comparisons between routing strategies (prefix-aware vs round-robin).
+Use `make benchmark-single-gpu` for basic validation.
 
 ### Configuration
 
