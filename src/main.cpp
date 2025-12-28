@@ -189,7 +189,7 @@ future<> run() {
             g_config.cluster.peers.size(), g_config.cluster.gossip_port);
     }
 
-    // 2. Init Controller with config on ALL shards
+    // 2. Build HttpController config
     // HttpController must be sharded because it contains shard-local state:
     // - ConnectionPool: manages TCP connections per-shard
     // - RateLimiter: tracks per-client request rates
@@ -220,9 +220,12 @@ future<> run() {
     ctrl_config.accept_client_tokens = g_config.routing.accept_client_tokens;
     ctrl_config.max_token_id = g_config.routing.max_token_id;
 
-    // Start HttpController on all shards - each shard gets its own instance
-    // Chain this as a future since we can't block on the reactor thread
-    return controller.start(std::ref(tokenizer), std::ref(*router), ctrl_config).then([] {
+    // 3. Initialize router's thread-local data on all shards, then start services
+    // Each shard needs its own RadixTree and backend maps for the shared-nothing architecture
+    return router->initialize_shards().then([ctrl_config] {
+        // Start HttpController on all shards - each shard gets its own instance
+        return controller.start(std::ref(tokenizer), std::ref(*router), ctrl_config);
+    }).then([] {
         // 2a. Initialize metrics on all shards
         ranvier::init_metrics();
 
