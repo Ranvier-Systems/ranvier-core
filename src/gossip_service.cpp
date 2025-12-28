@@ -323,13 +323,17 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     if (_route_learn_callback) {
         auto shared_tokens = std::make_shared<std::vector<TokenId>>(std::move(pkt->tokens));
         auto b_id = pkt->backend_id;
+        // Copy the callback to avoid cross-shard memory access.
+        // The callback captures RouterService 'this', but learn_route_remote()
+        // only accesses thread_local data, making it safe to call from any shard.
+        auto callback = _route_learn_callback;
 
         // Use an integer range from 0 to seastar::smp::count
         return seastar::parallel_for_each(
                 boost::irange<unsigned>(0, seastar::smp::count),
-                [this, shared_tokens, b_id](unsigned shard_id) {
-                return seastar::smp::submit_to(shard_id, [this, shared_tokens, b_id] {
-                        return _route_learn_callback(*shared_tokens, b_id);
+                [callback, shared_tokens, b_id](unsigned shard_id) {
+                return seastar::smp::submit_to(shard_id, [callback, shared_tokens, b_id] {
+                        return callback(*shared_tokens, b_id);
                         });
                 });
     }
@@ -383,12 +387,14 @@ void GossipService::check_liveness() {
 
             if (state.associated_backend && _route_prune_callback) {
                 BackendId b_id = *state.associated_backend;
+                // Copy the callback to avoid cross-shard memory access
+                auto callback = _route_prune_callback;
 
                 // Broadcast the prune command to ALL shards
                 (void)seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
-                    [this, b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [this, b_id] {
-                            return _route_prune_callback(b_id);
+                    [callback, b_id](unsigned shard_id) {
+                        return seastar::smp::submit_to(shard_id, [callback, b_id] {
+                            return callback(b_id);
                         });
                     });
             }
@@ -514,11 +520,13 @@ seastar::future<> GossipService::refresh_peers() {
                 // Prune routes for removed peers if they had an associated backend
                 if (state.associated_backend && _route_prune_callback) {
                     BackendId b_id = *state.associated_backend;
+                    // Copy the callback to avoid cross-shard memory access
+                    auto callback = _route_prune_callback;
                     (void)seastar::parallel_for_each(
                         boost::irange<unsigned>(0, seastar::smp::count),
-                        [this, b_id](unsigned shard_id) {
-                            return seastar::smp::submit_to(shard_id, [this, b_id] {
-                                return _route_prune_callback(b_id);
+                        [callback, b_id](unsigned shard_id) {
+                            return seastar::smp::submit_to(shard_id, [callback, b_id] {
+                                return callback(b_id);
                             });
                         });
                 }
