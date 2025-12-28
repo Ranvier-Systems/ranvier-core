@@ -58,18 +58,30 @@ RANVIER_METRICS = [
     os.environ.get("RANVIER_METRICS3", "http://172.29.2.3:9180"),
 ]
 
-BACKENDS = [
-    {
-        "id": 1,
-        "ip": os.environ.get("BACKEND1_IP", "172.29.1.10"),
-        "port": int(os.environ.get("BACKEND1_PORT", "8000")),
-    },
-    {
-        "id": 2,
-        "ip": os.environ.get("BACKEND2_IP", "172.29.1.11"),
-        "port": int(os.environ.get("BACKEND2_PORT", "8000")),
-    },
-]
+# Support single-backend mode for single-GPU testing
+SINGLE_BACKEND_MODE = os.environ.get("SINGLE_BACKEND_MODE", "false").lower() == "true"
+
+if SINGLE_BACKEND_MODE:
+    BACKENDS = [
+        {
+            "id": 1,
+            "ip": os.environ.get("BACKEND1_IP", "172.29.1.10"),
+            "port": int(os.environ.get("BACKEND1_PORT", "8000")),
+        },
+    ]
+else:
+    BACKENDS = [
+        {
+            "id": 1,
+            "ip": os.environ.get("BACKEND1_IP", "172.29.1.10"),
+            "port": int(os.environ.get("BACKEND1_PORT", "8000")),
+        },
+        {
+            "id": 2,
+            "ip": os.environ.get("BACKEND2_IP", "172.29.1.11"),
+            "port": int(os.environ.get("BACKEND2_PORT", "8000")),
+        },
+    ]
 
 # Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")

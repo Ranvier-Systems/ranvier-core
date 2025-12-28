@@ -63,6 +63,7 @@ services:
       start_period: 120s
     profiles:
       - local-vllm
+      - single-gpu
 
   vllm-backend2:
     image: vllm/vllm-openai:latest
@@ -260,6 +261,59 @@ services:
         condition: service_healthy
     profiles:
       - benchmark
+
+  # ============================================================================
+  # SINGLE-GPU LOCUST (For testing with 1 GPU)
+  # ============================================================================
+
+  locust-single-gpu:
+    image: ranvier-locust:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.locust
+    container_name: locust-single-gpu
+    networks:
+      - ranvier-benchmark
+    ports:
+      - "8089:8089"
+      - "8090:8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - LOCUST_HOST=http://172.29.2.1:8080
+      - LOCUST_LOCUSTFILE=/mnt/locust/locustfile_real.py
+      # Ranvier node endpoints
+      - RANVIER_NODE1=http://172.29.2.1:8080
+      - RANVIER_NODE2=http://172.29.2.2:8080
+      - RANVIER_NODE3=http://172.29.2.3:8080
+      # Metrics endpoints
+      - RANVIER_METRICS1=http://172.29.2.1:9180
+      - RANVIER_METRICS2=http://172.29.2.2:9180
+      - RANVIER_METRICS3=http://172.29.2.3:9180
+      # Single backend for single-GPU mode
+      - SINGLE_BACKEND_MODE=true
+      - BACKEND1_IP=172.29.1.10
+      - BACKEND1_PORT=8000
+      # vLLM endpoint for health checks
+      - VLLM_ENDPOINT_1=http://172.29.1.10:8000
+      # Benchmark settings
+      - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
+      - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
+      - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
+      - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
+    volumes:
+      - ./tests/integration:/mnt/locust:ro
+    depends_on:
+      ranvier1:
+        condition: service_healthy
+      ranvier2:
+        condition: service_healthy
+      ranvier3:
+        condition: service_healthy
+      vllm-backend1:
+        condition: service_healthy
+    profiles:
+      - single-gpu
 
   # ============================================================================
   # PROMETHEUS (Optional - for detailed metrics collection)

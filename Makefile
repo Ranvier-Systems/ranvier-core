@@ -1,7 +1,7 @@
 # Ranvier Core Makefile
 # Build and test targets for the Ranvier LLM routing layer
 
-.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-comparison benchmark-real-up benchmark-real-down help
+.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down help
 
 # Default target
 all: build
@@ -338,6 +338,66 @@ benchmark-real-local:
 	echo "Results saved to: $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_*"; \
 	exit $$LOCUST_EXIT
 
+# Run benchmark with single GPU (sanity check mode)
+# Useful when you only have 1 GPU available for testing
+benchmark-single-gpu:
+	@echo "======================================"
+	@echo "Running Single-GPU Benchmark Test"
+	@echo "======================================"
+	@echo ""
+	@if ! command -v nvidia-smi >/dev/null 2>&1; then \
+		echo "Error: nvidia-smi not found. GPU required."; \
+		exit 1; \
+	fi
+	@echo "GPU detected:"
+	@nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
+	@echo ""
+	@echo "This is a sanity check test with a single vLLM backend."
+	@echo "For A/B comparison of routing strategies, use 2+ GPUs."
+	@echo "Model: $${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
+	@echo ""
+	@mkdir -p $(BENCHMARK_REAL_REPORT_DIR)
+	@echo "Starting vLLM backend and Ranvier cluster..."
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu up -d --build
+	@echo "Waiting for vLLM backend to load model (this may take 2-3 minutes)..."
+	@sleep 120
+	@echo ""
+	@echo "Starting load test..."
+	@BENCHMARK_RUN_NAME=$$(date +%Y%m%d_%H%M%S)_single_gpu; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu run --rm \
+		-e BENCHMARK_MODE=$${RANVIER_ROUTING_MODE:-prefix} \
+		locust-single-gpu \
+		-f /mnt/locust/locustfile_real.py \
+		--host=http://172.29.2.1:8080 \
+		--users $(BENCHMARK_REAL_USERS) \
+		--spawn-rate $(BENCHMARK_REAL_SPAWN_RATE) \
+		--run-time $(BENCHMARK_REAL_DURATION) \
+		--headless \
+		--only-summary \
+		--exit-code-on-error 1 \
+		2>&1 | tee $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
+	echo ""; \
+	echo "Parsing results..."; \
+	python3 tests/integration/parse_real_benchmark.py \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		2>/dev/null || echo "  (parser output above)"; \
+	echo "Stopping cluster..."; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu down -v --remove-orphans; \
+	echo ""; \
+	if [ $$LOCUST_EXIT -ne 0 ]; then \
+		echo "======================================"; \
+		echo "BENCHMARK FAILED (exit code: $$LOCUST_EXIT)"; \
+		echo "======================================"; \
+	else \
+		echo "======================================"; \
+		echo "BENCHMARK PASSED"; \
+		echo "======================================"; \
+	fi; \
+	echo "Results saved to: $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_*"; \
+	exit $$LOCUST_EXIT
+
 # Run A/B comparison: prefix-aware vs round-robin routing
 benchmark-comparison:
 	@echo "======================================"
@@ -373,7 +433,7 @@ benchmark-real-up:
 # Stop real benchmark cluster
 benchmark-real-down:
 	@echo "Stopping real benchmark cluster..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark down -v --remove-orphans
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark --profile single-gpu down -v --remove-orphans
 	@echo "Cleanup complete"
 
 # Build Docker production image (uses docker-compose to work in devcontainers)
@@ -419,7 +479,8 @@ help:
 	@echo "Real vLLM Backend Benchmark (validates prefix-aware routing value):"
 	@echo "  make benchmark-real       - Run with external vLLM endpoints"
 	@echo "                              Requires: VLLM_ENDPOINT_1, VLLM_ENDPOINT_2"
-	@echo "  make benchmark-real-local - Run with local vLLM (requires GPU)"
+	@echo "  make benchmark-real-local - Run with local vLLM (requires 2 GPUs)"
+	@echo "  make benchmark-single-gpu - Sanity check with 1 GPU (no A/B test)"
 	@echo "  make benchmark-comparison - A/B test: prefix vs round-robin routing"
 	@echo "  make benchmark-real-up    - Start cluster for interactive testing"
 	@echo "  make benchmark-real-down  - Stop real benchmark cluster"
