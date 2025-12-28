@@ -292,8 +292,24 @@ benchmark-real-local:
 	@echo "Running Local vLLM Backend Benchmark"
 	@echo "======================================"
 	@echo ""
+	@# Pre-flight checks for required environment
 	@if ! command -v nvidia-smi >/dev/null 2>&1; then \
 		echo "Error: nvidia-smi not found. GPU required for local vLLM."; \
+		exit 1; \
+	fi
+	@if [ -z "$${HF_TOKEN:-}" ]; then \
+		echo "======================================"; \
+		echo "Error: HF_TOKEN environment variable not set"; \
+		echo "======================================"; \
+		echo ""; \
+		echo "The Llama model requires authentication with Hugging Face."; \
+		echo ""; \
+		echo "To fix:"; \
+		echo "  1. Get a token from https://huggingface.co/settings/tokens"; \
+		echo "  2. Accept the license at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct"; \
+		echo "  3. Run: export HF_TOKEN=your_token_here"; \
+		echo "  4. Re-run this benchmark"; \
+		echo ""; \
 		exit 1; \
 	fi
 	@echo "GPU detected. Starting local vLLM backends..."
@@ -348,8 +364,24 @@ benchmark-single-gpu:
 	@echo "Running Single-GPU Benchmark Test"
 	@echo "======================================"
 	@echo ""
+	@# Pre-flight checks for required environment
 	@if ! command -v nvidia-smi >/dev/null 2>&1; then \
 		echo "Error: nvidia-smi not found. GPU required."; \
+		exit 1; \
+	fi
+	@if [ -z "$${HF_TOKEN:-}" ]; then \
+		echo "======================================"; \
+		echo "Error: HF_TOKEN environment variable not set"; \
+		echo "======================================"; \
+		echo ""; \
+		echo "The Llama model requires authentication with Hugging Face."; \
+		echo ""; \
+		echo "To fix:"; \
+		echo "  1. Get a token from https://huggingface.co/settings/tokens"; \
+		echo "  2. Accept the license at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct"; \
+		echo "  3. Run: export HF_TOKEN=your_token_here"; \
+		echo "  4. Re-run this benchmark"; \
+		echo ""; \
 		exit 1; \
 	fi
 	@echo "GPU detected:"
