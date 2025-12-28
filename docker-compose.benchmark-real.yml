@@ -138,7 +138,8 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
-    command: ["./ranvier_server", "--smp", "${RANVIER_SMP:-2}", "--memory", "${RANVIER_MEMORY:-1G}"]
+    # Use --smp 1 to work around multi-shard segfault with real vLLM backends
+    command: ["./ranvier_server", "--smp", "1", "--memory", "${RANVIER_MEMORY:-1G}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -171,7 +172,8 @@ services:
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
-    command: ["./ranvier_server", "--smp", "${RANVIER_SMP:-2}", "--memory", "${RANVIER_MEMORY:-1G}"]
+    # Use --smp 1 to work around multi-shard segfault with real vLLM backends
+    command: ["./ranvier_server", "--smp", "1", "--memory", "${RANVIER_MEMORY:-1G}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -204,7 +206,8 @@ services:
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
-    command: ["./ranvier_server", "--smp", "${RANVIER_SMP:-2}", "--memory", "${RANVIER_MEMORY:-1G}"]
+    # Use --smp 1 to work around multi-shard segfault with real vLLM backends
+    command: ["./ranvier_server", "--smp", "1", "--memory", "${RANVIER_MEMORY:-1G}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
