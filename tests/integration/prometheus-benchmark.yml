@@ -1,0 +1,25 @@
+# Prometheus Configuration for Ranvier Benchmarking
+# Collects metrics from all 3 Ranvier nodes during benchmark runs
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'ranvier'
+    static_configs:
+      - targets:
+          - '172.29.2.1:9180'
+          - '172.29.2.2:9180'
+          - '172.29.2.3:9180'
+        labels:
+          cluster: 'benchmark'
+
+  - job_name: 'vllm'
+    static_configs:
+      - targets:
+          - '172.29.1.10:8000'
+          - '172.29.1.11:8000'
+        labels:
+          cluster: 'benchmark'
+    metrics_path: /metrics

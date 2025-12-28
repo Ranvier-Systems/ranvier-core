@@ -1,0 +1,347 @@
+# Docker Compose for Real vLLM Backend Benchmarking
+#
+# This configuration supports two modes:
+#   1. External vLLM endpoints (for testing against existing servers)
+#   2. Local vLLM containers (for GPU-equipped machines)
+#
+# Usage with external endpoints:
+#   VLLM_ENDPOINT_1=http://server1:8000 \
+#   VLLM_ENDPOINT_2=http://server2:8000 \
+#   docker compose -f docker-compose.benchmark-real.yml up -d
+#
+# Usage with local vLLM (requires GPU):
+#   docker compose -f docker-compose.benchmark-real.yml --profile local-vllm up -d
+#
+# See tests/integration/README.md for detailed instructions.
+
+networks:
+  ranvier-benchmark:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+services:
+  # ============================================================================
+  # LOCAL vLLM BACKENDS (Optional - requires GPU)
+  # Enable with --profile local-vllm
+  # ============================================================================
+
+  vllm-backend1:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-backend1
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      ranvier-benchmark:
+        ipv4_address: 172.29.1.10
+    ports:
+      - "18000:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - --model
+      - ${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
+      - --port
+      - "8000"
+      - --enable-prefix-caching
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-4096}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTIL:-0.85}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+    profiles:
+      - local-vllm
+      - single-gpu
+
+  vllm-backend2:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-backend2
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      ranvier-benchmark:
+        ipv4_address: 172.29.1.11
+    ports:
+      - "18001:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - --model
+      - ${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
+      - --port
+      - "8000"
+      - --enable-prefix-caching
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-4096}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTIL:-0.85}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+    profiles:
+      - local-vllm
+
+  # ============================================================================
+  # RANVIER CLUSTER (3 nodes)
+  # ============================================================================
+
+  ranvier1:
+    image: ranvier:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier-bench1
+    networks:
+      ranvier-benchmark:
+        ipv4_address: 172.29.2.1
+    ports:
+      - "8081:8080"
+      - "9181:9180"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Cluster configuration
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.29.2.2:9190,172.29.2.3:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      # Routing config - use more tokens for real workloads
+      - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
+      - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+    # Use --smp 1 to work around multi-shard segfault with real vLLM backends
+    command: ["./ranvier_server", "--smp", "1", "--memory", "${RANVIER_MEMORY:-1G}"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  ranvier2:
+    image: ranvier:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier-bench2
+    networks:
+      ranvier-benchmark:
+        ipv4_address: 172.29.2.2
+    ports:
+      - "8082:8080"
+      - "9182:9180"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.29.2.1:9190,172.29.2.3:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+    # Use --smp 1 to work around multi-shard segfault with real vLLM backends
+    command: ["./ranvier_server", "--smp", "1", "--memory", "${RANVIER_MEMORY:-1G}"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  ranvier3:
+    image: ranvier:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    container_name: ranvier-bench3
+    networks:
+      ranvier-benchmark:
+        ipv4_address: 172.29.2.3
+    ports:
+      - "8083:8080"
+      - "9183:9180"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - RANVIER_CLUSTER_ENABLED=true
+      - RANVIER_CLUSTER_GOSSIP_PORT=9190
+      - RANVIER_CLUSTER_PEERS=172.29.2.1:9190,172.29.2.2:9190
+      - RANVIER_CLUSTER_GOSSIP_INTERVAL_MS=500
+      - RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL=2
+      - RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT=6
+      - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
+      - RANVIER_DB_PATH=/tmp/ranvier.db
+      - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+    # Use --smp 1 to work around multi-shard segfault with real vLLM backends
+    command: ["./ranvier_server", "--smp", "1", "--memory", "${RANVIER_MEMORY:-1G}"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ============================================================================
+  # LOCUST LOAD TESTING (Real Backend Version)
+  # ============================================================================
+
+  locust:
+    image: ranvier-locust:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.locust
+    container_name: locust-real
+    networks:
+      - ranvier-benchmark
+    ports:
+      - "8089:8089"
+      - "8090:8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - LOCUST_HOST=http://172.29.2.1:8080
+      - LOCUST_LOCUSTFILE=/mnt/locust/locustfile_real.py
+      # Ranvier node endpoints
+      - RANVIER_NODE1=http://172.29.2.1:8080
+      - RANVIER_NODE2=http://172.29.2.2:8080
+      - RANVIER_NODE3=http://172.29.2.3:8080
+      # Metrics endpoints
+      - RANVIER_METRICS1=http://172.29.2.1:9180
+      - RANVIER_METRICS2=http://172.29.2.2:9180
+      - RANVIER_METRICS3=http://172.29.2.3:9180
+      # Backend configuration - use env vars or default to local vLLM
+      - VLLM_ENDPOINT_1=${VLLM_ENDPOINT_1:-http://172.29.1.10:8000}
+      - VLLM_ENDPOINT_2=${VLLM_ENDPOINT_2:-http://172.29.1.11:8000}
+      # For backend registration
+      - BACKEND1_IP=${BACKEND1_IP:-172.29.1.10}
+      - BACKEND1_PORT=${BACKEND1_PORT:-8000}
+      - BACKEND2_IP=${BACKEND2_IP:-172.29.1.11}
+      - BACKEND2_PORT=${BACKEND2_PORT:-8000}
+      # Model name must match vLLM's loaded model
+      - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
+      # Benchmark settings
+      - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
+      - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
+      # Prompt configuration
+      - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
+      - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
+    volumes:
+      - ./tests/integration:/mnt/locust:ro
+    depends_on:
+      ranvier1:
+        condition: service_healthy
+      ranvier2:
+        condition: service_healthy
+      ranvier3:
+        condition: service_healthy
+    profiles:
+      - benchmark
+
+  # ============================================================================
+  # SINGLE-GPU LOCUST (For testing with 1 GPU)
+  # ============================================================================
+
+  locust-single-gpu:
+    image: ranvier-locust:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.locust
+    container_name: locust-single-gpu
+    networks:
+      - ranvier-benchmark
+    ports:
+      - "8089:8089"
+      - "8090:8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - LOCUST_HOST=http://172.29.2.1:8080
+      - LOCUST_LOCUSTFILE=/mnt/locust/locustfile_real.py
+      # Ranvier node endpoints
+      - RANVIER_NODE1=http://172.29.2.1:8080
+      - RANVIER_NODE2=http://172.29.2.2:8080
+      - RANVIER_NODE3=http://172.29.2.3:8080
+      # Metrics endpoints
+      - RANVIER_METRICS1=http://172.29.2.1:9180
+      - RANVIER_METRICS2=http://172.29.2.2:9180
+      - RANVIER_METRICS3=http://172.29.2.3:9180
+      # Single backend for single-GPU mode
+      - SINGLE_BACKEND_MODE=true
+      - BACKEND1_IP=172.29.1.10
+      - BACKEND1_PORT=8000
+      # vLLM endpoint for health checks
+      - VLLM_ENDPOINT_1=http://172.29.1.10:8000
+      # Model name must match vLLM's loaded model
+      - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
+      # Benchmark settings
+      - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
+      - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
+      - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
+      - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
+    volumes:
+      - ./tests/integration:/mnt/locust:ro
+    depends_on:
+      ranvier1:
+        condition: service_healthy
+      ranvier2:
+        condition: service_healthy
+      ranvier3:
+        condition: service_healthy
+      vllm-backend1:
+        condition: service_healthy
+    profiles:
+      - single-gpu
+
+  # ============================================================================
+  # PROMETHEUS (Optional - for detailed metrics collection)
+  # ============================================================================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus-bench
+    networks:
+      - ranvier-benchmark
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./tests/integration/prometheus-benchmark.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=1d'
+    profiles:
+      - monitoring
