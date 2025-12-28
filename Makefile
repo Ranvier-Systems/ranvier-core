@@ -1,6 +1,9 @@
 # Ranvier Core Makefile
 # Build and test targets for the Ranvier LLM routing layer
 
+# Use bash for PIPESTATUS support in benchmark targets
+SHELL := /bin/bash
+
 .PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down help
 
 # Default target
