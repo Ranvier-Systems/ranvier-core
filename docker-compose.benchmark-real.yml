@@ -45,6 +45,8 @@ services:
       - "18000:8000"
     environment:
       - CUDA_VISIBLE_DEVICES=0
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     command:
       - --model
       - ${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
@@ -83,6 +85,8 @@ services:
       - "18001:8000"
     environment:
       - CUDA_VISIBLE_DEVICES=1
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     command:
       - --model
       - ${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
