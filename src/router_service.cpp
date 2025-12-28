@@ -1,6 +1,7 @@
 #include "router_service.hpp"
 #include "gossip_service.hpp"
 #include "logging.hpp"
+#include "metrics_service.hpp"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/loop.hh>
@@ -161,6 +162,10 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
                                  request_id, result.value());
             }
             stats_cache_misses++;
+            // Update MetricsService for ranvier_cache_hit_ratio gauge
+            if (g_metrics) {
+                metrics().record_cache_miss();
+            }
             return std::nullopt;
         }
         if (!request_id.empty()) {
@@ -168,11 +173,19 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
                              request_id, tokens.size(), result.value());
         }
         stats_cache_hits++;
+        // Update MetricsService for ranvier_cache_hit_ratio gauge
+        if (g_metrics) {
+            metrics().record_cache_hit();
+        }
     } else {
         if (!request_id.empty()) {
             log_router.debug("[{}] Cache miss for {} tokens", request_id, tokens.size());
         }
         stats_cache_misses++;
+        // Update MetricsService for ranvier_cache_hit_ratio gauge
+        if (g_metrics) {
+            metrics().record_cache_miss();
+        }
     }
 
     return result;
