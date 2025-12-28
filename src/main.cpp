@@ -226,9 +226,12 @@ future<> run() {
         // Start HttpController on all shards - each shard gets its own instance
         return controller.start(std::ref(tokenizer), std::ref(*router), ctrl_config);
     }).then([] {
-        // 2a. Initialize metrics on all shards
-        ranvier::init_metrics();
-
+        // Initialize metrics on ALL shards (not just shard 0)
+        // Each shard needs its own MetricsService for the shared-nothing architecture
+        return seastar::smp::invoke_on_all([] {
+            ranvier::init_metrics();
+        });
+    }).then([] {
         // 3. Init Persistence
         persistence = ranvier::create_persistence_store();
         if (persistence->open(g_config.database.path)) {
