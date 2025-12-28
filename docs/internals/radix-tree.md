@@ -1016,4 +1016,4 @@ routing:
 - [The Adaptive Radix Tree (Leis et al., 2013)](https://db.in.tum.de/~leis/papers/ART.pdf)
 - [Seastar Framework](https://seastar.io/shared-nothing/)
 - [Abseil Swiss Tables](https://abseil.io/docs/cpp/guides/container)
-- [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/)
+- [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html)
