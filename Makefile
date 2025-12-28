@@ -378,6 +378,7 @@ benchmark-single-gpu:
 		--headless \
 		--only-summary \
 		--exit-code-on-error 1 \
+		--stop-timeout 10 \
 		2>&1 | tee $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
 	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
 	echo ""; \
