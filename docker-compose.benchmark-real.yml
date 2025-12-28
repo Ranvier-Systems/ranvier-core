@@ -248,6 +248,8 @@ services:
       - BACKEND1_PORT=${BACKEND1_PORT:-8000}
       - BACKEND2_IP=${BACKEND2_IP:-172.29.1.11}
       - BACKEND2_PORT=${BACKEND2_PORT:-8000}
+      # Model name must match vLLM's loaded model
+      - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
       # Benchmark settings
       - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
       - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
@@ -300,6 +302,8 @@ services:
       - BACKEND1_PORT=8000
       # vLLM endpoint for health checks
       - VLLM_ENDPOINT_1=http://172.29.1.10:8000
+      # Model name must match vLLM's loaded model
+      - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
       # Benchmark settings
       - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
       - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
