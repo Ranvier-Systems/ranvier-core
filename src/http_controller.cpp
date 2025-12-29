@@ -413,8 +413,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
     auto prefix_affinity_enabled = _config.prefix_affinity_enabled;
 
-    // Add X-Request-ID to response headers before streaming
+    // Add X-Request-ID and X-Backend-ID to response headers before streaming
     rep->add_header("X-Request-ID", request_id);
+    rep->add_header("X-Backend-ID", std::to_string(target_id));
 
     rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, prefix_affinity_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 

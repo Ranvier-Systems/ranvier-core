@@ -793,16 +793,16 @@ class RealBackendUser(HttpUser):
                 timeout=60,
             )
 
-            # Get backend ID from response headers
-            # Note: Ranvier doesn't currently set X-Backend-ID, so we infer it
+            # Get backend ID from response headers (Ranvier sets X-Backend-ID)
             metrics.backend_id = get_backend_from_response(dict(resp.headers))
             if metrics.backend_id is None:
                 if SINGLE_BACKEND_MODE:
                     # Single backend mode: all requests go to backend 1
                     metrics.backend_id = "1"
                 else:
-                    # Multi-backend: can't track without X-Backend-ID header
-                    # Use node index as proxy (not accurate for prefix routing)
+                    # Fallback: infer from node index (inaccurate for prefix routing)
+                    # This means X-Backend-ID header is missing - cache tracking will be wrong
+                    logger.warning("X-Backend-ID header missing - cache tracking may be inaccurate")
                     metrics.backend_id = str((node_index % len(BACKENDS)) + 1)
 
             if resp.status_code != 200:
