@@ -384,6 +384,9 @@ Mock backends respond instantly, which is useful for measuring router latency bu
 ### Quick Start
 
 ```bash
+# Using the helper script (recommended)
+./scripts/run-multi-gpu-benchmark.sh 129.213.118.109 123.45.67.89
+
 # Single-GPU sanity check (recommended starting point)
 HF_TOKEN=your_token make benchmark-single-gpu
 
@@ -401,11 +404,17 @@ VLLM_ENDPOINT_2=http://gpu2:8000 \
 make benchmark-comparison
 ```
 
-### Known Limitations
+### Known Limitations (Resolved)
 
-**Multi-shard mode bug**: The Ranvier server crashes with a segfault when running
-with `--smp 2` (multi-shard) and real vLLM backends. The benchmark infrastructure
-uses `--smp 1` as a workaround. This is tracked as a known issue.
+**Multi-shard mode (FIXED)**: Previous segfault issues with `--smp 2` mode have been
+resolved in PR #58. The fixes include:
+- HttpController sharding with `sharded<HttpController>`
+- Router `initialize_shards()` for cross-shard data access
+- Gossip callback copy semantics to prevent cross-shard memory access
+- MetricsService initialization on all shards
+
+The benchmark infrastructure now runs with `--smp 2` by default to leverage
+multi-core performance.
 
 **Cache hit tracking**: Accurate cache hit tracking requires Ranvier to inject an
 `X-Backend-ID` header into responses. Until this is implemented:
@@ -543,6 +552,58 @@ The benefit becomes significant when:
 - Multiple GPU servers with A100/H100
 - 10Gbps+ networking
 - Dedicated load generator machine
+
+### Setting Up External GPU Instances (Lambda Labs)
+
+For multi-GPU benchmarking with external cloud instances (e.g., Lambda Labs):
+
+**Step 1: Launch GPU Instance**
+
+1. Create a Lambda Labs account and launch a GPU instance (1x A10 or better)
+2. SSH into the instance: `ssh ubuntu@<instance-ip>`
+3. Install vLLM and start the server:
+
+```bash
+# On the Lambda Labs instance
+pip install vllm
+
+# Start vLLM server (adjust model based on GPU memory)
+python -m vllm.entrypoints.openai.api_server \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --host 0.0.0.0 --port 8000 \
+  --enable-prefix-caching
+```
+
+**Step 2: Ensure Port Access**
+
+Lambda Labs instances typically have open ports, but verify:
+```bash
+# From your local machine, test connectivity
+curl http://<instance-ip>:8000/health
+```
+
+**Step 3: Run Multi-GPU Benchmark**
+
+With two Lambda instances running vLLM:
+
+```bash
+# Using the helper script
+./scripts/run-multi-gpu-benchmark.sh <gpu1-ip> <gpu2-ip>
+
+# Or manually
+VLLM_ENDPOINT_1=http://<gpu1-ip>:8000 \
+VLLM_ENDPOINT_2=http://<gpu2-ip>:8000 \
+BACKEND1_IP=<gpu1-ip> \
+BACKEND2_IP=<gpu2-ip> \
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+make benchmark-real
+```
+
+**Cost Optimization Tips**
+- Use spot/on-demand instances for testing
+- A10G instances offer good price/performance for 8B models
+- Shut down instances when not in use
+- Consider using the same instance for both backends in dev (not for A/B tests)
 
 ### Output Files
 
