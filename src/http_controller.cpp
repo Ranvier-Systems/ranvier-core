@@ -411,13 +411,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto request_timeout = _config.request_timeout;
     auto retry_config = _config.retry;
     auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
-    auto prefix_affinity_enabled = _config.prefix_affinity_enabled;
 
     // Add X-Request-ID and X-Backend-ID to response headers before streaming
     rep->add_header("X-Request-ID", request_id);
     rep->add_header("X-Backend-ID", std::to_string(target_id));
 
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, prefix_affinity_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -664,9 +663,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                                     request_id, current_backend, first_byte_latency);
                 }
 
-                // Learn route for radix tree cache (only when prefix affinity is disabled)
-                // Prefix affinity uses consistent hashing, so no learning is needed
-                if (!prefix_affinity_enabled && !route_hit && tokens.size() >= _config.min_token_length) {
+                // Learn route in the ART for future prefix matching
+                // This works for both prefix-affinity mode (hybrid ART+hash) and legacy mode
+                // - Prefix-affinity: learning improves future ART lookups
+                // - Legacy: learning is the primary routing mechanism
+                // The ART insert is idempotent - existing routes just get their timestamp updated
+                if (tokens.size() >= _config.min_token_length) {
                     (void)_router.learn_route_global(tokens, current_backend, request_id);
 
                     if (_persistence) {

@@ -329,28 +329,65 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     // Extract prefix (first N tokens)
     size_t prefix_len = std::min(tokens.size(), local_prefix_token_length);
     if (prefix_len == 0) {
-        // No tokens to hash, fall back to first backend
+        // No tokens to route on, fall back to first backend
         return live_backends[0];
     }
 
-    // Hash the prefix
-    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, local_block_alignment);
+    // HYBRID ROUTING: ART lookup first, hash fallback
+    //
+    // 1. ART provides "Longest Prefix Match" - finds the longest known prefix
+    //    that matches the beginning of this request. This enables partial
+    //    prefix matching for similar requests with different suffixes.
+    //
+    // 2. If ART finds a match, we route to that backend (affinity to learned route)
+    //
+    // 3. If no match in ART, we use consistent hashing on the prefix for
+    //    deterministic routing. The route will be learned after success.
 
-    // Consistent hashing: map hash to backend index
+    // Step 1: Try ART lookup for longest prefix match
+    if (local_tree) {
+        std::span<const TokenId> token_span(tokens.data(), tokens.size());
+        auto art_result = local_tree->lookup(token_span);
+
+        if (art_result.has_value()) {
+            BackendId art_backend = art_result.value();
+
+            // Verify the backend is still live
+            if (std::find(live_backends.begin(), live_backends.end(), art_backend) != live_backends.end()) {
+                // ART cache hit - route to learned backend
+                if (!request_id.empty()) {
+                    log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
+                                     request_id, tokens.size(), art_backend);
+                }
+                stats_cache_hits++;
+                stats_prefix_affinity_routes++;
+                if (g_metrics) {
+                    metrics().record_cache_hit();
+                }
+                return art_backend;
+            }
+            // Backend is dead/draining, fall through to hash-based selection
+            log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
+                             request_id, art_backend);
+        }
+    }
+
+    // Step 2: No ART match (or backend unavailable) - use consistent hashing
+    // This provides deterministic routing for new prefixes
+    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, local_block_alignment);
     size_t index = prefix_hash % live_backends.size();
     BackendId selected = live_backends[index];
 
-    // Log the routing decision
     if (!request_id.empty()) {
-        log_router.debug("[{}] Prefix affinity: {} tokens, hash={}, index={}/{} -> backend {}",
+        log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
                          request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
     }
 
-    // Update metrics
+    // This is a cache miss - the route will be learned after successful response
+    stats_cache_misses++;
     stats_prefix_affinity_routes++;
-    stats_cache_hits++;  // Prefix affinity is effectively always a "hit"
     if (g_metrics) {
-        metrics().record_cache_hit();
+        metrics().record_cache_miss();
     }
 
     return selected;
@@ -358,9 +395,17 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
 
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                                        const std::string& request_id) {
+    // Truncate to prefix length - we only store the prefix in the ART, not the full sequence
+    // This ensures that requests with the same prefix (e.g., same system prompt) but
+    // different suffixes (e.g., different user queries) share the same routing entry.
+    size_t prefix_len = std::min(tokens.size(), _config.prefix_token_length);
+    if (prefix_len < tokens.size()) {
+        tokens.resize(prefix_len);
+    }
+
     // Log route learning with request_id on shard 0 before broadcasting
     if (!request_id.empty()) {
-        log_router.info("[{}] Learning route: {} tokens -> backend {}",
+        log_router.info("[{}] Learning route: {} tokens (prefix) -> backend {}",
                         request_id, tokens.size(), backend);
     }
 
