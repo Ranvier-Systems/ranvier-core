@@ -259,8 +259,8 @@ services:
       # Prompt configuration
       - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
       - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
-    volumes:
-      - ./tests/integration:/mnt/locust:ro
+    # Note: locustfiles are baked into the image (see Dockerfile.locust)
+    # to support Docker-in-Docker environments
     depends_on:
       ranvier1:
         condition: service_healthy
@@ -312,8 +312,8 @@ services:
       - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
       - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
       - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
-    volumes:
-      - ./tests/integration:/mnt/locust:ro
+    # Note: locustfiles are baked into the image (see Dockerfile.locust)
+    # to support Docker-in-Docker environments
     depends_on:
       ranvier1:
         condition: service_healthy
