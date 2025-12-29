@@ -289,6 +289,11 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_PREFIX_AFFINITY_ENABLED")) {
         routing.prefix_affinity_enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
+    // Also support RANVIER_ROUTING_MODE for benchmark compatibility
+    // "prefix" enables prefix-affinity, "round_robin" disables it
+    if (auto v = get_env("RANVIER_ROUTING_MODE")) {
+        routing.prefix_affinity_enabled = (*v == "prefix");
+    }
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
         routing.prefix_token_length = *v;
     }
