@@ -329,15 +329,17 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
     }
 
-    auto route_hit = _router.lookup(tokens, request_id);
-
     BackendId target_id;
-    if (route_hit.has_value()) {
-        target_id = route_hit.value();
-        log_proxy.debug("[{}] Route cache hit -> backend {}", request_id, target_id);
-    } else {
-        auto random_id = _router.get_random_backend();
-        if (!random_id.has_value()) {
+    bool route_hit = false;
+
+    if (_config.prefix_affinity_enabled) {
+        // Use prefix-affinity routing: consistent hashing on prefix tokens
+        auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
+        if (affinity_backend.has_value()) {
+            target_id = affinity_backend.value();
+            route_hit = true;  // Prefix affinity is effectively always a "hit"
+            log_proxy.debug("[{}] Prefix affinity -> backend {}", request_id, target_id);
+        } else {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
             metrics().decrement_active_requests();
@@ -345,8 +347,26 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
         }
-        target_id = random_id.value();
-        log_proxy.debug("[{}] Route cache miss, using random backend {}", request_id, target_id);
+    } else {
+        // Legacy behavior: radix tree lookup + random fallback
+        auto lookup_result = _router.lookup(tokens, request_id);
+        if (lookup_result.has_value()) {
+            target_id = lookup_result.value();
+            route_hit = true;
+            log_proxy.debug("[{}] Route cache hit -> backend {}", request_id, target_id);
+        } else {
+            auto random_id = _router.get_random_backend();
+            if (!random_id.has_value()) {
+                log_proxy.warn("[{}] No backends registered", request_id);
+                metrics().record_failure();
+                metrics().decrement_active_requests();
+                rep->add_header("X-Request-ID", request_id);
+                rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+                co_return std::move(rep);
+            }
+            target_id = random_id.value();
+            log_proxy.debug("[{}] Route cache miss, using random backend {}", request_id, target_id);
+        }
     }
 
     // Timing: record routing decision latency (post-routing timestamp)
@@ -391,11 +411,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto request_timeout = _config.request_timeout;
     auto retry_config = _config.retry;
     auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
+    auto prefix_affinity_enabled = _config.prefix_affinity_enabled;
 
     // Add X-Request-ID to response headers before streaming
     rep->add_header("X-Request-ID", request_id);
 
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, prefix_affinity_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -642,7 +663,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                                     request_id, current_backend, first_byte_latency);
                 }
 
-                if (!route_hit.has_value() && tokens.size() >= _config.min_token_length) {
+                // Learn route for radix tree cache (only when prefix affinity is disabled)
+                // Prefix affinity uses consistent hashing, so no learning is needed
+                if (!prefix_affinity_enabled && !route_hit && tokens.size() >= _config.min_token_length) {
                     (void)_router.learn_route_global(tokens, current_backend, request_id);
 
                     if (_persistence) {

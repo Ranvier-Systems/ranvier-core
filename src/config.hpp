@@ -59,6 +59,10 @@ struct RoutingConfig {
     bool enable_token_forwarding = false;  // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;  // Accept pre-tokenized prompt_token_ids from clients for routing
     int32_t max_token_id = 100000;  // Maximum valid token ID for validation (security: reject out-of-range tokens)
+
+    // Prefix-affinity routing: route requests with same prefix to same backend for KV cache reuse
+    bool prefix_affinity_enabled = true;  // Enable prefix-affinity routing (default: true)
+    size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 };
 
 // Timeout configuration
@@ -281,6 +285,12 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<int32_t>("RANVIER_MAX_TOKEN_ID")) {
         routing.max_token_id = *v;
+    }
+    if (auto v = get_env("RANVIER_PREFIX_AFFINITY_ENABLED")) {
+        routing.prefix_affinity_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
+        routing.prefix_token_length = *v;
     }
 
     // Timeout overrides
@@ -534,6 +544,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["max_token_id"]) {
                 config.routing.max_token_id = r["max_token_id"].as<int32_t>();
+            }
+            if (r["prefix_affinity_enabled"]) {
+                config.routing.prefix_affinity_enabled = r["prefix_affinity_enabled"].as<bool>();
+            }
+            if (r["prefix_token_length"]) {
+                config.routing.prefix_token_length = r["prefix_token_length"].as<size_t>();
             }
         }
 
