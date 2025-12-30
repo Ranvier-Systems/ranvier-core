@@ -8,6 +8,22 @@ This script runs the same workload twice:
 
 It then compares the results to demonstrate the value of prefix-aware routing.
 
+## Stress Testing Mode
+
+For large-prefix stress testing that demonstrates measurable KV cache improvements:
+
+    # Run stress test with large prefixes (2000-8000 tokens)
+    python3 tests/integration/run_benchmark_comparison.py --stress
+
+    # Customize large prefix settings
+    python3 tests/integration/run_benchmark_comparison.py --stress \
+        --large-prefix-min 2000 --large-prefix-max 8000 --num-prefixes 5
+
+Expected Results with Large Prefixes:
+    - Cache hits: 50-100ms TTFT (cached prefill)
+    - Cache misses: 300-800ms TTFT (full prefill)
+    - 3-10x TTFT improvement visible
+
 Usage:
     # With external vLLM endpoints:
     VLLM_ENDPOINT_1=http://server1:8000 VLLM_ENDPOINT_2=http://server2:8000 \
@@ -15,6 +31,9 @@ Usage:
 
     # With local vLLM (requires GPU):
     python3 tests/integration/run_benchmark_comparison.py --local-vllm
+
+    # Stress test mode (large prefixes):
+    python3 tests/integration/run_benchmark_comparison.py --stress
 
     # Custom duration:
     python3 tests/integration/run_benchmark_comparison.py --duration 10m
@@ -26,6 +45,7 @@ Output:
         - round_robin_output.log
         - round_robin_stats.csv
         - comparison_summary.txt
+        - stress_report.txt (if --stress mode)
 """
 
 import argparse
@@ -95,6 +115,7 @@ def parse_locust_output(log_file: str) -> Dict:
         "total_requests": 0,
         "failed_requests": 0,
         "requests_per_sec": 0.0,
+        "bucket_stats": {},
     }
 
     # Parse TTFT percentiles
@@ -115,6 +136,9 @@ def parse_locust_output(log_file: str) -> Dict:
             results["ttft_cache_miss_p50_ms"] = stats.get("ttft_cache_miss_p50_ms")
             results["ttft_improvement_pct"] = stats.get("ttft_improvement_pct")
             results["tokens_per_second"] = stats.get("tokens_per_second")
+            # Parse bucket stats for stress testing
+            if "bucket_stats" in stats:
+                results["bucket_stats"] = stats["bucket_stats"]
         except json.JSONDecodeError:
             pass
 
@@ -212,6 +236,179 @@ def format_comparison_table(prefix_results: Dict, roundrobin_results: Dict) -> s
             lines.append("RESULT: No significant difference in P99 TTFT")
 
     lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def format_stress_test_report(
+    prefix_results: Dict,
+    roundrobin_results: Dict,
+    config: Dict
+) -> str:
+    """Generate a detailed stress test report with per-bucket analysis.
+
+    Args:
+        prefix_results: Results from prefix-affinity routing run
+        roundrobin_results: Results from round-robin routing run
+        config: Configuration used for the stress test
+    """
+    lines = []
+    lines.append("=" * 100)
+    lines.append("LARGE-PREFIX STRESS TEST REPORT: KV Cache Validation")
+    lines.append("=" * 100)
+    lines.append("")
+
+    # Configuration
+    lines.append("Configuration:")
+    lines.append(f"  Prompt Distribution: {config.get('prompt_distribution', 'large-prefix')}")
+    lines.append(f"  Large Prefix Min Tokens: {config.get('large_prefix_min', 2000)}")
+    lines.append(f"  Large Prefix Max Tokens: {config.get('large_prefix_max', 8000)}")
+    lines.append(f"  Number of Prefixes: {config.get('num_prefixes', 5)}")
+    lines.append("")
+
+    # Overall comparison
+    lines.append("-" * 100)
+    lines.append("OVERALL RESULTS")
+    lines.append("-" * 100)
+
+    pa_hit_rate = prefix_results.get("cache_hit_rate_pct", 0)
+    rr_hit_rate = roundrobin_results.get("cache_hit_rate_pct", 0)
+    lines.append(f"  Cache Hit Rate: {rr_hit_rate:.1f}% (round-robin) -> {pa_hit_rate:.1f}% (prefix-affinity)")
+
+    pa_improvement = prefix_results.get("ttft_improvement_pct")
+    rr_improvement = roundrobin_results.get("ttft_improvement_pct")
+    if pa_improvement:
+        lines.append(f"  TTFT Improvement (Cache Hit vs Miss): {pa_improvement:.1f}%")
+    lines.append("")
+
+    # Per-bucket analysis
+    lines.append("-" * 100)
+    lines.append("PER-BUCKET TTFT ANALYSIS")
+    lines.append("-" * 100)
+    lines.append("")
+
+    pa_buckets = prefix_results.get("bucket_stats", {})
+    rr_buckets = roundrobin_results.get("bucket_stats", {})
+
+    bucket_info = [
+        ("tiny", "0-100 tokens", "Negligible prefill time - no visible KV cache benefit"),
+        ("small", "100-500 tokens", "Small prefill time - minimal KV cache benefit"),
+        ("medium", "500-2000 tokens", "Moderate prefill time - some KV cache benefit"),
+        ("large", "2000-4000 tokens", "Significant prefill time - visible KV cache benefit"),
+        ("xlarge", "4000-8000 tokens", "Large prefill time - maximum KV cache benefit"),
+    ]
+
+    for bucket_name, token_range, description in bucket_info:
+        pa_bucket = pa_buckets.get(bucket_name, {})
+        rr_bucket = rr_buckets.get(bucket_name, {})
+
+        if not pa_bucket and not rr_bucket:
+            continue
+
+        lines.append(f"  {bucket_name.upper()} ({token_range})")
+        lines.append(f"    {description}")
+        lines.append("")
+
+        pa_requests = pa_bucket.get("requests", 0)
+        rr_requests = rr_bucket.get("requests", 0)
+        lines.append(f"    Requests: {rr_requests} (round-robin), {pa_requests} (prefix-affinity)")
+
+        # TTFT comparison
+        pa_hit_p50 = pa_bucket.get("cache_hit_ttft_p50_ms")
+        pa_miss_p50 = pa_bucket.get("cache_miss_ttft_p50_ms")
+        rr_hit_p50 = rr_bucket.get("cache_hit_ttft_p50_ms")
+        rr_miss_p50 = rr_bucket.get("cache_miss_ttft_p50_ms")
+
+        if pa_hit_p50:
+            lines.append(f"    Prefix-Affinity Cache Hit P50: {pa_hit_p50:.1f}ms")
+        if pa_miss_p50:
+            lines.append(f"    Prefix-Affinity Cache Miss P50: {pa_miss_p50:.1f}ms")
+        if rr_hit_p50:
+            lines.append(f"    Round-Robin Cache Hit P50: {rr_hit_p50:.1f}ms")
+        if rr_miss_p50:
+            lines.append(f"    Round-Robin Cache Miss P50: {rr_miss_p50:.1f}ms")
+
+        # Calculate improvements
+        pa_improv = pa_bucket.get("ttft_improvement_pct")
+        if pa_improv:
+            lines.append(f"    TTFT Improvement (Prefix-Affinity): {pa_improv:.1f}%")
+
+            # Determine if improvement is significant
+            if pa_improv >= 50:
+                lines.append(f"    *** SIGNIFICANT IMPROVEMENT: {pa_improv:.1f}% faster with cache hit ***")
+            elif pa_improv >= 20:
+                lines.append(f"    * Notable improvement: {pa_improv:.1f}% faster with cache hit")
+
+        lines.append("")
+
+    # Summary and recommendations
+    lines.append("-" * 100)
+    lines.append("SUMMARY AND ANALYSIS")
+    lines.append("-" * 100)
+    lines.append("")
+
+    # Calculate overall improvement for large prefixes
+    large_improvement = None
+    xlarge_improvement = None
+
+    if pa_buckets.get("large"):
+        large_improvement = pa_buckets["large"].get("ttft_improvement_pct")
+    if pa_buckets.get("xlarge"):
+        xlarge_improvement = pa_buckets["xlarge"].get("ttft_improvement_pct")
+
+    if large_improvement or xlarge_improvement:
+        avg_large_improvement = 0
+        count = 0
+        if large_improvement:
+            avg_large_improvement += large_improvement
+            count += 1
+        if xlarge_improvement:
+            avg_large_improvement += xlarge_improvement
+            count += 1
+        if count > 0:
+            avg_large_improvement /= count
+
+        lines.append(f"  Large Prefix TTFT Improvement: {avg_large_improvement:.1f}%")
+
+        if avg_large_improvement >= 50:
+            lines.append("")
+            lines.append("  CONCLUSION: KV cache prefix-affinity routing provides SIGNIFICANT benefit")
+            lines.append("  for large-prefix workloads (2000+ tokens). Cache hits are 2-10x faster")
+            lines.append("  than cache misses for GPU prefill operations.")
+        elif avg_large_improvement >= 20:
+            lines.append("")
+            lines.append("  CONCLUSION: KV cache prefix-affinity routing provides MODERATE benefit")
+            lines.append("  for large-prefix workloads.")
+        else:
+            lines.append("")
+            lines.append("  CONCLUSION: KV cache improvement is minimal for this workload.")
+            lines.append("  Consider checking vLLM --enable-prefix-caching is enabled.")
+    else:
+        lines.append("  No large prefix data available for analysis.")
+        lines.append("  Ensure PROMPT_DISTRIBUTION=large-prefix or stress mode is enabled.")
+
+    # Expected vs actual comparison
+    lines.append("")
+    lines.append("Expected Results with Large Prefixes (2000-8000 tokens):")
+    lines.append("  - Cache hits: 50-100ms TTFT (cached prefill)")
+    lines.append("  - Cache misses: 300-800ms TTFT (full prefill)")
+    lines.append("  - Expected improvement: 50-90% (3-10x faster)")
+    lines.append("")
+
+    if large_improvement and large_improvement >= 50:
+        lines.append("  RESULT: PASS - Achieved target improvement for large prefixes")
+    elif large_improvement and large_improvement >= 20:
+        lines.append("  RESULT: PARTIAL - Some improvement observed but below target")
+    elif large_improvement:
+        lines.append("  RESULT: NEEDS INVESTIGATION - Below expected improvement")
+        lines.append("  Recommendations:")
+        lines.append("    1. Verify vLLM --enable-prefix-caching is enabled")
+        lines.append("    2. Check GPU memory utilization (OOM may evict cache)")
+        lines.append("    3. Ensure prefix tokens match block alignment (16 tokens)")
+    else:
+        lines.append("  RESULT: NO DATA - Run with --stress flag for large prefix testing")
+
+    lines.append("")
+    lines.append("=" * 100)
     return "\n".join(lines)
 
 
@@ -363,6 +560,35 @@ def main():
         action="store_true",
         help="Skip prefix-aware (only run round-robin baseline)",
     )
+    parser.add_argument(
+        "--stress",
+        action="store_true",
+        help="Enable stress testing mode with large prefixes (2000-8000 tokens)",
+    )
+    parser.add_argument(
+        "--prompt-distribution",
+        default=None,
+        choices=["mixed", "short", "medium", "long", "large-prefix", "stress"],
+        help="Prompt distribution mode (default: mixed, or large-prefix if --stress)",
+    )
+    parser.add_argument(
+        "--large-prefix-min",
+        type=int,
+        default=2000,
+        help="Minimum tokens for large prefixes (default: 2000)",
+    )
+    parser.add_argument(
+        "--large-prefix-max",
+        type=int,
+        default=8000,
+        help="Maximum tokens for large prefixes (default: 8000)",
+    )
+    parser.add_argument(
+        "--num-prefixes",
+        type=int,
+        default=5,
+        help="Number of large prefixes to generate (default: 5)",
+    )
 
     args = parser.parse_args()
 
@@ -391,12 +617,41 @@ def main():
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = Path("benchmark-reports") / f"comparison_{timestamp}"
+        dir_suffix = "stress" if args.stress else "comparison"
+        output_dir = Path("benchmark-reports") / f"{dir_suffix}_{timestamp}"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
-    extra_env = {}
+    # Configure prompt distribution
+    prompt_distribution = args.prompt_distribution
+    if prompt_distribution is None:
+        prompt_distribution = "large-prefix" if args.stress else "mixed"
+
+    # Configure stress testing environment variables
+    extra_env = {
+        "PROMPT_DISTRIBUTION": prompt_distribution,
+        "LARGE_PREFIX_MIN_TOKENS": str(args.large_prefix_min),
+        "LARGE_PREFIX_MAX_TOKENS": str(args.large_prefix_max),
+        "NUM_LARGE_PREFIXES": str(args.num_prefixes),
+    }
+
+    # Store config for reporting
+    stress_config = {
+        "stress_mode": args.stress,
+        "prompt_distribution": prompt_distribution,
+        "large_prefix_min": args.large_prefix_min,
+        "large_prefix_max": args.large_prefix_max,
+        "num_prefixes": args.num_prefixes,
+    }
+
+    if args.stress:
+        print(f"\nStress Testing Mode:")
+        print(f"  Prompt Distribution: {prompt_distribution}")
+        print(f"  Large Prefix Tokens: {args.large_prefix_min}-{args.large_prefix_max}")
+        print(f"  Number of Prefixes: {args.num_prefixes}")
+        print("")
+
     roundrobin_results = {}
     prefix_results = {}
 
@@ -447,16 +702,56 @@ def main():
         with open(summary_file, "w") as f:
             f.write(comparison)
         print(f"\nComparison saved to: {summary_file}")
+
+        # Generate stress test report if in stress mode
+        if args.stress or prompt_distribution in ["large-prefix", "stress"]:
+            stress_report = format_stress_test_report(
+                prefix_results, roundrobin_results, stress_config
+            )
+            print("\n" + stress_report)
+
+            stress_report_file = output_dir / "stress_report.txt"
+            with open(stress_report_file, "w") as f:
+                f.write(stress_report)
+            print(f"\nStress report saved to: {stress_report_file}")
+
     elif prefix_results:
         print("\nPrefix-aware results:")
         for k, v in prefix_results.items():
-            if v is not None:
+            if v is not None and k != "bucket_stats":
                 print(f"  {k}: {v}")
+
+        # Still generate stress report for prefix-only runs
+        if args.stress or prompt_distribution in ["large-prefix", "stress"]:
+            stress_report = format_stress_test_report(
+                prefix_results, {}, stress_config
+            )
+            print("\n" + stress_report)
+
+            stress_report_file = output_dir / "stress_report.txt"
+            with open(stress_report_file, "w") as f:
+                f.write(stress_report)
+            print(f"\nStress report saved to: {stress_report_file}")
+
     elif roundrobin_results:
         print("\nRound-robin results:")
         for k, v in roundrobin_results.items():
-            if v is not None:
+            if v is not None and k != "bucket_stats":
                 print(f"  {k}: {v}")
+
+    # Save config for reproducibility
+    config_file = output_dir / "config.json"
+    with open(config_file, "w") as f:
+        json.dump({
+            "duration": args.duration,
+            "users": args.users,
+            "spawn_rate": args.spawn_rate,
+            "prompt_distribution": prompt_distribution,
+            "stress_mode": args.stress,
+            "large_prefix_min": args.large_prefix_min,
+            "large_prefix_max": args.large_prefix_max,
+            "num_prefixes": args.num_prefixes,
+        }, f, indent=2)
 
     print(f"\nAll results saved to: {output_dir}")
 

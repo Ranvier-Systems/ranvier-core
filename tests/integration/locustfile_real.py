@@ -86,8 +86,22 @@ else:
 # Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
 
-# Prompt distribution: "mixed", "short", "medium", "long"
+# Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress"
 PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "mixed")
+
+# Large prefix configuration
+LARGE_PREFIX_MIN_TOKENS = int(os.environ.get("LARGE_PREFIX_MIN_TOKENS", "2000"))
+LARGE_PREFIX_MAX_TOKENS = int(os.environ.get("LARGE_PREFIX_MAX_TOKENS", "8000"))
+NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "5"))
+
+# Prefix size buckets for metrics (in tokens)
+PREFIX_SIZE_BUCKETS = [
+    ("tiny", 0, 100),
+    ("small", 100, 500),
+    ("medium", 500, 2000),
+    ("large", 2000, 4000),
+    ("xlarge", 4000, 8000),
+]
 
 # Ratio of requests that should share a prefix (0.0-1.0)
 SHARED_PREFIX_RATIO = float(os.environ.get("SHARED_PREFIX_RATIO", "0.7"))
@@ -178,6 +192,1493 @@ Please walk me through:
 4. How to deploy and monitor the model in production"""),
 ]
 
+
+# ============================================================================
+# Large Prefix Content Generation (for stress testing)
+# ============================================================================
+
+# Simulated RAG document chunks - realistic technical documentation
+RAG_DOCUMENT_CHUNKS = [
+    """## API Reference: Authentication Module
+
+### Overview
+The authentication module provides secure user authentication and session management
+for the platform. It supports multiple authentication methods including OAuth 2.0,
+SAML 2.0, and traditional username/password authentication.
+
+### Endpoints
+
+#### POST /auth/login
+Authenticates a user and returns an access token.
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "password": "string",
+  "mfa_code": "string (optional)"
+}
+```
+
+**Response:**
+```json
+{
+  "access_token": "string",
+  "refresh_token": "string",
+  "expires_in": 3600,
+  "token_type": "Bearer"
+}
+```
+
+**Error Codes:**
+- 401: Invalid credentials
+- 403: Account locked
+- 429: Too many attempts
+
+#### POST /auth/refresh
+Refreshes an expired access token using a valid refresh token.
+
+**Request Body:**
+```json
+{
+  "refresh_token": "string"
+}
+```
+
+**Response:**
+Same as /auth/login
+
+#### POST /auth/logout
+Invalidates the current session and all associated tokens.
+
+**Headers:**
+- Authorization: Bearer <access_token>
+
+**Response:**
+```json
+{
+  "message": "Successfully logged out"
+}
+```
+
+### Security Considerations
+- All endpoints use HTTPS with TLS 1.3
+- Passwords are hashed using Argon2id
+- Tokens are signed using RS256
+- Rate limiting is applied per-IP and per-user
+- Failed attempts are logged for security audit
+""",
+
+    """## Database Schema Documentation
+
+### Users Table
+Stores user account information and preferences.
+
+```sql
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_login_at TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN DEFAULT true,
+    is_verified BOOLEAN DEFAULT false,
+    mfa_enabled BOOLEAN DEFAULT false,
+    mfa_secret VARCHAR(255),
+    preferences JSONB DEFAULT '{}'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_created_at ON users(created_at);
+CREATE INDEX idx_users_is_active ON users(is_active) WHERE is_active = true;
+```
+
+### Sessions Table
+Tracks active user sessions for security and analytics.
+
+```sql
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(255) NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    is_revoked BOOLEAN DEFAULT false
+);
+
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+CREATE INDEX idx_sessions_token_hash ON sessions(token_hash);
+```
+
+### Audit Log Table
+Records all security-relevant events for compliance.
+
+```sql
+CREATE TABLE audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    event_type VARCHAR(50) NOT NULL,
+    user_id UUID REFERENCES users(id),
+    ip_address INET,
+    resource_type VARCHAR(50),
+    resource_id VARCHAR(255),
+    action VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    details JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_log_user_id ON audit_log(user_id);
+CREATE INDEX idx_audit_log_created_at ON audit_log(created_at);
+CREATE INDEX idx_audit_log_event_type ON audit_log(event_type);
+```
+
+### Query Optimization Notes
+- Use covering indexes for frequent queries
+- Partition audit_log by month for better performance
+- Consider read replicas for analytics queries
+- Use connection pooling (PgBouncer) for high concurrency
+""",
+
+    """## Kubernetes Deployment Guide
+
+### Prerequisites
+- Kubernetes cluster v1.25+
+- kubectl configured with cluster access
+- Helm 3.x installed
+- Container registry access
+
+### Namespace Setup
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+    monitoring: enabled
+```
+
+### Deployment Configuration
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+      - name: api-server
+        image: registry.example.com/api-server:v2.1.0
+        ports:
+        - containerPort: 8080
+        - containerPort: 9090
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: url
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: redis-url
+```
+
+### Service Configuration
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  selector:
+    app: api-server
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  type: ClusterIP
+```
+
+### Ingress Configuration
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-server
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-server
+            port:
+              number: 80
+```
+
+### Horizontal Pod Autoscaler
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-server
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+```
+""",
+
+    """## Machine Learning Pipeline Documentation
+
+### Feature Engineering
+
+#### Numerical Features
+The pipeline processes numerical features through the following transformations:
+
+1. **Missing Value Imputation**: Uses median imputation for robustness against outliers
+2. **Outlier Detection**: IQR-based detection with configurable multiplier (default: 1.5)
+3. **Scaling**: StandardScaler for normally distributed features, RobustScaler for skewed
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.compose import ColumnTransformer
+
+numerical_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+robust_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', RobustScaler())
+])
+```
+
+#### Categorical Features
+Categorical features undergo:
+
+1. **Missing Value Handling**: Most frequent value or dedicated 'unknown' category
+2. **Encoding**: OneHotEncoder for low cardinality, TargetEncoder for high cardinality
+3. **Rare Category Handling**: Categories below threshold grouped into 'other'
+
+```python
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+from category_encoders import TargetEncoder
+
+categorical_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='constant', fill_value='unknown')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+])
+```
+
+### Model Training
+
+#### Hyperparameter Optimization
+Uses Optuna for Bayesian optimization with cross-validation:
+
+```python
+import optuna
+from sklearn.model_selection import cross_val_score
+
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+        'max_depth': trial.suggest_int('max_depth', 3, 15),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+    }
+
+    model = XGBClassifier(**params, random_state=42, n_jobs=-1)
+    scores = cross_val_score(model, X_train, y_train, cv=5, scoring='roc_auc')
+    return scores.mean()
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=100, timeout=3600)
+```
+
+### Model Evaluation
+
+#### Metrics
+- **AUC-ROC**: Primary metric for ranking performance
+- **Precision@K**: For top-K recommendation scenarios
+- **F1-Score**: Balance between precision and recall
+- **Log Loss**: Probability calibration quality
+
+```python
+from sklearn.metrics import (
+    roc_auc_score, precision_score, recall_score,
+    f1_score, log_loss, confusion_matrix, classification_report
+)
+
+def evaluate_model(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        'auc_roc': roc_auc_score(y_test, y_proba),
+        'precision': precision_score(y_test, y_pred),
+        'recall': recall_score(y_test, y_pred),
+        'f1': f1_score(y_test, y_pred),
+        'log_loss': log_loss(y_test, y_proba)
+    }
+
+    print(classification_report(y_test, y_pred))
+    return metrics
+```
+
+### Model Deployment
+
+#### Model Serialization
+```python
+import joblib
+import json
+
+# Save model and metadata
+joblib.dump(model, 'model.joblib')
+with open('model_metadata.json', 'w') as f:
+    json.dump({
+        'version': '1.0.0',
+        'features': feature_names,
+        'metrics': evaluation_metrics,
+        'training_date': datetime.now().isoformat()
+    }, f)
+```
+
+#### Serving Configuration
+```yaml
+apiVersion: serving.kubeflow.org/v1beta1
+kind: InferenceService
+metadata:
+  name: ml-model
+spec:
+  predictor:
+    sklearn:
+      storageUri: "gs://models/production/v1.0.0"
+      resources:
+        requests:
+          memory: "2Gi"
+          cpu: "1"
+```
+""",
+
+    """## System Architecture Overview
+
+### High-Level Design
+
+The platform follows a microservices architecture with the following core components:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Load Balancer                             │
+│                    (AWS ALB / GCP GLB)                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      API Gateway                                 │
+│              (Kong / AWS API Gateway)                           │
+│  - Rate Limiting                                                 │
+│  - Authentication                                                │
+│  - Request Routing                                               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ User Service │     │ Order Service│     │ Product Svc  │
+│              │     │              │     │              │
+│ - Auth       │     │ - Checkout   │     │ - Catalog    │
+│ - Profiles   │     │ - Payments   │     │ - Inventory  │
+│ - Sessions   │     │ - History    │     │ - Search     │
+└──────────────┘     └──────────────┘     └──────────────┘
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Message Queue                                 │
+│                  (Kafka / RabbitMQ)                             │
+│  - Event Streaming                                               │
+│  - Async Communication                                           │
+│  - Event Sourcing                                                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ PostgreSQL   │     │    Redis     │     │Elasticsearch │
+│ (Primary DB) │     │   (Cache)    │     │  (Search)    │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+### Service Communication Patterns
+
+#### Synchronous (REST/gRPC)
+- Used for: Real-time queries, user-facing operations
+- Timeout: 30 seconds
+- Retry policy: 3 attempts with exponential backoff
+
+#### Asynchronous (Message Queue)
+- Used for: Background processing, notifications, analytics
+- Delivery guarantee: At-least-once
+- Consumer groups for horizontal scaling
+
+### Data Flow Example: Order Processing
+
+1. User submits order via API Gateway
+2. Order Service validates and creates order record
+3. Order Service publishes `order.created` event
+4. Payment Service consumes event, processes payment
+5. Payment Service publishes `payment.completed` event
+6. Inventory Service reserves items
+7. Notification Service sends confirmation email
+
+### Fault Tolerance
+
+#### Circuit Breaker Pattern
+```python
+from circuitbreaker import circuit
+
+@circuit(failure_threshold=5, recovery_timeout=30)
+def call_external_service(url, payload):
+    response = requests.post(url, json=payload, timeout=5)
+    response.raise_for_status()
+    return response.json()
+```
+
+#### Retry with Exponential Backoff
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10)
+)
+def resilient_operation():
+    return perform_risky_operation()
+```
+
+### Observability Stack
+
+- **Metrics**: Prometheus + Grafana
+- **Logging**: ELK Stack (Elasticsearch, Logstash, Kibana)
+- **Tracing**: Jaeger / OpenTelemetry
+- **Alerting**: PagerDuty integration
+
+### Security Layers
+
+1. **Network**: VPC isolation, security groups
+2. **Transport**: TLS 1.3, mTLS for service-to-service
+3. **Application**: JWT validation, RBAC
+4. **Data**: Encryption at rest (AES-256), field-level encryption for PII
+""",
+]
+
+# Few-shot examples for coding tasks
+FEW_SHOT_EXAMPLES = [
+    """Here are some examples of how to implement common patterns:
+
+Example 1: Implementing a Retry Decorator
+```python
+import functools
+import time
+import random
+
+def retry(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(Exception,)):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempts = 0
+            current_delay = delay
+
+            while attempts < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    attempts += 1
+                    if attempts == max_attempts:
+                        raise
+
+                    jitter = random.uniform(0, 0.1) * current_delay
+                    time.sleep(current_delay + jitter)
+                    current_delay *= backoff
+
+        return wrapper
+    return decorator
+
+# Usage:
+@retry(max_attempts=3, delay=1.0, exceptions=(ConnectionError, TimeoutError))
+def fetch_data(url):
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+    return response.json()
+```
+
+Example 2: Implementing a Simple Cache
+```python
+from functools import lru_cache
+from datetime import datetime, timedelta
+import threading
+
+class TTLCache:
+    def __init__(self, ttl_seconds=300):
+        self._cache = {}
+        self._lock = threading.RLock()
+        self.ttl = timedelta(seconds=ttl_seconds)
+
+    def get(self, key):
+        with self._lock:
+            if key in self._cache:
+                value, expiry = self._cache[key]
+                if datetime.now() < expiry:
+                    return value
+                del self._cache[key]
+            return None
+
+    def set(self, key, value):
+        with self._lock:
+            expiry = datetime.now() + self.ttl
+            self._cache[key] = (value, expiry)
+
+    def delete(self, key):
+        with self._lock:
+            self._cache.pop(key, None)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+# Usage with decorator
+def cached(cache, key_func=None):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if key_func:
+                key = key_func(*args, **kwargs)
+            else:
+                key = (args, tuple(sorted(kwargs.items())))
+
+            result = cache.get(key)
+            if result is not None:
+                return result
+
+            result = func(*args, **kwargs)
+            cache.set(key, result)
+            return result
+        return wrapper
+    return decorator
+```
+
+Example 3: Implementing a Rate Limiter
+```python
+import time
+from collections import deque
+import threading
+
+class RateLimiter:
+    def __init__(self, max_requests, window_seconds):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        with self._lock:
+            now = time.time()
+
+            # Remove old requests outside the window
+            while self.requests and self.requests[0] <= now - self.window_seconds:
+                self.requests.popleft()
+
+            if len(self.requests) < self.max_requests:
+                self.requests.append(now)
+                return True
+
+            return False
+
+    def wait_and_acquire(self):
+        while not self.acquire():
+            time.sleep(0.1)
+        return True
+
+# Token bucket implementation
+class TokenBucket:
+    def __init__(self, capacity, refill_rate):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.refill_rate = refill_rate
+        self.last_refill = time.time()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens=1):
+        with self._lock:
+            self._refill()
+
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            return False
+
+    def _refill(self):
+        now = time.time()
+        elapsed = now - self.last_refill
+        refill_amount = elapsed * self.refill_rate
+        self.tokens = min(self.capacity, self.tokens + refill_amount)
+        self.last_refill = now
+```
+
+Example 4: Async Context Manager
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def managed_resource(resource_id):
+    resource = await acquire_resource(resource_id)
+    try:
+        yield resource
+    finally:
+        await release_resource(resource)
+
+# Database connection pool example
+class AsyncConnectionPool:
+    def __init__(self, dsn, min_size=5, max_size=20):
+        self.dsn = dsn
+        self.min_size = min_size
+        self.max_size = max_size
+        self._pool = None
+        self._lock = asyncio.Lock()
+
+    async def initialize(self):
+        import asyncpg
+        self._pool = await asyncpg.create_pool(
+            self.dsn,
+            min_size=self.min_size,
+            max_size=self.max_size
+        )
+
+    @asynccontextmanager
+    async def connection(self):
+        async with self._pool.acquire() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+    async def close(self):
+        await self._pool.close()
+
+# Usage:
+async def get_user(pool, user_id):
+    async with pool.connection() as conn:
+        return await conn.fetchrow(
+            'SELECT * FROM users WHERE id = $1',
+            user_id
+        )
+```
+""",
+
+    """Here are examples of implementing design patterns in Python:
+
+Example 1: Factory Pattern
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Type
+
+class Notification(ABC):
+    @abstractmethod
+    def send(self, recipient: str, message: str) -> bool:
+        pass
+
+class EmailNotification(Notification):
+    def __init__(self, smtp_config: dict):
+        self.smtp = smtp_config
+
+    def send(self, recipient: str, message: str) -> bool:
+        # Send email implementation
+        print(f"Sending email to {recipient}: {message}")
+        return True
+
+class SMSNotification(Notification):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def send(self, recipient: str, message: str) -> bool:
+        # Send SMS implementation
+        print(f"Sending SMS to {recipient}: {message}")
+        return True
+
+class PushNotification(Notification):
+    def __init__(self, firebase_config: dict):
+        self.firebase = firebase_config
+
+    def send(self, recipient: str, message: str) -> bool:
+        # Send push notification
+        print(f"Sending push to {recipient}: {message}")
+        return True
+
+class NotificationFactory:
+    _registry: Dict[str, Type[Notification]] = {}
+
+    @classmethod
+    def register(cls, notification_type: str):
+        def decorator(notification_class: Type[Notification]):
+            cls._registry[notification_type] = notification_class
+            return notification_class
+        return decorator
+
+    @classmethod
+    def create(cls, notification_type: str, **config) -> Notification:
+        if notification_type not in cls._registry:
+            raise ValueError(f"Unknown notification type: {notification_type}")
+        return cls._registry[notification_type](**config)
+
+# Register implementations
+NotificationFactory.register("email")(EmailNotification)
+NotificationFactory.register("sms")(SMSNotification)
+NotificationFactory.register("push")(PushNotification)
+```
+
+Example 2: Observer Pattern
+```python
+from abc import ABC, abstractmethod
+from typing import List, Any
+from weakref import WeakSet
+
+class Observer(ABC):
+    @abstractmethod
+    def update(self, event: str, data: Any) -> None:
+        pass
+
+class Observable:
+    def __init__(self):
+        self._observers: WeakSet[Observer] = WeakSet()
+
+    def subscribe(self, observer: Observer) -> None:
+        self._observers.add(observer)
+
+    def unsubscribe(self, observer: Observer) -> None:
+        self._observers.discard(observer)
+
+    def notify(self, event: str, data: Any = None) -> None:
+        for observer in self._observers:
+            observer.update(event, data)
+
+class EventBus:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._subscribers = {}
+        return cls._instance
+
+    def subscribe(self, event: str, callback):
+        if event not in self._subscribers:
+            self._subscribers[event] = []
+        self._subscribers[event].append(callback)
+
+    def publish(self, event: str, data: Any = None):
+        if event in self._subscribers:
+            for callback in self._subscribers[event]:
+                callback(data)
+
+# Usage:
+event_bus = EventBus()
+event_bus.subscribe("user.created", lambda user: print(f"New user: {user}"))
+event_bus.publish("user.created", {"id": 1, "name": "John"})
+```
+
+Example 3: Strategy Pattern
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Protocol
+
+class PricingStrategy(Protocol):
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        ...
+
+class RegularPricing:
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        return base_price * quantity
+
+class BulkPricing:
+    def __init__(self, threshold: int, discount: Decimal):
+        self.threshold = threshold
+        self.discount = discount
+
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        total = base_price * quantity
+        if quantity >= self.threshold:
+            total *= (1 - self.discount)
+        return total
+
+class TieredPricing:
+    def __init__(self, tiers: list):
+        self.tiers = sorted(tiers, key=lambda x: x[0])
+
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        total = Decimal(0)
+        remaining = quantity
+        prev_threshold = 0
+
+        for threshold, discount in self.tiers:
+            if remaining <= 0:
+                break
+            tier_qty = min(remaining, threshold - prev_threshold)
+            tier_price = base_price * (1 - discount)
+            total += tier_price * tier_qty
+            remaining -= tier_qty
+            prev_threshold = threshold
+
+        if remaining > 0:
+            total += base_price * remaining
+
+        return total
+
+@dataclass
+class ShoppingCart:
+    pricing_strategy: PricingStrategy
+
+    def calculate_total(self, items: list) -> Decimal:
+        total = Decimal(0)
+        for item in items:
+            total += self.pricing_strategy.calculate_price(
+                item['price'], item['quantity']
+            )
+        return total
+```
+
+Example 4: Decorator Pattern
+```python
+from abc import ABC, abstractmethod
+from functools import wraps
+import time
+import logging
+
+class DataSource(ABC):
+    @abstractmethod
+    def read_data(self, key: str) -> dict:
+        pass
+
+    @abstractmethod
+    def write_data(self, key: str, data: dict) -> bool:
+        pass
+
+class DatabaseSource(DataSource):
+    def read_data(self, key: str) -> dict:
+        # Simulated database read
+        return {"key": key, "value": "from_db"}
+
+    def write_data(self, key: str, data: dict) -> bool:
+        # Simulated database write
+        return True
+
+class CachingDecorator(DataSource):
+    def __init__(self, source: DataSource, cache: dict = None):
+        self._source = source
+        self._cache = cache or {}
+
+    def read_data(self, key: str) -> dict:
+        if key in self._cache:
+            return self._cache[key]
+        data = self._source.read_data(key)
+        self._cache[key] = data
+        return data
+
+    def write_data(self, key: str, data: dict) -> bool:
+        result = self._source.write_data(key, data)
+        if result:
+            self._cache[key] = data
+        return result
+
+class LoggingDecorator(DataSource):
+    def __init__(self, source: DataSource, logger: logging.Logger = None):
+        self._source = source
+        self._logger = logger or logging.getLogger(__name__)
+
+    def read_data(self, key: str) -> dict:
+        self._logger.info(f"Reading data for key: {key}")
+        start = time.time()
+        result = self._source.read_data(key)
+        self._logger.info(f"Read completed in {time.time() - start:.3f}s")
+        return result
+
+    def write_data(self, key: str, data: dict) -> bool:
+        self._logger.info(f"Writing data for key: {key}")
+        return self._source.write_data(key, data)
+
+# Usage: Stack decorators
+data_source = LoggingDecorator(CachingDecorator(DatabaseSource()))
+```
+""",
+]
+
+# Long system instruction templates
+LONG_SYSTEM_INSTRUCTIONS = [
+    """You are an expert AI coding assistant with deep knowledge of software engineering best practices. Your role is to help developers write clean, efficient, and maintainable code.
+
+## Core Principles
+
+1. **Code Quality**
+   - Write code that is readable and self-documenting
+   - Follow the principle of least surprise
+   - Prefer clarity over cleverness
+   - Use meaningful variable and function names
+
+2. **Design Patterns**
+   - Apply appropriate design patterns when they solve real problems
+   - Avoid over-engineering and premature abstraction
+   - Follow SOLID principles where applicable
+   - Consider the trade-offs of each pattern
+
+3. **Performance**
+   - Write efficient code, but prioritize readability first
+   - Profile before optimizing
+   - Understand Big O complexity
+   - Consider memory usage and cache efficiency
+
+4. **Security**
+   - Never trust user input
+   - Use parameterized queries to prevent SQL injection
+   - Properly escape output to prevent XSS
+   - Follow the principle of least privilege
+   - Keep dependencies updated
+
+5. **Testing**
+   - Write tests that document behavior
+   - Aim for high coverage of critical paths
+   - Use appropriate test types (unit, integration, e2e)
+   - Make tests deterministic and fast
+
+## Response Format
+
+When providing code solutions:
+
+1. First, understand the problem completely
+2. Ask clarifying questions if requirements are ambiguous
+3. Provide a working solution with explanations
+4. Include error handling and edge cases
+5. Suggest improvements or alternatives when relevant
+
+## Language-Specific Guidelines
+
+### Python
+- Follow PEP 8 style guide
+- Use type hints for function signatures
+- Prefer f-strings for string formatting
+- Use context managers for resource handling
+- Leverage dataclasses and Pydantic for data models
+
+### JavaScript/TypeScript
+- Use TypeScript when possible for type safety
+- Prefer async/await over callbacks
+- Use modern ES6+ features appropriately
+- Follow functional programming principles where beneficial
+- Handle promises correctly with proper error handling
+
+### Go
+- Follow effective Go guidelines
+- Use proper error handling (no panic for recoverable errors)
+- Leverage goroutines and channels appropriately
+- Keep functions small and focused
+- Use interfaces for abstraction
+
+### Rust
+- Embrace the ownership model
+- Use Result for error handling
+- Prefer iterators over manual loops
+- Leverage the type system for safety
+- Use appropriate smart pointers
+
+## Communication Style
+
+- Be concise but thorough
+- Explain the "why" behind recommendations
+- Provide examples when helpful
+- Acknowledge trade-offs and alternatives
+- Be honest about limitations or uncertainty
+
+Remember: The goal is to help developers become better at their craft, not just solve immediate problems.""",
+
+    """You are a specialized data science and machine learning assistant. Your expertise covers the entire ML lifecycle from data exploration to model deployment.
+
+## Capabilities
+
+### Data Analysis
+- Exploratory data analysis (EDA)
+- Statistical testing and hypothesis validation
+- Feature engineering and selection
+- Data cleaning and preprocessing
+- Visualization best practices
+
+### Machine Learning
+- Supervised learning (classification, regression)
+- Unsupervised learning (clustering, dimensionality reduction)
+- Deep learning architectures
+- Time series forecasting
+- Natural language processing
+- Computer vision
+
+### MLOps
+- Model versioning and experiment tracking
+- CI/CD for ML pipelines
+- Model monitoring and drift detection
+- A/B testing and canary deployments
+- Feature stores and data versioning
+
+## Analysis Framework
+
+When approaching any data science problem:
+
+1. **Understand the Business Context**
+   - What problem are we solving?
+   - Who are the stakeholders?
+   - What decisions will this analysis inform?
+   - What are the success metrics?
+
+2. **Data Understanding**
+   - What data is available?
+   - What is the data quality?
+   - Are there any biases or limitations?
+   - How was the data collected?
+
+3. **Methodology Selection**
+   - What approach best fits the problem?
+   - What are the assumptions?
+   - How will we validate results?
+   - What are the computational constraints?
+
+4. **Implementation**
+   - Use appropriate tools and libraries
+   - Write reproducible code
+   - Document assumptions and decisions
+   - Create clear visualizations
+
+5. **Evaluation**
+   - Use appropriate metrics
+   - Consider business impact
+   - Validate with domain experts
+   - Plan for monitoring
+
+## Code Standards
+
+When writing data science code:
+
+```python
+# Standard imports organization
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+
+# Configuration
+plt.style.use('seaborn-v0_8-whitegrid')
+pd.set_option('display.max_columns', 100)
+np.random.seed(42)
+
+# Constants at the top
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+CV_FOLDS = 5
+
+# Functions with docstrings and type hints
+def prepare_features(df: pd.DataFrame, target_col: str) -> tuple:
+    '''Prepare features for modeling.
+
+    Args:
+        df: Input dataframe
+        target_col: Name of target column
+
+    Returns:
+        Tuple of (X, y) arrays
+    '''
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+    return X, y
+```
+
+## Visualization Guidelines
+
+- Always label axes and include titles
+- Use colorblind-friendly palettes
+- Choose appropriate chart types for data
+- Keep visualizations simple and focused
+- Include context and annotations when helpful
+
+## Common Pitfalls to Avoid
+
+1. **Data Leakage**: Ensure strict separation of train/test data
+2. **Selection Bias**: Validate data representativeness
+3. **Overfitting**: Use proper validation strategies
+4. **P-hacking**: Pre-register hypotheses when possible
+5. **Ignoring Domain Knowledge**: Collaborate with subject matter experts
+
+## Communication
+
+When explaining results:
+- Start with the key insight or recommendation
+- Provide supporting evidence and analysis
+- Acknowledge uncertainty and limitations
+- Suggest next steps or follow-up analyses
+- Tailor technical depth to the audience""",
+
+    """You are an expert DevOps and Site Reliability Engineer (SRE). Your role is to help teams build, deploy, and operate reliable, scalable systems.
+
+## Areas of Expertise
+
+### Infrastructure as Code
+- Terraform, Pulumi, CloudFormation
+- Ansible, Chef, Puppet
+- Container orchestration (Kubernetes, ECS, Nomad)
+- Service mesh (Istio, Linkerd)
+
+### CI/CD
+- Pipeline design and optimization
+- Testing strategies (unit, integration, e2e)
+- Deployment strategies (blue-green, canary, rolling)
+- GitOps workflows
+
+### Monitoring & Observability
+- Metrics (Prometheus, Datadog, CloudWatch)
+- Logging (ELK, Loki, Splunk)
+- Tracing (Jaeger, Zipkin, OpenTelemetry)
+- Alerting and on-call practices
+
+### Cloud Platforms
+- AWS, GCP, Azure
+- Multi-cloud and hybrid architectures
+- Cost optimization
+- Security best practices
+
+## SRE Principles
+
+### Service Level Objectives (SLOs)
+
+Define reliability targets based on user experience:
+
+```yaml
+# Example SLO specification
+service: api-gateway
+slos:
+  - name: availability
+    target: 99.9%
+    window: 30d
+    sli:
+      type: availability
+      good_events: successful_requests
+      total_events: total_requests
+
+  - name: latency
+    target: 95%
+    window: 30d
+    sli:
+      type: latency
+      threshold_ms: 200
+      percentile: 95
+
+error_budget:
+  calculation: 1 - slo_target
+  burn_rate_alerts:
+    - severity: critical
+      burn_rate: 14.4  # 2h budget in 1h
+      window: 1h
+    - severity: warning
+      burn_rate: 6     # 6h budget in 6h
+      window: 6h
+```
+
+### Error Budgets
+
+- Use error budgets to balance reliability and velocity
+- When budget is exhausted, focus on reliability
+- When budget is healthy, ship faster
+- Make data-driven decisions about risk
+
+### Incident Management
+
+1. **Detection**: Automated alerting based on SLIs
+2. **Response**: Clear on-call escalation paths
+3. **Mitigation**: Runbooks and automation
+4. **Resolution**: Root cause analysis
+5. **Prevention**: Blameless postmortems
+
+## Kubernetes Best Practices
+
+### Resource Management
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "250m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+```
+
+### Security
+- Use RBAC with least privilege
+- Enable Pod Security Standards
+- Scan images for vulnerabilities
+- Use network policies to limit traffic
+- Encrypt secrets with external KMS
+
+### Reliability
+- Set appropriate resource limits
+- Use Pod Disruption Budgets
+- Implement graceful shutdown
+- Use anti-affinity for HA
+- Test failure scenarios regularly
+
+## Monitoring Strategy
+
+### The Four Golden Signals
+
+1. **Latency**: Time to serve a request
+2. **Traffic**: Demand on the system
+3. **Errors**: Rate of failed requests
+4. **Saturation**: How full the system is
+
+### Alert Design
+
+Good alerts are:
+- **Actionable**: Someone needs to do something
+- **Urgent**: Requires immediate attention
+- **Symptomatic**: Based on user-visible symptoms
+- **Non-noisy**: Low false positive rate
+
+## Automation Philosophy
+
+Automate:
+- Repetitive manual tasks
+- Toil that doesn't add value
+- Incident response procedures
+- Capacity planning
+
+But:
+- Document what you automate
+- Handle failures gracefully
+- Keep humans in the loop for critical decisions
+- Test automation regularly""",
+]
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count from text length.
+
+    Rough estimation: ~4 characters per token on average.
+    This is a simplification; real tokenization varies by model.
+    """
+    return len(text) // 4
+
+
+def generate_large_prefix(
+    target_tokens: int,
+    prefix_type: str = "mixed",
+    prefix_id: int = 0
+) -> str:
+    """Generate a large prefix of approximately target_tokens size.
+
+    Args:
+        target_tokens: Target number of tokens (2000-8000)
+        prefix_type: Type of prefix content: "rag", "fewshot", "system", "mixed"
+        prefix_id: Unique identifier for this prefix (for variation)
+
+    Returns:
+        Large prefix text of approximately target_tokens
+    """
+    prefix_parts = []
+    current_tokens = 0
+
+    if prefix_type == "rag" or prefix_type == "mixed":
+        # Add RAG document chunks
+        chunks = RAG_DOCUMENT_CHUNKS.copy()
+        random.shuffle(chunks)
+
+        for chunk in chunks:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(chunk)
+            current_tokens += estimate_tokens(chunk)
+
+    if prefix_type == "fewshot" or (prefix_type == "mixed" and current_tokens < target_tokens):
+        # Add few-shot examples
+        for example in FEW_SHOT_EXAMPLES:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(example)
+            current_tokens += estimate_tokens(example)
+
+    if prefix_type == "system" or (prefix_type == "mixed" and current_tokens < target_tokens):
+        # Add long system instructions
+        for instruction in LONG_SYSTEM_INSTRUCTIONS:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(instruction)
+            current_tokens += estimate_tokens(instruction)
+
+    # If we still need more tokens, pad with documentation-style content
+    padding_chunks = [
+        "### Additional Context\n" + "Lorem ipsum " * 50 + "\n",
+        "### Technical Specifications\n" + "Configuration details " * 40 + "\n",
+        "### Implementation Notes\n" + "Reference documentation " * 45 + "\n",
+    ]
+
+    while current_tokens < target_tokens:
+        for chunk in padding_chunks:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(chunk)
+            current_tokens += estimate_tokens(chunk)
+
+    # Add unique prefix identifier for routing consistency
+    header = f"[Context ID: {prefix_id}]\n\n"
+
+    return header + "\n\n".join(prefix_parts)
+
+
+# Pre-generated large prefixes for consistent routing
+_large_prefixes: List[Tuple[str, int]] = []  # (prefix_text, estimated_tokens)
+
+def initialize_large_prefixes():
+    """Initialize the pool of large prefixes for stress testing."""
+    global _large_prefixes
+
+    if _large_prefixes:
+        return
+
+    logger.info(f"Generating {NUM_LARGE_PREFIXES} large prefixes...")
+
+    prefix_types = ["rag", "fewshot", "system", "mixed"]
+
+    for i in range(NUM_LARGE_PREFIXES):
+        # Random size within configured range
+        target_tokens = random.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
+        prefix_type = prefix_types[i % len(prefix_types)]
+
+        prefix_text = generate_large_prefix(target_tokens, prefix_type, i)
+        actual_tokens = estimate_tokens(prefix_text)
+
+        _large_prefixes.append((prefix_text, actual_tokens))
+        logger.info(f"  Generated prefix {i}: ~{actual_tokens} tokens ({prefix_type})")
+
+    logger.info(f"Large prefix generation complete")
+
+
+def get_prefix_size_bucket(token_count: int) -> str:
+    """Get the size bucket for a given token count."""
+    for bucket_name, min_tokens, max_tokens in PREFIX_SIZE_BUCKETS:
+        if min_tokens <= token_count < max_tokens:
+            return bucket_name
+    return "xlarge"
+
 # ============================================================================
 # Metrics Collection
 # ============================================================================
@@ -194,6 +1695,8 @@ class RequestMetrics:
     completion_tokens: int = 0
     is_cache_hit: bool = False
     routing_mode: str = "unknown"
+    prefix_size_bucket: str = "unknown"
+    estimated_prefix_tokens: int = 0
 
 
 @dataclass
@@ -219,6 +1722,12 @@ class BenchmarkStats:
     # Routing tracking: prefix_hash -> backend_id
     prefix_to_backend: Dict[str, str] = field(default_factory=dict)
 
+    # TTFT by prefix size bucket (for stress testing)
+    ttft_by_bucket: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    ttft_cache_hit_by_bucket: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    ttft_cache_miss_by_bucket: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    requests_by_bucket: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
     # Lock for thread safety
     _lock: Lock = field(default_factory=Lock)
 
@@ -238,6 +1747,12 @@ class BenchmarkStats:
             if metrics.total_time_ms:
                 self.total_generation_time_s += metrics.total_time_ms / 1000.0
 
+            # Track by prefix size bucket
+            bucket = metrics.prefix_size_bucket
+            if bucket and bucket != "unknown":
+                self.ttft_by_bucket[bucket].append(metrics.ttft_ms)
+                self.requests_by_bucket[bucket] += 1
+
             # Track cache hits based on prefix routing
             if metrics.prompt_prefix_hash:
                 expected_backend = self.prefix_to_backend.get(metrics.prompt_prefix_hash)
@@ -248,16 +1763,22 @@ class BenchmarkStats:
                     self.cache_misses += 1
                     self.ttft_cache_miss.append(metrics.ttft_ms)
                     metrics.is_cache_hit = False
+                    if bucket and bucket != "unknown":
+                        self.ttft_cache_miss_by_bucket[bucket].append(metrics.ttft_ms)
                 elif expected_backend == metrics.backend_id:
                     # Same backend - cache hit
                     self.cache_hits += 1
                     self.ttft_cache_hit.append(metrics.ttft_ms)
                     metrics.is_cache_hit = True
+                    if bucket and bucket != "unknown":
+                        self.ttft_cache_hit_by_bucket[bucket].append(metrics.ttft_ms)
                 else:
                     # Different backend - cache miss (routing failure)
                     self.cache_misses += 1
                     self.ttft_cache_miss.append(metrics.ttft_ms)
                     metrics.is_cache_hit = False
+                    if bucket and bucket != "unknown":
+                        self.ttft_cache_miss_by_bucket[bucket].append(metrics.ttft_ms)
 
     def get_summary(self) -> dict:
         """Generate summary statistics."""
@@ -275,7 +1796,7 @@ class BenchmarkStats:
             if self.total_generation_time_s > 0:
                 tokens_per_sec = self.total_completion_tokens / self.total_generation_time_s
 
-            return {
+            summary = {
                 "total_requests": self.total_requests,
                 "successful_requests": self.successful_requests,
                 "failed_requests": self.failed_requests,
@@ -292,6 +1813,38 @@ class BenchmarkStats:
                 "tokens_per_second": tokens_per_sec,
                 "unique_prefixes": len(self.prefix_to_backend),
             }
+
+            # Add per-bucket statistics for large-prefix stress testing
+            if self.ttft_by_bucket:
+                bucket_stats = {}
+                for bucket_name in ["tiny", "small", "medium", "large", "xlarge"]:
+                    if bucket_name in self.ttft_by_bucket and self.ttft_by_bucket[bucket_name]:
+                        all_ttft = self.ttft_by_bucket[bucket_name]
+                        hit_ttft = self.ttft_cache_hit_by_bucket.get(bucket_name, [])
+                        miss_ttft = self.ttft_cache_miss_by_bucket.get(bucket_name, [])
+
+                        bucket_stats[bucket_name] = {
+                            "requests": self.requests_by_bucket.get(bucket_name, 0),
+                            "ttft_p50_ms": self._percentile(all_ttft, 0.50),
+                            "ttft_p99_ms": self._percentile(all_ttft, 0.99),
+                            "ttft_min_ms": min(all_ttft) if all_ttft else None,
+                            "ttft_max_ms": max(all_ttft) if all_ttft else None,
+                            "cache_hit_ttft_p50_ms": self._percentile(hit_ttft, 0.50) if hit_ttft else None,
+                            "cache_miss_ttft_p50_ms": self._percentile(miss_ttft, 0.50) if miss_ttft else None,
+                            "cache_hit_count": len(hit_ttft),
+                            "cache_miss_count": len(miss_ttft),
+                        }
+
+                        # Calculate improvement for this bucket
+                        if hit_ttft and miss_ttft:
+                            hit_p50 = self._percentile(hit_ttft, 0.50)
+                            miss_p50 = self._percentile(miss_ttft, 0.50)
+                            bucket_stats[bucket_name]["ttft_improvement_pct"] = \
+                                self._calculate_improvement(miss_p50, hit_p50)
+
+                summary["bucket_stats"] = bucket_stats
+
+            return summary
 
     def _percentile(self, data: List[float], p: float) -> Optional[float]:
         """Calculate percentile of data."""
@@ -545,29 +2098,39 @@ def get_backend_from_response(headers: dict) -> Optional[str]:
 # Prompt Generation
 # ============================================================================
 
-def generate_prompt() -> Tuple[List[dict], str]:
+def generate_prompt() -> Tuple[List[dict], str, int]:
     """Generate a prompt based on configured distribution.
 
     Returns:
-        Tuple of (messages list, prefix_hash for cache tracking)
+        Tuple of (messages list, prefix_hash for cache tracking, estimated_token_count)
     """
-    distribution = PROMPT_DISTRIBUTION.lower()
+    distribution = PROMPT_DISTRIBUTION.lower().replace("-", "_")
 
     if distribution == "short":
-        return _generate_short_prompt()
+        messages, prefix_hash = _generate_short_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
     elif distribution == "medium":
-        return _generate_medium_prompt()
+        messages, prefix_hash = _generate_medium_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
     elif distribution == "long":
-        return _generate_long_prompt()
+        messages, prefix_hash = _generate_long_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif distribution == "large_prefix":
+        # Large prefix mode for stress testing KV cache
+        return _generate_large_prefix_prompt()
+    elif distribution == "stress":
+        # Stress mode with mixed sizes biased toward large prefixes
+        return _generate_stress_prompt()
     else:  # mixed
         # Weighted distribution: 30% short, 50% medium, 20% long
         r = random.random()
         if r < 0.3:
-            return _generate_short_prompt()
+            messages, prefix_hash = _generate_short_prompt()
         elif r < 0.8:
-            return _generate_medium_prompt()
+            messages, prefix_hash = _generate_medium_prompt()
         else:
-            return _generate_long_prompt()
+            messages, prefix_hash = _generate_long_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
 
 
 def _generate_short_prompt() -> Tuple[List[dict], str]:
@@ -612,6 +2175,97 @@ def _generate_long_prompt() -> Tuple[List[dict], str]:
     return messages, hash_prompt_prefix(messages)
 
 
+def _generate_large_prefix_prompt() -> Tuple[List[dict], str, int]:
+    """Generate a prompt with a large shared prefix for stress testing.
+
+    Returns:
+        Tuple of (messages, prefix_hash, estimated_token_count)
+    """
+    # Ensure large prefixes are initialized
+    initialize_large_prefixes()
+
+    if not _large_prefixes:
+        # Fallback to long prompt if generation failed
+        messages, prefix_hash = _generate_long_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+
+    # Select a prefix (shared for prefix-affinity routing)
+    prefix_text, token_count = random.choice(_large_prefixes)
+
+    # Generate different user queries for the same prefix
+    user_queries = [
+        "Based on the context above, summarize the key points.",
+        "What are the main technical requirements described?",
+        "Identify any potential issues or risks mentioned.",
+        "How would you improve the implementation described?",
+        "What are the dependencies between components?",
+        "Provide a step-by-step implementation plan.",
+        "What testing strategy would you recommend?",
+        "How would you scale this architecture?",
+        "What security considerations are important here?",
+        "Compare the approaches mentioned and recommend one.",
+    ]
+
+    messages = [
+        {"role": "system", "content": prefix_text},
+        {"role": "user", "content": random.choice(user_queries)},
+    ]
+
+    return messages, hash_prompt_prefix(messages), token_count
+
+
+def _generate_stress_prompt() -> Tuple[List[dict], str, int]:
+    """Generate prompts with mixed sizes for comprehensive stress testing.
+
+    Uses a distribution biased toward large prefixes to stress the KV cache.
+
+    Returns:
+        Tuple of (messages, prefix_hash, estimated_token_count)
+    """
+    # Weighted distribution: 10% small, 20% medium, 30% large, 40% xlarge
+    r = random.random()
+    if r < 0.1:
+        # Small prompt
+        messages, prefix_hash = _generate_short_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif r < 0.3:
+        # Medium prompt
+        messages, prefix_hash = _generate_medium_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif r < 0.6:
+        # Large prefix (2000-4000 tokens)
+        initialize_large_prefixes()
+        if _large_prefixes:
+            # Filter for large range
+            large_prefixes = [(p, t) for p, t in _large_prefixes if 2000 <= t < 4000]
+            if large_prefixes:
+                prefix_text, token_count = random.choice(large_prefixes)
+                messages = [
+                    {"role": "system", "content": prefix_text},
+                    {"role": "user", "content": "Analyze and summarize the key points."},
+                ]
+                return messages, hash_prompt_prefix(messages), token_count
+
+        # Fallback
+        return _generate_large_prefix_prompt()
+    else:
+        # XLarge prefix (4000-8000 tokens)
+        initialize_large_prefixes()
+        if _large_prefixes:
+            # Filter for xlarge range
+            xlarge_prefixes = [(p, t) for p, t in _large_prefixes if t >= 4000]
+            if xlarge_prefixes:
+                prefix_text, token_count = random.choice(xlarge_prefixes)
+                messages = [
+                    {"role": "system", "content": prefix_text},
+                    {"role": "user", "content": "Provide a comprehensive analysis."},
+                ]
+                return messages, hash_prompt_prefix(messages), token_count
+
+        # Fallback
+        return _generate_large_prefix_prompt()
+
+
 # ============================================================================
 # Event Handlers
 # ============================================================================
@@ -630,7 +2284,22 @@ def on_test_start(environment, **kwargs):
     logger.info(f"Shared Prefix Ratio: {SHARED_PREFIX_RATIO}")
     logger.info(f"P99 Latency Threshold: {P99_LATENCY_THRESHOLD_MS}ms")
     logger.info(f"Backends: {BACKENDS}")
+
+    # Log large prefix configuration if using stress modes
+    dist = PROMPT_DISTRIBUTION.lower().replace("-", "_")
+    if dist in ["large_prefix", "stress"]:
+        logger.info(f"Large Prefix Mode:")
+        logger.info(f"  Min Tokens: {LARGE_PREFIX_MIN_TOKENS}")
+        logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
+        logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
+        logger.info(f"  Prefix Size Buckets: {PREFIX_SIZE_BUCKETS}")
+
     logger.info("=" * 70)
+
+    # Pre-initialize large prefixes if using stress modes
+    if dist in ["large_prefix", "stress"]:
+        logger.info("Pre-generating large prefixes for stress testing...")
+        initialize_large_prefixes()
 
     # Register backends
     register_backends_on_all_nodes()
@@ -675,6 +2344,40 @@ def on_test_stop(environment, **kwargs):
         logger.info(f"  Cache Miss P99: {summary['ttft_cache_miss_p99_ms']:.1f}ms")
     if summary['ttft_improvement_pct']:
         logger.info(f"  TTFT Improvement: {summary['ttft_improvement_pct']:.1f}%")
+
+    # Print per-bucket statistics (for large-prefix stress testing)
+    bucket_stats = summary.get("bucket_stats", {})
+    if bucket_stats:
+        logger.info(f"\nTTFT by Prefix Size Bucket:")
+        logger.info(f"  {'Bucket':<10} {'Reqs':>8} {'P50':>10} {'P99':>10} {'Hit P50':>10} {'Miss P50':>10} {'Improv%':>10}")
+        logger.info(f"  {'-' * 68}")
+
+        for bucket_name in ["tiny", "small", "medium", "large", "xlarge"]:
+            if bucket_name in bucket_stats:
+                b = bucket_stats[bucket_name]
+                reqs = b.get("requests", 0)
+                p50 = b.get("ttft_p50_ms")
+                p99 = b.get("ttft_p99_ms")
+                hit_p50 = b.get("cache_hit_ttft_p50_ms")
+                miss_p50 = b.get("cache_miss_ttft_p50_ms")
+                improv = b.get("ttft_improvement_pct")
+
+                p50_str = f"{p50:.1f}ms" if p50 else "N/A"
+                p99_str = f"{p99:.1f}ms" if p99 else "N/A"
+                hit_str = f"{hit_p50:.1f}ms" if hit_p50 else "N/A"
+                miss_str = f"{miss_p50:.1f}ms" if miss_p50 else "N/A"
+                improv_str = f"{improv:.1f}%" if improv else "N/A"
+
+                logger.info(f"  {bucket_name:<10} {reqs:>8} {p50_str:>10} {p99_str:>10} {hit_str:>10} {miss_str:>10} {improv_str:>10}")
+
+        # Highlight large prefix improvements for stress testing
+        large_stats = bucket_stats.get("large", {})
+        xlarge_stats = bucket_stats.get("xlarge", {})
+
+        if large_stats.get("ttft_improvement_pct"):
+            logger.info(f"\n  Large Prefix (2000-4000 tokens) TTFT Improvement: {large_stats['ttft_improvement_pct']:.1f}%")
+        if xlarge_stats.get("ttft_improvement_pct"):
+            logger.info(f"  XLarge Prefix (4000-8000 tokens) TTFT Improvement: {xlarge_stats['ttft_improvement_pct']:.1f}%")
 
     # Print throughput
     logger.info(f"\nThroughput:")
@@ -763,8 +2466,11 @@ class RealBackendUser(HttpUser):
 
         target_url = RANVIER_NODES[node_index]
 
-        # Generate prompt
-        messages, prefix_hash = generate_prompt()
+        # Generate prompt (now returns token count for stress testing)
+        messages, prefix_hash, estimated_tokens = generate_prompt()
+
+        # Determine prefix size bucket for metrics tracking
+        prefix_size_bucket = get_prefix_size_bucket(estimated_tokens)
 
         request_body = {
             "model": os.environ.get("VLLM_MODEL", "default"),
@@ -778,6 +2484,8 @@ class RealBackendUser(HttpUser):
             request_id=f"req-{self._request_count}",
             prompt_prefix_hash=prefix_hash,
             routing_mode=BENCHMARK_MODE,
+            prefix_size_bucket=prefix_size_bucket,
+            estimated_prefix_tokens=estimated_tokens,
         )
 
         start_time = time.perf_counter()
@@ -873,6 +2581,27 @@ class RealBackendUser(HttpUser):
                     exception=None,
                     context={},
                 )
+
+                # Record bucket-specific TTFT for stress testing
+                if prefix_size_bucket and prefix_size_bucket != "unknown":
+                    events.request.fire(
+                        request_type="GET",
+                        name=f"TTFT ({prefix_size_bucket})",
+                        response_time=ttft,
+                        response_length=0,
+                        exception=None,
+                        context={},
+                    )
+
+                    # Record bucket + cache status for detailed analysis
+                    events.request.fire(
+                        request_type="GET",
+                        name=f"TTFT ({prefix_size_bucket} {cache_status})",
+                        response_time=ttft,
+                        response_length=0,
+                        exception=None,
+                        context={},
+                    )
 
             if completion_tokens > 0:
                 # Record tokens per second for this request
