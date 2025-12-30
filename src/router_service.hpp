@@ -76,6 +76,11 @@ public:
     // Get a backend using weighted random selection within the highest available priority group
     std::optional<BackendId> get_random_backend();
 
+    // Get a backend using prefix-affinity routing (consistent hashing on prefix tokens)
+    // Routes requests with the same prefix to the same backend for KV cache reuse
+    std::optional<BackendId> get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                                     const std::string& request_id = "");
+
     // Get list of all IDs (For the Health Checker to iterate)
     std::vector<BackendId> get_all_backend_ids() const;
 

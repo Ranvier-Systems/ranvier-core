@@ -150,6 +150,7 @@ future<> reload_config() {
         ctrl_config.enable_token_forwarding = g_config.routing.enable_token_forwarding;
         ctrl_config.accept_client_tokens = g_config.routing.accept_client_tokens;
         ctrl_config.max_token_id = g_config.routing.max_token_id;
+        ctrl_config.prefix_affinity_enabled = g_config.routing.prefix_affinity_enabled;
 
         // Update HttpController config on all shards (controller is sharded)
         return controller.invoke_on_all([ctrl_config](ranvier::HttpController& c) {
@@ -219,6 +220,7 @@ future<> run() {
     ctrl_config.enable_token_forwarding = g_config.routing.enable_token_forwarding;
     ctrl_config.accept_client_tokens = g_config.routing.accept_client_tokens;
     ctrl_config.max_token_id = g_config.routing.max_token_id;
+    ctrl_config.prefix_affinity_enabled = g_config.routing.prefix_affinity_enabled;
 
     // 3. Initialize router's thread-local data on all shards, then start services
     // Each shard needs its own RadixTree and backend maps for the shared-nothing architecture

@@ -49,6 +49,35 @@ thread_local uint64_t stats_cluster_routes_pruned = 0;
 thread_local size_t local_max_routes = 100000;
 thread_local std::chrono::seconds local_ttl_seconds{3600};
 thread_local std::chrono::seconds local_backend_drain_timeout{60};
+thread_local bool local_prefix_affinity_enabled = true;
+thread_local size_t local_prefix_token_length = 128;
+thread_local uint32_t local_block_alignment = 16;
+
+// Thread-local counter for prefix affinity routing
+thread_local uint64_t stats_prefix_affinity_routes = 0;
+
+// FNV-1a hash constants for 64-bit
+constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+
+// Hash function for prefix tokens using FNV-1a
+// Aligns to block_alignment boundary for vLLM compatibility
+inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
+    // Align to block_alignment boundary
+    size_t aligned_len = (count / block_alignment) * block_alignment;
+    if (aligned_len == 0) aligned_len = count;
+
+    uint64_t hash = FNV_OFFSET_BASIS;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
+    size_t byte_len = aligned_len * sizeof(int32_t);
+
+    for (size_t i = 0; i < byte_len; ++i) {
+        hash ^= data[i];
+        hash *= FNV_PRIME;
+    }
+
+    return hash;
+}
 
 thread_local std::mt19937 rng([]() {
     std::random_device rd;
@@ -68,6 +97,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     local_max_routes = routing_config.max_routes;
     local_ttl_seconds = routing_config.ttl_seconds;
     local_backend_drain_timeout = routing_config.backend_drain_timeout;
+    local_prefix_affinity_enabled = routing_config.prefix_affinity_enabled;
+    local_prefix_token_length = routing_config.prefix_token_length;
+    local_block_alignment = routing_config.block_alignment;
 
     // Create GossipService if cluster mode is enabled
     if (_cluster_config.enabled) {
@@ -96,7 +128,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_routes_expired", stats_routes_expired,
             seastar::metrics::description("Total number of routes expired due to TTL")),
         seastar::metrics::make_counter("router_cluster_routes_pruned", stats_cluster_routes_pruned,
-            seastar::metrics::description("Total number of routes pruned when cluster peer fails"))
+            seastar::metrics::description("Total number of routes pruned when cluster peer fails")),
+        seastar::metrics::make_counter("router_prefix_affinity_routes", stats_prefix_affinity_routes,
+            seastar::metrics::description("Total number of requests routed via prefix affinity"))
     });
 }
 
@@ -106,14 +140,19 @@ seastar::future<> RouterService::initialize_shards() {
     size_t max_routes = _config.max_routes;
     auto ttl_seconds = _config.ttl_seconds;
     auto drain_timeout = _config.backend_drain_timeout;
+    bool prefix_affinity_enabled = _config.prefix_affinity_enabled;
+    size_t prefix_token_length = _config.prefix_token_length;
 
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
-        [block_alignment, max_routes, ttl_seconds, drain_timeout](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout] {
+        [block_alignment, max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length] {
                 local_tree = std::make_unique<RadixTree>(block_alignment);
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
                 local_backend_drain_timeout = drain_timeout;
+                local_prefix_affinity_enabled = prefix_affinity_enabled;
+                local_prefix_token_length = prefix_token_length;
+                local_block_alignment = block_alignment;
                 return seastar::make_ready_future<>();
             });
         });
@@ -258,11 +297,115 @@ std::optional<BackendId> RouterService::get_random_backend() {
     return candidates.back().first;
 }
 
+std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                                                 const std::string& request_id) {
+    if (local_backend_ids.empty()) {
+        return std::nullopt;
+    }
+
+    // Collect live backends (not dead, not draining)
+    std::vector<BackendId> live_backends;
+    for (BackendId id : local_backend_ids) {
+        if (local_dead_backends.contains(id)) {
+            continue;  // Skip dead backends
+        }
+        auto it = local_backends.find(id);
+        if (it == local_backends.end()) {
+            continue;
+        }
+        if (it->second.is_draining) {
+            continue;  // Skip draining backends
+        }
+        live_backends.push_back(id);
+    }
+
+    if (live_backends.empty()) {
+        return std::nullopt;
+    }
+
+    // Sort for deterministic ordering across shards
+    std::sort(live_backends.begin(), live_backends.end());
+
+    // Extract prefix (first N tokens)
+    size_t prefix_len = std::min(tokens.size(), local_prefix_token_length);
+    if (prefix_len == 0) {
+        // No tokens to route on, fall back to first backend
+        return live_backends[0];
+    }
+
+    // HYBRID ROUTING: ART lookup first, hash fallback
+    //
+    // 1. ART provides "Longest Prefix Match" - finds the longest known prefix
+    //    that matches the beginning of this request. This enables partial
+    //    prefix matching for similar requests with different suffixes.
+    //
+    // 2. If ART finds a match, we route to that backend (affinity to learned route)
+    //
+    // 3. If no match in ART, we use consistent hashing on the prefix for
+    //    deterministic routing. The route will be learned after success.
+
+    // Step 1: Try ART lookup for longest prefix match
+    if (local_tree) {
+        std::span<const TokenId> token_span(tokens.data(), tokens.size());
+        auto art_result = local_tree->lookup(token_span);
+
+        if (art_result.has_value()) {
+            BackendId art_backend = art_result.value();
+
+            // Verify the backend is still live
+            if (std::find(live_backends.begin(), live_backends.end(), art_backend) != live_backends.end()) {
+                // ART cache hit - route to learned backend
+                if (!request_id.empty()) {
+                    log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
+                                     request_id, tokens.size(), art_backend);
+                }
+                stats_cache_hits++;
+                stats_prefix_affinity_routes++;
+                if (g_metrics) {
+                    metrics().record_cache_hit();
+                }
+                return art_backend;
+            }
+            // Backend is dead/draining, fall through to hash-based selection
+            log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
+                             request_id, art_backend);
+        }
+    }
+
+    // Step 2: No ART match (or backend unavailable) - use consistent hashing
+    // This provides deterministic routing for new prefixes
+    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, local_block_alignment);
+    size_t index = prefix_hash % live_backends.size();
+    BackendId selected = live_backends[index];
+
+    if (!request_id.empty()) {
+        log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
+                         request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
+    }
+
+    // This is a cache miss - the route will be learned after successful response
+    stats_cache_misses++;
+    stats_prefix_affinity_routes++;
+    if (g_metrics) {
+        metrics().record_cache_miss();
+    }
+
+    return selected;
+}
+
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                                        const std::string& request_id) {
+    // Truncate to prefix length - we only store the prefix in the ART, not the full sequence
+    // This ensures that requests with the same prefix (e.g., same system prompt) but
+    // different suffixes (e.g., different user queries) share the same routing entry.
+    size_t prefix_len = std::min(tokens.size(), _config.prefix_token_length);
+    if (prefix_len < tokens.size()) {
+        tokens.resize(prefix_len);
+    }
+
     // Log route learning with request_id on shard 0 before broadcasting
     if (!request_id.empty()) {
-        log_router.info("[{}] Learning route: {} tokens -> backend {}",
+        log_router.info("[{}] Learning route: {} tokens (prefix) -> backend {}",
                         request_id, tokens.size(), backend);
     }
 
@@ -432,17 +575,23 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     size_t max_routes = config.max_routes;
     auto ttl_seconds = config.ttl_seconds;
     auto drain_timeout = config.backend_drain_timeout;
+    bool prefix_affinity_enabled = config.prefix_affinity_enabled;
+    size_t prefix_token_length = config.prefix_token_length;
+    uint32_t block_alignment = config.block_alignment;
 
-    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s)",
-                  max_routes, ttl_seconds.count(), drain_timeout.count());
+    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, prefix_affinity={}, prefix_len={})",
+                  max_routes, ttl_seconds.count(), drain_timeout.count(), prefix_affinity_enabled, prefix_token_length);
 
     // Broadcast to all shards using Seastar's async message passing
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-        [max_routes, ttl_seconds, drain_timeout](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds, drain_timeout] {
+        [max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length, block_alignment](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length, block_alignment] {
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
                 local_backend_drain_timeout = drain_timeout;
+                local_prefix_affinity_enabled = prefix_affinity_enabled;
+                local_prefix_token_length = prefix_token_length;
+                local_block_alignment = block_alignment;
                 return seastar::make_ready_future<>();
             });
         });
