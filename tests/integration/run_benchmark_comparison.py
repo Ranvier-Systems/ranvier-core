@@ -8,6 +8,24 @@ This script runs the same workload twice:
 
 It then compares the results to demonstrate the value of prefix-aware routing.
 
+## Multi-GPU Testing
+
+More backends = greater relative benefit from prefix-affinity routing:
+- 2 backends: Random routing gets ~50% cache hit rate
+- 4 backends: Random routing gets ~25% cache hit rate
+- 8 backends: Random routing gets ~12.5% cache hit rate
+
+Use --num-backends to configure:
+
+    # Test with 4 GPUs
+    python3 tests/integration/run_benchmark_comparison.py --num-backends 4 \
+        --stress
+
+    # Configure backend IPs via environment variables
+    BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 \
+    BACKEND3_IP=10.0.0.3 BACKEND4_IP=10.0.0.4 \
+    python3 tests/integration/run_benchmark_comparison.py --num-backends 4
+
 ## Stress Testing Mode
 
 For large-prefix stress testing that demonstrates measurable KV cache improvements:
@@ -34,6 +52,9 @@ Usage:
 
     # Stress test mode (large prefixes):
     python3 tests/integration/run_benchmark_comparison.py --stress
+
+    # Multi-GPU stress test:
+    python3 tests/integration/run_benchmark_comparison.py --stress --num-backends 4
 
     # Custom duration:
     python3 tests/integration/run_benchmark_comparison.py --duration 10m
@@ -258,11 +279,16 @@ def format_stress_test_report(
     lines.append("")
 
     # Configuration
+    num_backends = config.get('num_backends', 2)
+    expected_random_hit = 100.0 / num_backends
     lines.append("Configuration:")
+    lines.append(f"  Number of Backends: {num_backends}")
+    lines.append(f"  Number of Ranvier Nodes: {config.get('num_ranvier_nodes', 3)}")
     lines.append(f"  Prompt Distribution: {config.get('prompt_distribution', 'large-prefix')}")
     lines.append(f"  Large Prefix Min Tokens: {config.get('large_prefix_min', 2000)}")
     lines.append(f"  Large Prefix Max Tokens: {config.get('large_prefix_max', 8000)}")
     lines.append(f"  Number of Prefixes: {config.get('num_prefixes', 5)}")
+    lines.append(f"  Expected Random Cache Hit Rate: {expected_random_hit:.1f}% (1/{num_backends})")
     lines.append("")
 
     # Overall comparison
@@ -589,6 +615,18 @@ def main():
         default=5,
         help="Number of large prefixes to generate (default: 5)",
     )
+    parser.add_argument(
+        "--num-backends",
+        type=int,
+        default=2,
+        help="Number of vLLM backends (default: 2). More backends = greater cache benefit.",
+    )
+    parser.add_argument(
+        "--num-ranvier-nodes",
+        type=int,
+        default=3,
+        help="Number of Ranvier router nodes (default: 3)",
+    )
 
     args = parser.parse_args()
 
@@ -634,6 +672,8 @@ def main():
         "LARGE_PREFIX_MIN_TOKENS": str(args.large_prefix_min),
         "LARGE_PREFIX_MAX_TOKENS": str(args.large_prefix_max),
         "NUM_LARGE_PREFIXES": str(args.num_prefixes),
+        "NUM_BACKENDS": str(args.num_backends),
+        "NUM_RANVIER_NODES": str(args.num_ranvier_nodes),
     }
 
     # Store config for reporting
@@ -643,6 +683,8 @@ def main():
         "large_prefix_min": args.large_prefix_min,
         "large_prefix_max": args.large_prefix_max,
         "num_prefixes": args.num_prefixes,
+        "num_backends": args.num_backends,
+        "num_ranvier_nodes": args.num_ranvier_nodes,
     }
 
     if args.stress:
@@ -650,6 +692,11 @@ def main():
         print(f"  Prompt Distribution: {prompt_distribution}")
         print(f"  Large Prefix Tokens: {args.large_prefix_min}-{args.large_prefix_max}")
         print(f"  Number of Prefixes: {args.num_prefixes}")
+        print(f"  Number of Backends: {args.num_backends}")
+        print(f"  Number of Ranvier Nodes: {args.num_ranvier_nodes}")
+        # Print expected random cache hit rate for comparison
+        expected_random_hit = 100.0 / args.num_backends
+        print(f"  Expected Random Cache Hit Rate: {expected_random_hit:.1f}%")
         print("")
 
     roundrobin_results = {}

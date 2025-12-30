@@ -14,13 +14,44 @@ Key Metrics:
 - Token Throughput: Tokens generated per second
 - Routing Accuracy: Whether router correctly identified prefix locality
 
+Environment Variables:
+    Backend Configuration:
+        NUM_BACKENDS          - Number of vLLM backends (default: 2)
+        BACKEND{N}_IP         - IP address for backend N (default: 172.29.1.{9+N})
+        BACKEND{N}_PORT       - Port for backend N (default: 8000)
+        SINGLE_BACKEND_MODE   - Legacy: set to "true" for single backend
+
+    Ranvier Node Configuration:
+        NUM_RANVIER_NODES     - Number of Ranvier router nodes (default: 3)
+        RANVIER_NODE{N}       - Full URL for node N (e.g., http://host:8080)
+        RANVIER_NODE{N}_IP    - IP address for node N (default: 172.29.2.{N})
+        RANVIER_NODE{N}_PORT  - Port for node N (default: 8080)
+        RANVIER_METRICS{N}    - Full metrics URL for node N
+        RANVIER_METRICS{N}_PORT - Metrics port for node N (default: 9180)
+
+    Benchmark Configuration:
+        BENCHMARK_MODE        - "prefix" (default) or "round_robin"
+        PROMPT_DISTRIBUTION   - "mixed", "short", "medium", "long", "large-prefix", "stress"
+        SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
+        P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
+
+    Large Prefix Stress Testing:
+        LARGE_PREFIX_MIN_TOKENS - Minimum prefix size (default: 2000)
+        LARGE_PREFIX_MAX_TOKENS - Maximum prefix size (default: 8000)
+        NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
+
 Usage:
-    # With external vLLM endpoints:
-    VLLM_ENDPOINT_1=http://server1:8000 VLLM_ENDPOINT_2=http://server2:8000 \
+    # With 2 backends (default):
     make benchmark-real
 
-    # With local vLLM containers (requires GPU):
-    make benchmark-real-local
+    # With 4 backends for multi-GPU testing:
+    NUM_BACKENDS=4 \
+    BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 \
+    BACKEND3_IP=10.0.0.3 BACKEND4_IP=10.0.0.4 \
+    make benchmark-real
+
+    # Stress test with large prefixes:
+    PROMPT_DISTRIBUTION=stress NUM_BACKENDS=4 make benchmark-real
 """
 
 import json
@@ -46,42 +77,92 @@ logger = logging.getLogger(__name__)
 # Environment Configuration
 # ============================================================================
 
-RANVIER_NODES = [
-    os.environ.get("RANVIER_NODE1", "http://172.29.2.1:8080"),
-    os.environ.get("RANVIER_NODE2", "http://172.29.2.2:8080"),
-    os.environ.get("RANVIER_NODE3", "http://172.29.2.3:8080"),
-]
-
-RANVIER_METRICS = [
-    os.environ.get("RANVIER_METRICS1", "http://172.29.2.1:9180"),
-    os.environ.get("RANVIER_METRICS2", "http://172.29.2.2:9180"),
-    os.environ.get("RANVIER_METRICS3", "http://172.29.2.3:9180"),
-]
-
-# Support single-backend mode for single-GPU testing
+# Support single-backend mode for single-GPU testing (legacy, prefer NUM_BACKENDS=1)
 SINGLE_BACKEND_MODE = os.environ.get("SINGLE_BACKEND_MODE", "false").lower() == "true"
 
+# Configurable backend count (1-16 backends supported)
+# Set NUM_BACKENDS to control how many backends to use
+# Each backend requires BACKEND{N}_IP and optionally BACKEND{N}_PORT environment variables
 if SINGLE_BACKEND_MODE:
-    BACKENDS = [
-        {
-            "id": 1,
-            "ip": os.environ.get("BACKEND1_IP", "172.29.1.10"),
-            "port": int(os.environ.get("BACKEND1_PORT", "8000")),
-        },
-    ]
+    NUM_BACKENDS = 1
 else:
-    BACKENDS = [
-        {
-            "id": 1,
-            "ip": os.environ.get("BACKEND1_IP", "172.29.1.10"),
-            "port": int(os.environ.get("BACKEND1_PORT", "8000")),
-        },
-        {
-            "id": 2,
-            "ip": os.environ.get("BACKEND2_IP", "172.29.1.11"),
-            "port": int(os.environ.get("BACKEND2_PORT", "8000")),
-        },
-    ]
+    NUM_BACKENDS = int(os.environ.get("NUM_BACKENDS", "2"))
+
+# Default backend IP patterns (can be overridden per-backend)
+DEFAULT_BACKEND_IP_PATTERN = "172.29.1.{}"  # {} is replaced with 10 + backend_index
+DEFAULT_BACKEND_PORT = 8000
+
+# Dynamically build backends list based on NUM_BACKENDS
+def _build_backends_list(num_backends: int) -> List[dict]:
+    """Build the backends list dynamically based on environment configuration.
+
+    For each backend N (1-indexed), checks for:
+    - BACKEND{N}_IP: IP address (default: 172.29.1.{9+N})
+    - BACKEND{N}_PORT: Port number (default: 8000)
+
+    Examples:
+        NUM_BACKENDS=4 with defaults:
+          Backend 1: 172.29.1.10:8000
+          Backend 2: 172.29.1.11:8000
+          Backend 3: 172.29.1.12:8000
+          Backend 4: 172.29.1.13:8000
+
+        With custom IPs:
+          BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 NUM_BACKENDS=2
+    """
+    backends = []
+    for i in range(1, num_backends + 1):
+        default_ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
+        backends.append({
+            "id": i,
+            "ip": os.environ.get(f"BACKEND{i}_IP", default_ip),
+            "port": int(os.environ.get(f"BACKEND{i}_PORT", str(DEFAULT_BACKEND_PORT))),
+        })
+    return backends
+
+BACKENDS = _build_backends_list(NUM_BACKENDS)
+
+# Configurable Ranvier node count
+# Set NUM_RANVIER_NODES to control how many router nodes to use
+NUM_RANVIER_NODES = int(os.environ.get("NUM_RANVIER_NODES", "3"))
+
+# Default Ranvier node patterns
+DEFAULT_RANVIER_IP_PATTERN = "172.29.2.{}"  # {} is replaced with node_index
+DEFAULT_RANVIER_PORT = 8080
+DEFAULT_RANVIER_METRICS_PORT = 9180
+
+def _build_ranvier_nodes_list(num_nodes: int) -> List[str]:
+    """Build the Ranvier nodes list dynamically."""
+    nodes = []
+    for i in range(1, num_nodes + 1):
+        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
+        port = os.environ.get(f"RANVIER_NODE{i}_PORT", str(DEFAULT_RANVIER_PORT))
+        # Support full URL override
+        full_url = os.environ.get(f"RANVIER_NODE{i}")
+        if full_url:
+            nodes.append(full_url)
+        else:
+            nodes.append(f"http://{ip}:{port}")
+    return nodes
+
+def _build_ranvier_metrics_list(num_nodes: int) -> List[str]:
+    """Build the Ranvier metrics endpoints list dynamically."""
+    metrics = []
+    for i in range(1, num_nodes + 1):
+        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
+        port = os.environ.get(f"RANVIER_METRICS{i}_PORT", str(DEFAULT_RANVIER_METRICS_PORT))
+        # Support full URL override
+        full_url = os.environ.get(f"RANVIER_METRICS{i}")
+        if full_url:
+            metrics.append(full_url)
+        else:
+            metrics.append(f"http://{ip}:{port}")
+    return metrics
+
+RANVIER_NODES = _build_ranvier_nodes_list(NUM_RANVIER_NODES)
+RANVIER_METRICS = _build_ranvier_metrics_list(NUM_RANVIER_NODES)
 
 # Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
@@ -2283,7 +2364,10 @@ def on_test_start(environment, **kwargs):
     logger.info(f"Prompt Distribution: {PROMPT_DISTRIBUTION}")
     logger.info(f"Shared Prefix Ratio: {SHARED_PREFIX_RATIO}")
     logger.info(f"P99 Latency Threshold: {P99_LATENCY_THRESHOLD_MS}ms")
+    logger.info(f"Number of Backends: {NUM_BACKENDS}")
     logger.info(f"Backends: {BACKENDS}")
+    logger.info(f"Number of Ranvier Nodes: {NUM_RANVIER_NODES}")
+    logger.info(f"Ranvier Nodes: {RANVIER_NODES}")
 
     # Log large prefix configuration if using stress modes
     dist = PROMPT_DISTRIBUTION.lower().replace("-", "_")
