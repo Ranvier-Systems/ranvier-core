@@ -558,7 +558,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 _circuit_breaker.record_failure(current_backend);
                 metrics().record_connection_error();
             } else {
-                // Re-throw non-connection errors
+                // Close client output stream before re-throwing non-connection errors
+                // This prevents the assertion failure in output_stream destructor
+                try { co_await client_out.close(); } catch (...) {}
                 throw;
             }
         }
@@ -619,7 +621,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     read_failed = true;
                     bundle.is_valid = false;
                 } else {
-                    throw; // Re-throw non-connection errors
+                    // Close client output stream before re-throwing non-connection errors
+                    // This prevents the assertion failure in output_stream destructor
+                    try { co_await client_out.close(); } catch (...) {}
+                    throw;
                 }
             }
 
@@ -691,7 +696,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                         bundle.is_valid = false;
                         break;
                     }
-                    throw; // Re-throw non-connection errors
+                    // Close client output stream before re-throwing non-connection errors
+                    // This prevents the assertion failure in output_stream destructor
+                    try { co_await client_out.close(); } catch (...) {}
+                    throw;
                 }
             }
 
