@@ -573,6 +573,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         // Send request with broken pipe/connection reset handling
         bool write_failed = false;
+        std::exception_ptr rethrow_exception;
         try {
             co_await bundle.out.write(http_req);
             co_await bundle.out.flush();
@@ -586,21 +587,20 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 _circuit_breaker.record_failure(current_backend);
                 metrics().record_connection_error();
             } else {
-                // Non-connection error - need to clean up and rethrow
-                // Can't co_await in catch block, so set flag and handle after
-                metrics().record_failure();
-                metrics().decrement_active_requests();
-                bundle.is_valid = false;
-                stream_closed = true;  // Signal that we need to close and rethrow
-                // Store exception to rethrow after cleanup
+                // Capture exception for re-throw after cleanup
+                // (co_await not permitted in catch handlers)
+                rethrow_exception = std::current_exception();
             }
         }
 
-        // Handle non-connection errors that need cleanup and rethrow
-        if (stream_closed && !write_failed) {
+        // Handle non-connection errors: cleanup and rethrow outside catch block
+        if (rethrow_exception) {
+            metrics().record_failure();
+            metrics().decrement_active_requests();
             co_await bundle.close();
             try { co_await client_out.close(); } catch (...) {}
-            co_return;  // Exit cleanly instead of throwing
+            stream_closed = true;
+            std::rethrow_exception(rethrow_exception);
         }
 
         if (write_failed) {
@@ -664,20 +664,21 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     read_failed = true;
                     bundle.is_valid = false;
                 } else {
-                    // Non-connection error - need to clean up and rethrow
-                    // Can't co_await in catch block, so set flag and handle after
-                    metrics().record_failure();
-                    metrics().decrement_active_requests();
-                    bundle.is_valid = false;
-                    stream_closed = true;  // Signal cleanup needed
+                    // Capture exception for re-throw after cleanup
+                    // (co_await not permitted in catch handlers)
+                    rethrow_exception = std::current_exception();
                 }
             }
 
-            // Handle non-connection read errors - cleanup and exit
-            if (stream_closed && !read_failed) {
+            // Handle non-connection errors: cleanup and rethrow outside catch block
+            if (rethrow_exception) {
+                metrics().record_failure();
+                metrics().decrement_active_requests();
+                bundle.is_valid = false;
                 co_await bundle.close();
                 try { co_await client_out.close(); } catch (...) {}
-                co_return;  // Exit cleanly instead of throwing
+                stream_closed = true;
+                std::rethrow_exception(rethrow_exception);
             }
 
             if (read_failed) {
@@ -759,21 +760,21 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                         client_disconnected = true;
                         break;
                     }
-                    // Non-connection error - need to clean up and rethrow
-                    // Can't co_await in catch block, so set flag and handle after
+                    // Capture exception for re-throw after cleanup
+                    // (co_await not permitted in catch handlers)
+                    rethrow_exception = std::current_exception();
+                }
+
+                // Handle non-connection errors: cleanup and rethrow outside catch block
+                if (rethrow_exception) {
                     metrics().record_failure();
                     metrics().decrement_active_requests();
                     bundle.is_valid = false;
                     stream_closed = true;
-                    client_write_error = true;
+                    co_await bundle.close();
+                    try { co_await client_out.close(); } catch (...) {}
+                    std::rethrow_exception(rethrow_exception);
                 }
-            }
-
-            // Handle non-connection client write errors - cleanup and exit
-            if (client_write_error) {
-                co_await bundle.close();
-                try { co_await client_out.close(); } catch (...) {}
-                co_return;  // Exit cleanly instead of throwing
             }
 
             if (res.done) {
