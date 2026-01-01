@@ -61,7 +61,6 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/open-telemetry/opentelemetry-cpp
   GIT_TAG        v1.14.2
 )
-set(WITH_OTLP ON CACHE BOOL "" FORCE)
 set(WITH_OTLP_HTTP ON CACHE BOOL "" FORCE)
 set(WITH_OTLP_GRPC OFF CACHE BOOL "" FORCE)  # Use HTTP exporter to avoid gRPC dependency
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
