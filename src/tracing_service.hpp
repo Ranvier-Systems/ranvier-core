@@ -437,8 +437,9 @@ inline void TracingService::init(const TelemetryConfig& config) {
         std::move(sampler)
     );
 
-    // Set as global provider
-    trace::Provider::SetTracerProvider(_provider);
+    // Set as global provider (wrap std::shared_ptr in nostd::shared_ptr)
+    trace::Provider::SetTracerProvider(
+        opentelemetry::nostd::shared_ptr<trace::TracerProvider>(_provider));
 
     // Get our tracer
     _tracer = _provider->GetTracer("ranvier", "1.0.0");
