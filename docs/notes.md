@@ -1617,6 +1617,22 @@ python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.2-1B-Ins
 # Model meta-llama/Llama-3.1-8B-Instruct
 vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-model-len 8192 --port 8000
 
+# Start 8 instances (one per GPU)
+for i in {0..7}; do
+  CUDA_VISIBLE_DEVICES=$i HF_TOKEN=$HF_TOKEN \
+  vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --enable-prefix-caching \
+    --max-model-len 8192 \
+    --port $((8000 + i)) \
+    > /tmp/vllm-$i.log 2>&1 &
+  echo "Started vLLM on GPU $i, port $((8000 + i))"
+done
+
+for i in {0..7}; do
+  curl -s http://localhost:$((8000 + i))/health && echo " - GPU $i ready"
+done
+
+
 host=129.213.118.109
 host=150.136.90.99
 scp ~/.ssh/id_rsa ~/.ssh/id_rsa.pub ubuntu@${host}:~/.ssh/
@@ -1635,10 +1651,6 @@ newgrp docker
 docker compose -f docker-compose.benchmark-real.yml up -d --build
 # Build and start just Ranvier (3 nodes)
 docker compose -f docker-compose.benchmark-real.yml up -d ranvier1 ranvier2 ranvier3
-
-# watch for the vllm instances to finish
-# Option 1: Watch the logs
-tail -f /tmp/vllm-*.log
 # Look for "Uvicorn running on" or "Application startup complete"
 
 # Option 2: Poll health endpoints
@@ -2003,3 +2015,119 @@ locust -f tests/integration/locustfile_real.py \
   2>&1 | tee benchmark-roundrobin-50prefixes.log
 
 
+# Rebuild Docker image
+docker compose -f docker-compose.benchmark-real.yml build ranvier1
+
+# Restart Ranvier nodes
+docker compose -f docker-compose.benchmark-real.yml up -d --force-recreate ranvier1 ranvier2 ranvier3
+
+# Wait for healthy, then re-register backends
+for i in {1..8}; do
+  curl -s -X POST http://localhost:8081/backends \
+    -H "Content-Type: application/json" \
+    -d "{\"backend_id\":$i, \"ip\":\"172.17.0.1\", \"port\":$((7999+i)), \"weight\":100}"
+done
+
+    I got this error:
+Network ranvier-benchmark-prefix-aware_ranvier-benchmark Creating
+Network ranvier-benchmark-prefix-aware_ranvier-benchmark Error
+failed to create network ranvier-benchmark-prefix-aware_ranvier-benchmark: Error response from daemon: invalid pool request: Pool overlaps with other one on this address space
+
+# Run these commands to clean up the conflicting networks:
+    # Stop any running benchmark containers
+    docker compose -f docker-compose.benchmark-real.yml down
+
+    # List and remove stale ranvier networks
+    docker network ls | grep ranvier
+    docker network prune -f
+
+    # If specific networks remain, remove them manually
+    docker network rm ranvier-benchmark-prefix-aware_ranvier-benchmark 2>/dev/null || true
+
+    # Now try again
+    docker compose -f docker-compose.benchmark-real.yml up -d
+
+
+# If you're running locust directly (without the docker-compose benchmark script), you don't need the benchmark network at all. Just make sure your Ranvier containers are running:
+    # Check if ranvier is already running
+    docker ps | grep ranvier
+
+    # If running, just run locust directly against it
+
+# Run benchmark
+export BENCHMARK_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 |tee ${BENCHMARK_MODE}.stdout
+
+
+To test round-robin, you need to restart Ranvier with the environment variable:
+# Stop Ranvier
+docker compose -f docker-compose.benchmark-real.yml down
+
+# Restart with round-robin routing
+RANVIER_ROUTING_MODE=round_robin docker compose -f docker-compose.benchmark-real.yml up -d
+
+# Wait for healthy, re-register backends
+for i in {1..8}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+  echo
+done
+
+# Run round-robin benchmark
+export BENCHMARK_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 | tee round_robin.stdout
+
+
+
+Round-Robin (baseline):
+# Restart Ranvier with round-robin
+docker compose -f docker-compose.benchmark-real.yml down
+RANVIER_ROUTING_MODE=round_robin docker compose -f docker-compose.benchmark-real.yml up -d
+
+# Wait for healthy, register backends
+sleep 10
+for i in {1..8}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+done
+
+# Run benchmark
+export BENCHMARK_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 | tee round_robin.stdout
+
+
+
+Prefix-Affinity:
+# Restart Ranvier with prefix-affinity (default)
+docker compose -f docker-compose.benchmark-real.yml down
+export RANVIER_ROUTING_MODE=prefix
+docker compose -f docker-compose.benchmark-real.yml up -d
+
+# Wait for healthy, register backends
+sleep 10
+for i in {1..8}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+done
+
+# Run benchmark
+export BENCHMARK_MODE=prefix
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 | tee prefix_affinity.stdout
+
+
+# Inspect env vars
+docker inspect ranvier-bench1 | grep -A 20 "Env"
+docker exec ranvier-bench1 printenv | grep ROUTING
