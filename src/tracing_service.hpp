@@ -33,6 +33,7 @@
 #include <opentelemetry/trace/propagation/http_trace_context.h>
 #include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/sdk/trace/batch_span_processor.h>
+#include <opentelemetry/sdk/trace/batch_span_processor_options.h>
 #include <opentelemetry/sdk/trace/samplers/always_on.h>
 #include <opentelemetry/sdk/trace/samplers/always_off.h>
 #include <opentelemetry/sdk/trace/samplers/trace_id_ratio.h>
@@ -155,6 +156,7 @@ public:
 
 private:
     static opentelemetry::nostd::shared_ptr<trace::Tracer> _tracer;
+    static std::shared_ptr<sdk_trace::TracerProvider> _provider;
     static bool _enabled;
     static std::string _service_name;
 };
@@ -361,6 +363,7 @@ inline bool ScopedSpan::is_recording() const {
 
 // Static member initialization
 inline opentelemetry::nostd::shared_ptr<trace::Tracer> TracingService::_tracer;
+inline std::shared_ptr<sdk_trace::TracerProvider> TracingService::_provider;
 inline bool TracingService::_enabled = false;
 inline std::string TracingService::_service_name;
 
@@ -427,27 +430,25 @@ inline void TracingService::init(const TelemetryConfig& config) {
     };
     auto resource_obj = resource::Resource::Create(resource_attrs);
 
-    // Create tracer provider
-    auto provider = std::make_shared<sdk_trace::TracerProvider>(
+    // Create tracer provider and store it for later shutdown
+    _provider = std::make_shared<sdk_trace::TracerProvider>(
         std::move(processor),
         resource_obj,
         std::move(sampler)
     );
 
     // Set as global provider
-    trace::Provider::SetTracerProvider(provider);
+    trace::Provider::SetTracerProvider(_provider);
 
     // Get our tracer
-    _tracer = provider->GetTracer("ranvier", "1.0.0");
+    _tracer = _provider->GetTracer("ranvier", "1.0.0");
 }
 
 inline void TracingService::shutdown() {
-    if (_enabled) {
-        // Get provider and force flush
-        auto provider = trace::Provider::GetTracerProvider();
-        if (auto sdk_provider = std::dynamic_pointer_cast<sdk_trace::TracerProvider>(provider)) {
-            sdk_provider->ForceFlush();
-        }
+    if (_enabled && _provider) {
+        // Force flush pending spans
+        _provider->ForceFlush();
+        _provider.reset();
     }
     _enabled = false;
 }
