@@ -127,6 +127,81 @@ locust -f tests/integration/locustfile_real.py \
   --host http://localhost:8081
 ```
 
+## Optional Follow-up Tests
+
+### Longer Duration Test
+For more statistical confidence, run a 15-30 minute test:
+
+```bash
+# 15-minute test for more data points
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 10 --spawn-rate 2 --run-time 15m \
+  --host http://localhost:8081
+```
+
+### More Prefixes
+Test with 100+ unique prefixes to stress the routing and cache systems:
+
+```bash
+# 100 unique prefixes
+NUM_LARGE_PREFIXES=100 \
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 10 --spawn-rate 2 --run-time 5m \
+  --host http://localhost:8081
+```
+
+### Higher Concurrency
+Test with more concurrent users to measure throughput under load:
+
+```bash
+# 50 concurrent users
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 50 --spawn-rate 5 --run-time 5m \
+  --host http://localhost:8081
+```
+
+### Different Prefix Sizes
+Adjust the prefix token range to test smaller or larger prefixes:
+
+```bash
+# Smaller prefixes (500-2000 tokens)
+LARGE_PREFIX_MIN_TOKENS=500 LARGE_PREFIX_MAX_TOKENS=2000 \
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 10 --spawn-rate 2 --run-time 5m \
+  --host http://localhost:8081
+
+# Larger prefixes (8000-16000 tokens) - requires sufficient GPU memory
+LARGE_PREFIX_MIN_TOKENS=8000 LARGE_PREFIX_MAX_TOKENS=16000 \
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 10 --spawn-rate 2 --run-time 5m \
+  --host http://localhost:8081
+```
+
+### Compare All Three Routing Modes
+Run the same test with each routing mode:
+
+```bash
+for mode in prefix radix round_robin; do
+  echo "Testing routing mode: $mode"
+  docker compose -f docker-compose.benchmark-real.yml down
+  export RANVIER_ROUTING_MODE=$mode
+  docker compose -f docker-compose.benchmark-real.yml up -d
+  sleep 10
+
+  # Register backends
+  for i in {1..8}; do
+    curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+  done
+
+  # Run benchmark
+  BENCHMARK_MODE=$mode PROMPT_DISTRIBUTION=large-prefix NUM_LARGE_PREFIXES=50 \
+  BACKEND1_IP=172.17.0.1 NUM_BACKENDS=8 \
+  locust -f tests/integration/locustfile_real.py \
+    --headless --users 10 --spawn-rate 2 --run-time 5m \
+    --host http://localhost:8081 2>&1 | tee ${mode}_results.txt
+done
+```
+
 ## Related Files
 
 - `tests/integration/locustfile_real.py` - Benchmark script
