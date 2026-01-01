@@ -820,10 +820,18 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (connection_failed || connection_error || timed_out || !bundle.is_valid) {
             // Don't return broken connections to the pool
             bundle.is_valid = false;
-            co_await bundle.close();
+            try {
+                co_await bundle.close();
+            } catch (...) {
+                log_proxy.trace("[{}] Error closing backend connection", request_id);
+            }
         } else {
             // Return healthy connection to pool
-            _pool.put(std::move(bundle), request_id);
+            try {
+                _pool.put(std::move(bundle), request_id);
+            } catch (...) {
+                log_proxy.trace("[{}] Error returning connection to pool", request_id);
+            }
         }
 
         // Close client output stream (skip if already closed in exception path)
