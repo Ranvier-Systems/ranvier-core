@@ -32,7 +32,9 @@
 #include <opentelemetry/trace/propagation/http_trace_context.h>
 #include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/sdk/trace/batch_span_processor.h>
-#include <opentelemetry/sdk/trace/samplers/trace_id_ratio_based.h>
+#include <opentelemetry/sdk/trace/samplers/always_on.h>
+#include <opentelemetry/sdk/trace/samplers/always_off.h>
+#include <opentelemetry/sdk/trace/samplers/trace_id_ratio.h>
 #include <opentelemetry/sdk/resource/resource.h>
 
 // Include the appropriate exporter
