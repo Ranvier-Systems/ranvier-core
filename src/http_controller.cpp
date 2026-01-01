@@ -512,8 +512,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             metrics().record_failure();
             metrics().decrement_active_requests();
             sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Ignore write errors - client may have disconnected
+            }
             co_await client_out.close();
             co_return;
         }
@@ -524,10 +528,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             metrics().record_timeout();
             metrics().decrement_active_requests();
             bundle.is_valid = false;
-            _pool.put(std::move(bundle), request_id);
+            co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Ignore write errors - client may have disconnected
+            }
             co_await client_out.close();
             co_return;
         }
@@ -572,11 +580,16 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         if (write_failed) {
             // Clean up and send error to client
+            metrics().record_failure();
             metrics().decrement_active_requests();
             co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Backend connection lost during request\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Ignore write errors - client may have disconnected
+            }
             co_await client_out.close();
             co_return;
         }
