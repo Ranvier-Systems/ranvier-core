@@ -39,13 +39,30 @@ RUN dnf install -y \
     lksctp-tools libunistring libtasn1 nettle p11-kit zlib systemd-libs && \
     dnf clean all
 
+# Create non-root user for security (fixed UID/GID for Kubernetes compatibility)
+ARG UID=10001
+ARG GID=10001
+RUN groupadd --gid ${GID} ranvier && \
+    useradd --uid ${UID} --gid ${GID} --shell /sbin/nologin --create-home ranvier
+
 # Copy Binary and Assets
 WORKDIR /app
 COPY --from=builder /src/build/ranvier_server .
 COPY --from=builder /src/assets ./assets
 
+# Set ownership to non-root user
+RUN chown -R ranvier:ranvier /app
+
 # Expose HTTP API and Metrics ports
 EXPOSE 8080 9180
 
-# Run (Seastar needs memory locking)
+# Switch to non-root user
+USER ranvier
+
+# Run (Seastar needs memory locking - requires CAP_IPC_LOCK capability)
+# To run this container:
+#   docker run --cap-add=IPC_LOCK ranvier:latest
+# Or in docker-compose:
+#   cap_add:
+#     - IPC_LOCK
 CMD ["./ranvier_server", "--smp", "1", "--memory", "1G"]
