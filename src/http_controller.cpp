@@ -64,6 +64,32 @@ inline const char* connection_error_to_string(ConnectionErrorType type) {
     }
 }
 
+// RAII guard for active request counter
+// Ensures decrement happens even if an exception is thrown during request setup
+class ActiveRequestGuard {
+    MetricsService* _metrics;
+    bool _released = false;
+public:
+    explicit ActiveRequestGuard(MetricsService& metrics) : _metrics(&metrics) {
+        _metrics->increment_active_requests();
+    }
+    ~ActiveRequestGuard() {
+        if (!_released) {
+            _metrics->decrement_active_requests();
+        }
+    }
+    // Prevent copy
+    ActiveRequestGuard(const ActiveRequestGuard&) = delete;
+    ActiveRequestGuard& operator=(const ActiveRequestGuard&) = delete;
+    // Allow move
+    ActiveRequestGuard(ActiveRequestGuard&& other) noexcept
+        : _metrics(other._metrics), _released(other._released) {
+        other._released = true;
+    }
+    // Release ownership - caller takes responsibility for decrementing
+    void release() { _released = true; }
+};
+
 // Helper: explicit seastar::httpd:: (Server) types
 template <typename Func>
 struct async_handler : public seastar::httpd::handler_base {
@@ -252,7 +278,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Track request start time for latency metrics (ingress timestamp)
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
-    metrics().increment_active_requests();
+
+    // RAII guard ensures active request counter is decremented even if exception thrown
+    // Guard is released before entering the lambda, which takes over responsibility
+    ActiveRequestGuard active_request_guard(metrics());
 
     std::string body = req->content;
     std::string client_ip = get_client_ip(*req);
@@ -264,7 +293,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     if (!_tokenizer.is_loaded()) {
         log_proxy.warn("[{}] Tokenizer not loaded", request_id);
         metrics().record_failure();
-        metrics().decrement_active_requests();
+        // active_request_guard destructor will decrement counter
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
         co_return std::move(rep);
@@ -290,7 +319,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 // Client provided invalid tokens - reject the request
                 log_proxy.warn("[{}] Invalid client tokens: {}", request_id, token_result.error);
                 metrics().record_failure();
-                metrics().decrement_active_requests();
+                // active_request_guard destructor will decrement counter
                 rep->add_header("X-Request-ID", request_id);
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
@@ -342,7 +371,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         } else {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
-            metrics().decrement_active_requests();
+            // active_request_guard destructor will decrement counter
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
@@ -359,7 +388,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             if (!random_id.has_value()) {
                 log_proxy.warn("[{}] No backends registered", request_id);
                 metrics().record_failure();
-                metrics().decrement_active_requests();
+                // active_request_guard destructor will decrement counter
                 rep->add_header("X-Request-ID", request_id);
                 rep->write_body("json", "{\"error\": \"No backends registered!\"}");
                 co_return std::move(rep);
@@ -386,7 +415,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         } else {
             log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
             metrics().record_failure();
-            metrics().decrement_active_requests();
+            // active_request_guard destructor will decrement counter
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"All backends unavailable (circuit breaker open)\"}");
             co_return std::move(rep);
@@ -397,7 +426,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     if (!target_addr_opt.has_value()) {
         log_proxy.warn("[{}] Backend {} IP not found", request_id, target_id);
         metrics().record_failure();
-        metrics().decrement_active_requests();
+        // active_request_guard destructor will decrement counter
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
         co_return std::move(rep);
@@ -415,6 +444,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Add X-Request-ID and X-Backend-ID to response headers before streaming
     rep->add_header("X-Request-ID", request_id);
     rep->add_header("X-Backend-ID", std::to_string(target_id));
+
+    // Release the guard - lambda takes over responsibility for decrementing counter
+    active_request_guard.release();
 
     rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
