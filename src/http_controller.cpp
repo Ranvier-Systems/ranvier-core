@@ -349,8 +349,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     BackendId target_id;
 
-    if (_config.prefix_affinity_enabled) {
-        // Use prefix-affinity routing: consistent hashing on prefix tokens
+    if (_config.is_prefix_mode()) {
+        // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
         auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
         if (affinity_backend.has_value()) {
             target_id = affinity_backend.value();
@@ -358,30 +358,40 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         } else {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
-            // active_request_guard destructor will decrement counter
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
         }
-    } else {
-        // Legacy behavior: radix tree lookup + random fallback
+    } else if (_config.is_radix_mode()) {
+        // RADIX mode: radix tree lookup with random fallback (adaptive learning)
         auto lookup_result = _router.lookup(tokens, request_id);
         if (lookup_result.has_value()) {
             target_id = lookup_result.value();
-            log_proxy.debug("[{}] Route cache hit -> backend {}", request_id, target_id);
+            log_proxy.debug("[{}] Radix tree hit -> backend {}", request_id, target_id);
         } else {
             auto random_id = _router.get_random_backend();
             if (!random_id.has_value()) {
                 log_proxy.warn("[{}] No backends registered", request_id);
                 metrics().record_failure();
-                // active_request_guard destructor will decrement counter
                 rep->add_header("X-Request-ID", request_id);
                 rep->write_body("json", "{\"error\": \"No backends registered!\"}");
                 co_return std::move(rep);
             }
             target_id = random_id.value();
-            log_proxy.debug("[{}] Route cache miss, using random backend {}", request_id, target_id);
+            log_proxy.debug("[{}] Radix tree miss, random -> backend {}", request_id, target_id);
         }
+    } else {
+        // ROUND_ROBIN mode: always use random/weighted backend selection
+        auto random_id = _router.get_random_backend();
+        if (!random_id.has_value()) {
+            log_proxy.warn("[{}] No backends registered", request_id);
+            metrics().record_failure();
+            rep->add_header("X-Request-ID", request_id);
+            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+            co_return std::move(rep);
+        }
+        target_id = random_id.value();
+        log_proxy.debug("[{}] Round-robin -> backend {}", request_id, target_id);
     }
 
     // Timing: record routing decision latency (post-routing timestamp)
@@ -722,11 +732,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
 
                 // Learn route in the ART for future prefix matching
-                // This works for both prefix-affinity mode (hybrid ART+hash) and legacy mode
-                // - Prefix-affinity: learning improves future ART lookups
-                // - Legacy: learning is the primary routing mechanism
+                // Learn routes in PREFIX and RADIX modes; skip for ROUND_ROBIN mode
                 // The ART insert is idempotent - existing routes just get their timestamp updated
-                if (tokens.size() >= _config.min_token_length) {
+                if (_config.should_learn_routes() && tokens.size() >= _config.min_token_length) {
                     // Route learning is best-effort; don't fail the request if it fails
                     (void)_router.learn_route_global(tokens, current_backend, request_id)
                         .handle_exception([request_id](auto) {
@@ -745,6 +753,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             }
 
             // Write to client with broken pipe handling
+            bool client_write_error = false;
             if (!res.data.empty()) {
                 try {
                     co_await client_out.write(res.data);
@@ -769,9 +778,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     metrics().record_failure();
                     metrics().decrement_active_requests();
                     bundle.is_valid = false;
+                    stream_closed = true;
                     co_await bundle.close();
                     try { co_await client_out.close(); } catch (...) {}
-                    stream_closed = true;
                     std::rethrow_exception(rethrow_exception);
                 }
             }

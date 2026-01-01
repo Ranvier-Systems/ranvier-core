@@ -60,9 +60,19 @@ struct RoutingConfig {
     bool accept_client_tokens = false;  // Accept pre-tokenized prompt_token_ids from clients for routing
     int32_t max_token_id = 100000;  // Maximum valid token ID for validation (security: reject out-of-range tokens)
 
-    // Prefix-affinity routing: route requests with same prefix to same backend for KV cache reuse
-    bool prefix_affinity_enabled = true;  // Enable prefix-affinity routing (default: true)
+    // Routing mode: determines how requests are routed to backends
+    // - "prefix": Prefix-affinity routing using consistent hashing on prefix tokens (best for KV cache reuse)
+    // - "radix": Radix tree learning with random fallback (adaptive route learning)
+    // - "round_robin": True random/weighted distribution (baseline, no learning)
+    enum class RoutingMode { PREFIX, RADIX, ROUND_ROBIN };
+    RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity for KV cache optimization
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
+
+    // Helper to check routing mode
+    bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
+    bool is_radix_mode() const { return routing_mode == RoutingMode::RADIX; }
+    bool is_round_robin_mode() const { return routing_mode == RoutingMode::ROUND_ROBIN; }
+    bool should_learn_routes() const { return routing_mode != RoutingMode::ROUND_ROBIN; }
 };
 
 // Timeout configuration
@@ -286,13 +296,23 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int32_t>("RANVIER_MAX_TOKEN_ID")) {
         routing.max_token_id = *v;
     }
+    // Legacy: RANVIER_PREFIX_AFFINITY_ENABLED (true=prefix, false=round_robin)
     if (auto v = get_env("RANVIER_PREFIX_AFFINITY_ENABLED")) {
-        routing.prefix_affinity_enabled = (*v == "1" || *v == "true" || *v == "yes");
+        if (*v == "1" || *v == "true" || *v == "yes") {
+            routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        } else {
+            routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+        }
     }
-    // Also support RANVIER_ROUTING_MODE for benchmark compatibility
-    // "prefix" enables prefix-affinity, "round_robin" disables it
+    // RANVIER_ROUTING_MODE: "prefix", "radix", or "round_robin"
     if (auto v = get_env("RANVIER_ROUTING_MODE")) {
-        routing.prefix_affinity_enabled = (*v == "prefix");
+        if (*v == "prefix") {
+            routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        } else if (*v == "radix") {
+            routing.routing_mode = RoutingConfig::RoutingMode::RADIX;
+        } else if (*v == "round_robin") {
+            routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+        }
     }
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
         routing.prefix_token_length = *v;
@@ -550,8 +570,24 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["max_token_id"]) {
                 config.routing.max_token_id = r["max_token_id"].as<int32_t>();
             }
+            // Legacy: prefix_affinity_enabled (bool)
             if (r["prefix_affinity_enabled"]) {
-                config.routing.prefix_affinity_enabled = r["prefix_affinity_enabled"].as<bool>();
+                if (r["prefix_affinity_enabled"].as<bool>()) {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+                } else {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+                }
+            }
+            // New: routing_mode (string: "prefix", "radix", "round_robin")
+            if (r["routing_mode"]) {
+                std::string mode = r["routing_mode"].as<std::string>();
+                if (mode == "prefix") {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+                } else if (mode == "radix") {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::RADIX;
+                } else if (mode == "round_robin") {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+                }
             }
             if (r["prefix_token_length"]) {
                 config.routing.prefix_token_length = r["prefix_token_length"].as<size_t>();

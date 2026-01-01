@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <memory>
 #include <unordered_map>
 #include <chrono>
 #include <iostream>
@@ -115,7 +116,8 @@ public:
                                    request_id, addr);
                 }
                 _dead_connections_reaped++;
-                (void)bundle.close(); // Fire-and-forget close
+                // Move to heap to keep alive during async close
+                close_bundle_async(std::move(bundle));
                 continue;
             }
 
@@ -126,7 +128,8 @@ public:
                                    request_id, addr);
                 }
                 _dead_connections_reaped++;
-                (void)bundle.close(); // Fire-and-forget close
+                // Move to heap to keep alive during async close
+                close_bundle_async(std::move(bundle));
                 continue;
             }
 
@@ -184,7 +187,7 @@ public:
                 log_pool.debug("[{}] Closing invalid connection to {}",
                                request_id, bundle.addr);
             }
-            (void)bundle.close();
+            close_bundle_async(std::move(bundle));
             return;
         }
 
@@ -195,7 +198,7 @@ public:
                                request_id, bundle.addr);
             }
             _dead_connections_reaped++;
-            (void)bundle.close();
+            close_bundle_async(std::move(bundle));
             return;
         }
 
@@ -205,10 +208,11 @@ public:
         // Check per-host limit
         if (pool.size() >= _config.max_connections_per_host) {
             // Pool full - evict oldest (front of deque)
-            auto& oldest = pool.front();
-            (void)oldest.close();
+            auto oldest = std::move(pool.front());
             pool.pop_front();
             _total_idle_connections--;
+            // Close asynchronously, keeping bundle alive until close completes
+            close_bundle_async(std::move(oldest));
         }
 
         // Check total limit
@@ -255,7 +259,8 @@ public:
         size_t closed = 0;
         auto& pool = it->second;
         for (auto& bundle : pool) {
-            (void)bundle.close();
+            // Move each bundle to close asynchronously
+            close_bundle_async(std::move(bundle));
             closed++;
         }
         _total_idle_connections -= pool.size();
@@ -287,7 +292,8 @@ public:
                 }
 
                 if (should_close) {
-                    (void)it->close();
+                    // Move bundle out and close asynchronously
+                    close_bundle_async(std::move(*it));
                     it = pool.erase(it);
                     _total_idle_connections--;
                     _dead_connections_reaped++;
@@ -338,11 +344,25 @@ private:
         if (oldest_addr) {
             auto& pool = _pools[*oldest_addr];
             if (!pool.empty()) {
-                (void)pool.front().close();
+                auto oldest = std::move(pool.front());
                 pool.pop_front();
                 _total_idle_connections--;
+                close_bundle_async(std::move(oldest));
             }
         }
+    }
+
+    // Close a connection bundle asynchronously, keeping it alive until close completes.
+    // This prevents the Seastar output_stream assertion failure that occurs when
+    // a stream is destroyed while still in batch mode.
+    static void close_bundle_async(ConnectionBundle&& bundle) {
+        // Move bundle to heap so it outlives this scope
+        auto ptr = std::make_unique<ConnectionBundle>(std::move(bundle));
+        auto* raw_ptr = ptr.get();
+        // Start close and destroy bundle after completion
+        (void)raw_ptr->close().finally([p = std::move(ptr)] {
+            // unique_ptr releases the bundle here after close completes
+        });
     }
 };
 

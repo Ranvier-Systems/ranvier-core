@@ -1600,3 +1600,534 @@ curl -X POST "http://localhost:8080/admin/clear"
 # Override with environment variables
 RANVIER_API_PORT=9000 RANVIER_MIN_TOKEN_LENGTH=64 ./ranvier_server
 
+
+---
+ssh ubuntu@150.136.143.0
+
+# Install vLLM
+pip install vllm
+pip install "numpy<2"
+
+export HF_TOKEN=<your_token>
+export VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct
+
+# Model meta-llama/Llama-3.2-1B-Instruct
+python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.2-1B-Instruct --host 0.0.0.0 --port 8000 --enable-prefix-caching
+
+# Model meta-llama/Llama-3.1-8B-Instruct
+vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-model-len 8192 --port 8000
+
+# Start 8 instances (one per GPU)
+for i in {0..7}; do
+  CUDA_VISIBLE_DEVICES=$i HF_TOKEN=$HF_TOKEN \
+  vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --enable-prefix-caching \
+    --max-model-len 8192 \
+    --port $((8000 + i)) \
+    > /tmp/vllm-$i.log 2>&1 &
+  echo "Started vLLM on GPU $i, port $((8000 + i))"
+done
+
+for i in {0..7}; do
+  curl -s http://localhost:$((8000 + i))/health && echo " - GPU $i ready"
+done
+
+
+host=129.213.118.109
+host=150.136.90.99
+scp ~/.ssh/id_rsa ~/.ssh/id_rsa.pub ubuntu@${host}:~/.ssh/
+
+git clone git@github.com:Ranvier-Systems/ranvier-core.git
+
+# unable to get image 'ranvier:latest': permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.51/images/ranvier:latest/json": dial unix /var/run/docker.sock: connect: permission denied
+# Option 1: Quick fix (use sudo)
+sudo docker compose -f docker-compose.benchmark-real.yml up -d ranvier1 ranvier2 ranvier3
+# Option 2: Permanent fix (add to docker group)
+sudo usermod -aG docker $USER
+newgrp docker
+
+
+# Build
+docker compose -f docker-compose.benchmark-real.yml up -d --build
+# Build and start just Ranvier (3 nodes)
+docker compose -f docker-compose.benchmark-real.yml up -d ranvier1 ranvier2 ranvier3
+# Look for "Uvicorn running on" or "Application startup complete"
+
+# Option 2: Poll health endpoints
+# Check which are ready
+for i in {0..7}; do
+  curl -s http://localhost:$((8000 + i))/health > /dev/null && echo "GPU $i: ready" || echo "GPU $i: loading..."
+done
+
+# Option 3: Wait script (blocks until all ready)
+echo "Waiting for all 8 vLLM instances..."
+for i in {0..7}; do
+  port=$((8000 + i))
+  until curl -s http://localhost:$port/health > /dev/null 2>&1; do
+    sleep 5
+  done
+  echo "GPU $i (port $port): ready"
+done
+echo "All instances ready!"
+
+
+# Check all 3 nodes
+curl -s http://localhost:8081/health && echo " - Ranvier 1 OK"
+curl -s http://localhost:8082/health && echo " - Ranvier 2 OK"
+curl -s http://localhost:8083/health && echo " - Ranvier 3 OK"
+
+# Or check metrics endpoints
+curl -s http://localhost:9181/metrics | head -5
+
+# Register all 8 backends (host.docker.internal lets containers reach host ports)
+for i in {0..7}; do
+  curl -X POST "http://localhost:8081/admin/backends?id=$((i+1))&ip=host.docker.internal&port=$((8000+i))"
+  curl -X POST "http://localhost:8082/admin/backends?id=$((i+1))&ip=host.docker.internal&port=$((8000+i))"
+  curl -X POST "http://localhost:8083/admin/backends?id=$((i+1))&ip=host.docker.internal&port=$((8000+i))"
+done
+
+The host.docker.internal doesn't work reliably on Linux. We need to find the IP that Docker containers can use to reach the host.
+Try this:
+# Find the Docker bridge gateway IP
+docker network inspect ranvier-core_ranvier-benchmark | grep Gateway
+
+Or use the host's IP on the docker network:
+# Usually this works on Linux
+ip addr show docker0 | grep inet
+
+Then register with that IP (likely 172.17.0.1 or similar):
+# Replace with the gateway IP you found
+HOST_IP=172.17.0.1
+
+for i in {0..7}; do
+  curl -X POST "http://localhost:8081/admin/backends?id=$((i+1))&ip=${HOST_IP}&port=$((8000+i))"
+  curl -X POST "http://localhost:8082/admin/backends?id=$((i+1))&ip=${HOST_IP}&port=$((8000+i))"
+  curl -X POST "http://localhost:8083/admin/backends?id=$((i+1))&ip=${HOST_IP}&port=$((8000+i))"
+done
+
+# List backends on each Ranvier node
+curl -s http://localhost:8081/admin/backends | jq .
+curl -s http://localhost:8082/admin/backends | jq .
+curl -s http://localhost:8083/admin/backends | jq .
+
+# Check backend count in metrics
+curl -s http://localhost:9181/metrics | grep -i backend
+
+# test with an actual chat completion request
+curl -s http://localhost:8081/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Say hello"}],
+    "max_tokens": 10
+  }'
+
+# Check Ranvier logs for errors
+ubuntu@150-136-90-99:~/ranvier-core$ docker logs ranvier-bench1 --tail 50
+INFO 2025-12-31 03:45:02,998 [shard 0:main] ranvier.control - Registered Backend 1 -> 172.17.0.1:8000 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,024 [shard 0:main] ranvier.control - Registered Backend 2 -> 172.17.0.1:8001 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,049 [shard 0:main] ranvier.control - Registered Backend 3 -> 172.17.0.1:8002 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,072 [shard 0:main] ranvier.control - Registered Backend 4 -> 172.17.0.1:8003 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,102 [shard 0:main] ranvier.control - Registered Backend 5 -> 172.17.0.1:8004 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,128 [shard 0:main] ranvier.control - Registered Backend 6 -> 172.17.0.1:8005 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,151 [shard 0:main] ranvier.control - Registered Backend 7 -> 172.17.0.1:8006 (weight=100, priority=0)
+INFO 2025-12-31 03:45:03,174 [shard 0:main] ranvier.control - Registered Backend 8 -> 172.17.0.1:8007 (weight=100, priority=0)
+INFO 2025-12-31 03:52:40,436 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] Request received from direct (135 bytes)
+INFO 2025-12-31 03:52:40,436 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] Routing to backend 4 at 172.17.0.1:8003
+INFO 2025-12-31 03:52:40,437 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] Connection established to backend 4 at 172.17.0.1:8003
+INFO 2025-12-31 03:52:40,437 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] Sending request to backend (144 bytes)
+INFO 2025-12-31 03:52:41,486 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] First byte received from backend 4 (latency: 1.050s)
+INFO 2025-12-31 03:52:46,486 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] Backend response complete (EOF after 1 chunks)
+INFO 2025-12-31 03:52:46,486 [shard 0:main] ranvier.proxy - [req-0-000000000000-000000] Request completed successfully
+
+It worked! The logs show:
+All 8 backends registered ✓
+Request routed to backend 4 ✓
+Response completed in ~6 seconds ✓
+The curl output probably just didn't have a newline. Try again:
+curl -s http://localhost:8081/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Say hello"}],
+    "max_tokens": 10
+  }' && echo ""
+INFO  2025-12-31 03:56:53,318 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] Request received from direct (135 bytes)
+INFO  2025-12-31 03:56:53,318 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] Routing to backend 4 at 172.17.0.1:8003
+INFO  2025-12-31 03:56:53,318 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] Connection established to backend 4 at 172.17.0.1:8003
+INFO  2025-12-31 03:56:53,318 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] Sending request to backend (144 bytes)
+INFO  2025-12-31 03:56:53,473 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] First byte received from backend 4 (latency: 0.155s)
+INFO  2025-12-31 03:56:58,473 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] Backend response complete (EOF after 1 chunks)
+INFO  2025-12-31 03:56:58,473 [shard 0:main] ranvier.proxy - [req-0-00000f12aaf8-000001] Request completed successfully
+
+This is exactly what we want to see!
+Request	Backend	TTFT
+1st (cache miss)	Backend 4	1.050s
+2nd (cache hit)	Backend 4	0.155s
+That's a 6.8x speedup from the KV cache hit! The prefix-affinity routing correctly sent both requests to the same backend, and the second one benefited from the warm cache.
+
+
+pip install locust requests
+
+export NUM_BACKENDS=8
+export VLLM_ENDPOINT_1=http://localhost:8000
+export VLLM_ENDPOINT_2=http://localhost:8001
+export RANVIER_NODE1=http://localhost:8081
+export RANVIER_NODE2=http://localhost:8082
+export RANVIER_NODE3=http://localhost:8083
+export RANVIER_METRICS1=http://localhost:9181
+export RANVIER_METRICS2=http://localhost:9182
+export RANVIER_METRICS3=http://localhost:9183
+export BACKEND1_IP=172.17.0.1
+export BACKEND1_PORT=8000
+export BACKEND2_IP=172.17.0.1
+export BACKEND2_PORT=8001
+export BACKEND3_IP=172.17.0.1
+export BACKEND3_PORT=8002
+export BACKEND4_IP=172.17.0.1
+export BACKEND4_PORT=8003
+export BACKEND5_IP=172.17.0.1
+export BACKEND5_PORT=8004
+export BACKEND6_IP=172.17.0.1
+export BACKEND6_PORT=8005
+export BACKEND7_IP=172.17.0.1
+export BACKEND7_PORT=8006
+export BACKEND8_IP=172.17.0.1
+export BACKEND8_PORT=8007
+export VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct
+python3 tests/integration/run_benchmark_comparison.py --stress --num-backends 8 2>&1 |tee run_benchmark_comparison.stdout
+
+
+In another terminal:
+# Watch vLLM activity (should see requests flowing)
+tail -f /tmp/vllm-0.log | grep -E "(throughput|Running)"
+
+# Watch Ranvier logs
+docker logs -f ranvier-bench1 2>&1 | grep -E "(Routing|First byte)"
+
+# Check if locust process is running
+ps aux | grep locust
+
+Expected timeline:
+0-5 min: Round-robin baseline test
+5-5.5 min: Cooldown
+5.5-10.5 min: Prefix-affinity test
+10.5-11 min: Report generation
+If you see requests in the vLLM logs, it's working. Just let it finish and it'll print the comparison results.
+
+
+# Restart all 3 nodes to be safe
+docker compose -f docker-compose.benchmark-real.yml restart ranvier1 ranvier2 ranvier3
+
+
+
+# Stop all Ranvier nodes
+docker compose -f docker-compose.benchmark-real.yml down ranvier1 ranvier2 ranvier3
+
+# Start only 1 node
+docker compose -f docker-compose.benchmark-real.yml up -d ranvier1
+
+
+
+
+BENCHMARK_MODE=round_robin \
+PROMPT_DISTRIBUTION=large-prefix \
+NUM_BACKENDS=8 \
+NUM_RANVIER_NODES=3 \
+RANVIER_NODE1=http://localhost:8081 \
+RANVIER_NODE2=http://localhost:8082 \
+RANVIER_NODE3=http://localhost:8083 \
+RANVIER_METRICS1=http://localhost:9181 \
+RANVIER_METRICS2=http://localhost:9182 \
+RANVIER_METRICS3=http://localhost:9183 \
+BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
+BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
+BACKEND3_IP=172.17.0.1 BACKEND3_PORT=8002 \
+BACKEND4_IP=172.17.0.1 BACKEND4_PORT=8003 \
+BACKEND5_IP=172.17.0.1 BACKEND5_PORT=8004 \
+BACKEND6_IP=172.17.0.1 BACKEND6_PORT=8005 \
+BACKEND7_IP=172.17.0.1 BACKEND7_PORT=8006 \
+BACKEND8_IP=172.17.0.1 BACKEND8_PORT=8007 \
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+LARGE_PREFIX_MIN_TOKENS=2000 \
+LARGE_PREFIX_MAX_TOKENS=8000 \
+NUM_LARGE_PREFIXES=5 \
+locust -f tests/integration/locustfile_real.py \
+  --headless \
+  --users 10 \
+  --spawn-rate 2 \
+  --run-time 5m \
+  --host http://localhost:8081 \
+  2>&1 | tee benchmark-roundrobin.log
+
+
+
+
+# Prefix-affinity test (5 minutes)
+BENCHMARK_MODE=prefix \
+PROMPT_DISTRIBUTION=large-prefix \
+NUM_BACKENDS=8 \
+NUM_RANVIER_NODES=3 \
+RANVIER_NODE1=http://localhost:8081 \
+RANVIER_NODE2=http://localhost:8082 \
+RANVIER_NODE3=http://localhost:8083 \
+RANVIER_METRICS1=http://localhost:9181 \
+RANVIER_METRICS2=http://localhost:9182 \
+RANVIER_METRICS3=http://localhost:9183 \
+BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
+BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
+BACKEND3_IP=172.17.0.1 BACKEND3_PORT=8002 \
+BACKEND4_IP=172.17.0.1 BACKEND4_PORT=8003 \
+BACKEND5_IP=172.17.0.1 BACKEND5_PORT=8004 \
+BACKEND6_IP=172.17.0.1 BACKEND6_PORT=8005 \
+BACKEND7_IP=172.17.0.1 BACKEND7_PORT=8006 \
+BACKEND8_IP=172.17.0.1 BACKEND8_PORT=8007 \
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+LARGE_PREFIX_MIN_TOKENS=2000 \
+LARGE_PREFIX_MAX_TOKENS=8000 \
+NUM_LARGE_PREFIXES=5 \
+locust -f tests/integration/locustfile_real.py \
+  --headless \
+  --users 10 \
+  --spawn-rate 2 \
+  --run-time 5m \
+  --host http://localhost:8081 \
+  2>&1 | tee benchmark-prefix.log
+
+
+# 1 node, round robin
+BENCHMARK_MODE=round_robin \
+PROMPT_DISTRIBUTION=large-prefix \
+NUM_BACKENDS=8 \
+NUM_RANVIER_NODES=1 \
+RANVIER_NODE1=http://localhost:8081 \
+RANVIER_METRICS1=http://localhost:9181 \
+BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
+BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
+BACKEND3_IP=172.17.0.1 BACKEND3_PORT=8002 \
+BACKEND4_IP=172.17.0.1 BACKEND4_PORT=8003 \
+BACKEND5_IP=172.17.0.1 BACKEND5_PORT=8004 \
+BACKEND6_IP=172.17.0.1 BACKEND6_PORT=8005 \
+BACKEND7_IP=172.17.0.1 BACKEND7_PORT=8006 \
+BACKEND8_IP=172.17.0.1 BACKEND8_PORT=8007 \
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+LARGE_PREFIX_MIN_TOKENS=2000 \
+LARGE_PREFIX_MAX_TOKENS=8000 \
+NUM_LARGE_PREFIXES=5 \
+locust -f tests/integration/locustfile_real.py \
+  --headless \
+  --users 3 \
+  --spawn-rate 1 \
+  --run-time 5m \
+  --host http://localhost:8081 \
+  2>&1 | tee benchmark-roundrobin.log
+
+# 1 node, prefix
+BENCHMARK_MODE=prefix \
+PROMPT_DISTRIBUTION=large-prefix \
+NUM_BACKENDS=8 \
+NUM_RANVIER_NODES=1 \
+RANVIER_NODE1=http://localhost:8081 \
+RANVIER_METRICS1=http://localhost:9181 \
+BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
+BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
+BACKEND3_IP=172.17.0.1 BACKEND3_PORT=8002 \
+BACKEND4_IP=172.17.0.1 BACKEND4_PORT=8003 \
+BACKEND5_IP=172.17.0.1 BACKEND5_PORT=8004 \
+BACKEND6_IP=172.17.0.1 BACKEND6_PORT=8005 \
+BACKEND7_IP=172.17.0.1 BACKEND7_PORT=8006 \
+BACKEND8_IP=172.17.0.1 BACKEND8_PORT=8007 \
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+LARGE_PREFIX_MIN_TOKENS=2000 \
+LARGE_PREFIX_MAX_TOKENS=8000 \
+NUM_LARGE_PREFIXES=5 \
+locust -f tests/integration/locustfile_real.py \
+  --headless \
+  --users 3 \
+  --spawn-rate 1 \
+  --run-time 5m \
+  --host http://localhost:8081 \
+  2>&1 | tee benchmark-prefix.log
+
+
+
+The persisted state database might be corrupted. Let's clear it and start fresh:
+# Stop the container
+docker compose -f docker-compose.benchmark-real.yml down ranvier1
+
+# Remove the container to clear the /tmp/ranvier.db inside it
+docker rm ranvier-bench1
+
+# Start fresh
+docker compose -f docker-compose.benchmark-real.yml up -d ranvier1
+
+# Wait and check
+sleep 10
+curl -s http://localhost:8081/health && echo " - Node 1 OK"
+
+If that doesn't work, force recreate:
+docker compose -f docker-compose.benchmark-real.yml up -d --force-recreate ranvier1
+
+Then re-register backends:
+HOST_IP=172.17.0.1
+for i in {0..7}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$((i+1))&ip=${HOST_IP}&port=$((8000+i))" > /dev/null
+done
+
+
+You're right to be suspicious. The results are nearly identical because there's a flaw in the test setup:
+The Problem
+With only 5 unique prefixes and 8 backends, even round-robin eventually warms up ALL backends for ALL prefixes:
+5 prefixes × 8 backends = 40 requests to warm everything
+After that, every request is a cache hit regardless of routing
+Both tests ran ~280 requests, so after the first ~40, everything is cached everywhere
+That's why both show 98% cache hit rate - it's measuring vLLM's prefix cache, not Ranvier's routing benefit.
+The Fix
+We need more prefixes than can fit in cache across all backends. Run with more prefixes:
+
+
+
+# Use 50 prefixes instead of 5
+BENCHMARK_MODE=round_robin \
+PROMPT_DISTRIBUTION=large-prefix \
+NUM_LARGE_PREFIXES=50 \
+NUM_BACKENDS=8 \
+NUM_RANVIER_NODES=1 \
+RANVIER_NODE1=http://localhost:8081 \
+RANVIER_METRICS1=http://localhost:9181 \
+BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
+BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
+BACKEND3_IP=172.17.0.1 BACKEND2_PORT=8002 \
+BACKEND4_IP=172.17.0.1 BACKEND3_PORT=8003 \
+BACKEND5_IP=172.17.0.1 BACKEND4_PORT=8004 \
+BACKEND6_IP=172.17.0.1 BACKEND5_PORT=8005 \
+BACKEND7_IP=172.17.0.1 BACKEND6_PORT=8006 \
+BACKEND8_IP=172.17.0.1 BACKEND7_PORT=8007 \
+VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+LARGE_PREFIX_MIN_TOKENS=2000 \
+LARGE_PREFIX_MAX_TOKENS=8000 \
+locust -f tests/integration/locustfile_real.py \
+  --headless \
+  --users 3 \
+  --spawn-rate 1 \
+  --run-time 5m \
+  --host http://localhost:8081 \
+  2>&1 | tee benchmark-roundrobin-50prefixes.log
+
+
+# Rebuild Docker image
+docker compose -f docker-compose.benchmark-real.yml build ranvier1
+
+# Restart Ranvier nodes
+docker compose -f docker-compose.benchmark-real.yml up -d --force-recreate ranvier1 ranvier2 ranvier3
+
+# Wait for healthy, then re-register backends
+for i in {1..8}; do
+  curl -s -X POST http://localhost:8081/backends \
+    -H "Content-Type: application/json" \
+    -d "{\"backend_id\":$i, \"ip\":\"172.17.0.1\", \"port\":$((7999+i)), \"weight\":100}"
+done
+
+    I got this error:
+Network ranvier-benchmark-prefix-aware_ranvier-benchmark Creating
+Network ranvier-benchmark-prefix-aware_ranvier-benchmark Error
+failed to create network ranvier-benchmark-prefix-aware_ranvier-benchmark: Error response from daemon: invalid pool request: Pool overlaps with other one on this address space
+
+# Run these commands to clean up the conflicting networks:
+    # Stop any running benchmark containers
+    docker compose -f docker-compose.benchmark-real.yml down
+
+    # List and remove stale ranvier networks
+    docker network ls | grep ranvier
+    docker network prune -f
+
+    # If specific networks remain, remove them manually
+    docker network rm ranvier-benchmark-prefix-aware_ranvier-benchmark 2>/dev/null || true
+
+    # Now try again
+    docker compose -f docker-compose.benchmark-real.yml up -d
+
+
+# If you're running locust directly (without the docker-compose benchmark script), you don't need the benchmark network at all. Just make sure your Ranvier containers are running:
+    # Check if ranvier is already running
+    docker ps | grep ranvier
+
+    # If running, just run locust directly against it
+
+# Run benchmark
+export BENCHMARK_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 |tee ${BENCHMARK_MODE}.stdout
+
+
+To test round-robin, you need to restart Ranvier with the environment variable:
+# Stop Ranvier
+docker compose -f docker-compose.benchmark-real.yml down
+
+# Restart with round-robin routing
+RANVIER_ROUTING_MODE=round_robin docker compose -f docker-compose.benchmark-real.yml up -d
+
+# Wait for healthy, re-register backends
+for i in {1..8}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+  echo
+done
+
+# Run round-robin benchmark
+export BENCHMARK_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 | tee round_robin.stdout
+
+
+
+Round-Robin (baseline):
+# Restart Ranvier with round-robin
+docker compose -f docker-compose.benchmark-real.yml down
+RANVIER_ROUTING_MODE=round_robin docker compose -f docker-compose.benchmark-real.yml up -d
+
+# Wait for healthy, register backends
+sleep 10
+for i in {1..8}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+done
+
+# Run benchmark
+export BENCHMARK_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 | tee round_robin.stdout
+
+
+
+Prefix-Affinity:
+# Restart Ranvier with prefix-affinity (default)
+docker compose -f docker-compose.benchmark-real.yml down
+export RANVIER_ROUTING_MODE=prefix
+docker compose -f docker-compose.benchmark-real.yml up -d
+
+# Wait for healthy, register backends
+sleep 10
+for i in {1..8}; do
+  curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
+done
+
+# Run benchmark
+export BENCHMARK_MODE=prefix
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export BACKEND1_IP=172.17.0.1
+export NUM_BACKENDS=8
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 | tee prefix_affinity.stdout
+
+
+# Inspect env vars
+docker inspect ranvier-bench1 | grep -A 20 "Env"
+docker exec ranvier-bench1 printenv | grep ROUTING
