@@ -55,6 +55,14 @@ public:
     virtual bool clear_all() = 0;
     virtual size_t route_count() = 0;
     virtual size_t backend_count() = 0;
+
+    // Crash recovery support
+    // checkpoint() flushes WAL to main database file - call after critical writes
+    virtual bool checkpoint() = 0;
+    // verify_integrity() runs SQLite integrity check and validates data structures
+    virtual bool verify_integrity() = 0;
+    // Returns count of records skipped during last load due to corruption
+    virtual size_t last_load_skipped_count() const = 0;
 };
 
 // Factory function to create the default persistence store
