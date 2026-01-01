@@ -405,11 +405,13 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
-| 2024-XX-XX | Accept pre-tokenized client input | #50 |
-| 2024-XX-XX | Locust load testing infrastructure | #49 |
-| 2024-XX-XX | Abseil high-performance containers | #48 |
-| 2024-XX-XX | Multi-node integration tests | #47 |
-| 2024-XX-XX | Request rewriting for token forwarding | #46 |
+| 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
+| 2025-01-01 | Fix: Persistence state corruption after crash | - |
+| 2024-12-XX | Accept pre-tokenized client input | #50 |
+| 2024-12-XX | Locust load testing infrastructure | #49 |
+| 2024-12-XX | Abseil high-performance containers | #48 |
+| 2024-12-XX | Multi-node integration tests | #47 |
+| 2024-12-XX | Request rewriting for token forwarding | #46 |
 
 ---
 
