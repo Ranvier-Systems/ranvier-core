@@ -124,6 +124,8 @@ services:
       - "9181:9180"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    cap_add:
+      - IPC_LOCK
     environment:
       # Cluster configuration
       - RANVIER_CLUSTER_ENABLED=true
@@ -161,6 +163,8 @@ services:
       - "9182:9180"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    cap_add:
+      - IPC_LOCK
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -195,6 +199,8 @@ services:
       - "9183:9180"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    cap_add:
+      - IPC_LOCK
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190

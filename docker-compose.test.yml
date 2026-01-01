@@ -57,6 +57,8 @@ services:
     ports:
       - "8081:8080"
       - "9181:9180"
+    cap_add:
+      - IPC_LOCK
     environment:
       # Cluster configuration via environment variables
       - RANVIER_CLUSTER_ENABLED=true
@@ -93,6 +95,8 @@ services:
     ports:
       - "8082:8080"
       - "9182:9180"
+    cap_add:
+      - IPC_LOCK
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -127,6 +131,8 @@ services:
     ports:
       - "8083:8080"
       - "9183:9180"
+    cap_add:
+      - IPC_LOCK
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
