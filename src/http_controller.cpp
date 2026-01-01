@@ -858,6 +858,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_route(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
     sstring id_str = req->get_query_param("backend_id");
     if (id_str.empty()) {
+        log_control.warn("POST /admin/routes: missing backend_id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -867,6 +868,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     try {
         backend_id = std::stoi(std::string(id_str));
     } catch (const std::exception& e) {
+        log_control.warn("POST /admin/routes: invalid backend_id '{}': {}", id_str, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -876,6 +878,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     try {
         tokens = _tokenizer.encode(req->content);
     } catch (const std::exception& e) {
+        log_control.warn("POST /admin/routes: failed to tokenize content for backend {}: {}", backend_id, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Failed to tokenize request content\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -906,6 +909,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
+        log_control.warn("POST /admin/backends: missing required parameter (id={}, ip={}, port={})",
+            id_str.empty() ? "<missing>" : id_str,
+            ip_str.empty() ? "<missing>" : ip_str,
+            port_str.empty() ? "<missing>" : port_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id, ip, or port\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -928,6 +935,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
             priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
         }
     } catch (const std::exception& e) {
+        log_control.warn("POST /admin/backends: invalid parameter (id={}, port={}, weight={}, priority={}): {}",
+            id_str, port_str, weight_str, priority_str, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid parameter: id, port, weight, and priority must be valid integers\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -938,6 +947,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     try {
         addr = socket_address(ipv4_addr(std::string(ip_str), port));
     } catch (const std::exception& e) {
+        log_control.warn("POST /admin/backends: invalid IP address '{}': {}", ip_str, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid IP address format\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -971,6 +981,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
     sstring id_str = req->get_query_param("id");
 
     if (id_str.empty()) {
+        log_control.warn("DELETE /admin/backends: missing id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id parameter\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -980,6 +991,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
     try {
         id = std::stoi(std::string(id_str));
     } catch (const std::exception& e) {
+        log_control.warn("DELETE /admin/backends: invalid id '{}': {}", id_str, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -1008,6 +1020,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
     sstring id_str = req->get_query_param("backend_id");
 
     if (id_str.empty()) {
+        log_control.warn("DELETE /admin/routes: missing backend_id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -1017,6 +1030,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
     try {
         backend_id = std::stoi(std::string(id_str));
     } catch (const std::exception& e) {
+        log_control.warn("DELETE /admin/routes: invalid backend_id '{}': {}", id_str, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
