@@ -50,15 +50,31 @@ std::unique_ptr<ranvier::PersistenceStore> persistence;
 std::unique_ptr<ranvier::K8sDiscoveryService> k8s_discovery;
 
 // Helper to load persisted state into the router
+// Includes crash recovery: validates integrity, skips corrupted records, handles exceptions
 future<> load_persisted_state() {
     if (!persistence || !persistence->is_open()) {
         ranvier::log_main.info("No persistence store - starting with empty state");
         return make_ready_future<>();
     }
 
-    // Load backends first
+    // Step 1: Verify database integrity before loading
+    // This catches SQLite corruption from incomplete WAL recovery
+    if (!persistence->verify_integrity()) {
+        ranvier::log_main.error("Persistence integrity check failed - clearing corrupted state");
+        persistence->clear_all();
+        ranvier::log_main.info("Persistence store cleared - starting fresh");
+        return make_ready_future<>();
+    }
+
+    // Step 2: Load backends and routes (corrupted records are skipped internally)
     auto backends = persistence->load_backends();
     auto routes = persistence->load_routes();
+
+    // Check if any records were skipped due to corruption
+    size_t skipped = persistence->last_load_skipped_count();
+    if (skipped > 0) {
+        ranvier::log_main.warn("Skipped {} corrupted route records during load", skipped);
+    }
 
     if (backends.empty() && routes.empty()) {
         ranvier::log_main.info("Persistence store is empty - starting fresh");
@@ -67,7 +83,7 @@ future<> load_persisted_state() {
 
     ranvier::log_main.info("Restoring state from persistence:");
     ranvier::log_main.info("  Backends: {}", backends.size());
-    ranvier::log_main.info("  Routes:   {}", routes.size());
+    ranvier::log_main.info("  Routes:   {} (skipped {} corrupted)", routes.size(), skipped);
 
     // Log each backend at info level for visibility
     for (const auto& rec : backends) {
@@ -75,18 +91,62 @@ future<> load_persisted_state() {
             rec.id, rec.ip, rec.port, rec.weight, rec.priority);
     }
 
-    return do_with(std::move(backends), std::move(routes), [](auto& backends, auto& routes) {
-        return do_for_each(backends, [](const ranvier::BackendRecord& rec) {
-            socket_address addr(ipv4_addr(rec.ip, rec.port));
-            return router->register_backend_global(rec.id, addr, rec.weight, rec.priority);
-        }).then([&routes] {
-            return do_for_each(routes, [](const ranvier::RouteRecord& rec) {
-                return router->learn_route_global(rec.tokens, rec.backend_id);
+    // Step 3: Restore backends first, then routes
+    // Each step has exception handling to continue on partial failures
+    return do_with(std::move(backends), std::move(routes),
+                   size_t(0), size_t(0),  // Counters for failed backends/routes
+        [](auto& backends, auto& routes, size_t& failed_backends, size_t& failed_routes) {
+            // Restore backends with individual exception handling
+            return do_for_each(backends, [&failed_backends](const ranvier::BackendRecord& rec) {
+                socket_address addr(ipv4_addr(rec.ip, rec.port));
+                return router->register_backend_global(rec.id, addr, rec.weight, rec.priority)
+                    .handle_exception([&failed_backends, id = rec.id](auto ep) {
+                        failed_backends++;
+                        try {
+                            std::rethrow_exception(ep);
+                        } catch (const std::exception& e) {
+                            ranvier::log_main.warn("Failed to restore backend {}: {}", id, e.what());
+                        }
+                        return make_ready_future<>();
+                    });
+            }).then([&routes, &failed_routes] {
+                // Restore routes with individual exception handling
+                // Routes are less critical - they can be relearned from traffic
+                return do_for_each(routes, [&failed_routes](const ranvier::RouteRecord& rec) {
+                    // Copy tokens to avoid lifetime issues in async context
+                    // The do_with inside learn_route_global needs its own copy
+                    auto tokens_copy = rec.tokens;
+                    return router->learn_route_global(std::move(tokens_copy), rec.backend_id)
+                        .handle_exception([&failed_routes](auto ep) {
+                            failed_routes++;
+                            // Log at debug level - route failures are common and recoverable
+                            try {
+                                std::rethrow_exception(ep);
+                            } catch (const std::exception& e) {
+                                ranvier::log_main.debug("Failed to restore route: {}", e.what());
+                            }
+                            return make_ready_future<>();
+                        });
+                });
+            }).then([&failed_backends, &failed_routes] {
+                if (failed_backends > 0 || failed_routes > 0) {
+                    ranvier::log_main.warn("State restoration completed with errors: "
+                                           "{} backend failures, {} route failures",
+                                           failed_backends, failed_routes);
+                } else {
+                    ranvier::log_main.info("State restoration complete");
+                }
             });
+        }).handle_exception([](auto ep) {
+            // Catch-all for unexpected errors during restoration
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                ranvier::log_main.error("State restoration failed: {} - starting with empty state", e.what());
+            }
+            // Continue startup even if restoration fails completely
+            return make_ready_future<>();
         });
-    }).then([] {
-        ranvier::log_main.info("State restoration complete");
-    });
 }
 
 // Hot-reload configuration on SIGHUP
@@ -238,6 +298,15 @@ future<> run() {
         persistence = ranvier::create_persistence_store();
         if (persistence->open(g_config.database.path)) {
             ranvier::log_main.info("Persistence initialized (SQLite: {})", g_config.database.path);
+
+            // Checkpoint WAL on startup to ensure clean state after potential crash
+            // This flushes any pending WAL entries to the main database file
+            if (persistence->checkpoint()) {
+                ranvier::log_main.debug("Persistence WAL checkpoint complete");
+            } else {
+                ranvier::log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
+            }
+
             // Set persistence on all shards - persistence store is thread-safe for writes
             return controller.invoke_on_all([](ranvier::HttpController& c) {
                 c.set_persistence(persistence.get());
@@ -438,6 +507,15 @@ future<> run() {
                     ranvier::log_main.info("Shutdown summary:");
                     ranvier::log_main.info("  Persisted backends: {}", persistence->backend_count());
                     ranvier::log_main.info("  Persisted routes:   {}", persistence->route_count());
+
+                    // Checkpoint WAL before closing to ensure all data is durable
+                    // This prevents data loss if the process is killed shortly after
+                    if (persistence->checkpoint()) {
+                        ranvier::log_main.debug("Final WAL checkpoint complete");
+                    } else {
+                        ranvier::log_main.warn("Final WAL checkpoint failed - some data may be in WAL");
+                    }
+
                     persistence->close();
                     ranvier::log_main.info("Persistence store closed");
                 }

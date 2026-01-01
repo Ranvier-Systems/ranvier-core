@@ -171,7 +171,26 @@ std::vector<uint8_t> SqlitePersistence::serialize_tokens(std::span<const TokenId
 }
 
 std::vector<TokenId> SqlitePersistence::deserialize_tokens(const void* data, size_t size) {
+    // Validate input: null data or zero size returns empty vector
+    if (data == nullptr || size == 0) {
+        return {};
+    }
+
+    // Validate size is a multiple of TokenId size (corruption check)
+    if (size % sizeof(TokenId) != 0) {
+        // Corrupted blob - size doesn't align with TokenId boundary
+        return {};
+    }
+
     size_t count = size / sizeof(TokenId);
+
+    // Sanity check: reject unreasonably large token sequences (> 1M tokens)
+    // This prevents allocation failures from corrupted size data
+    constexpr size_t MAX_TOKEN_COUNT = 1'000'000;
+    if (count > MAX_TOKEN_COUNT) {
+        return {};
+    }
+
     std::vector<TokenId> tokens(count);
     std::memcpy(tokens.data(), data, size);
     return tokens;
@@ -241,6 +260,8 @@ std::vector<RouteRecord> SqlitePersistence::load_routes() {
     std::lock_guard<std::mutex> lock(_mutex);
 
     std::vector<RouteRecord> results;
+    size_t skipped_count = 0;
+
     if (!_db) return results;
 
     const char* sql = "SELECT tokens, backend_id FROM routes";
@@ -250,17 +271,43 @@ std::vector<RouteRecord> SqlitePersistence::load_routes() {
     if (rc != SQLITE_OK) return results;
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        RouteRecord record;
-
         const void* blob = sqlite3_column_blob(stmt, 0);
         int blob_size = sqlite3_column_bytes(stmt, 0);
-        record.tokens = deserialize_tokens(blob, static_cast<size_t>(blob_size));
-        record.backend_id = sqlite3_column_int(stmt, 1);
 
+        // Handle empty token sequences (valid edge case)
+        // blob can be null for empty BLOB in SQLite
+        std::vector<TokenId> tokens;
+        if (blob != nullptr && blob_size > 0) {
+            tokens = deserialize_tokens(blob, static_cast<size_t>(blob_size));
+
+            // If deserialization returned empty but input was non-empty, data is corrupted
+            // (e.g., blob_size not divisible by sizeof(TokenId) or exceeds max)
+            if (tokens.empty()) {
+                skipped_count++;
+                continue;
+            }
+        }
+        // If blob is null/empty, tokens stays empty (valid empty sequence)
+
+        int backend_id = sqlite3_column_int(stmt, 1);
+
+        // Validate backend_id is reasonable (positive integer)
+        if (backend_id <= 0) {
+            skipped_count++;
+            continue;
+        }
+
+        RouteRecord record;
+        record.tokens = std::move(tokens);
+        record.backend_id = backend_id;
         results.push_back(std::move(record));
     }
 
     sqlite3_finalize(stmt);
+
+    // Log if we skipped any corrupted records (caller can check this)
+    _last_load_skipped_count = skipped_count;
+
     return results;
 }
 
@@ -347,6 +394,70 @@ size_t SqlitePersistence::backend_count() {
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+bool SqlitePersistence::checkpoint() {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (!_db) return false;
+
+    // PRAGMA wal_checkpoint(TRUNCATE) forces a checkpoint and truncates the WAL file
+    // This ensures all changes are written to the main database file
+    // TRUNCATE mode is safest for crash recovery as it leaves no WAL residue
+    int rc = sqlite3_wal_checkpoint_v2(_db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+    return rc == SQLITE_OK;
+}
+
+bool SqlitePersistence::verify_integrity() {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (!_db) return false;
+
+    // Run SQLite's built-in integrity check
+    const char* sql = "PRAGMA integrity_check";
+    sqlite3_stmt* stmt = nullptr;
+
+    int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return false;
+
+    bool is_ok = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* result = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        // "ok" means the database passed integrity check
+        is_ok = (result && std::strcmp(result, "ok") == 0);
+    }
+
+    sqlite3_finalize(stmt);
+
+    if (!is_ok) {
+        return false;
+    }
+
+    // Additional validation: check for orphaned routes (routes referencing non-existent backends)
+    // This can happen if a crash occurred during backend deletion
+    const char* orphan_sql = R"(
+        SELECT COUNT(*) FROM routes r
+        WHERE NOT EXISTS (SELECT 1 FROM backends b WHERE b.id = r.backend_id)
+    )";
+
+    rc = sqlite3_prepare_v2(_db, orphan_sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return false;
+
+    size_t orphan_count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        orphan_count = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
+    }
+
+    sqlite3_finalize(stmt);
+
+    // If orphaned routes exist, they indicate potential corruption
+    // We don't fail the check, but this info is useful for diagnostics
+    // The routes will be cleaned up during normal operation
+    return true;
+}
+
+size_t SqlitePersistence::last_load_skipped_count() const {
+    return _last_load_skipped_count;
 }
 
 // Factory function implementation

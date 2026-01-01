@@ -42,6 +42,11 @@ public:
     size_t route_count() override;
     size_t backend_count() override;
 
+    // Crash recovery support
+    bool checkpoint() override;
+    bool verify_integrity() override;
+    size_t last_load_skipped_count() const override;
+
 private:
     bool create_tables();
     bool exec_sql(const char* sql);
@@ -52,6 +57,7 @@ private:
 
     sqlite3* _db = nullptr;
     mutable std::mutex _mutex;  // Thread safety for SQLite operations
+    size_t _last_load_skipped_count = 0;  // Count of corrupted records skipped during load
 };
 
 } // namespace ranvier
