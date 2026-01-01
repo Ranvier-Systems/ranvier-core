@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 
+#include <opentelemetry/nostd/span.h>
 #include <opentelemetry/trace/provider.h>
 #include <opentelemetry/trace/tracer.h>
 #include <opentelemetry/trace/span.h>
@@ -230,8 +231,8 @@ inline ScopedSpan::ScopedSpan(trace::Tracer& tracer, const std::string& name,
 
     if (parent && parent->valid) {
         // Create span context from parent
-        char trace_id_bytes[16];
-        char span_id_bytes[8];
+        uint8_t trace_id_bytes[16];
+        uint8_t span_id_bytes[8];
 
         // Parse hex strings to bytes
         auto hex_to_byte = [](char hi, char lo) -> uint8_t {
@@ -251,9 +252,9 @@ inline ScopedSpan::ScopedSpan(trace::Tracer& tracer, const std::string& name,
             span_id_bytes[i] = hex_to_byte(parent->parent_span_id[i*2], parent->parent_span_id[i*2+1]);
         }
 
-        trace::TraceId tid(reinterpret_cast<const uint8_t*>(trace_id_bytes));
-        trace::SpanId sid(reinterpret_cast<const uint8_t*>(span_id_bytes));
-        trace::TraceFlags flags(parent->sampled ? trace::TraceFlags::kIsSampled : trace::TraceFlags::kDefault);
+        trace::TraceId tid(opentelemetry::nostd::span<const uint8_t, 16>(trace_id_bytes, 16));
+        trace::SpanId sid(opentelemetry::nostd::span<const uint8_t, 8>(span_id_bytes, 8));
+        trace::TraceFlags flags(parent->sampled ? trace::TraceFlags::kIsSampled : 0);
 
         trace::SpanContext parent_ctx(tid, sid, flags, true);
         options.parent = parent_ctx;
