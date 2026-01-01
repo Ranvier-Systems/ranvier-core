@@ -20,12 +20,6 @@ using namespace seastar;
 
 namespace ranvier {
 
-// Custom exception for request timeouts
-class request_timeout_error : public std::runtime_error {
-public:
-    request_timeout_error() : std::runtime_error("Request timed out") {}
-};
-
 // Helper to check if an exception is a connection error (broken pipe or connection reset)
 // These errors occur when the backend closes the connection unexpectedly
 enum class ConnectionErrorType {
@@ -341,12 +335,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Rewrite request body with token IDs if enabled and we tokenized locally
     // Skip rewriting if client already provided prompt_token_ids (it's already in the body)
     std::string forwarded_body = body;
-    bool body_rewritten = used_client_tokens;  // Client tokens means body already has them
     if (_config.enable_token_forwarding && !tokens.empty() && !used_client_tokens) {
         auto rewrite_result = RequestRewriter::rewrite(body, tokens);
         if (rewrite_result.success) {
             forwarded_body = std::move(rewrite_result.body);
-            body_rewritten = true;
             log_proxy.debug("[{}] Request rewritten with {} token IDs ({} -> {} bytes)",
                            request_id, tokens.size(), body.size(), forwarded_body.size());
         } else {
@@ -356,14 +348,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
 
     BackendId target_id;
-    bool route_hit = false;
 
     if (_config.prefix_affinity_enabled) {
         // Use prefix-affinity routing: consistent hashing on prefix tokens
         auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
         if (affinity_backend.has_value()) {
             target_id = affinity_backend.value();
-            route_hit = true;  // Prefix affinity is effectively always a "hit"
             log_proxy.debug("[{}] Prefix affinity -> backend {}", request_id, target_id);
         } else {
             log_proxy.warn("[{}] No backends registered", request_id);
@@ -378,7 +368,6 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         auto lookup_result = _router.lookup(tokens, request_id);
         if (lookup_result.has_value()) {
             target_id = lookup_result.value();
-            route_hit = true;
             log_proxy.debug("[{}] Route cache hit -> backend {}", request_id, target_id);
         } else {
             auto random_id = _router.get_random_backend();
@@ -445,7 +434,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -869,6 +858,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_route(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
     sstring id_str = req->get_query_param("backend_id");
     if (id_str.empty()) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
