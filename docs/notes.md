@@ -2131,3 +2131,26 @@ locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rat
 # Inspect env vars
 docker inspect ranvier-bench1 | grep -A 20 "Env"
 docker exec ranvier-bench1 printenv | grep ROUTING
+
+
+
+--- Add non-root user to Docker image
+# Build the image first
+~/dev/ranvier-core % docker build -f Dockerfile.production -t ranvier:latest .
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/rvweyagifflm6vzmk5a4smatr
+
+# Then run with the capability
+~/dev/ranvier-core % docker run --cap-add=IPC_LOCK ranvier:latest
+
+# To verify it's running as non-root
+docker run --cap-add=IPC_LOCK ranvier:latest id
+# Expected: uid=10001(ranvier) gid=10001(ranvier)
+
+~/dev/ranvier-core % docker run --cap-add=IPC_LOCK ranvier:latest id
+uid=10001(ranvier) gid=10001(ranvier) groups=10001(ranvier)
+
+# Confirmed working. The container runs as UID 10001 (non-root) and Seastar initializes correctly with the IPC_LOCK capability.
+
+# For the docker-compose files, you don't need the --cap-add flag since I already added cap_add: [IPC_LOCK] to the service definitions. Just run:
+docker-compose -f docker-compose.test.yml up
+
