@@ -67,25 +67,22 @@ inline const char* connection_error_to_string(ConnectionErrorType type) {
 // RAII guard for active request counter
 // Ensures decrement happens even if an exception is thrown during request setup
 class ActiveRequestGuard {
-    MetricsService* _metrics;
+    MetricsService& _metrics;
     bool _released = false;
 public:
-    explicit ActiveRequestGuard(MetricsService& metrics) : _metrics(&metrics) {
-        _metrics->increment_active_requests();
+    explicit ActiveRequestGuard(MetricsService& metrics) : _metrics(metrics) {
+        _metrics.increment_active_requests();
     }
     ~ActiveRequestGuard() {
         if (!_released) {
-            _metrics->decrement_active_requests();
+            _metrics.decrement_active_requests();
         }
     }
-    // Prevent copy
+    // Non-copyable, non-movable (prevent accidental double-decrement)
     ActiveRequestGuard(const ActiveRequestGuard&) = delete;
     ActiveRequestGuard& operator=(const ActiveRequestGuard&) = delete;
-    // Allow move
-    ActiveRequestGuard(ActiveRequestGuard&& other) noexcept
-        : _metrics(other._metrics), _released(other._released) {
-        other._released = true;
-    }
+    ActiveRequestGuard(ActiveRequestGuard&&) = delete;
+    ActiveRequestGuard& operator=(ActiveRequestGuard&&) = delete;
     // Release ownership - caller takes responsibility for decrementing
     void release() { _released = true; }
 };
