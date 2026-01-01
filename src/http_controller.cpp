@@ -428,6 +428,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         ConnectionBundle bundle;
         bool timed_out = false;
         bool connection_failed = false;
+        bool client_disconnected = false;  // Track if client disconnected mid-stream
+        bool stream_closed = false;        // Track if client_out was already closed
         BackendId current_backend = target_id;
         socket_address current_addr = target_addr;
 
@@ -558,9 +560,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 _circuit_breaker.record_failure(current_backend);
                 metrics().record_connection_error();
             } else {
-                // Close client output stream before re-throwing non-connection errors
-                // This prevents the assertion failure in output_stream destructor
+                // Clean up resources before re-throwing non-connection errors
+                metrics().record_failure();
+                metrics().decrement_active_requests();
+                co_await bundle.close();
                 try { co_await client_out.close(); } catch (...) {}
+                stream_closed = true;
                 throw;
             }
         }
@@ -621,9 +626,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     read_failed = true;
                     bundle.is_valid = false;
                 } else {
-                    // Close client output stream before re-throwing non-connection errors
-                    // This prevents the assertion failure in output_stream destructor
+                    // Clean up resources before re-throwing non-connection errors
+                    metrics().record_failure();
+                    metrics().decrement_active_requests();
+                    bundle.is_valid = false;
+                    co_await bundle.close();
                     try { co_await client_out.close(); } catch (...) {}
+                    stream_closed = true;
                     throw;
                 }
             }
@@ -694,11 +703,16 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                                        request_id, connection_error_to_string(err_type));
                         // Client disconnected, clean up backend connection and exit
                         bundle.is_valid = false;
+                        client_disconnected = true;
                         break;
                     }
-                    // Close client output stream before re-throwing non-connection errors
-                    // This prevents the assertion failure in output_stream destructor
+                    // Clean up resources before re-throwing non-connection errors
+                    metrics().record_failure();
+                    metrics().decrement_active_requests();
+                    bundle.is_valid = false;
+                    co_await bundle.close();
                     try { co_await client_out.close(); } catch (...) {}
+                    stream_closed = true;
                     throw;
                 }
             }
@@ -709,8 +723,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             }
         }
 
-        // Send error to client if needed
-        if (timed_out) {
+        // Send error to client if needed (skip if client already disconnected)
+        if (client_disconnected) {
+            // Client disconnected mid-stream - don't count as success or failure
+            // The request was partially served; this is a client-side abort
+            log_proxy.info("[{}] Client disconnected mid-stream", request_id);
+        } else if (timed_out) {
             // Record failure for circuit breaker on timeout
             log_proxy.warn("[{}] Request timed out", request_id);
             _circuit_breaker.record_failure(current_backend);
@@ -768,12 +786,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             _pool.put(std::move(bundle), request_id);
         }
 
-        // Close client output stream
-        try {
-            co_await client_out.close();
-        } catch (...) {
-            // Ignore errors closing client connection
-            log_proxy.trace("[{}] Error closing client output stream", request_id);
+        // Close client output stream (skip if already closed in exception path)
+        if (!stream_closed) {
+            try {
+                co_await client_out.close();
+            } catch (...) {
+                // Ignore errors closing client connection
+                log_proxy.trace("[{}] Error closing client output stream", request_id);
+            }
         }
 
         // Record total request duration (end-to-end from ingress to completion)
