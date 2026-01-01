@@ -652,7 +652,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             if (read_failed) {
                 if (connection_error) {
-                    bundle.is_valid = false;
+                    // bundle.is_valid already set to false in catch block above
                     _circuit_breaker.record_failure(current_backend);
                 } else {
                     timed_out = true;
@@ -696,10 +696,19 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 // - Legacy: learning is the primary routing mechanism
                 // The ART insert is idempotent - existing routes just get their timestamp updated
                 if (tokens.size() >= _config.min_token_length) {
-                    (void)_router.learn_route_global(tokens, current_backend, request_id);
+                    // Route learning is best-effort; don't fail the request if it fails
+                    (void)_router.learn_route_global(tokens, current_backend, request_id)
+                        .handle_exception([request_id](auto) {
+                            log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
+                        });
 
                     if (_persistence) {
-                        _persistence->save_route(tokens, current_backend);
+                        try {
+                            _persistence->save_route(tokens, current_backend);
+                        } catch (...) {
+                            // Best-effort persistence, ignore failures
+                            log_proxy.debug("[{}] Route persistence failed (non-fatal)", request_id);
+                        }
                     }
                 }
             }
