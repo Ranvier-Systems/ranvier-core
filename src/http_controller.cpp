@@ -600,7 +600,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (stream_closed && !write_failed) {
             co_await bundle.close();
             try { co_await client_out.close(); } catch (...) {}
-            throw std::runtime_error("Backend write failed with non-connection error");
+            co_return;  // Exit cleanly instead of throwing
         }
 
         if (write_failed) {
@@ -673,11 +673,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
             }
 
-            // Handle non-connection read errors - cleanup and rethrow
+            // Handle non-connection read errors - cleanup and exit
             if (stream_closed && !read_failed) {
                 co_await bundle.close();
                 try { co_await client_out.close(); } catch (...) {}
-                throw std::runtime_error("Backend read failed with non-connection error");
+                co_return;  // Exit cleanly instead of throwing
             }
 
             if (read_failed) {
@@ -769,11 +769,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
             }
 
-            // Handle non-connection client write errors - cleanup and rethrow
+            // Handle non-connection client write errors - cleanup and exit
             if (client_write_error) {
                 co_await bundle.close();
                 try { co_await client_out.close(); } catch (...) {}
-                throw std::runtime_error("Client write failed with non-connection error");
+                co_return;  // Exit cleanly instead of throwing
             }
 
             if (res.done) {
