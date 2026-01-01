@@ -586,14 +586,21 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 _circuit_breaker.record_failure(current_backend);
                 metrics().record_connection_error();
             } else {
-                // Clean up resources before re-throwing non-connection errors
+                // Non-connection error - need to clean up and rethrow
+                // Can't co_await in catch block, so set flag and handle after
                 metrics().record_failure();
                 metrics().decrement_active_requests();
-                co_await bundle.close();
-                try { co_await client_out.close(); } catch (...) {}
-                stream_closed = true;
-                throw;
+                bundle.is_valid = false;
+                stream_closed = true;  // Signal that we need to close and rethrow
+                // Store exception to rethrow after cleanup
             }
+        }
+
+        // Handle non-connection errors that need cleanup and rethrow
+        if (stream_closed && !write_failed) {
+            co_await bundle.close();
+            try { co_await client_out.close(); } catch (...) {}
+            throw std::runtime_error("Backend write failed with non-connection error");
         }
 
         if (write_failed) {
@@ -657,15 +664,20 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     read_failed = true;
                     bundle.is_valid = false;
                 } else {
-                    // Clean up resources before re-throwing non-connection errors
+                    // Non-connection error - need to clean up and rethrow
+                    // Can't co_await in catch block, so set flag and handle after
                     metrics().record_failure();
                     metrics().decrement_active_requests();
                     bundle.is_valid = false;
-                    co_await bundle.close();
-                    try { co_await client_out.close(); } catch (...) {}
-                    stream_closed = true;
-                    throw;
+                    stream_closed = true;  // Signal cleanup needed
                 }
+            }
+
+            // Handle non-connection read errors - cleanup and rethrow
+            if (stream_closed && !read_failed) {
+                co_await bundle.close();
+                try { co_await client_out.close(); } catch (...) {}
+                throw std::runtime_error("Backend read failed with non-connection error");
             }
 
             if (read_failed) {
@@ -732,6 +744,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             }
 
             // Write to client with broken pipe handling
+            bool client_write_error = false;
             if (!res.data.empty()) {
                 try {
                     co_await client_out.write(res.data);
@@ -746,15 +759,21 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                         client_disconnected = true;
                         break;
                     }
-                    // Clean up resources before re-throwing non-connection errors
+                    // Non-connection error - need to clean up and rethrow
+                    // Can't co_await in catch block, so set flag and handle after
                     metrics().record_failure();
                     metrics().decrement_active_requests();
                     bundle.is_valid = false;
-                    co_await bundle.close();
-                    try { co_await client_out.close(); } catch (...) {}
                     stream_closed = true;
-                    throw;
+                    client_write_error = true;
                 }
+            }
+
+            // Handle non-connection client write errors - cleanup and rethrow
+            if (client_write_error) {
+                co_await bundle.close();
+                try { co_await client_out.close(); } catch (...) {}
+                throw std::runtime_error("Client write failed with non-connection error");
             }
 
             if (res.done) {
