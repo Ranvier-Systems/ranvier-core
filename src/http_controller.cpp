@@ -873,12 +873,31 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id = std::stoi(std::string(id_str));
-    auto tokens = _tokenizer.encode(req->content);
+    int backend_id;
+    try {
+        backend_id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    std::vector<int32_t> tokens;
+    try {
+        tokens = _tokenizer.encode(req->content);
+    } catch (const std::exception& e) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Failed to tokenize request content\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Persist the route
     if (_persistence) {
-        _persistence->save_route(tokens, backend_id);
+        try {
+            _persistence->save_route(tokens, backend_id);
+        } catch (...) {
+            log_control.warn("Failed to persist route for backend {}", backend_id);
+        }
     }
 
     return _router.learn_route_global(tokens, backend_id).then([backend_id, rep = std::move(rep)]() mutable {
@@ -897,29 +916,50 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id, ip, or port\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int id = std::stoi(std::string(id_str));
-    int port = std::stoi(std::string(port_str));
-
-    // Parse optional weight and priority (defaults: weight=100, priority=0)
+    int id, port;
     uint32_t weight = 100;
     uint32_t priority = 0;
-    if (!weight_str.empty()) {
-        weight = static_cast<uint32_t>(std::stoi(std::string(weight_str)));
-    }
-    if (!priority_str.empty()) {
-        priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
+
+    try {
+        id = std::stoi(std::string(id_str));
+        port = std::stoi(std::string(port_str));
+        if (port < 1 || port > 65535) {
+            throw std::out_of_range("port out of range");
+        }
+        if (!weight_str.empty()) {
+            weight = static_cast<uint32_t>(std::stoi(std::string(weight_str)));
+        }
+        if (!priority_str.empty()) {
+            priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
+        }
+    } catch (const std::exception& e) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid parameter: id, port, weight, and priority must be valid integers\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    // Use the provided IP string
-    socket_address addr(ipv4_addr(std::string(ip_str), port));
+    // Parse and validate IP address
+    socket_address addr;
+    try {
+        addr = socket_address(ipv4_addr(std::string(ip_str), port));
+    } catch (const std::exception& e) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid IP address format\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Persist the backend registration
     if (_persistence) {
-        _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
+        try {
+            _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
+        } catch (...) {
+            log_control.warn("Failed to persist backend {} registration", id);
+        }
     }
 
     return _router.register_backend_global(id, addr, weight, priority).then(
@@ -941,16 +981,28 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
     sstring id_str = req->get_query_param("id");
 
     if (id_str.empty()) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id parameter\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int id = std::stoi(std::string(id_str));
+    int id;
+    try {
+        id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Remove from persistence first
     if (_persistence) {
-        _persistence->remove_routes_for_backend(id);
-        _persistence->remove_backend(id);
+        try {
+            _persistence->remove_routes_for_backend(id);
+            _persistence->remove_backend(id);
+        } catch (...) {
+            log_control.warn("Failed to remove backend {} from persistence", id);
+        }
     }
 
     // Remove from in-memory state across all shards
@@ -966,15 +1018,27 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
     sstring id_str = req->get_query_param("backend_id");
 
     if (id_str.empty()) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id = std::stoi(std::string(id_str));
+    int backend_id;
+    try {
+        backend_id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Remove routes from persistence
     if (_persistence) {
-        _persistence->remove_routes_for_backend(backend_id);
+        try {
+            _persistence->remove_routes_for_backend(backend_id);
+        } catch (...) {
+            log_control.warn("Failed to remove routes for backend {} from persistence", backend_id);
+        }
     }
 
     // Note: In-memory routes in the RadixTree are not removed immediately.
@@ -990,7 +1054,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(
     // WARNING: This is destructive!
 
     if (_persistence) {
-        _persistence->clear_all();
+        try {
+            _persistence->clear_all();
+        } catch (...) {
+            log_control.error("Failed to clear persistence data");
+            rep->set_status(seastar::http::reply::status_type::internal_server_error);
+            rep->write_body("json", "{\"error\": \"Failed to clear persistence data\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
     }
 
     log_control.warn("Cleared all persisted data (backends and routes). Restart required to clear in-memory state.");
