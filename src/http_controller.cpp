@@ -1,6 +1,7 @@
 #include "http_controller.hpp"
 #include "logging.hpp"
 #include "request_rewriter.hpp"
+#include "tracing_service.hpp"
 
 #include "stream_parser.hpp"
 
@@ -242,6 +243,23 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         request_id = generate_request_id();
     }
 
+    // Extract W3C Trace Context for distributed tracing
+    std::string traceparent_header = extract_traceparent(req->_headers);
+    std::optional<TraceContext> trace_ctx;
+    if (!traceparent_header.empty()) {
+        auto ctx = TraceContext::parse(traceparent_header);
+        if (ctx.valid) {
+            trace_ctx = ctx;
+            log_proxy.debug("[{}] Trace context parsed: trace_id={}", request_id, ctx.trace_id);
+        }
+    }
+
+    // Start root span for this request (if tracing is enabled)
+    auto request_span = TracingService::start_span("ranvier.request", trace_ctx);
+    request_span.set_attribute("http.method", "POST");
+    request_span.set_attribute("http.url", "/v1/chat/completions");
+    request_span.set_attribute("ranvier.request_id", request_id);
+
     // Check if we're draining - reject new requests with 503
     if (_draining.load(std::memory_order_relaxed)) {
         log_proxy.info("[{}] Request rejected - server is draining", request_id);
@@ -297,40 +315,50 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     std::vector<int32_t> tokens;
     bool used_client_tokens = false;
 
-    // First, check if client provided pre-tokenized prompt_token_ids
-    if (_config.accept_client_tokens) {
-        auto token_result = RequestRewriter::extract_prompt_token_ids(body, _config.max_token_id);
-        if (token_result.found) {
-            if (token_result.valid) {
-                tokens = std::move(token_result.tokens);
-                used_client_tokens = true;
-                log_proxy.debug("[{}] Using {} client-provided token IDs for routing",
-                               request_id, tokens.size());
-            } else {
-                // Client provided invalid tokens - reject the request
-                log_proxy.warn("[{}] Invalid client tokens: {}", request_id, token_result.error);
-                metrics().record_failure();
-                // active_request_guard destructor will decrement counter
-                rep->add_header("X-Request-ID", request_id);
-                rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
-                co_return std::move(rep);
+    // Start tokenization span
+    {
+        auto tokenize_span = TracingService::start_child_span("ranvier.tokenize");
+
+        // First, check if client provided pre-tokenized prompt_token_ids
+        if (_config.accept_client_tokens) {
+            auto token_result = RequestRewriter::extract_prompt_token_ids(body, _config.max_token_id);
+            if (token_result.found) {
+                if (token_result.valid) {
+                    tokens = std::move(token_result.tokens);
+                    used_client_tokens = true;
+                    tokenize_span.set_attribute("ranvier.token_source", "client");
+                    tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
+                    log_proxy.debug("[{}] Using {} client-provided token IDs for routing",
+                                   request_id, tokens.size());
+                } else {
+                    // Client provided invalid tokens - reject the request
+                    log_proxy.warn("[{}] Invalid client tokens: {}", request_id, token_result.error);
+                    tokenize_span.set_error(token_result.error);
+                    metrics().record_failure();
+                    // active_request_guard destructor will decrement counter
+                    rep->add_header("X-Request-ID", request_id);
+                    rep->set_status(seastar::http::reply::status_type::bad_request);
+                    rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
+                    co_return std::move(rep);
+                }
             }
         }
-    }
 
-    // If no client tokens, tokenize locally
-    if (!used_client_tokens) {
-        // Extract text from request body for tokenization (prompt or messages content)
-        // This ensures we tokenize exactly what we use for routing, not metadata
-        auto extracted_text = RequestRewriter::extract_text(body);
-        if (extracted_text.has_value()) {
-            tokens = _tokenizer.encode(extracted_text.value());
-        } else {
-            // Fallback: tokenize the entire body (legacy behavior)
-            tokens = _tokenizer.encode(body);
+        // If no client tokens, tokenize locally
+        if (!used_client_tokens) {
+            // Extract text from request body for tokenization (prompt or messages content)
+            // This ensures we tokenize exactly what we use for routing, not metadata
+            auto extracted_text = RequestRewriter::extract_text(body);
+            if (extracted_text.has_value()) {
+                tokens = _tokenizer.encode(extracted_text.value());
+            } else {
+                // Fallback: tokenize the entire body (legacy behavior)
+                tokens = _tokenizer.encode(body);
+            }
+            tokenize_span.set_attribute("ranvier.token_source", "local");
+            tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
         }
-    }
+    } // tokenize_span ends here
 
     // Rewrite request body with token IDs if enabled and we tokenized locally
     // Skip rewriting if client already provided prompt_token_ids (it's already in the body)
@@ -348,51 +376,72 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     }
 
     BackendId target_id;
+    std::string routing_mode_str;
 
-    if (_config.is_prefix_mode()) {
-        // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
-        auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
-        if (affinity_backend.has_value()) {
-            target_id = affinity_backend.value();
-            log_proxy.debug("[{}] Prefix affinity -> backend {}", request_id, target_id);
+    // Start route lookup span
+    {
+        auto route_span = TracingService::start_child_span("ranvier.route_lookup");
+
+        if (_config.is_prefix_mode()) {
+            // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
+            routing_mode_str = "prefix";
+            route_span.set_attribute("ranvier.routing_mode", "prefix");
+            auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
+            if (affinity_backend.has_value()) {
+                target_id = affinity_backend.value();
+                route_span.set_attribute("ranvier.cache_hit", true);
+                log_proxy.debug("[{}] Prefix affinity -> backend {}", request_id, target_id);
+            } else {
+                log_proxy.warn("[{}] No backends registered", request_id);
+                route_span.set_error("No backends registered");
+                metrics().record_failure();
+                rep->add_header("X-Request-ID", request_id);
+                rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+                co_return std::move(rep);
+            }
+        } else if (_config.is_radix_mode()) {
+            // RADIX mode: radix tree lookup with random fallback (adaptive learning)
+            routing_mode_str = "radix";
+            route_span.set_attribute("ranvier.routing_mode", "radix");
+            auto lookup_result = _router.lookup(tokens, request_id);
+            if (lookup_result.has_value()) {
+                target_id = lookup_result.value();
+                route_span.set_attribute("ranvier.cache_hit", true);
+                log_proxy.debug("[{}] Radix tree hit -> backend {}", request_id, target_id);
+            } else {
+                auto random_id = _router.get_random_backend();
+                if (!random_id.has_value()) {
+                    log_proxy.warn("[{}] No backends registered", request_id);
+                    route_span.set_error("No backends registered");
+                    metrics().record_failure();
+                    rep->add_header("X-Request-ID", request_id);
+                    rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+                    co_return std::move(rep);
+                }
+                target_id = random_id.value();
+                route_span.set_attribute("ranvier.cache_hit", false);
+                log_proxy.debug("[{}] Radix tree miss, random -> backend {}", request_id, target_id);
+            }
         } else {
-            log_proxy.warn("[{}] No backends registered", request_id);
-            metrics().record_failure();
-            rep->add_header("X-Request-ID", request_id);
-            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
-            co_return std::move(rep);
-        }
-    } else if (_config.is_radix_mode()) {
-        // RADIX mode: radix tree lookup with random fallback (adaptive learning)
-        auto lookup_result = _router.lookup(tokens, request_id);
-        if (lookup_result.has_value()) {
-            target_id = lookup_result.value();
-            log_proxy.debug("[{}] Radix tree hit -> backend {}", request_id, target_id);
-        } else {
+            // ROUND_ROBIN mode: always use random/weighted backend selection
+            routing_mode_str = "round_robin";
+            route_span.set_attribute("ranvier.routing_mode", "round_robin");
             auto random_id = _router.get_random_backend();
             if (!random_id.has_value()) {
                 log_proxy.warn("[{}] No backends registered", request_id);
+                route_span.set_error("No backends registered");
                 metrics().record_failure();
                 rep->add_header("X-Request-ID", request_id);
                 rep->write_body("json", "{\"error\": \"No backends registered!\"}");
                 co_return std::move(rep);
             }
             target_id = random_id.value();
-            log_proxy.debug("[{}] Radix tree miss, random -> backend {}", request_id, target_id);
+            route_span.set_attribute("ranvier.cache_hit", false);
+            log_proxy.debug("[{}] Round-robin -> backend {}", request_id, target_id);
         }
-    } else {
-        // ROUND_ROBIN mode: always use random/weighted backend selection
-        auto random_id = _router.get_random_backend();
-        if (!random_id.has_value()) {
-            log_proxy.warn("[{}] No backends registered", request_id);
-            metrics().record_failure();
-            rep->add_header("X-Request-ID", request_id);
-            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
-            co_return std::move(rep);
-        }
-        target_id = random_id.value();
-        log_proxy.debug("[{}] Round-robin -> backend {}", request_id, target_id);
-    }
+
+        route_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
+    } // route_span ends here
 
     // Timing: record routing decision latency (post-routing timestamp)
     auto routing_end = std::chrono::steady_clock::now();
@@ -441,10 +490,25 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     rep->add_header("X-Request-ID", request_id);
     rep->add_header("X-Backend-ID", std::to_string(target_id));
 
+    // Set final attributes on request span before entering streaming lambda
+    request_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
+    request_span.set_attribute("ranvier.routing_mode", routing_mode_str);
+
+    // Generate traceparent header for propagation to backend
+    // Format: "00-{trace_id}-{span_id}-{flags}"
+    std::string backend_traceparent;
+    if (request_span.is_recording()) {
+        std::string span_trace_id = request_span.trace_id();
+        std::string span_id = request_span.span_id();
+        if (!span_trace_id.empty() && !span_id.empty()) {
+            backend_traceparent = "00-" + span_trace_id + "-" + span_id + "-01";
+        }
+    }
+
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id, backend_traceparent](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -568,16 +632,23 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             co_return;
         }
 
-        // Build HTTP request with X-Request-ID header for backend tracing
+        // Build HTTP request with tracing headers for backend
+        // - X-Request-ID: Ranvier's internal request correlation ID
+        // - traceparent: W3C Trace Context for distributed tracing
         // Use forwarded_body which may include prompt_token_ids if token forwarding is enabled
         sstring http_req =
             "POST /v1/chat/completions HTTP/1.1\r\n"
             "Host: localhost\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: " + to_sstring(forwarded_body.size()) + "\r\n"
-            "X-Request-ID: " + request_id + "\r\n"
-            "Connection: keep-alive\r\n\r\n" +
-            forwarded_body;
+            "X-Request-ID: " + request_id + "\r\n";
+
+        // Add traceparent header if tracing is enabled
+        if (!backend_traceparent.empty()) {
+            http_req += "traceparent: " + backend_traceparent + "\r\n";
+        }
+
+        http_req += "Connection: keep-alive\r\n\r\n" + forwarded_body;
 
         log_proxy.info("[{}] Sending request to backend ({} bytes)", request_id, forwarded_body.size());
 

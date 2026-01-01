@@ -16,6 +16,7 @@
 #include "router_service.hpp"
 #include "sqlite_persistence.hpp"
 #include "tokenizer_service.hpp"
+#include "tracing_service.hpp"
 
 #include <csignal>
 #include <fstream>
@@ -241,6 +242,15 @@ future<> run() {
     } catch (const std::exception& e) {
         ranvier::log_main.error("Service init failed: {}", e.what());
         return make_ready_future<>();
+    }
+
+    // 1b. Init OpenTelemetry tracing
+    ranvier::TracingService::init(g_config.telemetry);
+    if (g_config.telemetry.enabled) {
+        ranvier::log_main.info("OpenTelemetry tracing enabled (endpoint: {}, sample_rate: {:.2f})",
+            g_config.telemetry.otlp_endpoint, g_config.telemetry.sample_rate);
+    } else {
+        ranvier::log_main.info("OpenTelemetry tracing disabled");
     }
 
     // 1a. Init Router with routing and cluster config
@@ -519,6 +529,12 @@ future<> run() {
                     persistence->close();
                     ranvier::log_main.info("Persistence store closed");
                 }
+
+                // Shutdown OpenTelemetry tracing (flush pending spans)
+                if (ranvier::TracingService::is_enabled()) {
+                    ranvier::TracingService::shutdown();
+                    ranvier::log_main.info("OpenTelemetry tracing shutdown complete");
+                }
             });
         });
     });
@@ -600,6 +616,12 @@ int main(int argc, char** argv) {
                       << " (port " << g_config.k8s_discovery.target_port << ")\n";
         } else {
             std::cout << "  K8s Discovery: disabled\n";
+        }
+        if (g_config.telemetry.enabled) {
+            std::cout << "  Telemetry:    " << g_config.telemetry.otlp_endpoint
+                      << " (sample_rate: " << g_config.telemetry.sample_rate << ")\n";
+        } else {
+            std::cout << "  Telemetry:    disabled\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";

@@ -54,6 +54,22 @@ FetchContent_MakeAvailable(rapidjson)
 add_library(rapidjson_interface INTERFACE)
 target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
 
+# OpenTelemetry C++ SDK Configuration
+# Provides distributed tracing with OTLP export support
+FetchContent_Declare(
+  opentelemetry-cpp
+  GIT_REPOSITORY https://github.com/open-telemetry/opentelemetry-cpp
+  GIT_TAG        v1.14.2
+)
+set(WITH_OTLP ON CACHE BOOL "" FORCE)
+set(WITH_OTLP_HTTP ON CACHE BOOL "" FORCE)
+set(WITH_OTLP_GRPC OFF CACHE BOOL "" FORCE)  # Use HTTP exporter to avoid gRPC dependency
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(WITH_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(WITH_BENCHMARK OFF CACHE BOOL "" FORCE)
+set(OTELCPP_MAINTAINER_MODE OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(opentelemetry-cpp)
+
 # SQLite3 Configuration
 # Try system SQLite first, fall back to building from source
 find_package(SQLite3 QUIET)
@@ -118,6 +134,10 @@ if(Seastar_FOUND)
       rapidjson_interface
       absl::flat_hash_map
       absl::flat_hash_set
+      opentelemetry_trace
+      opentelemetry_exporter_otlp_http
+      opentelemetry_resources
+      opentelemetry_common
     )
 
     # Copy the assets folder to the build directory automatically
