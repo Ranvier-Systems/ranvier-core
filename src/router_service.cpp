@@ -49,7 +49,7 @@ thread_local uint64_t stats_cluster_routes_pruned = 0;
 thread_local size_t local_max_routes = 100000;
 thread_local std::chrono::seconds local_ttl_seconds{3600};
 thread_local std::chrono::seconds local_backend_drain_timeout{60};
-thread_local bool local_prefix_affinity_enabled = true;
+thread_local RoutingConfig::RoutingMode local_routing_mode = RoutingConfig::RoutingMode::PREFIX;
 thread_local size_t local_prefix_token_length = 128;
 thread_local uint32_t local_block_alignment = 16;
 
@@ -97,7 +97,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     local_max_routes = routing_config.max_routes;
     local_ttl_seconds = routing_config.ttl_seconds;
     local_backend_drain_timeout = routing_config.backend_drain_timeout;
-    local_prefix_affinity_enabled = routing_config.prefix_affinity_enabled;
+    local_routing_mode = routing_config.routing_mode;
     local_prefix_token_length = routing_config.prefix_token_length;
     local_block_alignment = routing_config.block_alignment;
 
@@ -140,17 +140,17 @@ seastar::future<> RouterService::initialize_shards() {
     size_t max_routes = _config.max_routes;
     auto ttl_seconds = _config.ttl_seconds;
     auto drain_timeout = _config.backend_drain_timeout;
-    bool prefix_affinity_enabled = _config.prefix_affinity_enabled;
+    auto routing_mode = _config.routing_mode;
     size_t prefix_token_length = _config.prefix_token_length;
 
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
-        [block_alignment, max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length] {
+        [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length] {
                 local_tree = std::make_unique<RadixTree>(block_alignment);
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
                 local_backend_drain_timeout = drain_timeout;
-                local_prefix_affinity_enabled = prefix_affinity_enabled;
+                local_routing_mode = routing_mode;
                 local_prefix_token_length = prefix_token_length;
                 local_block_alignment = block_alignment;
                 return seastar::make_ready_future<>();
@@ -575,21 +575,23 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     size_t max_routes = config.max_routes;
     auto ttl_seconds = config.ttl_seconds;
     auto drain_timeout = config.backend_drain_timeout;
-    bool prefix_affinity_enabled = config.prefix_affinity_enabled;
+    auto routing_mode = config.routing_mode;
     size_t prefix_token_length = config.prefix_token_length;
     uint32_t block_alignment = config.block_alignment;
 
-    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, prefix_affinity={}, prefix_len={})",
-                  max_routes, ttl_seconds.count(), drain_timeout.count(), prefix_affinity_enabled, prefix_token_length);
+    const char* mode_str = routing_mode == RoutingConfig::RoutingMode::PREFIX ? "prefix" :
+                           routing_mode == RoutingConfig::RoutingMode::RADIX ? "radix" : "round_robin";
+    log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, mode={}, prefix_len={})",
+                  max_routes, ttl_seconds.count(), drain_timeout.count(), mode_str, prefix_token_length);
 
     // Broadcast to all shards using Seastar's async message passing
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-        [max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length, block_alignment](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds, drain_timeout, prefix_affinity_enabled, prefix_token_length, block_alignment] {
+        [max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length, block_alignment](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length, block_alignment] {
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
                 local_backend_drain_timeout = drain_timeout;
-                local_prefix_affinity_enabled = prefix_affinity_enabled;
+                local_routing_mode = routing_mode;
                 local_prefix_token_length = prefix_token_length;
                 local_block_alignment = block_alignment;
                 return seastar::make_ready_future<>();

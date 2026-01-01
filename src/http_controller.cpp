@@ -349,8 +349,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     BackendId target_id;
 
-    if (_config.prefix_affinity_enabled) {
-        // Use prefix-affinity routing: consistent hashing on prefix tokens
+    if (_config.is_prefix_mode()) {
+        // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
         auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
         if (affinity_backend.has_value()) {
             target_id = affinity_backend.value();
@@ -358,19 +358,34 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         } else {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
-            // active_request_guard destructor will decrement counter
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
         }
+    } else if (_config.is_radix_mode()) {
+        // RADIX mode: radix tree lookup with random fallback (adaptive learning)
+        auto lookup_result = _router.lookup(tokens, request_id);
+        if (lookup_result.has_value()) {
+            target_id = lookup_result.value();
+            log_proxy.debug("[{}] Radix tree hit -> backend {}", request_id, target_id);
+        } else {
+            auto random_id = _router.get_random_backend();
+            if (!random_id.has_value()) {
+                log_proxy.warn("[{}] No backends registered", request_id);
+                metrics().record_failure();
+                rep->add_header("X-Request-ID", request_id);
+                rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+                co_return std::move(rep);
+            }
+            target_id = random_id.value();
+            log_proxy.debug("[{}] Radix tree miss, random -> backend {}", request_id, target_id);
+        }
     } else {
-        // Round-robin mode: always use random/weighted backend selection
-        // Skip radix tree lookup to ensure true round-robin distribution
+        // ROUND_ROBIN mode: always use random/weighted backend selection
         auto random_id = _router.get_random_backend();
         if (!random_id.has_value()) {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
-            // active_request_guard destructor will decrement counter
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
@@ -717,9 +732,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
 
                 // Learn route in the ART for future prefix matching
-                // Only learn routes when prefix-affinity is enabled; skip for round-robin mode
+                // Learn routes in PREFIX and RADIX modes; skip for ROUND_ROBIN mode
                 // The ART insert is idempotent - existing routes just get their timestamp updated
-                if (_config.prefix_affinity_enabled && tokens.size() >= _config.min_token_length) {
+                if (_config.should_learn_routes() && tokens.size() >= _config.min_token_length) {
                     // Route learning is best-effort; don't fail the request if it fails
                     (void)_router.learn_route_global(tokens, current_backend, request_id)
                         .handle_exception([request_id](auto) {
