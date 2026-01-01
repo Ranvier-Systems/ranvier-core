@@ -82,9 +82,9 @@ flowchart TB
 - **Prometheus**: Exposes metrics for monitoring (cache hits/misses, latency)
 
 ### Domain Layer
-- **RouterService**: Core routing logic with cross-shard broadcasting
-- **RadixTree**: Adaptive Radix Tree (ART) for O(k) prefix lookups
-- **Circuit Breaker**: Quarantines unhealthy backends
+- **RouterService**: Core routing logic with cross-shard broadcasting. Uses `absl::flat_hash_map` for backend lookups, providing SIMD-accelerated operations and improved cache locality over `std::unordered_map`.
+- **RadixTree**: Adaptive Radix Tree (ART) for O(k) prefix lookups with node sizes 4→16→48→256 for memory efficiency.
+- **Circuit Breaker**: Quarantines unhealthy backends based on health check failures.
 
 ### Infrastructure Layer
 - **TokenizerService**: GPT-2 tokenization for request content
@@ -93,3 +93,69 @@ flowchart TB
 
 ### Persistence Layer
 - **SqlitePersistence**: Durable storage for routes and backends (survives restarts)
+
+## Distributed State
+
+Ranvier Core supports multi-node clustering via the **GossipService**, which maintains consistent RadixTree state across shards without locks.
+
+### Gossip Protocol Architecture
+
+```mermaid
+flowchart TB
+    subgraph "Node 1"
+        RS1[RouterService]
+        GS1[GossipService<br/>UDP :8481]
+        RT1[RadixTree<br/>Shard 0..N]
+    end
+
+    subgraph "Node 2"
+        RS2[RouterService]
+        GS2[GossipService<br/>UDP :8481]
+        RT2[RadixTree<br/>Shard 0..N]
+    end
+
+    subgraph "Node 3"
+        RS3[RouterService]
+        GS3[GossipService<br/>UDP :8481]
+        RT3[RadixTree<br/>Shard 0..N]
+    end
+
+    %% Gossip mesh
+    GS1 <-->|Route Announcements| GS2
+    GS2 <-->|Route Announcements| GS3
+    GS3 <-->|Route Announcements| GS1
+
+    %% Local flows
+    RS1 --> RT1
+    RS1 <--> GS1
+    RS2 --> RT2
+    RS2 <--> GS2
+    RS3 --> RT3
+    RS3 <--> GS3
+
+    classDef gossip fill:#ffa,stroke:#333
+    class GS1,GS2,GS3 gossip
+```
+
+### Lock-Free State Synchronization
+
+The GossipService operates on Shard 0 and uses UDP for low-latency route propagation:
+
+1. **Route Learning**: When a node learns a new route (cache miss → successful response), it broadcasts a `ROUTE_ANNOUNCEMENT` packet to all peers.
+2. **Packet Format**: Fixed 8-byte header + variable token array: `[type:1][version:1][backend_id:4][token_count:2][tokens:4*N]`
+3. **Shard Broadcast**: Received routes are inserted into all local shards via `learn_route_global()`, maintaining Seastar's shared-nothing model.
+4. **Peer Liveness**: Heartbeat mechanism tracks peer health; stale peers trigger route pruning callbacks.
+
+### Configuration
+
+Enable clustering in your configuration:
+```yaml
+cluster:
+  enabled: true
+  gossip_port: 8481
+  peers:
+    - "10.0.0.2:8481"
+    - "10.0.0.3:8481"
+```
+
+For Kubernetes deployments, DNS-based peer discovery automatically resolves headless service endpoints.

@@ -1,0 +1,2715 @@
+#!/usr/bin/env python3
+"""
+Real vLLM Backend Load Testing for Ranvier Core
+
+This load test measures the actual value proposition of prefix-aware routing:
+1. Cache hit rate - requests routed to same backend for shared prefix
+2. TTFT comparison - cache hit vs. cache miss latency
+3. Tokens per second throughput
+4. Usage statistics from SSE responses
+
+Key Metrics:
+- TTFT (Time To First Token): Latency until first token arrives
+- Cache Hit Rate: Percentage of requests hitting warm KV cache
+- Token Throughput: Tokens generated per second
+- Routing Accuracy: Whether router correctly identified prefix locality
+
+Environment Variables:
+    Backend Configuration:
+        NUM_BACKENDS          - Number of vLLM backends (default: 2)
+        BACKEND{N}_IP         - IP address for backend N (default: 172.29.1.{9+N})
+        BACKEND{N}_PORT       - Port for backend N (default: 8000)
+        SINGLE_BACKEND_MODE   - Legacy: set to "true" for single backend
+
+    Ranvier Node Configuration:
+        NUM_RANVIER_NODES     - Number of Ranvier router nodes (default: 3)
+        RANVIER_NODE{N}       - Full URL for node N (e.g., http://host:8080)
+        RANVIER_NODE{N}_IP    - IP address for node N (default: 172.29.2.{N})
+        RANVIER_NODE{N}_PORT  - Port for node N (default: 8080)
+        RANVIER_METRICS{N}    - Full metrics URL for node N
+        RANVIER_METRICS{N}_PORT - Metrics port for node N (default: 9180)
+
+    Benchmark Configuration:
+        BENCHMARK_MODE        - "prefix" (default) or "round_robin"
+        PROMPT_DISTRIBUTION   - "mixed", "short", "medium", "long", "large-prefix", "stress"
+        SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
+        P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
+
+    Large Prefix Stress Testing:
+        LARGE_PREFIX_MIN_TOKENS - Minimum prefix size (default: 2000)
+        LARGE_PREFIX_MAX_TOKENS - Maximum prefix size (default: 8000)
+        NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
+
+Usage:
+    # With 2 backends (default):
+    make benchmark-real
+
+    # With 4 backends for multi-GPU testing:
+    NUM_BACKENDS=4 \
+    BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 \
+    BACKEND3_IP=10.0.0.3 BACKEND4_IP=10.0.0.4 \
+    make benchmark-real
+
+    # Stress test with large prefixes:
+    PROMPT_DISTRIBUTION=stress NUM_BACKENDS=4 make benchmark-real
+"""
+
+import json
+import logging
+import os
+import random
+import re
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from threading import Lock
+
+import requests
+from locust import HttpUser, task, between, events
+from locust.runners import MasterRunner, WorkerRunner
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Environment Configuration
+# ============================================================================
+
+# Support single-backend mode for single-GPU testing (legacy, prefer NUM_BACKENDS=1)
+SINGLE_BACKEND_MODE = os.environ.get("SINGLE_BACKEND_MODE", "false").lower() == "true"
+
+# Configurable backend count (1-16 backends supported)
+# Set NUM_BACKENDS to control how many backends to use
+# Each backend requires BACKEND{N}_IP and optionally BACKEND{N}_PORT environment variables
+if SINGLE_BACKEND_MODE:
+    NUM_BACKENDS = 1
+else:
+    NUM_BACKENDS = int(os.environ.get("NUM_BACKENDS", "2"))
+
+# Default backend IP patterns (can be overridden per-backend)
+DEFAULT_BACKEND_IP_PATTERN = "172.29.1.{}"  # {} is replaced with 10 + backend_index
+DEFAULT_BACKEND_PORT = 8000
+
+# Dynamically build backends list based on NUM_BACKENDS
+def _build_backends_list(num_backends: int) -> List[dict]:
+    """Build the backends list dynamically based on environment configuration.
+
+    For each backend N (1-indexed), checks for:
+    - BACKEND{N}_IP: IP address (default: 172.29.1.{9+N})
+    - BACKEND{N}_PORT: Port number (default: 8000)
+
+    Examples:
+        NUM_BACKENDS=4 with defaults:
+          Backend 1: 172.29.1.10:8000
+          Backend 2: 172.29.1.11:8000
+          Backend 3: 172.29.1.12:8000
+          Backend 4: 172.29.1.13:8000
+
+        With custom IPs:
+          BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 NUM_BACKENDS=2
+    """
+    backends = []
+    for i in range(1, num_backends + 1):
+        default_ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
+        backends.append({
+            "id": i,
+            "ip": os.environ.get(f"BACKEND{i}_IP", default_ip),
+            "port": int(os.environ.get(f"BACKEND{i}_PORT", str(DEFAULT_BACKEND_PORT))),
+        })
+    return backends
+
+BACKENDS = _build_backends_list(NUM_BACKENDS)
+
+# Configurable Ranvier node count
+# Set NUM_RANVIER_NODES to control how many router nodes to use
+NUM_RANVIER_NODES = int(os.environ.get("NUM_RANVIER_NODES", "3"))
+
+# Default Ranvier node patterns
+DEFAULT_RANVIER_IP_PATTERN = "172.29.2.{}"  # {} is replaced with node_index
+DEFAULT_RANVIER_PORT = 8080
+DEFAULT_RANVIER_METRICS_PORT = 9180
+
+def _build_ranvier_nodes_list(num_nodes: int) -> List[str]:
+    """Build the Ranvier nodes list dynamically."""
+    nodes = []
+    for i in range(1, num_nodes + 1):
+        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
+        port = os.environ.get(f"RANVIER_NODE{i}_PORT", str(DEFAULT_RANVIER_PORT))
+        # Support full URL override
+        full_url = os.environ.get(f"RANVIER_NODE{i}")
+        if full_url:
+            nodes.append(full_url)
+        else:
+            nodes.append(f"http://{ip}:{port}")
+    return nodes
+
+def _build_ranvier_metrics_list(num_nodes: int) -> List[str]:
+    """Build the Ranvier metrics endpoints list dynamically."""
+    metrics = []
+    for i in range(1, num_nodes + 1):
+        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
+        port = os.environ.get(f"RANVIER_METRICS{i}_PORT", str(DEFAULT_RANVIER_METRICS_PORT))
+        # Support full URL override
+        full_url = os.environ.get(f"RANVIER_METRICS{i}")
+        if full_url:
+            metrics.append(full_url)
+        else:
+            metrics.append(f"http://{ip}:{port}")
+    return metrics
+
+RANVIER_NODES = _build_ranvier_nodes_list(NUM_RANVIER_NODES)
+RANVIER_METRICS = _build_ranvier_metrics_list(NUM_RANVIER_NODES)
+
+# Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
+BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
+
+# Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress"
+PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "mixed")
+
+# Large prefix configuration
+LARGE_PREFIX_MIN_TOKENS = int(os.environ.get("LARGE_PREFIX_MIN_TOKENS", "2000"))
+LARGE_PREFIX_MAX_TOKENS = int(os.environ.get("LARGE_PREFIX_MAX_TOKENS", "8000"))
+NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "5"))
+
+# Prefix size buckets for metrics (in tokens)
+PREFIX_SIZE_BUCKETS = [
+    ("tiny", 0, 100),
+    ("small", 100, 500),
+    ("medium", 500, 2000),
+    ("large", 2000, 4000),
+    ("xlarge", 4000, 8000),
+]
+
+# Ratio of requests that should share a prefix (0.0-1.0)
+SHARED_PREFIX_RATIO = float(os.environ.get("SHARED_PREFIX_RATIO", "0.7"))
+
+# Configurable thresholds
+P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "5000"))
+
+# ============================================================================
+# Prompt Templates with Shared Prefixes
+# ============================================================================
+
+# System prompts that will be shared across multiple requests
+SYSTEM_PROMPTS = {
+    "coding": """You are an expert software engineer. You write clean, efficient,
+and well-documented code. You follow best practices and design patterns.
+You always explain your reasoning step by step.""",
+
+    "analysis": """You are a data analyst expert. You analyze data carefully,
+identify patterns and trends, and provide actionable insights.
+You use statistical methods and visualizations when appropriate.""",
+
+    "writing": """You are a professional writer and editor. You craft clear,
+engaging, and grammatically correct content. You adapt your style
+to match the target audience and purpose.""",
+
+    "math": """You are a mathematics tutor. You explain concepts clearly,
+work through problems step by step, and provide multiple examples.
+You check your work and verify your calculations.""",
+}
+
+# Short prompts (< 100 tokens)
+SHORT_PROMPTS = [
+    "Write a Python function to calculate factorial.",
+    "Explain what a hash table is in one paragraph.",
+    "What is the Big O complexity of quicksort?",
+    "Fix this code: def add(a,b) return a+b",
+    "What is the difference between == and === in JavaScript?",
+]
+
+# Medium prompts (100-500 tokens) - include shared prefix
+MEDIUM_PROMPTS = [
+    ("coding", "I'm building a REST API in Python using FastAPI. I need to implement user authentication with JWT tokens. Please show me how to create the login endpoint and middleware for protected routes."),
+    ("coding", "I'm building a REST API in Python using FastAPI. I need to add rate limiting to prevent abuse. Show me how to implement a token bucket algorithm."),
+    ("coding", "I'm building a REST API in Python using FastAPI. I need to set up database connections with SQLAlchemy. Show me the best practices for connection pooling."),
+    ("analysis", "I have a dataset of customer transactions with columns: customer_id, timestamp, amount, category. I want to identify customers who are likely to churn. What features should I engineer?"),
+    ("analysis", "I have a dataset of customer transactions with columns: customer_id, timestamp, amount, category. I want to segment customers into groups. What clustering algorithm would you recommend?"),
+    ("analysis", "I have a dataset of customer transactions with columns: customer_id, timestamp, amount, category. I want to detect fraudulent transactions. What anomaly detection approach should I use?"),
+]
+
+# Long prompts (500+ tokens) - include shared prefix
+LONG_PROMPTS = [
+    ("coding", """I'm working on a microservices architecture for an e-commerce platform.
+The system has the following services:
+- User Service: handles authentication and user profiles
+- Product Service: manages product catalog and inventory
+- Order Service: processes orders and payments
+- Notification Service: sends emails and push notifications
+
+Currently, services communicate synchronously via REST APIs. I'm experiencing issues with:
+1. Cascading failures when one service is down
+2. High latency for operations that span multiple services
+3. Difficulty maintaining data consistency across services
+
+Please help me design a better communication pattern using message queues.
+Include specific technology recommendations and implementation details."""),
+
+    ("coding", """I'm working on a microservices architecture for an e-commerce platform.
+The system has the following services:
+- User Service: handles authentication and user profiles
+- Product Service: manages product catalog and inventory
+- Order Service: processes orders and payments
+- Notification Service: sends emails and push notifications
+
+I need to implement distributed tracing to debug issues across services.
+What tools and patterns should I use? Please provide a detailed implementation plan."""),
+
+    ("analysis", """I'm analyzing website traffic data for an e-commerce site. The data includes:
+- Session data: session_id, user_id, start_time, end_time, device_type, browser
+- Page views: session_id, page_url, timestamp, time_on_page
+- Events: session_id, event_type, event_data, timestamp
+- Purchases: session_id, order_id, products, total_amount
+
+I want to build a model to predict which sessions will result in a purchase.
+Please walk me through:
+1. Data preprocessing and feature engineering
+2. Model selection and training approach
+3. Evaluation metrics and validation strategy
+4. How to deploy and monitor the model in production"""),
+]
+
+
+# ============================================================================
+# Large Prefix Content Generation (for stress testing)
+# ============================================================================
+
+# Simulated RAG document chunks - realistic technical documentation
+RAG_DOCUMENT_CHUNKS = [
+    """## API Reference: Authentication Module
+
+### Overview
+The authentication module provides secure user authentication and session management
+for the platform. It supports multiple authentication methods including OAuth 2.0,
+SAML 2.0, and traditional username/password authentication.
+
+### Endpoints
+
+#### POST /auth/login
+Authenticates a user and returns an access token.
+
+**Request Body:**
+```json
+{
+  "username": "string",
+  "password": "string",
+  "mfa_code": "string (optional)"
+}
+```
+
+**Response:**
+```json
+{
+  "access_token": "string",
+  "refresh_token": "string",
+  "expires_in": 3600,
+  "token_type": "Bearer"
+}
+```
+
+**Error Codes:**
+- 401: Invalid credentials
+- 403: Account locked
+- 429: Too many attempts
+
+#### POST /auth/refresh
+Refreshes an expired access token using a valid refresh token.
+
+**Request Body:**
+```json
+{
+  "refresh_token": "string"
+}
+```
+
+**Response:**
+Same as /auth/login
+
+#### POST /auth/logout
+Invalidates the current session and all associated tokens.
+
+**Headers:**
+- Authorization: Bearer <access_token>
+
+**Response:**
+```json
+{
+  "message": "Successfully logged out"
+}
+```
+
+### Security Considerations
+- All endpoints use HTTPS with TLS 1.3
+- Passwords are hashed using Argon2id
+- Tokens are signed using RS256
+- Rate limiting is applied per-IP and per-user
+- Failed attempts are logged for security audit
+""",
+
+    """## Database Schema Documentation
+
+### Users Table
+Stores user account information and preferences.
+
+```sql
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_login_at TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN DEFAULT true,
+    is_verified BOOLEAN DEFAULT false,
+    mfa_enabled BOOLEAN DEFAULT false,
+    mfa_secret VARCHAR(255),
+    preferences JSONB DEFAULT '{}'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_created_at ON users(created_at);
+CREATE INDEX idx_users_is_active ON users(is_active) WHERE is_active = true;
+```
+
+### Sessions Table
+Tracks active user sessions for security and analytics.
+
+```sql
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash VARCHAR(255) NOT NULL,
+    ip_address INET,
+    user_agent TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    is_revoked BOOLEAN DEFAULT false
+);
+
+CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
+CREATE INDEX idx_sessions_token_hash ON sessions(token_hash);
+```
+
+### Audit Log Table
+Records all security-relevant events for compliance.
+
+```sql
+CREATE TABLE audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    event_type VARCHAR(50) NOT NULL,
+    user_id UUID REFERENCES users(id),
+    ip_address INET,
+    resource_type VARCHAR(50),
+    resource_id VARCHAR(255),
+    action VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    details JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_log_user_id ON audit_log(user_id);
+CREATE INDEX idx_audit_log_created_at ON audit_log(created_at);
+CREATE INDEX idx_audit_log_event_type ON audit_log(event_type);
+```
+
+### Query Optimization Notes
+- Use covering indexes for frequent queries
+- Partition audit_log by month for better performance
+- Consider read replicas for analytics queries
+- Use connection pooling (PgBouncer) for high concurrency
+""",
+
+    """## Kubernetes Deployment Guide
+
+### Prerequisites
+- Kubernetes cluster v1.25+
+- kubectl configured with cluster access
+- Helm 3.x installed
+- Container registry access
+
+### Namespace Setup
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+    monitoring: enabled
+```
+
+### Deployment Configuration
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+      - name: api-server
+        image: registry.example.com/api-server:v2.1.0
+        ports:
+        - containerPort: 8080
+        - containerPort: 9090
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-credentials
+              key: url
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: app-config
+              key: redis-url
+```
+
+### Service Configuration
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  selector:
+    app: api-server
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  type: ClusterIP
+```
+
+### Ingress Configuration
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-server
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: api-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-server
+            port:
+              number: 80
+```
+
+### Horizontal Pod Autoscaler
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-server
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-server
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+```
+""",
+
+    """## Machine Learning Pipeline Documentation
+
+### Feature Engineering
+
+#### Numerical Features
+The pipeline processes numerical features through the following transformations:
+
+1. **Missing Value Imputation**: Uses median imputation for robustness against outliers
+2. **Outlier Detection**: IQR-based detection with configurable multiplier (default: 1.5)
+3. **Scaling**: StandardScaler for normally distributed features, RobustScaler for skewed
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.compose import ColumnTransformer
+
+numerical_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+robust_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', RobustScaler())
+])
+```
+
+#### Categorical Features
+Categorical features undergo:
+
+1. **Missing Value Handling**: Most frequent value or dedicated 'unknown' category
+2. **Encoding**: OneHotEncoder for low cardinality, TargetEncoder for high cardinality
+3. **Rare Category Handling**: Categories below threshold grouped into 'other'
+
+```python
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+from category_encoders import TargetEncoder
+
+categorical_pipeline = Pipeline([
+    ('imputer', SimpleImputer(strategy='constant', fill_value='unknown')),
+    ('encoder', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+])
+```
+
+### Model Training
+
+#### Hyperparameter Optimization
+Uses Optuna for Bayesian optimization with cross-validation:
+
+```python
+import optuna
+from sklearn.model_selection import cross_val_score
+
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+        'max_depth': trial.suggest_int('max_depth', 3, 15),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+    }
+
+    model = XGBClassifier(**params, random_state=42, n_jobs=-1)
+    scores = cross_val_score(model, X_train, y_train, cv=5, scoring='roc_auc')
+    return scores.mean()
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=100, timeout=3600)
+```
+
+### Model Evaluation
+
+#### Metrics
+- **AUC-ROC**: Primary metric for ranking performance
+- **Precision@K**: For top-K recommendation scenarios
+- **F1-Score**: Balance between precision and recall
+- **Log Loss**: Probability calibration quality
+
+```python
+from sklearn.metrics import (
+    roc_auc_score, precision_score, recall_score,
+    f1_score, log_loss, confusion_matrix, classification_report
+)
+
+def evaluate_model(model, X_test, y_test):
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+
+    metrics = {
+        'auc_roc': roc_auc_score(y_test, y_proba),
+        'precision': precision_score(y_test, y_pred),
+        'recall': recall_score(y_test, y_pred),
+        'f1': f1_score(y_test, y_pred),
+        'log_loss': log_loss(y_test, y_proba)
+    }
+
+    print(classification_report(y_test, y_pred))
+    return metrics
+```
+
+### Model Deployment
+
+#### Model Serialization
+```python
+import joblib
+import json
+
+# Save model and metadata
+joblib.dump(model, 'model.joblib')
+with open('model_metadata.json', 'w') as f:
+    json.dump({
+        'version': '1.0.0',
+        'features': feature_names,
+        'metrics': evaluation_metrics,
+        'training_date': datetime.now().isoformat()
+    }, f)
+```
+
+#### Serving Configuration
+```yaml
+apiVersion: serving.kubeflow.org/v1beta1
+kind: InferenceService
+metadata:
+  name: ml-model
+spec:
+  predictor:
+    sklearn:
+      storageUri: "gs://models/production/v1.0.0"
+      resources:
+        requests:
+          memory: "2Gi"
+          cpu: "1"
+```
+""",
+
+    """## System Architecture Overview
+
+### High-Level Design
+
+The platform follows a microservices architecture with the following core components:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Load Balancer                             │
+│                    (AWS ALB / GCP GLB)                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      API Gateway                                 │
+│              (Kong / AWS API Gateway)                           │
+│  - Rate Limiting                                                 │
+│  - Authentication                                                │
+│  - Request Routing                                               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ User Service │     │ Order Service│     │ Product Svc  │
+│              │     │              │     │              │
+│ - Auth       │     │ - Checkout   │     │ - Catalog    │
+│ - Profiles   │     │ - Payments   │     │ - Inventory  │
+│ - Sessions   │     │ - History    │     │ - Search     │
+└──────────────┘     └──────────────┘     └──────────────┘
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Message Queue                                 │
+│                  (Kafka / RabbitMQ)                             │
+│  - Event Streaming                                               │
+│  - Async Communication                                           │
+│  - Event Sourcing                                                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ PostgreSQL   │     │    Redis     │     │Elasticsearch │
+│ (Primary DB) │     │   (Cache)    │     │  (Search)    │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+### Service Communication Patterns
+
+#### Synchronous (REST/gRPC)
+- Used for: Real-time queries, user-facing operations
+- Timeout: 30 seconds
+- Retry policy: 3 attempts with exponential backoff
+
+#### Asynchronous (Message Queue)
+- Used for: Background processing, notifications, analytics
+- Delivery guarantee: At-least-once
+- Consumer groups for horizontal scaling
+
+### Data Flow Example: Order Processing
+
+1. User submits order via API Gateway
+2. Order Service validates and creates order record
+3. Order Service publishes `order.created` event
+4. Payment Service consumes event, processes payment
+5. Payment Service publishes `payment.completed` event
+6. Inventory Service reserves items
+7. Notification Service sends confirmation email
+
+### Fault Tolerance
+
+#### Circuit Breaker Pattern
+```python
+from circuitbreaker import circuit
+
+@circuit(failure_threshold=5, recovery_timeout=30)
+def call_external_service(url, payload):
+    response = requests.post(url, json=payload, timeout=5)
+    response.raise_for_status()
+    return response.json()
+```
+
+#### Retry with Exponential Backoff
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10)
+)
+def resilient_operation():
+    return perform_risky_operation()
+```
+
+### Observability Stack
+
+- **Metrics**: Prometheus + Grafana
+- **Logging**: ELK Stack (Elasticsearch, Logstash, Kibana)
+- **Tracing**: Jaeger / OpenTelemetry
+- **Alerting**: PagerDuty integration
+
+### Security Layers
+
+1. **Network**: VPC isolation, security groups
+2. **Transport**: TLS 1.3, mTLS for service-to-service
+3. **Application**: JWT validation, RBAC
+4. **Data**: Encryption at rest (AES-256), field-level encryption for PII
+""",
+]
+
+# Few-shot examples for coding tasks
+FEW_SHOT_EXAMPLES = [
+    """Here are some examples of how to implement common patterns:
+
+Example 1: Implementing a Retry Decorator
+```python
+import functools
+import time
+import random
+
+def retry(max_attempts=3, delay=1.0, backoff=2.0, exceptions=(Exception,)):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempts = 0
+            current_delay = delay
+
+            while attempts < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    attempts += 1
+                    if attempts == max_attempts:
+                        raise
+
+                    jitter = random.uniform(0, 0.1) * current_delay
+                    time.sleep(current_delay + jitter)
+                    current_delay *= backoff
+
+        return wrapper
+    return decorator
+
+# Usage:
+@retry(max_attempts=3, delay=1.0, exceptions=(ConnectionError, TimeoutError))
+def fetch_data(url):
+    response = requests.get(url, timeout=5)
+    response.raise_for_status()
+    return response.json()
+```
+
+Example 2: Implementing a Simple Cache
+```python
+from functools import lru_cache
+from datetime import datetime, timedelta
+import threading
+
+class TTLCache:
+    def __init__(self, ttl_seconds=300):
+        self._cache = {}
+        self._lock = threading.RLock()
+        self.ttl = timedelta(seconds=ttl_seconds)
+
+    def get(self, key):
+        with self._lock:
+            if key in self._cache:
+                value, expiry = self._cache[key]
+                if datetime.now() < expiry:
+                    return value
+                del self._cache[key]
+            return None
+
+    def set(self, key, value):
+        with self._lock:
+            expiry = datetime.now() + self.ttl
+            self._cache[key] = (value, expiry)
+
+    def delete(self, key):
+        with self._lock:
+            self._cache.pop(key, None)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+# Usage with decorator
+def cached(cache, key_func=None):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if key_func:
+                key = key_func(*args, **kwargs)
+            else:
+                key = (args, tuple(sorted(kwargs.items())))
+
+            result = cache.get(key)
+            if result is not None:
+                return result
+
+            result = func(*args, **kwargs)
+            cache.set(key, result)
+            return result
+        return wrapper
+    return decorator
+```
+
+Example 3: Implementing a Rate Limiter
+```python
+import time
+from collections import deque
+import threading
+
+class RateLimiter:
+    def __init__(self, max_requests, window_seconds):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        with self._lock:
+            now = time.time()
+
+            # Remove old requests outside the window
+            while self.requests and self.requests[0] <= now - self.window_seconds:
+                self.requests.popleft()
+
+            if len(self.requests) < self.max_requests:
+                self.requests.append(now)
+                return True
+
+            return False
+
+    def wait_and_acquire(self):
+        while not self.acquire():
+            time.sleep(0.1)
+        return True
+
+# Token bucket implementation
+class TokenBucket:
+    def __init__(self, capacity, refill_rate):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.refill_rate = refill_rate
+        self.last_refill = time.time()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens=1):
+        with self._lock:
+            self._refill()
+
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return True
+            return False
+
+    def _refill(self):
+        now = time.time()
+        elapsed = now - self.last_refill
+        refill_amount = elapsed * self.refill_rate
+        self.tokens = min(self.capacity, self.tokens + refill_amount)
+        self.last_refill = now
+```
+
+Example 4: Async Context Manager
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def managed_resource(resource_id):
+    resource = await acquire_resource(resource_id)
+    try:
+        yield resource
+    finally:
+        await release_resource(resource)
+
+# Database connection pool example
+class AsyncConnectionPool:
+    def __init__(self, dsn, min_size=5, max_size=20):
+        self.dsn = dsn
+        self.min_size = min_size
+        self.max_size = max_size
+        self._pool = None
+        self._lock = asyncio.Lock()
+
+    async def initialize(self):
+        import asyncpg
+        self._pool = await asyncpg.create_pool(
+            self.dsn,
+            min_size=self.min_size,
+            max_size=self.max_size
+        )
+
+    @asynccontextmanager
+    async def connection(self):
+        async with self._pool.acquire() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+    async def close(self):
+        await self._pool.close()
+
+# Usage:
+async def get_user(pool, user_id):
+    async with pool.connection() as conn:
+        return await conn.fetchrow(
+            'SELECT * FROM users WHERE id = $1',
+            user_id
+        )
+```
+""",
+
+    """Here are examples of implementing design patterns in Python:
+
+Example 1: Factory Pattern
+```python
+from abc import ABC, abstractmethod
+from typing import Dict, Type
+
+class Notification(ABC):
+    @abstractmethod
+    def send(self, recipient: str, message: str) -> bool:
+        pass
+
+class EmailNotification(Notification):
+    def __init__(self, smtp_config: dict):
+        self.smtp = smtp_config
+
+    def send(self, recipient: str, message: str) -> bool:
+        # Send email implementation
+        print(f"Sending email to {recipient}: {message}")
+        return True
+
+class SMSNotification(Notification):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def send(self, recipient: str, message: str) -> bool:
+        # Send SMS implementation
+        print(f"Sending SMS to {recipient}: {message}")
+        return True
+
+class PushNotification(Notification):
+    def __init__(self, firebase_config: dict):
+        self.firebase = firebase_config
+
+    def send(self, recipient: str, message: str) -> bool:
+        # Send push notification
+        print(f"Sending push to {recipient}: {message}")
+        return True
+
+class NotificationFactory:
+    _registry: Dict[str, Type[Notification]] = {}
+
+    @classmethod
+    def register(cls, notification_type: str):
+        def decorator(notification_class: Type[Notification]):
+            cls._registry[notification_type] = notification_class
+            return notification_class
+        return decorator
+
+    @classmethod
+    def create(cls, notification_type: str, **config) -> Notification:
+        if notification_type not in cls._registry:
+            raise ValueError(f"Unknown notification type: {notification_type}")
+        return cls._registry[notification_type](**config)
+
+# Register implementations
+NotificationFactory.register("email")(EmailNotification)
+NotificationFactory.register("sms")(SMSNotification)
+NotificationFactory.register("push")(PushNotification)
+```
+
+Example 2: Observer Pattern
+```python
+from abc import ABC, abstractmethod
+from typing import List, Any
+from weakref import WeakSet
+
+class Observer(ABC):
+    @abstractmethod
+    def update(self, event: str, data: Any) -> None:
+        pass
+
+class Observable:
+    def __init__(self):
+        self._observers: WeakSet[Observer] = WeakSet()
+
+    def subscribe(self, observer: Observer) -> None:
+        self._observers.add(observer)
+
+    def unsubscribe(self, observer: Observer) -> None:
+        self._observers.discard(observer)
+
+    def notify(self, event: str, data: Any = None) -> None:
+        for observer in self._observers:
+            observer.update(event, data)
+
+class EventBus:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._subscribers = {}
+        return cls._instance
+
+    def subscribe(self, event: str, callback):
+        if event not in self._subscribers:
+            self._subscribers[event] = []
+        self._subscribers[event].append(callback)
+
+    def publish(self, event: str, data: Any = None):
+        if event in self._subscribers:
+            for callback in self._subscribers[event]:
+                callback(data)
+
+# Usage:
+event_bus = EventBus()
+event_bus.subscribe("user.created", lambda user: print(f"New user: {user}"))
+event_bus.publish("user.created", {"id": 1, "name": "John"})
+```
+
+Example 3: Strategy Pattern
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Protocol
+
+class PricingStrategy(Protocol):
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        ...
+
+class RegularPricing:
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        return base_price * quantity
+
+class BulkPricing:
+    def __init__(self, threshold: int, discount: Decimal):
+        self.threshold = threshold
+        self.discount = discount
+
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        total = base_price * quantity
+        if quantity >= self.threshold:
+            total *= (1 - self.discount)
+        return total
+
+class TieredPricing:
+    def __init__(self, tiers: list):
+        self.tiers = sorted(tiers, key=lambda x: x[0])
+
+    def calculate_price(self, base_price: Decimal, quantity: int) -> Decimal:
+        total = Decimal(0)
+        remaining = quantity
+        prev_threshold = 0
+
+        for threshold, discount in self.tiers:
+            if remaining <= 0:
+                break
+            tier_qty = min(remaining, threshold - prev_threshold)
+            tier_price = base_price * (1 - discount)
+            total += tier_price * tier_qty
+            remaining -= tier_qty
+            prev_threshold = threshold
+
+        if remaining > 0:
+            total += base_price * remaining
+
+        return total
+
+@dataclass
+class ShoppingCart:
+    pricing_strategy: PricingStrategy
+
+    def calculate_total(self, items: list) -> Decimal:
+        total = Decimal(0)
+        for item in items:
+            total += self.pricing_strategy.calculate_price(
+                item['price'], item['quantity']
+            )
+        return total
+```
+
+Example 4: Decorator Pattern
+```python
+from abc import ABC, abstractmethod
+from functools import wraps
+import time
+import logging
+
+class DataSource(ABC):
+    @abstractmethod
+    def read_data(self, key: str) -> dict:
+        pass
+
+    @abstractmethod
+    def write_data(self, key: str, data: dict) -> bool:
+        pass
+
+class DatabaseSource(DataSource):
+    def read_data(self, key: str) -> dict:
+        # Simulated database read
+        return {"key": key, "value": "from_db"}
+
+    def write_data(self, key: str, data: dict) -> bool:
+        # Simulated database write
+        return True
+
+class CachingDecorator(DataSource):
+    def __init__(self, source: DataSource, cache: dict = None):
+        self._source = source
+        self._cache = cache or {}
+
+    def read_data(self, key: str) -> dict:
+        if key in self._cache:
+            return self._cache[key]
+        data = self._source.read_data(key)
+        self._cache[key] = data
+        return data
+
+    def write_data(self, key: str, data: dict) -> bool:
+        result = self._source.write_data(key, data)
+        if result:
+            self._cache[key] = data
+        return result
+
+class LoggingDecorator(DataSource):
+    def __init__(self, source: DataSource, logger: logging.Logger = None):
+        self._source = source
+        self._logger = logger or logging.getLogger(__name__)
+
+    def read_data(self, key: str) -> dict:
+        self._logger.info(f"Reading data for key: {key}")
+        start = time.time()
+        result = self._source.read_data(key)
+        self._logger.info(f"Read completed in {time.time() - start:.3f}s")
+        return result
+
+    def write_data(self, key: str, data: dict) -> bool:
+        self._logger.info(f"Writing data for key: {key}")
+        return self._source.write_data(key, data)
+
+# Usage: Stack decorators
+data_source = LoggingDecorator(CachingDecorator(DatabaseSource()))
+```
+""",
+]
+
+# Long system instruction templates
+LONG_SYSTEM_INSTRUCTIONS = [
+    """You are an expert AI coding assistant with deep knowledge of software engineering best practices. Your role is to help developers write clean, efficient, and maintainable code.
+
+## Core Principles
+
+1. **Code Quality**
+   - Write code that is readable and self-documenting
+   - Follow the principle of least surprise
+   - Prefer clarity over cleverness
+   - Use meaningful variable and function names
+
+2. **Design Patterns**
+   - Apply appropriate design patterns when they solve real problems
+   - Avoid over-engineering and premature abstraction
+   - Follow SOLID principles where applicable
+   - Consider the trade-offs of each pattern
+
+3. **Performance**
+   - Write efficient code, but prioritize readability first
+   - Profile before optimizing
+   - Understand Big O complexity
+   - Consider memory usage and cache efficiency
+
+4. **Security**
+   - Never trust user input
+   - Use parameterized queries to prevent SQL injection
+   - Properly escape output to prevent XSS
+   - Follow the principle of least privilege
+   - Keep dependencies updated
+
+5. **Testing**
+   - Write tests that document behavior
+   - Aim for high coverage of critical paths
+   - Use appropriate test types (unit, integration, e2e)
+   - Make tests deterministic and fast
+
+## Response Format
+
+When providing code solutions:
+
+1. First, understand the problem completely
+2. Ask clarifying questions if requirements are ambiguous
+3. Provide a working solution with explanations
+4. Include error handling and edge cases
+5. Suggest improvements or alternatives when relevant
+
+## Language-Specific Guidelines
+
+### Python
+- Follow PEP 8 style guide
+- Use type hints for function signatures
+- Prefer f-strings for string formatting
+- Use context managers for resource handling
+- Leverage dataclasses and Pydantic for data models
+
+### JavaScript/TypeScript
+- Use TypeScript when possible for type safety
+- Prefer async/await over callbacks
+- Use modern ES6+ features appropriately
+- Follow functional programming principles where beneficial
+- Handle promises correctly with proper error handling
+
+### Go
+- Follow effective Go guidelines
+- Use proper error handling (no panic for recoverable errors)
+- Leverage goroutines and channels appropriately
+- Keep functions small and focused
+- Use interfaces for abstraction
+
+### Rust
+- Embrace the ownership model
+- Use Result for error handling
+- Prefer iterators over manual loops
+- Leverage the type system for safety
+- Use appropriate smart pointers
+
+## Communication Style
+
+- Be concise but thorough
+- Explain the "why" behind recommendations
+- Provide examples when helpful
+- Acknowledge trade-offs and alternatives
+- Be honest about limitations or uncertainty
+
+Remember: The goal is to help developers become better at their craft, not just solve immediate problems.""",
+
+    """You are a specialized data science and machine learning assistant. Your expertise covers the entire ML lifecycle from data exploration to model deployment.
+
+## Capabilities
+
+### Data Analysis
+- Exploratory data analysis (EDA)
+- Statistical testing and hypothesis validation
+- Feature engineering and selection
+- Data cleaning and preprocessing
+- Visualization best practices
+
+### Machine Learning
+- Supervised learning (classification, regression)
+- Unsupervised learning (clustering, dimensionality reduction)
+- Deep learning architectures
+- Time series forecasting
+- Natural language processing
+- Computer vision
+
+### MLOps
+- Model versioning and experiment tracking
+- CI/CD for ML pipelines
+- Model monitoring and drift detection
+- A/B testing and canary deployments
+- Feature stores and data versioning
+
+## Analysis Framework
+
+When approaching any data science problem:
+
+1. **Understand the Business Context**
+   - What problem are we solving?
+   - Who are the stakeholders?
+   - What decisions will this analysis inform?
+   - What are the success metrics?
+
+2. **Data Understanding**
+   - What data is available?
+   - What is the data quality?
+   - Are there any biases or limitations?
+   - How was the data collected?
+
+3. **Methodology Selection**
+   - What approach best fits the problem?
+   - What are the assumptions?
+   - How will we validate results?
+   - What are the computational constraints?
+
+4. **Implementation**
+   - Use appropriate tools and libraries
+   - Write reproducible code
+   - Document assumptions and decisions
+   - Create clear visualizations
+
+5. **Evaluation**
+   - Use appropriate metrics
+   - Consider business impact
+   - Validate with domain experts
+   - Plan for monitoring
+
+## Code Standards
+
+When writing data science code:
+
+```python
+# Standard imports organization
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+
+# Configuration
+plt.style.use('seaborn-v0_8-whitegrid')
+pd.set_option('display.max_columns', 100)
+np.random.seed(42)
+
+# Constants at the top
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+CV_FOLDS = 5
+
+# Functions with docstrings and type hints
+def prepare_features(df: pd.DataFrame, target_col: str) -> tuple:
+    '''Prepare features for modeling.
+
+    Args:
+        df: Input dataframe
+        target_col: Name of target column
+
+    Returns:
+        Tuple of (X, y) arrays
+    '''
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+    return X, y
+```
+
+## Visualization Guidelines
+
+- Always label axes and include titles
+- Use colorblind-friendly palettes
+- Choose appropriate chart types for data
+- Keep visualizations simple and focused
+- Include context and annotations when helpful
+
+## Common Pitfalls to Avoid
+
+1. **Data Leakage**: Ensure strict separation of train/test data
+2. **Selection Bias**: Validate data representativeness
+3. **Overfitting**: Use proper validation strategies
+4. **P-hacking**: Pre-register hypotheses when possible
+5. **Ignoring Domain Knowledge**: Collaborate with subject matter experts
+
+## Communication
+
+When explaining results:
+- Start with the key insight or recommendation
+- Provide supporting evidence and analysis
+- Acknowledge uncertainty and limitations
+- Suggest next steps or follow-up analyses
+- Tailor technical depth to the audience""",
+
+    """You are an expert DevOps and Site Reliability Engineer (SRE). Your role is to help teams build, deploy, and operate reliable, scalable systems.
+
+## Areas of Expertise
+
+### Infrastructure as Code
+- Terraform, Pulumi, CloudFormation
+- Ansible, Chef, Puppet
+- Container orchestration (Kubernetes, ECS, Nomad)
+- Service mesh (Istio, Linkerd)
+
+### CI/CD
+- Pipeline design and optimization
+- Testing strategies (unit, integration, e2e)
+- Deployment strategies (blue-green, canary, rolling)
+- GitOps workflows
+
+### Monitoring & Observability
+- Metrics (Prometheus, Datadog, CloudWatch)
+- Logging (ELK, Loki, Splunk)
+- Tracing (Jaeger, Zipkin, OpenTelemetry)
+- Alerting and on-call practices
+
+### Cloud Platforms
+- AWS, GCP, Azure
+- Multi-cloud and hybrid architectures
+- Cost optimization
+- Security best practices
+
+## SRE Principles
+
+### Service Level Objectives (SLOs)
+
+Define reliability targets based on user experience:
+
+```yaml
+# Example SLO specification
+service: api-gateway
+slos:
+  - name: availability
+    target: 99.9%
+    window: 30d
+    sli:
+      type: availability
+      good_events: successful_requests
+      total_events: total_requests
+
+  - name: latency
+    target: 95%
+    window: 30d
+    sli:
+      type: latency
+      threshold_ms: 200
+      percentile: 95
+
+error_budget:
+  calculation: 1 - slo_target
+  burn_rate_alerts:
+    - severity: critical
+      burn_rate: 14.4  # 2h budget in 1h
+      window: 1h
+    - severity: warning
+      burn_rate: 6     # 6h budget in 6h
+      window: 6h
+```
+
+### Error Budgets
+
+- Use error budgets to balance reliability and velocity
+- When budget is exhausted, focus on reliability
+- When budget is healthy, ship faster
+- Make data-driven decisions about risk
+
+### Incident Management
+
+1. **Detection**: Automated alerting based on SLIs
+2. **Response**: Clear on-call escalation paths
+3. **Mitigation**: Runbooks and automation
+4. **Resolution**: Root cause analysis
+5. **Prevention**: Blameless postmortems
+
+## Kubernetes Best Practices
+
+### Resource Management
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "250m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+```
+
+### Security
+- Use RBAC with least privilege
+- Enable Pod Security Standards
+- Scan images for vulnerabilities
+- Use network policies to limit traffic
+- Encrypt secrets with external KMS
+
+### Reliability
+- Set appropriate resource limits
+- Use Pod Disruption Budgets
+- Implement graceful shutdown
+- Use anti-affinity for HA
+- Test failure scenarios regularly
+
+## Monitoring Strategy
+
+### The Four Golden Signals
+
+1. **Latency**: Time to serve a request
+2. **Traffic**: Demand on the system
+3. **Errors**: Rate of failed requests
+4. **Saturation**: How full the system is
+
+### Alert Design
+
+Good alerts are:
+- **Actionable**: Someone needs to do something
+- **Urgent**: Requires immediate attention
+- **Symptomatic**: Based on user-visible symptoms
+- **Non-noisy**: Low false positive rate
+
+## Automation Philosophy
+
+Automate:
+- Repetitive manual tasks
+- Toil that doesn't add value
+- Incident response procedures
+- Capacity planning
+
+But:
+- Document what you automate
+- Handle failures gracefully
+- Keep humans in the loop for critical decisions
+- Test automation regularly""",
+]
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count from text length.
+
+    Rough estimation: ~4 characters per token on average.
+    This is a simplification; real tokenization varies by model.
+    """
+    return len(text) // 4
+
+
+def generate_large_prefix(
+    target_tokens: int,
+    prefix_type: str = "mixed",
+    prefix_id: int = 0
+) -> str:
+    """Generate a large prefix of approximately target_tokens size.
+
+    Args:
+        target_tokens: Target number of tokens (2000-8000)
+        prefix_type: Type of prefix content: "rag", "fewshot", "system", "mixed"
+        prefix_id: Unique identifier for this prefix (for variation)
+
+    Returns:
+        Large prefix text of approximately target_tokens
+    """
+    prefix_parts = []
+    current_tokens = 0
+
+    if prefix_type == "rag" or prefix_type == "mixed":
+        # Add RAG document chunks
+        chunks = RAG_DOCUMENT_CHUNKS.copy()
+        random.shuffle(chunks)
+
+        for chunk in chunks:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(chunk)
+            current_tokens += estimate_tokens(chunk)
+
+    if prefix_type == "fewshot" or (prefix_type == "mixed" and current_tokens < target_tokens):
+        # Add few-shot examples
+        for example in FEW_SHOT_EXAMPLES:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(example)
+            current_tokens += estimate_tokens(example)
+
+    if prefix_type == "system" or (prefix_type == "mixed" and current_tokens < target_tokens):
+        # Add long system instructions
+        for instruction in LONG_SYSTEM_INSTRUCTIONS:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(instruction)
+            current_tokens += estimate_tokens(instruction)
+
+    # If we still need more tokens, pad with documentation-style content
+    padding_chunks = [
+        "### Additional Context\n" + "Lorem ipsum " * 50 + "\n",
+        "### Technical Specifications\n" + "Configuration details " * 40 + "\n",
+        "### Implementation Notes\n" + "Reference documentation " * 45 + "\n",
+    ]
+
+    while current_tokens < target_tokens:
+        for chunk in padding_chunks:
+            if current_tokens >= target_tokens:
+                break
+            prefix_parts.append(chunk)
+            current_tokens += estimate_tokens(chunk)
+
+    # Add unique prefix identifier for routing consistency
+    header = f"[Context ID: {prefix_id}]\n\n"
+
+    return header + "\n\n".join(prefix_parts)
+
+
+# Pre-generated large prefixes for consistent routing
+_large_prefixes: List[Tuple[str, int]] = []  # (prefix_text, estimated_tokens)
+
+def initialize_large_prefixes():
+    """Initialize the pool of large prefixes for stress testing."""
+    global _large_prefixes
+
+    if _large_prefixes:
+        return
+
+    logger.info(f"Generating {NUM_LARGE_PREFIXES} large prefixes...")
+
+    prefix_types = ["rag", "fewshot", "system", "mixed"]
+
+    for i in range(NUM_LARGE_PREFIXES):
+        # Random size within configured range
+        target_tokens = random.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
+        prefix_type = prefix_types[i % len(prefix_types)]
+
+        prefix_text = generate_large_prefix(target_tokens, prefix_type, i)
+        actual_tokens = estimate_tokens(prefix_text)
+
+        _large_prefixes.append((prefix_text, actual_tokens))
+        logger.info(f"  Generated prefix {i}: ~{actual_tokens} tokens ({prefix_type})")
+
+    logger.info(f"Large prefix generation complete")
+
+
+def get_prefix_size_bucket(token_count: int) -> str:
+    """Get the size bucket for a given token count."""
+    for bucket_name, min_tokens, max_tokens in PREFIX_SIZE_BUCKETS:
+        if min_tokens <= token_count < max_tokens:
+            return bucket_name
+    return "xlarge"
+
+# ============================================================================
+# Metrics Collection
+# ============================================================================
+
+@dataclass
+class RequestMetrics:
+    """Metrics collected for each request."""
+    request_id: str
+    prompt_prefix_hash: str
+    backend_id: Optional[str] = None
+    ttft_ms: Optional[float] = None
+    total_time_ms: Optional[float] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    is_cache_hit: bool = False
+    routing_mode: str = "unknown"
+    prefix_size_bucket: str = "unknown"
+    estimated_prefix_tokens: int = 0
+
+
+@dataclass
+class BenchmarkStats:
+    """Aggregated benchmark statistics."""
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+
+    # Cache hit tracking
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+    # TTFT by cache status
+    ttft_cache_hit: List[float] = field(default_factory=list)
+    ttft_cache_miss: List[float] = field(default_factory=list)
+
+    # Token throughput
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_generation_time_s: float = 0.0
+
+    # Routing tracking: prefix_hash -> backend_id
+    prefix_to_backend: Dict[str, str] = field(default_factory=dict)
+
+    # TTFT by prefix size bucket (for stress testing)
+    ttft_by_bucket: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    ttft_cache_hit_by_bucket: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    ttft_cache_miss_by_bucket: Dict[str, List[float]] = field(default_factory=lambda: defaultdict(list))
+    requests_by_bucket: Dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+    # Lock for thread safety
+    _lock: Lock = field(default_factory=Lock)
+
+    def record_request(self, metrics: RequestMetrics):
+        """Record metrics from a completed request."""
+        with self._lock:
+            self.total_requests += 1
+
+            if metrics.ttft_ms is None:
+                self.failed_requests += 1
+                return
+
+            self.successful_requests += 1
+            self.total_prompt_tokens += metrics.prompt_tokens
+            self.total_completion_tokens += metrics.completion_tokens
+
+            if metrics.total_time_ms:
+                self.total_generation_time_s += metrics.total_time_ms / 1000.0
+
+            # Track by prefix size bucket
+            bucket = metrics.prefix_size_bucket
+            if bucket and bucket != "unknown":
+                self.ttft_by_bucket[bucket].append(metrics.ttft_ms)
+                self.requests_by_bucket[bucket] += 1
+
+            # Track cache hits based on prefix routing
+            if metrics.prompt_prefix_hash:
+                expected_backend = self.prefix_to_backend.get(metrics.prompt_prefix_hash)
+
+                if expected_backend is None:
+                    # First request with this prefix - cache miss
+                    self.prefix_to_backend[metrics.prompt_prefix_hash] = metrics.backend_id
+                    self.cache_misses += 1
+                    self.ttft_cache_miss.append(metrics.ttft_ms)
+                    metrics.is_cache_hit = False
+                    if bucket and bucket != "unknown":
+                        self.ttft_cache_miss_by_bucket[bucket].append(metrics.ttft_ms)
+                elif expected_backend == metrics.backend_id:
+                    # Same backend - cache hit
+                    self.cache_hits += 1
+                    self.ttft_cache_hit.append(metrics.ttft_ms)
+                    metrics.is_cache_hit = True
+                    if bucket and bucket != "unknown":
+                        self.ttft_cache_hit_by_bucket[bucket].append(metrics.ttft_ms)
+                else:
+                    # Different backend - cache miss (routing failure)
+                    self.cache_misses += 1
+                    self.ttft_cache_miss.append(metrics.ttft_ms)
+                    metrics.is_cache_hit = False
+                    if bucket and bucket != "unknown":
+                        self.ttft_cache_miss_by_bucket[bucket].append(metrics.ttft_ms)
+
+    def get_summary(self) -> dict:
+        """Generate summary statistics."""
+        with self._lock:
+            cache_hit_rate = 0.0
+            if self.cache_hits + self.cache_misses > 0:
+                cache_hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses) * 100
+
+            ttft_hit_p50 = self._percentile(self.ttft_cache_hit, 0.50)
+            ttft_hit_p99 = self._percentile(self.ttft_cache_hit, 0.99)
+            ttft_miss_p50 = self._percentile(self.ttft_cache_miss, 0.50)
+            ttft_miss_p99 = self._percentile(self.ttft_cache_miss, 0.99)
+
+            tokens_per_sec = 0.0
+            if self.total_generation_time_s > 0:
+                tokens_per_sec = self.total_completion_tokens / self.total_generation_time_s
+
+            summary = {
+                "total_requests": self.total_requests,
+                "successful_requests": self.successful_requests,
+                "failed_requests": self.failed_requests,
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "cache_hit_rate_pct": cache_hit_rate,
+                "ttft_cache_hit_p50_ms": ttft_hit_p50,
+                "ttft_cache_hit_p99_ms": ttft_hit_p99,
+                "ttft_cache_miss_p50_ms": ttft_miss_p50,
+                "ttft_cache_miss_p99_ms": ttft_miss_p99,
+                "ttft_improvement_pct": self._calculate_improvement(ttft_miss_p50, ttft_hit_p50),
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "total_completion_tokens": self.total_completion_tokens,
+                "tokens_per_second": tokens_per_sec,
+                "unique_prefixes": len(self.prefix_to_backend),
+            }
+
+            # Add per-bucket statistics for large-prefix stress testing
+            if self.ttft_by_bucket:
+                bucket_stats = {}
+                for bucket_name in ["tiny", "small", "medium", "large", "xlarge"]:
+                    if bucket_name in self.ttft_by_bucket and self.ttft_by_bucket[bucket_name]:
+                        all_ttft = self.ttft_by_bucket[bucket_name]
+                        hit_ttft = self.ttft_cache_hit_by_bucket.get(bucket_name, [])
+                        miss_ttft = self.ttft_cache_miss_by_bucket.get(bucket_name, [])
+
+                        bucket_stats[bucket_name] = {
+                            "requests": self.requests_by_bucket.get(bucket_name, 0),
+                            "ttft_p50_ms": self._percentile(all_ttft, 0.50),
+                            "ttft_p99_ms": self._percentile(all_ttft, 0.99),
+                            "ttft_min_ms": min(all_ttft) if all_ttft else None,
+                            "ttft_max_ms": max(all_ttft) if all_ttft else None,
+                            "cache_hit_ttft_p50_ms": self._percentile(hit_ttft, 0.50) if hit_ttft else None,
+                            "cache_miss_ttft_p50_ms": self._percentile(miss_ttft, 0.50) if miss_ttft else None,
+                            "cache_hit_count": len(hit_ttft),
+                            "cache_miss_count": len(miss_ttft),
+                        }
+
+                        # Calculate improvement for this bucket
+                        if hit_ttft and miss_ttft:
+                            hit_p50 = self._percentile(hit_ttft, 0.50)
+                            miss_p50 = self._percentile(miss_ttft, 0.50)
+                            bucket_stats[bucket_name]["ttft_improvement_pct"] = \
+                                self._calculate_improvement(miss_p50, hit_p50)
+
+                summary["bucket_stats"] = bucket_stats
+
+            return summary
+
+    def _percentile(self, data: List[float], p: float) -> Optional[float]:
+        """Calculate percentile of data."""
+        if not data:
+            return None
+        sorted_data = sorted(data)
+        idx = int(len(sorted_data) * p)
+        return sorted_data[min(idx, len(sorted_data) - 1)]
+
+    def _calculate_improvement(self, baseline: Optional[float], improved: Optional[float]) -> Optional[float]:
+        """Calculate percentage improvement (positive = faster)."""
+        if baseline is None or improved is None or baseline == 0:
+            return None
+        return ((baseline - improved) / baseline) * 100
+
+
+# Global stats object
+_benchmark_stats = BenchmarkStats()
+_initial_sync_errors: Dict[str, float] = {}
+_backends_registered = False
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
+    """Extract a specific metric value from Prometheus endpoint."""
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            if metric_name in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    return float(match.group(1))
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch metrics from {metrics_url}: {e}")
+        return None
+
+
+def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
+    """Get average value from a Prometheus histogram (sum/count)."""
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        sum_val = None
+        count_val = None
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            if f"{metric_name}_sum" in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    sum_val = float(match.group(1))
+            elif f"{metric_name}_count" in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    count_val = float(match.group(1))
+
+        if sum_val is not None and count_val is not None and count_val > 0:
+            return sum_val / count_val
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch histogram from {metrics_url}: {e}")
+        return None
+
+
+def get_ranvier_latency_breakdown() -> dict:
+    """Get Ranvier's internal latency breakdown from Prometheus metrics.
+
+    Returns average latencies in milliseconds for:
+    - routing_latency: Time spent making routing decision
+    - connect_latency: Time to establish backend connection
+    - first_byte_latency: Time to receive first byte from backend (TTFT)
+    - total_latency: Total request processing time
+    """
+    breakdown = {
+        "routing_latency_ms": None,
+        "connect_latency_ms": None,
+        "first_byte_latency_ms": None,
+        "total_latency_ms": None,
+    }
+
+    # Aggregate from all nodes
+    routing_sum, routing_count = 0.0, 0
+    connect_sum, connect_count = 0.0, 0
+    first_byte_sum, first_byte_count = 0.0, 0
+    total_sum, total_count = 0.0, 0
+
+    for metrics_url in RANVIER_METRICS:
+        routing = get_histogram_avg(metrics_url, "router_routing_latency_seconds")
+        if routing is not None:
+            routing_sum += routing
+            routing_count += 1
+
+        connect = get_histogram_avg(metrics_url, "backend_connect_duration_seconds")
+        if connect is not None:
+            connect_sum += connect
+            connect_count += 1
+
+        first_byte = get_histogram_avg(metrics_url, "backend_response_duration_seconds")
+        if first_byte is not None:
+            first_byte_sum += first_byte
+            first_byte_count += 1
+
+        total = get_histogram_avg(metrics_url, "router_request_total_latency_seconds")
+        if total is not None:
+            total_sum += total
+            total_count += 1
+
+    # Calculate averages across nodes (convert to ms)
+    if routing_count > 0:
+        breakdown["routing_latency_ms"] = (routing_sum / routing_count) * 1000
+    if connect_count > 0:
+        breakdown["connect_latency_ms"] = (connect_sum / connect_count) * 1000
+    if first_byte_count > 0:
+        breakdown["first_byte_latency_ms"] = (first_byte_sum / first_byte_count) * 1000
+    if total_count > 0:
+        breakdown["total_latency_ms"] = (total_sum / total_count) * 1000
+
+    return breakdown
+
+
+def register_backends_on_all_nodes():
+    """Register backends on all Ranvier nodes."""
+    global _backends_registered
+    if _backends_registered:
+        return
+
+    logger.info("Registering backends on all Ranvier nodes...")
+
+    for node_url in RANVIER_NODES:
+        for backend in BACKENDS:
+            url = (
+                f"{node_url}/admin/backends"
+                f"?id={backend['id']}"
+                f"&ip={backend['ip']}"
+                f"&port={backend['port']}"
+            )
+            try:
+                resp = requests.post(url, timeout=10)
+                if resp.status_code == 200:
+                    logger.info(f"Registered backend {backend['id']} on {node_url}")
+                else:
+                    logger.warning(
+                        f"Failed to register backend {backend['id']} on {node_url}: "
+                        f"{resp.status_code} - {resp.text}"
+                    )
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error registering backend {backend['id']} on {node_url}: {e}")
+
+    _backends_registered = True
+    logger.info("Backend registration complete")
+
+
+def capture_initial_sync_errors():
+    """Capture initial sync error counts from all nodes."""
+    global _initial_sync_errors
+    _initial_sync_errors = {}
+
+    for i, metrics_url in enumerate(RANVIER_METRICS):
+        value = get_metric_value(metrics_url, "router_cluster_sync_errors")
+        node_name = f"node{i + 1}"
+        _initial_sync_errors[node_name] = value if value is not None else 0.0
+        logger.info(f"Initial sync errors on {node_name}: {_initial_sync_errors[node_name]}")
+
+
+def check_sync_errors() -> Tuple[bool, str]:
+    """Check if any sync errors occurred during the test run."""
+    errors_found = []
+
+    for i, metrics_url in enumerate(RANVIER_METRICS):
+        node_name = f"node{i + 1}"
+        current_value = get_metric_value(metrics_url, "router_cluster_sync_errors")
+
+        if current_value is None:
+            continue
+
+        initial_value = _initial_sync_errors.get(node_name, 0.0)
+        delta = current_value - initial_value
+
+        if delta > 0:
+            errors_found.append(f"{node_name}: {delta} new sync errors")
+
+    if errors_found:
+        return False, f"Sync errors detected: {', '.join(errors_found)}"
+
+    return True, "No sync errors detected"
+
+
+def hash_prompt_prefix(messages: List[dict], token_limit: int = 100) -> str:
+    """Generate a hash of the prompt prefix for cache tracking.
+
+    This approximates what the router does - extracting the first N tokens
+    to determine routing affinity.
+    """
+    # Combine all message content
+    full_text = ""
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        full_text += f"{role}: {content}\n"
+
+    # Take first ~400 characters as approximation of first 100 tokens
+    prefix = full_text[:400]
+
+    # Simple hash
+    return str(hash(prefix))
+
+
+def parse_sse_usage(response_text: str) -> Tuple[int, int]:
+    """Parse usage statistics from SSE response chunks.
+
+    vLLM includes usage info in the final chunk:
+    {"usage": {"prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168}}
+    """
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    for line in response_text.split("\n"):
+        if line.startswith("data: ") and line != "data: [DONE]":
+            try:
+                data = json.loads(line[6:])
+                if "usage" in data:
+                    usage = data["usage"]
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    completion_tokens = usage.get("completion_tokens", 0)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    return prompt_tokens, completion_tokens
+
+
+def get_backend_from_response(headers: dict) -> Optional[str]:
+    """Extract backend ID from response headers.
+
+    Ranvier adds X-Backend-ID header to responses.
+    """
+    return headers.get("X-Backend-ID") or headers.get("x-backend-id")
+
+
+# ============================================================================
+# Prompt Generation
+# ============================================================================
+
+def generate_prompt() -> Tuple[List[dict], str, int]:
+    """Generate a prompt based on configured distribution.
+
+    Returns:
+        Tuple of (messages list, prefix_hash for cache tracking, estimated_token_count)
+    """
+    distribution = PROMPT_DISTRIBUTION.lower().replace("-", "_")
+
+    if distribution == "short":
+        messages, prefix_hash = _generate_short_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif distribution == "medium":
+        messages, prefix_hash = _generate_medium_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif distribution == "long":
+        messages, prefix_hash = _generate_long_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif distribution == "large_prefix":
+        # Large prefix mode for stress testing KV cache
+        return _generate_large_prefix_prompt()
+    elif distribution == "stress":
+        # Stress mode with mixed sizes biased toward large prefixes
+        return _generate_stress_prompt()
+    else:  # mixed
+        # Weighted distribution: 30% short, 50% medium, 20% long
+        r = random.random()
+        if r < 0.3:
+            messages, prefix_hash = _generate_short_prompt()
+        elif r < 0.8:
+            messages, prefix_hash = _generate_medium_prompt()
+        else:
+            messages, prefix_hash = _generate_long_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+
+
+def _generate_short_prompt() -> Tuple[List[dict], str]:
+    """Generate a short prompt without shared prefix."""
+    prompt = random.choice(SHORT_PROMPTS)
+    messages = [{"role": "user", "content": prompt}]
+    return messages, hash_prompt_prefix(messages)
+
+
+def _generate_medium_prompt() -> Tuple[List[dict], str]:
+    """Generate a medium prompt with potential shared prefix."""
+    # Decide if this should share a prefix with other requests
+    if random.random() < SHARED_PREFIX_RATIO:
+        # Use a shared system prompt
+        category, user_prompt = random.choice(MEDIUM_PROMPTS)
+        system_prompt = SYSTEM_PROMPTS[category]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    else:
+        # Unique prompt
+        prompt = random.choice(SHORT_PROMPTS)
+        messages = [{"role": "user", "content": prompt + f" (request {random.randint(1000, 9999)})"}]
+
+    return messages, hash_prompt_prefix(messages)
+
+
+def _generate_long_prompt() -> Tuple[List[dict], str]:
+    """Generate a long prompt with potential shared prefix."""
+    if random.random() < SHARED_PREFIX_RATIO:
+        category, user_prompt = random.choice(LONG_PROMPTS)
+        system_prompt = SYSTEM_PROMPTS[category]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    else:
+        # Unique long prompt
+        messages = [{"role": "user", "content": random.choice(LONG_PROMPTS)[1]}]
+
+    return messages, hash_prompt_prefix(messages)
+
+
+def _generate_large_prefix_prompt() -> Tuple[List[dict], str, int]:
+    """Generate a prompt with a large shared prefix for stress testing.
+
+    Returns:
+        Tuple of (messages, prefix_hash, estimated_token_count)
+    """
+    # Ensure large prefixes are initialized
+    initialize_large_prefixes()
+
+    if not _large_prefixes:
+        # Fallback to long prompt if generation failed
+        messages, prefix_hash = _generate_long_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+
+    # Select a prefix (shared for prefix-affinity routing)
+    prefix_text, token_count = random.choice(_large_prefixes)
+
+    # Generate different user queries for the same prefix
+    user_queries = [
+        "Based on the context above, summarize the key points.",
+        "What are the main technical requirements described?",
+        "Identify any potential issues or risks mentioned.",
+        "How would you improve the implementation described?",
+        "What are the dependencies between components?",
+        "Provide a step-by-step implementation plan.",
+        "What testing strategy would you recommend?",
+        "How would you scale this architecture?",
+        "What security considerations are important here?",
+        "Compare the approaches mentioned and recommend one.",
+    ]
+
+    messages = [
+        {"role": "system", "content": prefix_text},
+        {"role": "user", "content": random.choice(user_queries)},
+    ]
+
+    return messages, hash_prompt_prefix(messages), token_count
+
+
+def _generate_stress_prompt() -> Tuple[List[dict], str, int]:
+    """Generate prompts with mixed sizes for comprehensive stress testing.
+
+    Uses a distribution biased toward large prefixes to stress the KV cache.
+
+    Returns:
+        Tuple of (messages, prefix_hash, estimated_token_count)
+    """
+    # Weighted distribution: 10% small, 20% medium, 30% large, 40% xlarge
+    r = random.random()
+    if r < 0.1:
+        # Small prompt
+        messages, prefix_hash = _generate_short_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif r < 0.3:
+        # Medium prompt
+        messages, prefix_hash = _generate_medium_prompt()
+        return messages, prefix_hash, estimate_tokens(str(messages))
+    elif r < 0.6:
+        # Large prefix (2000-4000 tokens)
+        initialize_large_prefixes()
+        if _large_prefixes:
+            # Filter for large range
+            large_prefixes = [(p, t) for p, t in _large_prefixes if 2000 <= t < 4000]
+            if large_prefixes:
+                prefix_text, token_count = random.choice(large_prefixes)
+                messages = [
+                    {"role": "system", "content": prefix_text},
+                    {"role": "user", "content": "Analyze and summarize the key points."},
+                ]
+                return messages, hash_prompt_prefix(messages), token_count
+
+        # Fallback
+        return _generate_large_prefix_prompt()
+    else:
+        # XLarge prefix (4000-8000 tokens)
+        initialize_large_prefixes()
+        if _large_prefixes:
+            # Filter for xlarge range
+            xlarge_prefixes = [(p, t) for p, t in _large_prefixes if t >= 4000]
+            if xlarge_prefixes:
+                prefix_text, token_count = random.choice(xlarge_prefixes)
+                messages = [
+                    {"role": "system", "content": prefix_text},
+                    {"role": "user", "content": "Provide a comprehensive analysis."},
+                ]
+                return messages, hash_prompt_prefix(messages), token_count
+
+        # Fallback
+        return _generate_large_prefix_prompt()
+
+
+# ============================================================================
+# Event Handlers
+# ============================================================================
+
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    """Called when the test starts."""
+    if isinstance(environment.runner, WorkerRunner):
+        return
+
+    logger.info("=" * 70)
+    logger.info("Starting Ranvier Real Backend Load Test")
+    logger.info("=" * 70)
+    logger.info(f"Benchmark Mode: {BENCHMARK_MODE}")
+    logger.info(f"Prompt Distribution: {PROMPT_DISTRIBUTION}")
+    logger.info(f"Shared Prefix Ratio: {SHARED_PREFIX_RATIO}")
+    logger.info(f"P99 Latency Threshold: {P99_LATENCY_THRESHOLD_MS}ms")
+    logger.info(f"Number of Backends: {NUM_BACKENDS}")
+    logger.info(f"Backends: {BACKENDS}")
+    logger.info(f"Number of Ranvier Nodes: {NUM_RANVIER_NODES}")
+    logger.info(f"Ranvier Nodes: {RANVIER_NODES}")
+
+    # Log large prefix configuration if using stress modes
+    dist = PROMPT_DISTRIBUTION.lower().replace("-", "_")
+    if dist in ["large_prefix", "stress"]:
+        logger.info(f"Large Prefix Mode:")
+        logger.info(f"  Min Tokens: {LARGE_PREFIX_MIN_TOKENS}")
+        logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
+        logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
+        logger.info(f"  Prefix Size Buckets: {PREFIX_SIZE_BUCKETS}")
+
+    logger.info("=" * 70)
+
+    # Pre-initialize large prefixes if using stress modes
+    if dist in ["large_prefix", "stress"]:
+        logger.info("Pre-generating large prefixes for stress testing...")
+        initialize_large_prefixes()
+
+    # Register backends
+    register_backends_on_all_nodes()
+
+    # Wait for backends to be ready
+    logger.info("Waiting for backends to warm up...")
+    time.sleep(5)
+
+    # Capture initial sync errors
+    capture_initial_sync_errors()
+
+    logger.info("Load test initialization complete")
+
+
+@events.test_stop.add_listener
+def on_test_stop(environment, **kwargs):
+    """Called when the test stops."""
+    if isinstance(environment.runner, WorkerRunner):
+        return
+
+    logger.info("=" * 70)
+    logger.info("Benchmark Results Summary")
+    logger.info("=" * 70)
+
+    # Get aggregated stats
+    summary = _benchmark_stats.get_summary()
+
+    # Print cache hit statistics
+    logger.info(f"Cache Statistics:")
+    logger.info(f"  Cache Hits: {summary['cache_hits']}")
+    logger.info(f"  Cache Misses: {summary['cache_misses']}")
+    logger.info(f"  Cache Hit Rate: {summary['cache_hit_rate_pct']:.1f}%")
+    logger.info(f"  Unique Prefixes: {summary['unique_prefixes']}")
+
+    # Print TTFT comparison
+    logger.info(f"\nTTFT Comparison:")
+    if summary['ttft_cache_hit_p50_ms']:
+        logger.info(f"  Cache Hit P50: {summary['ttft_cache_hit_p50_ms']:.1f}ms")
+        logger.info(f"  Cache Hit P99: {summary['ttft_cache_hit_p99_ms']:.1f}ms")
+    if summary['ttft_cache_miss_p50_ms']:
+        logger.info(f"  Cache Miss P50: {summary['ttft_cache_miss_p50_ms']:.1f}ms")
+        logger.info(f"  Cache Miss P99: {summary['ttft_cache_miss_p99_ms']:.1f}ms")
+    if summary['ttft_improvement_pct']:
+        logger.info(f"  TTFT Improvement: {summary['ttft_improvement_pct']:.1f}%")
+
+    # Print per-bucket statistics (for large-prefix stress testing)
+    bucket_stats = summary.get("bucket_stats", {})
+    if bucket_stats:
+        logger.info(f"\nTTFT by Prefix Size Bucket:")
+        logger.info(f"  {'Bucket':<10} {'Reqs':>8} {'P50':>10} {'P99':>10} {'Hit P50':>10} {'Miss P50':>10} {'Improv%':>10}")
+        logger.info(f"  {'-' * 68}")
+
+        for bucket_name in ["tiny", "small", "medium", "large", "xlarge"]:
+            if bucket_name in bucket_stats:
+                b = bucket_stats[bucket_name]
+                reqs = b.get("requests", 0)
+                p50 = b.get("ttft_p50_ms")
+                p99 = b.get("ttft_p99_ms")
+                hit_p50 = b.get("cache_hit_ttft_p50_ms")
+                miss_p50 = b.get("cache_miss_ttft_p50_ms")
+                improv = b.get("ttft_improvement_pct")
+
+                p50_str = f"{p50:.1f}ms" if p50 else "N/A"
+                p99_str = f"{p99:.1f}ms" if p99 else "N/A"
+                hit_str = f"{hit_p50:.1f}ms" if hit_p50 else "N/A"
+                miss_str = f"{miss_p50:.1f}ms" if miss_p50 else "N/A"
+                improv_str = f"{improv:.1f}%" if improv else "N/A"
+
+                logger.info(f"  {bucket_name:<10} {reqs:>8} {p50_str:>10} {p99_str:>10} {hit_str:>10} {miss_str:>10} {improv_str:>10}")
+
+        # Highlight large prefix improvements for stress testing
+        large_stats = bucket_stats.get("large", {})
+        xlarge_stats = bucket_stats.get("xlarge", {})
+
+        if large_stats.get("ttft_improvement_pct"):
+            logger.info(f"\n  Large Prefix (2000-4000 tokens) TTFT Improvement: {large_stats['ttft_improvement_pct']:.1f}%")
+        if xlarge_stats.get("ttft_improvement_pct"):
+            logger.info(f"  XLarge Prefix (4000-8000 tokens) TTFT Improvement: {xlarge_stats['ttft_improvement_pct']:.1f}%")
+
+    # Print throughput
+    logger.info(f"\nThroughput:")
+    logger.info(f"  Total Prompt Tokens: {summary['total_prompt_tokens']}")
+    logger.info(f"  Total Completion Tokens: {summary['total_completion_tokens']}")
+    logger.info(f"  Tokens/Second: {summary['tokens_per_second']:.1f}")
+
+    # Print Ranvier internal latency breakdown
+    latency_breakdown = get_ranvier_latency_breakdown()
+    logger.info(f"\nRanvier Latency Breakdown (avg):")
+    if latency_breakdown["routing_latency_ms"] is not None:
+        logger.info(f"  Routing Decision: {latency_breakdown['routing_latency_ms']:.2f}ms")
+    if latency_breakdown["connect_latency_ms"] is not None:
+        logger.info(f"  Backend Connect: {latency_breakdown['connect_latency_ms']:.2f}ms")
+    if latency_breakdown["first_byte_latency_ms"] is not None:
+        logger.info(f"  Backend First Byte: {latency_breakdown['first_byte_latency_ms']:.2f}ms")
+    if latency_breakdown["total_latency_ms"] is not None:
+        logger.info(f"  Total Request: {latency_breakdown['total_latency_ms']:.2f}ms")
+
+    # Calculate actual Ranvier overhead (routing + connect)
+    routing = latency_breakdown.get("routing_latency_ms") or 0
+    connect = latency_breakdown.get("connect_latency_ms") or 0
+    if routing > 0 or connect > 0:
+        ranvier_overhead = routing + connect
+        logger.info(f"  Ranvier Overhead: {ranvier_overhead:.2f}ms (routing + connect)")
+        latency_breakdown["ranvier_overhead_ms"] = ranvier_overhead
+
+    # Add to summary for JSON output
+    summary.update(latency_breakdown)
+
+    # Check sync errors
+    sync_passed, sync_msg = check_sync_errors()
+    logger.info(f"\nCluster Health: {sync_msg}")
+
+    # Validation
+    logger.info("=" * 70)
+    validation_passed = True
+
+    # Check P99 TTFT (use overall TTFT from Locust stats)
+    stats = environment.stats
+    ttft_stats = stats.get("TTFT (Time To First Token)", "GET")
+
+    if ttft_stats and ttft_stats.num_requests > 0:
+        p99_latency = ttft_stats.get_response_time_percentile(0.99)
+        if p99_latency is not None and p99_latency > P99_LATENCY_THRESHOLD_MS:
+            validation_passed = False
+            logger.error(f"FAIL: P99 TTFT {p99_latency:.1f}ms exceeds {P99_LATENCY_THRESHOLD_MS}ms threshold")
+        else:
+            logger.info(f"PASS: P99 TTFT {p99_latency:.1f}ms within threshold")
+
+    if not sync_passed:
+        validation_passed = False
+        logger.error(f"FAIL: {sync_msg}")
+
+    if validation_passed:
+        logger.info("BENCHMARK PASSED")
+    else:
+        logger.error("BENCHMARK FAILED")
+        environment.process_exit_code = 1
+
+    logger.info("=" * 70)
+
+    # Output machine-readable summary
+    logger.info("BENCHMARK_STATS_JSON:" + json.dumps(summary))
+
+
+# ============================================================================
+# Locust User Class
+# ============================================================================
+
+class RealBackendUser(HttpUser):
+    """Simulates users sending chat completion requests to real vLLM backends."""
+
+    wait_time = between(0.5, 2)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._request_count = 0
+
+    @task
+    def chat_completion(self):
+        """Send a chat completion request and collect detailed metrics."""
+        # Round-robin across Ranvier nodes
+        node_index = self._request_count % len(RANVIER_NODES)
+        self._request_count += 1
+
+        target_url = RANVIER_NODES[node_index]
+
+        # Generate prompt (now returns token count for stress testing)
+        messages, prefix_hash, estimated_tokens = generate_prompt()
+
+        # Determine prefix size bucket for metrics tracking
+        prefix_size_bucket = get_prefix_size_bucket(estimated_tokens)
+
+        request_body = {
+            "model": os.environ.get("VLLM_MODEL", "default"),
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 100,  # Limit output for benchmarking
+        }
+
+        # Initialize metrics
+        metrics = RequestMetrics(
+            request_id=f"req-{self._request_count}",
+            prompt_prefix_hash=prefix_hash,
+            routing_mode=BENCHMARK_MODE,
+            prefix_size_bucket=prefix_size_bucket,
+            estimated_prefix_tokens=estimated_tokens,
+        )
+
+        start_time = time.perf_counter()
+        ttft = None
+        response_text = ""
+
+        try:
+            resp = requests.post(
+                f"{target_url}/v1/chat/completions",
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                stream=True,
+                timeout=60,
+            )
+
+            # Get backend ID from response headers (Ranvier sets X-Backend-ID)
+            metrics.backend_id = get_backend_from_response(dict(resp.headers))
+            if metrics.backend_id is None:
+                if SINGLE_BACKEND_MODE:
+                    # Single backend mode: all requests go to backend 1
+                    metrics.backend_id = "1"
+                else:
+                    # Fallback: infer from node index (inaccurate for prefix routing)
+                    # This means X-Backend-ID header is missing - cache tracking will be wrong
+                    logger.warning("X-Backend-ID header missing - cache tracking may be inaccurate")
+                    metrics.backend_id = str((node_index % len(BACKENDS)) + 1)
+
+            if resp.status_code != 200:
+                events.request.fire(
+                    request_type="POST",
+                    name=f"/v1/chat/completions (node{node_index + 1})",
+                    response_time=(time.perf_counter() - start_time) * 1000,
+                    response_length=0,
+                    exception=Exception(f"Status: {resp.status_code}"),
+                    context={},
+                )
+                _benchmark_stats.record_request(metrics)
+                return
+
+            # Process streaming response
+            for line in resp.iter_lines():
+                if line:
+                    decoded = line.decode("utf-8")
+                    response_text += decoded + "\n"
+
+                    if decoded.startswith("data: "):
+                        if ttft is None:
+                            ttft = (time.perf_counter() - start_time) * 1000
+
+                        if decoded == "data: [DONE]":
+                            break
+
+            total_time = (time.perf_counter() - start_time) * 1000
+
+            # Parse usage stats
+            prompt_tokens, completion_tokens = parse_sse_usage(response_text)
+            metrics.prompt_tokens = prompt_tokens
+            metrics.completion_tokens = completion_tokens
+            metrics.ttft_ms = ttft
+            metrics.total_time_ms = total_time
+
+            # Record to global stats
+            _benchmark_stats.record_request(metrics)
+
+            # Fire Locust events
+            events.request.fire(
+                request_type="POST",
+                name=f"/v1/chat/completions (node{node_index + 1})",
+                response_time=total_time,
+                response_length=len(response_text),
+                exception=None,
+                context={},
+            )
+
+            if ttft is not None:
+                # Record TTFT
+                events.request.fire(
+                    request_type="GET",
+                    name="TTFT (Time To First Token)",
+                    response_time=ttft,
+                    response_length=0,
+                    exception=None,
+                    context={},
+                )
+
+                # Record cache-specific TTFT
+                cache_status = "hit" if metrics.is_cache_hit else "miss"
+                events.request.fire(
+                    request_type="GET",
+                    name=f"TTFT (Cache {cache_status.upper()})",
+                    response_time=ttft,
+                    response_length=0,
+                    exception=None,
+                    context={},
+                )
+
+                # Record bucket-specific TTFT for stress testing
+                if prefix_size_bucket and prefix_size_bucket != "unknown":
+                    events.request.fire(
+                        request_type="GET",
+                        name=f"TTFT ({prefix_size_bucket})",
+                        response_time=ttft,
+                        response_length=0,
+                        exception=None,
+                        context={},
+                    )
+
+                    # Record bucket + cache status for detailed analysis
+                    events.request.fire(
+                        request_type="GET",
+                        name=f"TTFT ({prefix_size_bucket} {cache_status})",
+                        response_time=ttft,
+                        response_length=0,
+                        exception=None,
+                        context={},
+                    )
+
+            if completion_tokens > 0:
+                # Record tokens per second for this request
+                gen_time_s = (total_time - (ttft or 0)) / 1000.0
+                if gen_time_s > 0:
+                    tps = completion_tokens / gen_time_s
+                    events.request.fire(
+                        request_type="METRIC",
+                        name="Tokens/Second",
+                        response_time=tps,  # Using response_time to record the metric
+                        response_length=completion_tokens,
+                        exception=None,
+                        context={},
+                    )
+
+        except Exception as e:
+            total_time = (time.perf_counter() - start_time) * 1000
+            events.request.fire(
+                request_type="POST",
+                name=f"/v1/chat/completions (node{node_index + 1})",
+                response_time=total_time,
+                response_length=0,
+                exception=e,
+                context={},
+            )
+            _benchmark_stats.record_request(metrics)
+            logger.warning(f"Request to node{node_index + 1} failed: {e}")

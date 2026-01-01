@@ -24,6 +24,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
@@ -40,21 +41,40 @@ ranvier::TokenizerService tokenizer;
 std::unique_ptr<ranvier::RouterService> router;
 
 // These are initialized in run() after config is loaded
-std::unique_ptr<ranvier::HttpController> controller;
+// HttpController MUST be sharded to avoid cross-shard memory access when
+// handling concurrent requests in multi-shard mode (--smp > 1).
+// Each shard needs its own ConnectionPool, RateLimiter, and request gate.
+seastar::sharded<ranvier::HttpController> controller;
 std::unique_ptr<ranvier::HealthService> health_checker;
 std::unique_ptr<ranvier::PersistenceStore> persistence;
 std::unique_ptr<ranvier::K8sDiscoveryService> k8s_discovery;
 
 // Helper to load persisted state into the router
+// Includes crash recovery: validates integrity, skips corrupted records, handles exceptions
 future<> load_persisted_state() {
     if (!persistence || !persistence->is_open()) {
         ranvier::log_main.info("No persistence store - starting with empty state");
         return make_ready_future<>();
     }
 
-    // Load backends first
+    // Step 1: Verify database integrity before loading
+    // This catches SQLite corruption from incomplete WAL recovery
+    if (!persistence->verify_integrity()) {
+        ranvier::log_main.error("Persistence integrity check failed - clearing corrupted state");
+        persistence->clear_all();
+        ranvier::log_main.info("Persistence store cleared - starting fresh");
+        return make_ready_future<>();
+    }
+
+    // Step 2: Load backends and routes (corrupted records are skipped internally)
     auto backends = persistence->load_backends();
     auto routes = persistence->load_routes();
+
+    // Check if any records were skipped due to corruption
+    size_t skipped = persistence->last_load_skipped_count();
+    if (skipped > 0) {
+        ranvier::log_main.warn("Skipped {} corrupted route records during load", skipped);
+    }
 
     if (backends.empty() && routes.empty()) {
         ranvier::log_main.info("Persistence store is empty - starting fresh");
@@ -63,7 +83,7 @@ future<> load_persisted_state() {
 
     ranvier::log_main.info("Restoring state from persistence:");
     ranvier::log_main.info("  Backends: {}", backends.size());
-    ranvier::log_main.info("  Routes:   {}", routes.size());
+    ranvier::log_main.info("  Routes:   {} (skipped {} corrupted)", routes.size(), skipped);
 
     // Log each backend at info level for visibility
     for (const auto& rec : backends) {
@@ -71,18 +91,62 @@ future<> load_persisted_state() {
             rec.id, rec.ip, rec.port, rec.weight, rec.priority);
     }
 
-    return do_with(std::move(backends), std::move(routes), [](auto& backends, auto& routes) {
-        return do_for_each(backends, [](const ranvier::BackendRecord& rec) {
-            socket_address addr(ipv4_addr(rec.ip, rec.port));
-            return router->register_backend_global(rec.id, addr, rec.weight, rec.priority);
-        }).then([&routes] {
-            return do_for_each(routes, [](const ranvier::RouteRecord& rec) {
-                return router->learn_route_global(rec.tokens, rec.backend_id);
+    // Step 3: Restore backends first, then routes
+    // Each step has exception handling to continue on partial failures
+    return do_with(std::move(backends), std::move(routes),
+                   size_t(0), size_t(0),  // Counters for failed backends/routes
+        [](auto& backends, auto& routes, size_t& failed_backends, size_t& failed_routes) {
+            // Restore backends with individual exception handling
+            return do_for_each(backends, [&failed_backends](const ranvier::BackendRecord& rec) {
+                socket_address addr(ipv4_addr(rec.ip, rec.port));
+                return router->register_backend_global(rec.id, addr, rec.weight, rec.priority)
+                    .handle_exception([&failed_backends, id = rec.id](auto ep) {
+                        failed_backends++;
+                        try {
+                            std::rethrow_exception(ep);
+                        } catch (const std::exception& e) {
+                            ranvier::log_main.warn("Failed to restore backend {}: {}", id, e.what());
+                        }
+                        return make_ready_future<>();
+                    });
+            }).then([&routes, &failed_routes] {
+                // Restore routes with individual exception handling
+                // Routes are less critical - they can be relearned from traffic
+                return do_for_each(routes, [&failed_routes](const ranvier::RouteRecord& rec) {
+                    // Copy tokens to avoid lifetime issues in async context
+                    // The do_with inside learn_route_global needs its own copy
+                    auto tokens_copy = rec.tokens;
+                    return router->learn_route_global(std::move(tokens_copy), rec.backend_id)
+                        .handle_exception([&failed_routes](auto ep) {
+                            failed_routes++;
+                            // Log at debug level - route failures are common and recoverable
+                            try {
+                                std::rethrow_exception(ep);
+                            } catch (const std::exception& e) {
+                                ranvier::log_main.debug("Failed to restore route: {}", e.what());
+                            }
+                            return make_ready_future<>();
+                        });
+                });
+            }).then([&failed_backends, &failed_routes] {
+                if (failed_backends > 0 || failed_routes > 0) {
+                    ranvier::log_main.warn("State restoration completed with errors: "
+                                           "{} backend failures, {} route failures",
+                                           failed_backends, failed_routes);
+                } else {
+                    ranvier::log_main.info("State restoration complete");
+                }
             });
+        }).handle_exception([](auto ep) {
+            // Catch-all for unexpected errors during restoration
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                ranvier::log_main.error("State restoration failed: {} - starting with empty state", e.what());
+            }
+            // Continue startup even if restoration fails completely
+            return make_ready_future<>();
         });
-    }).then([] {
-        ranvier::log_main.info("State restoration complete");
-    });
 }
 
 // Hot-reload configuration on SIGHUP
@@ -146,10 +210,15 @@ future<> reload_config() {
         ctrl_config.enable_token_forwarding = g_config.routing.enable_token_forwarding;
         ctrl_config.accept_client_tokens = g_config.routing.accept_client_tokens;
         ctrl_config.max_token_id = g_config.routing.max_token_id;
-        controller->update_config(ctrl_config);
+        ctrl_config.routing_mode = g_config.routing.routing_mode;
 
-        // Update routing config on all shards
-        return router->update_routing_config(g_config.routing).then([] {
+        // Update HttpController config on all shards (controller is sharded)
+        return controller.invoke_on_all([ctrl_config](ranvier::HttpController& c) {
+            c.update_config(ctrl_config);
+        }).then([] {
+            // Update routing config on all shards
+            return router->update_routing_config(g_config.routing);
+        }).then([] {
             ranvier::log_main.info("Configuration reloaded successfully");
         });
 
@@ -181,7 +250,12 @@ future<> run() {
             g_config.cluster.peers.size(), g_config.cluster.gossip_port);
     }
 
-    // 2. Init Controller with config
+    // 2. Build HttpController config
+    // HttpController must be sharded because it contains shard-local state:
+    // - ConnectionPool: manages TCP connections per-shard
+    // - RateLimiter: tracks per-client request rates
+    // - request_gate: tracks in-flight requests for graceful shutdown
+    // Without sharding, requests on shard N would access shard 0's memory → segfault
     ranvier::HttpControllerConfig ctrl_config;
     ctrl_config.pool.max_connections_per_host = g_config.pool.max_connections_per_host;
     ctrl_config.pool.idle_timeout = g_config.pool.idle_timeout;
@@ -206,64 +280,87 @@ future<> run() {
     ctrl_config.enable_token_forwarding = g_config.routing.enable_token_forwarding;
     ctrl_config.accept_client_tokens = g_config.routing.accept_client_tokens;
     ctrl_config.max_token_id = g_config.routing.max_token_id;
-    controller = std::make_unique<ranvier::HttpController>(tokenizer, *router, ctrl_config);
+    ctrl_config.routing_mode = g_config.routing.routing_mode;
 
-    // 2a. Initialize metrics on all shards
-    ranvier::init_metrics();
+    // 3. Initialize router's thread-local data on all shards, then start services
+    // Each shard needs its own RadixTree and backend maps for the shared-nothing architecture
+    return router->initialize_shards().then([ctrl_config] {
+        // Start HttpController on all shards - each shard gets its own instance
+        return controller.start(std::ref(tokenizer), std::ref(*router), ctrl_config);
+    }).then([] {
+        // Initialize metrics on ALL shards (not just shard 0)
+        // Each shard needs its own MetricsService for the shared-nothing architecture
+        return seastar::smp::invoke_on_all([] {
+            ranvier::init_metrics();
+        });
+    }).then([] {
+        // 3. Init Persistence
+        persistence = ranvier::create_persistence_store();
+        if (persistence->open(g_config.database.path)) {
+            ranvier::log_main.info("Persistence initialized (SQLite: {})", g_config.database.path);
 
-    // 3. Init Persistence
-    persistence = ranvier::create_persistence_store();
-    if (persistence->open(g_config.database.path)) {
-        ranvier::log_main.info("Persistence initialized (SQLite: {})", g_config.database.path);
-        controller->set_persistence(persistence.get());
-    } else {
-        ranvier::log_main.warn("Failed to open persistence store - running without persistence");
-    }
+            // Checkpoint WAL on startup to ensure clean state after potential crash
+            // This flushes any pending WAL entries to the main database file
+            if (persistence->checkpoint()) {
+                ranvier::log_main.debug("Persistence WAL checkpoint complete");
+            } else {
+                ranvier::log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
+            }
 
-    // 4. Init Health Checker with config
-    ranvier::HealthServiceConfig health_config;
-    health_config.check_interval = g_config.health.check_interval;
-    health_config.check_timeout = g_config.health.check_timeout;
-    health_config.failure_threshold = g_config.health.failure_threshold;
-    health_config.recovery_threshold = g_config.health.recovery_threshold;
-    health_checker = std::make_unique<ranvier::HealthService>(*router, health_config);
-    health_checker->start();
-
-    // 4a. Init K8s Discovery Service if enabled
-    if (g_config.k8s_discovery.enabled) {
-        ranvier::K8sDiscoveryConfig k8s_config;
-        k8s_config.enabled = g_config.k8s_discovery.enabled;
-        k8s_config.api_server = g_config.k8s_discovery.api_server;
-        k8s_config.namespace_name = g_config.k8s_discovery.namespace_name;
-        k8s_config.service_name = g_config.k8s_discovery.service_name;
-        k8s_config.target_port = g_config.k8s_discovery.target_port;
-        k8s_config.token_path = g_config.k8s_discovery.token_path;
-        k8s_config.ca_cert_path = g_config.k8s_discovery.ca_cert_path;
-        k8s_config.poll_interval = g_config.k8s_discovery.poll_interval;
-        k8s_config.watch_timeout = g_config.k8s_discovery.watch_timeout;
-        k8s_config.watch_reconnect_delay = g_config.k8s_discovery.watch_reconnect_delay;
-        k8s_config.watch_reconnect_max_delay = g_config.k8s_discovery.watch_reconnect_max_delay;
-        k8s_config.verify_tls = g_config.k8s_discovery.verify_tls;
-        k8s_config.label_selector = g_config.k8s_discovery.label_selector;
-
-        k8s_discovery = std::make_unique<ranvier::K8sDiscoveryService>(k8s_config);
-
-        // Connect K8s discovery to router
-        k8s_discovery->set_register_callback(
-            [](ranvier::BackendId id, socket_address addr, uint32_t weight, uint32_t priority) {
-                return router->register_backend_global(id, addr, weight, priority);
+            // Set persistence on all shards - persistence store is thread-safe for writes
+            return controller.invoke_on_all([](ranvier::HttpController& c) {
+                c.set_persistence(persistence.get());
             });
-        k8s_discovery->set_drain_callback(
-            [](ranvier::BackendId id) {
-                return router->drain_backend_global(id);
-            });
+        } else {
+            ranvier::log_main.warn("Failed to open persistence store - running without persistence");
+            return make_ready_future<>();
+        }
+    }).then([] {
+        // 4. Init Health Checker with config
+        ranvier::HealthServiceConfig health_config;
+        health_config.check_interval = g_config.health.check_interval;
+        health_config.check_timeout = g_config.health.check_timeout;
+        health_config.failure_threshold = g_config.health.failure_threshold;
+        health_config.recovery_threshold = g_config.health.recovery_threshold;
+        health_checker = std::make_unique<ranvier::HealthService>(*router, health_config);
+        health_checker->start();
 
-        ranvier::log_main.info("K8s discovery configured for {}/{}",
-            g_config.k8s_discovery.namespace_name, g_config.k8s_discovery.service_name);
-    }
+        // 4a. Init K8s Discovery Service if enabled
+        if (g_config.k8s_discovery.enabled) {
+            ranvier::K8sDiscoveryConfig k8s_config;
+            k8s_config.enabled = g_config.k8s_discovery.enabled;
+            k8s_config.api_server = g_config.k8s_discovery.api_server;
+            k8s_config.namespace_name = g_config.k8s_discovery.namespace_name;
+            k8s_config.service_name = g_config.k8s_discovery.service_name;
+            k8s_config.target_port = g_config.k8s_discovery.target_port;
+            k8s_config.token_path = g_config.k8s_discovery.token_path;
+            k8s_config.ca_cert_path = g_config.k8s_discovery.ca_cert_path;
+            k8s_config.poll_interval = g_config.k8s_discovery.poll_interval;
+            k8s_config.watch_timeout = g_config.k8s_discovery.watch_timeout;
+            k8s_config.watch_reconnect_delay = g_config.k8s_discovery.watch_reconnect_delay;
+            k8s_config.watch_reconnect_max_delay = g_config.k8s_discovery.watch_reconnect_max_delay;
+            k8s_config.verify_tls = g_config.k8s_discovery.verify_tls;
+            k8s_config.label_selector = g_config.k8s_discovery.label_selector;
 
-    // 5. Start gossip service if cluster mode is enabled
-    return router->start_gossip().then([] {
+            k8s_discovery = std::make_unique<ranvier::K8sDiscoveryService>(k8s_config);
+
+            // Connect K8s discovery to router
+            k8s_discovery->set_register_callback(
+                [](ranvier::BackendId id, socket_address addr, uint32_t weight, uint32_t priority) {
+                    return router->register_backend_global(id, addr, weight, priority);
+                });
+            k8s_discovery->set_drain_callback(
+                [](ranvier::BackendId id) {
+                    return router->drain_backend_global(id);
+                });
+
+            ranvier::log_main.info("K8s discovery configured for {}/{}",
+                g_config.k8s_discovery.namespace_name, g_config.k8s_discovery.service_name);
+        }
+
+        // 5. Start gossip service if cluster mode is enabled
+        return router->start_gossip();
+    }).then([] {
         // 6. Load persisted state
         return load_persisted_state();
     }).then([] {
@@ -318,7 +415,9 @@ future<> run() {
                 return api_server.start();
             }).then([&api_server] {
                 return api_server.set_routes([](seastar::httpd::routes& r) {
-                    controller->register_routes(r);
+                    // Use controller.local() to get the shard-local HttpController instance
+                    // This is critical: each shard's routes must use that shard's controller
+                    controller.local().register_routes(r);
                 });
             }).then([&api_server, &tls_creds] {
                 auto addr = socket_address(ipv4_addr(g_config.server.bind_address, g_config.server.api_port));
@@ -352,11 +451,15 @@ future<> run() {
                 auto graceful_shutdown = [stop_signal]() {
                     ranvier::log_main.info("Shutdown signal received - initiating graceful shutdown");
 
-                    // Start draining (reject new requests)
-                    controller->start_draining();
-
-                    // Wait for in-flight requests to complete, then signal stop
-                    (void)controller->wait_for_drain().then([stop_signal] {
+                    // Start draining on ALL shards (reject new requests)
+                    (void)controller.invoke_on_all([](ranvier::HttpController& c) {
+                        c.start_draining();
+                    }).then([] {
+                        // Wait for in-flight requests on ALL shards to complete
+                        return controller.invoke_on_all([](ranvier::HttpController& c) {
+                            return c.wait_for_drain();
+                        });
+                    }).then([stop_signal] {
                         stop_signal->set_value();
                     }).handle_exception([stop_signal](auto ep) {
                         try {
@@ -395,12 +498,24 @@ future<> run() {
                         });
                     });
                 });
+            }).then([] {
+                // Stop the sharded HttpController (cleans up per-shard resources)
+                return controller.stop();
             }).finally([] {
                 // Log shutdown summary and close persistence
                 if (persistence && persistence->is_open()) {
                     ranvier::log_main.info("Shutdown summary:");
                     ranvier::log_main.info("  Persisted backends: {}", persistence->backend_count());
                     ranvier::log_main.info("  Persisted routes:   {}", persistence->route_count());
+
+                    // Checkpoint WAL before closing to ensure all data is durable
+                    // This prevents data loss if the process is killed shortly after
+                    if (persistence->checkpoint()) {
+                        ranvier::log_main.debug("Final WAL checkpoint complete");
+                    } else {
+                        ranvier::log_main.warn("Final WAL checkpoint failed - some data may be in WAL");
+                    }
+
                     persistence->close();
                     ranvier::log_main.info("Persistence store closed");
                 }

@@ -207,6 +207,18 @@ target_link_libraries(request_rewriter_test
 )
 gtest_discover_tests(request_rewriter_test)
 
+# Prefix Affinity Unit Tests (Pure C++, no Seastar dependency)
+# Tests for prefix-affinity routing hash function and backend selection
+add_executable(prefix_affinity_test
+  tests/unit/prefix_affinity_test.cpp
+)
+target_include_directories(prefix_affinity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(prefix_affinity_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(prefix_affinity_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)
     add_executable(stream_parser_test

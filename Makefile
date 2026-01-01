@@ -1,7 +1,10 @@
 # Ranvier Core Makefile
 # Build and test targets for the Ranvier LLM routing layer
 
-.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down help
+# Use bash for PIPESTATUS support in benchmark targets
+SHELL := /bin/bash
+
+.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down help
 
 # Default target
 all: build
@@ -203,6 +206,272 @@ benchmark-down:
 	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans
 	@echo "Cleanup complete"
 
+# ============================================================================
+# Real vLLM Backend Benchmarking
+# ============================================================================
+# These targets run benchmarks against real vLLM backends instead of mock backends.
+# This validates the actual value proposition of prefix-aware routing.
+
+COMPOSE_REAL_ARGS := -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real
+BENCHMARK_REAL_DURATION ?= 5m
+BENCHMARK_REAL_USERS ?= 10
+BENCHMARK_REAL_SPAWN_RATE ?= 2
+BENCHMARK_REAL_REPORT_DIR ?= benchmark-reports
+
+# Run benchmark against real vLLM backends (external endpoints)
+# Requires VLLM_ENDPOINT_1 and VLLM_ENDPOINT_2 environment variables
+benchmark-real:
+	@echo "======================================"
+	@echo "Running Real vLLM Backend Benchmark"
+	@echo "======================================"
+	@echo ""
+	@if [ -z "$$VLLM_ENDPOINT_1" ] || [ -z "$$VLLM_ENDPOINT_2" ]; then \
+		echo "Error: VLLM_ENDPOINT_1 and VLLM_ENDPOINT_2 must be set"; \
+		echo ""; \
+		echo "Example:"; \
+		echo "  VLLM_ENDPOINT_1=http://gpu-server1:8000 \\"; \
+		echo "  VLLM_ENDPOINT_2=http://gpu-server2:8000 \\"; \
+		echo "  make benchmark-real"; \
+		echo ""; \
+		echo "Or use 'make benchmark-real-local' for local vLLM (requires GPU)"; \
+		exit 1; \
+	fi
+	@echo "Configuration:"
+	@echo "  vLLM Endpoint 1: $$VLLM_ENDPOINT_1"
+	@echo "  vLLM Endpoint 2: $$VLLM_ENDPOINT_2"
+	@echo "  Users: $(BENCHMARK_REAL_USERS)"
+	@echo "  Spawn rate: $(BENCHMARK_REAL_SPAWN_RATE)/s"
+	@echo "  Duration: $(BENCHMARK_REAL_DURATION)"
+	@echo "  Routing mode: $${RANVIER_ROUTING_MODE:-prefix}"
+	@echo ""
+	@mkdir -p $(BENCHMARK_REAL_REPORT_DIR)
+	@echo "Starting Ranvier cluster..."
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile benchmark up -d --build
+	@echo "Waiting for cluster to become healthy..."
+	@sleep 15
+	@echo ""
+	@echo "Starting load test..."
+	@BENCHMARK_RUN_NAME=$$(date +%Y%m%d_%H%M%S)_real; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile benchmark run --rm \
+		-e BENCHMARK_MODE=$${RANVIER_ROUTING_MODE:-prefix} \
+		locust \
+		-f /mnt/locust/locustfile_real.py \
+		--host=http://172.29.2.1:8080 \
+		--users $(BENCHMARK_REAL_USERS) \
+		--spawn-rate $(BENCHMARK_REAL_SPAWN_RATE) \
+		--run-time $(BENCHMARK_REAL_DURATION) \
+		--headless \
+		--only-summary \
+		--exit-code-on-error 1 \
+		2>&1 | tee $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
+	echo ""; \
+	echo "Parsing results..."; \
+	python3 tests/integration/parse_real_benchmark.py \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		2>/dev/null || echo "  (parser output above)"; \
+	echo "Stopping cluster..."; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile benchmark down -v --remove-orphans; \
+	echo ""; \
+	if [ $$LOCUST_EXIT -ne 0 ]; then \
+		echo "======================================"; \
+		echo "BENCHMARK FAILED (exit code: $$LOCUST_EXIT)"; \
+		echo "======================================"; \
+	else \
+		echo "======================================"; \
+		echo "BENCHMARK PASSED"; \
+		echo "======================================"; \
+	fi; \
+	echo "Results saved to: $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_*"; \
+	exit $$LOCUST_EXIT
+
+# Run benchmark with local vLLM containers (requires NVIDIA GPU)
+benchmark-real-local:
+	@echo "======================================"
+	@echo "Running Local vLLM Backend Benchmark"
+	@echo "======================================"
+	@echo ""
+	@# Pre-flight checks for required environment
+	@if ! command -v nvidia-smi >/dev/null 2>&1; then \
+		echo "Error: nvidia-smi not found. GPU required for local vLLM."; \
+		exit 1; \
+	fi
+	@if [ -z "$${HF_TOKEN:-}" ]; then \
+		echo "======================================"; \
+		echo "Error: HF_TOKEN environment variable not set"; \
+		echo "======================================"; \
+		echo ""; \
+		echo "The Llama model requires authentication with Hugging Face."; \
+		echo ""; \
+		echo "To fix:"; \
+		echo "  1. Get a token from https://huggingface.co/settings/tokens"; \
+		echo "  2. Accept the license at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct"; \
+		echo "  3. Run: export HF_TOKEN=your_token_here"; \
+		echo "  4. Re-run this benchmark"; \
+		echo ""; \
+		exit 1; \
+	fi
+	@echo "GPU detected. Starting local vLLM backends..."
+	@echo "Model: $${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
+	@echo ""
+	@mkdir -p $(BENCHMARK_REAL_REPORT_DIR)
+	@echo "Starting vLLM backends and Ranvier cluster..."
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark up -d --build
+	@echo "Waiting for vLLM backends to load model (this may take a few minutes)..."
+	@sleep 120
+	@echo ""
+	@echo "Starting load test..."
+	@BENCHMARK_RUN_NAME=$$(date +%Y%m%d_%H%M%S)_local; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark run --rm \
+		-e BENCHMARK_MODE=$${RANVIER_ROUTING_MODE:-prefix} \
+		locust \
+		-f /mnt/locust/locustfile_real.py \
+		--host=http://172.29.2.1:8080 \
+		--users $(BENCHMARK_REAL_USERS) \
+		--spawn-rate $(BENCHMARK_REAL_SPAWN_RATE) \
+		--run-time $(BENCHMARK_REAL_DURATION) \
+		--headless \
+		--only-summary \
+		--exit-code-on-error 1 \
+		2>&1 | tee $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
+	echo ""; \
+	echo "Parsing results..."; \
+	python3 tests/integration/parse_real_benchmark.py \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		2>/dev/null || echo "  (parser output above)"; \
+	echo "Stopping cluster..."; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark down -v --remove-orphans; \
+	echo ""; \
+	if [ $$LOCUST_EXIT -ne 0 ]; then \
+		echo "======================================"; \
+		echo "BENCHMARK FAILED (exit code: $$LOCUST_EXIT)"; \
+		echo "======================================"; \
+	else \
+		echo "======================================"; \
+		echo "BENCHMARK PASSED"; \
+		echo "======================================"; \
+	fi; \
+	echo "Results saved to: $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_*"; \
+	exit $$LOCUST_EXIT
+
+# Run benchmark with single GPU (sanity check mode)
+# Useful when you only have 1 GPU available for testing
+benchmark-single-gpu:
+	@echo "======================================"
+	@echo "Running Single-GPU Benchmark Test"
+	@echo "======================================"
+	@echo ""
+	@# Pre-flight checks for required environment
+	@if ! command -v nvidia-smi >/dev/null 2>&1; then \
+		echo "Error: nvidia-smi not found. GPU required."; \
+		exit 1; \
+	fi
+	@if [ -z "$${HF_TOKEN:-}" ]; then \
+		echo "======================================"; \
+		echo "Error: HF_TOKEN environment variable not set"; \
+		echo "======================================"; \
+		echo ""; \
+		echo "The Llama model requires authentication with Hugging Face."; \
+		echo ""; \
+		echo "To fix:"; \
+		echo "  1. Get a token from https://huggingface.co/settings/tokens"; \
+		echo "  2. Accept the license at https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct"; \
+		echo "  3. Run: export HF_TOKEN=your_token_here"; \
+		echo "  4. Re-run this benchmark"; \
+		echo ""; \
+		exit 1; \
+	fi
+	@echo "GPU detected:"
+	@nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
+	@echo ""
+	@echo "This is a sanity check test with a single vLLM backend."
+	@echo "For A/B comparison of routing strategies, use 2+ GPUs."
+	@echo "Model: $${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}"
+	@echo ""
+	@mkdir -p $(BENCHMARK_REAL_REPORT_DIR)
+	@echo "Starting vLLM backend and Ranvier cluster..."
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu up -d --build
+	@echo "Waiting for vLLM backend to load model (this may take 2-3 minutes)..."
+	@sleep 120
+	@echo ""
+	@echo "Starting load test..."
+	@BENCHMARK_RUN_NAME=$$(date +%Y%m%d_%H%M%S)_single_gpu; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu run --rm \
+		-e BENCHMARK_MODE=$${RANVIER_ROUTING_MODE:-prefix} \
+		locust-single-gpu \
+		-f /mnt/locust/locustfile_real.py \
+		--host=http://172.29.2.1:8080 \
+		--users $(BENCHMARK_REAL_USERS) \
+		--spawn-rate $(BENCHMARK_REAL_SPAWN_RATE) \
+		--run-time $(BENCHMARK_REAL_DURATION) \
+		--headless \
+		--only-summary \
+		--exit-code-on-error 1 \
+		--stop-timeout 10 \
+		2>&1 | tee $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
+	echo ""; \
+	echo "Parsing results..."; \
+	python3 tests/integration/parse_real_benchmark.py \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
+		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		2>/dev/null || echo "  (parser output above)"; \
+	echo "Stopping cluster..."; \
+	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu down -v --remove-orphans; \
+	echo ""; \
+	if [ $$LOCUST_EXIT -ne 0 ]; then \
+		echo "======================================"; \
+		echo "BENCHMARK FAILED (exit code: $$LOCUST_EXIT)"; \
+		echo "======================================"; \
+	else \
+		echo "======================================"; \
+		echo "BENCHMARK PASSED"; \
+		echo "======================================"; \
+	fi; \
+	echo "Results saved to: $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_*"; \
+	exit $$LOCUST_EXIT
+
+# Run A/B comparison: prefix-aware vs round-robin routing
+benchmark-comparison:
+	@echo "======================================"
+	@echo "Running Routing Strategy Comparison"
+	@echo "======================================"
+	@echo ""
+	@echo "This will run two benchmarks:"
+	@echo "  1. Round-robin routing (baseline)"
+	@echo "  2. Prefix-aware routing (optimized)"
+	@echo ""
+	@python3 tests/integration/run_benchmark_comparison.py \
+		--duration $(BENCHMARK_REAL_DURATION) \
+		--users $(BENCHMARK_REAL_USERS) \
+		--spawn-rate $(BENCHMARK_REAL_SPAWN_RATE) \
+		$(if $(LOCAL_VLLM),--local-vllm,)
+
+# Start real benchmark cluster for interactive testing
+benchmark-real-up:
+	@echo "Starting real vLLM benchmark cluster..."
+	@if [ -z "$$VLLM_ENDPOINT_1" ] || [ -z "$$VLLM_ENDPOINT_2" ]; then \
+		echo "Warning: VLLM_ENDPOINT_* not set, using defaults"; \
+	fi
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile benchmark up -d --build
+	@echo ""
+	@echo "Cluster started. Endpoints:"
+	@echo "  Locust Web UI: http://localhost:8089"
+	@echo "  Node 1: http://localhost:8081 (metrics: http://localhost:9181)"
+	@echo "  Node 2: http://localhost:8082 (metrics: http://localhost:9182)"
+	@echo "  Node 3: http://localhost:8083 (metrics: http://localhost:9183)"
+	@echo ""
+	@echo "Use 'make benchmark-real-down' to stop"
+
+# Stop real benchmark cluster
+benchmark-real-down:
+	@echo "Stopping real benchmark cluster..."
+	@$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark --profile single-gpu down -v --remove-orphans
+	@echo "Cleanup complete"
+
 # Build Docker production image (uses docker-compose to work in devcontainers)
 docker-build:
 	@echo "Building production Docker image..."
@@ -238,22 +507,35 @@ help:
 	@echo "  make test-unit      - Run unit tests"
 	@echo "  make test-integration - Run multi-node integration tests"
 	@echo ""
-	@echo "Benchmark targets:"
-	@echo "  make benchmark      - Run Locust load test (headless, 5 min)"
-	@echo "                        Outputs: benchmark-reports/*.csv, *.html"
-	@echo "                        Fails if: P99 TTFT > threshold or sync errors > 0"
+	@echo "Mock Backend Benchmark (fast, validates router overhead):"
+	@echo "  make benchmark      - Run Locust load test with mock backends"
 	@echo "  make benchmark-up   - Start cluster with Locust web UI (port 8089)"
 	@echo "  make benchmark-down - Stop benchmark cluster"
+	@echo ""
+	@echo "Real vLLM Backend Benchmark (validates prefix-aware routing value):"
+	@echo "  make benchmark-real       - Run with external vLLM endpoints"
+	@echo "                              Requires: VLLM_ENDPOINT_1, VLLM_ENDPOINT_2"
+	@echo "  make benchmark-real-local - Run with local vLLM (requires 2 GPUs)"
+	@echo "  make benchmark-single-gpu - Sanity check with 1 GPU (no A/B test)"
+	@echo "  make benchmark-comparison - A/B test: prefix vs round-robin routing"
+	@echo "  make benchmark-real-up    - Start cluster for interactive testing"
+	@echo "  make benchmark-real-down  - Stop real benchmark cluster"
+	@echo ""
+	@echo "  Example:"
+	@echo "    VLLM_ENDPOINT_1=http://gpu1:8000 VLLM_ENDPOINT_2=http://gpu2:8000 \\"
+	@echo "    make benchmark-real"
 	@echo ""
 	@echo "  Benchmark variables (override with make benchmark VAR=value):"
 	@echo "    BENCHMARK_USERS=10       - Number of concurrent users"
 	@echo "    BENCHMARK_SPAWN_RATE=2   - Users spawned per second"
 	@echo "    BENCHMARK_DURATION=5m    - Test duration"
 	@echo "    BENCHMARK_REPORT_DIR=benchmark-reports - Report output dir"
-	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT latency threshold (ms)"
-	@echo "    BENCHMARK_LABEL=<name>   - Label prefix (e.g., token_on → token_on_YYYYMMDD_HHMMSS)"
+	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT threshold (mock: 100ms, real: 5000ms)"
+	@echo "    BENCHMARK_LABEL=<name>   - Label prefix for output files"
 	@echo "    BENCHMARK_BUILD=1        - Set to 0 to skip rebuilding images"
-	@echo "    BENCHMARK_TOKEN_FORWARDING=0 - Set to 1 to enable token forwarding"
+	@echo "    RANVIER_ROUTING_MODE=prefix - Routing mode: prefix or round_robin"
+	@echo "    PROMPT_DISTRIBUTION=mixed   - Prompt length: short, medium, long, mixed"
+	@echo "    SHARED_PREFIX_RATIO=0.7     - Ratio of requests with shared prefix"
 	@echo ""
 	@echo "  Compare benchmark results:"
 	@echo "    python3 tests/integration/compare_results.py <baseline.csv> <new.csv>"

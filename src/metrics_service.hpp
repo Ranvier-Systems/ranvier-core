@@ -133,12 +133,12 @@ class MetricsService {
 
     // Per-backend histogram storage for labeled metrics
     struct BackendMetrics {
-        MetricHistogram backend_latency;
+        MetricHistogram latency;  // ranvier_backend_latency_seconds
         MetricHistogram first_byte_latency;
         bool registered = false;
 
         BackendMetrics()
-            : backend_latency(backend_latency_buckets())
+            : latency(backend_latency_buckets())
             , first_byte_latency(backend_latency_buckets()) {}
     };
 
@@ -203,7 +203,20 @@ public:
 
             // Active proxy requests gauge
             seastar::metrics::make_gauge("active_proxy_requests", _active_requests,
-                seastar::metrics::description("Current number of in-flight proxy requests"))
+                seastar::metrics::description("Current number of in-flight proxy requests")),
+
+            // Cache hit ratio gauge: hits / (hits + misses)
+            // Returns 0.0 when no requests have been made (divide-by-zero protection)
+            // Useful for detecting KV-cache thrashing before it impacts user experience
+            seastar::metrics::make_gauge("cache_hit_ratio",
+                seastar::metrics::description("Ratio of cache hits to total cache lookups (0.0-1.0). Returns 0.0 when cluster first starts."),
+                [this] {
+                    uint64_t total = _cache_hits + _cache_misses;
+                    if (total == 0) {
+                        return 0.0;  // Avoid divide-by-zero on startup
+                    }
+                    return static_cast<double>(_cache_hits) / static_cast<double>(total);
+                })
         });
     }
 
@@ -216,6 +229,13 @@ public:
     void record_timeout() { _requests_timeout++; }
     void record_rate_limited() { _requests_rate_limited++; }
     void record_connection_error() { _requests_connection_error++; }
+
+    // Cache hit/miss tracking for ranvier_cache_hit_ratio gauge
+    // These are shard-local (lock-free) for hot path efficiency
+    void record_cache_hit() { _cache_hits++; }
+    void record_cache_miss() { _cache_misses++; }
+    uint64_t get_cache_hits() const { return _cache_hits; }
+    uint64_t get_cache_misses() const { return _cache_misses; }
 
     // Record circuit breaker events
     void record_circuit_open() { _circuit_opens++; }
@@ -261,9 +281,11 @@ public:
     }
 
     // Record latency with backend_id label for GPU model comparison
+    // This populates ranvier_backend_latency_seconds{backend_id="X"}
+    // Shard-local for lock-free hot path efficiency
     void record_backend_latency_by_id(BackendId backend_id, double seconds) {
         auto& backend_metrics = get_or_create_backend_metrics(backend_id);
-        backend_metrics.backend_latency.record(seconds);
+        backend_metrics.latency.record(seconds);
         // Also record in the aggregate histogram
         _router_backend_latency.record(seconds);
     }
@@ -294,6 +316,11 @@ private:
     uint64_t _circuit_opens = 0;
     uint64_t _fallback_attempts = 0;
 
+    // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
+    // Shard-local for lock-free hot path performance
+    uint64_t _cache_hits = 0;
+    uint64_t _cache_misses = 0;
+
     // Active requests gauge
     uint64_t _active_requests = 0;
 
@@ -312,6 +339,7 @@ private:
     std::unordered_map<BackendId, BackendMetrics> _per_backend_metrics;
 
     // Get or create per-backend metrics and register with Seastar
+    // Metrics are shard-local (lock-free) to maintain hot path efficiency
     BackendMetrics& get_or_create_backend_metrics(BackendId backend_id) {
         auto it = _per_backend_metrics.find(backend_id);
         if (it != _per_backend_metrics.end()) {
@@ -322,15 +350,18 @@ private:
         auto& metrics = _per_backend_metrics[backend_id];
 
         // Register per-backend histograms with Seastar metrics
+        // Uses backend_id label to segment data for identifying slow GPUs in the cluster
         std::string backend_id_str = std::to_string(backend_id);
         _backend_metrics.add_group("ranvier", {
-            seastar::metrics::make_histogram("router_backend_latency_by_id_seconds",
-                seastar::metrics::description("Backend processing latency by backend ID (for GPU model comparison)"),
+            // Per-backend latency histogram for GPU model comparison (e.g., H100 vs A100)
+            // Allows operators to identify slow GPUs in the cluster
+            seastar::metrics::make_histogram("backend_latency_seconds",
+                seastar::metrics::description("Backend processing latency in seconds, segmented by backend_id. Use to identify slow GPUs in the cluster."),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return metrics.backend_latency.data; }),
+                [&metrics] { return metrics.latency.data; }),
 
-            seastar::metrics::make_histogram("router_first_byte_latency_by_id_seconds",
-                seastar::metrics::description("Time to first byte from backend by backend ID"),
+            seastar::metrics::make_histogram("backend_first_byte_latency_seconds",
+                seastar::metrics::description("Time to first byte from backend in seconds, segmented by backend_id."),
                 {{"backend_id", backend_id_str}},
                 [&metrics] { return metrics.first_byte_latency.data; })
         });

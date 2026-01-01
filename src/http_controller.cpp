@@ -20,12 +20,6 @@ using namespace seastar;
 
 namespace ranvier {
 
-// Custom exception for request timeouts
-class request_timeout_error : public std::runtime_error {
-public:
-    request_timeout_error() : std::runtime_error("Request timed out") {}
-};
-
 // Helper to check if an exception is a connection error (broken pipe or connection reset)
 // These errors occur when the backend closes the connection unexpectedly
 enum class ConnectionErrorType {
@@ -63,6 +57,29 @@ inline const char* connection_error_to_string(ConnectionErrorType type) {
         default: return "unknown";
     }
 }
+
+// RAII guard for active request counter
+// Ensures decrement happens even if an exception is thrown during request setup
+class ActiveRequestGuard {
+    MetricsService& _metrics;
+    bool _released = false;
+public:
+    explicit ActiveRequestGuard(MetricsService& metrics) : _metrics(metrics) {
+        _metrics.increment_active_requests();
+    }
+    ~ActiveRequestGuard() {
+        if (!_released) {
+            _metrics.decrement_active_requests();
+        }
+    }
+    // Non-copyable, non-movable (prevent accidental double-decrement)
+    ActiveRequestGuard(const ActiveRequestGuard&) = delete;
+    ActiveRequestGuard& operator=(const ActiveRequestGuard&) = delete;
+    ActiveRequestGuard(ActiveRequestGuard&&) = delete;
+    ActiveRequestGuard& operator=(ActiveRequestGuard&&) = delete;
+    // Release ownership - caller takes responsibility for decrementing
+    void release() { _released = true; }
+};
 
 // Helper: explicit seastar::httpd:: (Server) types
 template <typename Func>
@@ -252,7 +269,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Track request start time for latency metrics (ingress timestamp)
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
-    metrics().increment_active_requests();
+
+    // RAII guard ensures active request counter is decremented even if exception thrown
+    // Guard is released before entering the lambda, which takes over responsibility
+    ActiveRequestGuard active_request_guard(metrics());
 
     std::string body = req->content;
     std::string client_ip = get_client_ip(*req);
@@ -264,7 +284,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     if (!_tokenizer.is_loaded()) {
         log_proxy.warn("[{}] Tokenizer not loaded", request_id);
         metrics().record_failure();
-        metrics().decrement_active_requests();
+        // active_request_guard destructor will decrement counter
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Tokenizer not loaded\"}");
         co_return std::move(rep);
@@ -290,7 +310,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 // Client provided invalid tokens - reject the request
                 log_proxy.warn("[{}] Invalid client tokens: {}", request_id, token_result.error);
                 metrics().record_failure();
-                metrics().decrement_active_requests();
+                // active_request_guard destructor will decrement counter
                 rep->add_header("X-Request-ID", request_id);
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
@@ -315,12 +335,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Rewrite request body with token IDs if enabled and we tokenized locally
     // Skip rewriting if client already provided prompt_token_ids (it's already in the body)
     std::string forwarded_body = body;
-    bool body_rewritten = used_client_tokens;  // Client tokens means body already has them
     if (_config.enable_token_forwarding && !tokens.empty() && !used_client_tokens) {
         auto rewrite_result = RequestRewriter::rewrite(body, tokens);
         if (rewrite_result.success) {
             forwarded_body = std::move(rewrite_result.body);
-            body_rewritten = true;
             log_proxy.debug("[{}] Request rewritten with {} token IDs ({} -> {} bytes)",
                            request_id, tokens.size(), body.size(), forwarded_body.size());
         } else {
@@ -329,24 +347,51 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
     }
 
-    auto route_hit = _router.lookup(tokens, request_id);
-
     BackendId target_id;
-    if (route_hit.has_value()) {
-        target_id = route_hit.value();
-        log_proxy.debug("[{}] Route cache hit -> backend {}", request_id, target_id);
+
+    if (_config.is_prefix_mode()) {
+        // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
+        auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
+        if (affinity_backend.has_value()) {
+            target_id = affinity_backend.value();
+            log_proxy.debug("[{}] Prefix affinity -> backend {}", request_id, target_id);
+        } else {
+            log_proxy.warn("[{}] No backends registered", request_id);
+            metrics().record_failure();
+            rep->add_header("X-Request-ID", request_id);
+            rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+            co_return std::move(rep);
+        }
+    } else if (_config.is_radix_mode()) {
+        // RADIX mode: radix tree lookup with random fallback (adaptive learning)
+        auto lookup_result = _router.lookup(tokens, request_id);
+        if (lookup_result.has_value()) {
+            target_id = lookup_result.value();
+            log_proxy.debug("[{}] Radix tree hit -> backend {}", request_id, target_id);
+        } else {
+            auto random_id = _router.get_random_backend();
+            if (!random_id.has_value()) {
+                log_proxy.warn("[{}] No backends registered", request_id);
+                metrics().record_failure();
+                rep->add_header("X-Request-ID", request_id);
+                rep->write_body("json", "{\"error\": \"No backends registered!\"}");
+                co_return std::move(rep);
+            }
+            target_id = random_id.value();
+            log_proxy.debug("[{}] Radix tree miss, random -> backend {}", request_id, target_id);
+        }
     } else {
+        // ROUND_ROBIN mode: always use random/weighted backend selection
         auto random_id = _router.get_random_backend();
         if (!random_id.has_value()) {
             log_proxy.warn("[{}] No backends registered", request_id);
             metrics().record_failure();
-            metrics().decrement_active_requests();
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"No backends registered!\"}");
             co_return std::move(rep);
         }
         target_id = random_id.value();
-        log_proxy.debug("[{}] Route cache miss, using random backend {}", request_id, target_id);
+        log_proxy.debug("[{}] Round-robin -> backend {}", request_id, target_id);
     }
 
     // Timing: record routing decision latency (post-routing timestamp)
@@ -366,7 +411,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         } else {
             log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
             metrics().record_failure();
-            metrics().decrement_active_requests();
+            // active_request_guard destructor will decrement counter
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"All backends unavailable (circuit breaker open)\"}");
             co_return std::move(rep);
@@ -377,7 +422,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     if (!target_addr_opt.has_value()) {
         log_proxy.warn("[{}] Backend {} IP not found", request_id, target_id);
         metrics().record_failure();
-        metrics().decrement_active_requests();
+        // active_request_guard destructor will decrement counter
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
         co_return std::move(rep);
@@ -392,10 +437,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto retry_config = _config.retry;
     auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
 
-    // Add X-Request-ID to response headers before streaming
+    // Add X-Request-ID and X-Backend-ID to response headers before streaming
     rep->add_header("X-Request-ID", request_id);
+    rep->add_header("X-Backend-ID", std::to_string(target_id));
 
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, route_hit, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
+    // Release the guard - lambda takes over responsibility for decrementing counter
+    active_request_guard.release();
+
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id](output_stream<char> client_out) -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -407,6 +456,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         ConnectionBundle bundle;
         bool timed_out = false;
         bool connection_failed = false;
+        bool client_disconnected = false;  // Track if client disconnected mid-stream
+        bool stream_closed = false;        // Track if client_out was already closed
         BackendId current_backend = target_id;
         socket_address current_addr = target_addr;
 
@@ -489,8 +540,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             metrics().record_failure();
             metrics().decrement_active_requests();
             sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Ignore write errors - client may have disconnected
+            }
             co_await client_out.close();
             co_return;
         }
@@ -501,10 +556,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             metrics().record_timeout();
             metrics().decrement_active_requests();
             bundle.is_valid = false;
-            _pool.put(std::move(bundle), request_id);
+            co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Ignore write errors - client may have disconnected
+            }
             co_await client_out.close();
             co_return;
         }
@@ -524,6 +583,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         // Send request with broken pipe/connection reset handling
         bool write_failed = false;
+        std::exception_ptr rethrow_exception;
         try {
             co_await bundle.out.write(http_req);
             co_await bundle.out.flush();
@@ -537,18 +597,34 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 _circuit_breaker.record_failure(current_backend);
                 metrics().record_connection_error();
             } else {
-                // Re-throw non-connection errors
-                throw;
+                // Capture exception for re-throw after cleanup
+                // (co_await not permitted in catch handlers)
+                rethrow_exception = std::current_exception();
             }
+        }
+
+        // Handle non-connection errors: cleanup and rethrow outside catch block
+        if (rethrow_exception) {
+            metrics().record_failure();
+            metrics().decrement_active_requests();
+            co_await bundle.close();
+            try { co_await client_out.close(); } catch (...) {}
+            stream_closed = true;
+            std::rethrow_exception(rethrow_exception);
         }
 
         if (write_failed) {
             // Clean up and send error to client
+            metrics().record_failure();
             metrics().decrement_active_requests();
             co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Backend connection lost during request\"}\n\n";
-            co_await client_out.write(error_msg);
-            co_await client_out.flush();
+            try {
+                co_await client_out.write(error_msg);
+                co_await client_out.flush();
+            } catch (...) {
+                // Ignore write errors - client may have disconnected
+            }
             co_await client_out.close();
             co_return;
         }
@@ -598,13 +674,26 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     read_failed = true;
                     bundle.is_valid = false;
                 } else {
-                    throw; // Re-throw non-connection errors
+                    // Capture exception for re-throw after cleanup
+                    // (co_await not permitted in catch handlers)
+                    rethrow_exception = std::current_exception();
                 }
+            }
+
+            // Handle non-connection errors: cleanup and rethrow outside catch block
+            if (rethrow_exception) {
+                metrics().record_failure();
+                metrics().decrement_active_requests();
+                bundle.is_valid = false;
+                co_await bundle.close();
+                try { co_await client_out.close(); } catch (...) {}
+                stream_closed = true;
+                std::rethrow_exception(rethrow_exception);
             }
 
             if (read_failed) {
                 if (connection_error) {
-                    bundle.is_valid = false;
+                    // bundle.is_valid already set to false in catch block above
                     _circuit_breaker.record_failure(current_backend);
                 } else {
                     timed_out = true;
@@ -642,16 +731,29 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                                     request_id, current_backend, first_byte_latency);
                 }
 
-                if (!route_hit.has_value() && tokens.size() >= _config.min_token_length) {
-                    (void)_router.learn_route_global(tokens, current_backend, request_id);
+                // Learn route in the ART for future prefix matching
+                // Learn routes in PREFIX and RADIX modes; skip for ROUND_ROBIN mode
+                // The ART insert is idempotent - existing routes just get their timestamp updated
+                if (_config.should_learn_routes() && tokens.size() >= _config.min_token_length) {
+                    // Route learning is best-effort; don't fail the request if it fails
+                    (void)_router.learn_route_global(tokens, current_backend, request_id)
+                        .handle_exception([request_id](auto) {
+                            log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
+                        });
 
                     if (_persistence) {
-                        _persistence->save_route(tokens, current_backend);
+                        try {
+                            _persistence->save_route(tokens, current_backend);
+                        } catch (...) {
+                            // Best-effort persistence, ignore failures
+                            log_proxy.debug("[{}] Route persistence failed (non-fatal)", request_id);
+                        }
                     }
                 }
             }
 
             // Write to client with broken pipe handling
+            bool client_write_error = false;
             if (!res.data.empty()) {
                 try {
                     co_await client_out.write(res.data);
@@ -663,9 +765,23 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                                        request_id, connection_error_to_string(err_type));
                         // Client disconnected, clean up backend connection and exit
                         bundle.is_valid = false;
+                        client_disconnected = true;
                         break;
                     }
-                    throw; // Re-throw non-connection errors
+                    // Capture exception for re-throw after cleanup
+                    // (co_await not permitted in catch handlers)
+                    rethrow_exception = std::current_exception();
+                }
+
+                // Handle non-connection errors: cleanup and rethrow outside catch block
+                if (rethrow_exception) {
+                    metrics().record_failure();
+                    metrics().decrement_active_requests();
+                    bundle.is_valid = false;
+                    stream_closed = true;
+                    co_await bundle.close();
+                    try { co_await client_out.close(); } catch (...) {}
+                    std::rethrow_exception(rethrow_exception);
                 }
             }
 
@@ -675,8 +791,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             }
         }
 
-        // Send error to client if needed
-        if (timed_out) {
+        // Send error to client if needed (skip if client already disconnected)
+        if (client_disconnected) {
+            // Client disconnected mid-stream - don't count as success or failure
+            // The request was partially served; this is a client-side abort
+            log_proxy.info("[{}] Client disconnected mid-stream", request_id);
+        } else if (timed_out) {
             // Record failure for circuit breaker on timeout
             log_proxy.warn("[{}] Request timed out", request_id);
             _circuit_breaker.record_failure(current_backend);
@@ -728,18 +848,28 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (connection_failed || connection_error || timed_out || !bundle.is_valid) {
             // Don't return broken connections to the pool
             bundle.is_valid = false;
-            co_await bundle.close();
+            try {
+                co_await bundle.close();
+            } catch (...) {
+                log_proxy.trace("[{}] Error closing backend connection", request_id);
+            }
         } else {
             // Return healthy connection to pool
-            _pool.put(std::move(bundle), request_id);
+            try {
+                _pool.put(std::move(bundle), request_id);
+            } catch (...) {
+                log_proxy.trace("[{}] Error returning connection to pool", request_id);
+            }
         }
 
-        // Close client output stream
-        try {
-            co_await client_out.close();
-        } catch (...) {
-            // Ignore errors closing client connection
-            log_proxy.trace("[{}] Error closing client output stream", request_id);
+        // Close client output stream (skip if already closed in exception path)
+        if (!stream_closed) {
+            try {
+                co_await client_out.close();
+            } catch (...) {
+                // Ignore errors closing client connection
+                log_proxy.trace("[{}] Error closing client output stream", request_id);
+            }
         }
 
         // Record total request duration (end-to-end from ingress to completion)
@@ -764,16 +894,39 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_route(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
     sstring id_str = req->get_query_param("backend_id");
     if (id_str.empty()) {
+        log_control.warn("POST /admin/routes: missing backend_id parameter");
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id = std::stoi(std::string(id_str));
-    auto tokens = _tokenizer.encode(req->content);
+    int backend_id;
+    try {
+        backend_id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        log_control.warn("POST /admin/routes: invalid backend_id '{}': {}", id_str, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    std::vector<int32_t> tokens;
+    try {
+        tokens = _tokenizer.encode(req->content);
+    } catch (const std::exception& e) {
+        log_control.warn("POST /admin/routes: failed to tokenize content for backend {}: {}", backend_id, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Failed to tokenize request content\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Persist the route
     if (_persistence) {
-        _persistence->save_route(tokens, backend_id);
+        try {
+            _persistence->save_route(tokens, backend_id);
+        } catch (...) {
+            log_control.warn("Failed to persist route for backend {}", backend_id);
+        }
     }
 
     return _router.learn_route_global(tokens, backend_id).then([backend_id, rep = std::move(rep)]() mutable {
@@ -792,29 +945,57 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
+        log_control.warn("POST /admin/backends: missing required parameter (id={}, ip={}, port={})",
+            id_str.empty() ? "<missing>" : id_str,
+            ip_str.empty() ? "<missing>" : ip_str,
+            port_str.empty() ? "<missing>" : port_str);
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id, ip, or port\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int id = std::stoi(std::string(id_str));
-    int port = std::stoi(std::string(port_str));
-
-    // Parse optional weight and priority (defaults: weight=100, priority=0)
+    int id, port;
     uint32_t weight = 100;
     uint32_t priority = 0;
-    if (!weight_str.empty()) {
-        weight = static_cast<uint32_t>(std::stoi(std::string(weight_str)));
-    }
-    if (!priority_str.empty()) {
-        priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
+
+    try {
+        id = std::stoi(std::string(id_str));
+        port = std::stoi(std::string(port_str));
+        if (port < 1 || port > 65535) {
+            throw std::out_of_range("port out of range");
+        }
+        if (!weight_str.empty()) {
+            weight = static_cast<uint32_t>(std::stoi(std::string(weight_str)));
+        }
+        if (!priority_str.empty()) {
+            priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
+        }
+    } catch (const std::exception& e) {
+        log_control.warn("POST /admin/backends: invalid parameter (id={}, port={}, weight={}, priority={}): {}",
+            id_str, port_str, weight_str, priority_str, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid parameter: id, port, weight, and priority must be valid integers\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    // Use the provided IP string
-    socket_address addr(ipv4_addr(std::string(ip_str), port));
+    // Parse and validate IP address
+    socket_address addr;
+    try {
+        addr = socket_address(ipv4_addr(std::string(ip_str), port));
+    } catch (const std::exception& e) {
+        log_control.warn("POST /admin/backends: invalid IP address '{}': {}", ip_str, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid IP address format\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Persist the backend registration
     if (_persistence) {
-        _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
+        try {
+            _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
+        } catch (...) {
+            log_control.warn("Failed to persist backend {} registration", id);
+        }
     }
 
     return _router.register_backend_global(id, addr, weight, priority).then(
@@ -836,16 +1017,30 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
     sstring id_str = req->get_query_param("id");
 
     if (id_str.empty()) {
+        log_control.warn("DELETE /admin/backends: missing id parameter");
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id parameter\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int id = std::stoi(std::string(id_str));
+    int id;
+    try {
+        id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        log_control.warn("DELETE /admin/backends: invalid id '{}': {}", id_str, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Remove from persistence first
     if (_persistence) {
-        _persistence->remove_routes_for_backend(id);
-        _persistence->remove_backend(id);
+        try {
+            _persistence->remove_routes_for_backend(id);
+            _persistence->remove_backend(id);
+        } catch (...) {
+            log_control.warn("Failed to remove backend {} from persistence", id);
+        }
     }
 
     // Remove from in-memory state across all shards
@@ -861,15 +1056,29 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
     sstring id_str = req->get_query_param("backend_id");
 
     if (id_str.empty()) {
+        log_control.warn("DELETE /admin/routes: missing backend_id parameter");
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id = std::stoi(std::string(id_str));
+    int backend_id;
+    try {
+        backend_id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        log_control.warn("DELETE /admin/routes: invalid backend_id '{}': {}", id_str, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
 
     // Remove routes from persistence
     if (_persistence) {
-        _persistence->remove_routes_for_backend(backend_id);
+        try {
+            _persistence->remove_routes_for_backend(backend_id);
+        } catch (...) {
+            log_control.warn("Failed to remove routes for backend {} from persistence", backend_id);
+        }
     }
 
     // Note: In-memory routes in the RadixTree are not removed immediately.
@@ -885,7 +1094,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(
     // WARNING: This is destructive!
 
     if (_persistence) {
-        _persistence->clear_all();
+        try {
+            _persistence->clear_all();
+        } catch (...) {
+            log_control.error("Failed to clear persistence data");
+            rep->set_status(seastar::http::reply::status_type::internal_server_error);
+            rep->write_body("json", "{\"error\": \"Failed to clear persistence data\"}");
+            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        }
     }
 
     log_control.warn("Cleared all persisted data (backends and routes). Restart required to clear in-memory state.");

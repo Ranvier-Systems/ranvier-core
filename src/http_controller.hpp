@@ -1,6 +1,7 @@
 #pragma once
 
 #include "circuit_breaker.hpp"
+#include "config.hpp"
 #include "connection_pool.hpp"
 #include "metrics_service.hpp"
 #include "persistence.hpp"
@@ -48,6 +49,13 @@ struct HttpControllerConfig {
     bool enable_token_forwarding = false;       // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;          // Accept pre-tokenized prompt_token_ids from clients for routing
     int32_t max_token_id = 100000;              // Maximum valid token ID for validation (security)
+    RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;  // Routing mode
+
+    // Helper methods for routing mode checks
+    bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
+    bool is_radix_mode() const { return routing_mode == RoutingConfig::RoutingMode::RADIX; }
+    bool is_round_robin_mode() const { return routing_mode == RoutingConfig::RoutingMode::ROUND_ROBIN; }
+    bool should_learn_routes() const { return routing_mode != RoutingConfig::RoutingMode::ROUND_ROBIN; }
 };
 
 class HttpController {
