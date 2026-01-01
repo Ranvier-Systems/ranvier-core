@@ -55,18 +55,28 @@ add_library(rapidjson_interface INTERFACE)
 target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
 
 # OpenTelemetry C++ SDK Configuration
-# Provides distributed tracing with OTLP export support
+# Provides distributed tracing with Zipkin HTTP export support
+# Note: OTLP export requires protobuf; use WITH_OTLP_HTTP=ON if protobuf is installed
+find_package(Protobuf QUIET)
 FetchContent_Declare(
   opentelemetry-cpp
   GIT_REPOSITORY https://github.com/open-telemetry/opentelemetry-cpp
   GIT_TAG        v1.14.2
 )
-set(WITH_OTLP_HTTP ON CACHE BOOL "" FORCE)
-set(WITH_OTLP_GRPC OFF CACHE BOOL "" FORCE)  # Use HTTP exporter to avoid gRPC dependency
+if(Protobuf_FOUND)
+    message(STATUS "Protobuf found - enabling OTLP exporter")
+    set(WITH_OTLP_HTTP ON CACHE BOOL "" FORCE)
+else()
+    message(STATUS "Protobuf not found - using Zipkin exporter (install libprotobuf-dev for OTLP)")
+    set(WITH_OTLP_HTTP OFF CACHE BOOL "" FORCE)
+endif()
+set(WITH_OTLP_GRPC OFF CACHE BOOL "" FORCE)  # Avoid gRPC dependency
+set(WITH_ZIPKIN ON CACHE BOOL "" FORCE)  # Zipkin works without protobuf
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(WITH_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WITH_BENCHMARK OFF CACHE BOOL "" FORCE)
 set(OTELCPP_MAINTAINER_MODE OFF CACHE BOOL "" FORCE)
+set(WITH_ABSEIL OFF CACHE BOOL "" FORCE)  # Use OpenTelemetry internal containers
 FetchContent_MakeAvailable(opentelemetry-cpp)
 
 # SQLite3 Configuration
@@ -124,6 +134,17 @@ if(Seastar_FOUND)
     )
 
     target_include_directories(ranvier_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
+
+    # OpenTelemetry configuration - use OTLP if protobuf available, otherwise Zipkin
+    set(OTEL_EXPORTER_LIBS opentelemetry_exporter_zipkin_trace)
+    if(Protobuf_FOUND)
+        list(APPEND OTEL_EXPORTER_LIBS opentelemetry_exporter_otlp_http)
+        target_compile_definitions(ranvier_server PRIVATE RANVIER_USE_OTLP_EXPORTER)
+        message(STATUS "OpenTelemetry: Using OTLP HTTP exporter (protobuf available)")
+    else()
+        message(STATUS "OpenTelemetry: Using Zipkin exporter (no protobuf)")
+    endif()
+
     target_link_libraries(ranvier_server
       PRIVATE
       Seastar::seastar
@@ -134,7 +155,7 @@ if(Seastar_FOUND)
       absl::flat_hash_map
       absl::flat_hash_set
       opentelemetry_trace
-      opentelemetry_exporter_otlp_http
+      ${OTEL_EXPORTER_LIBS}
       opentelemetry_resources
       opentelemetry_common
     )

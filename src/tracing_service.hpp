@@ -2,12 +2,17 @@
 //
 // Provides distributed tracing with:
 // - W3C Trace Context propagation (traceparent header)
-// - OTLP HTTP export to Jaeger, Tempo, or other collectors
+// - Zipkin HTTP export (default) or OTLP HTTP export (if protobuf is available)
 // - Automatic span creation for request lifecycle
 // - Backend ID attributes for debugging
 //
 // Thread-safety: Uses OpenTelemetry's thread-safe tracer provider
 // Seastar compatibility: Span operations are synchronous and non-blocking
+//
+// Exporter selection:
+// - Zipkin: Default, works without protobuf, sends to Zipkin/Jaeger collectors
+// - OTLP: Requires protobuf, preferred for OTEL Collector/Tempo/modern backends
+// Define RANVIER_USE_OTLP_EXPORTER before including to use OTLP (requires protobuf)
 
 #pragma once
 
@@ -25,19 +30,30 @@
 #include <opentelemetry/trace/context.h>
 #include <opentelemetry/context/propagation/text_map_propagator.h>
 #include <opentelemetry/trace/propagation/http_trace_context.h>
-#include <opentelemetry/exporters/otlp/otlp_http_exporter.h>
 #include <opentelemetry/sdk/trace/tracer_provider.h>
 #include <opentelemetry/sdk/trace/batch_span_processor.h>
 #include <opentelemetry/sdk/trace/samplers/trace_id_ratio_based.h>
 #include <opentelemetry/sdk/resource/resource.h>
+
+// Include the appropriate exporter
+#ifdef RANVIER_USE_OTLP_EXPORTER
+#include <opentelemetry/exporters/otlp/otlp_http_exporter.h>
+#else
+#include <opentelemetry/exporters/zipkin/zipkin_exporter.h>
+#endif
 
 namespace ranvier {
 
 namespace trace = opentelemetry::trace;
 namespace sdk_trace = opentelemetry::sdk::trace;
 namespace resource = opentelemetry::sdk::resource;
-namespace otlp = opentelemetry::exporter::otlp;
 namespace propagation = opentelemetry::context::propagation;
+
+#ifdef RANVIER_USE_OTLP_EXPORTER
+namespace otlp = opentelemetry::exporter::otlp;
+#else
+namespace zipkin = opentelemetry::exporter::zipkin;
+#endif
 
 // W3C Trace Context parsed from traceparent header
 // Format: {version}-{trace-id}-{parent-span-id}-{trace-flags}
@@ -355,10 +371,33 @@ inline void TracingService::init(const TelemetryConfig& config) {
         return;
     }
 
-    // Create OTLP HTTP exporter
+    // Create exporter based on build configuration
+#ifdef RANVIER_USE_OTLP_EXPORTER
+    // OTLP HTTP exporter (requires protobuf)
     otlp::OtlpHttpExporterOptions exporter_opts;
     exporter_opts.url = config.otlp_endpoint + "/v1/traces";
     auto exporter = std::make_unique<otlp::OtlpHttpExporter>(exporter_opts);
+#else
+    // Zipkin exporter (no protobuf required)
+    // Zipkin endpoint format: http://host:9411/api/v2/spans
+    // For Jaeger with Zipkin receiver: http://host:9411/api/v2/spans
+    zipkin::ZipkinExporterOptions exporter_opts;
+    // Convert OTLP endpoint to Zipkin format if needed
+    // OTLP: http://localhost:4318 -> Zipkin: http://localhost:9411/api/v2/spans
+    std::string endpoint = config.otlp_endpoint;
+    if (endpoint.find(":4318") != std::string::npos) {
+        // Convert OTLP default port to Zipkin default port
+        size_t pos = endpoint.find(":4318");
+        endpoint = endpoint.substr(0, pos) + ":9411/api/v2/spans";
+    } else if (endpoint.find("/v1/traces") == std::string::npos &&
+               endpoint.find("/api/v2/spans") == std::string::npos) {
+        // Append Zipkin path if not already present
+        endpoint += "/api/v2/spans";
+    }
+    exporter_opts.url = endpoint;
+    exporter_opts.service_name = config.service_name;
+    auto exporter = std::make_unique<zipkin::ZipkinExporter>(exporter_opts);
+#endif
 
     // Create batch processor with configured settings
     sdk_trace::BatchSpanProcessorOptions processor_opts;
