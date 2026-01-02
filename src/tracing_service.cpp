@@ -24,23 +24,15 @@
 #include <opentelemetry/sdk/trace/samplers/trace_id_ratio.h>
 #include <opentelemetry/sdk/resource/resource.h>
 
-#ifdef RANVIER_USE_OTLP_EXPORTER
-#include <opentelemetry/exporters/otlp/otlp_http_exporter.h>
-#else
+// Use Zipkin exporter (OTLP exporter disabled due to protobuf static init issues)
 #include <opentelemetry/exporters/zipkin/zipkin_exporter.h>
-#endif
 
 namespace ranvier {
 
 namespace trace = opentelemetry::trace;
 namespace sdk_trace = opentelemetry::sdk::trace;
 namespace resource = opentelemetry::sdk::resource;
-
-#ifdef RANVIER_USE_OTLP_EXPORTER
-namespace otlp = opentelemetry::exporter::otlp;
-#else
 namespace zipkin = opentelemetry::exporter::zipkin;
-#endif
 
 // ============================================================================
 // Static storage (file-local to avoid header pollution)
@@ -265,16 +257,12 @@ void TracingService::init(const TelemetryConfig& config) {
         return;
     }
 
-    // Create exporter based on build configuration
-#ifdef RANVIER_USE_OTLP_EXPORTER
-    // OTLP HTTP exporter (requires protobuf)
-    otlp::OtlpHttpExporterOptions exporter_opts;
-    exporter_opts.url = config.otlp_endpoint + "/v1/traces";
-    auto exporter = std::make_unique<otlp::OtlpHttpExporter>(exporter_opts);
-#else
-    // Zipkin exporter (no protobuf required)
+    // Create Zipkin exporter
+    // Note: OTLP exporter is disabled due to protobuf static initialization issues
+    // Zipkin format works with Jaeger, Tempo, and other collectors
     zipkin::ZipkinExporterOptions exporter_opts;
     std::string endpoint = config.otlp_endpoint;
+    // Convert OTLP-style endpoint to Zipkin format if needed
     if (endpoint.find(":4318") != std::string::npos) {
         size_t pos = endpoint.find(":4318");
         endpoint = endpoint.substr(0, pos) + ":9411/api/v2/spans";
@@ -285,7 +273,6 @@ void TracingService::init(const TelemetryConfig& config) {
     //exporter_opts.url = endpoint; // TODO: Disabled for testing
     exporter_opts.service_name = config.service_name;
     auto exporter = std::make_unique<zipkin::ZipkinExporter>(exporter_opts);
-#endif
 
     // Create batch processor with configured settings
     sdk_trace::BatchSpanProcessorOptions processor_opts;

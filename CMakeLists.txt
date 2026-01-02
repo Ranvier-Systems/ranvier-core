@@ -145,16 +145,17 @@ if(Seastar_FOUND)
     target_include_directories(ranvier_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
 
     # OpenTelemetry configuration (optional)
+    # Note: We always use the Zipkin exporter because the OTLP exporter (which uses
+    # protobuf) has static initialization that blocks before main() runs.
+    # Zipkin exports to the same collectors (Jaeger, Tempo, etc.) via HTTP/JSON.
     if(WITH_TELEMETRY)
-        set(OTEL_EXPORTER_LIBS opentelemetry_exporter_zipkin_trace)
-        if(Protobuf_FOUND)
-            #list(APPEND OTEL_EXPORTER_LIBS opentelemetry_exporter_otlp_http)
-            #target_compile_definitions(ranvier_server PRIVATE RANVIER_USE_OTLP_EXPORTER)
-            message(STATUS "OpenTelemetry: Using OTLP HTTP exporter (protobuf available)")
-        else()
-            message(STATUS "OpenTelemetry: Using Zipkin exporter (no protobuf)")
-        endif()
-        set(OTEL_LIBS opentelemetry_trace ${OTEL_EXPORTER_LIBS} opentelemetry_resources opentelemetry_common)
+        set(OTEL_LIBS
+            opentelemetry_trace
+            opentelemetry_exporter_zipkin_trace
+            opentelemetry_resources
+            opentelemetry_common
+        )
+        message(STATUS "OpenTelemetry: Using Zipkin exporter (OTLP disabled due to protobuf static init issues)")
     else()
         target_compile_definitions(ranvier_server PRIVATE RANVIER_NO_TELEMETRY)
         set(OTEL_LIBS "")
