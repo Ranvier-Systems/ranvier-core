@@ -142,9 +142,13 @@ flowchart TB
 The GossipService operates on Shard 0 and uses UDP for low-latency route propagation:
 
 1. **Route Learning**: When a node learns a new route (cache miss → successful response), it broadcasts a `ROUTE_ANNOUNCEMENT` packet to all peers.
-2. **Packet Format**: Fixed 8-byte header + variable token array: `[type:1][version:1][backend_id:4][token_count:2][tokens:4*N]`
-3. **Shard Broadcast**: Received routes are inserted into all local shards via `learn_route_global()`, maintaining Seastar's shared-nothing model.
-4. **Peer Liveness**: Heartbeat mechanism tracks peer health; stale peers trigger route pruning callbacks.
+2. **Packet Format (v2)**: Fixed 12-byte header + variable token array: `[type:1][version:1][seq_num:4][backend_id:4][token_count:2][tokens:4*N]`
+3. **Reliable Delivery**: ACK-based delivery with retries ensures route announcements aren't lost to UDP packet drops.
+4. **Duplicate Detection**: Sliding window per peer filters duplicate announcements from retransmissions.
+5. **Shard Broadcast**: Received routes are inserted into all local shards via `learn_route_global()`, maintaining Seastar's shared-nothing model.
+6. **Peer Liveness**: Heartbeat mechanism tracks peer health; stale peers trigger route pruning callbacks.
+
+See [Gossip Protocol Internals](internals/gossip-protocol.md) for detailed wire format and reliability mechanisms.
 
 ### Configuration
 
@@ -152,10 +156,16 @@ Enable clustering in your configuration:
 ```yaml
 cluster:
   enabled: true
-  gossip_port: 8481
+  gossip_port: 9190
   peers:
-    - "10.0.0.2:8481"
-    - "10.0.0.3:8481"
+    - "10.0.0.2:9190"
+    - "10.0.0.3:9190"
+
+  # Reliable delivery (enabled by default)
+  gossip_reliable_delivery: true
+  gossip_ack_timeout_ms: 100
+  gossip_max_retries: 3
+  gossip_dedup_window: 1000
 ```
 
 For Kubernetes deployments, DNS-based peer discovery automatically resolves headless service endpoints.
