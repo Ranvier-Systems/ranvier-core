@@ -5,6 +5,7 @@
 #include "gossip_service.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <unordered_set>
 
 #include <boost/range/irange.hpp>
@@ -255,12 +256,10 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
                      tokens.size(), backend, _peer_addresses.size());
 
     // Send to each peer with per-peer sequence numbers
+    // Note: Loopback prevention against _my_address was removed because _my_address
+    // is bound to 0.0.0.0:port which never matches real peer IPs. Operators should
+    // ensure the peer list does not include the node's own address.
     return seastar::parallel_for_each(_peer_addresses, [this, tokens, backend](const seastar::socket_address& peer) mutable {
-        // Basic loopback prevention: Don't send gossip to ourselves
-        if (peer == _my_address) {
-            return seastar::make_ready_future<>();
-        }
-
         // Create packet with per-peer sequence number
         RouteAnnouncementPacket pkt;
         pkt.backend_id = backend;
@@ -286,9 +285,12 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
             log_gossip.trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
         }
 
-        // Create the packet for sending
-        seastar::net::packet packet(seastar::temporary_buffer<char>(
-            reinterpret_cast<const char*>(serialized.data()), serialized.size()));
+        // Create an owned buffer by copying the data
+        // Note: temporary_buffer(ptr, len) creates a non-owning view, which would cause
+        // use-after-free since 'serialized' goes out of scope before async send completes
+        seastar::temporary_buffer<char> buf(serialized.size());
+        std::memcpy(buf.get_write(), serialized.data(), serialized.size());
+        seastar::net::packet packet(std::move(buf));
 
         return _channel->send(peer, std::move(packet)).then([this] {
             _packets_sent++;
@@ -424,18 +426,16 @@ seastar::future<> GossipService::broadcast_heartbeat() {
     }
 
     // Prepare a small 2-byte heartbeat (Type + Version)
-    std::vector<uint8_t> payload = {
-        static_cast<uint8_t>(GossipPacketType::HEARTBEAT),
-        RouteAnnouncementPacket::PROTOCOL_VERSION
-    };
-
-    seastar::net::packet pb(seastar::temporary_buffer<char>(
-        reinterpret_cast<const char*>(payload.data()), payload.size()));
+    // Create an owned buffer to avoid use-after-free with async sends
+    seastar::temporary_buffer<char> buf(2);
+    buf.get_write()[0] = static_cast<char>(GossipPacketType::HEARTBEAT);
+    buf.get_write()[1] = static_cast<char>(RouteAnnouncementPacket::PROTOCOL_VERSION);
+    seastar::net::packet pb(std::move(buf));
 
     return seastar::parallel_for_each(_peer_addresses, [this, p = pb.share()](const seastar::socket_address& peer) mutable {
-        if (peer == _my_address) {
-            return seastar::make_ready_future<>();
-        }
+        // Note: Loopback prevention check against _my_address is ineffective since
+        // _my_address is 0.0.0.0:port which never matches real peer IPs.
+        // In practice, peers should not include the node's own address in config.
 
         // Send and ignore individual results
         return _channel->send(peer, p.share()).discard_result();
@@ -589,10 +589,16 @@ seastar::future<> GossipService::refresh_peers() {
             }
         }
 
-        // Log peers that were removed
+        // Log peers that were removed and clean up their state
         for (const auto& [addr, state] : _peer_table) {
             if (new_peer_table.find(addr) == new_peer_table.end()) {
                 log_gossip.info("DNS discovery: peer removed: {}", addr);
+
+                // Clean up reliable delivery state for removed peer
+                _pending_acks.erase(addr);
+                _peer_seq_counters.erase(addr);
+                _received_seq_windows.erase(addr);
+                _received_seq_sets.erase(addr);
 
                 // Prune routes for removed peers if they had an associated backend
                 if (state.associated_backend && _route_prune_callback) {
@@ -646,8 +652,10 @@ seastar::future<> GossipService::send_ack(const seastar::socket_address& peer, u
     ack.seq_num = seq_num;
     auto serialized = ack.serialize();
 
-    seastar::net::packet packet(seastar::temporary_buffer<char>(
-        reinterpret_cast<const char*>(serialized.data()), serialized.size()));
+    // Create an owned buffer to avoid use-after-free with async send
+    seastar::temporary_buffer<char> buf(serialized.size());
+    std::memcpy(buf.get_write(), serialized.data(), serialized.size());
+    seastar::net::packet packet(std::move(buf));
 
     log_gossip.trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
 
@@ -746,10 +754,10 @@ void GossipService::process_retries() {
             auto backoff = calculate_backoff(pending.retry_count);
             pending.next_retry = now + backoff;
 
-            // Resend the packet
-            seastar::net::packet packet(seastar::temporary_buffer<char>(
-                reinterpret_cast<const char*>(pending.serialized_packet.data()),
-                pending.serialized_packet.size()));
+            // Resend the packet - create owned buffer for safety with async send
+            seastar::temporary_buffer<char> buf(pending.serialized_packet.size());
+            std::memcpy(buf.get_write(), pending.serialized_packet.data(), pending.serialized_packet.size());
+            seastar::net::packet packet(std::move(buf));
 
             log_gossip.debug("Retrying route announcement: peer={}, seq_num={}, retry={}/{}",
                            peer, seq_num, pending.retry_count, _config.gossip_max_retries);
