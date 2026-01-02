@@ -148,6 +148,12 @@ struct ClusterConfig {
     std::string discovery_dns_name;                        // DNS name to query for peer discovery (empty = disabled)
     DiscoveryType discovery_type = DiscoveryType::STATIC;  // Type of DNS records to query
     std::chrono::seconds discovery_refresh_interval{30};   // Interval between DNS refresh queries
+
+    // Reliable delivery settings (ACKs, retries, deduplication)
+    bool gossip_reliable_delivery = true;                  // Enable reliable delivery with ACKs
+    std::chrono::milliseconds gossip_ack_timeout{100};     // Timeout before retrying unACK'd packets
+    uint32_t gossip_max_retries = 3;                       // Maximum retry attempts before giving up
+    size_t gossip_dedup_window = 1000;                     // Size of per-peer sequence window for dedup
 };
 
 // Kubernetes service discovery configuration
@@ -440,6 +446,19 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<int>("RANVIER_CLUSTER_DISCOVERY_REFRESH_INTERVAL")) {
         cluster.discovery_refresh_interval = std::chrono::seconds(*v);
+    }
+    // Reliable delivery overrides
+    if (auto v = get_env("RANVIER_CLUSTER_GOSSIP_RELIABLE_DELIVERY")) {
+        cluster.gossip_reliable_delivery = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_GOSSIP_ACK_TIMEOUT_MS")) {
+        cluster.gossip_ack_timeout = std::chrono::milliseconds(*v);
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_CLUSTER_GOSSIP_MAX_RETRIES")) {
+        cluster.gossip_max_retries = *v;
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_CLUSTER_GOSSIP_DEDUP_WINDOW")) {
+        cluster.gossip_dedup_window = *v;
     }
 
     // K8s discovery overrides
@@ -744,6 +763,19 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (c["discovery_refresh_interval_seconds"]) {
                 config.cluster.discovery_refresh_interval = std::chrono::seconds(c["discovery_refresh_interval_seconds"].as<int>());
             }
+            // Reliable delivery settings
+            if (c["gossip_reliable_delivery"]) {
+                config.cluster.gossip_reliable_delivery = c["gossip_reliable_delivery"].as<bool>();
+            }
+            if (c["gossip_ack_timeout_ms"]) {
+                config.cluster.gossip_ack_timeout = std::chrono::milliseconds(c["gossip_ack_timeout_ms"].as<int>());
+            }
+            if (c["gossip_max_retries"]) {
+                config.cluster.gossip_max_retries = c["gossip_max_retries"].as<uint32_t>();
+            }
+            if (c["gossip_dedup_window"]) {
+                config.cluster.gossip_dedup_window = c["gossip_dedup_window"].as<size_t>();
+            }
         }
 
         // K8s discovery section
@@ -911,6 +943,15 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
             }
             if (config.cluster.discovery_refresh_interval.count() < 5) {
                 return "cluster.discovery_refresh_interval must be at least 5 seconds";
+            }
+        }
+        // Validate reliable delivery settings
+        if (config.cluster.gossip_reliable_delivery) {
+            if (config.cluster.gossip_ack_timeout.count() < 10) {
+                return "cluster.gossip_ack_timeout must be at least 10ms";
+            }
+            if (config.cluster.gossip_dedup_window == 0) {
+                return "cluster.gossip_dedup_window must be positive";
             }
         }
     }

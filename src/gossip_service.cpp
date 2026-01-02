@@ -15,6 +15,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/ip.hh>
@@ -53,7 +54,18 @@ GossipService::GossipService(const ClusterConfig& config)
         seastar::metrics::make_counter("cluster_dns_discovery_success", _dns_discovery_success,
             seastar::metrics::description("Total number of successful DNS peer discovery operations")),
         seastar::metrics::make_counter("cluster_dns_discovery_failure", _dns_discovery_failure,
-            seastar::metrics::description("Total number of failed DNS peer discovery operations"))
+            seastar::metrics::description("Total number of failed DNS peer discovery operations")),
+        // Reliable delivery metrics
+        seastar::metrics::make_counter("cluster_acks_sent", _acks_sent,
+            seastar::metrics::description("Total number of route ACKs sent")),
+        seastar::metrics::make_counter("cluster_acks_received", _acks_received,
+            seastar::metrics::description("Total number of route ACKs received")),
+        seastar::metrics::make_counter("cluster_retries_sent", _retries_sent,
+            seastar::metrics::description("Total number of route announcement retries sent")),
+        seastar::metrics::make_counter("cluster_duplicates_suppressed", _duplicates_suppressed,
+            seastar::metrics::description("Total number of duplicate route announcements suppressed")),
+        seastar::metrics::make_counter("cluster_max_retries_exceeded", _max_retries_exceeded,
+            seastar::metrics::description("Total number of route announcements that exceeded max retries"))
     });
 }
 
@@ -109,6 +121,20 @@ seastar::future<> GossipService::start() {
 
         for (const auto& addr : _peer_addresses) {
             _peer_table[addr] = { seastar::lowres_clock::now(), true };
+        }
+
+        // Set up reliable delivery retry timer if enabled
+        if (_config.gossip_reliable_delivery) {
+            log_gossip.info("Reliable delivery enabled: ack_timeout={}ms, max_retries={}, dedup_window={}",
+                            _config.gossip_ack_timeout.count(),
+                            _config.gossip_max_retries,
+                            _config.gossip_dedup_window);
+            _retry_timer.set_callback([this] { process_retries(); });
+            // Check retries at half the ack timeout interval for responsiveness
+            auto retry_check_interval = std::max(
+                std::chrono::milliseconds(10),
+                _config.gossip_ack_timeout / 2);
+            _retry_timer.arm_periodic(retry_check_interval);
         }
 
         // Set up DNS discovery if configured
@@ -189,6 +215,12 @@ seastar::future<> GossipService::stop() {
     // Stop the liveness checker
     _liveness_timer.cancel();
 
+    // Stop reliable delivery retry timer
+    _retry_timer.cancel();
+
+    // Clear pending ACKs (no point in retrying during shutdown)
+    _pending_acks.clear();
+
     // Stop DNS discovery
     _discovery_enabled = false;
     _discovery_timer.cancel();
@@ -219,33 +251,46 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
         return seastar::make_ready_future<>();
     }
 
-    RouteAnnouncementPacket pkt;
-    pkt.backend_id = backend;
-    pkt.tokens = tokens;
-    pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
-                                                      static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
-
-    auto serialized = pkt.serialize();
-
-    // Create the base packet once.
-    seastar::net::packet base_packet(seastar::temporary_buffer<char>(
-        reinterpret_cast<const char*>(serialized.data()), serialized.size()));
-
     log_gossip.debug("Broadcasting route: {} tokens -> backend {} to {} peers",
                      tokens.size(), backend, _peer_addresses.size());
 
-    // We do NOT capture base_packet by value if the copy constructor is deleted.
-    // Instead, we use the shared-pointer-like behavior of Seastar packets.
-    return seastar::parallel_for_each(_peer_addresses, [this, p = base_packet.share()](const seastar::socket_address& peer) mutable {
+    // Send to each peer with per-peer sequence numbers
+    return seastar::parallel_for_each(_peer_addresses, [this, tokens, backend](const seastar::socket_address& peer) mutable {
         // Basic loopback prevention: Don't send gossip to ourselves
-        // Note: You may need to store 'bind_addr' as a member variable during start()
         if (peer == _my_address) {
             return seastar::make_ready_future<>();
         }
 
-        // .share() increments the internal reference count.
-        // We move the shared instance into the send call.
-        return _channel->send(peer, p.share()).then([this] {
+        // Create packet with per-peer sequence number
+        RouteAnnouncementPacket pkt;
+        pkt.backend_id = backend;
+        pkt.tokens = tokens;
+        pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
+                                                          static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+
+        // Assign sequence number if reliable delivery is enabled
+        if (_config.gossip_reliable_delivery) {
+            pkt.seq_num = next_seq_num(peer);
+        }
+
+        auto serialized = pkt.serialize();
+
+        // Track pending ACK if reliable delivery is enabled
+        if (_config.gossip_reliable_delivery) {
+            PendingAck pending;
+            pending.seq_num = pkt.seq_num;
+            pending.serialized_packet = serialized;
+            pending.next_retry = seastar::lowres_clock::now() + _config.gossip_ack_timeout;
+            pending.retry_count = 0;
+            _pending_acks[peer][pkt.seq_num] = std::move(pending);
+            log_gossip.trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
+        }
+
+        // Create the packet for sending
+        seastar::net::packet packet(seastar::temporary_buffer<char>(
+            reinterpret_cast<const char*>(serialized.data()), serialized.size()));
+
+        return _channel->send(peer, std::move(packet)).then([this] {
             _packets_sent++;
         }).handle_exception([peer](auto ep) {
             try {
@@ -292,33 +337,63 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     // Now it is safe to access the full length from the first fragment
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
 
-    // Identify packet type
-    GossipPacketType type = static_cast<GossipPacketType>(ptr[0]);
-
-    if (type == GossipPacketType::HEARTBEAT) {
-        // Change get_src_address() to get_src()
-        log_gossip.debug("Received heartbeat from {}", dgram.get_src());
-
-        // Logic: You would typically update a 'last_seen' timestamp for this peer
-        // in a peer-management table here.
+    // Identify packet type (need at least 1 byte)
+    if (data.len() < 1) {
+        _packets_invalid++;
         return seastar::make_ready_future<>();
     }
 
+    GossipPacketType type = static_cast<GossipPacketType>(ptr[0]);
+
+    if (type == GossipPacketType::HEARTBEAT) {
+        log_gossip.debug("Received heartbeat from {}", dgram.get_src());
+        return seastar::make_ready_future<>();
+    }
+
+    // Handle ACK packets
+    if (type == GossipPacketType::ROUTE_ACK) {
+        auto ack_pkt = RouteAckPacket::deserialize(ptr, data.len());
+        if (!ack_pkt) {
+            _packets_invalid++;
+            return seastar::make_ready_future<>();
+        }
+
+        handle_ack(src_addr, ack_pkt->seq_num);
+        return seastar::make_ready_future<>();
+    }
+
+    // Handle route announcements
     auto pkt = RouteAnnouncementPacket::deserialize(ptr, data.len());
     if (!pkt) {
         _packets_invalid++;
         return seastar::make_ready_future<>();
     }
 
+    // Check for duplicate if reliable delivery is enabled
+    if (_config.gossip_reliable_delivery) {
+        if (is_duplicate(src_addr, pkt->seq_num)) {
+            log_gossip.trace("Duplicate route announcement suppressed: peer={}, seq_num={}", src_addr, pkt->seq_num);
+            ++_duplicates_suppressed;
+            // Still send ACK for duplicate (sender may not have received our previous ACK)
+            return send_ack(src_addr, pkt->seq_num);
+        }
+    }
+
     // Map this peer address to the backend ID it just announced
     if (seastar::this_shard_id() == 0) {
-        auto it = _peer_table.find(src_addr);
-        if (it != _peer_table.end()) {
-            it->second.associated_backend = pkt->backend_id;
+        auto peer_it = _peer_table.find(src_addr);
+        if (peer_it != _peer_table.end()) {
+            peer_it->second.associated_backend = pkt->backend_id;
         }
     }
 
     ++_packets_received;
+
+    // Send ACK if reliable delivery is enabled
+    seastar::future<> ack_future = seastar::make_ready_future<>();
+    if (_config.gossip_reliable_delivery) {
+        ack_future = send_ack(src_addr, pkt->seq_num);
+    }
 
     if (_route_learn_callback) {
         auto shared_tokens = std::make_shared<std::vector<TokenId>>(std::move(pkt->tokens));
@@ -329,16 +404,18 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
         auto callback = _route_learn_callback;
 
         // Use an integer range from 0 to seastar::smp::count
-        return seastar::parallel_for_each(
+        auto learn_future = seastar::parallel_for_each(
                 boost::irange<unsigned>(0, seastar::smp::count),
                 [callback, shared_tokens, b_id](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [callback, shared_tokens, b_id] {
                         return callback(*shared_tokens, b_id);
                         });
                 });
+
+        return seastar::when_all_succeed(std::move(ack_future), std::move(learn_future)).discard_result();
     }
 
-    return seastar::make_ready_future<>();
+    return ack_future;
 }
 
 seastar::future<> GossipService::broadcast_heartbeat() {
@@ -557,6 +634,166 @@ seastar::future<> GossipService::refresh_peers() {
     }
 
     co_return;
+}
+
+// Reliable delivery: send an ACK for a received packet
+seastar::future<> GossipService::send_ack(const seastar::socket_address& peer, uint32_t seq_num) {
+    if (!_channel) {
+        return seastar::make_ready_future<>();
+    }
+
+    RouteAckPacket ack;
+    ack.seq_num = seq_num;
+    auto serialized = ack.serialize();
+
+    seastar::net::packet packet(seastar::temporary_buffer<char>(
+        reinterpret_cast<const char*>(serialized.data()), serialized.size()));
+
+    log_gossip.trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
+
+    return _channel->send(peer, std::move(packet)).then([this] {
+        ++_acks_sent;
+    }).handle_exception([peer, seq_num](auto ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_gossip.debug("Failed to send ACK to peer {}: {}", peer, e.what());
+        }
+    });
+}
+
+// Reliable delivery: handle a received ACK
+void GossipService::handle_ack(const seastar::socket_address& peer, uint32_t seq_num) {
+    auto peer_it = _pending_acks.find(peer);
+    if (peer_it == _pending_acks.end()) {
+        log_gossip.trace("Received ACK for unknown peer: peer={}, seq_num={}", peer, seq_num);
+        return;
+    }
+
+    auto& pending_map = peer_it->second;
+    auto ack_it = pending_map.find(seq_num);
+    if (ack_it == pending_map.end()) {
+        log_gossip.trace("Received ACK for unknown seq_num: peer={}, seq_num={}", peer, seq_num);
+        return;
+    }
+
+    log_gossip.trace("Received ACK: peer={}, seq_num={}", peer, seq_num);
+    pending_map.erase(ack_it);
+    ++_acks_received;
+
+    // Clean up empty peer entry
+    if (pending_map.empty()) {
+        _pending_acks.erase(peer_it);
+    }
+}
+
+// Reliable delivery: check if a sequence number is a duplicate
+bool GossipService::is_duplicate(const seastar::socket_address& peer, uint32_t seq_num) {
+    auto& seq_set = _received_seq_sets[peer];
+    auto& seq_window = _received_seq_windows[peer];
+
+    // Check if we've seen this sequence number
+    if (seq_set.count(seq_num) > 0) {
+        return true;
+    }
+
+    // Add to window
+    seq_set.insert(seq_num);
+    seq_window.push_back(seq_num);
+
+    // Slide window if too large
+    while (seq_window.size() > _config.gossip_dedup_window) {
+        uint32_t oldest = seq_window.front();
+        seq_window.pop_front();
+        seq_set.erase(oldest);
+    }
+
+    return false;
+}
+
+// Reliable delivery: process pending retries
+void GossipService::process_retries() {
+    if (!_channel || !_running) {
+        return;
+    }
+
+    auto now = seastar::lowres_clock::now();
+
+    for (auto& [peer, pending_map] : _pending_acks) {
+        // Collect entries to retry or remove (can't modify while iterating)
+        std::vector<uint32_t> to_retry;
+        std::vector<uint32_t> to_remove;
+
+        for (auto& [seq_num, pending] : pending_map) {
+            if (now >= pending.next_retry) {
+                if (pending.retry_count >= _config.gossip_max_retries) {
+                    // Max retries exceeded, give up
+                    to_remove.push_back(seq_num);
+                    ++_max_retries_exceeded;
+                    log_gossip.warn("Max retries exceeded for route announcement: peer={}, seq_num={}", peer, seq_num);
+                } else {
+                    to_retry.push_back(seq_num);
+                }
+            }
+        }
+
+        // Process retries
+        for (uint32_t seq_num : to_retry) {
+            auto& pending = pending_map[seq_num];
+            pending.retry_count++;
+
+            // Calculate next retry time with exponential backoff
+            auto backoff = calculate_backoff(pending.retry_count);
+            pending.next_retry = now + backoff;
+
+            // Resend the packet
+            seastar::net::packet packet(seastar::temporary_buffer<char>(
+                reinterpret_cast<const char*>(pending.serialized_packet.data()),
+                pending.serialized_packet.size()));
+
+            log_gossip.debug("Retrying route announcement: peer={}, seq_num={}, retry={}/{}",
+                           peer, seq_num, pending.retry_count, _config.gossip_max_retries);
+
+            (void)_channel->send(peer, std::move(packet)).then([this] {
+                ++_retries_sent;
+            }).handle_exception([peer, seq_num](auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    log_gossip.debug("Failed to retry to peer {}: {}", peer, e.what());
+                }
+            });
+        }
+
+        // Remove entries that exceeded max retries
+        for (uint32_t seq_num : to_remove) {
+            pending_map.erase(seq_num);
+        }
+    }
+
+    // Clean up empty peer entries
+    for (auto it = _pending_acks.begin(); it != _pending_acks.end(); ) {
+        if (it->second.empty()) {
+            it = _pending_acks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Reliable delivery: get next sequence number for a peer
+uint32_t GossipService::next_seq_num(const seastar::socket_address& peer) {
+    auto& counter = _peer_seq_counters[peer];
+    return ++counter;  // Pre-increment so we start at 1, not 0
+}
+
+// Reliable delivery: calculate backoff delay for retry
+std::chrono::milliseconds GossipService::calculate_backoff(uint32_t retry_count) const {
+    // Exponential backoff: 100ms, 200ms, 400ms, ...
+    // Capped at 8x the base timeout
+    auto base = _config.gossip_ack_timeout;
+    auto multiplier = static_cast<uint32_t>(1) << std::min(retry_count, 3u);  // 1, 2, 4, 8
+    return std::min(base * multiplier, base * 8);
 }
 
 }  // namespace ranvier
