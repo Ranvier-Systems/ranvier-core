@@ -21,6 +21,7 @@
 #include <csignal>
 #include <fstream>
 #include <streambuf>
+#include <unistd.h>
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/prometheus.hh>
@@ -568,6 +569,9 @@ void print_help(const char* program_name) {
 }
 
 int main(int argc, char** argv) {
+    // Debug: verify we reach main()
+    write(STDERR_FILENO, "DEBUG: main() reached\n", 22);
+
     // Check for --help or -h BEFORE any other processing
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
