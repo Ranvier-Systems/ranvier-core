@@ -76,7 +76,8 @@ set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(WITH_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WITH_BENCHMARK OFF CACHE BOOL "" FORCE)
 set(OTELCPP_MAINTAINER_MODE OFF CACHE BOOL "" FORCE)
-set(WITH_ABSEIL OFF CACHE BOOL "" FORCE)  # Use OpenTelemetry internal containers
+set(WITH_ABSEIL OFF CACHE BOOL "" FORCE)  # Don't use external abseil
+set(WITH_STL "CXX20" CACHE STRING "" FORCE)  # Use C++20 stdlib instead of internal absl
 FetchContent_MakeAvailable(opentelemetry-cpp)
 
 # SQLite3 Configuration
