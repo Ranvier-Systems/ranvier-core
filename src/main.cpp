@@ -243,7 +243,14 @@ int run_dry_run_validation(const std::string& config_path, const ranvier::Ranvie
     // ============================================================
     std::cout << "Configuration: " << config_path << "\n";
 
-    std::cout << "  \xE2\x9C\x93 Config file parsed successfully\n";
+    // Check if config file actually exists
+    std::ifstream config_file(config_path);
+    if (config_file.is_open()) {
+        config_file.close();
+        std::cout << "  \xE2\x9C\x93 Config file parsed successfully\n";
+    } else {
+        std::cout << "  ! Config file not found, using defaults\n";
+    }
     std::cout << "  \xE2\x9C\x93 API port: " << config.server.api_port << "\n";
     std::cout << "  \xE2\x9C\x93 Metrics port: " << config.server.metrics_port << "\n";
 
