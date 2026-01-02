@@ -17,12 +17,11 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
     ninja -j4 -C build/release install
 
 # Build Ranvier
-# Note: WITH_TELEMETRY=OFF avoids OpenTelemetry static initialization that blocks
-# Set WITH_TELEMETRY=ON if you need distributed tracing (requires fixing OTEL init)
+# OpenTelemetry uses PIMPL pattern to defer initialization until after main() starts
 WORKDIR /src
 COPY . .
 RUN rm -rf build && mkdir build && cd build && \
-    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DWITH_TELEMETRY=OFF && \
+    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
     ninja
 
 # Collect all shared libraries needed at runtime (including symlinks)

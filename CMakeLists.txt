@@ -139,6 +139,7 @@ if(Seastar_FOUND)
       src/stream_parser.cpp
       src/tokenizer_service.cpp
       src/sqlite_persistence.cpp
+      src/tracing_service.cpp
     )
 
     target_include_directories(ranvier_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
