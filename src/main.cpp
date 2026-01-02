@@ -564,6 +564,7 @@ void print_help(const char* program_name) {
     std::cout << "    " << program_name << " --smp 4 --memory 8G\n";
     std::cout << "        Start with 4 CPU cores and 8GB memory\n\n";
     std::cout << "For more information, see: https://github.com/ranvier-systems/ranvier-core\n";
+    std::cout << std::flush;
 }
 
 int main(int argc, char** argv) {
