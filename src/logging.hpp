@@ -48,6 +48,23 @@ inline std::string extract_request_id(const auto& headers) {
     return "";
 }
 
+// Extract W3C Trace Context (traceparent header) from incoming HTTP headers
+// Returns empty string if header is not present
+// Format: "{version}-{trace-id}-{parent-span-id}-{trace-flags}"
+// Example: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+inline std::string extract_traceparent(const auto& headers) {
+    auto it = headers.find("traceparent");
+    if (it != headers.end() && !it->second.empty()) {
+        return std::string(it->second);
+    }
+    // Also check lowercase (HTTP/2 uses lowercase headers)
+    it = headers.find("Traceparent");
+    if (it != headers.end() && !it->second.empty()) {
+        return std::string(it->second);
+    }
+    return "";
+}
+
 // Ranvier loggers - one per component for fine-grained control
 //
 // Log levels (from seastar/util/log.hh):

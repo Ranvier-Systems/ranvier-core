@@ -281,3 +281,75 @@ cluster:
 shutdown:
   # Maximum time in seconds to wait for in-flight requests during shutdown (RANVIER_SHUTDOWN_DRAIN_TIMEOUT)
   drain_timeout_seconds: 30
+
+# =============================================================================
+# OpenTelemetry Distributed Tracing Configuration
+# =============================================================================
+# Enable distributed tracing for debugging request flow across the router.
+# Exporter selection is automatic based on build dependencies:
+#   - With protobuf: OTLP HTTP (recommended for OTEL Collector, Tempo)
+#   - Without protobuf: Zipkin HTTP (works with Jaeger, Zipkin)
+telemetry:
+  # Enable OpenTelemetry tracing (RANVIER_TELEMETRY_ENABLED)
+  enabled: false
+
+  # Trace collector endpoint (RANVIER_OTLP_ENDPOINT)
+  # Format depends on the exporter:
+  #   - OTLP: http://localhost:4318 (path /v1/traces added automatically)
+  #   - Zipkin: http://localhost:9411 (path /api/v2/spans added automatically)
+  #
+  # Common endpoints:
+  #   - Jaeger (OTLP): http://localhost:4318
+  #   - Jaeger (Zipkin): http://localhost:9411
+  #   - Grafana Tempo: http://localhost:4318
+  #   - OpenTelemetry Collector: http://localhost:4318
+  #   - Zipkin: http://localhost:9411
+  otlp_endpoint: "http://localhost:4318"
+
+  # Service name for traces (RANVIER_SERVICE_NAME)
+  # This appears in your tracing backend as the service identifier
+  service_name: "ranvier"
+
+  # Trace sampling rate (RANVIER_TELEMETRY_SAMPLE_RATE)
+  # 0.0 = never sample, 1.0 = always sample
+  # For production, consider 0.1 (10%) to reduce overhead
+  sample_rate: 1.0
+
+  # Batch export interval in milliseconds (RANVIER_TELEMETRY_EXPORT_INTERVAL_MS)
+  # Spans are batched and exported at this interval
+  export_interval_ms: 5000
+
+  # Maximum number of spans in the export queue (RANVIER_TELEMETRY_MAX_QUEUE_SIZE)
+  # If queue is full, oldest spans are dropped
+  max_queue_size: 2048
+
+  # Maximum spans per export batch (RANVIER_TELEMETRY_MAX_EXPORT_BATCH_SIZE)
+  max_export_batch_size: 512
+
+  # Spans created by Ranvier:
+  # - ranvier.request: Root span for each incoming request
+  #     Attributes: http.method, http.url, ranvier.request_id, ranvier.backend_id, ranvier.routing_mode
+  # - ranvier.tokenize: Tokenization time
+  #     Attributes: ranvier.token_source (client|local), ranvier.token_count
+  # - ranvier.route_lookup: Radix tree or prefix hash lookup time
+  #     Attributes: ranvier.routing_mode, ranvier.cache_hit, ranvier.backend_id
+  #
+  # Trace context propagation:
+  # - Incoming: Parses W3C Trace Context (traceparent header)
+  # - Outgoing: Forwards traceparent header to backend vLLM instances
+  #
+  # Example with Jaeger (OTLP - requires protobuf):
+  #   docker run -d --name jaeger \
+  #     -p 4318:4318 \
+  #     -p 16686:16686 \
+  #     jaegertracing/all-in-one:latest
+  #   Then set: enabled: true, otlp_endpoint: "http://localhost:4318"
+  #   View traces at: http://localhost:16686
+  #
+  # Example with Jaeger (Zipkin - no protobuf required):
+  #   docker run -d --name jaeger \
+  #     -p 9411:9411 \
+  #     -p 16686:16686 \
+  #     jaegertracing/all-in-one:latest
+  #   Then set: enabled: true, otlp_endpoint: "http://localhost:9411"
+  #   View traces at: http://localhost:16686

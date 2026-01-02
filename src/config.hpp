@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -176,6 +177,17 @@ struct K8sDiscoveryConfig {
     std::string label_selector;
 };
 
+// OpenTelemetry distributed tracing configuration
+struct TelemetryConfig {
+    bool enabled = false;                                  // Enable OpenTelemetry tracing
+    std::string otlp_endpoint = "http://localhost:4318";   // OTLP HTTP endpoint (Jaeger, Tempo, etc.)
+    std::string service_name = "ranvier";                  // Service name for traces
+    double sample_rate = 1.0;                              // Trace sampling rate (0.0-1.0)
+    std::chrono::milliseconds export_interval{5000};       // Batch export interval
+    size_t max_queue_size = 2048;                          // Max pending spans in queue
+    size_t max_export_batch_size = 512;                    // Max spans per export batch
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -193,6 +205,7 @@ struct RanvierConfig {
     ShutdownConfig shutdown;
     ClusterConfig cluster;
     K8sDiscoveryConfig k8s_discovery;
+    TelemetryConfig telemetry;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
@@ -469,6 +482,35 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_K8S_LABEL_SELECTOR")) {
         k8s_discovery.label_selector = *v;
     }
+
+    // Telemetry overrides
+    if (auto v = get_env("RANVIER_TELEMETRY_ENABLED")) {
+        telemetry.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_OTLP_ENDPOINT")) {
+        telemetry.otlp_endpoint = *v;
+    }
+    if (auto v = get_env("RANVIER_SERVICE_NAME")) {
+        telemetry.service_name = *v;
+    }
+    if (auto v = get_env("RANVIER_TELEMETRY_SAMPLE_RATE")) {
+        try {
+            telemetry.sample_rate = std::stod(*v);
+            if (telemetry.sample_rate < 0.0) telemetry.sample_rate = 0.0;
+            if (telemetry.sample_rate > 1.0) telemetry.sample_rate = 1.0;
+        } catch (...) {
+            // Ignore invalid values
+        }
+    }
+    if (auto v = get_env_as<int>("RANVIER_TELEMETRY_EXPORT_INTERVAL_MS")) {
+        telemetry.export_interval = std::chrono::milliseconds(*v);
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TELEMETRY_MAX_QUEUE_SIZE")) {
+        telemetry.max_queue_size = *v;
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TELEMETRY_MAX_EXPORT_BATCH_SIZE")) {
+        telemetry.max_export_batch_size = *v;
+    }
 }
 
 inline RanvierConfig RanvierConfig::defaults() {
@@ -729,6 +771,27 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (k["verify_tls"]) config.k8s_discovery.verify_tls = k["verify_tls"].as<bool>();
             if (k["label_selector"]) config.k8s_discovery.label_selector = k["label_selector"].as<std::string>();
         }
+
+        // Telemetry section (OpenTelemetry distributed tracing)
+        if (yaml["telemetry"]) {
+            YAML::Node t = yaml["telemetry"];
+            if (t["enabled"]) config.telemetry.enabled = t["enabled"].as<bool>();
+            if (t["otlp_endpoint"]) config.telemetry.otlp_endpoint = t["otlp_endpoint"].as<std::string>();
+            if (t["service_name"]) config.telemetry.service_name = t["service_name"].as<std::string>();
+            if (t["sample_rate"]) {
+                double rate = t["sample_rate"].as<double>();
+                config.telemetry.sample_rate = std::max(0.0, std::min(1.0, rate));
+            }
+            if (t["export_interval_ms"]) {
+                config.telemetry.export_interval = std::chrono::milliseconds(t["export_interval_ms"].as<int>());
+            }
+            if (t["max_queue_size"]) {
+                config.telemetry.max_queue_size = t["max_queue_size"].as<size_t>();
+            }
+            if (t["max_export_batch_size"]) {
+                config.telemetry.max_export_batch_size = t["max_export_batch_size"].as<size_t>();
+            }
+        }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -868,6 +931,25 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
         }
         if (config.k8s_discovery.api_server.empty()) {
             return "k8s_discovery.api_server must be non-empty";
+        }
+    }
+
+    // Validate telemetry settings (if enabled)
+    if (config.telemetry.enabled) {
+        if (config.telemetry.otlp_endpoint.empty()) {
+            return "telemetry.otlp_endpoint must be non-empty when telemetry is enabled";
+        }
+        if (config.telemetry.service_name.empty()) {
+            return "telemetry.service_name must be non-empty when telemetry is enabled";
+        }
+        if (config.telemetry.sample_rate < 0.0 || config.telemetry.sample_rate > 1.0) {
+            return "telemetry.sample_rate must be between 0.0 and 1.0";
+        }
+        if (config.telemetry.max_queue_size == 0) {
+            return "telemetry.max_queue_size must be positive";
+        }
+        if (config.telemetry.max_export_batch_size == 0) {
+            return "telemetry.max_export_batch_size must be positive";
         }
     }
 
