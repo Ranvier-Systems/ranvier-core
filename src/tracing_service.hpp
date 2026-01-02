@@ -13,6 +13,9 @@
 // - Zipkin: Default, works without protobuf, sends to Zipkin/Jaeger collectors
 // - OTLP: Requires protobuf, preferred for OTEL Collector/Tempo/modern backends
 // Define RANVIER_USE_OTLP_EXPORTER before including to use OTLP (requires protobuf)
+//
+// Build without telemetry: cmake -DWITH_TELEMETRY=OFF to disable OpenTelemetry
+// and avoid its static initialization (which can block on some platforms)
 
 #pragma once
 
@@ -22,6 +25,53 @@
 #include <optional>
 #include <string>
 #include <string_view>
+
+#ifdef RANVIER_NO_TELEMETRY
+// ============================================================================
+// No-op stubs when OpenTelemetry is disabled
+// ============================================================================
+
+namespace ranvier {
+
+struct TraceContext {
+    std::string trace_id;
+    std::string parent_span_id;
+    bool sampled = false;
+    bool valid = false;
+    static TraceContext parse(std::string_view) { return {}; }
+    std::string to_traceparent(std::string_view) const { return ""; }
+};
+
+class ScopedSpan {
+public:
+    ScopedSpan() = default;
+    void set_attribute(const std::string&, const std::string&) {}
+    void set_attribute(const std::string&, int64_t) {}
+    void set_attribute(const std::string&, double) {}
+    void set_attribute(const std::string&, bool) {}
+    void set_status(int, const std::string& = "") {}
+    void set_error(const std::string&) {}
+    void set_ok() {}
+    void record_exception(const std::exception&) {}
+    std::string span_id() const { return ""; }
+    std::string trace_id() const { return ""; }
+    bool is_recording() const { return false; }
+};
+
+class TracingService {
+public:
+    static void init(const TelemetryConfig&) {}
+    static void shutdown() {}
+    static bool is_enabled() { return false; }
+    static ScopedSpan start_span(const std::string&, const std::optional<TraceContext>& = std::nullopt) {
+        return ScopedSpan();
+    }
+    static ScopedSpan start_child_span(const std::string&) { return ScopedSpan(); }
+};
+
+}  // namespace ranvier
+
+#else  // RANVIER_NO_TELEMETRY not defined - use real OpenTelemetry
 
 #include <opentelemetry/nostd/span.h>
 #include <opentelemetry/trace/provider.h>
@@ -472,3 +522,5 @@ inline ScopedSpan TracingService::start_child_span(const std::string& name) {
 }
 
 }  // namespace ranvier
+
+#endif  // RANVIER_NO_TELEMETRY
