@@ -106,12 +106,12 @@ Hardening the gossip protocol and cluster coordination for production multi-node
 
 ### 2.3 Gossip Protocol Reliability
 
-- [ ] **Add reliable delivery with acknowledgments**
+- [x] **Add reliable delivery with acknowledgments** ✓
   _Justification:_ Current UDP gossip is fire-and-forget. Critical route updates can be lost. Add lightweight ACK/retry for route announcements.
   _Location:_ `src/gossip_service.cpp:217-262`
   _Complexity:_ Medium
 
-- [ ] **Implement duplicate suppression**
+- [x] **Implement duplicate suppression** ✓
   _Justification:_ Same route may be announced multiple times on retransmit. Add sequence numbers to deduplicate.
   _Location:_ `src/gossip_service.hpp`
   _Complexity:_ Low
@@ -405,6 +405,8 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-02 | Add reliable delivery with acknowledgments (gossip protocol) | - |
+| 2025-01-02 | Implement duplicate suppression (gossip protocol) | - |
 | 2025-01-02 | OpenTelemetry distributed tracing integration | - |
 | 2025-01-01 | Non-root container execution (P0 security fix) | - |
 | 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |

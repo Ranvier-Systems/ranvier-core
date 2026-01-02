@@ -15,21 +15,24 @@ using namespace ranvier;
 
 // =============================================================================
 // RouteAnnouncementPacket - Replicated here to avoid Seastar dependencies
+// Wire format v2: [type:1][version:1][seq_num:4][backend_id:4][token_count:2][tokens:4*N]
 // =============================================================================
 
 enum class GossipPacketType : uint8_t {
     ROUTE_ANNOUNCEMENT = 0x01,
     HEARTBEAT = 0x02,
+    ROUTE_ACK = 0x03,
 };
 
 struct RouteAnnouncementPacket {
-    static constexpr uint8_t PROTOCOL_VERSION = 1;
-    static constexpr size_t HEADER_SIZE = 8;
+    static constexpr uint8_t PROTOCOL_VERSION = 2;  // Version 2 includes seq_num
+    static constexpr size_t HEADER_SIZE = 12;  // type + version + seq_num + backend_id + token_count
     static constexpr size_t MAX_TOKENS = 256;
     static constexpr size_t MAX_PACKET_SIZE = HEADER_SIZE + (MAX_TOKENS * sizeof(TokenId));
 
     GossipPacketType type = GossipPacketType::ROUTE_ANNOUNCEMENT;
     uint8_t version = PROTOCOL_VERSION;
+    uint32_t seq_num = 0;  // Sequence number for reliable delivery
     BackendId backend_id = 0;
     uint16_t token_count = 0;
     std::vector<TokenId> tokens;
@@ -41,6 +44,13 @@ struct RouteAnnouncementPacket {
         buffer.push_back(static_cast<uint8_t>(type));
         buffer.push_back(version);
 
+        // Sequence number (big-endian)
+        buffer.push_back((seq_num >> 24) & 0xFF);
+        buffer.push_back((seq_num >> 16) & 0xFF);
+        buffer.push_back((seq_num >> 8) & 0xFF);
+        buffer.push_back(seq_num & 0xFF);
+
+        // Backend ID (big-endian)
         buffer.push_back((backend_id >> 24) & 0xFF);
         buffer.push_back((backend_id >> 16) & 0xFF);
         buffer.push_back((backend_id >> 8) & 0xFF);
@@ -74,12 +84,19 @@ struct RouteAnnouncementPacket {
             return std::nullopt;
         }
 
-        pkt.backend_id = (static_cast<BackendId>(data[2]) << 24) |
-                         (static_cast<BackendId>(data[3]) << 16) |
-                         (static_cast<BackendId>(data[4]) << 8) |
-                         static_cast<BackendId>(data[5]);
+        // Sequence number (big-endian)
+        pkt.seq_num = (static_cast<uint32_t>(data[2]) << 24) |
+                      (static_cast<uint32_t>(data[3]) << 16) |
+                      (static_cast<uint32_t>(data[4]) << 8) |
+                      static_cast<uint32_t>(data[5]);
 
-        pkt.token_count = (static_cast<uint16_t>(data[6]) << 8) | static_cast<uint16_t>(data[7]);
+        // Backend ID (big-endian)
+        pkt.backend_id = (static_cast<BackendId>(data[6]) << 24) |
+                         (static_cast<BackendId>(data[7]) << 16) |
+                         (static_cast<BackendId>(data[8]) << 8) |
+                         static_cast<BackendId>(data[9]);
+
+        pkt.token_count = (static_cast<uint16_t>(data[10]) << 8) | static_cast<uint16_t>(data[11]);
 
         size_t expected_size = HEADER_SIZE + pkt.token_count * sizeof(TokenId);
         if (len != expected_size || pkt.token_count > MAX_TOKENS) {
@@ -100,6 +117,55 @@ struct RouteAnnouncementPacket {
     }
 };
 
+// Wire format for route acknowledgments
+// Format: [type:1][version:1][seq_num:4]
+struct RouteAckPacket {
+    static constexpr uint8_t PROTOCOL_VERSION = 2;
+    static constexpr size_t PACKET_SIZE = 6;  // type + version + seq_num
+
+    GossipPacketType type = GossipPacketType::ROUTE_ACK;
+    uint8_t version = PROTOCOL_VERSION;
+    uint32_t seq_num = 0;  // Sequence number being acknowledged
+
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buffer;
+        buffer.reserve(PACKET_SIZE);
+
+        buffer.push_back(static_cast<uint8_t>(type));
+        buffer.push_back(version);
+
+        // Sequence number (big-endian)
+        buffer.push_back((seq_num >> 24) & 0xFF);
+        buffer.push_back((seq_num >> 16) & 0xFF);
+        buffer.push_back((seq_num >> 8) & 0xFF);
+        buffer.push_back(seq_num & 0xFF);
+
+        return buffer;
+    }
+
+    static std::optional<RouteAckPacket> deserialize(const uint8_t* data, size_t len) {
+        if (len != PACKET_SIZE) {
+            return std::nullopt;
+        }
+
+        RouteAckPacket pkt;
+        pkt.type = static_cast<GossipPacketType>(data[0]);
+        pkt.version = data[1];
+
+        if (pkt.type != GossipPacketType::ROUTE_ACK || pkt.version != PROTOCOL_VERSION) {
+            return std::nullopt;
+        }
+
+        // Sequence number (big-endian)
+        pkt.seq_num = (static_cast<uint32_t>(data[2]) << 24) |
+                      (static_cast<uint32_t>(data[3]) << 16) |
+                      (static_cast<uint32_t>(data[4]) << 8) |
+                      static_cast<uint32_t>(data[5]);
+
+        return pkt;
+    }
+};
+
 // =============================================================================
 // Wire Format Tests
 // =============================================================================
@@ -111,7 +177,7 @@ protected:
 };
 
 TEST_F(GossipProtocolTest, PacketHeaderSize) {
-    EXPECT_EQ(RouteAnnouncementPacket::HEADER_SIZE, 8u);
+    EXPECT_EQ(RouteAnnouncementPacket::HEADER_SIZE, 12u);  // v2: type + version + seq_num + backend_id + token_count
 }
 
 TEST_F(GossipProtocolTest, MaxTokensLimit) {
@@ -119,8 +185,8 @@ TEST_F(GossipProtocolTest, MaxTokensLimit) {
 }
 
 TEST_F(GossipProtocolTest, MaxPacketSize) {
-    // Header (8) + 256 tokens * 4 bytes = 1032 bytes
-    EXPECT_EQ(RouteAnnouncementPacket::MAX_PACKET_SIZE, 8u + 256u * 4u);
+    // Header (12) + 256 tokens * 4 bytes = 1036 bytes
+    EXPECT_EQ(RouteAnnouncementPacket::MAX_PACKET_SIZE, 12u + 256u * 4u);
 }
 
 // =============================================================================
@@ -137,40 +203,52 @@ TEST_F(GossipProtocolTest, SerializeEmptyPacket) {
     ASSERT_EQ(data.size(), RouteAnnouncementPacket::HEADER_SIZE);
     EXPECT_EQ(data[0], static_cast<uint8_t>(GossipPacketType::ROUTE_ANNOUNCEMENT));
     EXPECT_EQ(data[1], RouteAnnouncementPacket::PROTOCOL_VERSION);
-    // Backend ID = 0
+    // Seq num = 0
     EXPECT_EQ(data[2], 0);
     EXPECT_EQ(data[3], 0);
     EXPECT_EQ(data[4], 0);
     EXPECT_EQ(data[5], 0);
-    // Token count = 0
+    // Backend ID = 0
     EXPECT_EQ(data[6], 0);
     EXPECT_EQ(data[7], 0);
+    EXPECT_EQ(data[8], 0);
+    EXPECT_EQ(data[9], 0);
+    // Token count = 0
+    EXPECT_EQ(data[10], 0);
+    EXPECT_EQ(data[11], 0);
 }
 
 TEST_F(GossipProtocolTest, SerializeSingleToken) {
     RouteAnnouncementPacket pkt;
     pkt.backend_id = 42;
+    pkt.seq_num = 1;
     pkt.tokens = {0x12345678};
 
     auto data = pkt.serialize();
 
     ASSERT_EQ(data.size(), RouteAnnouncementPacket::HEADER_SIZE + 4);
 
-    // Backend ID = 42 (0x0000002A)
+    // Seq num = 1
     EXPECT_EQ(data[2], 0x00);
     EXPECT_EQ(data[3], 0x00);
     EXPECT_EQ(data[4], 0x00);
-    EXPECT_EQ(data[5], 0x2A);
+    EXPECT_EQ(data[5], 0x01);
+
+    // Backend ID = 42 (0x0000002A)
+    EXPECT_EQ(data[6], 0x00);
+    EXPECT_EQ(data[7], 0x00);
+    EXPECT_EQ(data[8], 0x00);
+    EXPECT_EQ(data[9], 0x2A);
 
     // Token count = 1
-    EXPECT_EQ(data[6], 0x00);
-    EXPECT_EQ(data[7], 0x01);
+    EXPECT_EQ(data[10], 0x00);
+    EXPECT_EQ(data[11], 0x01);
 
     // Token 0x12345678 in big-endian
-    EXPECT_EQ(data[8], 0x12);
-    EXPECT_EQ(data[9], 0x34);
-    EXPECT_EQ(data[10], 0x56);
-    EXPECT_EQ(data[11], 0x78);
+    EXPECT_EQ(data[12], 0x12);
+    EXPECT_EQ(data[13], 0x34);
+    EXPECT_EQ(data[14], 0x56);
+    EXPECT_EQ(data[15], 0x78);
 }
 
 TEST_F(GossipProtocolTest, SerializeMultipleTokens) {
@@ -183,8 +261,8 @@ TEST_F(GossipProtocolTest, SerializeMultipleTokens) {
     ASSERT_EQ(data.size(), RouteAnnouncementPacket::HEADER_SIZE + 5 * 4);
 
     // Token count = 5
-    EXPECT_EQ(data[6], 0x00);
-    EXPECT_EQ(data[7], 0x05);
+    EXPECT_EQ(data[10], 0x00);
+    EXPECT_EQ(data[11], 0x05);
 }
 
 TEST_F(GossipProtocolTest, SerializeLargeBackendId) {
@@ -194,11 +272,11 @@ TEST_F(GossipProtocolTest, SerializeLargeBackendId) {
 
     auto data = pkt.serialize();
 
-    // Backend ID in big-endian
-    EXPECT_EQ(data[2], 0xDE);
-    EXPECT_EQ(data[3], 0xAD);
-    EXPECT_EQ(data[4], 0xBE);
-    EXPECT_EQ(data[5], 0xEF);
+    // Backend ID in big-endian (at offset 6-9)
+    EXPECT_EQ(data[6], 0xDE);
+    EXPECT_EQ(data[7], 0xAD);
+    EXPECT_EQ(data[8], 0xBE);
+    EXPECT_EQ(data[9], 0xEF);
 }
 
 TEST_F(GossipProtocolTest, SerializeTruncatesExcessTokens) {
@@ -218,8 +296,8 @@ TEST_F(GossipProtocolTest, SerializeTruncatesExcessTokens) {
                            RouteAnnouncementPacket::MAX_TOKENS * sizeof(TokenId);
     EXPECT_EQ(data.size(), expected_size);
 
-    // Token count should be MAX_TOKENS
-    uint16_t token_count = (static_cast<uint16_t>(data[6]) << 8) | data[7];
+    // Token count should be MAX_TOKENS (at offset 10-11)
+    uint16_t token_count = (static_cast<uint16_t>(data[10]) << 8) | data[11];
     EXPECT_EQ(token_count, RouteAnnouncementPacket::MAX_TOKENS);
 }
 
@@ -340,11 +418,14 @@ TEST_F(GossipProtocolTest, DeserializeFailsTooManyTokens) {
     std::vector<uint8_t> data(RouteAnnouncementPacket::HEADER_SIZE);
     data[0] = static_cast<uint8_t>(GossipPacketType::ROUTE_ANNOUNCEMENT);
     data[1] = RouteAnnouncementPacket::PROTOCOL_VERSION;
-    data[2] = 0; data[3] = 0; data[4] = 0; data[5] = 1;  // backend_id = 1
+    // seq_num = 0
+    data[2] = 0; data[3] = 0; data[4] = 0; data[5] = 0;
+    // backend_id = 1
+    data[6] = 0; data[7] = 0; data[8] = 0; data[9] = 1;
 
     // Set token_count to 257 (> MAX_TOKENS)
-    data[6] = 0x01;
-    data[7] = 0x01;
+    data[10] = 0x01;
+    data[11] = 0x01;
 
     auto result = RouteAnnouncementPacket::deserialize(data.data(), data.size());
     EXPECT_FALSE(result.has_value());
@@ -420,7 +501,7 @@ TEST_F(GossipProtocolTest, HeartbeatPacketFormat) {
 
     EXPECT_EQ(heartbeat.size(), 2u);
     EXPECT_EQ(heartbeat[0], 0x02);  // HEARTBEAT
-    EXPECT_EQ(heartbeat[1], 0x01);  // VERSION 1
+    EXPECT_EQ(heartbeat[1], 0x02);  // VERSION 2
 }
 
 // =============================================================================
@@ -430,6 +511,78 @@ TEST_F(GossipProtocolTest, HeartbeatPacketFormat) {
 TEST_F(GossipProtocolTest, PacketTypeValues) {
     EXPECT_EQ(static_cast<uint8_t>(GossipPacketType::ROUTE_ANNOUNCEMENT), 0x01);
     EXPECT_EQ(static_cast<uint8_t>(GossipPacketType::HEARTBEAT), 0x02);
+    EXPECT_EQ(static_cast<uint8_t>(GossipPacketType::ROUTE_ACK), 0x03);
+}
+
+// =============================================================================
+// Route ACK Packet Tests
+// =============================================================================
+
+TEST_F(GossipProtocolTest, RouteAckPacketSize) {
+    EXPECT_EQ(RouteAckPacket::PACKET_SIZE, 6u);  // type + version + seq_num
+}
+
+TEST_F(GossipProtocolTest, RouteAckSerialize) {
+    RouteAckPacket ack;
+    ack.seq_num = 0x12345678;
+
+    auto data = ack.serialize();
+
+    ASSERT_EQ(data.size(), RouteAckPacket::PACKET_SIZE);
+    EXPECT_EQ(data[0], static_cast<uint8_t>(GossipPacketType::ROUTE_ACK));
+    EXPECT_EQ(data[1], RouteAckPacket::PROTOCOL_VERSION);
+    // Seq num in big-endian
+    EXPECT_EQ(data[2], 0x12);
+    EXPECT_EQ(data[3], 0x34);
+    EXPECT_EQ(data[4], 0x56);
+    EXPECT_EQ(data[5], 0x78);
+}
+
+TEST_F(GossipProtocolTest, RouteAckDeserialize) {
+    RouteAckPacket original;
+    original.seq_num = 42;
+
+    auto data = original.serialize();
+    auto result = RouteAckPacket::deserialize(data.data(), data.size());
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->type, GossipPacketType::ROUTE_ACK);
+    EXPECT_EQ(result->version, RouteAckPacket::PROTOCOL_VERSION);
+    EXPECT_EQ(result->seq_num, 42u);
+}
+
+TEST_F(GossipProtocolTest, RouteAckDeserializeFailsWrongSize) {
+    uint8_t short_data[4] = {0x03, 0x02, 0x00, 0x00};
+    auto result = RouteAckPacket::deserialize(short_data, 4);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(GossipProtocolTest, RouteAckDeserializeFailsWrongType) {
+    RouteAckPacket ack;
+    ack.seq_num = 1;
+    auto data = ack.serialize();
+
+    // Change type to ROUTE_ANNOUNCEMENT
+    data[0] = static_cast<uint8_t>(GossipPacketType::ROUTE_ANNOUNCEMENT);
+
+    auto result = RouteAckPacket::deserialize(data.data(), data.size());
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(GossipProtocolTest, RouteAnnouncementWithSeqNum) {
+    // Test sequence number round-trip
+    RouteAnnouncementPacket pkt;
+    pkt.seq_num = 0xFEDCBA98;
+    pkt.backend_id = 42;
+    pkt.tokens = {1, 2, 3};
+
+    auto data = pkt.serialize();
+    auto result = RouteAnnouncementPacket::deserialize(data.data(), data.size());
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->seq_num, 0xFEDCBA98u);
+    EXPECT_EQ(result->backend_id, 42);
+    ASSERT_EQ(result->tokens.size(), 3u);
 }
 
 int main(int argc, char** argv) {
