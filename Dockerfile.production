@@ -23,9 +23,9 @@ RUN rm -rf build && mkdir build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
     ninja
 
-# Collect all shared libraries needed at runtime
+# Collect all shared libraries needed at runtime (including symlinks)
 RUN mkdir -p /src/build/runtime-libs && \
-    find /src/build -name "*.so*" -type f -exec cp {} /src/build/runtime-libs/ \;
+    find /src/build -name "*.so*" \( -type f -o -type l \) -exec cp -L {} /src/build/runtime-libs/ \;
 
 # ---------------------------------------------------------
 # STAGE 2: Runner (Lightweight, Runtime only)
