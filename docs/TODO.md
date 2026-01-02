@@ -405,6 +405,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-02 | OpenTelemetry distributed tracing integration | - |
 | 2025-01-01 | Non-root container execution (P0 security fix) | - |
 | 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
 | 2025-01-01 | Fix: Persistence state corruption after crash | - |
