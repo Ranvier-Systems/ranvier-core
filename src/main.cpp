@@ -540,7 +540,42 @@ future<> run() {
     });
 }
 
+void print_help(const char* program_name) {
+    std::cout << "Ranvier Core - Content-aware Layer 7+ Load Balancer for LLM Inference\n\n";
+    std::cout << "USAGE:\n";
+    std::cout << "    " << program_name << " [OPTIONS]\n\n";
+    std::cout << "DESCRIPTION:\n";
+    std::cout << "    Ranvier routes LLM requests based on token prefixes rather than\n";
+    std::cout << "    connection availability, reducing GPU cache thrashing by directing\n";
+    std::cout << "    requests to backends that already hold relevant KV cache state.\n\n";
+    std::cout << "OPTIONS:\n";
+    std::cout << "    -h, --help              Print this help message and exit\n";
+    std::cout << "    --config <PATH>         Path to configuration file (default: ranvier.yaml)\n";
+    std::cout << "    --smp <N>               Number of CPU cores to use (Seastar option)\n";
+    std::cout << "    --memory <SIZE>         Memory to allocate (e.g., 4G) (Seastar option)\n\n";
+    std::cout << "SIGNALS:\n";
+    std::cout << "    SIGHUP                  Reload configuration (hot-reload)\n";
+    std::cout << "    SIGINT, SIGTERM         Graceful shutdown with connection draining\n\n";
+    std::cout << "EXAMPLES:\n";
+    std::cout << "    " << program_name << "\n";
+    std::cout << "        Start with default config file (ranvier.yaml)\n\n";
+    std::cout << "    " << program_name << " --config /etc/ranvier/config.yaml\n";
+    std::cout << "        Start with custom config file\n\n";
+    std::cout << "    " << program_name << " --smp 4 --memory 8G\n";
+    std::cout << "        Start with 4 CPU cores and 8GB memory\n\n";
+    std::cout << "For more information, see: https://github.com/ranvier-systems/ranvier-core\n";
+}
+
 int main(int argc, char** argv) {
+    // Check for --help or -h BEFORE any other processing
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_help(argv[0]);
+            return 0;
+        }
+    }
+
     // Load configuration BEFORE Seastar starts
     // This allows us to use config values for server initialization
     std::string config_path = "ranvier.yaml";
