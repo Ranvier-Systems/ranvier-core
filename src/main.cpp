@@ -706,7 +706,8 @@ OPTIONS:
     -h, --help              Print this help message and exit
     --help-seastar          Show Seastar framework options
     --help-loggers          Print available logger names
-    --config <PATH>         Path to configuration file (default: ranvier.yaml)
+    --config <PATH>         Path to configuration file (default: ranvier.yaml,
+                            falls back to built-in defaults if not found)
     --dry-run               Validate configuration and exit (no server start)
     --smp <N>               Number of CPU cores to use
     --memory <SIZE>         Memory to allocate (e.g., 4G)
@@ -717,7 +718,7 @@ SIGNALS:
 
 EXAMPLES:
     ranvier_server
-        Start with default config file (ranvier.yaml)
+        Start with ranvier.yaml if present, otherwise use built-in defaults
 
     ranvier_server --config /etc/ranvier/config.yaml
         Start with custom config file
@@ -761,7 +762,14 @@ For more information, see: https://github.com/ranvier-systems/ranvier-core
         }
 
         // Log config summary (before Seastar logger is available)
-        std::cout << "Ranvier Core - Configuration loaded\n";
+        // Check if config file actually exists to report accurately
+        std::ifstream config_check(config_path);
+        if (config_check.is_open()) {
+            config_check.close();
+            std::cout << "Ranvier Core - Configuration loaded from " << config_path << "\n";
+        } else {
+            std::cout << "Ranvier Core - Using built-in defaults (" << config_path << " not found)\n";
+        }
         std::cout << "  API Port:     " << g_config.server.api_port << "\n";
         std::cout << "  Metrics Port: " << g_config.server.metrics_port << "\n";
         std::cout << "  Database:     " << g_config.database.path << "\n";
