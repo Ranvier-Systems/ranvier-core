@@ -96,7 +96,6 @@ seastar::future<> GossipService::start() {
     try {
         // Synchronously create the channel.
         _channel = seastar::engine().net().make_bound_datagram_channel(bind_addr);
-        _my_address = bind_addr;
 
         log_gossip.info("Gossip UDP channel opened on port {}", _config.gossip_port);
 
@@ -256,9 +255,7 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
                      tokens.size(), backend, _peer_addresses.size());
 
     // Send to each peer with per-peer sequence numbers
-    // Note: Loopback prevention against _my_address was removed because _my_address
-    // is bound to 0.0.0.0:port which never matches real peer IPs. Operators should
-    // ensure the peer list does not include the node's own address.
+    // Note: Operators should ensure the peer list does not include the node's own address.
     return seastar::parallel_for_each(_peer_addresses, [this, tokens, backend](const seastar::socket_address& peer) mutable {
         // Create packet with per-peer sequence number
         RouteAnnouncementPacket pkt;
@@ -433,11 +430,6 @@ seastar::future<> GossipService::broadcast_heartbeat() {
     seastar::net::packet pb(std::move(buf));
 
     return seastar::parallel_for_each(_peer_addresses, [this, p = pb.share()](const seastar::socket_address& peer) mutable {
-        // Note: Loopback prevention check against _my_address is ineffective since
-        // _my_address is 0.0.0.0:port which never matches real peer IPs.
-        // In practice, peers should not include the node's own address in config.
-
-        // Send and ignore individual results
         return _channel->send(peer, p.share()).discard_result();
     });
 }
