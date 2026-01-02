@@ -53,6 +53,7 @@ RUN groupadd --gid ${GID} ranvier && \
 # Copy Binary and Assets
 WORKDIR /app
 COPY --from=builder /src/build/ranvier_server .
+COPY --from=builder /src/scripts/ranvier-wrapper.sh ./ranvier
 # Copy all OpenTelemetry and other shared libraries built with the project
 COPY --from=builder /src/build/runtime-libs/ /usr/local/lib/
 # Add /usr/local/lib to library search path and run ldconfig
@@ -74,4 +75,4 @@ USER ranvier
 # Or in docker-compose:
 #   cap_add:
 #     - IPC_LOCK
-CMD ["./ranvier_server", "--smp", "1", "--memory", "1G"]
+CMD ["./ranvier", "--smp", "1", "--memory", "1G"]
