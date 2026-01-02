@@ -22,6 +22,54 @@
 #include <fstream>
 #include <streambuf>
 #include <unistd.h>
+#include <cstring>
+
+// Check for --help BEFORE static initialization (which can block with Seastar)
+// Priority 101 runs before most other constructors (default is 65535)
+__attribute__((constructor(101)))
+static void check_help_early(int argc, char** argv) {
+    // Access argc/argv via /proc on Linux
+    FILE* cmdline = fopen("/proc/self/cmdline", "r");
+    if (!cmdline) return;
+
+    char buf[4096];
+    size_t len = fread(buf, 1, sizeof(buf) - 1, cmdline);
+    fclose(cmdline);
+    buf[len] = '\0';
+
+    // cmdline is null-separated arguments
+    for (size_t i = 0; i < len; ) {
+        if (strcmp(&buf[i], "--help") == 0 || strcmp(&buf[i], "-h") == 0) {
+            const char* help =
+                "Ranvier Core - Content-aware Layer 7+ Load Balancer for LLM Inference\n\n"
+                "USAGE:\n"
+                "    ranvier_server [OPTIONS]\n\n"
+                "DESCRIPTION:\n"
+                "    Ranvier routes LLM requests based on token prefixes rather than\n"
+                "    connection availability, reducing GPU cache thrashing by directing\n"
+                "    requests to backends that already hold relevant KV cache state.\n\n"
+                "OPTIONS:\n"
+                "    -h, --help              Print this help message and exit\n"
+                "    --config <PATH>         Path to configuration file (default: ranvier.yaml)\n"
+                "    --smp <N>               Number of CPU cores to use (Seastar option)\n"
+                "    --memory <SIZE>         Memory to allocate (e.g., 4G) (Seastar option)\n\n"
+                "SIGNALS:\n"
+                "    SIGHUP                  Reload configuration (hot-reload)\n"
+                "    SIGINT, SIGTERM         Graceful shutdown with connection draining\n\n"
+                "EXAMPLES:\n"
+                "    ranvier_server\n"
+                "        Start with default config file (ranvier.yaml)\n\n"
+                "    ranvier_server --config /etc/ranvier/config.yaml\n"
+                "        Start with custom config file\n\n"
+                "    ranvier_server --smp 4 --memory 8G\n"
+                "        Start with 4 CPU cores and 8GB memory\n\n"
+                "For more information, see: https://github.com/ranvier-systems/ranvier-core\n";
+            write(STDOUT_FILENO, help, strlen(help));
+            _exit(0);
+        }
+        i += strlen(&buf[i]) + 1;
+    }
+}
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/prometheus.hh>
@@ -569,10 +617,8 @@ void print_help(const char* program_name) {
 }
 
 int main(int argc, char** argv) {
-    // Debug: verify we reach main()
-    write(STDERR_FILENO, "DEBUG: main() reached\n", 22);
-
-    // Check for --help or -h BEFORE any other processing
+    // Note: --help is handled earlier via constructor attribute to avoid
+    // Seastar static initialization blocking. This is a fallback.
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
