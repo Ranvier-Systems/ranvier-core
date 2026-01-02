@@ -10,6 +10,7 @@
 #include "tokenizer_service.hpp"
 
 #include <atomic>
+#include <functional>
 
 #include <seastar/core/gate.hh>
 #include <seastar/http/httpd.hh>
@@ -41,7 +42,7 @@ struct HttpControllerConfig {
     size_t min_token_length = 4;  // Minimum tokens before caching a route
     std::chrono::seconds connect_timeout{5};    // Timeout for backend connection
     std::chrono::seconds request_timeout{300};  // Total timeout for request
-    std::string admin_api_key = "";             // API key for admin endpoints (empty = no auth)
+    AuthConfig auth;                            // Authentication configuration (multi-key support)
     RateLimiterConfig rate_limit;               // Rate limiting configuration
     RetrySettings retry;                        // Retry configuration
     CircuitBreakerSettings circuit_breaker;     // Circuit breaker configuration
@@ -73,6 +74,12 @@ public:
 
     // Set optional persistence store (call before serving requests)
     void set_persistence(PersistenceStore* store) { _persistence = store; }
+
+    // Set config reload callback (for /admin/keys/reload endpoint)
+    // Callback returns true on success, false on failure
+    // The callback is synchronous as it should just trigger the reload process
+    using ConfigReloadCallback = std::function<bool()>;
+    void set_config_reload_callback(ConfigReloadCallback callback) { _config_reload_callback = std::move(callback); }
 
     // Hot-reload: Update configuration at runtime
     void update_config(const HttpControllerConfig& config) {
@@ -109,6 +116,7 @@ private:
     RateLimiter _rate_limiter;
     CircuitBreaker _circuit_breaker;
     PersistenceStore* _persistence;
+    ConfigReloadCallback _config_reload_callback;  // Callback for config hot-reload
 
     // Graceful shutdown state
     std::atomic<bool> _draining{false};  // Set to true to reject new requests
@@ -123,9 +131,13 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_routes(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;
+
+    // Auth helper with detailed info - returns pair<authorized, error_or_key_name>
+    std::pair<bool, std::string> check_admin_auth_with_info(const seastar::http::request& req) const;
 
     // Get client IP from request (checks X-Forwarded-For header)
     static std::string get_client_ip(const seastar::http::request& req);
