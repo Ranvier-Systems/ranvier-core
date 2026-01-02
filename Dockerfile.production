@@ -55,7 +55,8 @@ WORKDIR /app
 COPY --from=builder /src/build/ranvier_server .
 # Copy all OpenTelemetry and other shared libraries built with the project
 COPY --from=builder /src/build/runtime-libs/ /usr/local/lib/
-RUN ldconfig
+# Add /usr/local/lib to library search path and run ldconfig
+RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
 COPY --from=builder /src/assets ./assets
 
 # Set ownership to non-root user
