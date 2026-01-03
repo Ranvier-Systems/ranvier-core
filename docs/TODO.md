@@ -129,13 +129,13 @@ Metrics, tracing, and logging improvements for production monitoring and debuggi
 
 ### 3.1 Prometheus Metrics Enhancements
 
-- [ ] **Add cache hit/miss ratio gauge**
+- [x] **Add cache hit/miss ratio gauge** ✓
   _Justification:_ Counters exist but no pre-computed ratio. Operators need instant visibility into routing efficiency.
   _Metric:_ `ranvier_cache_hit_ratio` (gauge)
   _Location:_ `src/metrics_service.hpp`
   _Complexity:_ Low
 
-- [ ] **Add per-backend latency histograms**
+- [x] **Add per-backend latency histograms** ✓
   _Justification:_ Current histograms are global. Need per-backend breakdown to identify slow GPUs.
   _Metric:_ `ranvier_backend_latency_seconds{backend_id="..."}`
   _Location:_ `src/http_controller.cpp`, `src/metrics_service.hpp`
@@ -155,19 +155,19 @@ Metrics, tracing, and logging improvements for production monitoring and debuggi
 
 ### 3.2 Distributed Tracing (OpenTelemetry)
 
-- [ ] **Integrate OpenTelemetry SDK**
+- [x] **Integrate OpenTelemetry SDK** ✓
   _Justification:_ Current request IDs are correlation tokens only. No span propagation or distributed trace visualization.
   _Approach:_ Add OTLP exporter, propagate W3C trace context headers.
   _Location:_ `src/http_controller.cpp`, `src/logging.hpp`
   _Complexity:_ Medium
 
-- [ ] **Add spans for critical operations**
+- [x] **Add spans for critical operations** ✓
   _Justification:_ Need visibility into time spent in tokenization, routing, backend selection, and response streaming.
   _Spans:_ `tokenize`, `route_lookup`, `backend_connect`, `stream_response`
   _Location:_ `src/http_controller.cpp`, `src/router_service.cpp`
   _Complexity:_ Medium
 
-- [ ] **Propagate trace context to backends**
+- [x] **Propagate trace context to backends** ✓
   _Justification:_ End-to-end tracing requires context propagation to vLLM. Add `traceparent` header forwarding.
   _Location:_ `src/http_controller.cpp:350+`
   _Complexity:_ Low
@@ -198,7 +198,7 @@ Hardening for production deployment environments.
 
 ### 4.1 Container Security
 
-- [ ] **Run container as non-root user**
+- [x] **Run container as non-root user** ✓
   _Justification:_ Current Dockerfile runs as root (default). Container escape vulnerabilities grant full host access.
   _Fix:_ Add `USER ranvier` directive and adjust file permissions.
   _Location:_ `Dockerfile.production:42+`
@@ -243,7 +243,7 @@ Hardening for production deployment environments.
 
 ### 4.3 Authentication & Authorization
 
-- [ ] **Implement API key rotation mechanism**
+- [x] **Implement API key rotation mechanism** ✓
   _Justification:_ Single static API key with no rotation. Compromised key requires restart to change.
   _Approach:_ Support multiple keys with validity periods; add `/admin/keys` endpoint.
   _Location:_ `src/config.hpp`, `src/http_controller.cpp`
@@ -349,7 +349,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `sdk/python/`
   _Complexity:_ Medium
 
-- [ ] **Create Helm chart for Kubernetes deployment**
+- [x] **Create Helm chart for Kubernetes deployment** ✓
   _Justification:_ K8s deployment requires manual YAML authoring. Helm chart enables one-command deployment.
   _Location:_ `deploy/helm/ranvier/`
   _Complexity:_ Medium
@@ -381,21 +381,21 @@ Tooling, testing, and documentation improvements for contributors and operators.
 
 ## Priority Matrix
 
-| Priority | Category | Item | Effort |
-|----------|----------|------|--------|
-| **P0 - Critical** | Security | Non-root container execution | Low |
-| **P0 - Critical** | Security | mTLS for gossip protocol | High |
-| **P1 - High** | Reliability | Split-brain detection | High |
-| **P1 - High** | Reliability | Reliable gossip delivery | Medium |
-| **P1 - High** | Security | API key rotation | Medium |
-| **P1 - High** | Observability | OpenTelemetry integration | Medium |
-| **P2 - Medium** | Performance | SIMD Node16 optimization | Medium |
-| **P2 - Medium** | Performance | Node pooling for Radix Tree | High |
-| **P2 - Medium** | DX | Benchmark regression CI | Medium |
-| **P2 - Medium** | DX | Helm chart | Medium |
-| **P3 - Low** | Performance | Memory-mapped tokenizer | Low |
-| **P3 - Low** | DX | OpenAPI specification | Low |
-| **P3 - Low** | DX | Pre-built Docker images | Low |
+| Priority | Category | Item | Effort | Status |
+|----------|----------|------|--------|--------|
+| **P0 - Critical** | Security | Non-root container execution | Low | ✅ Done |
+| **P0 - Critical** | Security | mTLS for gossip protocol | High | |
+| **P1 - High** | Reliability | Split-brain detection | High | |
+| **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
+| **P1 - High** | Security | API key rotation | Medium | ✅ Done |
+| **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
+| **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
+| **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
+| **P2 - Medium** | DX | Benchmark regression CI | Medium | |
+| **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
+| **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
+| **P3 - Low** | DX | OpenAPI specification | Low | |
+| **P3 - Low** | DX | Pre-built Docker images | Low | |
 
 ---
 
@@ -407,6 +407,8 @@ _Move completed items here with completion date and PR reference._
 |------|------|----|
 | 2025-01-03 | Create Helm chart for Kubernetes deployment | - |
 | 2025-01-03 | API key rotation mechanism with expiry and hot-reload | - |
+| 2025-01-03 | Add cache hit/miss ratio gauge (Prometheus) | - |
+| 2025-01-03 | Add per-backend latency histograms (Prometheus) | - |
 | 2025-01-02 | Add reliable delivery with acknowledgments (gossip protocol) | - |
 | 2025-01-02 | Implement duplicate suppression (gossip protocol) | - |
 | 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
