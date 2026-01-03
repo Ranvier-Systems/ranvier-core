@@ -111,6 +111,12 @@ else()
     set(SQLITE3_INCLUDE_DIRS ${SQLite3_INCLUDE_DIRS})
 endif()
 
+# OpenSSL Configuration (Required for DTLS gossip encryption)
+find_package(OpenSSL REQUIRED)
+message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
+message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
+message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
+
 # Seastar Configuration (Optional - for full server build)
 find_package(Seastar QUIET)
 
@@ -131,6 +137,7 @@ if(Seastar_FOUND)
     # Define the Main Server Executable
     add_executable(ranvier_server
       src/main.cpp
+      src/dtls_context.cpp
       src/gossip_service.cpp
       src/health_service.cpp
       src/http_controller.cpp
@@ -170,6 +177,8 @@ if(Seastar_FOUND)
       rapidjson_interface
       absl::flat_hash_map
       absl::flat_hash_set
+      OpenSSL::SSL
+      OpenSSL::Crypto
       ${OTEL_LIBS}
     )
 

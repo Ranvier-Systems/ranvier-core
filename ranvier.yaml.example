@@ -332,6 +332,81 @@ cluster:
   #   discovery_type: "A"
   #   discovery_refresh_interval_seconds: 30
 
+  # =============================================================================
+  # Gossip TLS/DTLS Encryption (mTLS)
+  # =============================================================================
+  # Enable DTLS encryption for secure gossip communication between cluster nodes.
+  # Uses mutual TLS (mTLS) where both peers authenticate with certificates.
+  #
+  # SECURITY NOTE: Without TLS, gossip traffic is unencrypted and vulnerable to:
+  #   - Route table poisoning (malicious route injection)
+  #   - Cluster hijacking (unauthorized node joining)
+  #   - Man-in-the-middle attacks
+  #
+  # STRONGLY RECOMMENDED for production deployments!
+  tls:
+    # Enable DTLS encryption for gossip (RANVIER_CLUSTER_TLS_ENABLED)
+    enabled: false
+
+    # Path to node certificate in PEM format (RANVIER_CLUSTER_TLS_CERT_PATH)
+    # Each node needs its own certificate signed by the cluster CA
+    # cert_path: "/etc/ranvier/certs/node.crt"
+
+    # Path to private key in PEM format (RANVIER_CLUSTER_TLS_KEY_PATH)
+    # key_path: "/etc/ranvier/certs/node.key"
+
+    # Path to CA certificate for peer verification (RANVIER_CLUSTER_TLS_CA_PATH)
+    # All nodes must use certificates signed by this CA
+    # ca_path: "/etc/ranvier/certs/ca.crt"
+
+    # Require mutual TLS - verify peer certificates (RANVIER_CLUSTER_TLS_VERIFY_PEER)
+    # When true, connections from nodes without valid certificates are rejected
+    verify_peer: true
+
+    # Interval in seconds to check for certificate file changes (RANVIER_CLUSTER_TLS_CERT_RELOAD_INTERVAL)
+    # Set to 0 to disable automatic certificate reloading
+    # When certificates change, sessions are re-established transparently
+    cert_reload_interval_seconds: 300
+
+    # Allow plaintext fallback if TLS handshake fails (RANVIER_CLUSTER_TLS_ALLOW_PLAINTEXT_FALLBACK)
+    # WARNING: Setting this to true undermines security! Only use for debugging.
+    allow_plaintext_fallback: false
+
+  # =============================================================================
+  # Certificate Generation for Gossip TLS
+  # =============================================================================
+  # Generate a CA and node certificates for your cluster:
+  #
+  # 1. Create CA private key and certificate:
+  #    openssl genrsa -out ca.key 4096
+  #    openssl req -x509 -new -key ca.key -days 3650 -out ca.crt \
+  #      -subj "/CN=Ranvier Cluster CA"
+  #
+  # 2. Generate node private key:
+  #    openssl genrsa -out node.key 2048
+  #
+  # 3. Create certificate signing request (CSR):
+  #    openssl req -new -key node.key -out node.csr \
+  #      -subj "/CN=ranvier-node-1"
+  #
+  # 4. Sign the certificate with CA:
+  #    openssl x509 -req -in node.csr -CA ca.crt -CAkey ca.key \
+  #      -CAcreateserial -out node.crt -days 365
+  #
+  # 5. Distribute to each node:
+  #    - ca.crt: Same file for all nodes
+  #    - node.crt + node.key: Unique per node
+  #
+  # 6. Configure each node with the paths:
+  #    cluster:
+  #      tls:
+  #        enabled: true
+  #        cert_path: "/etc/ranvier/certs/node.crt"
+  #        key_path: "/etc/ranvier/certs/node.key"
+  #        ca_path: "/etc/ranvier/certs/ca.crt"
+  #
+  # For Kubernetes, consider using cert-manager for automatic certificate issuance.
+
 # Graceful shutdown configuration
 shutdown:
   # Maximum time in seconds to wait for in-flight requests during shutdown (RANVIER_SHUTDOWN_DRAIN_TIMEOUT)
