@@ -1,0 +1,185 @@
+
+================================================================================
+ Ranvier Core - Distributed LLM Router
+================================================================================
+
+Thank you for installing {{ .Chart.Name }}!
+
+Chart Version: {{ .Chart.Version }}
+App Version:   {{ .Chart.AppVersion }}
+Namespace:     {{ .Release.Namespace }}
+
+--------------------------------------------------------------------------------
+ CLUSTER STATUS
+--------------------------------------------------------------------------------
+
+Ranvier is deployed as a {{ .Values.replicaCount }}-node cluster with:
+{{- if .Values.cluster.enabled }}
+  ✓ Gossip synchronization enabled (port {{ .Values.cluster.gossipPort }}/UDP)
+  ✓ DNS-based peer discovery via {{ include "ranvier.headlessServiceName" . }}
+{{- else }}
+  ✗ Gossip synchronization disabled (standalone mode)
+{{- end }}
+
+To check the status of your pods:
+
+  kubectl get pods -l "app.kubernetes.io/name={{ include "ranvier.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -n {{ .Release.Namespace }}
+
+To view logs from a specific pod:
+
+  kubectl logs -f {{ include "ranvier.fullname" . }}-0 -n {{ .Release.Namespace }}
+
+--------------------------------------------------------------------------------
+ ACCESSING RANVIER
+--------------------------------------------------------------------------------
+
+{{- if .Values.ingress.enabled }}
+Ranvier is accessible via Ingress at:
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+Get the NodePort:
+
+  export NODE_PORT=$(kubectl get -n {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "ranvier.fullname" . }})
+  export NODE_IP=$(kubectl get nodes -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "Ranvier API: http://${NODE_IP}:${NODE_PORT}"
+
+{{- else if contains "LoadBalancer" .Values.service.type }}
+Get the LoadBalancer IP (may take a few minutes):
+
+  export SERVICE_IP=$(kubectl get svc -n {{ .Release.Namespace }} {{ include "ranvier.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  echo "Ranvier API: http://${SERVICE_IP}:{{ .Values.service.port }}"
+
+{{- else }}
+Port-forward to access Ranvier locally:
+
+  kubectl port-forward svc/{{ include "ranvier.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+
+Then access Ranvier at: http://localhost:{{ .Values.service.port }}
+{{- end }}
+
+--------------------------------------------------------------------------------
+ API ENDPOINTS
+--------------------------------------------------------------------------------
+
+Once accessible, Ranvier exposes:
+
+  POST /v1/chat/completions    - OpenAI-compatible chat completion
+  GET  /metrics                - Prometheus metrics (port {{ .Values.config.metricsPort }})
+  POST /admin/backends         - Register GPU backends (requires API key)
+  GET  /admin/backends         - List registered backends
+  DELETE /admin/backends       - Remove a backend
+
+Example chat completion request:
+
+  curl -X POST http://localhost:{{ .Values.service.port }}/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "llama-3",
+      "messages": [{"role": "user", "content": "Hello!"}]
+    }'
+
+{{- if or .Values.auth.apiKeys .Values.auth.existingSecret }}
+
+--------------------------------------------------------------------------------
+ AUTHENTICATION
+--------------------------------------------------------------------------------
+
+Admin endpoints require authentication. Use the Authorization header:
+
+  curl -X POST http://localhost:{{ .Values.service.port }}/admin/backends \
+    -H "Authorization: Bearer <your-api-key>" \
+    -d "id=1&ip=192.168.1.100&port=8080"
+
+{{- end }}
+
+{{- if .Values.backends.discovery.enabled }}
+
+--------------------------------------------------------------------------------
+ BACKEND DISCOVERY
+--------------------------------------------------------------------------------
+
+Kubernetes backend discovery is enabled:
+  Service:   {{ .Values.backends.discovery.serviceName }}
+  Namespace: {{ include "ranvier.backendNamespace" . }}
+  Port:      {{ .Values.backends.discovery.targetPort }}
+
+Ranvier will automatically discover and register GPU backends from this service.
+
+{{- else }}
+
+--------------------------------------------------------------------------------
+ REGISTERING BACKENDS
+--------------------------------------------------------------------------------
+
+To register GPU backends manually:
+
+  # Register a vLLM backend
+  curl -X POST "http://localhost:{{ .Values.service.port }}/admin/backends?id=1&ip=<vllm-ip>&port=8000" \
+    -H "Authorization: Bearer <your-api-key>"
+
+Consider enabling Kubernetes service discovery for automatic registration:
+
+  backends:
+    discovery:
+      enabled: true
+      serviceName: vllm-backends
+      namespace: gpu-workloads
+
+{{- end }}
+
+{{- if .Values.serviceMonitor.enabled }}
+
+--------------------------------------------------------------------------------
+ MONITORING
+--------------------------------------------------------------------------------
+
+ServiceMonitor is enabled. Prometheus Operator will automatically discover
+Ranvier metrics at /metrics on port {{ .Values.config.metricsPort }}.
+
+Key metrics to monitor:
+  - ranvier_http_requests_total
+  - ranvier_http_request_duration_seconds
+  - ranvier_cache_hit_ratio
+  - ranvier_active_proxy_requests
+  - ranvier_circuit_breaker_opens
+
+{{- end }}
+
+{{- if .Values.telemetry.enabled }}
+
+--------------------------------------------------------------------------------
+ DISTRIBUTED TRACING
+--------------------------------------------------------------------------------
+
+OpenTelemetry tracing is enabled:
+  OTLP Endpoint: {{ .Values.telemetry.otlpEndpoint }}
+  Service Name:  {{ .Values.telemetry.serviceName }}
+  Sample Rate:   {{ .Values.telemetry.sampleRate }}
+
+Traces will be exported to your OTLP collector for visualization in
+Jaeger, Grafana Tempo, or similar tools.
+
+{{- end }}
+
+--------------------------------------------------------------------------------
+ USEFUL COMMANDS
+--------------------------------------------------------------------------------
+
+# Scale the cluster
+kubectl scale statefulset {{ include "ranvier.fullname" . }} --replicas=5 -n {{ .Release.Namespace }}
+
+# Check gossip connectivity
+kubectl exec -it {{ include "ranvier.fullname" . }}-0 -n {{ .Release.Namespace }} -- \
+  nslookup {{ include "ranvier.headlessServiceName" . }}
+
+# Reload API keys (after updating secret)
+kubectl exec -it {{ include "ranvier.fullname" . }}-0 -n {{ .Release.Namespace }} -- kill -HUP 1
+
+# View configuration
+kubectl get configmap {{ include "ranvier.configMapName" . }} -n {{ .Release.Namespace }} -o yaml
+
+================================================================================
