@@ -111,17 +111,17 @@ else()
     set(SQLITE3_INCLUDE_DIRS ${SQLite3_INCLUDE_DIRS})
 endif()
 
-# OpenSSL Configuration (Required for DTLS gossip encryption)
-find_package(OpenSSL REQUIRED)
-message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
-message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
-message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
-
 # Seastar Configuration (Optional - for full server build)
 find_package(Seastar QUIET)
 
 if(Seastar_FOUND)
     message(STATUS "Seastar found - building full server and all tests")
+
+    # OpenSSL Configuration (Required for DTLS gossip encryption)
+    find_package(OpenSSL REQUIRED)
+    message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
+    message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
+    message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
 
     # Tokenizers-CPP Configuration (Downloads it automatically)
     FetchContent_Declare(
