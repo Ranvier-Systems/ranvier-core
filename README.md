@@ -85,8 +85,26 @@ graph TD
 
 ### Docker
 
+Pre-built multi-architecture images (amd64/arm64) are available on GitHub Container Registry:
+
 ```bash
-# Build production image
+# Pull the latest image
+docker pull ghcr.io/ranvier-systems/ranvier:latest
+
+# Pull a specific version
+docker pull ghcr.io/ranvier-systems/ranvier:1.0.0
+
+# Pull by commit SHA for traceability
+docker pull ghcr.io/ranvier-systems/ranvier:sha-abc1234
+
+# Run with required IPC_LOCK capability
+docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ghcr.io/ranvier-systems/ranvier:latest
+```
+
+Build from source (optional):
+
+```bash
+# Build production image locally
 docker build -f Dockerfile.production -t ranvier:latest .
 
 # Run with required IPC_LOCK capability
