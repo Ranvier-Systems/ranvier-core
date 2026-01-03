@@ -13,6 +13,7 @@ RUN dnf install -y \
     zip \
     unzip \
     openssl-devel \
+    libcurl-devel \
     && dnf clean all
 
 # Install Python Deps
