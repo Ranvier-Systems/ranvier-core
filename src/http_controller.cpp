@@ -92,28 +92,51 @@ struct async_handler : public seastar::httpd::handler_base {
     }
 };
 
-// Check admin authentication - returns true if authorized
-bool HttpController::check_admin_auth(const seastar::http::request& req) const {
+// Check admin authentication - returns pair<authorized, error_message>
+// If authorized, error_message contains the key identifier for audit logging
+// If not authorized, error_message contains the reason for failure
+std::pair<bool, std::string> HttpController::check_admin_auth_with_info(const seastar::http::request& req) const {
     // If no API key configured, allow all requests (auth disabled)
-    if (_config.admin_api_key.empty()) {
-        return true;
+    if (!_config.auth.is_enabled()) {
+        return {true, ""};
     }
 
     // Check Authorization header: "Bearer <token>"
     auto auth_it = req._headers.find("Authorization");
     if (auth_it == req._headers.end()) {
-        return false;
+        return {false, "missing Authorization header"};
     }
 
     const auto& auth_header = auth_it->second;
     const std::string bearer_prefix = "Bearer ";
     if (auth_header.size() <= bearer_prefix.size() ||
         auth_header.substr(0, bearer_prefix.size()) != bearer_prefix) {
-        return false;
+        return {false, "invalid Authorization format (expected 'Bearer <token>')"};
     }
 
     std::string token = auth_header.substr(bearer_prefix.size());
-    return token == _config.admin_api_key;
+
+    // Use constant-time comparison with expiry checking
+    auto [valid, key_name] = _config.auth.validate_token(token);
+
+    if (!valid) {
+        if (key_name.find("expired") != std::string::npos) {
+            // Key matched but is expired
+            log_control.warn("Admin request rejected: key '{}' has expired", key_name);
+            return {false, "API key has expired"};
+        }
+        return {false, "invalid API key"};
+    }
+
+    // Log successful authentication with key name (not the key value)
+    log_control.debug("Admin request authenticated with key '{}'", key_name);
+    return {true, key_name};
+}
+
+// Check admin authentication - returns true if authorized (simple wrapper)
+bool HttpController::check_admin_auth(const seastar::http::request& req) const {
+    auto [authorized, _] = check_admin_auth_with_info(req);
+    return authorized;
 }
 
 // Get client IP from request, checking X-Forwarded-For for proxied requests
@@ -158,19 +181,22 @@ std::optional<BackendId> HttpController::get_fallback_backend(BackendId failed_i
     return std::nullopt;
 }
 
-// Helper to create an auth-protected admin handler
-template <typename AuthCheck, typename Func>
-auto make_admin_handler(AuthCheck&& auth_check, Func&& handler) {
+// Helper to create an auth-protected admin handler with detailed error messages
+template <typename AuthCheckWithInfo, typename Func>
+auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler) {
     return new async_handler([
-        auth_check = std::forward<AuthCheck>(auth_check),
+        auth_check_with_info = std::forward<AuthCheckWithInfo>(auth_check_with_info),
         handler = std::forward<Func>(handler)
     ](auto req, auto rep) mutable -> future<std::unique_ptr<seastar::httpd::reply>> {
 
-        // Execute the captured private check
-        if (!auth_check(*req)) {
+        // Execute the captured private check with detailed info
+        auto [authorized, info] = auth_check_with_info(*req);
+        if (!authorized) {
             rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->add_header("WWW-Authenticate", "Bearer");
-            rep->write_body("json", "{\"error\": \"Unauthorized - valid API key required\"}");
+            // Provide specific error message
+            std::string error_msg = "{\"error\": \"Unauthorized - " + info + "\"}";
+            rep->write_body("json", error_msg);
             return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
         }
         return handler(std::move(req), std::move(rep));
@@ -208,7 +234,8 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     }));
 
     // Define the check once as a local lambda to keep the calls clean.
-    auto auth_check = [this](const auto& req) { return this->check_admin_auth(req); };
+    // Use check_admin_auth_with_info for detailed error messages
+    auto auth_check = [this](const auto& req) { return this->check_admin_auth_with_info(req); };
 
     // 2. CONTROL PLANE - Create/Update (auth protected)
     r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
@@ -230,6 +257,11 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 
     r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_clear_all(std::move(req), std::move(rep));
+    }));
+
+    // 4. API KEY MANAGEMENT
+    r.add(operation_type::POST, url("/admin/keys/reload"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_keys_reload(std::move(req), std::move(rep));
     }));
 }
 
@@ -1177,6 +1209,87 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(
 
     log_control.warn("Cleared all persisted data (backends and routes). Restart required to clear in-memory state.");
     rep->write_body("json", "{\"status\": \"ok\", \"warning\": \"All persisted data cleared. Restart to clear in-memory state.\"}");
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+
+// ---------------------------------------------------------
+// API KEY MANAGEMENT
+// ---------------------------------------------------------
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reload(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+    // Usage: POST /admin/keys/reload
+    // Triggers a hot-reload of the configuration file to pick up new API keys
+    // Note: This triggers SIGHUP for async reload. The response returns current state,
+    // but the new config will be applied shortly after the response is sent.
+
+    // Get current key count (for informational purposes)
+    size_t current_key_count = _config.auth.valid_key_count();
+
+    if (!_config_reload_callback) {
+        log_control.error("Config reload callback not configured");
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
+        rep->write_body("json", "{\"error\": \"Config reload not available\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    // Trigger the reload (sends SIGHUP to self for async processing)
+    bool triggered = _config_reload_callback();
+
+    if (!triggered) {
+        log_control.error("Failed to trigger config reload");
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
+        rep->write_body("json", "{\"error\": \"Failed to trigger config reload\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    log_control.info("Config reload triggered via /admin/keys/reload endpoint");
+
+    // Helper to escape JSON string values (prevent injection)
+    auto escape_json_string = [](const std::string& s) -> std::string {
+        std::string result;
+        result.reserve(s.size() + 8);
+        for (char c : s) {
+            switch (c) {
+                case '"': result += "\\\""; break;
+                case '\\': result += "\\\\"; break;
+                case '\b': result += "\\b"; break;
+                case '\f': result += "\\f"; break;
+                case '\n': result += "\\n"; break;
+                case '\r': result += "\\r"; break;
+                case '\t': result += "\\t"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        // Control character - encode as \u00XX
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                        result += buf;
+                    } else {
+                        result += c;
+                    }
+            }
+        }
+        return result;
+    };
+
+    // Build response with current key metadata (names only, not values)
+    // Note: This shows the state BEFORE the reload completes
+    std::string response = "{\"status\": \"reload_triggered\", \"message\": \"Configuration reload initiated\", "
+                          "\"current_key_count\": " + std::to_string(current_key_count) + ", \"current_keys\": [";
+
+    bool first = true;
+    for (const auto& api_key : _config.auth.api_keys) {
+        if (!first) response += ", ";
+        first = false;
+        response += "{\"name\": \"" + escape_json_string(api_key.name) + "\", \"expired\": " +
+                   (api_key.is_expired() ? "true" : "false") + "}";
+    }
+    if (!_config.auth.admin_api_key.empty()) {
+        if (!first) response += ", ";
+        response += "{\"name\": \"legacy-key\", \"expired\": false}";
+    }
+    response += "]}";
+
+    rep->write_body("json", response);
     return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
 }
 

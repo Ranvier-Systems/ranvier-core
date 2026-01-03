@@ -10,10 +10,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <yaml-cpp/yaml.h>
 
@@ -94,9 +97,114 @@ struct TlsConfig {
     std::string key_path = "";                // Path to private key file (PEM)
 };
 
+// API key with metadata for rotation and audit
+struct ApiKey {
+    std::string key;                                  // The actual API key value (e.g., rnv_prod_abc123...)
+    std::string name;                                 // Human-readable name for audit logs (e.g., "production-deploy")
+    std::string created;                              // ISO 8601 creation date (e.g., "2025-01-01")
+    std::optional<std::string> expires;               // Optional ISO 8601 expiry date (e.g., "2025-12-31")
+    std::vector<std::string> roles;                   // Future RBAC prep (e.g., ["admin"], ["viewer"])
+
+    // Check if this key has expired (returns false if no expiry set)
+    bool is_expired() const {
+        if (!expires.has_value() || expires->empty()) {
+            return false;
+        }
+        // Parse expiry date (YYYY-MM-DD format) and compare with current date
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm = *std::gmtime(&now_time_t);
+
+        // Parse expiry date
+        std::tm expiry_tm = {};
+        std::istringstream iss(*expires);
+        iss >> std::get_time(&expiry_tm, "%Y-%m-%d");
+        if (iss.fail()) {
+            return false;  // Invalid date format, treat as non-expired
+        }
+
+        // Compare dates (expiry is valid until end of that day)
+        if (now_tm.tm_year < expiry_tm.tm_year) return false;
+        if (now_tm.tm_year > expiry_tm.tm_year) return true;
+        if (now_tm.tm_mon < expiry_tm.tm_mon) return false;
+        if (now_tm.tm_mon > expiry_tm.tm_mon) return true;
+        return now_tm.tm_mday > expiry_tm.tm_mday;
+    }
+
+    // Get a safe prefix of the key for logging (first 8 chars or key name)
+    std::string get_log_identifier() const {
+        if (!name.empty()) {
+            return name;
+        }
+        if (key.length() >= 12) {
+            return key.substr(0, 12) + "...";
+        }
+        return "***";
+    }
+};
+
 // Authentication configuration
 struct AuthConfig {
-    std::string admin_api_key = "";           // API key for admin endpoints (empty = no auth)
+    std::string admin_api_key = "";           // Legacy: single API key for admin endpoints (empty = no auth)
+    std::vector<ApiKey> api_keys;             // New: multiple API keys with metadata
+
+    // Constant-time string comparison to prevent timing attacks
+    static bool secure_compare(const std::string& a, const std::string& b) {
+        if (a.length() != b.length()) {
+            // Still do a comparison to maintain constant time for equal-length strings
+            volatile size_t dummy = 0;
+            for (size_t i = 0; i < std::max(a.length(), b.length()); ++i) {
+                dummy ^= (i < a.length() ? a[i] : 0) ^ (i < b.length() ? b[i] : 0);
+            }
+            (void)dummy;
+            return false;
+        }
+        volatile unsigned char result = 0;
+        for (size_t i = 0; i < a.length(); ++i) {
+            result |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+        }
+        return result == 0;
+    }
+
+    // Check if authentication is enabled
+    bool is_enabled() const {
+        return !admin_api_key.empty() || !api_keys.empty();
+    }
+
+    // Validate a token against configured keys
+    // Returns: pair<is_valid, key_name_for_audit> (key_name is empty if invalid)
+    std::pair<bool, std::string> validate_token(const std::string& token) const {
+        // First check new multi-key format (takes precedence)
+        for (const auto& api_key : api_keys) {
+            if (secure_compare(api_key.key, token)) {
+                if (api_key.is_expired()) {
+                    return {false, api_key.get_log_identifier() + " (expired)"};
+                }
+                return {true, api_key.get_log_identifier()};
+            }
+        }
+
+        // Fall back to legacy single key
+        if (!admin_api_key.empty() && secure_compare(admin_api_key, token)) {
+            return {true, "legacy-key"};
+        }
+
+        return {false, ""};
+    }
+
+    // Get count of valid (non-expired) keys
+    size_t valid_key_count() const {
+        size_t count = 0;
+        for (const auto& api_key : api_keys) {
+            if (!api_key.is_expired()) {
+                ++count;
+            }
+        }
+        if (!admin_api_key.empty()) {
+            ++count;
+        }
+        return count;
+    }
 };
 
 // Rate limiting configuration
@@ -683,7 +791,29 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
         // Auth section
         if (yaml["auth"]) {
             YAML::Node a = yaml["auth"];
+            // Legacy single key (backward compatibility)
             if (a["admin_api_key"]) config.auth.admin_api_key = a["admin_api_key"].as<std::string>();
+
+            // New multi-key format with metadata
+            if (a["api_keys"]) {
+                config.auth.api_keys.clear();
+                for (const auto& key_node : a["api_keys"]) {
+                    ApiKey api_key;
+                    if (key_node["key"]) api_key.key = key_node["key"].as<std::string>();
+                    if (key_node["name"]) api_key.name = key_node["name"].as<std::string>();
+                    if (key_node["created"]) api_key.created = key_node["created"].as<std::string>();
+                    if (key_node["expires"]) api_key.expires = key_node["expires"].as<std::string>();
+                    if (key_node["roles"]) {
+                        for (const auto& role : key_node["roles"]) {
+                            api_key.roles.push_back(role.as<std::string>());
+                        }
+                    }
+                    // Only add keys that have a value
+                    if (!api_key.key.empty()) {
+                        config.auth.api_keys.push_back(std::move(api_key));
+                    }
+                }
+            }
         }
 
         // Rate limit section

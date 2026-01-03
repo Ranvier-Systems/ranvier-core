@@ -196,7 +196,7 @@ future<> reload_config() {
         ctrl_config.min_token_length = g_config.routing.min_token_length;
         ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
         ctrl_config.request_timeout = g_config.timeouts.request_timeout;
-        ctrl_config.admin_api_key = g_config.auth.admin_api_key;
+        ctrl_config.auth = g_config.auth;  // Full auth config with multi-key support
         ctrl_config.rate_limit.enabled = g_config.rate_limit.enabled;
         ctrl_config.rate_limit.requests_per_second = g_config.rate_limit.requests_per_second;
         ctrl_config.rate_limit.burst_size = g_config.rate_limit.burst_size;
@@ -420,7 +420,7 @@ future<> run() {
     ctrl_config.min_token_length = g_config.routing.min_token_length;
     ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
     ctrl_config.request_timeout = g_config.timeouts.request_timeout;
-    ctrl_config.admin_api_key = g_config.auth.admin_api_key;
+    ctrl_config.auth = g_config.auth;  // Full auth config with multi-key support
     ctrl_config.rate_limit.enabled = g_config.rate_limit.enabled;
     ctrl_config.rate_limit.requests_per_second = g_config.rate_limit.requests_per_second;
     ctrl_config.rate_limit.burst_size = g_config.rate_limit.burst_size;
@@ -600,6 +600,21 @@ future<> run() {
                     });
                 });
                 ranvier::log_main.info("SIGHUP handler registered for config hot-reload");
+
+                // Set up config reload callback for /admin/keys/reload endpoint
+                // The callback triggers SIGHUP to reuse existing reload logic
+                (void)controller.invoke_on_all([](ranvier::HttpController& c) {
+                    c.set_config_reload_callback([]() {
+                        // Trigger SIGHUP to self - this is async but reliable
+                        if (raise(SIGHUP) == 0) {
+                            ranvier::log_main.info("Config reload triggered via API endpoint");
+                            return true;
+                        }
+                        ranvier::log_main.error("Failed to send SIGHUP signal");
+                        return false;
+                    });
+                });
+                ranvier::log_main.info("Config reload callback registered for /admin/keys/reload endpoint");
 
                 // Wait Loop with Graceful Shutdown
                 auto stop_signal = std::make_shared<promise<>>();
