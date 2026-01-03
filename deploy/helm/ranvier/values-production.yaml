@@ -1,0 +1,229 @@
+# Production values for Ranvier Core
+# 3-node cluster with full observability and HA features
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/ranvier-systems/ranvier
+  tag: ""  # Uses chart appVersion, set explicitly for production
+  pullPolicy: IfNotPresent
+
+# Production resource allocation
+resources:
+  requests:
+    memory: "2Gi"
+    cpu: "1"
+  limits:
+    memory: "4Gi"
+    cpu: "4"
+
+# Seastar runtime configuration
+seastar:
+  smp: 2
+  memory: "2G"
+
+# Server configuration
+config:
+  routingMode: prefix
+  prefixTokenLength: 128
+  apiPort: 8080
+  metricsPort: 9180
+
+  # Aggressive health checks for production
+  health:
+    checkIntervalSeconds: 5
+    checkTimeoutSeconds: 3
+    failureThreshold: 3
+    recoveryThreshold: 2
+
+  # Higher connection limits for production traffic
+  pool:
+    maxConnectionsPerHost: 50
+    maxTotalConnections: 500
+    idleTimeoutSeconds: 60
+    tcpNoDelay: true
+
+  # Production timeouts
+  timeouts:
+    connectTimeoutSeconds: 5
+    requestTimeoutSeconds: 300  # 5 minutes for long inference
+
+  # Enable rate limiting for protection
+  rateLimit:
+    enabled: true
+    requestsPerSecond: 1000
+    burstSize: 200
+
+  # Retry configuration
+  retry:
+    maxRetries: 3
+    initialBackoffMs: 100
+    maxBackoffMs: 5000
+    backoffMultiplier: 2.0
+
+  # Circuit breaker enabled for resilience
+  circuitBreaker:
+    enabled: true
+    failureThreshold: 5
+    successThreshold: 2
+    recoveryTimeoutSeconds: 30
+    fallbackEnabled: true
+
+  # Graceful shutdown
+  shutdown:
+    drainTimeoutSeconds: 60
+
+  # SQLite in WAL mode for better performance
+  database:
+    path: "/data/ranvier.db"
+    journalMode: "WAL"
+    synchronous: "NORMAL"
+
+# Gossip cluster configuration
+cluster:
+  enabled: true
+  gossipPort: 9190
+  gossipIntervalMs: 1000
+  heartbeatIntervalSeconds: 5
+  peerTimeoutSeconds: 15
+  reliableDelivery: true
+  ackTimeoutMs: 100
+  maxRetries: 3
+  dedupWindow: 1000
+  discoveryRefreshIntervalSeconds: 30
+
+# Kubernetes backend discovery
+backends:
+  discovery:
+    enabled: true
+    serviceName: vllm-backends  # Change to your GPU backend service name
+    namespace: ""  # Uses release namespace if empty
+    targetPort: 8000
+    labelSelector: ""
+    pollIntervalSeconds: 30
+    verifyTls: true
+
+# API key authentication - CHANGE THESE FOR PRODUCTION!
+auth:
+  apiKeys:
+    - name: production-admin
+      key: "rnv_prod_CHANGE_ME_TO_A_SECURE_KEY"
+      roles:
+        - admin
+    - name: monitoring-readonly
+      key: "rnv_readonly_CHANGE_ME_TO_A_SECURE_KEY"
+      roles:
+        - viewer
+  # For production, prefer using an existing secret:
+  # existingSecret: ranvier-api-keys
+
+# OpenTelemetry tracing
+telemetry:
+  enabled: true
+  otlpEndpoint: "http://otel-collector.monitoring:4318"
+  serviceName: "ranvier"
+  sampleRate: 0.1  # 10% sampling for production
+  exportIntervalMs: 5000
+  maxQueueSize: 2048
+  maxExportBatchSize: 512
+
+# Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus  # Match your Prometheus Operator selector
+  interval: 30s
+  scrapeTimeout: 10s
+  path: /metrics
+
+# HPA disabled by default - StatefulSet scaling requires care
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Persistent storage for SQLite
+persistence:
+  enabled: true
+  storageClass: ""  # Use cluster default or specify SSD class
+  accessMode: ReadWriteOnce
+  size: 10Gi
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8080
+
+# Ingress for external access
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+  hosts:
+    - host: ranvier.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: ranvier-tls
+    #   hosts:
+    #     - ranvier.example.com
+
+# Probes tuned for production
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /metrics
+    port: metrics
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /metrics
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+# Anti-affinity for high availability
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ranvier
+          topologyKey: kubernetes.io/hostname
+
+# Spread across availability zones
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: ranvier
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: ranvier
+
+# Graceful termination
+terminationGracePeriodSeconds: 90
+
+# Priority class for production workloads
+priorityClassName: ""  # Set to your high-priority class

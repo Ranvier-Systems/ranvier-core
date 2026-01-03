@@ -1,0 +1,325 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ranvier.fullname" . }}
+  labels:
+    {{- include "ranvier.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ranvier.headlessServiceName" . }}
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "ranvier.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.auth.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "ranvier.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ranvier.serviceAccountName" . }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "ranvier.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - {{ include "ranvier.seastarArgs" . }}
+          ports:
+            - name: api
+              containerPort: {{ .Values.config.apiPort }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.config.metricsPort }}
+              protocol: TCP
+            {{- if .Values.cluster.enabled }}
+            - name: gossip
+              containerPort: {{ .Values.cluster.gossipPort }}
+              protocol: UDP
+            {{- end }}
+          env:
+            # Server configuration
+            - name: RANVIER_BIND_ADDRESS
+              value: "0.0.0.0"
+            - name: RANVIER_API_PORT
+              value: {{ .Values.config.apiPort | quote }}
+            - name: RANVIER_METRICS_PORT
+              value: {{ .Values.config.metricsPort | quote }}
+
+            # Routing configuration
+            - name: RANVIER_ROUTING_MODE
+              value: {{ .Values.config.routingMode | quote }}
+            - name: RANVIER_PREFIX_TOKEN_LENGTH
+              value: {{ .Values.config.prefixTokenLength | quote }}
+            - name: RANVIER_MIN_TOKEN_LENGTH
+              value: {{ .Values.config.routing.minTokenLength | quote }}
+            - name: RANVIER_BACKEND_DRAIN_TIMEOUT
+              value: {{ .Values.config.routing.backendDrainTimeoutSeconds | quote }}
+            - name: RANVIER_ACCEPT_CLIENT_TOKENS
+              value: {{ .Values.config.routing.acceptClientTokens | quote }}
+            - name: RANVIER_MAX_TOKEN_ID
+              value: {{ .Values.config.routing.maxTokenId | quote }}
+
+            # Database configuration
+            - name: RANVIER_DB_PATH
+              value: {{ .Values.config.database.path | quote }}
+            - name: RANVIER_DB_JOURNAL_MODE
+              value: {{ .Values.config.database.journalMode | quote }}
+            - name: RANVIER_DB_SYNCHRONOUS
+              value: {{ .Values.config.database.synchronous | quote }}
+
+            # Health check configuration
+            - name: RANVIER_HEALTH_CHECK_INTERVAL
+              value: {{ .Values.config.health.checkIntervalSeconds | quote }}
+            - name: RANVIER_HEALTH_CHECK_TIMEOUT
+              value: {{ .Values.config.health.checkTimeoutSeconds | quote }}
+
+            # Connection pool configuration
+            - name: RANVIER_POOL_MAX_PER_HOST
+              value: {{ .Values.config.pool.maxConnectionsPerHost | quote }}
+            - name: RANVIER_POOL_MAX_TOTAL
+              value: {{ .Values.config.pool.maxTotalConnections | quote }}
+            - name: RANVIER_POOL_IDLE_TIMEOUT
+              value: {{ .Values.config.pool.idleTimeoutSeconds | quote }}
+
+            # Timeout configuration
+            - name: RANVIER_CONNECT_TIMEOUT
+              value: {{ .Values.config.timeouts.connectTimeoutSeconds | quote }}
+            - name: RANVIER_REQUEST_TIMEOUT
+              value: {{ .Values.config.timeouts.requestTimeoutSeconds | quote }}
+
+            # Rate limiting
+            - name: RANVIER_RATE_LIMIT_ENABLED
+              value: {{ .Values.config.rateLimit.enabled | quote }}
+            {{- if .Values.config.rateLimit.enabled }}
+            - name: RANVIER_RATE_LIMIT_RPS
+              value: {{ .Values.config.rateLimit.requestsPerSecond | quote }}
+            - name: RANVIER_RATE_LIMIT_BURST
+              value: {{ .Values.config.rateLimit.burstSize | quote }}
+            {{- end }}
+
+            # Retry configuration
+            - name: RANVIER_RETRY_MAX
+              value: {{ .Values.config.retry.maxRetries | quote }}
+            - name: RANVIER_RETRY_INITIAL_BACKOFF_MS
+              value: {{ .Values.config.retry.initialBackoffMs | quote }}
+            - name: RANVIER_RETRY_MAX_BACKOFF_MS
+              value: {{ .Values.config.retry.maxBackoffMs | quote }}
+
+            # Circuit breaker configuration
+            - name: RANVIER_CIRCUIT_BREAKER_ENABLED
+              value: {{ .Values.config.circuitBreaker.enabled | quote }}
+            {{- if .Values.config.circuitBreaker.enabled }}
+            - name: RANVIER_CIRCUIT_BREAKER_FAILURE_THRESHOLD
+              value: {{ .Values.config.circuitBreaker.failureThreshold | quote }}
+            - name: RANVIER_CIRCUIT_BREAKER_SUCCESS_THRESHOLD
+              value: {{ .Values.config.circuitBreaker.successThreshold | quote }}
+            - name: RANVIER_CIRCUIT_BREAKER_RECOVERY_TIMEOUT
+              value: {{ .Values.config.circuitBreaker.recoveryTimeoutSeconds | quote }}
+            - name: RANVIER_CIRCUIT_BREAKER_FALLBACK
+              value: {{ .Values.config.circuitBreaker.fallbackEnabled | quote }}
+            {{- end }}
+
+            # Shutdown configuration
+            - name: RANVIER_SHUTDOWN_DRAIN_TIMEOUT
+              value: {{ .Values.config.shutdown.drainTimeoutSeconds | quote }}
+
+            # Cluster (gossip) configuration
+            {{- if .Values.cluster.enabled }}
+            - name: RANVIER_CLUSTER_ENABLED
+              value: "true"
+            - name: RANVIER_CLUSTER_GOSSIP_PORT
+              value: {{ .Values.cluster.gossipPort | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_INTERVAL_MS
+              value: {{ .Values.cluster.gossipIntervalMs | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_HEARTBEAT_INTERVAL
+              value: {{ .Values.cluster.heartbeatIntervalSeconds | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_PEER_TIMEOUT
+              value: {{ .Values.cluster.peerTimeoutSeconds | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_RELIABLE_DELIVERY
+              value: {{ .Values.cluster.reliableDelivery | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_ACK_TIMEOUT_MS
+              value: {{ .Values.cluster.ackTimeoutMs | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_MAX_RETRIES
+              value: {{ .Values.cluster.maxRetries | quote }}
+            - name: RANVIER_CLUSTER_GOSSIP_DEDUP_WINDOW
+              value: {{ .Values.cluster.dedupWindow | quote }}
+            # DNS-based peer discovery using headless service
+            - name: RANVIER_CLUSTER_DISCOVERY_DNS_NAME
+              value: {{ include "ranvier.gossipDnsName" . | quote }}
+            - name: RANVIER_CLUSTER_DISCOVERY_TYPE
+              value: "A"
+            - name: RANVIER_CLUSTER_DISCOVERY_REFRESH_INTERVAL
+              value: {{ .Values.cluster.discoveryRefreshIntervalSeconds | quote }}
+            {{- end }}
+
+            # Kubernetes backend discovery
+            {{- if .Values.backends.discovery.enabled }}
+            - name: RANVIER_K8S_DISCOVERY_ENABLED
+              value: "true"
+            - name: RANVIER_K8S_SERVICE_NAME
+              value: {{ required "backends.discovery.serviceName is required when discovery is enabled" .Values.backends.discovery.serviceName | quote }}
+            - name: RANVIER_K8S_NAMESPACE
+              value: {{ include "ranvier.backendNamespace" . | quote }}
+            - name: RANVIER_K8S_TARGET_PORT
+              value: {{ .Values.backends.discovery.targetPort | quote }}
+            {{- if .Values.backends.discovery.labelSelector }}
+            - name: RANVIER_K8S_LABEL_SELECTOR
+              value: {{ .Values.backends.discovery.labelSelector | quote }}
+            {{- end }}
+            - name: RANVIER_K8S_POLL_INTERVAL
+              value: {{ .Values.backends.discovery.pollIntervalSeconds | quote }}
+            - name: RANVIER_K8S_VERIFY_TLS
+              value: {{ .Values.backends.discovery.verifyTls | quote }}
+            {{- end }}
+
+            # Telemetry configuration
+            {{- if .Values.telemetry.enabled }}
+            - name: RANVIER_TELEMETRY_ENABLED
+              value: "true"
+            - name: RANVIER_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otlpEndpoint | quote }}
+            - name: RANVIER_SERVICE_NAME
+              value: {{ .Values.telemetry.serviceName | quote }}
+            - name: RANVIER_TELEMETRY_SAMPLE_RATE
+              value: {{ .Values.telemetry.sampleRate | quote }}
+            - name: RANVIER_TELEMETRY_EXPORT_INTERVAL_MS
+              value: {{ .Values.telemetry.exportIntervalMs | quote }}
+            - name: RANVIER_TELEMETRY_MAX_QUEUE_SIZE
+              value: {{ .Values.telemetry.maxQueueSize | quote }}
+            - name: RANVIER_TELEMETRY_MAX_EXPORT_BATCH_SIZE
+              value: {{ .Values.telemetry.maxExportBatchSize | quote }}
+            {{- end }}
+
+            # TLS configuration
+            {{- if .Values.config.tls.enabled }}
+            - name: RANVIER_TLS_ENABLED
+              value: "true"
+            - name: RANVIER_TLS_CERT_PATH
+              value: "/etc/ranvier/tls/tls.crt"
+            - name: RANVIER_TLS_KEY_PATH
+              value: "/etc/ranvier/tls/tls.key"
+            {{- end }}
+
+            # Extra environment variables
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "ranvier.secretName" . }}
+                optional: true
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.livenessProbe.httpGet.path }}
+              port: {{ .Values.livenessProbe.httpGet.port }}
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.readinessProbe.httpGet.path }}
+              port: {{ .Values.readinessProbe.httpGet.port }}
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+            successThreshold: {{ .Values.readinessProbe.successThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.config.tls.enabled }}
+            - name: tls
+              mountPath: /etc/ranvier/tls
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with .Values.sidecars }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.config.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ required "config.tls.secretName is required when TLS is enabled" .Values.config.tls.secretName }}
+        {{- end }}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          - {{ .Values.persistence.accessMode }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}

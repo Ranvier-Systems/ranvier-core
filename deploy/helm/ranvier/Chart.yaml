@@ -1,0 +1,27 @@
+apiVersion: v2
+name: ranvier
+description: A Helm chart for deploying Ranvier Core - a distributed LLM router with gossip synchronization
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+home: https://github.com/ranvier-systems/ranvier-core
+sources:
+  - https://github.com/ranvier-systems/ranvier-core
+
+maintainers:
+  - name: Ranvier Systems
+    url: https://github.com/ranvier-systems
+
+keywords:
+  - llm
+  - router
+  - distributed
+  - inference
+  - vllm
+  - gpu
+  - machine-learning
+
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: ai-machine-learning

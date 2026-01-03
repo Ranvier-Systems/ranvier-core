@@ -1,0 +1,356 @@
+# Ranvier Core Helm Chart Values
+# https://github.com/ranvier-systems/ranvier-core
+
+# Number of Ranvier replicas (recommended: 3 for production clusters)
+replicaCount: 3
+
+image:
+  repository: ghcr.io/ranvier-systems/ranvier
+  # Overrides the image tag whose default is the chart appVersion
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Pod-level settings
+podAnnotations: {}
+podLabels: {}
+
+# Service account configuration
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Automatically mount a ServiceAccount's API credentials
+  automount: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+# Security context for the pod
+podSecurityContext:
+  fsGroup: 10001
+
+# Security context for the container
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - IPC_LOCK  # Required by Seastar for memory locking
+
+# Ranvier server configuration
+config:
+  # Routing mode: "prefix", "radix", or "round_robin"
+  routingMode: prefix
+  # Prefix token length for routing key (only used with prefix mode)
+  prefixTokenLength: 128
+
+  # Server ports
+  apiPort: 8080
+  metricsPort: 9180
+
+  # Health check settings
+  health:
+    checkIntervalSeconds: 5
+    checkTimeoutSeconds: 3
+    failureThreshold: 3
+    recoveryThreshold: 2
+
+  # Connection pool settings
+  pool:
+    maxConnectionsPerHost: 10
+    maxTotalConnections: 100
+    idleTimeoutSeconds: 60
+    tcpNoDelay: true
+
+  # Routing cache settings
+  routing:
+    minTokenLength: 4
+    backendRetryLimit: 5
+    blockAlignment: 16
+    maxRoutes: 100000
+    ttlSeconds: 3600
+    backendDrainTimeoutSeconds: 60
+    acceptClientTokens: false
+    maxTokenId: 100000
+
+  # Timeout settings
+  timeouts:
+    connectTimeoutSeconds: 5
+    requestTimeoutSeconds: 300
+
+  # Rate limiting
+  rateLimit:
+    enabled: false
+    requestsPerSecond: 100
+    burstSize: 50
+
+  # Retry configuration
+  retry:
+    maxRetries: 3
+    initialBackoffMs: 100
+    maxBackoffMs: 5000
+    backoffMultiplier: 2.0
+
+  # Circuit breaker
+  circuitBreaker:
+    enabled: true
+    failureThreshold: 5
+    successThreshold: 2
+    recoveryTimeoutSeconds: 30
+    fallbackEnabled: true
+
+  # Shutdown settings
+  shutdown:
+    drainTimeoutSeconds: 30
+
+  # Database settings (SQLite)
+  database:
+    # Path relative to data volume
+    path: "/data/ranvier.db"
+    journalMode: "WAL"
+    synchronous: "NORMAL"
+
+  # TLS configuration
+  tls:
+    enabled: false
+    # Secret name containing tls.crt and tls.key
+    secretName: ""
+
+# Cluster (gossip) configuration
+cluster:
+  enabled: true
+  # Gossip UDP port
+  gossipPort: 9190
+  # Gossip interval in milliseconds
+  gossipIntervalMs: 1000
+  # Heartbeat interval in seconds
+  heartbeatIntervalSeconds: 5
+  # Peer timeout (should be >= 2x heartbeat)
+  peerTimeoutSeconds: 15
+  # Reliable delivery settings
+  reliableDelivery: true
+  ackTimeoutMs: 100
+  maxRetries: 3
+  dedupWindow: 1000
+  # DNS discovery refresh interval
+  discoveryRefreshIntervalSeconds: 30
+
+# Backend discovery via Kubernetes EndpointSlice
+backends:
+  # Enable Kubernetes service discovery for GPU backends
+  discovery:
+    enabled: false
+    # Name of the Kubernetes service to watch for GPU backends
+    serviceName: ""
+    # Namespace of the service (defaults to release namespace)
+    namespace: ""
+    # Target port on the GPU backends
+    targetPort: 8080
+    # Label selector for filtering endpoints
+    labelSelector: ""
+    # Poll interval in seconds
+    pollIntervalSeconds: 30
+    # TLS verification for Kubernetes API
+    verifyTls: true
+
+# API key authentication
+auth:
+  # API keys for admin endpoint authentication
+  # Keys can be provided directly or via an existing secret
+  apiKeys: []
+    # - name: admin
+    #   key: "rnv_prod_your-secret-key-here"
+    #   expires: ""  # Optional: YYYY-MM-DD
+    #   roles:
+    #     - admin
+
+  # Use an existing secret for API keys
+  # Secret should have a key named "api-keys.yaml" with YAML content
+  existingSecret: ""
+
+# OpenTelemetry distributed tracing
+telemetry:
+  enabled: false
+  # OTLP endpoint (HTTP)
+  otlpEndpoint: "http://otel-collector:4318"
+  # Service name for traces
+  serviceName: "ranvier"
+  # Sample rate (0.0 to 1.0)
+  sampleRate: 1.0
+  # Export settings
+  exportIntervalMs: 5000
+  maxQueueSize: 2048
+  maxExportBatchSize: 512
+
+# Prometheus ServiceMonitor for metrics scraping
+serviceMonitor:
+  enabled: false
+  # Additional labels for the ServiceMonitor
+  labels: {}
+  # Scrape interval
+  interval: 30s
+  # Scrape timeout
+  scrapeTimeout: 10s
+  # Path to metrics endpoint
+  path: /metrics
+  # Metric relabeling configs
+  metricRelabelings: []
+  # Target relabeling configs
+  relabelings: []
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  # Custom metrics (requires metrics-server or prometheus-adapter)
+  # metrics: []
+
+# Resource requests and limits
+resources:
+  requests:
+    memory: "1Gi"
+    cpu: "500m"
+  limits:
+    memory: "2Gi"
+    cpu: "2"
+
+# Seastar runtime arguments
+seastar:
+  # Number of CPU cores to use
+  smp: 1
+  # Memory allocation
+  memory: "1G"
+  # Additional Seastar arguments
+  extraArgs: []
+
+# Persistence for SQLite database
+persistence:
+  enabled: true
+  # Storage class (leave empty for default)
+  storageClass: ""
+  # Access mode
+  accessMode: ReadWriteOnce
+  # Size of the persistent volume
+  size: 1Gi
+  # Annotations for the PVC
+  annotations: {}
+
+# Service configuration
+service:
+  type: ClusterIP
+  # API port
+  port: 8080
+  # Node port (only if type is NodePort)
+  nodePort: ""
+  # Annotations for the service
+  annotations: {}
+  # Load balancer IP (only if type is LoadBalancer)
+  loadBalancerIP: ""
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: ranvier.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: ranvier-tls
+    #   hosts:
+    #     - ranvier.local
+
+# Liveness and readiness probes
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /metrics
+    port: metrics
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /metrics
+    port: metrics
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity rules
+affinity: {}
+  # Example: spread pods across nodes
+  # podAntiAffinity:
+  #   preferredDuringSchedulingIgnoredDuringExecution:
+  #     - weight: 100
+  #       podAffinityTerm:
+  #         labelSelector:
+  #           matchLabels:
+  #             app.kubernetes.io/name: ranvier
+  #         topologyKey: kubernetes.io/hostname
+
+# Topology spread constraints
+topologySpreadConstraints: []
+  # - maxSkew: 1
+  #   topologyKey: kubernetes.io/hostname
+  #   whenUnsatisfiable: DoNotSchedule
+  #   labelSelector:
+  #     matchLabels:
+  #       app.kubernetes.io/name: ranvier
+
+# Priority class name
+priorityClassName: ""
+
+# Termination grace period
+terminationGracePeriodSeconds: 60
+
+# Extra environment variables
+extraEnv: []
+  # - name: CUSTOM_VAR
+  #   value: "custom-value"
+
+# Extra volume mounts
+extraVolumeMounts: []
+  # - name: extra-config
+  #   mountPath: /etc/extra
+
+# Extra volumes
+extraVolumes: []
+  # - name: extra-config
+  #   configMap:
+  #     name: extra-config
+
+# Init containers
+initContainers: []
+
+# Sidecar containers
+sidecars: []
