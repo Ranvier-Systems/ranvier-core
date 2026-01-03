@@ -114,6 +114,9 @@ public:
     // Update last activity time
     void touch() { _last_activity = std::chrono::steady_clock::now(); }
 
+    // Get OpenSSL error string (static utility)
+    static std::string get_ssl_error();
+
 private:
     SSL* _ssl = nullptr;
     BIO* _read_bio = nullptr;   // For incoming encrypted data
@@ -128,9 +131,6 @@ private:
 
     // Set error state with message
     void set_error(const std::string& msg);
-
-    // Get OpenSSL error string
-    static std::string get_ssl_error();
 };
 
 // DTLS context manager for gossip encryption
