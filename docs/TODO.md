@@ -405,6 +405,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-03 | API key rotation mechanism with expiry and hot-reload | - |
 | 2025-01-02 | Add reliable delivery with acknowledgments (gossip protocol) | - |
 | 2025-01-02 | Implement duplicate suppression (gossip protocol) | - |
 | 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
