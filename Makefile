@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down help
+.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
 
 # Default target
 all: build
@@ -492,6 +492,59 @@ lint:
 	fi
 	@find src -name "*.cpp" | xargs clang-tidy -p build
 
+# ============================================================================
+# Helm Chart Targets
+# ============================================================================
+# These targets help with developing and testing the Kubernetes Helm chart.
+# Requires: helm 3.8+ installed locally
+
+HELM_CHART_DIR := deploy/helm/ranvier
+HELM_RELEASE_NAME ?= ranvier
+HELM_NAMESPACE ?= ranvier
+
+# Lint the Helm chart for errors and best practices
+helm-lint:
+	@echo "======================================"
+	@echo "Linting Ranvier Helm Chart"
+	@echo "======================================"
+	@if ! command -v helm >/dev/null 2>&1; then \
+		echo "Error: helm not found. Install from https://helm.sh/docs/intro/install/"; \
+		exit 1; \
+	fi
+	helm lint $(HELM_CHART_DIR)
+
+# Render Helm templates locally (no cluster required)
+helm-template:
+	@echo "======================================"
+	@echo "Rendering Ranvier Helm Templates"
+	@echo "======================================"
+	@if ! command -v helm >/dev/null 2>&1; then \
+		echo "Error: helm not found. Install from https://helm.sh/docs/intro/install/"; \
+		exit 1; \
+	fi
+	helm template $(HELM_RELEASE_NAME) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--debug
+
+# Dry-run installation against a cluster (requires cluster access)
+helm-dry-run:
+	@echo "======================================"
+	@echo "Dry-Run Ranvier Helm Installation"
+	@echo "======================================"
+	@if ! command -v helm >/dev/null 2>&1; then \
+		echo "Error: helm not found. Install from https://helm.sh/docs/intro/install/"; \
+		exit 1; \
+	fi
+	@if ! kubectl cluster-info >/dev/null 2>&1; then \
+		echo "Error: Cannot connect to Kubernetes cluster."; \
+		echo "Configure kubectl or use 'make helm-template' for offline validation."; \
+		exit 1; \
+	fi
+	helm install $(HELM_RELEASE_NAME) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--create-namespace \
+		--dry-run
+
 # Show help
 help:
 	@echo "Ranvier Core Build System"
@@ -548,3 +601,12 @@ help:
 	@echo "Code quality:"
 	@echo "  make format         - Format C++ code with clang-format"
 	@echo "  make lint           - Run clang-tidy static analysis"
+	@echo ""
+	@echo "Helm chart (Kubernetes deployment):"
+	@echo "  make helm-lint      - Lint the Helm chart"
+	@echo "  make helm-template  - Render templates locally (no cluster needed)"
+	@echo "  make helm-dry-run   - Dry-run install against a cluster"
+	@echo ""
+	@echo "  Helm variables:"
+	@echo "    HELM_RELEASE_NAME=ranvier  - Helm release name"
+	@echo "    HELM_NAMESPACE=ranvier     - Kubernetes namespace"

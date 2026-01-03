@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ranvier.fullname" . }}
+  labels:
+    {{- include "ranvier.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if and (eq .Values.service.type "LoadBalancer") .Values.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.service.loadBalancerIP }}
+  {{- end }}
+  ports:
+    - name: api
+      port: {{ .Values.service.port }}
+      targetPort: api
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
+    - name: metrics
+      port: {{ .Values.config.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "ranvier.selectorLabels" . | nindent 4 }}
+---
+# Headless service for StatefulSet DNS-based peer discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ranvier.headlessServiceName" . }}
+  labels:
+    {{- include "ranvier.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: api
+      port: {{ .Values.config.apiPort }}
+      targetPort: api
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.config.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+    {{- if .Values.cluster.enabled }}
+    - name: gossip
+      port: {{ .Values.cluster.gossipPort }}
+      targetPort: gossip
+      protocol: UDP
+    {{- end }}
+  selector:
+    {{- include "ranvier.selectorLabels" . | nindent 4 }}

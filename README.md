@@ -78,3 +78,53 @@ graph TD
     style Router fill:#f9f,stroke:#333,stroke-width:4px
     style Radix fill:#ccf,stroke:#333
 ```
+
+---
+
+## 🐳 Deployment
+
+### Docker
+
+```bash
+# Build production image
+docker build -f Dockerfile.production -t ranvier:latest .
+
+# Run with required IPC_LOCK capability
+docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ranvier:latest
+```
+
+### Kubernetes (Helm)
+
+Deploy a 3-node Ranvier cluster with gossip synchronization:
+
+```bash
+# Install with default values
+helm install ranvier ./deploy/helm/ranvier \
+  --namespace ranvier --create-namespace
+
+# Production installation with backend discovery
+helm install ranvier ./deploy/helm/ranvier \
+  --namespace ranvier --create-namespace \
+  --set "auth.apiKeys[0].name=admin" \
+  --set "auth.apiKeys[0].key=rnv_prod_$(openssl rand -hex 24)" \
+  --set "auth.apiKeys[0].roles={admin}" \
+  --set backends.discovery.enabled=true \
+  --set backends.discovery.serviceName=vllm-backends \
+  --set serviceMonitor.enabled=true
+```
+
+See [Kubernetes Deployment Guide](docs/kubernetes.md) for detailed configuration options.
+
+---
+
+## 📖 Documentation
+
+- [Architecture Overview](docs/architecture.md)
+- [API Reference](docs/api-reference.md)
+- [Request Flow](docs/request-flow.md)
+- [Kubernetes Deployment](docs/kubernetes.md)
+- [Performance Tuning](docs/performance.md)
+- **Internals:**
+  - [Gossip Protocol](docs/internals/gossip-protocol.md)
+  - [Radix Tree](docs/internals/radix-tree.md)
+  - [Prefix Affinity Routing](docs/internals/prefix-affinity-routing.md)
