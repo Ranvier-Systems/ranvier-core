@@ -21,6 +21,8 @@
 #include <csignal>
 #include <fstream>
 #include <streambuf>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <seastar/core/app-template.hh>
 #include <seastar/core/prometheus.hh>
@@ -194,7 +196,7 @@ future<> reload_config() {
         ctrl_config.min_token_length = g_config.routing.min_token_length;
         ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
         ctrl_config.request_timeout = g_config.timeouts.request_timeout;
-        ctrl_config.admin_api_key = g_config.auth.admin_api_key;
+        ctrl_config.auth = g_config.auth;  // Full auth config with multi-key support
         ctrl_config.rate_limit.enabled = g_config.rate_limit.enabled;
         ctrl_config.rate_limit.requests_per_second = g_config.rate_limit.requests_per_second;
         ctrl_config.rate_limit.burst_size = g_config.rate_limit.burst_size;
@@ -226,6 +228,151 @@ future<> reload_config() {
     } catch (const std::exception& e) {
         ranvier::log_main.error("Config reload failed: {}", e.what());
         return make_ready_future<>();
+    }
+}
+
+// Dry-run validation - checks configuration, tokenizer, database, and TLS without starting services
+// Returns 0 if all checks pass, 1 if any fail
+int run_dry_run_validation(const std::string& config_path, const ranvier::RanvierConfig& config) {
+    int error_count = 0;
+
+    std::cout << "\nRanvier Core - Dry Run Validation\n\n";
+
+    // ============================================================
+    // Configuration validation
+    // ============================================================
+    std::cout << "Configuration: " << config_path << "\n";
+
+    // Check if config file actually exists
+    std::ifstream config_file(config_path);
+    if (config_file.is_open()) {
+        config_file.close();
+        std::cout << "  \xE2\x9C\x93 Config file parsed successfully\n";
+    } else {
+        std::cout << "  ! Config file not found, using defaults\n";
+    }
+    std::cout << "  \xE2\x9C\x93 API port: " << config.server.api_port << "\n";
+    std::cout << "  \xE2\x9C\x93 Metrics port: " << config.server.metrics_port << "\n";
+
+    // Run config validation
+    auto validation_error = ranvier::RanvierConfig::validate(config);
+    if (validation_error) {
+        std::cout << "  \xE2\x9C\x97 Validation error: " << *validation_error << "\n";
+        error_count++;
+    } else {
+        std::cout << "  \xE2\x9C\x93 Configuration validation passed\n";
+    }
+
+    // ============================================================
+    // Tokenizer validation
+    // ============================================================
+    std::cout << "\nTokenizers:\n";
+
+    // Check tokenizer file exists
+    std::ifstream tokenizer_file(config.assets.tokenizer_path);
+    if (!tokenizer_file.is_open()) {
+        std::cout << "  \xE2\x9C\x97 " << config.assets.tokenizer_path << " (file not found)\n";
+        error_count++;
+    } else {
+        // Try to read and parse the JSON
+        try {
+            std::string json_str((std::istreambuf_iterator<char>(tokenizer_file)),
+                                 std::istreambuf_iterator<char>());
+            tokenizer_file.close();
+
+            // Try to load the tokenizer to validate the JSON
+            ranvier::TokenizerService test_tokenizer;
+            test_tokenizer.load_from_json(json_str);
+
+            if (test_tokenizer.is_loaded()) {
+                std::cout << "  \xE2\x9C\x93 " << config.assets.tokenizer_path << " (valid)\n";
+            } else {
+                std::cout << "  \xE2\x9C\x97 " << config.assets.tokenizer_path << " (failed to parse)\n";
+                error_count++;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "  \xE2\x9C\x97 " << config.assets.tokenizer_path << " (invalid: " << e.what() << ")\n";
+            error_count++;
+        }
+    }
+
+    // ============================================================
+    // Database validation
+    // ============================================================
+    std::cout << "\nDatabase:\n";
+
+    const std::string& db_path = config.database.path;
+
+    // Check if the database file exists
+    struct stat db_stat;
+    if (stat(db_path.c_str(), &db_stat) == 0) {
+        // File exists, check if it's writable
+        if (access(db_path.c_str(), W_OK) == 0) {
+            std::cout << "  \xE2\x9C\x93 " << db_path << " (writable)\n";
+        } else {
+            std::cout << "  \xE2\x9C\x97 " << db_path << " (not writable)\n";
+            error_count++;
+        }
+    } else {
+        // File doesn't exist, check if parent directory is writable
+        std::string parent_dir = ".";
+        size_t last_slash = db_path.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            parent_dir = db_path.substr(0, last_slash);
+            if (parent_dir.empty()) {
+                parent_dir = "/";
+            }
+        }
+
+        if (access(parent_dir.c_str(), W_OK) == 0) {
+            std::cout << "  \xE2\x9C\x93 " << db_path << " (can be created)\n";
+        } else {
+            std::cout << "  \xE2\x9C\x97 " << db_path << " (parent directory not writable: " << parent_dir << ")\n";
+            error_count++;
+        }
+    }
+
+    // ============================================================
+    // TLS validation
+    // ============================================================
+    std::cout << "\nTLS:\n";
+
+    if (!config.tls.enabled) {
+        std::cout << "  - TLS disabled\n";
+    } else {
+        // Check certificate file
+        if (config.tls.cert_path.empty()) {
+            std::cout << "  \xE2\x9C\x97 Certificate: (path not configured)\n";
+            error_count++;
+        } else if (access(config.tls.cert_path.c_str(), R_OK) == 0) {
+            std::cout << "  \xE2\x9C\x93 Certificate: " << config.tls.cert_path << "\n";
+        } else {
+            std::cout << "  \xE2\x9C\x97 Certificate: " << config.tls.cert_path << " (not readable)\n";
+            error_count++;
+        }
+
+        // Check private key file
+        if (config.tls.key_path.empty()) {
+            std::cout << "  \xE2\x9C\x97 Private key: (path not configured)\n";
+            error_count++;
+        } else if (access(config.tls.key_path.c_str(), R_OK) == 0) {
+            std::cout << "  \xE2\x9C\x93 Private key: " << config.tls.key_path << "\n";
+        } else {
+            std::cout << "  \xE2\x9C\x97 Private key: " << config.tls.key_path << " (not readable)\n";
+            error_count++;
+        }
+    }
+
+    // ============================================================
+    // Summary
+    // ============================================================
+    std::cout << "\n";
+    if (error_count == 0) {
+        std::cout << "Result: PASSED\n";
+        return 0;
+    } else {
+        std::cout << "Result: FAILED (" << error_count << " error" << (error_count == 1 ? "" : "s") << ")\n";
+        return 1;
     }
 }
 
@@ -273,7 +420,7 @@ future<> run() {
     ctrl_config.min_token_length = g_config.routing.min_token_length;
     ctrl_config.connect_timeout = g_config.timeouts.connect_timeout;
     ctrl_config.request_timeout = g_config.timeouts.request_timeout;
-    ctrl_config.admin_api_key = g_config.auth.admin_api_key;
+    ctrl_config.auth = g_config.auth;  // Full auth config with multi-key support
     ctrl_config.rate_limit.enabled = g_config.rate_limit.enabled;
     ctrl_config.rate_limit.requests_per_second = g_config.rate_limit.requests_per_second;
     ctrl_config.rate_limit.burst_size = g_config.rate_limit.burst_size;
@@ -454,6 +601,21 @@ future<> run() {
                 });
                 ranvier::log_main.info("SIGHUP handler registered for config hot-reload");
 
+                // Set up config reload callback for /admin/keys/reload endpoint
+                // The callback triggers SIGHUP to reuse existing reload logic
+                (void)controller.invoke_on_all([](ranvier::HttpController& c) {
+                    c.set_config_reload_callback([]() {
+                        // Trigger SIGHUP to self - this is async but reliable
+                        if (raise(SIGHUP) == 0) {
+                            ranvier::log_main.info("Config reload triggered via API endpoint");
+                            return true;
+                        }
+                        ranvier::log_main.error("Failed to send SIGHUP signal");
+                        return false;
+                    });
+                });
+                ranvier::log_main.info("Config reload callback registered for /admin/keys/reload endpoint");
+
                 // Wait Loop with Graceful Shutdown
                 auto stop_signal = std::make_shared<promise<>>();
 
@@ -541,17 +703,67 @@ future<> run() {
 }
 
 int main(int argc, char** argv) {
+    // Check for --help BEFORE loading config (avoids config errors blocking help)
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << R"(Ranvier Core - Content-aware Layer 7+ Load Balancer for LLM Inference
+
+USAGE:
+    ranvier_server [OPTIONS]
+
+DESCRIPTION:
+    Ranvier routes LLM requests based on token prefixes rather than
+    connection availability, reducing GPU cache thrashing by directing
+    requests to backends that already hold relevant KV cache state.
+
+OPTIONS:
+    -h, --help              Print this help message and exit
+    --help-seastar          Show Seastar framework options
+    --help-loggers          Print available logger names
+    --config <PATH>         Path to configuration file (default: ranvier.yaml,
+                            falls back to built-in defaults if not found)
+    --dry-run               Validate configuration and exit (no server start)
+    --smp <N>               Number of CPU cores to use
+    --memory <SIZE>         Memory to allocate (e.g., 4G)
+
+SIGNALS:
+    SIGHUP                  Reload configuration (hot-reload)
+    SIGINT, SIGTERM         Graceful shutdown with connection draining
+
+EXAMPLES:
+    ranvier_server
+        Start with ranvier.yaml if present, otherwise use built-in defaults
+
+    ranvier_server --config /etc/ranvier/config.yaml
+        Start with custom config file
+
+    ranvier_server --dry-run
+        Validate configuration without starting the server
+
+    ranvier_server --smp 4 --memory 8G
+        Start with 4 CPU cores and 8GB memory
+
+For more information, see: https://github.com/ranvier-systems/ranvier-core
+)";
+            return 0;
+        }
+    }
+
     // Load configuration BEFORE Seastar starts
     // This allows us to use config values for server initialization
     std::string config_path = "ranvier.yaml";
+    bool dry_run = false;
 
-    // Check for --config argument
+    // Check for --config and --dry-run arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             config_path = argv[i + 1];
         } else if (arg.rfind("--config=", 0) == 0) {
             config_path = arg.substr(9);
+        } else if (arg == "--dry-run") {
+            dry_run = true;
         }
     }
 
@@ -559,8 +771,20 @@ int main(int argc, char** argv) {
         g_config = ranvier::RanvierConfig::load(config_path);
         g_config_path = config_path;  // Store for hot-reload
 
+        // Run dry-run validation if requested
+        if (dry_run) {
+            return run_dry_run_validation(config_path, g_config);
+        }
+
         // Log config summary (before Seastar logger is available)
-        std::cout << "Ranvier Core - Configuration loaded\n";
+        // Check if config file actually exists to report accurately
+        std::ifstream config_check(config_path);
+        if (config_check.is_open()) {
+            config_check.close();
+            std::cout << "Ranvier Core - Configuration loaded from " << config_path << "\n";
+        } else {
+            std::cout << "Ranvier Core - Using built-in defaults (" << config_path << " not found)\n";
+        }
         std::cout << "  API Port:     " << g_config.server.api_port << "\n";
         std::cout << "  Metrics Port: " << g_config.server.metrics_port << "\n";
         std::cout << "  Database:     " << g_config.database.path << "\n";

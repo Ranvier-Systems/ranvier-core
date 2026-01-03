@@ -889,6 +889,295 @@ TEST_F(ConfigTest, RoutingConfigStructDefaults) {
     EXPECT_FALSE(routing.enable_token_forwarding);
 }
 
+// =============================================================================
+// API Key Rotation Tests
+// =============================================================================
+
+TEST_F(ConfigTest, ApiKeyIsExpiredForPastDate) {
+    ApiKey key;
+    key.key = "test-key";
+    key.name = "test";
+    key.expires = "2020-01-01";  // Past date
+
+    EXPECT_TRUE(key.is_expired());
+}
+
+TEST_F(ConfigTest, ApiKeyIsNotExpiredForFutureDate) {
+    ApiKey key;
+    key.key = "test-key";
+    key.name = "test";
+    key.expires = "2099-12-31";  // Far future date
+
+    EXPECT_FALSE(key.is_expired());
+}
+
+TEST_F(ConfigTest, ApiKeyIsNotExpiredWithNoExpiry) {
+    ApiKey key;
+    key.key = "test-key";
+    key.name = "test";
+    // No expires set (nullopt)
+
+    EXPECT_FALSE(key.is_expired());
+}
+
+TEST_F(ConfigTest, ApiKeyIsNotExpiredWithEmptyExpiry) {
+    ApiKey key;
+    key.key = "test-key";
+    key.name = "test";
+    key.expires = "";  // Empty string
+
+    EXPECT_FALSE(key.is_expired());
+}
+
+TEST_F(ConfigTest, ApiKeyGetLogIdentifierReturnsName) {
+    ApiKey key;
+    key.key = "rnv_prod_abc123def456ghi789jkl012mno345pqr";
+    key.name = "production-deploy";
+
+    EXPECT_EQ(key.get_log_identifier(), "production-deploy");
+}
+
+TEST_F(ConfigTest, ApiKeyGetLogIdentifierReturnsTruncatedKeyIfNoName) {
+    ApiKey key;
+    key.key = "rnv_prod_abc123def456ghi789jkl012mno345pqr";
+    key.name = "";  // No name
+
+    std::string log_id = key.get_log_identifier();
+    EXPECT_EQ(log_id, "rnv_prod_abc...");  // First 12 chars + "..."
+}
+
+TEST_F(ConfigTest, AuthConfigSecureCompareWorks) {
+    EXPECT_TRUE(AuthConfig::secure_compare("test", "test"));
+    EXPECT_FALSE(AuthConfig::secure_compare("test", "test1"));
+    EXPECT_FALSE(AuthConfig::secure_compare("test1", "test"));
+    EXPECT_FALSE(AuthConfig::secure_compare("test", "TEST"));
+    EXPECT_TRUE(AuthConfig::secure_compare("", ""));
+}
+
+TEST_F(ConfigTest, AuthConfigIsEnabledWithLegacyKey) {
+    AuthConfig auth;
+    auth.admin_api_key = "";
+    EXPECT_FALSE(auth.is_enabled());
+
+    auth.admin_api_key = "secret-key";
+    EXPECT_TRUE(auth.is_enabled());
+}
+
+TEST_F(ConfigTest, AuthConfigIsEnabledWithApiKeys) {
+    AuthConfig auth;
+    EXPECT_FALSE(auth.is_enabled());
+
+    ApiKey key;
+    key.key = "test-key";
+    key.name = "test";
+    auth.api_keys.push_back(key);
+    EXPECT_TRUE(auth.is_enabled());
+}
+
+TEST_F(ConfigTest, AuthConfigValidateTokenWithLegacyKey) {
+    AuthConfig auth;
+    auth.admin_api_key = "secret-key";
+
+    auto [valid1, name1] = auth.validate_token("secret-key");
+    EXPECT_TRUE(valid1);
+    EXPECT_EQ(name1, "legacy-key");
+
+    auto [valid2, name2] = auth.validate_token("wrong-key");
+    EXPECT_FALSE(valid2);
+    EXPECT_EQ(name2, "");
+}
+
+TEST_F(ConfigTest, AuthConfigValidateTokenWithApiKeys) {
+    AuthConfig auth;
+
+    ApiKey key1;
+    key1.key = "rnv_prod_key1";
+    key1.name = "prod-key";
+    key1.expires = "2099-12-31";
+    auth.api_keys.push_back(key1);
+
+    ApiKey key2;
+    key2.key = "rnv_test_key2";
+    key2.name = "test-key";
+    auth.api_keys.push_back(key2);
+
+    auto [valid1, name1] = auth.validate_token("rnv_prod_key1");
+    EXPECT_TRUE(valid1);
+    EXPECT_EQ(name1, "prod-key");
+
+    auto [valid2, name2] = auth.validate_token("rnv_test_key2");
+    EXPECT_TRUE(valid2);
+    EXPECT_EQ(name2, "test-key");
+
+    auto [valid3, name3] = auth.validate_token("invalid");
+    EXPECT_FALSE(valid3);
+}
+
+TEST_F(ConfigTest, AuthConfigRejectsExpiredKey) {
+    AuthConfig auth;
+
+    ApiKey key;
+    key.key = "rnv_expired_key";
+    key.name = "expired-key";
+    key.expires = "2020-01-01";  // Past date
+    auth.api_keys.push_back(key);
+
+    auto [valid, name] = auth.validate_token("rnv_expired_key");
+    EXPECT_FALSE(valid);
+    EXPECT_NE(name.find("expired"), std::string::npos);
+}
+
+TEST_F(ConfigTest, AuthConfigApiKeysTakePrecedenceOverLegacy) {
+    AuthConfig auth;
+    auth.admin_api_key = "legacy-secret";
+
+    ApiKey key;
+    key.key = "rnv_new_key";
+    key.name = "new-key";
+    auth.api_keys.push_back(key);
+
+    // New key should work
+    auto [valid1, name1] = auth.validate_token("rnv_new_key");
+    EXPECT_TRUE(valid1);
+    EXPECT_EQ(name1, "new-key");
+
+    // Legacy key should also still work (fallback)
+    auto [valid2, name2] = auth.validate_token("legacy-secret");
+    EXPECT_TRUE(valid2);
+    EXPECT_EQ(name2, "legacy-key");
+}
+
+TEST_F(ConfigTest, AuthConfigValidKeyCount) {
+    AuthConfig auth;
+    EXPECT_EQ(auth.valid_key_count(), 0u);
+
+    auth.admin_api_key = "legacy";
+    EXPECT_EQ(auth.valid_key_count(), 1u);
+
+    ApiKey key1;
+    key1.key = "valid-key";
+    key1.name = "valid";
+    auth.api_keys.push_back(key1);
+    EXPECT_EQ(auth.valid_key_count(), 2u);
+
+    ApiKey key2;
+    key2.key = "expired-key";
+    key2.name = "expired";
+    key2.expires = "2020-01-01";  // Expired
+    auth.api_keys.push_back(key2);
+    EXPECT_EQ(auth.valid_key_count(), 2u);  // Still 2, expired key doesn't count
+}
+
+TEST_F(ConfigTest, ApiKeysFromYaml) {
+    writeTestConfig("test_config.yaml", R"(
+auth:
+  api_keys:
+    - key: "rnv_prod_abc123"
+      name: "production"
+      created: "2025-01-01"
+      expires: "2025-12-31"
+      roles: ["admin"]
+    - key: "rnv_test_xyz789"
+      name: "testing"
+      created: "2025-01-15"
+      roles: ["viewer"]
+)");
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    ASSERT_EQ(config.auth.api_keys.size(), 2u);
+
+    EXPECT_EQ(config.auth.api_keys[0].key, "rnv_prod_abc123");
+    EXPECT_EQ(config.auth.api_keys[0].name, "production");
+    EXPECT_EQ(config.auth.api_keys[0].created, "2025-01-01");
+    EXPECT_EQ(config.auth.api_keys[0].expires.value(), "2025-12-31");
+    ASSERT_EQ(config.auth.api_keys[0].roles.size(), 1u);
+    EXPECT_EQ(config.auth.api_keys[0].roles[0], "admin");
+
+    EXPECT_EQ(config.auth.api_keys[1].key, "rnv_test_xyz789");
+    EXPECT_EQ(config.auth.api_keys[1].name, "testing");
+    EXPECT_FALSE(config.auth.api_keys[1].expires.has_value());
+    ASSERT_EQ(config.auth.api_keys[1].roles.size(), 1u);
+    EXPECT_EQ(config.auth.api_keys[1].roles[0], "viewer");
+}
+
+TEST_F(ConfigTest, ApiKeysAndLegacyKeyFromYaml) {
+    writeTestConfig("test_config.yaml", R"(
+auth:
+  admin_api_key: "legacy-key-123"
+  api_keys:
+    - key: "rnv_new_key"
+      name: "new-key"
+)");
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    // Both should be set
+    EXPECT_EQ(config.auth.admin_api_key, "legacy-key-123");
+    ASSERT_EQ(config.auth.api_keys.size(), 1u);
+    EXPECT_EQ(config.auth.api_keys[0].key, "rnv_new_key");
+
+    // Auth should be enabled
+    EXPECT_TRUE(config.auth.is_enabled());
+
+    // Both keys should be valid
+    EXPECT_EQ(config.auth.valid_key_count(), 2u);
+
+    auto [valid1, _1] = config.auth.validate_token("legacy-key-123");
+    EXPECT_TRUE(valid1);
+
+    auto [valid2, _2] = config.auth.validate_token("rnv_new_key");
+    EXPECT_TRUE(valid2);
+}
+
+TEST_F(ConfigTest, LegacySingleKeyStillWorks) {
+    writeTestConfig("test_config.yaml", R"(
+auth:
+  admin_api_key: "simple-key"
+)");
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    EXPECT_EQ(config.auth.admin_api_key, "simple-key");
+    EXPECT_TRUE(config.auth.api_keys.empty());
+    EXPECT_TRUE(config.auth.is_enabled());
+
+    auto [valid, name] = config.auth.validate_token("simple-key");
+    EXPECT_TRUE(valid);
+    EXPECT_EQ(name, "legacy-key");
+}
+
+TEST_F(ConfigTest, ApiKeyHotReloadAddsNewKey) {
+    // Simulate initial config
+    writeTestConfig("test_config.yaml", R"(
+auth:
+  api_keys:
+    - key: "rnv_key1"
+      name: "key1"
+)");
+
+    auto config1 = RanvierConfig::load("test_config.yaml");
+    EXPECT_EQ(config1.auth.api_keys.size(), 1u);
+
+    // Simulate updated config with new key
+    writeTestConfig("test_config.yaml", R"(
+auth:
+  api_keys:
+    - key: "rnv_key1"
+      name: "key1"
+    - key: "rnv_key2"
+      name: "key2"
+)");
+
+    auto config2 = RanvierConfig::load("test_config.yaml");
+    EXPECT_EQ(config2.auth.api_keys.size(), 2u);
+
+    // New key should now be valid
+    auto [valid, name] = config2.auth.validate_token("rnv_key2");
+    EXPECT_TRUE(valid);
+    EXPECT_EQ(name, "key2");
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
