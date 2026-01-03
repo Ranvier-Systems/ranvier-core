@@ -1,6 +1,7 @@
 FROM fedora:39
 
 # Install Basic Build Tools & Git
+# openssl-devel required for DTLS gossip encryption
 RUN dnf install -y \
     git \
     cmake \
@@ -11,6 +12,7 @@ RUN dnf install -y \
     curl \
     zip \
     unzip \
+    openssl-devel \
     && dnf clean all
 
 # Install Python Deps
