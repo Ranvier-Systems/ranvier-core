@@ -1244,6 +1244,33 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reloa
 
     log_control.info("Config reload triggered via /admin/keys/reload endpoint");
 
+    // Helper to escape JSON string values (prevent injection)
+    auto escape_json_string = [](const std::string& s) -> std::string {
+        std::string result;
+        result.reserve(s.size() + 8);
+        for (char c : s) {
+            switch (c) {
+                case '"': result += "\\\""; break;
+                case '\\': result += "\\\\"; break;
+                case '\b': result += "\\b"; break;
+                case '\f': result += "\\f"; break;
+                case '\n': result += "\\n"; break;
+                case '\r': result += "\\r"; break;
+                case '\t': result += "\\t"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        // Control character - encode as \u00XX
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                        result += buf;
+                    } else {
+                        result += c;
+                    }
+            }
+        }
+        return result;
+    };
+
     // Build response with current key metadata (names only, not values)
     // Note: This shows the state BEFORE the reload completes
     std::string response = "{\"status\": \"reload_triggered\", \"message\": \"Configuration reload initiated\", "
@@ -1253,7 +1280,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reloa
     for (const auto& api_key : _config.auth.api_keys) {
         if (!first) response += ", ";
         first = false;
-        response += "{\"name\": \"" + api_key.name + "\", \"expired\": " +
+        response += "{\"name\": \"" + escape_json_string(api_key.name) + "\", \"expired\": " +
                    (api_key.is_expired() ? "true" : "false") + "}";
     }
     if (!_config.auth.admin_api_key.empty()) {
