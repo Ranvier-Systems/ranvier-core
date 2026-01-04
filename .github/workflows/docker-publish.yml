@@ -1,5 +1,9 @@
 # Build and publish Docker images to GitHub Container Registry
 # Triggers on push to main (latest tag) and version tags (v*)
+#
+# NOTE: Uses Dockerfile.production.fast with pre-built base image for speed.
+# The base image (ranvier-base) is built separately via docker-base.yml.
+# Currently amd64 only - arm64 requires native ARM runners for Seastar builds.
 name: Docker Publish
 
 on:
@@ -12,6 +16,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ranvier-systems/ranvier
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
 
 jobs:
   build-and-push:
@@ -27,11 +32,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Set up QEMU for multi-architecture builds
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      # Free up disk space for large Docker builds
+      # GitHub runners have limited space (~14GB free)
+      - name: Free disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          # Remove unnecessary tools to free up space
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          echo "=== Disk space after cleanup ==="
+          df -h /
 
-      # Set up Docker Buildx for multi-arch and caching
+      # Set up Docker Buildx for caching
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -61,22 +77,23 @@ jobs:
             # Tag with short commit SHA for traceability
             type=sha,prefix=sha-,format=short
 
-      # Build and push multi-architecture Docker image
+      # Build and push Docker image using pre-built base image
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.production
-          platforms: linux/amd64,linux/arm64
+          file: ./Dockerfile.production.fast
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # BuildKit cache configuration for faster builds
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Build arguments
+          # Use the pre-built base image with Seastar
           build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
             UID=10001
             GID=10001
 
@@ -102,4 +119,6 @@ jobs:
           echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform:** linux/amd64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Base Image:** \`${{ env.BASE_IMAGE }}\`" >> $GITHUB_STEP_SUMMARY
