@@ -372,7 +372,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `.github/workflows/`, `Dockerfile.production`
   _Complexity:_ Low
 
-- [ ] **Add development container (devcontainer)**
+- [x] **Add development container (devcontainer)** ✓
   _Justification:_ Complex build dependencies. Devcontainer provides reproducible environment.
   _Location:_ `.devcontainer/`
   _Complexity:_ Low
@@ -405,6 +405,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-04 | Add development container (devcontainer) | - |
 | 2025-01-04 | Generate OpenAPI 3.0 specification for HTTP API | - |
 | 2025-01-04 | Implement mTLS/DTLS encryption for gossip protocol (P0 security) | - |
 | 2025-01-04 | Add pre-built Docker images to GHCR | - |
