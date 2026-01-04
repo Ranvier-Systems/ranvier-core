@@ -1,46 +1,24 @@
-FROM fedora:39
+# Dev Container for Ranvier - Uses shared base image for environment parity
+# Ensures dev environment exactly matches production build environment
+#
+# Option 1: Pull pre-built base from GitHub Container Registry (after CI publishes it)
+#   docker pull ghcr.io/ranvier-systems/ranvier-base:latest
+#
+# Option 2: Build locally (required until base image is published to ghcr.io)
+#   docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+#
+ARG BASE_IMAGE=ranvier-dev/ranvier-base:latest
+FROM ${BASE_IMAGE}
 
-# Install Basic Build Tools & Git
-# openssl-devel required for DTLS gossip encryption
+# Install only dev-specific tools not in the base image
 RUN dnf install -y \
-    git \
-    cmake \
-    gcc-c++ \
-    ninja-build \
-    python3 \
-    python3-pip \
-    curl \
-    zip \
-    unzip \
-    openssl-devel \
-    libcurl-devel \
-    && dnf clean all
+        gdb \
+        strace \
+        valgrind \
+        zip \
+        unzip \
+    && pip3 install --no-cache-dir docker requests \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
-# Install Python Deps
-RUN dnf install -y python3-pip \
-    && pip3 install docker requests
-
-# Clone Seastar to get the dependency script
-# We use a specific tag (master/latest) to ensure stability
-WORKDIR /tmp
-RUN git clone --depth 1 https://github.com/scylladb/seastar.git
-
-# Install Seastar's System Dependencies
-# This script automatically finds the right dnf packages for Fedora 39
-RUN cd seastar && \
-    ./install-dependencies.sh
-
-# Build and Install Seastar (The Heavy Lifting)
-# This takes ~15 mins but only runs ONCE when you build the image.
-# We build in 'release' mode for performance.
-RUN cd seastar && \
-    ./configure.py --mode=release --prefix=/usr/local --c++-standard=20 && \
-    ninja -C build/release install && \
-    cd /tmp && rm -rf seastar
-
-# Install Rust (Required for the Tokenizer library)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Cleanup
 WORKDIR /workspaces/ranvier-core
