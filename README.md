@@ -107,8 +107,8 @@ Build from source (optional):
 # Build production image locally (standalone, ~20 min)
 docker build -f Dockerfile.production -t ranvier:latest .
 
-# Or use the base image strategy for faster rebuilds (~2 min after initial setup)
-docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+# Or use the base image strategy for faster rebuilds (~2 min)
+docker pull ghcr.io/ranvier-systems/ranvier-base:latest
 docker build -f Dockerfile.production.fast -t ranvier:latest .
 
 # Run with required IPC_LOCK capability
@@ -125,9 +125,13 @@ docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ranvier:latest
 
 ### Quick Start
 
-1. **Build the base image** (one-time, or when Seastar/toolchain updates):
+1. **Pull the base image** (pre-built from GitHub Container Registry):
    ```bash
-   docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+   docker pull ghcr.io/ranvier-systems/ranvier-base:latest
+   ```
+   Or build locally if customizing:
+   ```bash
+   docker build -f Dockerfile.base -t ghcr.io/ranvier-systems/ranvier-base:latest .
    ```
 
 2. **Open in VS Code:**

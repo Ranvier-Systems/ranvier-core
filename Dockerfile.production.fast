@@ -1,14 +1,13 @@
 # ---------------------------------------------------------
 # STAGE 1: Builder (Uses pre-built base image with Seastar)
 # ---------------------------------------------------------
-# This Dockerfile requires the base image to be built first:
-#   docker build -f Dockerfile.base -t my-registry/ranvier-base:latest .
-#
+# Uses the pre-built base image from GitHub Container Registry.
 # Build times drop from ~20 minutes to ~2 minutes since Seastar is cached.
+#
+# Pull the base image (or it will be pulled automatically):
+#   docker pull ghcr.io/ranvier-systems/ranvier-base:latest
 # ---------------------------------------------------------
-# For local dev, use ranvier-dev/ranvier-base:latest
-# For CI/CD, override with --build-arg BASE_IMAGE=ghcr.io/your-org/ranvier-base:latest
-ARG BASE_IMAGE=ranvier-dev/ranvier-base:latest
+ARG BASE_IMAGE=ghcr.io/ranvier-systems/ranvier-base:latest
 FROM ${BASE_IMAGE} AS builder
 
 # Copy ONLY dependency files first for better caching

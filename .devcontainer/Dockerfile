@@ -1,10 +1,13 @@
 # Dev Container for Ranvier - Uses shared base image for environment parity
 # Ensures dev environment exactly matches production build environment
 #
-# Build the base image first (once, or when Seastar/toolchain updates):
-#   docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+# Option 1: Pull pre-built base from GitHub Container Registry (recommended)
+#   docker pull ghcr.io/ranvier-systems/ranvier-base:latest
 #
-ARG BASE_IMAGE=ranvier-dev/ranvier-base:latest
+# Option 2: Build locally (if customizing toolchain)
+#   docker build -f Dockerfile.base -t ghcr.io/ranvier-systems/ranvier-base:latest .
+#
+ARG BASE_IMAGE=ghcr.io/ranvier-systems/ranvier-base:latest
 FROM ${BASE_IMAGE}
 
 # Install only dev-specific tools not in the base image
