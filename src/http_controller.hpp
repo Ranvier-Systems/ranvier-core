@@ -1,5 +1,6 @@
 #pragma once
 
+#include "async_persistence.hpp"
 #include "circuit_breaker.hpp"
 #include "config.hpp"
 #include "connection_pool.hpp"
@@ -72,8 +73,9 @@ public:
           }),
           _persistence(nullptr) {}
 
-    // Set optional persistence store (call before serving requests)
-    void set_persistence(PersistenceStore* store) { _persistence = store; }
+    // Set optional async persistence manager (call before serving requests)
+    // Uses fire-and-forget queueing to avoid blocking the reactor
+    void set_persistence(AsyncPersistenceManager* manager) { _persistence = manager; }
 
     // Set config reload callback (for /admin/keys/reload endpoint)
     // Callback returns true on success, false on failure
@@ -115,7 +117,7 @@ private:
     HttpControllerConfig _config;
     RateLimiter _rate_limiter;
     CircuitBreaker _circuit_breaker;
-    PersistenceStore* _persistence;
+    AsyncPersistenceManager* _persistence;  // Async persistence (fire-and-forget, non-blocking)
     ConfigReloadCallback _config_reload_callback;  // Callback for config hot-reload
 
     // Graceful shutdown state

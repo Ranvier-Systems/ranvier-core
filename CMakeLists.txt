@@ -137,6 +137,7 @@ if(Seastar_FOUND)
     # Define the Main Server Executable
     add_executable(ranvier_server
       src/main.cpp
+      src/async_persistence.cpp
       src/dtls_context.cpp
       src/gossip_service.cpp
       src/health_service.cpp

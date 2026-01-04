@@ -6,6 +6,7 @@
 // 3. Presentation Layer (HttpController): Handles HTTP endpoints
 // 4. Persistence Layer (SqlitePersistence): Handles durable storage of routes/backends
 
+#include "async_persistence.hpp"
 #include "config.hpp"
 #include "gossip_service.hpp"
 #include "health_service.hpp"
@@ -51,6 +52,7 @@ std::unique_ptr<ranvier::RouterService> router;
 seastar::sharded<ranvier::HttpController> controller;
 std::unique_ptr<ranvier::HealthService> health_checker;
 std::unique_ptr<ranvier::PersistenceStore> persistence;
+std::unique_ptr<ranvier::AsyncPersistenceManager> async_persistence;  // Non-blocking persistence wrapper
 std::unique_ptr<ranvier::K8sDiscoveryService> k8s_discovery;
 
 // Helper to load persisted state into the router
@@ -452,7 +454,7 @@ future<> run() {
             ranvier::init_metrics();
         });
     }).then([] {
-        // 3. Init Persistence
+        // 3. Init Persistence (SQLite backend + async wrapper for non-blocking I/O)
         persistence = ranvier::create_persistence_store();
         if (persistence->open(g_config.database.path)) {
             ranvier::log_main.info("Persistence initialized (SQLite: {})", g_config.database.path);
@@ -465,9 +467,24 @@ future<> run() {
                 ranvier::log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
             }
 
-            // Set persistence on all shards - persistence store is thread-safe for writes
-            return controller.invoke_on_all([](ranvier::HttpController& c) {
-                c.set_persistence(persistence.get());
+            // Create async persistence manager to decouple SQLite I/O from the hot path
+            // This prevents blocking the Seastar reactor thread during disk writes
+            ranvier::AsyncPersistenceConfig async_config;
+            async_config.flush_interval = std::chrono::milliseconds(100);  // Flush every 100ms
+            async_config.max_batch_size = 1000;     // Up to 1000 routes per batch
+            async_config.max_queue_depth = 100000;  // Backpressure threshold
+            async_config.enable_stats_logging = true;
+            async_config.stats_interval = std::chrono::seconds(60);
+
+            async_persistence = std::make_unique<ranvier::AsyncPersistenceManager>(async_config);
+            async_persistence->set_persistence_store(persistence.get());
+
+            // Start the async persistence background flush loop
+            return async_persistence->start().then([] {
+                // Set async persistence on all shards - uses fire-and-forget queue API
+                return controller.invoke_on_all([](ranvier::HttpController& c) {
+                    c.set_persistence(async_persistence.get());
+                });
             });
         } else {
             ranvier::log_main.warn("Failed to open persistence store - running without persistence");
@@ -674,6 +691,14 @@ future<> run() {
             }).then([] {
                 // Stop the sharded HttpController (cleans up per-shard resources)
                 return controller.stop();
+            }).then([] {
+                // Stop async persistence manager (flushes pending operations)
+                if (async_persistence) {
+                    return async_persistence->stop().then([] {
+                        ranvier::log_main.info("Async persistence manager stopped (queue flushed)");
+                    });
+                }
+                return make_ready_future<>();
             }).finally([] {
                 // Log shutdown summary and close persistence
                 if (persistence && persistence->is_open()) {
