@@ -5,6 +5,7 @@
 #include "gossip_service.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <unordered_set>
 
@@ -79,7 +80,14 @@ GossipService::GossipService(const ClusterConfig& config)
         seastar::metrics::make_counter("cluster_dtls_packets_decrypted", _dtls_packets_decrypted,
             seastar::metrics::description("Total number of packets decrypted with DTLS")),
         seastar::metrics::make_counter("cluster_dtls_cert_reloads", _dtls_cert_reloads,
-            seastar::metrics::description("Total number of certificate hot-reloads"))
+            seastar::metrics::description("Total number of certificate hot-reloads")),
+        // Split-brain detection / Quorum metrics
+        seastar::metrics::make_gauge("cluster_quorum_state", _stats_quorum_state,
+            seastar::metrics::description("Cluster quorum state: 1=healthy (quorum maintained), 0=degraded (quorum lost)")),
+        seastar::metrics::make_counter("cluster_quorum_transitions", _quorum_transitions,
+            seastar::metrics::description("Total number of quorum state transitions (healthy<->degraded)")),
+        seastar::metrics::make_counter("cluster_routes_rejected_degraded", _routes_rejected_degraded,
+            seastar::metrics::description("Total number of route broadcasts rejected due to degraded quorum state"))
     });
 }
 
@@ -279,6 +287,14 @@ void GossipService::set_route_learn_callback(RouteLearnCallback callback) {
 
 seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
     if (!_config.enabled || !_channel || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Split-brain protection: reject new route writes when quorum is lost
+    if (_config.quorum_enabled && _config.reject_routes_on_quorum_loss && is_degraded()) {
+        ++_routes_rejected_degraded;
+        log_gossip.debug("Route broadcast rejected: cluster in DEGRADED mode (no quorum). "
+                        "tokens={}, backend={}", tokens.size(), backend);
         return seastar::make_ready_future<>();
     }
 
@@ -548,6 +564,62 @@ void GossipService::check_liveness() {
     }
 
     _stats_cluster_peers_alive = alive_count;
+
+    // Update quorum state after liveness check
+    if (_config.quorum_enabled) {
+        update_quorum_state();
+    }
+}
+
+size_t GossipService::quorum_required() const {
+    // Quorum = floor(N * threshold) + 1 where N is total peers (including self)
+    // For standard majority (threshold=0.5), this gives N/2+1
+    // Example: 5 nodes (4 peers + self) with threshold=0.5 -> floor(5*0.5)+1 = 3 required
+    size_t total_nodes = _peer_table.size() + 1;  // +1 for self
+    return static_cast<size_t>(std::floor(total_nodes * _config.quorum_threshold)) + 1;
+}
+
+void GossipService::update_quorum_state() {
+    // Only run on shard 0 since it manages the peer table
+    if (seastar::this_shard_id() != 0) {
+        return;
+    }
+
+    size_t total_nodes = _peer_table.size() + 1;  // +1 for self
+    size_t alive_nodes = _stats_cluster_peers_alive + 1;  // +1 for self (we're always alive)
+    size_t required = quorum_required();
+
+    QuorumState new_state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
+
+    // Check for warning threshold: approaching quorum loss
+    if (_config.quorum_warning_threshold > 0 && new_state == QuorumState::HEALTHY) {
+        size_t margin = alive_nodes - required;
+        if (margin <= _config.quorum_warning_threshold) {
+            log_gossip.warn("QUORUM WARNING: Only {} peers alive above quorum threshold "
+                           "(alive={}, required={}, total={}). Cluster at risk of split-brain.",
+                           margin, alive_nodes, required, total_nodes);
+        }
+    }
+
+    // Handle state transitions
+    if (new_state != _quorum_state) {
+        ++_quorum_transitions;
+
+        if (new_state == QuorumState::DEGRADED) {
+            log_gossip.error("QUORUM LOST: Cluster entering DEGRADED mode. "
+                            "Only {}/{} nodes reachable (need {} for quorum). "
+                            "New route writes will be rejected to prevent split-brain divergence.",
+                            alive_nodes, total_nodes, required);
+        } else {
+            log_gossip.info("QUORUM RESTORED: Cluster returning to HEALTHY mode. "
+                           "{}/{} nodes reachable (need {} for quorum). "
+                           "Route writes re-enabled.",
+                           alive_nodes, total_nodes, required);
+        }
+
+        _quorum_state = new_state;
+        _stats_quorum_state = (new_state == QuorumState::HEALTHY) ? 1 : 0;
+    }
 }
 
 std::optional<seastar::socket_address> GossipService::parse_peer_address(const std::string& peer) {

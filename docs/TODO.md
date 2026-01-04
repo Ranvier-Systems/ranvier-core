@@ -71,7 +71,7 @@ Hardening the gossip protocol and cluster coordination for production multi-node
 
 ### 2.1 Network Partition Handling
 
-- [ ] **Implement split-brain detection**
+- [x] **Implement split-brain detection** ✓
   _Justification:_ Current gossip uses timeout-based failure detection only. Nodes cannot distinguish between peer failure and network partition, risking divergent state.
   _Approach:_ Add quorum-aware health checks; require N/2+1 peers visible before accepting new routes.
   _Location:_ `src/gossip_service.cpp:375-403`
@@ -385,7 +385,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 |----------|----------|------|--------|--------|
 | **P0 - Critical** | Security | Non-root container execution | Low | ✅ Done |
 | **P0 - Critical** | Security | mTLS for gossip protocol | High | ✅ Done |
-| **P1 - High** | Reliability | Split-brain detection | High | |
+| **P1 - High** | Reliability | Split-brain detection | High | ✅ Done |
 | **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
 | **P1 - High** | Security | API key rotation | Medium | ✅ Done |
 | **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
@@ -405,6 +405,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-04 | Implement split-brain detection with quorum-aware health checks | - |
 | 2025-01-04 | Add development container (devcontainer) | - |
 | 2025-01-04 | Generate OpenAPI 3.0 specification for HTTP API | - |
 | 2025-01-04 | Implement mTLS/DTLS encryption for gossip protocol (P0 security) | - |
