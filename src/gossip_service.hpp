@@ -231,11 +231,15 @@ public:
     bool is_enabled() const { return _config.enabled; }
 
     // Quorum state accessors for split-brain detection
+    // NOTE: These accessors only return valid data on shard 0.
+    // On other shards, they return initial/stale values.
+    // Use submit_to(0, ...) if you need to query from another shard.
     QuorumState quorum_state() const { return _quorum_state; }
     bool has_quorum() const { return _quorum_state == QuorumState::HEALTHY; }
     bool is_degraded() const { return _quorum_state == QuorumState::DEGRADED; }
 
     // Get quorum status for external queries (e.g., health checks, metrics)
+    // NOTE: Only valid on shard 0 where peer table is maintained.
     size_t quorum_required() const;  // N/2+1
     size_t peers_alive_count() const { return _stats_cluster_peers_alive; }
     size_t total_peers_count() const { return _peer_table.size(); }
@@ -274,6 +278,7 @@ private:
     uint64_t _stats_quorum_state = 1;  // 1=healthy, 0=degraded (for Prometheus gauge)
     uint64_t _quorum_transitions = 0;  // Count of state transitions
     uint64_t _routes_rejected_degraded = 0;  // Routes rejected due to degraded state
+    bool _quorum_warning_active = false;  // Track if we've already logged a warning (rate limiting)
 
     // Reliable delivery metrics
     uint64_t _acks_sent = 0;

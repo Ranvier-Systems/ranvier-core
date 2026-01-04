@@ -168,12 +168,35 @@ TEST_F(QuorumTest, Threshold_Zero) {
 TEST_F(QuorumTest, Threshold_One) {
     // threshold=1.0 means all nodes required
     // 5 nodes: Required = floor(5 * 1.0) + 1 = 5 + 1 = 6
-    // Wait, that's more than total nodes! This is a pathological case.
-    // In practice, threshold should be < 1.0
+    // This exceeds total nodes, which is a pathological case.
+    // The raw calculation returns 6:
     size_t required = calculate_quorum_required(4, 1.0);
     EXPECT_EQ(required, 6u);
     // With all peers alive, we have 5 nodes but need 6 -> DEGRADED
     EXPECT_EQ(calculate_quorum_state(4, 4, 1.0), QuorumState::DEGRADED);
+}
+
+TEST_F(QuorumTest, Threshold_One_WithCapping) {
+    // In the actual implementation, quorum_required is capped at total_nodes
+    // to prevent impossible requirements. This simulates that behavior:
+    auto calculate_capped_quorum_state = [](size_t alive_peers, size_t total_peers, double threshold) {
+        size_t total_nodes = total_peers + 1;
+        size_t alive_nodes = alive_peers + 1;
+        size_t required = calculate_quorum_required(total_peers, threshold);
+        // Cap at total_nodes (implementation detail from update_quorum_state)
+        if (required > total_nodes) {
+            required = total_nodes;
+        }
+        return (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
+    };
+
+    // With capping, threshold=1.0 with all nodes alive should be HEALTHY
+    // 5 nodes, need min(6, 5) = 5, have 5 -> HEALTHY
+    EXPECT_EQ(calculate_capped_quorum_state(4, 4, 1.0), QuorumState::HEALTHY);
+
+    // But if one node is down, still DEGRADED
+    // 5 nodes, need 5, have 4 -> DEGRADED
+    EXPECT_EQ(calculate_capped_quorum_state(3, 4, 1.0), QuorumState::DEGRADED);
 }
 
 // =============================================================================
@@ -229,6 +252,67 @@ TEST_F(QuorumTest, WarningThreshold_NotTriggeredWhenDegraded) {
     // When already degraded, don't trigger warning (only warn when healthy)
     // 5 nodes, 1 alive -> state = DEGRADED, no warning
     EXPECT_FALSE(should_warn_quorum_loss(1, 4, 0.5, 5));
+}
+
+// =============================================================================
+// Warning Rate Limiting Tests (simulated logic)
+// =============================================================================
+// Note: The actual implementation in GossipService tracks _quorum_warning_active
+// to avoid log spam. These tests verify the triggering logic, not the rate limiting.
+// Full rate limiting behavior is tested via integration tests.
+
+TEST_F(QuorumTest, WarningRateLimiting_EnterWarningZone) {
+    // Simulates the state machine for warning rate limiting
+    struct WarningState {
+        bool warning_active = false;
+
+        // Returns true if a warning should be logged (entering warning zone)
+        bool check_and_update(size_t alive_peers, size_t total_peers,
+                              double threshold, uint32_t warning_threshold) {
+            size_t alive_nodes = alive_peers + 1;
+            size_t required = calculate_quorum_required(total_peers, threshold);
+            QuorumState state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
+
+            if (state == QuorumState::DEGRADED) {
+                warning_active = false;
+                return false;
+            }
+
+            size_t margin = alive_nodes - required;
+            bool should_warn = (warning_threshold > 0) && (margin <= warning_threshold);
+
+            if (should_warn && !warning_active) {
+                warning_active = true;
+                return true;  // Log warning
+            } else if (!should_warn && warning_active) {
+                warning_active = false;
+                return false;  // Log "warning cleared" (separate path)
+            }
+            return false;  // No change, no log
+        }
+    };
+
+    WarningState state;
+
+    // Initial state: 5 nodes, all alive, margin = 2, no warning
+    EXPECT_FALSE(state.check_and_update(4, 4, 0.5, 1));
+    EXPECT_FALSE(state.warning_active);
+
+    // One peer dies: margin = 1, enters warning zone
+    EXPECT_TRUE(state.check_and_update(3, 4, 0.5, 1));
+    EXPECT_TRUE(state.warning_active);
+
+    // Still at margin = 1, already in warning zone, no new log
+    EXPECT_FALSE(state.check_and_update(3, 4, 0.5, 1));
+    EXPECT_TRUE(state.warning_active);
+
+    // Peer recovers: margin = 2, exits warning zone
+    EXPECT_FALSE(state.check_and_update(4, 4, 0.5, 1));
+    EXPECT_FALSE(state.warning_active);
+
+    // Another peer dies and we enter warning zone again
+    EXPECT_TRUE(state.check_and_update(3, 4, 0.5, 1));
+    EXPECT_TRUE(state.warning_active);
 }
 
 int main(int argc, char** argv) {

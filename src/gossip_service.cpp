@@ -144,6 +144,35 @@ seastar::future<> GossipService::start() {
             _peer_table[addr] = { seastar::lowres_clock::now(), true };
         }
 
+        // Initialize alive count (all peers start alive)
+        _stats_cluster_peers_alive = _peer_table.size();
+
+        // Calculate initial quorum state
+        // At startup, all configured peers are assumed alive
+        if (_config.quorum_enabled) {
+            size_t total_nodes = _peer_table.size() + 1;  // +1 for self
+            size_t required = quorum_required();
+            // Cap required at total_nodes for edge cases like threshold=1.0
+            if (required > total_nodes) {
+                required = total_nodes;
+            }
+            size_t alive_nodes = _stats_cluster_peers_alive + 1;  // +1 for self
+
+            if (alive_nodes >= required) {
+                _quorum_state = QuorumState::HEALTHY;
+                _stats_quorum_state = 1;
+                log_gossip.info("Quorum initialized: HEALTHY (alive={}, required={}, total={})",
+                               alive_nodes, required, total_nodes);
+            } else {
+                // This can happen if no peers are configured
+                _quorum_state = QuorumState::DEGRADED;
+                _stats_quorum_state = 0;
+                log_gossip.warn("Quorum initialized: DEGRADED - insufficient peers "
+                               "(alive={}, required={}, total={})",
+                               alive_nodes, required, total_nodes);
+            }
+        }
+
         // Initialize DTLS if enabled
         if (_config.tls.enabled) {
             co_await initialize_dtls();
@@ -589,16 +618,36 @@ void GossipService::update_quorum_state() {
     size_t alive_nodes = _stats_cluster_peers_alive + 1;  // +1 for self (we're always alive)
     size_t required = quorum_required();
 
+    // Handle edge case: if required > total_nodes (e.g., threshold=1.0), cap it
+    // This prevents impossible quorum requirements
+    if (required > total_nodes) {
+        required = total_nodes;
+    }
+
     QuorumState new_state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
 
     // Check for warning threshold: approaching quorum loss
+    // Rate-limited: only log when entering warning zone, not every check
     if (_config.quorum_warning_threshold > 0 && new_state == QuorumState::HEALTHY) {
         size_t margin = alive_nodes - required;
-        if (margin <= _config.quorum_warning_threshold) {
-            log_gossip.warn("QUORUM WARNING: Only {} peers alive above quorum threshold "
+        bool should_warn = margin <= _config.quorum_warning_threshold;
+
+        if (should_warn && !_quorum_warning_active) {
+            // Entering warning zone
+            _quorum_warning_active = true;
+            log_gossip.warn("QUORUM WARNING: Only {} node(s) above quorum threshold "
                            "(alive={}, required={}, total={}). Cluster at risk of split-brain.",
                            margin, alive_nodes, required, total_nodes);
+        } else if (!should_warn && _quorum_warning_active) {
+            // Exiting warning zone (recovered)
+            _quorum_warning_active = false;
+            log_gossip.info("QUORUM WARNING CLEARED: Cluster has sufficient margin "
+                           "(alive={}, required={}, total={}).",
+                           alive_nodes, required, total_nodes);
         }
+    } else if (new_state == QuorumState::DEGRADED) {
+        // Reset warning flag when entering degraded mode
+        _quorum_warning_active = false;
     }
 
     // Handle state transitions
