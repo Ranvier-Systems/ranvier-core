@@ -224,7 +224,7 @@ Hardening for production deployment environments.
 
 ### 4.2 Transport Security
 
-- [ ] **Implement mTLS between Ranvier nodes**
+- [x] **Implement mTLS between Ranvier nodes** ✓
   _Justification:_ Gossip protocol uses plaintext UDP. Enables route table poisoning and cluster hijacking.
   _Approach:_ Add DTLS encryption for gossip channel.
   _Location:_ `src/gossip_service.cpp`
@@ -367,7 +367,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `CMakeLists.txt`
   _Complexity:_ High
 
-- [ ] **Add pre-built Docker images to container registry**
+- [x] **Add pre-built Docker images to container registry** ✓
   _Justification:_ Users must build from source. Publish to Docker Hub/GHCR for easy deployment.
   _Location:_ `.github/workflows/`, `Dockerfile.production`
   _Complexity:_ Low
@@ -384,7 +384,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | Priority | Category | Item | Effort | Status |
 |----------|----------|------|--------|--------|
 | **P0 - Critical** | Security | Non-root container execution | Low | ✅ Done |
-| **P0 - Critical** | Security | mTLS for gossip protocol | High | |
+| **P0 - Critical** | Security | mTLS for gossip protocol | High | ✅ Done |
 | **P1 - High** | Reliability | Split-brain detection | High | |
 | **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
 | **P1 - High** | Security | API key rotation | Medium | ✅ Done |
@@ -395,7 +395,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
 | **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
 | **P3 - Low** | DX | OpenAPI specification | Low | |
-| **P3 - Low** | DX | Pre-built Docker images | Low | |
+| **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
 
 ---
 
@@ -405,6 +405,8 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-04 | Implement mTLS/DTLS encryption for gossip protocol (P0 security) | - |
+| 2025-01-04 | Add pre-built Docker images to GHCR | - |
 | 2025-01-03 | Create Helm chart for Kubernetes deployment | - |
 | 2025-01-03 | API key rotation mechanism with expiry and hot-reload | - |
 | 2025-01-03 | Add cache hit/miss ratio gauge (Prometheus) | - |
