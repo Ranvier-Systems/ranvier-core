@@ -1,0 +1,893 @@
+openapi: 3.0.3
+info:
+  title: Ranvier Core API
+  description: |
+    Ranvier Core is a high-performance LLM routing proxy that provides intelligent
+    KV-cache-aware routing to GPU backends. It consists of a Data Plane for forwarding
+    LLM inference requests and a Control Plane for backend and route management.
+
+    ## Authentication
+
+    Control plane endpoints (`/admin/*`) require Bearer token authentication.
+    Configure API keys via the `auth.api_keys` configuration or legacy `auth.admin_api_key`.
+
+    ## Rate Limiting
+
+    The data plane endpoint (`/v1/chat/completions`) supports optional rate limiting
+    based on client IP using a token bucket algorithm. Configure via `rate_limit.*` settings.
+
+    ## Ports
+
+    - **API Server**: Port 8080 (default, configurable via `server.api_port`)
+    - **Metrics Server**: Port 9180 (separate Prometheus endpoint)
+  version: 1.0.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  contact:
+    name: Ranvier Systems
+    url: https://github.com/Ranvier-Systems/ranvier-core
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://{host}:{port}
+    description: Production server
+    variables:
+      host:
+        default: ranvier.example.com
+        description: Server hostname
+      port:
+        default: "8080"
+        description: API server port
+
+tags:
+  - name: Data Plane
+    description: LLM inference request routing
+  - name: Control Plane
+    description: Backend and route management (requires authentication)
+  - name: Metrics
+    description: Prometheus metrics (served on separate port 9180)
+
+paths:
+  /v1/chat/completions:
+    post:
+      summary: Chat Completions
+      description: |
+        Proxies chat completion requests to backend LLM servers with intelligent routing.
+
+        **Routing Logic:**
+        1. Tokenize request body (or use client-provided `prompt_token_ids`)
+        2. Look up longest prefix match in routing table
+        3. If hit → route to matched backend (KV cache affinity)
+        4. If miss → route to random healthy backend
+        5. On success → learn route for future requests
+
+        **Streaming:**
+        Responses are streamed using Server-Sent Events (SSE) format.
+
+        **Rate Limiting:**
+        When enabled, requests are rate-limited per client IP using a token bucket algorithm.
+      tags:
+        - Data Plane
+      operationId: chatCompletions
+      parameters:
+        - name: X-Request-ID
+          in: header
+          description: Request correlation ID (auto-generated if not provided)
+          required: false
+          schema:
+            type: string
+            format: uuid
+            example: "550e8400-e29b-41d4-a716-446655440000"
+        - name: traceparent
+          in: header
+          description: W3C Trace Context header for distributed tracing
+          required: false
+          schema:
+            type: string
+            example: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        - name: X-Forwarded-For
+          in: header
+          description: Client IP address (used for rate limiting when behind a proxy)
+          required: false
+          schema:
+            type: string
+            example: "192.168.1.100"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+            examples:
+              basic:
+                summary: Basic chat request
+                value:
+                  model: "llama2"
+                  messages:
+                    - role: "user"
+                      content: "Hello, how are you?"
+                  stream: true
+              withSystemPrompt:
+                summary: Chat with system prompt
+                value:
+                  model: "llama2"
+                  messages:
+                    - role: "system"
+                      content: "You are a helpful assistant."
+                    - role: "user"
+                      content: "What is the capital of France?"
+                  stream: true
+                  temperature: 0.7
+                  max_tokens: 1024
+              withTokenIds:
+                summary: Chat with pre-tokenized input
+                value:
+                  model: "llama2"
+                  prompt_token_ids:
+                    - 1
+                    - 15043
+                    - 29892
+                    - 920
+                    - 526
+                    - 366
+                  stream: true
+      responses:
+        '200':
+          description: Streaming chat completion response
+          headers:
+            X-Request-ID:
+              description: Request correlation ID
+              schema:
+                type: string
+            X-Backend-ID:
+              description: ID of the backend that processed the request
+              schema:
+                type: integer
+            Content-Type:
+              description: Response content type
+              schema:
+                type: string
+                enum:
+                  - text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Server-Sent Events stream with JSON data payloads
+              example: |
+                data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hello"}}]}
+
+                data: {"id":"chatcmpl-123","object":"chat.completion.chunk","choices":[{"delta":{"content":"!"}}]}
+
+                data: [DONE]
+        '400':
+          description: Bad request (invalid parameters or token IDs)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidTokens:
+                  summary: Invalid token IDs
+                  value:
+                    error: "Invalid prompt_token_ids: token 999999 exceeds max_token_id 100000"
+        '429':
+          description: Rate limit exceeded
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+                example: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Rate limit exceeded - try again later"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Tokenizer not loaded"
+        '503':
+          description: Service unavailable (no backends, circuit breaker open, or server draining)
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+                example: 5
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                noBackends:
+                  summary: No backends registered
+                  value:
+                    error: "No backends registered!"
+                circuitBreaker:
+                  summary: Circuit breaker open
+                  value:
+                    error: "All backends unavailable (circuit breaker open)"
+                connectionFailed:
+                  summary: Backend connection failed
+                  value:
+                    error: "Backend connection failed after retries"
+                draining:
+                  summary: Server shutting down
+                  value:
+                    error: "Server is shutting down"
+        '504':
+          description: Gateway timeout
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Request timed out"
+
+  /admin/backends:
+    post:
+      summary: Register Backend
+      description: |
+        Register a new GPU backend server with the router.
+
+        Backends are identified by a unique integer ID and include connection
+        details (IP and port). Optional weight and priority parameters enable
+        weighted load balancing and priority-based routing.
+      tags:
+        - Control Plane
+      operationId: registerBackend
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: query
+          description: Unique backend identifier
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+            example: 1
+        - name: ip
+          in: query
+          description: Backend server IPv4 address
+          required: true
+          schema:
+            type: string
+            format: ipv4
+            example: "192.168.1.100"
+        - name: port
+          in: query
+          description: Backend server port
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 65535
+            example: 8000
+        - name: weight
+          in: query
+          description: Load balancing weight (higher = more traffic)
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 100
+            example: 100
+        - name: priority
+          in: query
+          description: Routing priority (lower = higher priority)
+          required: false
+          schema:
+            type: integer
+            default: 0
+            example: 0
+      responses:
+        '200':
+          description: Backend registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendRegistrationResponse'
+              example:
+                status: "ok"
+                weight: 100
+                priority: 0
+        '400':
+          description: Bad request (missing or invalid parameters)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingParams:
+                  summary: Missing required parameters
+                  value:
+                    error: "Missing id, ip, or port"
+                invalidParams:
+                  summary: Invalid parameter values
+                  value:
+                    error: "Invalid parameter: id, port, weight, and priority must be valid integers"
+                invalidIP:
+                  summary: Invalid IP address
+                  value:
+                    error: "Invalid IP address format"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      summary: Delete Backend
+      description: |
+        Remove a backend server and all its associated routes from the router.
+
+        This operation removes the backend from the health check pool and
+        deletes all learned routes pointing to this backend.
+      tags:
+        - Control Plane
+      operationId: deleteBackend
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: query
+          description: Backend ID to delete
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+            example: 1
+      responses:
+        '200':
+          description: Backend deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackendDeletionResponse'
+              example:
+                status: "ok"
+                backend_deleted: 1
+        '400':
+          description: Bad request (missing or invalid ID)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingId:
+                  summary: Missing ID parameter
+                  value:
+                    error: "Missing id parameter"
+                invalidId:
+                  summary: Invalid ID format
+                  value:
+                    error: "Invalid id: must be a valid integer"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/routes:
+    post:
+      summary: Register Route
+      description: |
+        Manually add a route (prefix → backend mapping) to the routing table.
+
+        The request body contains text content that will be tokenized and
+        used as the route prefix. Future requests with matching token prefixes
+        will be routed to the specified backend for KV cache affinity.
+      tags:
+        - Control Plane
+      operationId: registerRoute
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: backend_id
+          in: query
+          description: Target backend ID for this route
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+            example: 1
+      requestBody:
+        required: true
+        description: Text content to tokenize and use as route prefix
+        content:
+          text/plain:
+            schema:
+              type: string
+            example: "System prompt for my assistant..."
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Route registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteRegistrationResponse'
+              example:
+                status: "ok"
+                route_added: 1
+        '400':
+          description: Bad request (missing backend_id or tokenization failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingBackendId:
+                  summary: Missing backend_id parameter
+                  value:
+                    error: "Missing backend_id"
+                invalidBackendId:
+                  summary: Invalid backend_id format
+                  value:
+                    error: "Invalid backend_id: must be a valid integer"
+                tokenizationFailed:
+                  summary: Tokenization error
+                  value:
+                    error: "Failed to tokenize request content"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      summary: Delete Routes
+      description: |
+        Remove all routes for a specific backend.
+
+        This clears all learned prefix → backend mappings for the specified
+        backend ID. Note that in-memory routes will only be fully cleared
+        after a restart.
+      tags:
+        - Control Plane
+      operationId: deleteRoutes
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: backend_id
+          in: query
+          description: Backend ID whose routes to remove
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+            example: 1
+      responses:
+        '200':
+          description: Routes deleted successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteDeletionResponse'
+              example:
+                status: "ok"
+                routes_deleted_for_backend: 1
+                note: "In-memory routes will be cleared on restart"
+        '400':
+          description: Bad request (missing or invalid backend_id)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingBackendId:
+                  summary: Missing backend_id parameter
+                  value:
+                    error: "Missing backend_id parameter"
+                invalidBackendId:
+                  summary: Invalid backend_id format
+                  value:
+                    error: "Invalid backend_id: must be a valid integer"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/clear:
+    post:
+      summary: Clear All Data
+      description: |
+        **DESTRUCTIVE OPERATION**: Clear all persisted data including backends and routes.
+
+        This operation clears all persistence storage. A server restart is required
+        to fully clear in-memory state.
+      tags:
+        - Control Plane
+      operationId: clearAll
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Data cleared successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearResponse'
+              example:
+                status: "ok"
+                warning: "All persisted data cleared. Restart to clear in-memory state."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          description: Failed to clear persistence data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Failed to clear persistence data"
+
+  /admin/keys/reload:
+    post:
+      summary: Reload API Keys
+      description: |
+        Trigger an asynchronous reload of the API key configuration.
+
+        This allows hot-reloading of API keys without restarting the server.
+        The response includes the current key count and status of each key.
+      tags:
+        - Control Plane
+      operationId: reloadApiKeys
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Key reload triggered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyReloadResponse'
+              example:
+                status: "reload_triggered"
+                message: "Configuration reload initiated"
+                current_key_count: 2
+                current_keys:
+                  - name: "production-key"
+                    expired: false
+                  - name: "staging-key"
+                    expired: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          description: Config reload not available or failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                notAvailable:
+                  summary: Config reload not available
+                  value:
+                    error: "Config reload not available"
+                failed:
+                  summary: Failed to trigger reload
+                  value:
+                    error: "Failed to trigger config reload"
+
+  /metrics:
+    get:
+      summary: Prometheus Metrics
+      description: |
+        Prometheus metrics endpoint. **Note:** This endpoint is served on a separate
+        port (default 9180) from the main API server.
+
+        **Key Metrics:**
+        - `ranvier_router_cache_hits` - Prefix cache hits (counter)
+        - `ranvier_router_cache_misses` - Prefix cache misses (counter)
+        - `ranvier_requests_total` - Total requests processed (counter)
+        - `ranvier_request_duration_seconds` - Request latency histogram
+        - `ranvier_backends_healthy` - Number of healthy backends (gauge)
+      tags:
+        - Metrics
+      operationId: getMetrics
+      servers:
+        - url: http://localhost:9180
+          description: Metrics server (default port)
+      responses:
+        '200':
+          description: Prometheus metrics in text format
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP ranvier_router_cache_hits Total prefix cache hits
+                # TYPE ranvier_router_cache_hits counter
+                ranvier_router_cache_hits 1234
+                # HELP ranvier_router_cache_misses Total prefix cache misses
+                # TYPE ranvier_router_cache_misses counter
+                ranvier_router_cache_misses 567
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        API key authentication for control plane endpoints.
+
+        Configure keys via `auth.api_keys` in the configuration file:
+        ```yaml
+        auth:
+          api_keys:
+            - key: "rnv_prod_..."
+              name: "production-key"
+              created: "2025-01-01"
+              expires: "2025-12-31"
+        ```
+
+  schemas:
+    ChatCompletionRequest:
+      type: object
+      description: OpenAI-compatible chat completion request
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          description: Model identifier
+          example: "llama2"
+        messages:
+          type: array
+          description: Chat messages (required unless prompt_token_ids is provided)
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        prompt_token_ids:
+          type: array
+          description: |
+            Pre-tokenized prompt token IDs (optional, requires `accept_client_tokens: true` in config).
+            If provided, bypasses server-side tokenization.
+          items:
+            type: integer
+          example: [1, 15043, 29892, 920, 526, 366]
+        stream:
+          type: boolean
+          description: Whether to stream the response
+          default: true
+          example: true
+        temperature:
+          type: number
+          description: Sampling temperature (0.0 to 2.0)
+          minimum: 0
+          maximum: 2
+          example: 0.7
+        max_tokens:
+          type: integer
+          description: Maximum tokens to generate
+          minimum: 1
+          example: 1024
+        top_p:
+          type: number
+          description: Nucleus sampling probability
+          minimum: 0
+          maximum: 1
+          example: 0.95
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+          description: Stop sequences
+          example: ["\n\n", "END"]
+        presence_penalty:
+          type: number
+          description: Presence penalty (-2.0 to 2.0)
+          minimum: -2
+          maximum: 2
+          example: 0
+        frequency_penalty:
+          type: number
+          description: Frequency penalty (-2.0 to 2.0)
+          minimum: -2
+          maximum: 2
+          example: 0
+
+    ChatMessage:
+      type: object
+      description: A single chat message
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          description: Message role
+          enum:
+            - system
+            - user
+            - assistant
+          example: "user"
+        content:
+          type: string
+          description: Message content
+          example: "Hello, how are you?"
+
+    ErrorResponse:
+      type: object
+      description: Error response
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+          example: "No backends registered!"
+        warning:
+          type: string
+          description: Optional warning message
+        note:
+          type: string
+          description: Optional additional note
+
+    BackendRegistrationResponse:
+      type: object
+      description: Response for successful backend registration
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          example: "ok"
+        weight:
+          type: integer
+          description: Configured weight for load balancing
+          example: 100
+        priority:
+          type: integer
+          description: Configured priority value
+          example: 0
+
+    BackendDeletionResponse:
+      type: object
+      description: Response for successful backend deletion
+      required:
+        - status
+        - backend_deleted
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          example: "ok"
+        backend_deleted:
+          type: integer
+          description: ID of the deleted backend
+          example: 1
+
+    RouteRegistrationResponse:
+      type: object
+      description: Response for successful route registration
+      required:
+        - status
+        - route_added
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          example: "ok"
+        route_added:
+          type: integer
+          description: Backend ID the route was added for
+          example: 1
+
+    RouteDeletionResponse:
+      type: object
+      description: Response for successful route deletion
+      required:
+        - status
+        - routes_deleted_for_backend
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          example: "ok"
+        routes_deleted_for_backend:
+          type: integer
+          description: Backend ID whose routes were deleted
+          example: 1
+        note:
+          type: string
+          description: Additional information
+          example: "In-memory routes will be cleared on restart"
+
+    ClearResponse:
+      type: object
+      description: Response for successful clear operation
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+          example: "ok"
+        warning:
+          type: string
+          description: Warning about operation implications
+          example: "All persisted data cleared. Restart to clear in-memory state."
+
+    KeyReloadResponse:
+      type: object
+      description: Response for API key reload operation
+      required:
+        - status
+        - message
+        - current_key_count
+      properties:
+        status:
+          type: string
+          enum:
+            - reload_triggered
+          example: "reload_triggered"
+        message:
+          type: string
+          description: Status message
+          example: "Configuration reload initiated"
+        current_key_count:
+          type: integer
+          description: Number of currently configured API keys
+          example: 2
+        current_keys:
+          type: array
+          description: List of current API keys with their status
+          items:
+            $ref: '#/components/schemas/ApiKeyStatus'
+
+    ApiKeyStatus:
+      type: object
+      description: Status information for an API key
+      required:
+        - name
+        - expired
+      properties:
+        name:
+          type: string
+          description: Human-readable key name
+          example: "production-key"
+        expired:
+          type: boolean
+          description: Whether the key has expired
+          example: false
+
+  responses:
+    Unauthorized:
+      description: Authentication required or failed
+      headers:
+        WWW-Authenticate:
+          description: Authentication scheme required
+          schema:
+            type: string
+            example: "Bearer"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            missingHeader:
+              summary: Missing Authorization header
+              value:
+                error: "Unauthorized - missing Authorization header"
+            invalidFormat:
+              summary: Invalid Authorization format
+              value:
+                error: "Unauthorized - invalid Authorization format"
+            invalidKey:
+              summary: Invalid API key
+              value:
+                error: "Unauthorized - invalid API key"
+            expiredKey:
+              summary: Expired API key
+              value:
+                error: "Unauthorized - API key has expired"
