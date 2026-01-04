@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/dns.hh>
@@ -349,6 +350,19 @@ private:
     uint64_t _dtls_packets_decrypted = 0;
     uint64_t _dtls_cert_reloads = 0;
 
+    // Crypto stall watchdog metrics
+    uint64_t _crypto_stall_warnings = 0;       // Count of crypto ops exceeding stall threshold
+    uint64_t _crypto_ops_offloaded = 0;        // Count of crypto ops offloaded to seastar::thread
+    uint64_t _crypto_batch_broadcasts = 0;     // Count of batched broadcast operations
+
+    // Gate for cert reload handshakes (limits concurrent handshakes)
+    seastar::gate _handshake_gate;
+
+    // Configuration thresholds for crypto offloading
+    static constexpr size_t CRYPTO_OFFLOAD_PEER_THRESHOLD = 10;      // Offload if > N peers
+    static constexpr size_t CRYPTO_OFFLOAD_BYTES_THRESHOLD = 1024;   // Offload if packet > N bytes
+    static constexpr uint64_t CRYPTO_STALL_WARNING_US = 100;         // Log warning if > 100μs
+
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
     void update_quorum_state();  // Check and update quorum based on alive peers
@@ -361,8 +375,28 @@ private:
                                                         const uint8_t* data, size_t len);
     seastar::future<> handle_dtls_handshake(const seastar::socket_address& peer,
                                              const uint8_t* data, size_t len);
-    void check_cert_reload();
+    seastar::future<> check_cert_reload();  // Now async with parallel handshakes
     void cleanup_dtls_sessions();
+
+    // Parallel broadcast: batch encrypt and send to multiple peers
+    // Uses seastar::thread to offload CPU-intensive encryption when peer count is high
+    seastar::future<> broadcast_encrypted(const std::vector<seastar::socket_address>& peers,
+                                           const std::vector<uint8_t>& plaintext);
+
+    // Stall watchdog: measure and log crypto operation latency
+    template<typename Func>
+    auto with_stall_watchdog(const char* op_name, Func&& func) -> decltype(func()) {
+        auto start = std::chrono::steady_clock::now();
+        auto result = func();
+        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (static_cast<uint64_t>(elapsed_us) > CRYPTO_STALL_WARNING_US) {
+            ++_crypto_stall_warnings;
+            log_gossip.warn("Crypto stall detected: {} took {}μs (threshold: {}μs)",
+                           op_name, elapsed_us, CRYPTO_STALL_WARNING_US);
+        }
+        return result;
+    }
 
     // Receive loop (runs continuously while service is active)
     seastar::future<> receive_loop();

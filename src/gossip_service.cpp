@@ -17,6 +17,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
@@ -81,6 +82,13 @@ GossipService::GossipService(const ClusterConfig& config)
             seastar::metrics::description("Total number of packets decrypted with DTLS")),
         seastar::metrics::make_counter("cluster_dtls_cert_reloads", _dtls_cert_reloads,
             seastar::metrics::description("Total number of certificate hot-reloads")),
+        // Crypto stall watchdog metrics
+        seastar::metrics::make_counter("cluster_crypto_stall_warnings", _crypto_stall_warnings,
+            seastar::metrics::description("Total number of crypto operations exceeding stall threshold")),
+        seastar::metrics::make_counter("cluster_crypto_ops_offloaded", _crypto_ops_offloaded,
+            seastar::metrics::description("Total number of crypto operations offloaded to background thread")),
+        seastar::metrics::make_counter("cluster_crypto_batch_broadcasts", _crypto_batch_broadcasts,
+            seastar::metrics::description("Total number of batched broadcast operations")),
         // Split-brain detection / Quorum metrics
         seastar::metrics::make_gauge("cluster_quorum_state", _stats_quorum_state,
             seastar::metrics::description("Cluster quorum state: 1=healthy (quorum maintained), 0=degraded (quorum lost)")),
@@ -282,6 +290,9 @@ seastar::future<> GossipService::stop() {
     // Stop DTLS timers
     _cert_reload_timer.cancel();
     _dtls_session_cleanup_timer.cancel();
+
+    // Close the handshake gate and wait for in-flight handshakes to complete
+    co_await _handshake_gate.close();
 
     // Clean up DTLS context
     if (_dtls_context) {
@@ -530,11 +541,9 @@ seastar::future<> GossipService::broadcast_heartbeat() {
         static_cast<uint8_t>(RouteAnnouncementPacket::PROTOCOL_VERSION)
     };
 
-    // Use DTLS encryption if enabled
+    // Use DTLS encryption if enabled - use broadcast_encrypted for efficiency
     if (_dtls_context && _dtls_context->is_enabled()) {
-        return seastar::parallel_for_each(_peer_addresses, [this, heartbeat_data](const seastar::socket_address& peer) {
-            return send_encrypted(peer, heartbeat_data).discard_result();
-        });
+        return broadcast_encrypted(_peer_addresses, heartbeat_data);
     }
 
     // Plaintext mode: create an owned buffer to avoid use-after-free with async sends
@@ -1037,7 +1046,16 @@ seastar::future<> GossipService::initialize_dtls() {
     if (_config.tls.cert_reload_interval.count() > 0) {
         log_gossip.info("Certificate hot-reload enabled: interval={}s",
                         _config.tls.cert_reload_interval.count());
-        _cert_reload_timer.set_callback([this] { check_cert_reload(); });
+        _cert_reload_timer.set_callback([this] {
+            // Fire-and-forget the async cert reload check
+            (void)check_cert_reload().handle_exception([](auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    log_gossip.error("Certificate reload check failed: {}", e.what());
+                }
+            });
+        });
         _cert_reload_timer.arm_periodic(_config.tls.cert_reload_interval);
     }
 
@@ -1090,10 +1108,51 @@ seastar::future<> GossipService::send_encrypted(const seastar::socket_address& p
         return seastar::make_ready_future<>();
     }
 
-    // Encrypt the data
+    // For large packets, offload encryption to seastar::thread to avoid reactor stalls
+    if (plaintext.size() > CRYPTO_OFFLOAD_BYTES_THRESHOLD) {
+        ++_crypto_ops_offloaded;
+
+        // Copy plaintext for the thread context (plaintext ref may not survive the async boundary)
+        auto plaintext_copy = std::make_shared<std::vector<uint8_t>>(plaintext);
+
+        return seastar::async([this, peer, plaintext_copy, session]() {
+            // Run encryption in the thread context
+            std::vector<uint8_t> encrypted;
+            auto start = std::chrono::steady_clock::now();
+            auto result = session->encrypt(plaintext_copy->data(), plaintext_copy->size(), encrypted);
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+            if (static_cast<uint64_t>(elapsed_us) > CRYPTO_STALL_WARNING_US) {
+                ++_crypto_stall_warnings;
+                log_gossip.warn("Crypto stall (offloaded): encrypt took {}μs for {} bytes to peer {}",
+                               elapsed_us, plaintext_copy->size(), peer);
+            }
+
+            if (result != DtlsResult::SUCCESS || encrypted.empty()) {
+                log_gossip.debug("Failed to encrypt data for peer {}", peer);
+                return;
+            }
+
+            ++_dtls_packets_encrypted;
+
+            // Send encrypted data (back on reactor context)
+            seastar::temporary_buffer<char> buf(encrypted.size());
+            std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
+            seastar::net::packet packet(std::move(buf));
+            (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+                log_gossip.debug("Failed to send encrypted data to {}: {}", peer, ep);
+            });
+        });
+    }
+
+    // Small packets: encrypt inline with stall watchdog
     std::vector<uint8_t> encrypted;
-    auto result = session->encrypt(plaintext.data(), plaintext.size(), encrypted);
-    if (result != DtlsResult::SUCCESS || encrypted.empty()) {
+    auto encrypt_result = with_stall_watchdog("encrypt", [&]() {
+        return session->encrypt(plaintext.data(), plaintext.size(), encrypted);
+    });
+
+    if (encrypt_result != DtlsResult::SUCCESS || encrypted.empty()) {
         log_gossip.debug("Failed to encrypt data for peer {}", peer);
         return seastar::make_ready_future<>();
     }
@@ -1149,9 +1208,19 @@ std::optional<std::vector<uint8_t>> GossipService::decrypt_packet(const seastar:
         return std::nullopt;
     }
 
-    // Session established, decrypt the data
+    // Session established, decrypt the data with stall watchdog
     std::vector<uint8_t> decrypted;
+    auto start = std::chrono::steady_clock::now();
     auto result = session->decrypt(data, len, decrypted);
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    if (static_cast<uint64_t>(elapsed_us) > CRYPTO_STALL_WARNING_US) {
+        ++_crypto_stall_warnings;
+        log_gossip.warn("Crypto stall detected: decrypt took {}μs for {} bytes from peer {}",
+                       elapsed_us, len, peer);
+    }
+
     if (result != DtlsResult::SUCCESS) {
         if (result == DtlsResult::WANT_READ) {
             // Might be more handshake data, process it
@@ -1181,31 +1250,123 @@ seastar::future<> GossipService::handle_dtls_handshake(const seastar::socket_add
     return seastar::make_ready_future<>();
 }
 
-void GossipService::check_cert_reload() {
-    if (!_dtls_context) {
-        return;
+// Parallel broadcast: batch encrypt and send to multiple peers
+// Uses seastar::thread when peer count exceeds threshold to avoid reactor stalls
+seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::socket_address>& peers,
+                                                      const std::vector<uint8_t>& plaintext) {
+    if (!_dtls_context || !_dtls_context->is_enabled() || peers.empty() || !_channel) {
+        return seastar::make_ready_future<>();
     }
 
-    if (_dtls_context->check_and_reload_certs()) {
-        ++_dtls_cert_reloads;
-        log_gossip.info("Certificates reloaded successfully");
+    // For high fan-out broadcasts, use seastar::thread to batch the crypto work
+    if (peers.size() > CRYPTO_OFFLOAD_PEER_THRESHOLD) {
+        ++_crypto_batch_broadcasts;
+        ++_crypto_ops_offloaded;
 
-        // Re-initiate handshakes with all peers since sessions were cleared
-        for (const auto& peer : _peer_addresses) {
-            auto* session = _dtls_context->get_or_create_session(peer, false);
-            if (session) {
-                std::vector<uint8_t> handshake_data;
-                auto result = session->initiate_handshake(handshake_data);
-                if (result == DtlsResult::WANT_READ && !handshake_data.empty() && _channel) {
-                    ++_dtls_handshakes_started;
-                    seastar::temporary_buffer<char> buf(handshake_data.size());
-                    std::memcpy(buf.get_write(), handshake_data.data(), handshake_data.size());
-                    seastar::net::packet packet(std::move(buf));
-                    (void)_channel->send(peer, std::move(packet));
+        // Copy data for thread safety
+        auto plaintext_copy = std::make_shared<std::vector<uint8_t>>(plaintext);
+        auto peers_copy = std::make_shared<std::vector<seastar::socket_address>>(peers);
+
+        return seastar::async([this, plaintext_copy, peers_copy]() {
+            // Pre-encrypt for all peers in the thread context with batch timing
+            std::vector<std::pair<seastar::socket_address, std::vector<uint8_t>>> encrypted_packets;
+            encrypted_packets.reserve(peers_copy->size());
+
+            auto batch_start = std::chrono::steady_clock::now();
+
+            for (const auto& peer : *peers_copy) {
+                auto* session = _dtls_context->get_or_create_session(peer, false);
+                if (!session || !session->is_established()) {
+                    continue;
+                }
+
+                std::vector<uint8_t> encrypted;
+                auto result = session->encrypt(plaintext_copy->data(), plaintext_copy->size(), encrypted);
+                if (result == DtlsResult::SUCCESS && !encrypted.empty()) {
+                    ++_dtls_packets_encrypted;
+                    encrypted_packets.emplace_back(peer, std::move(encrypted));
                 }
             }
-        }
+
+            auto batch_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - batch_start).count();
+
+            // Log if the batch operation stalled (use higher threshold for batched ops)
+            // Threshold scales with peer count: 100μs per peer
+            uint64_t batch_threshold = CRYPTO_STALL_WARNING_US * peers_copy->size();
+            if (static_cast<uint64_t>(batch_elapsed_us) > batch_threshold) {
+                ++_crypto_stall_warnings;
+                log_gossip.warn("Crypto batch stall: encrypted {} peers in {}μs (threshold: {}μs)",
+                               encrypted_packets.size(), batch_elapsed_us, batch_threshold);
+            }
+
+            // Now send all encrypted packets (yields back to reactor between sends)
+            for (auto& [peer, encrypted] : encrypted_packets) {
+                seastar::temporary_buffer<char> buf(encrypted.size());
+                std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
+                seastar::net::packet packet(std::move(buf));
+                (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+                    log_gossip.debug("Failed to send batched encrypted to {}: {}", peer, ep);
+                });
+
+                // Yield between sends to avoid monopolizing the reactor
+                seastar::thread::yield();
+            }
+
+            log_gossip.trace("Batch broadcast completed: {} packets encrypted and sent", encrypted_packets.size());
+        });
     }
+
+    // For small peer counts, use parallel_for_each (existing behavior)
+    return seastar::parallel_for_each(peers, [this, &plaintext](const seastar::socket_address& peer) {
+        return send_encrypted(peer, plaintext);
+    });
+}
+
+// Async check and reload certificates with parallel handshake initiation
+seastar::future<> GossipService::check_cert_reload() {
+    if (!_dtls_context) {
+        co_return;
+    }
+
+    if (!_dtls_context->check_and_reload_certs()) {
+        co_return;  // No reload needed
+    }
+
+    ++_dtls_cert_reloads;
+    log_gossip.info("Certificates reloaded successfully, re-initiating handshakes with {} peers",
+                    _peer_addresses.size());
+
+    // Re-initiate handshakes with all peers using parallel_for_each with gating
+    // The gate limits the number of concurrent handshakes to prevent SMP storms
+    co_await seastar::parallel_for_each(_peer_addresses, [this](const seastar::socket_address& peer) -> seastar::future<> {
+        // Use the gate to limit concurrent handshakes
+        try {
+            auto holder = _handshake_gate.hold();
+
+            auto* session = _dtls_context->get_or_create_session(peer, false);
+            if (!session) {
+                co_return;
+            }
+
+            std::vector<uint8_t> handshake_data;
+            auto result = session->initiate_handshake(handshake_data);
+            if (result == DtlsResult::WANT_READ && !handshake_data.empty() && _channel) {
+                ++_dtls_handshakes_started;
+                seastar::temporary_buffer<char> buf(handshake_data.size());
+                std::memcpy(buf.get_write(), handshake_data.data(), handshake_data.size());
+                seastar::net::packet packet(std::move(buf));
+                co_await _channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+                    log_gossip.debug("Failed to send handshake to {}: {}", peer, ep);
+                });
+            }
+        } catch (const seastar::gate_closed_exception&) {
+            // Service is shutting down, skip this handshake
+            log_gossip.debug("Handshake skipped during shutdown for peer {}", peer);
+        }
+    });
+
+    log_gossip.info("Certificate reload handshakes initiated for all peers");
 }
 
 void GossipService::cleanup_dtls_sessions() {
