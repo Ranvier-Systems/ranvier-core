@@ -3,8 +3,8 @@
 # ---------------------------------------------------------
 FROM fedora:39 AS builder
 
-# Install Build Deps (libcurl-devel needed for OpenTelemetry HTTP exporters)
-RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl libcurl-devel \
+# Install Build Deps (libcurl-devel for OpenTelemetry, openssl-devel for DTLS gossip encryption)
+RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl libcurl-devel openssl-devel \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 

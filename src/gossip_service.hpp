@@ -4,10 +4,12 @@
 // - UDP-based route announcements between cluster nodes
 // - Stateless packet format for route propagation
 // - Thread-local service following Seastar's shared-nothing model
+// - Optional DTLS encryption for secure cluster communication (mTLS)
 
 #pragma once
 
 #include "config.hpp"
+#include "dtls_context.hpp"
 #include "types.hpp"
 #include "logging.hpp"
 
@@ -305,8 +307,32 @@ private:
     bool _discovery_enabled = false;
     seastar::future<> _discovery_future;
 
+    // DTLS encryption context (shard 0 only)
+    std::unique_ptr<DtlsContext> _dtls_context;
+    seastar::timer<> _cert_reload_timer;
+    seastar::timer<> _dtls_session_cleanup_timer;
+
+    // DTLS metrics
+    uint64_t _dtls_handshakes_started = 0;
+    uint64_t _dtls_handshakes_completed = 0;
+    uint64_t _dtls_handshakes_failed = 0;
+    uint64_t _dtls_packets_encrypted = 0;
+    uint64_t _dtls_packets_decrypted = 0;
+    uint64_t _dtls_cert_reloads = 0;
+
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
+
+    // DTLS helper methods
+    seastar::future<> initialize_dtls();
+    seastar::future<> send_encrypted(const seastar::socket_address& peer,
+                                      const std::vector<uint8_t>& plaintext);
+    std::optional<std::vector<uint8_t>> decrypt_packet(const seastar::socket_address& peer,
+                                                        const uint8_t* data, size_t len);
+    seastar::future<> handle_dtls_handshake(const seastar::socket_address& peer,
+                                             const uint8_t* data, size_t len);
+    void check_cert_reload();
+    void cleanup_dtls_sessions();
 
     // Receive loop (runs continuously while service is active)
     seastar::future<> receive_loop();
