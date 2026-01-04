@@ -32,13 +32,10 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
 # Changes to source code won't invalidate the layer above
 WORKDIR /src
 COPY CMakeLists.txt ./
-COPY cmake/ ./cmake/
-COPY vendor/ ./vendor/
 
-# Layer 5: Now copy the rest of the source code
+# Layer 5: Copy source code and assets
 # This layer invalidates on code changes, but Seastar is already cached
 COPY src/ ./src/
-COPY include/ ./include/
 COPY assets/ ./assets/
 
 # Layer 6: Build Ranvier (only this rebuilds on code changes)

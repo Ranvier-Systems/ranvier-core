@@ -14,12 +14,9 @@ FROM ${BASE_IMAGE} AS builder
 # Changes to source code won't invalidate this layer
 WORKDIR /src
 COPY CMakeLists.txt ./
-COPY cmake/ ./cmake/
-COPY vendor/ ./vendor/
 
-# Copy the rest of the source code
+# Copy the source code and assets
 COPY src/ ./src/
-COPY include/ ./include/
 COPY assets/ ./assets/
 
 # Build Ranvier (this is all that rebuilds on code changes!)
