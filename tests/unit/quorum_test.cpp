@@ -20,10 +20,18 @@ enum class QuorumState : uint8_t {
 // Quorum Calculation Helper (matches gossip_service.cpp logic)
 // =============================================================================
 
-// Calculate quorum required: floor(N * threshold) + 1
+// Calculate quorum required: floor(N * threshold) + 1, capped at N
 // N = total nodes (peers + self)
 // For threshold=0.5, this gives majority: floor(N/2) + 1
+// The cap prevents impossible requirements (e.g., threshold=1.0 giving N+1)
 size_t calculate_quorum_required(size_t total_peers, double threshold) {
+    size_t total_nodes = total_peers + 1;  // +1 for self
+    size_t required = static_cast<size_t>(std::floor(total_nodes * threshold)) + 1;
+    return std::min(required, total_nodes);  // Cap at total_nodes
+}
+
+// Raw (uncapped) calculation for testing the formula itself
+size_t calculate_quorum_required_raw(size_t total_peers, double threshold) {
     size_t total_nodes = total_peers + 1;  // +1 for self
     return static_cast<size_t>(std::floor(total_nodes * threshold)) + 1;
 }
@@ -165,38 +173,25 @@ TEST_F(QuorumTest, Threshold_Zero) {
     EXPECT_EQ(calculate_quorum_state(0, 4, 0.0), QuorumState::HEALTHY);
 }
 
-TEST_F(QuorumTest, Threshold_One) {
+TEST_F(QuorumTest, Threshold_One_RawFormula) {
     // threshold=1.0 means all nodes required
-    // 5 nodes: Required = floor(5 * 1.0) + 1 = 5 + 1 = 6
-    // This exceeds total nodes, which is a pathological case.
-    // The raw calculation returns 6:
-    size_t required = calculate_quorum_required(4, 1.0);
-    EXPECT_EQ(required, 6u);
-    // With all peers alive, we have 5 nodes but need 6 -> DEGRADED
-    EXPECT_EQ(calculate_quorum_state(4, 4, 1.0), QuorumState::DEGRADED);
+    // 5 nodes: Raw formula = floor(5 * 1.0) + 1 = 5 + 1 = 6
+    // This exceeds total nodes, which is why we cap
+    size_t required_raw = calculate_quorum_required_raw(4, 1.0);
+    EXPECT_EQ(required_raw, 6u);
 }
 
-TEST_F(QuorumTest, Threshold_One_WithCapping) {
-    // In the actual implementation, quorum_required is capped at total_nodes
-    // to prevent impossible requirements. This simulates that behavior:
-    auto calculate_capped_quorum_state = [](size_t alive_peers, size_t total_peers, double threshold) {
-        size_t total_nodes = total_peers + 1;
-        size_t alive_nodes = alive_peers + 1;
-        size_t required = calculate_quorum_required(total_peers, threshold);
-        // Cap at total_nodes (implementation detail from update_quorum_state)
-        if (required > total_nodes) {
-            required = total_nodes;
-        }
-        return (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
-    };
+TEST_F(QuorumTest, Threshold_One_Capped) {
+    // With capping (matches actual implementation), threshold=1.0 is capped at N
+    // 5 nodes: capped to min(6, 5) = 5
+    size_t required = calculate_quorum_required(4, 1.0);
+    EXPECT_EQ(required, 5u);
 
-    // With capping, threshold=1.0 with all nodes alive should be HEALTHY
-    // 5 nodes, need min(6, 5) = 5, have 5 -> HEALTHY
-    EXPECT_EQ(calculate_capped_quorum_state(4, 4, 1.0), QuorumState::HEALTHY);
+    // With all nodes alive, we have 5, need 5 -> HEALTHY
+    EXPECT_EQ(calculate_quorum_state(4, 4, 1.0), QuorumState::HEALTHY);
 
-    // But if one node is down, still DEGRADED
-    // 5 nodes, need 5, have 4 -> DEGRADED
-    EXPECT_EQ(calculate_capped_quorum_state(3, 4, 1.0), QuorumState::DEGRADED);
+    // If one node is down, have 4, need 5 -> DEGRADED
+    EXPECT_EQ(calculate_quorum_state(3, 4, 1.0), QuorumState::DEGRADED);
 }
 
 // =============================================================================
@@ -263,30 +258,38 @@ TEST_F(QuorumTest, WarningThreshold_NotTriggeredWhenDegraded) {
 
 TEST_F(QuorumTest, WarningRateLimiting_EnterWarningZone) {
     // Simulates the state machine for warning rate limiting
+    // Note: In actual implementation, state transition is logged before warning
     struct WarningState {
         bool warning_active = false;
+        QuorumState current_state = QuorumState::HEALTHY;
 
         // Returns true if a warning should be logged (entering warning zone)
         bool check_and_update(size_t alive_peers, size_t total_peers,
                               double threshold, uint32_t warning_threshold) {
             size_t alive_nodes = alive_peers + 1;
-            size_t required = calculate_quorum_required(total_peers, threshold);
-            QuorumState state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
+            size_t required = calculate_quorum_required(total_peers, threshold);  // Already capped
+            QuorumState new_state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
 
-            if (state == QuorumState::DEGRADED) {
-                warning_active = false;
-                return false;
+            // Handle state transition first (as in actual implementation)
+            if (new_state != current_state) {
+                if (new_state == QuorumState::DEGRADED) {
+                    warning_active = false;
+                }
+                current_state = new_state;
             }
 
-            size_t margin = alive_nodes - required;
-            bool should_warn = (warning_threshold > 0) && (margin <= warning_threshold);
+            // Then check warning zone
+            if (new_state == QuorumState::HEALTHY && warning_threshold > 0) {
+                size_t margin = alive_nodes - required;
+                bool should_warn = margin <= warning_threshold;
 
-            if (should_warn && !warning_active) {
-                warning_active = true;
-                return true;  // Log warning
-            } else if (!should_warn && warning_active) {
-                warning_active = false;
-                return false;  // Log "warning cleared" (separate path)
+                if (should_warn && !warning_active) {
+                    warning_active = true;
+                    return true;  // Log warning
+                } else if (!should_warn && warning_active) {
+                    warning_active = false;
+                    return false;  // Log "warning cleared" (separate path)
+                }
             }
             return false;  // No change, no log
         }
