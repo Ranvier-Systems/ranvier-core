@@ -175,3 +175,39 @@ histogram_quantile(0.99, sum(rate(ranvier_http_request_duration_seconds_bucket[5
 - [Request Flow Diagrams](request-flow.md)
 - [API Reference](api-reference.md)
 - [Locust Test Configuration](../tests/integration/README.md)
+- [KV Cache Prefix-Routing Benchmark](benchmarks/kv-cache-prefix-routing-benchmark.md)
+
+---
+
+## Large-Prefix KV Cache Benchmark
+
+For production LLM workloads with large context windows, see our [detailed benchmark](benchmarks/kv-cache-prefix-routing-benchmark.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B-Instruct.
+
+### Summary Results (2000-8000 token prefixes)
+
+| Routing Mode | Cache Hit Rate | TTFT P50 (hit) | TTFT P99 (hit) |
+|--------------|----------------|----------------|----------------|
+| Round-Robin | 14.5% | 433.8ms | 925.1ms |
+| **Prefix-Affinity** | **94.1%** | **433.5ms** | **487.4ms** |
+
+### Key Findings
+
+- **6.5x better cache hit rate** with prefix-affinity routing
+- **47% lower P99 tail latency** for cache hits
+- **37% TTFT improvement** for XLarge prefixes (4-8K tokens)
+- **7% higher throughput** overall (847 vs 800 requests/5min)
+
+### Routing Modes
+
+Configure via `RANVIER_ROUTING_MODE`:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `prefix` | ART + consistent hashing | **Production LLM inference** |
+| `radix` | ART + random fallback | Adaptive learning |
+| `round_robin` | Random/weighted | Baseline testing |
+
+```bash
+# Enable prefix-affinity routing (recommended)
+export RANVIER_ROUTING_MODE=prefix
+```
