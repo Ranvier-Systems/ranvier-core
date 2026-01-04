@@ -2156,7 +2156,13 @@ docker-compose -f docker-compose.test.yml up
 
 
 
+# Optimize Dockerfile and Cleanup Strategy for Heavy C++ Build
+# https://docs.google.com/document/d/1v14yj6TQIGDpuQpOAw9VgOapRdzjqY6FtuWAlzWqyhs/edit?tab=t.0#heading=h.gbew78o1h3ly
 
+# Build base + fast builds
 docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
 docker build -f Dockerfile.production.fast --build-arg BASE_IMAGE=ranvier-dev/ranvier-base:latest -t ranvier-test .
 
+# Build full + run
+docker build -f Dockerfile.production -t ranvier:latest .
+docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ranvier:latest
