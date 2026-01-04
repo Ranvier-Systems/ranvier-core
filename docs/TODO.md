@@ -338,7 +338,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 
 ### 5.3 Client SDKs & Documentation
 
-- [ ] **Generate OpenAPI specification**
+- [x] **Generate OpenAPI specification** ✓
   _Justification:_ API documented manually. OpenAPI enables auto-generated clients and validation.
   _Output:_ `docs/openapi.yaml`
   _Complexity:_ Low
@@ -394,7 +394,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
 | **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
 | **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
-| **P3 - Low** | DX | OpenAPI specification | Low | |
+| **P3 - Low** | DX | OpenAPI specification | Low | ✅ Done |
 | **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
 
 ---
@@ -405,6 +405,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2025-01-04 | Generate OpenAPI 3.0 specification for HTTP API | - |
 | 2025-01-04 | Implement mTLS/DTLS encryption for gossip protocol (P0 security) | - |
 | 2025-01-04 | Add pre-built Docker images to GHCR | - |
 | 2025-01-03 | Create Helm chart for Kubernetes deployment | - |
