@@ -4,6 +4,7 @@
 // These tests don't require Seastar runtime.
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
