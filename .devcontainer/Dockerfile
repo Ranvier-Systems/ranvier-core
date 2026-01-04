@@ -1,13 +1,13 @@
 # Dev Container for Ranvier - Uses shared base image for environment parity
 # Ensures dev environment exactly matches production build environment
 #
-# Option 1: Pull pre-built base from GitHub Container Registry (recommended)
+# Option 1: Pull pre-built base from GitHub Container Registry (after CI publishes it)
 #   docker pull ghcr.io/ranvier-systems/ranvier-base:latest
 #
-# Option 2: Build locally (if customizing toolchain)
-#   docker build -f Dockerfile.base -t ghcr.io/ranvier-systems/ranvier-base:latest .
+# Option 2: Build locally (required until base image is published to ghcr.io)
+#   docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
 #
-ARG BASE_IMAGE=ghcr.io/ranvier-systems/ranvier-base:latest
+ARG BASE_IMAGE=ranvier-dev/ranvier-base:latest
 FROM ${BASE_IMAGE}
 
 # Install only dev-specific tools not in the base image
