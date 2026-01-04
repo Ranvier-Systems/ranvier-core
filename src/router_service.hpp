@@ -16,6 +16,21 @@
 
 namespace ranvier {
 
+// A pending remote route waiting to be batched and broadcast to all shards
+struct PendingRemoteRoute {
+    std::vector<int32_t> tokens;
+    BackendId backend;
+};
+
+// Configuration for route batching to avoid SMP storm
+struct RouteBatchConfig {
+    // Maximum number of routes to buffer before forcing a flush
+    static constexpr size_t MAX_BATCH_SIZE = 100;
+
+    // Flush interval in milliseconds (how often to flush even if batch not full)
+    static constexpr std::chrono::milliseconds FLUSH_INTERVAL{10};
+};
+
 // Forward declaration
 class GossipService;
 
@@ -59,6 +74,15 @@ public:
 
     // Stop the gossip service (call before shutdown)
     seastar::future<> stop_gossip();
+
+    // Start the route batch flush timer (call after Seastar is initialized)
+    void start_batch_flush_timer();
+
+    // Stop the route batch flush timer (call before shutdown)
+    void stop_batch_flush_timer();
+
+    // Force an immediate flush of any pending batched routes
+    seastar::future<> flush_route_batch();
 
     // Teach the system a new server (ID -> IP:Port) with optional weight and priority
     // Weight: relative load balancing weight (default 100, higher = more traffic)
@@ -123,6 +147,13 @@ private:
 
     // Draining reaper timer (runs on shard 0, checks for expired draining backends)
     seastar::timer<> _draining_reaper_timer;
+
+    // Batch flush timer for remote routes (runs on shard 0)
+    seastar::timer<> _batch_flush_timer;
+
+    // Buffer for pending remote routes (shard 0 only)
+    // Routes are accumulated here and broadcast in batches to reduce SMP message traffic
+    std::vector<PendingRemoteRoute> _pending_remote_routes;
 
     // Callback for pool cleanup when a backend is fully removed
     PoolCleanupCallback _pool_cleanup_callback;
