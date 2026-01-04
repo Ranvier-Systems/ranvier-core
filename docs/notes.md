@@ -2154,3 +2154,9 @@ uid=10001(ranvier) gid=10001(ranvier) groups=10001(ranvier)
 # For the docker-compose files, you don't need the --cap-add flag since I already added cap_add: [IPC_LOCK] to the service definitions. Just run:
 docker-compose -f docker-compose.test.yml up
 
+
+
+
+docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+docker build -f Dockerfile.production.fast --build-arg BASE_IMAGE=ranvier-dev/ranvier-base:latest -t ranvier-test .
+
