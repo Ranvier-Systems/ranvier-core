@@ -15,8 +15,9 @@ FROM ${BASE_IMAGE} AS builder
 WORKDIR /src
 COPY CMakeLists.txt ./
 
-# Copy the source code and assets
+# Copy the source code, tests, and assets
 COPY src/ ./src/
+COPY tests/ ./tests/
 COPY assets/ ./assets/
 
 # Build Ranvier (this is all that rebuilds on code changes!)

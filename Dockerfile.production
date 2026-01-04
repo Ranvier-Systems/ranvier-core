@@ -33,9 +33,10 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
 WORKDIR /src
 COPY CMakeLists.txt ./
 
-# Layer 5: Copy source code and assets
+# Layer 5: Copy source code, tests, and assets
 # This layer invalidates on code changes, but Seastar is already cached
 COPY src/ ./src/
+COPY tests/ ./tests/
 COPY assets/ ./assets/
 
 # Layer 6: Build Ranvier (only this rebuilds on code changes)
