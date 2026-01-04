@@ -447,34 +447,32 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
 seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
     // Learn route from cluster peer - mark as REMOTE origin
     // REMOTE routes can be evicted more aggressively than LOCAL routes
-    log_router.debug("Learning remote route: {} tokens -> backend {}", tokens.size(), backend);
+    //
+    // BATCHING STRATEGY: Instead of immediately broadcasting to all shards (which causes
+    // an "SMP storm" with high route ingestion rates), we buffer routes on shard 0 and
+    // flush them periodically or when the buffer is full. This reduces cross-core message
+    // traffic from O(routes * shards) to O(batches * shards).
 
-    return seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
-                if (!local_tree) return seastar::make_ready_future<>();
+    log_router.debug("Buffering remote route: {} tokens -> backend {}", tokens.size(), backend);
 
-                // LRU eviction: prefer evicting REMOTE routes first when at capacity
-                if (local_max_routes > 0) {
-                    while (local_tree->route_count() >= local_max_routes) {
-                        if (local_tree->evict_oldest_remote()) {
-                            stats_routes_evicted++;
-                        } else {
-                            break;  // No more routes to evict
-                        }
-                    }
-                }
+    // Add to pending buffer
+    _pending_remote_routes.push_back(PendingRemoteRoute{std::move(tokens), backend});
 
-                // Insert with REMOTE origin (learned from cluster gossip)
-                local_tree->insert(tokens, backend, RouteOrigin::REMOTE);
-                return seastar::make_ready_future<>();
-            });
-        });
-    });
+    // Check if we should flush immediately due to buffer size limit
+    if (_pending_remote_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
+        log_router.debug("Route batch buffer full ({} routes), flushing immediately",
+                         _pending_remote_routes.size());
+        return flush_route_batch();
+    }
+
+    return seastar::make_ready_future<>();
 }
 
 seastar::future<> RouterService::start_gossip() {
     if (_gossip) {
+        // Start the batch flush timer when gossip is enabled
+        // (remote routes only arrive via gossip, so batching is only needed then)
+        start_batch_flush_timer();
         return _gossip->start();
     }
     return seastar::make_ready_future<>();
@@ -482,9 +480,78 @@ seastar::future<> RouterService::start_gossip() {
 
 seastar::future<> RouterService::stop_gossip() {
     if (_gossip) {
+        // Stop the batch flush timer and flush any remaining routes
+        stop_batch_flush_timer();
         return _gossip->stop();
     }
     return seastar::make_ready_future<>();
+}
+
+void RouterService::start_batch_flush_timer() {
+    _batch_flush_timer.set_callback([this] {
+        // Fire-and-forget the flush - timer callback can't return a future
+        (void)flush_route_batch();
+    });
+    _batch_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
+    log_router.info("Route batch flush timer started (interval: {}ms, max_batch: {})",
+                    RouteBatchConfig::FLUSH_INTERVAL.count(), RouteBatchConfig::MAX_BATCH_SIZE);
+}
+
+void RouterService::stop_batch_flush_timer() {
+    _batch_flush_timer.cancel();
+
+    // Flush any remaining pending routes before shutdown
+    if (!_pending_remote_routes.empty()) {
+        log_router.info("Flushing {} remaining routes before shutdown", _pending_remote_routes.size());
+        (void)flush_route_batch();
+    }
+
+    log_router.info("Route batch flush timer stopped");
+}
+
+seastar::future<> RouterService::flush_route_batch() {
+    // Nothing to flush?
+    if (_pending_remote_routes.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Move the pending routes out for processing, leaving buffer empty for new routes
+    std::vector<PendingRemoteRoute> batch = std::move(_pending_remote_routes);
+    _pending_remote_routes.clear();  // Ensure it's truly empty after move
+
+    log_router.debug("Flushing batch of {} remote routes to {} shards",
+                     batch.size(), seastar::smp::count);
+
+    // Broadcast the entire batch to all shards in a SINGLE message per shard
+    // This reduces SMP message traffic from O(routes * shards) to O(shards)
+    return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& shared_batch) {
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            [&shared_batch](unsigned shard_id) {
+                // Copy the batch for this shard (each shard needs its own copy)
+                return seastar::smp::submit_to(shard_id, [batch = shared_batch] {
+                    if (!local_tree) return seastar::make_ready_future<>();
+
+                    // Process all routes in the batch on this shard
+                    for (const auto& route : batch) {
+                        // LRU eviction: prefer evicting REMOTE routes first when at capacity
+                        if (local_max_routes > 0) {
+                            while (local_tree->route_count() >= local_max_routes) {
+                                if (local_tree->evict_oldest_remote()) {
+                                    stats_routes_evicted++;
+                                } else {
+                                    break;  // No more routes to evict
+                                }
+                            }
+                        }
+
+                        // Insert with REMOTE origin (learned from cluster gossip)
+                        local_tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
+                    }
+
+                    return seastar::make_ready_future<>();
+                });
+            });
+    });
 }
 
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
