@@ -19,6 +19,9 @@ cmake-build-*/
 doc/
 *.md
 
+# Exclude scripts (not needed in container)
+scripts/
+
 # Exclude test databases
 *.db
 *.db-wal

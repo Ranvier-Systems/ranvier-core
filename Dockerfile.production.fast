@@ -1,47 +1,28 @@
 # ---------------------------------------------------------
-# STAGE 1: Builder (Heavy, contains GCC, CMake, Rust)
+# STAGE 1: Builder (Uses pre-built base image with Seastar)
 # ---------------------------------------------------------
-FROM fedora:39 AS builder
+# This Dockerfile requires the base image to be built first:
+#   docker build -f Dockerfile.base -t my-registry/ranvier-base:latest .
+#
+# Build times drop from ~20 minutes to ~2 minutes since Seastar is cached.
+# ---------------------------------------------------------
+# IMPORTANT: Replace 'my-registry' with your actual registry (e.g., ghcr.io/your-org)
+ARG BASE_IMAGE=my-registry/ranvier-base:latest
+FROM ${BASE_IMAGE} AS builder
 
-# Install Build Deps (libcurl-devel for OpenTelemetry, openssl-devel for DTLS gossip encryption)
-# Layer 1: System packages (rarely changes)
-RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl libcurl-devel openssl-devel \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf
-
-# Layer 2: Rust toolchain (rarely changes)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rm -rf /root/.cargo/registry/cache
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Layer 3: Seastar build - consolidated into single RUN to avoid layer bloat
-# Clone, install deps, build, install, and cleanup ALL in one layer
-# This prevents the ~2GB source/build artifacts from persisting in image history
-WORKDIR /tmp
-RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
-    cd seastar && \
-    ./install-dependencies.sh && \
-    dnf clean all && \
-    ./configure.py --mode=release --prefix=/usr/local --c++-standard=20 && \
-    ninja -j$(nproc) -C build/release install && \
-    cd /tmp && \
-    rm -rf seastar && \
-    rm -rf /var/cache/dnf /root/.cache
-
-# Layer 4: Copy ONLY dependency files first for better caching
-# Changes to source code won't invalidate the layer above
+# Copy ONLY dependency files first for better caching
+# Changes to source code won't invalidate this layer
 WORKDIR /src
 COPY CMakeLists.txt ./
 COPY cmake/ ./cmake/
 COPY vendor/ ./vendor/
 
-# Layer 5: Now copy the rest of the source code
-# This layer invalidates on code changes, but Seastar is already cached
+# Copy the rest of the source code
 COPY src/ ./src/
 COPY include/ ./include/
 COPY assets/ ./assets/
 
-# Layer 6: Build Ranvier (only this rebuilds on code changes)
+# Build Ranvier (this is all that rebuilds on code changes!)
 # OpenTelemetry uses PIMPL pattern to defer initialization until after main() starts
 RUN mkdir -p build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
