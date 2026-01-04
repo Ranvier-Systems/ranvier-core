@@ -104,11 +104,51 @@ docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ghcr.io/ranvier-systems/
 Build from source (optional):
 
 ```bash
-# Build production image locally
+# Build production image locally (standalone, ~20 min)
 docker build -f Dockerfile.production -t ranvier:latest .
+
+# Or use the base image strategy for faster rebuilds (~2 min after initial setup)
+docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+docker build -f Dockerfile.production.fast -t ranvier:latest .
 
 # Run with required IPC_LOCK capability
 docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ranvier:latest
+```
+
+---
+
+## 🔧 Development Setup
+
+### Prerequisites
+- Docker with BuildKit enabled
+- VS Code with Dev Containers extension (recommended)
+
+### Quick Start
+
+1. **Build the base image** (one-time, or when Seastar/toolchain updates):
+   ```bash
+   docker build -f Dockerfile.base -t ranvier-dev/ranvier-base:latest .
+   ```
+
+2. **Open in VS Code:**
+   - Open the project folder
+   - Press `Ctrl+Shift+P` → "Dev Containers: Reopen in Container"
+   - The dev container uses the base image for fast startup
+
+3. **Build Ranvier:**
+   ```bash
+   mkdir build && cd build
+   cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+   ninja
+   ```
+
+### Disk Management
+
+After benchmarking or when disk usage grows:
+```bash
+./scripts/docker-cleanup.sh              # Keep 10GB cache (default)
+./scripts/docker-cleanup.sh --keep 5GB   # Custom limit
+./scripts/docker-cleanup.sh --aggressive # Remove everything unused
 ```
 
 ### Kubernetes (Helm)
