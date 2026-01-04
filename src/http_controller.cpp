@@ -844,13 +844,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                             log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
                         });
 
+                    // Queue route for async persistence (fire-and-forget, non-blocking)
                     if (_persistence) {
-                        try {
-                            _persistence->save_route(tokens, current_backend);
-                        } catch (...) {
-                            // Best-effort persistence, ignore failures
-                            log_proxy.debug("[{}] Route persistence failed (non-fatal)", request_id);
-                        }
+                        _persistence->queue_save_route(tokens, current_backend);
                     }
                 }
             }
@@ -1023,13 +1019,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    // Persist the route
+    // Queue route for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
-        try {
-            _persistence->save_route(tokens, backend_id);
-        } catch (...) {
-            log_control.warn("Failed to persist route for backend {}", backend_id);
-        }
+        _persistence->queue_save_route(tokens, backend_id);
     }
 
     return _router.learn_route_global(tokens, backend_id).then([backend_id, rep = std::move(rep)]() mutable {
@@ -1092,13 +1084,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    // Persist the backend registration
+    // Queue backend for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
-        try {
-            _persistence->save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
-        } catch (...) {
-            log_control.warn("Failed to persist backend {} registration", id);
-        }
+        _persistence->queue_save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
     }
 
     return _router.register_backend_global(id, addr, weight, priority).then(
@@ -1136,14 +1124,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    // Remove from persistence first
+    // Queue removal for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
-        try {
-            _persistence->remove_routes_for_backend(id);
-            _persistence->remove_backend(id);
-        } catch (...) {
-            log_control.warn("Failed to remove backend {} from persistence", id);
-        }
+        _persistence->queue_remove_routes_for_backend(id);
+        _persistence->queue_remove_backend(id);
     }
 
     // Remove from in-memory state across all shards
@@ -1175,13 +1159,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    // Remove routes from persistence
+    // Queue routes removal for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
-        try {
-            _persistence->remove_routes_for_backend(backend_id);
-        } catch (...) {
-            log_control.warn("Failed to remove routes for backend {} from persistence", backend_id);
-        }
+        _persistence->queue_remove_routes_for_backend(backend_id);
     }
 
     // Note: In-memory routes in the RadixTree are not removed immediately.
@@ -1196,19 +1176,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(
     // Usage: POST /admin/clear
     // WARNING: This is destructive!
 
+    // Queue clear-all for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
-        try {
-            _persistence->clear_all();
-        } catch (...) {
-            log_control.error("Failed to clear persistence data");
-            rep->set_status(seastar::http::reply::status_type::internal_server_error);
-            rep->write_body("json", "{\"error\": \"Failed to clear persistence data\"}");
-            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
-        }
+        _persistence->queue_clear_all();
     }
 
-    log_control.warn("Cleared all persisted data (backends and routes). Restart required to clear in-memory state.");
-    rep->write_body("json", "{\"status\": \"ok\", \"warning\": \"All persisted data cleared. Restart to clear in-memory state.\"}");
+    log_control.warn("Queued clear of all persisted data (backends and routes). Restart required to clear in-memory state.");
+    rep->write_body("json", "{\"status\": \"ok\", \"warning\": \"All persisted data queued for clearing. Restart to clear in-memory state.\"}");
     return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
 }
 
