@@ -85,7 +85,7 @@ graph TD
 
 ### Docker
 
-Pre-built multi-architecture images (amd64/arm64) are available on GitHub Container Registry:
+Pre-built images are available on GitHub Container Registry (linux/amd64):
 
 ```bash
 # Pull the latest image
