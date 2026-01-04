@@ -66,14 +66,27 @@ GossipService::GossipService(const ClusterConfig& config)
         seastar::metrics::make_counter("cluster_duplicates_suppressed", _duplicates_suppressed,
             seastar::metrics::description("Total number of duplicate route announcements suppressed")),
         seastar::metrics::make_counter("cluster_max_retries_exceeded", _max_retries_exceeded,
-            seastar::metrics::description("Total number of route announcements that exceeded max retries"))
+            seastar::metrics::description("Total number of route announcements that exceeded max retries")),
+        // DTLS encryption metrics
+        seastar::metrics::make_counter("cluster_dtls_handshakes_started", _dtls_handshakes_started,
+            seastar::metrics::description("Total number of DTLS handshakes initiated")),
+        seastar::metrics::make_counter("cluster_dtls_handshakes_completed", _dtls_handshakes_completed,
+            seastar::metrics::description("Total number of DTLS handshakes completed successfully")),
+        seastar::metrics::make_counter("cluster_dtls_handshakes_failed", _dtls_handshakes_failed,
+            seastar::metrics::description("Total number of DTLS handshakes that failed")),
+        seastar::metrics::make_counter("cluster_dtls_packets_encrypted", _dtls_packets_encrypted,
+            seastar::metrics::description("Total number of packets encrypted with DTLS")),
+        seastar::metrics::make_counter("cluster_dtls_packets_decrypted", _dtls_packets_decrypted,
+            seastar::metrics::description("Total number of packets decrypted with DTLS")),
+        seastar::metrics::make_counter("cluster_dtls_cert_reloads", _dtls_cert_reloads,
+            seastar::metrics::description("Total number of certificate hot-reloads"))
     });
 }
 
 seastar::future<> GossipService::start() {
     if (!_config.enabled) {
         log_gossip.info("Gossip service disabled");
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     if (_peer_addresses.empty()) {
@@ -86,7 +99,7 @@ seastar::future<> GossipService::start() {
     // Only Shard 0 manages the physical hardware/UDP port
     if (seastar::this_shard_id() != 0) {
         log_gossip.debug("Gossip service started on worker shard {}", seastar::this_shard_id());
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     log_gossip.info("Starting gossip service on port {}", _config.gossip_port);
@@ -121,6 +134,14 @@ seastar::future<> GossipService::start() {
 
         for (const auto& addr : _peer_addresses) {
             _peer_table[addr] = { seastar::lowres_clock::now(), true };
+        }
+
+        // Initialize DTLS if enabled
+        if (_config.tls.enabled) {
+            co_await initialize_dtls();
+        } else {
+            log_gossip.warn("Gossip TLS is DISABLED - cluster traffic is unencrypted!");
+            log_gossip.warn("This is a SECURITY RISK in production. Enable cluster.tls for encrypted gossip.");
         }
 
         // Set up reliable delivery retry timer if enabled
@@ -169,11 +190,11 @@ seastar::future<> GossipService::start() {
             _discovery_timer.arm_periodic(_config.discovery_refresh_interval);
         }
 
-        // Return a ready future to signal the service has 'started' successfully.
-        return seastar::make_ready_future<>();
+        // Service started successfully.
+        co_return;
     } catch (...) {
-        // If bind fails (e.g. EADDRINUSE), convert the exception to a failed future.
-        return seastar::make_exception_future<>(std::current_exception());
+        // If bind fails (e.g. EADDRINUSE), rethrow to fail the coroutine
+        throw;
     }
 }
 
@@ -224,6 +245,16 @@ seastar::future<> GossipService::stop() {
     // Stop DNS discovery
     _discovery_enabled = false;
     _discovery_timer.cancel();
+
+    // Stop DTLS timers
+    _cert_reload_timer.cancel();
+    _dtls_session_cleanup_timer.cancel();
+
+    // Clean up DTLS context
+    if (_dtls_context) {
+        _dtls_context.reset();
+        log_gossip.debug("DTLS context released");
+    }
 
     // Wait for any in-flight discovery to complete
     try {
@@ -282,7 +313,20 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
             log_gossip.trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
         }
 
-        // Create an owned buffer by copying the data
+        // Use DTLS encryption if enabled
+        if (_dtls_context && _dtls_context->is_enabled()) {
+            return send_encrypted(peer, serialized).then([this] {
+                _packets_sent++;
+            }).handle_exception([peer](auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::exception& e) {
+                    log_gossip.debug("Failed to send encrypted to peer {}: {}", peer, e.what());
+                }
+            });
+        }
+
+        // Plaintext mode: create an owned buffer by copying the data
         // Note: temporary_buffer(ptr, len) creates a non-owning view, which would cause
         // use-after-free since 'serialized' goes out of scope before async send completes
         seastar::temporary_buffer<char> buf(serialized.size());
@@ -334,10 +378,27 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     data.linearize();
 
     // Now it is safe to access the full length from the first fragment
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
+    const uint8_t* raw_ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
+    size_t raw_len = data.len();
+
+    // Decrypt if DTLS is enabled
+    const uint8_t* ptr = raw_ptr;
+    size_t len = raw_len;
+    std::optional<std::vector<uint8_t>> decrypted;
+
+    if (_dtls_context && _dtls_context->is_enabled()) {
+        decrypted = decrypt_packet(src_addr, raw_ptr, raw_len);
+        if (!decrypted) {
+            // Either handshake data (no application data) or decryption failed
+            // Handshake responses are sent inside decrypt_packet
+            return seastar::make_ready_future<>();
+        }
+        ptr = decrypted->data();
+        len = decrypted->size();
+    }
 
     // Identify packet type (need at least 1 byte)
-    if (data.len() < 1) {
+    if (len < 1) {
         _packets_invalid++;
         return seastar::make_ready_future<>();
     }
@@ -351,7 +412,7 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
 
     // Handle ACK packets
     if (type == GossipPacketType::ROUTE_ACK) {
-        auto ack_pkt = RouteAckPacket::deserialize(ptr, data.len());
+        auto ack_pkt = RouteAckPacket::deserialize(ptr, len);
         if (!ack_pkt) {
             _packets_invalid++;
             return seastar::make_ready_future<>();
@@ -362,7 +423,7 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     }
 
     // Handle route announcements
-    auto pkt = RouteAnnouncementPacket::deserialize(ptr, data.len());
+    auto pkt = RouteAnnouncementPacket::deserialize(ptr, len);
     if (!pkt) {
         _packets_invalid++;
         return seastar::make_ready_future<>();
@@ -423,7 +484,19 @@ seastar::future<> GossipService::broadcast_heartbeat() {
     }
 
     // Prepare a small 2-byte heartbeat (Type + Version)
-    // Create an owned buffer to avoid use-after-free with async sends
+    std::vector<uint8_t> heartbeat_data = {
+        static_cast<uint8_t>(GossipPacketType::HEARTBEAT),
+        static_cast<uint8_t>(RouteAnnouncementPacket::PROTOCOL_VERSION)
+    };
+
+    // Use DTLS encryption if enabled
+    if (_dtls_context && _dtls_context->is_enabled()) {
+        return seastar::parallel_for_each(_peer_addresses, [this, heartbeat_data](const seastar::socket_address& peer) {
+            return send_encrypted(peer, heartbeat_data).discard_result();
+        });
+    }
+
+    // Plaintext mode: create an owned buffer to avoid use-after-free with async sends
     seastar::temporary_buffer<char> buf(2);
     buf.get_write()[0] = static_cast<char>(GossipPacketType::HEARTBEAT);
     buf.get_write()[1] = static_cast<char>(RouteAnnouncementPacket::PROTOCOL_VERSION);
@@ -644,12 +717,25 @@ seastar::future<> GossipService::send_ack(const seastar::socket_address& peer, u
     ack.seq_num = seq_num;
     auto serialized = ack.serialize();
 
-    // Create an owned buffer to avoid use-after-free with async send
+    log_gossip.trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
+
+    // Use DTLS encryption if enabled
+    if (_dtls_context && _dtls_context->is_enabled()) {
+        return send_encrypted(peer, serialized).then([this] {
+            ++_acks_sent;
+        }).handle_exception([peer, seq_num](auto ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_gossip.debug("Failed to send encrypted ACK to peer {}: {}", peer, e.what());
+            }
+        });
+    }
+
+    // Plaintext mode: create an owned buffer to avoid use-after-free with async send
     seastar::temporary_buffer<char> buf(serialized.size());
     std::memcpy(buf.get_write(), serialized.data(), serialized.size());
     seastar::net::packet packet(std::move(buf));
-
-    log_gossip.trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
 
     return _channel->send(peer, std::move(packet)).then([this] {
         ++_acks_sent;
@@ -746,23 +832,36 @@ void GossipService::process_retries() {
             auto backoff = calculate_backoff(pending.retry_count);
             pending.next_retry = now + backoff;
 
-            // Resend the packet - create owned buffer for safety with async send
-            seastar::temporary_buffer<char> buf(pending.serialized_packet.size());
-            std::memcpy(buf.get_write(), pending.serialized_packet.data(), pending.serialized_packet.size());
-            seastar::net::packet packet(std::move(buf));
-
             log_gossip.debug("Retrying route announcement: peer={}, seq_num={}, retry={}/{}",
                            peer, seq_num, pending.retry_count, _config.gossip_max_retries);
 
-            (void)_channel->send(peer, std::move(packet)).then([this] {
-                ++_retries_sent;
-            }).handle_exception([peer, seq_num](auto ep) {
-                try {
-                    std::rethrow_exception(ep);
-                } catch (const std::exception& e) {
-                    log_gossip.debug("Failed to retry to peer {}: {}", peer, e.what());
-                }
-            });
+            // Use DTLS encryption if enabled
+            if (_dtls_context && _dtls_context->is_enabled()) {
+                (void)send_encrypted(peer, pending.serialized_packet).then([this] {
+                    ++_retries_sent;
+                }).handle_exception([peer, seq_num](auto ep) {
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (const std::exception& e) {
+                        log_gossip.debug("Failed to retry encrypted to peer {}: {}", peer, e.what());
+                    }
+                });
+            } else {
+                // Plaintext mode: resend the packet - create owned buffer for safety with async send
+                seastar::temporary_buffer<char> buf(pending.serialized_packet.size());
+                std::memcpy(buf.get_write(), pending.serialized_packet.data(), pending.serialized_packet.size());
+                seastar::net::packet packet(std::move(buf));
+
+                (void)_channel->send(peer, std::move(packet)).then([this] {
+                    ++_retries_sent;
+                }).handle_exception([peer, seq_num](auto ep) {
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (const std::exception& e) {
+                        log_gossip.debug("Failed to retry to peer {}: {}", peer, e.what());
+                    }
+                });
+            }
         }
 
         // Remove entries that exceeded max retries
@@ -794,6 +893,213 @@ std::chrono::milliseconds GossipService::calculate_backoff(uint32_t retry_count)
     auto base = _config.gossip_ack_timeout;
     auto multiplier = static_cast<uint32_t>(1) << std::min(retry_count, 3u);  // 1, 2, 4, 8
     return std::min(base * multiplier, base * 8);
+}
+
+//------------------------------------------------------------------------------
+// DTLS Helper Methods
+//------------------------------------------------------------------------------
+
+seastar::future<> GossipService::initialize_dtls() {
+    log_gossip.info("Initializing DTLS for gossip encryption");
+
+    _dtls_context = std::make_unique<DtlsContext>(_config.tls);
+
+    auto err = _dtls_context->initialize();
+    if (err) {
+        log_gossip.error("Failed to initialize DTLS: {}", *err);
+        if (!_config.tls.allow_plaintext_fallback) {
+            throw std::runtime_error("DTLS initialization failed: " + *err);
+        }
+        log_gossip.warn("Falling back to plaintext mode (allow_plaintext_fallback=true)");
+        _dtls_context.reset();
+        co_return;
+    }
+
+    log_gossip.info("DTLS initialized successfully");
+    log_gossip.info("DTLS peer verification: {}", _config.tls.verify_peer ? "enabled (mTLS)" : "disabled");
+
+    // Set up certificate reload timer if enabled
+    if (_config.tls.cert_reload_interval.count() > 0) {
+        log_gossip.info("Certificate hot-reload enabled: interval={}s",
+                        _config.tls.cert_reload_interval.count());
+        _cert_reload_timer.set_callback([this] { check_cert_reload(); });
+        _cert_reload_timer.arm_periodic(_config.tls.cert_reload_interval);
+    }
+
+    // Set up DTLS session cleanup timer (cleanup idle sessions every minute)
+    _dtls_session_cleanup_timer.set_callback([this] { cleanup_dtls_sessions(); });
+    _dtls_session_cleanup_timer.arm_periodic(std::chrono::seconds(60));
+
+    // Initiate handshakes with all configured peers
+    for (const auto& peer : _peer_addresses) {
+        auto* session = _dtls_context->get_or_create_session(peer, false);  // Client role
+        if (session) {
+            std::vector<uint8_t> handshake_data;
+            auto result = session->initiate_handshake(handshake_data);
+            if (result == DtlsResult::WANT_READ && !handshake_data.empty()) {
+                ++_dtls_handshakes_started;
+                // Send ClientHello to peer
+                seastar::temporary_buffer<char> buf(handshake_data.size());
+                std::memcpy(buf.get_write(), handshake_data.data(), handshake_data.size());
+                seastar::net::packet packet(std::move(buf));
+                (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+                    log_gossip.debug("Failed to send DTLS handshake to {}: {}", peer, ep);
+                });
+            }
+        }
+    }
+
+    co_return;
+}
+
+seastar::future<> GossipService::send_encrypted(const seastar::socket_address& peer,
+                                                 const std::vector<uint8_t>& plaintext) {
+    if (!_dtls_context || !_dtls_context->is_enabled()) {
+        // DTLS not enabled, send plaintext
+        seastar::temporary_buffer<char> buf(plaintext.size());
+        std::memcpy(buf.get_write(), plaintext.data(), plaintext.size());
+        seastar::net::packet packet(std::move(buf));
+        return _channel->send(peer, std::move(packet));
+    }
+
+    auto* session = _dtls_context->get_or_create_session(peer, false);
+    if (!session) {
+        log_gossip.debug("Failed to get DTLS session for peer {}", peer);
+        return seastar::make_ready_future<>();
+    }
+
+    // Check if handshake is complete
+    if (!session->is_established()) {
+        // Handshake not complete - queue data or wait
+        log_gossip.trace("DTLS handshake not complete for peer {}, cannot send yet", peer);
+        return seastar::make_ready_future<>();
+    }
+
+    // Encrypt the data
+    std::vector<uint8_t> encrypted;
+    auto result = session->encrypt(plaintext.data(), plaintext.size(), encrypted);
+    if (result != DtlsResult::SUCCESS || encrypted.empty()) {
+        log_gossip.debug("Failed to encrypt data for peer {}", peer);
+        return seastar::make_ready_future<>();
+    }
+
+    ++_dtls_packets_encrypted;
+
+    // Send encrypted data
+    seastar::temporary_buffer<char> buf(encrypted.size());
+    std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
+    seastar::net::packet packet(std::move(buf));
+    return _channel->send(peer, std::move(packet));
+}
+
+std::optional<std::vector<uint8_t>> GossipService::decrypt_packet(const seastar::socket_address& peer,
+                                                                   const uint8_t* data, size_t len) {
+    if (!_dtls_context || !_dtls_context->is_enabled()) {
+        // DTLS not enabled, return data as-is
+        return std::vector<uint8_t>(data, data + len);
+    }
+
+    auto* session = _dtls_context->get_or_create_session(peer, true);  // Server role (received first)
+    if (!session) {
+        log_gossip.debug("Failed to get DTLS session for peer {}", peer);
+        return std::nullopt;
+    }
+
+    // If not established, this is handshake data
+    if (!session->is_established()) {
+        std::vector<uint8_t> response;
+        auto result = session->continue_handshake(data, len, response);
+
+        if (result == DtlsResult::SUCCESS) {
+            ++_dtls_handshakes_completed;
+            log_gossip.info("DTLS handshake completed with peer {}", peer);
+        } else if (result == DtlsResult::ERROR) {
+            ++_dtls_handshakes_failed;
+            log_gossip.error("DTLS handshake failed with peer {}: {}", peer, session->last_error());
+            _dtls_context->remove_session(peer);
+            return std::nullopt;
+        }
+
+        // Send handshake response if any
+        if (!response.empty() && _channel) {
+            seastar::temporary_buffer<char> buf(response.size());
+            std::memcpy(buf.get_write(), response.data(), response.size());
+            seastar::net::packet packet(std::move(buf));
+            (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+                log_gossip.debug("Failed to send DTLS handshake response to {}: {}", peer, ep);
+            });
+        }
+
+        // Handshake data processed, no application data to return
+        return std::nullopt;
+    }
+
+    // Session established, decrypt the data
+    std::vector<uint8_t> decrypted;
+    auto result = session->decrypt(data, len, decrypted);
+    if (result != DtlsResult::SUCCESS) {
+        if (result == DtlsResult::WANT_READ) {
+            // Might be more handshake data, process it
+            std::vector<uint8_t> response;
+            session->continue_handshake(data, len, response);
+            if (!response.empty() && _channel) {
+                seastar::temporary_buffer<char> buf(response.size());
+                std::memcpy(buf.get_write(), response.data(), response.size());
+                seastar::net::packet packet(std::move(buf));
+                (void)_channel->send(peer, std::move(packet));
+            }
+        }
+        return std::nullopt;
+    }
+
+    ++_dtls_packets_decrypted;
+    return decrypted;
+}
+
+seastar::future<> GossipService::handle_dtls_handshake(const seastar::socket_address& peer,
+                                                        const uint8_t* data, size_t len) {
+    // This is called when we receive potential handshake data
+    // The decrypt_packet function handles handshake internally
+    auto result = decrypt_packet(peer, data, len);
+    // If result has value, it's application data that was decrypted after handshake
+    // We ignore it here since handle_packet will call decrypt_packet again
+    return seastar::make_ready_future<>();
+}
+
+void GossipService::check_cert_reload() {
+    if (!_dtls_context) {
+        return;
+    }
+
+    if (_dtls_context->check_and_reload_certs()) {
+        ++_dtls_cert_reloads;
+        log_gossip.info("Certificates reloaded successfully");
+
+        // Re-initiate handshakes with all peers since sessions were cleared
+        for (const auto& peer : _peer_addresses) {
+            auto* session = _dtls_context->get_or_create_session(peer, false);
+            if (session) {
+                std::vector<uint8_t> handshake_data;
+                auto result = session->initiate_handshake(handshake_data);
+                if (result == DtlsResult::WANT_READ && !handshake_data.empty() && _channel) {
+                    ++_dtls_handshakes_started;
+                    seastar::temporary_buffer<char> buf(handshake_data.size());
+                    std::memcpy(buf.get_write(), handshake_data.data(), handshake_data.size());
+                    seastar::net::packet packet(std::move(buf));
+                    (void)_channel->send(peer, std::move(packet));
+                }
+            }
+        }
+    }
+}
+
+void GossipService::cleanup_dtls_sessions() {
+    if (!_dtls_context) {
+        return;
+    }
+
+    // Clean up sessions idle for more than 5 minutes
+    _dtls_context->cleanup_idle_sessions(std::chrono::seconds(300));
 }
 
 }  // namespace ranvier

@@ -243,6 +243,17 @@ enum class DiscoveryType {
     SRV      // Use DNS SRV records (IPs and ports)
 };
 
+// Gossip TLS configuration for mTLS/DTLS encryption
+struct GossipTlsConfig {
+    bool enabled = false;                              // Enable DTLS encryption for gossip
+    std::string cert_path = "";                        // Path to node certificate (PEM)
+    std::string key_path = "";                         // Path to private key (PEM)
+    std::string ca_path = "";                          // Path to CA certificate for peer verification (PEM)
+    bool verify_peer = true;                           // Require mutual TLS (peer certificate verification)
+    std::chrono::seconds cert_reload_interval{300};    // Interval to check for certificate changes (0 = disabled)
+    bool allow_plaintext_fallback = false;             // Allow plaintext if TLS handshake fails (NOT recommended)
+};
+
 // Cluster configuration for distributed mode (gossip-based state sync)
 struct ClusterConfig {
     bool enabled = false;                                  // Enable distributed mode
@@ -262,6 +273,9 @@ struct ClusterConfig {
     std::chrono::milliseconds gossip_ack_timeout{100};     // Timeout before retrying unACK'd packets
     uint32_t gossip_max_retries = 3;                       // Maximum retry attempts before giving up
     size_t gossip_dedup_window = 1000;                     // Size of per-peer sequence window for dedup
+
+    // TLS/DTLS encryption for gossip (mTLS)
+    GossipTlsConfig tls;                                   // DTLS configuration for encrypted gossip
 };
 
 // Kubernetes service discovery configuration
@@ -567,6 +581,28 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<size_t>("RANVIER_CLUSTER_GOSSIP_DEDUP_WINDOW")) {
         cluster.gossip_dedup_window = *v;
+    }
+    // Gossip TLS/DTLS overrides
+    if (auto v = get_env("RANVIER_CLUSTER_TLS_ENABLED")) {
+        cluster.tls.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_TLS_CERT_PATH")) {
+        cluster.tls.cert_path = *v;
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_TLS_KEY_PATH")) {
+        cluster.tls.key_path = *v;
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_TLS_CA_PATH")) {
+        cluster.tls.ca_path = *v;
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_TLS_VERIFY_PEER")) {
+        cluster.tls.verify_peer = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_TLS_CERT_RELOAD_INTERVAL")) {
+        cluster.tls.cert_reload_interval = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_TLS_ALLOW_PLAINTEXT_FALLBACK")) {
+        cluster.tls.allow_plaintext_fallback = (*v == "1" || *v == "true" || *v == "yes");
     }
 
     // K8s discovery overrides
@@ -906,6 +942,31 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (c["gossip_dedup_window"]) {
                 config.cluster.gossip_dedup_window = c["gossip_dedup_window"].as<size_t>();
             }
+            // TLS/DTLS settings for gossip encryption
+            if (c["tls"]) {
+                YAML::Node t = c["tls"];
+                if (t["enabled"]) {
+                    config.cluster.tls.enabled = t["enabled"].as<bool>();
+                }
+                if (t["cert_path"]) {
+                    config.cluster.tls.cert_path = t["cert_path"].as<std::string>();
+                }
+                if (t["key_path"]) {
+                    config.cluster.tls.key_path = t["key_path"].as<std::string>();
+                }
+                if (t["ca_path"]) {
+                    config.cluster.tls.ca_path = t["ca_path"].as<std::string>();
+                }
+                if (t["verify_peer"]) {
+                    config.cluster.tls.verify_peer = t["verify_peer"].as<bool>();
+                }
+                if (t["cert_reload_interval_seconds"]) {
+                    config.cluster.tls.cert_reload_interval = std::chrono::seconds(t["cert_reload_interval_seconds"].as<int>());
+                }
+                if (t["allow_plaintext_fallback"]) {
+                    config.cluster.tls.allow_plaintext_fallback = t["allow_plaintext_fallback"].as<bool>();
+                }
+            }
         }
 
         // K8s discovery section
@@ -1082,6 +1143,21 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
             }
             if (config.cluster.gossip_dedup_window == 0) {
                 return "cluster.gossip_dedup_window must be positive";
+            }
+        }
+        // Validate gossip TLS settings
+        if (config.cluster.tls.enabled) {
+            if (config.cluster.tls.cert_path.empty()) {
+                return "cluster.tls.cert_path is required when gossip TLS is enabled";
+            }
+            if (config.cluster.tls.key_path.empty()) {
+                return "cluster.tls.key_path is required when gossip TLS is enabled";
+            }
+            if (config.cluster.tls.ca_path.empty()) {
+                return "cluster.tls.ca_path is required when gossip TLS is enabled (needed for peer verification)";
+            }
+            if (config.cluster.tls.cert_reload_interval.count() < 0) {
+                return "cluster.tls.cert_reload_interval must be non-negative";
             }
         }
     }

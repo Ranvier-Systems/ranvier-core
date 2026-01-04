@@ -117,6 +117,12 @@ find_package(Seastar QUIET)
 if(Seastar_FOUND)
     message(STATUS "Seastar found - building full server and all tests")
 
+    # OpenSSL Configuration (Required for DTLS gossip encryption)
+    find_package(OpenSSL REQUIRED)
+    message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
+    message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
+    message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
+
     # Tokenizers-CPP Configuration (Downloads it automatically)
     FetchContent_Declare(
       tokenizers_cpp
@@ -131,6 +137,7 @@ if(Seastar_FOUND)
     # Define the Main Server Executable
     add_executable(ranvier_server
       src/main.cpp
+      src/dtls_context.cpp
       src/gossip_service.cpp
       src/health_service.cpp
       src/http_controller.cpp
@@ -170,6 +177,8 @@ if(Seastar_FOUND)
       rapidjson_interface
       absl::flat_hash_map
       absl::flat_hash_set
+      OpenSSL::SSL
+      OpenSSL::Crypto
       ${OTEL_LIBS}
     )
 

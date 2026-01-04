@@ -43,6 +43,14 @@ protected:
         // Client token env vars
         unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
         unsetenv("RANVIER_MAX_TOKEN_ID");
+        // Gossip TLS env vars
+        unsetenv("RANVIER_CLUSTER_TLS_ENABLED");
+        unsetenv("RANVIER_CLUSTER_TLS_CERT_PATH");
+        unsetenv("RANVIER_CLUSTER_TLS_KEY_PATH");
+        unsetenv("RANVIER_CLUSTER_TLS_CA_PATH");
+        unsetenv("RANVIER_CLUSTER_TLS_VERIFY_PEER");
+        unsetenv("RANVIER_CLUSTER_TLS_CERT_RELOAD_INTERVAL");
+        unsetenv("RANVIER_CLUSTER_TLS_ALLOW_PLAINTEXT_FALLBACK");
     }
 
     void TearDown() override {
@@ -52,6 +60,7 @@ protected:
         std::remove("test_invalid.yaml");
         std::remove("test_cluster.yaml");
         std::remove("test_dns_discovery.yaml");
+        std::remove("test_gossip_tls.yaml");
     }
 
     void writeTestConfig(const std::string& filename, const std::string& content) {
@@ -1176,6 +1185,269 @@ auth:
     auto [valid, name] = config2.auth.validate_token("rnv_key2");
     EXPECT_TRUE(valid);
     EXPECT_EQ(name, "key2");
+}
+
+// =============================================================================
+// Gossip TLS/DTLS Configuration Tests
+// =============================================================================
+
+TEST_F(ConfigTest, GossipTlsConfigDefaults) {
+    GossipTlsConfig tls;
+
+    EXPECT_FALSE(tls.enabled);
+    EXPECT_EQ(tls.cert_path, "");
+    EXPECT_EQ(tls.key_path, "");
+    EXPECT_EQ(tls.ca_path, "");
+    EXPECT_TRUE(tls.verify_peer);
+    EXPECT_EQ(tls.cert_reload_interval.count(), 300);
+    EXPECT_FALSE(tls.allow_plaintext_fallback);
+}
+
+TEST_F(ConfigTest, GossipTlsInClusterConfigDefaults) {
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_FALSE(config.cluster.tls.enabled);
+    EXPECT_EQ(config.cluster.tls.cert_path, "");
+    EXPECT_EQ(config.cluster.tls.key_path, "");
+    EXPECT_EQ(config.cluster.tls.ca_path, "");
+    EXPECT_TRUE(config.cluster.tls.verify_peer);
+    EXPECT_EQ(config.cluster.tls.cert_reload_interval.count(), 300);
+    EXPECT_FALSE(config.cluster.tls.allow_plaintext_fallback);
+}
+
+TEST_F(ConfigTest, GossipTlsFromYaml) {
+    writeTestConfig("test_gossip_tls.yaml", R"(
+cluster:
+  enabled: true
+  gossip_port: 9190
+  tls:
+    enabled: true
+    cert_path: "/certs/node.crt"
+    key_path: "/certs/node.key"
+    ca_path: "/certs/ca.crt"
+    verify_peer: true
+    cert_reload_interval_seconds: 600
+    allow_plaintext_fallback: false
+)");
+
+    auto config = RanvierConfig::load("test_gossip_tls.yaml");
+
+    EXPECT_TRUE(config.cluster.enabled);
+    EXPECT_TRUE(config.cluster.tls.enabled);
+    EXPECT_EQ(config.cluster.tls.cert_path, "/certs/node.crt");
+    EXPECT_EQ(config.cluster.tls.key_path, "/certs/node.key");
+    EXPECT_EQ(config.cluster.tls.ca_path, "/certs/ca.crt");
+    EXPECT_TRUE(config.cluster.tls.verify_peer);
+    EXPECT_EQ(config.cluster.tls.cert_reload_interval.count(), 600);
+    EXPECT_FALSE(config.cluster.tls.allow_plaintext_fallback);
+}
+
+TEST_F(ConfigTest, GossipTlsWithPlaintextFallback) {
+    writeTestConfig("test_gossip_tls.yaml", R"(
+cluster:
+  enabled: true
+  tls:
+    enabled: true
+    cert_path: "/certs/node.crt"
+    key_path: "/certs/node.key"
+    ca_path: "/certs/ca.crt"
+    verify_peer: false
+    allow_plaintext_fallback: true
+)");
+
+    auto config = RanvierConfig::load("test_gossip_tls.yaml");
+
+    EXPECT_TRUE(config.cluster.tls.enabled);
+    EXPECT_FALSE(config.cluster.tls.verify_peer);
+    EXPECT_TRUE(config.cluster.tls.allow_plaintext_fallback);
+}
+
+TEST_F(ConfigTest, GossipTlsEnvironmentVariables) {
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "true", 1);
+    setenv("RANVIER_CLUSTER_TLS_CERT_PATH", "/env/node.crt", 1);
+    setenv("RANVIER_CLUSTER_TLS_KEY_PATH", "/env/node.key", 1);
+    setenv("RANVIER_CLUSTER_TLS_CA_PATH", "/env/ca.crt", 1);
+    setenv("RANVIER_CLUSTER_TLS_VERIFY_PEER", "false", 1);
+    setenv("RANVIER_CLUSTER_TLS_CERT_RELOAD_INTERVAL", "120", 1);
+    setenv("RANVIER_CLUSTER_TLS_ALLOW_PLAINTEXT_FALLBACK", "true", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_TRUE(config.cluster.tls.enabled);
+    EXPECT_EQ(config.cluster.tls.cert_path, "/env/node.crt");
+    EXPECT_EQ(config.cluster.tls.key_path, "/env/node.key");
+    EXPECT_EQ(config.cluster.tls.ca_path, "/env/ca.crt");
+    EXPECT_FALSE(config.cluster.tls.verify_peer);
+    EXPECT_EQ(config.cluster.tls.cert_reload_interval.count(), 120);
+    EXPECT_TRUE(config.cluster.tls.allow_plaintext_fallback);
+}
+
+TEST_F(ConfigTest, GossipTlsEnvOverridesYaml) {
+    writeTestConfig("test_gossip_tls.yaml", R"(
+cluster:
+  enabled: true
+  tls:
+    enabled: false
+    cert_path: "/yaml/node.crt"
+    key_path: "/yaml/node.key"
+    ca_path: "/yaml/ca.crt"
+)");
+
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "1", 1);
+    setenv("RANVIER_CLUSTER_TLS_CERT_PATH", "/env/override.crt", 1);
+
+    auto config = RanvierConfig::load("test_gossip_tls.yaml");
+
+    // Env vars override YAML
+    EXPECT_TRUE(config.cluster.tls.enabled);
+    EXPECT_EQ(config.cluster.tls.cert_path, "/env/override.crt");
+    // Non-overridden values from YAML
+    EXPECT_EQ(config.cluster.tls.key_path, "/yaml/node.key");
+    EXPECT_EQ(config.cluster.tls.ca_path, "/yaml/ca.crt");
+}
+
+TEST_F(ConfigTest, GossipTlsEnabledAcceptsMultipleValues) {
+    // Test "1"
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "1", 1);
+    auto config1 = RanvierConfig::defaults();
+    EXPECT_TRUE(config1.cluster.tls.enabled);
+
+    // Test "yes"
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "yes", 1);
+    auto config2 = RanvierConfig::defaults();
+    EXPECT_TRUE(config2.cluster.tls.enabled);
+
+    // Test "true"
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "true", 1);
+    auto config3 = RanvierConfig::defaults();
+    EXPECT_TRUE(config3.cluster.tls.enabled);
+
+    // Test "false" (should be false)
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "false", 1);
+    auto config4 = RanvierConfig::defaults();
+    EXPECT_FALSE(config4.cluster.tls.enabled);
+
+    // Test "0" (should be false)
+    setenv("RANVIER_CLUSTER_TLS_ENABLED", "0", 1);
+    auto config5 = RanvierConfig::defaults();
+    EXPECT_FALSE(config5.cluster.tls.enabled);
+}
+
+TEST_F(ConfigTest, GossipTlsDisabledByDefault) {
+    writeTestConfig("test_gossip_tls.yaml", R"(
+cluster:
+  enabled: true
+  gossip_port: 9190
+)");
+
+    auto config = RanvierConfig::load("test_gossip_tls.yaml");
+
+    // TLS should be disabled if not specified
+    EXPECT_FALSE(config.cluster.tls.enabled);
+}
+
+// =============================================================================
+// Gossip TLS Validation Tests
+// =============================================================================
+
+TEST_F(ConfigTest, ValidationFailsForGossipTlsWithoutCertPath) {
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.cluster.gossip_port = 9190;
+    config.cluster.gossip_interval = std::chrono::milliseconds(1000);
+    config.cluster.gossip_heartbeat_interval = std::chrono::seconds(5);
+    config.cluster.gossip_peer_timeout = std::chrono::seconds(15);
+    config.cluster.tls.enabled = true;
+    config.cluster.tls.cert_path = "";  // Missing!
+    config.cluster.tls.key_path = "/certs/node.key";
+    config.cluster.tls.ca_path = "/certs/ca.crt";
+
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("cert_path"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationFailsForGossipTlsWithoutKeyPath) {
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.cluster.gossip_port = 9190;
+    config.cluster.gossip_interval = std::chrono::milliseconds(1000);
+    config.cluster.gossip_heartbeat_interval = std::chrono::seconds(5);
+    config.cluster.gossip_peer_timeout = std::chrono::seconds(15);
+    config.cluster.tls.enabled = true;
+    config.cluster.tls.cert_path = "/certs/node.crt";
+    config.cluster.tls.key_path = "";  // Missing!
+    config.cluster.tls.ca_path = "/certs/ca.crt";
+
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("key_path"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationFailsForGossipTlsWithoutCaPath) {
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.cluster.gossip_port = 9190;
+    config.cluster.gossip_interval = std::chrono::milliseconds(1000);
+    config.cluster.gossip_heartbeat_interval = std::chrono::seconds(5);
+    config.cluster.gossip_peer_timeout = std::chrono::seconds(15);
+    config.cluster.tls.enabled = true;
+    config.cluster.tls.cert_path = "/certs/node.crt";
+    config.cluster.tls.key_path = "/certs/node.key";
+    config.cluster.tls.ca_path = "";  // Missing!
+
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("ca_path"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationPassesForValidGossipTlsConfig) {
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.cluster.gossip_port = 9190;
+    config.cluster.gossip_interval = std::chrono::milliseconds(1000);
+    config.cluster.gossip_heartbeat_interval = std::chrono::seconds(5);
+    config.cluster.gossip_peer_timeout = std::chrono::seconds(15);
+    config.cluster.tls.enabled = true;
+    config.cluster.tls.cert_path = "/certs/node.crt";
+    config.cluster.tls.key_path = "/certs/node.key";
+    config.cluster.tls.ca_path = "/certs/ca.crt";
+
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidationPassesForDisabledGossipTls) {
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.cluster.gossip_port = 9190;
+    config.cluster.gossip_interval = std::chrono::milliseconds(1000);
+    config.cluster.gossip_heartbeat_interval = std::chrono::seconds(5);
+    config.cluster.gossip_peer_timeout = std::chrono::seconds(15);
+    config.cluster.tls.enabled = false;  // Disabled, so paths not required
+    config.cluster.tls.cert_path = "";
+    config.cluster.tls.key_path = "";
+    config.cluster.tls.ca_path = "";
+
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidationPassesForZeroCertReloadInterval) {
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.cluster.gossip_port = 9190;
+    config.cluster.gossip_interval = std::chrono::milliseconds(1000);
+    config.cluster.gossip_heartbeat_interval = std::chrono::seconds(5);
+    config.cluster.gossip_peer_timeout = std::chrono::seconds(15);
+    config.cluster.tls.enabled = true;
+    config.cluster.tls.cert_path = "/certs/node.crt";
+    config.cluster.tls.key_path = "/certs/node.key";
+    config.cluster.tls.ca_path = "/certs/ca.crt";
+    config.cluster.tls.cert_reload_interval = std::chrono::seconds(0);  // Disabled reload
+
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
 }
 
 int main(int argc, char** argv) {
