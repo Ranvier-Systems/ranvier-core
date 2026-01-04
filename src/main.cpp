@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <boost/program_options.hpp>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
@@ -853,5 +854,13 @@ For more information, see: https://github.com/ranvier-systems/ranvier-core
     }
 
     app_template app;
+
+    // Register our custom options with Seastar so they're recognized
+    // (We already parsed them above, but Seastar needs to know they exist)
+    app.add_options()
+        ("config", boost::program_options::value<std::string>()->default_value("ranvier.yaml"),
+         "Path to configuration file")
+        ("dry-run", "Validate configuration and exit (no server start)");
+
     return app.run(argc, argv, run);
 }
