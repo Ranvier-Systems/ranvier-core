@@ -416,6 +416,7 @@ _Move completed items here with completion date and PR reference._
 | 2025-01-03 | Add per-backend latency histograms (Prometheus) | - |
 | 2025-01-02 | Add reliable delivery with acknowledgments (gossip protocol) | - |
 | 2025-01-02 | Implement duplicate suppression (gossip protocol) | - |
+| 2025-01-02 | OpenTelemetry distributed tracing integration | - |
 | 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
 | 2025-01-01 | Fix: Persistence state corruption after crash | - |
 | 2024-12-XX | Accept pre-tokenized client input | #50 |
