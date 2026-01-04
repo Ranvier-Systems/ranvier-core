@@ -59,13 +59,14 @@ jobs:
             type=raw,value={{date 'YYYYMMDD'}}
 
       # Build base image (this takes ~20-30 min due to Seastar compilation)
+      # Multi-arch: amd64 for Lambda Labs/servers, arm64 for Apple Silicon Macs
       - name: Build and push base image
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.base
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
