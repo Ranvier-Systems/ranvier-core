@@ -19,12 +19,18 @@ Design Philosophy:
 - Path Compression: Every node stores a prefix vector to skip checking individual nodes
 - Adaptive Nodes: Node4 → Node16 → Node48 → Node256 based on child count
 - Zero-Copy Lookups: Uses std::span<int32_t> for the lookup key
+- Unique Ownership: Uses std::unique_ptr for node ownership (Seastar shared-nothing model)
 
 Node Types:
 - Node4:   1-4 children,   linear search through keys vector
 - Node16:  5-16 children,  linear search (SIMD-friendly in production)
 - Node48:  17-48 children, 256-byte index array → 48 child pointers
 - Node256: 49-256 children, direct 256-element array
+
+Memory Model:
+- RadixTree instances are thread-local (owned uniquely by RouterService on each shard)
+- No cross-thread sharing, so std::unique_ptr is used instead of std::shared_ptr
+- This eliminates atomic reference counting overhead (lock xadd instructions)
 */
 
 namespace ranvier {
@@ -72,7 +78,7 @@ struct Node {
 // Linear search through keys, most memory efficient for sparse branching
 struct Node4 : public Node {
     std::vector<TokenId> keys;
-    std::vector<std::shared_ptr<Node>> children;
+    std::vector<std::unique_ptr<Node>> children;
 
     Node4() : Node(NodeType::Node4) {
         keys.reserve(4);
@@ -84,7 +90,7 @@ struct Node4 : public Node {
 // Linear search, but SIMD-friendly layout for production optimization
 struct Node16 : public Node {
     std::vector<TokenId> keys;
-    std::vector<std::shared_ptr<Node>> children;
+    std::vector<std::unique_ptr<Node>> children;
 
     Node16() : Node(NodeType::Node16) {
         keys.reserve(16);
@@ -99,7 +105,7 @@ struct Node48 : public Node {
     static constexpr uint8_t EMPTY_MARKER = 255;
 
     std::array<uint8_t, 256> index;          // Maps key byte → child position
-    std::vector<std::shared_ptr<Node>> children;  // Up to 48 children
+    std::vector<std::unique_ptr<Node>> children;  // Up to 48 children
     std::vector<TokenId> keys;               // Track original keys for iteration
 
     Node48() : Node(NodeType::Node48) {
@@ -112,10 +118,10 @@ struct Node48 : public Node {
 // Node256: Largest node (49-256 children)
 // Direct array lookup, O(1) access but uses most memory
 struct Node256 : public Node {
-    std::array<std::shared_ptr<Node>, 256> children;
+    std::array<std::unique_ptr<Node>, 256> children;
 
     Node256() : Node(NodeType::Node256) {
-        children.fill(nullptr);
+        // unique_ptrs are default-initialized to nullptr
     }
 };
 
@@ -132,7 +138,7 @@ class RadixTree {
 public:
     explicit RadixTree(uint32_t block_alignment = 16)
         : block_alignment_(block_alignment) {
-        root = std::make_shared<Node4>();
+        root_ = std::make_unique<Node4>();
     }
 
     // INSERT - O(k) where k is the number of tokens
@@ -146,13 +152,13 @@ public:
             return;  // Not enough tokens for a full block
         }
         auto aligned_tokens = tokens.subspan(0, aligned_len);
-        root = insert_recursive(root, aligned_tokens, backend, origin);
+        root_ = insert_recursive(std::move(root_), aligned_tokens, backend, origin);
         route_count_++;
     }
 
     // LOOKUP - Returns the BackendId if found, or nullopt
     std::optional<BackendId> lookup(std::span<const TokenId> tokens) {
-        return lookup_recursive(root, tokens);
+        return lookup_recursive(root_.get(), tokens);
     }
 
     // Get approximate route count (may be slightly inaccurate due to overwrites)
@@ -165,14 +171,14 @@ public:
     template<typename Callback>
     void for_each_leaf(Callback&& callback) const {
         std::vector<TokenId> path;
-        for_each_leaf_recursive(root, path, std::forward<Callback>(callback));
+        for_each_leaf_recursive(root_.get(), path, std::forward<Callback>(callback));
     }
 
     // Remove routes older than the given time point
     // Returns the number of routes removed
     size_t remove_expired(std::chrono::steady_clock::time_point cutoff) {
         size_t removed = 0;
-        remove_expired_recursive(root, cutoff, removed);
+        remove_expired_recursive(root_.get(), cutoff, removed);
         route_count_ = (route_count_ > removed) ? route_count_ - removed : 0;
         return removed;
     }
@@ -180,7 +186,7 @@ public:
     // Evict the oldest route (for LRU eviction when at capacity)
     // Returns true if a route was evicted
     bool evict_oldest() {
-        if (find_and_remove_oldest(root)) {
+        if (find_and_remove_oldest(root_.get())) {
             if (route_count_ > 0) route_count_--;
             return true;
         }
@@ -192,7 +198,7 @@ public:
     // Returns true if a route was evicted
     bool evict_oldest_remote() {
         // First try to evict oldest remote route
-        if (find_and_remove_oldest_by_origin(root, RouteOrigin::REMOTE)) {
+        if (find_and_remove_oldest_by_origin(root_.get(), RouteOrigin::REMOTE)) {
             if (route_count_ > 0) route_count_--;
             return true;
         }
@@ -205,13 +211,13 @@ public:
     // Returns the number of routes removed
     size_t remove_routes_by_backend(BackendId backend, RouteOrigin origin) {
         size_t removed = 0;
-        remove_routes_by_backend_recursive(root, backend, origin, removed);
+        remove_routes_by_backend_recursive(root_.get(), backend, origin, removed);
         route_count_ = (route_count_ > removed) ? route_count_ - removed : 0;
         return removed;
     }
 
 private:
-    std::shared_ptr<Node> root;
+    std::unique_ptr<Node> root_;
     uint32_t block_alignment_;  // vLLM PagedAttention block size
     size_t route_count_ = 0;
 
@@ -221,7 +227,8 @@ private:
     }
 
     // Recursive Insert Logic
-    std::shared_ptr<Node> insert_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens,
+    // Takes ownership of node via unique_ptr, returns (possibly new) node
+    std::unique_ptr<Node> insert_recursive(std::unique_ptr<Node> node, std::span<const TokenId> tokens,
                                            BackendId backend, RouteOrigin origin) {
         // 1. Calculate matching prefix length
         size_t match_len = 0;
@@ -232,7 +239,7 @@ private:
 
         // CASE A: Prefix mismatch - need to split
         if (match_len < node->prefix.size()) {
-            split_node(node, match_len);
+            split_node(node.get(), match_len);
         }
 
         auto remaining_tokens = tokens.subspan(match_len);
@@ -247,150 +254,190 @@ private:
 
         // CASE C: Need to traverse to a child
         TokenId next_token = remaining_tokens[0];
-        auto child = find_child(node, next_token);
+        Node* child = find_child(node.get(), next_token);
 
         if (child) {
-            auto new_child = insert_recursive(child, remaining_tokens.subspan(1), backend, origin);
-            if (new_child != child) {
-                set_child(node, next_token, new_child);
-            }
+            // Child exists - need to extract, recurse, and replace
+            auto child_ptr = extract_child(node.get(), next_token);
+            auto new_child = insert_recursive(std::move(child_ptr), remaining_tokens.subspan(1), backend, origin);
+            set_child(node.get(), next_token, std::move(new_child));
         } else {
-            auto new_child = std::make_shared<Node4>();
+            // Create new child
+            auto new_child = std::make_unique<Node4>();
             if (remaining_tokens.size() > 1) {
                 auto suffix = remaining_tokens.subspan(1);
                 new_child->prefix.assign(suffix.begin(), suffix.end());
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;
-            node = add_child(node, next_token, new_child);
+            node = add_child(std::move(node), next_token, std::move(new_child));
         }
         return node;
     }
 
-    // Find child by TokenID
-    std::shared_ptr<Node> find_child(std::shared_ptr<Node> node, TokenId key) {
+    // Find child by TokenID - returns raw pointer (no ownership transfer)
+    Node* find_child(Node* node, TokenId key) const {
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return n->children[i];
+                    if (n->keys[i] == key) return n->children[i].get();
                 }
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return n->children[i];
+                    if (n->keys[i] == key) return n->children[i].get();
                 }
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
                 if (idx != Node48::EMPTY_MARKER) {
-                    return n->children[idx];
+                    return n->children[idx].get();
                 }
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
-                return n->children[key_byte(key)];
+                auto* n = static_cast<Node256*>(node);
+                return n->children[key_byte(key)].get();
             }
         }
         return nullptr;
     }
 
-    // Set/update a child pointer
-    void set_child(std::shared_ptr<Node> node, TokenId key, std::shared_ptr<Node> child) {
+    // Extract child ownership by TokenID - removes and returns the unique_ptr
+    std::unique_ptr<Node> extract_child(Node* node, TokenId key) {
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 for (size_t i = 0; i < n->keys.size(); i++) {
                     if (n->keys[i] == key) {
-                        n->children[i] = child;
+                        return std::move(n->children[i]);
+                    }
+                }
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        return std::move(n->children[i]);
+                    }
+                }
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node);
+                uint8_t idx = n->index[key_byte(key)];
+                if (idx != Node48::EMPTY_MARKER) {
+                    return std::move(n->children[idx]);
+                }
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node);
+                return std::move(n->children[key_byte(key)]);
+            }
+        }
+        return nullptr;
+    }
+
+    // Set/update a child pointer - takes ownership
+    void set_child(Node* node, TokenId key, std::unique_ptr<Node> child) {
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        n->children[i] = std::move(child);
                         return;
                     }
                 }
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 for (size_t i = 0; i < n->keys.size(); i++) {
                     if (n->keys[i] == key) {
-                        n->children[i] = child;
+                        n->children[i] = std::move(child);
                         return;
                     }
                 }
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
                 if (idx != Node48::EMPTY_MARKER) {
-                    n->children[idx] = child;
+                    n->children[idx] = std::move(child);
                 }
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
-                n->children[key_byte(key)] = child;
+                auto* n = static_cast<Node256*>(node);
+                n->children[key_byte(key)] = std::move(child);
                 break;
             }
         }
     }
 
-    // Add child with automatic node growth
-    std::shared_ptr<Node> add_child(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
+    // Add child with automatic node growth - takes ownership of both parent and child
+    std::unique_ptr<Node> add_child(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
         switch (parent->type) {
             case NodeType::Node4: {
                 auto* n4 = static_cast<Node4*>(parent.get());
                 if (n4->keys.size() < 4) {
                     n4->keys.push_back(key);
-                    n4->children.push_back(child);
+                    n4->children.push_back(std::move(child));
                     return parent;
                 }
                 // Grow: Node4 → Node16
-                return grow_node4_to_node16(parent, key, child);
+                return grow_node4_to_node16(std::move(parent), key, std::move(child));
             }
             case NodeType::Node16: {
                 auto* n16 = static_cast<Node16*>(parent.get());
                 if (n16->keys.size() < 16) {
                     n16->keys.push_back(key);
-                    n16->children.push_back(child);
+                    n16->children.push_back(std::move(child));
                     return parent;
                 }
                 // Grow: Node16 → Node48
-                return grow_node16_to_node48(parent, key, child);
+                return grow_node16_to_node48(std::move(parent), key, std::move(child));
             }
             case NodeType::Node48: {
                 auto* n48 = static_cast<Node48*>(parent.get());
                 if (n48->children.size() < 48) {
                     uint8_t pos = static_cast<uint8_t>(n48->children.size());
                     n48->index[key_byte(key)] = pos;
-                    n48->children.push_back(child);
+                    n48->children.push_back(std::move(child));
                     n48->keys.push_back(key);
                     return parent;
                 }
                 // Grow: Node48 → Node256
-                return grow_node48_to_node256(parent, key, child);
+                return grow_node48_to_node256(std::move(parent), key, std::move(child));
             }
             case NodeType::Node256: {
                 auto* n256 = static_cast<Node256*>(parent.get());
-                n256->children[key_byte(key)] = child;
+                n256->children[key_byte(key)] = std::move(child);
                 return parent;
             }
         }
         return parent;
     }
 
-    // Growth functions
-    std::shared_ptr<Node> grow_node4_to_node16(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
+    // Growth functions - take ownership and return new node
+    std::unique_ptr<Node> grow_node4_to_node16(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
         auto* n4 = static_cast<Node4*>(parent.get());
-        auto n16 = std::make_shared<Node16>();
+        auto n16 = std::make_unique<Node16>();
 
         // Copy metadata
         n16->prefix = std::move(n4->prefix);
         n16->leaf_value = n4->leaf_value;
+        n16->origin = n4->origin;
+        n16->last_accessed = n4->last_accessed;
 
         // Migrate existing children
         n16->keys = std::move(n4->keys);
@@ -398,57 +445,61 @@ private:
 
         // Add new child
         n16->keys.push_back(key);
-        n16->children.push_back(child);
+        n16->children.push_back(std::move(child));
 
         return n16;
     }
 
-    std::shared_ptr<Node> grow_node16_to_node48(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
+    std::unique_ptr<Node> grow_node16_to_node48(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
         auto* n16 = static_cast<Node16*>(parent.get());
-        auto n48 = std::make_shared<Node48>();
+        auto n48 = std::make_unique<Node48>();
 
         // Copy metadata
         n48->prefix = std::move(n16->prefix);
         n48->leaf_value = n16->leaf_value;
+        n48->origin = n16->origin;
+        n48->last_accessed = n16->last_accessed;
 
         // Migrate existing children
         for (size_t i = 0; i < n16->keys.size(); i++) {
             n48->index[key_byte(n16->keys[i])] = static_cast<uint8_t>(i);
-            n48->children.push_back(n16->children[i]);
+            n48->children.push_back(std::move(n16->children[i]));
             n48->keys.push_back(n16->keys[i]);
         }
 
         // Add new child
         uint8_t pos = static_cast<uint8_t>(n48->children.size());
         n48->index[key_byte(key)] = pos;
-        n48->children.push_back(child);
+        n48->children.push_back(std::move(child));
         n48->keys.push_back(key);
 
         return n48;
     }
 
-    std::shared_ptr<Node> grow_node48_to_node256(std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child) {
+    std::unique_ptr<Node> grow_node48_to_node256(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
         auto* n48 = static_cast<Node48*>(parent.get());
-        auto n256 = std::make_shared<Node256>();
+        auto n256 = std::make_unique<Node256>();
 
         // Copy metadata
         n256->prefix = std::move(n48->prefix);
         n256->leaf_value = n48->leaf_value;
+        n256->origin = n48->origin;
+        n256->last_accessed = n48->last_accessed;
 
         // Migrate existing children using the index array
         for (size_t i = 0; i < n48->keys.size(); i++) {
-            n256->children[key_byte(n48->keys[i])] = n48->children[i];
+            n256->children[key_byte(n48->keys[i])] = std::move(n48->children[i]);
         }
 
         // Add new child
-        n256->children[key_byte(key)] = child;
+        n256->children[key_byte(key)] = std::move(child);
 
         return n256;
     }
 
-    // Split a node's prefix
-    void split_node(std::shared_ptr<Node> node, size_t split_point) {
-        auto new_child = std::make_shared<Node4>();
+    // Split a node's prefix - operates on raw pointer (modifies in place)
+    void split_node(Node* node, size_t split_point) {
+        auto new_child = std::make_unique<Node4>();
 
         TokenId split_edge_key = node->prefix[split_point];
 
@@ -462,12 +513,14 @@ private:
 
         // Move leaf value and children to new child
         new_child->leaf_value = node->leaf_value;
+        new_child->origin = node->origin;
+        new_child->last_accessed = node->last_accessed;
         node->leaf_value = std::nullopt;
 
         // Move children based on node type
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n4 = static_cast<Node4*>(node.get());
+                auto* n4 = static_cast<Node4*>(node);
                 auto* new_n4 = static_cast<Node4*>(new_child.get());
                 new_n4->keys = std::move(n4->keys);
                 new_n4->children = std::move(n4->children);
@@ -476,7 +529,7 @@ private:
                 break;
             }
             case NodeType::Node16: {
-                auto* n16 = static_cast<Node16*>(node.get());
+                auto* n16 = static_cast<Node16*>(node);
                 auto* new_n4 = static_cast<Node4*>(new_child.get());
                 // Node16 becomes Node4 after split (only 1 child)
                 new_n4->keys = std::move(n16->keys);
@@ -486,7 +539,7 @@ private:
                 break;
             }
             case NodeType::Node48: {
-                auto* n48 = static_cast<Node48*>(node.get());
+                auto* n48 = static_cast<Node48*>(node);
                 auto* new_n4 = static_cast<Node4*>(new_child.get());
                 new_n4->keys = std::move(n48->keys);
                 new_n4->children = std::move(n48->children);
@@ -497,13 +550,12 @@ private:
             }
             case NodeType::Node256: {
                 // For Node256 split, we need to collect all children
-                auto* n256 = static_cast<Node256*>(node.get());
+                auto* n256 = static_cast<Node256*>(node);
                 auto* new_n4 = static_cast<Node4*>(new_child.get());
                 for (int i = 0; i < 256; i++) {
                     if (n256->children[i]) {
                         new_n4->keys.push_back(static_cast<TokenId>(i));
-                        new_n4->children.push_back(n256->children[i]);
-                        n256->children[i] = nullptr;
+                        new_n4->children.push_back(std::move(n256->children[i]));
                     }
                 }
                 break;
@@ -516,34 +568,34 @@ private:
         // Add new_child to parent (parent now has only 1 child after split)
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n4 = static_cast<Node4*>(node.get());
+                auto* n4 = static_cast<Node4*>(node);
                 n4->keys.push_back(split_edge_key);
-                n4->children.push_back(new_child);
+                n4->children.push_back(std::move(new_child));
                 break;
             }
             case NodeType::Node16: {
-                auto* n16 = static_cast<Node16*>(node.get());
+                auto* n16 = static_cast<Node16*>(node);
                 n16->keys.push_back(split_edge_key);
-                n16->children.push_back(new_child);
+                n16->children.push_back(std::move(new_child));
                 break;
             }
             case NodeType::Node48: {
-                auto* n48 = static_cast<Node48*>(node.get());
+                auto* n48 = static_cast<Node48*>(node);
                 n48->index[key_byte(split_edge_key)] = 0;
-                n48->children.push_back(new_child);
+                n48->children.push_back(std::move(new_child));
                 n48->keys.push_back(split_edge_key);
                 break;
             }
             case NodeType::Node256: {
-                auto* n256 = static_cast<Node256*>(node.get());
-                n256->children[key_byte(split_edge_key)] = new_child;
+                auto* n256 = static_cast<Node256*>(node);
+                n256->children[key_byte(split_edge_key)] = std::move(new_child);
                 break;
             }
         }
     }
 
-    // Recursive lookup
-    std::optional<BackendId> lookup_recursive(std::shared_ptr<Node> node, std::span<const TokenId> tokens) {
+    // Recursive lookup - uses raw pointers (no ownership transfer)
+    std::optional<BackendId> lookup_recursive(Node* node, std::span<const TokenId> tokens) {
         // Check prefix match
         size_t match_len = 0;
         while (match_len < node->prefix.size() && match_len < tokens.size()) {
@@ -559,7 +611,7 @@ private:
         // Try to go deeper
         if (!remaining.empty()) {
             TokenId next_token = remaining[0];
-            auto child = find_child(node, next_token);
+            Node* child = find_child(node, next_token);
 
             if (child) {
                 auto result = lookup_recursive(child, remaining.subspan(1));
@@ -580,9 +632,9 @@ private:
         return node->leaf_value;
     }
 
-    // Helper: Traverse all leaves recursively
+    // Helper: Traverse all leaves recursively - uses raw pointers
     template<typename Callback>
-    void for_each_leaf_recursive(std::shared_ptr<Node> node, std::vector<TokenId>& path, Callback&& callback) const {
+    void for_each_leaf_recursive(Node* node, std::vector<TokenId>& path, Callback&& callback) const {
         if (!node) return;
 
         // Add this node's prefix to path
@@ -603,33 +655,33 @@ private:
         auto visit_children = [&](auto& keys, auto& children) {
             for (size_t i = 0; i < keys.size(); i++) {
                 path.push_back(keys[i]);
-                for_each_leaf_recursive(children[i], path, callback);
+                for_each_leaf_recursive(children[i].get(), path, callback);
                 path.pop_back();
             }
         };
 
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 visit_children(n->keys, n->children);
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 visit_children(n->keys, n->children);
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 visit_children(n->keys, n->children);
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
+                auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
                     if (n->children[i]) {
                         path.push_back(static_cast<TokenId>(i));
-                        for_each_leaf_recursive(n->children[i], path, callback);
+                        for_each_leaf_recursive(n->children[i].get(), path, callback);
                         path.pop_back();
                     }
                 }
@@ -641,8 +693,8 @@ private:
         path.resize(prefix_start);
     }
 
-    // Helper: Remove expired leaf values recursively
-    void remove_expired_recursive(std::shared_ptr<Node> node, std::chrono::steady_clock::time_point cutoff, size_t& removed) {
+    // Helper: Remove expired leaf values recursively - uses raw pointers
+    void remove_expired_recursive(Node* node, std::chrono::steady_clock::time_point cutoff, size_t& removed) {
         if (!node) return;
 
         // Check if this node's leaf value is expired
@@ -655,29 +707,29 @@ private:
         auto visit_children = [&](auto& children) {
             for (auto& child : children) {
                 if (child) {
-                    remove_expired_recursive(child, cutoff, removed);
+                    remove_expired_recursive(child.get(), cutoff, removed);
                 }
             }
         };
 
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
+                auto* n = static_cast<Node256*>(node);
                 visit_children(n->children);
                 break;
             }
@@ -686,10 +738,10 @@ private:
 
     // Helper: Find and remove the oldest leaf value
     // Returns true if a leaf was removed
-    bool find_and_remove_oldest(std::shared_ptr<Node> node) {
+    bool find_and_remove_oldest(Node* node) {
         if (!node) return false;
 
-        std::shared_ptr<Node> oldest_node = nullptr;
+        Node* oldest_node = nullptr;
         std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::time_point::max();
 
         // Find the oldest leaf
@@ -705,10 +757,10 @@ private:
 
     // Helper: Find and remove the oldest leaf value with specific origin
     // Returns true if a leaf was removed
-    bool find_and_remove_oldest_by_origin(std::shared_ptr<Node> node, RouteOrigin target_origin) {
+    bool find_and_remove_oldest_by_origin(Node* node, RouteOrigin target_origin) {
         if (!node) return false;
 
-        std::shared_ptr<Node> oldest_node = nullptr;
+        Node* oldest_node = nullptr;
         std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::time_point::max();
 
         // Find the oldest leaf with matching origin
@@ -722,8 +774,8 @@ private:
         return false;
     }
 
-    // Helper: Find the oldest leaf node
-    void find_oldest_recursive(std::shared_ptr<Node> node, std::shared_ptr<Node>& oldest_node,
+    // Helper: Find the oldest leaf node - uses raw pointers
+    void find_oldest_recursive(Node* node, Node*& oldest_node,
                                std::chrono::steady_clock::time_point& oldest_time) {
         if (!node) return;
 
@@ -737,37 +789,37 @@ private:
         auto visit_children = [&](auto& children) {
             for (auto& child : children) {
                 if (child) {
-                    find_oldest_recursive(child, oldest_node, oldest_time);
+                    find_oldest_recursive(child.get(), oldest_node, oldest_time);
                 }
             }
         };
 
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
+                auto* n = static_cast<Node256*>(node);
                 visit_children(n->children);
                 break;
             }
         }
     }
 
-    // Helper: Find the oldest leaf node with specific origin
-    void find_oldest_by_origin_recursive(std::shared_ptr<Node> node, std::shared_ptr<Node>& oldest_node,
+    // Helper: Find the oldest leaf node with specific origin - uses raw pointers
+    void find_oldest_by_origin_recursive(Node* node, Node*& oldest_node,
                                          std::chrono::steady_clock::time_point& oldest_time,
                                          RouteOrigin target_origin) {
         if (!node) return;
@@ -784,37 +836,37 @@ private:
         auto visit_children = [&](auto& children) {
             for (auto& child : children) {
                 if (child) {
-                    find_oldest_by_origin_recursive(child, oldest_node, oldest_time, target_origin);
+                    find_oldest_by_origin_recursive(child.get(), oldest_node, oldest_time, target_origin);
                 }
             }
         };
 
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
+                auto* n = static_cast<Node256*>(node);
                 visit_children(n->children);
                 break;
             }
         }
     }
 
-    // Helper: Remove routes matching a specific backend and origin
-    void remove_routes_by_backend_recursive(std::shared_ptr<Node> node, BackendId backend,
+    // Helper: Remove routes matching a specific backend and origin - uses raw pointers
+    void remove_routes_by_backend_recursive(Node* node, BackendId backend,
                                             RouteOrigin target_origin, size_t& removed) {
         if (!node) return;
 
@@ -830,29 +882,29 @@ private:
         auto visit_children = [&](auto& children) {
             for (auto& child : children) {
                 if (child) {
-                    remove_routes_by_backend_recursive(child, backend, target_origin, removed);
+                    remove_routes_by_backend_recursive(child.get(), backend, target_origin, removed);
                 }
             }
         };
 
         switch (node->type) {
             case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node.get());
+                auto* n = static_cast<Node4*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node.get());
+                auto* n = static_cast<Node16*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node.get());
+                auto* n = static_cast<Node48*>(node);
                 visit_children(n->children);
                 break;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node.get());
+                auto* n = static_cast<Node256*>(node);
                 visit_children(n->children);
                 break;
             }
