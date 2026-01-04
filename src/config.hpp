@@ -276,6 +276,12 @@ struct ClusterConfig {
 
     // TLS/DTLS encryption for gossip (mTLS)
     GossipTlsConfig tls;                                   // DTLS configuration for encrypted gossip
+
+    // Split-brain detection / Quorum settings
+    bool quorum_enabled = true;                            // Enable quorum-based split-brain detection
+    double quorum_threshold = 0.5;                         // Fraction of peers required (N*threshold+1 for majority)
+    bool reject_routes_on_quorum_loss = true;              // Reject new route writes when quorum is lost
+    uint32_t quorum_warning_threshold = 1;                 // Warn when alive peers <= required + this threshold
 };
 
 // Kubernetes service discovery configuration
@@ -603,6 +609,25 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env("RANVIER_CLUSTER_TLS_ALLOW_PLAINTEXT_FALLBACK")) {
         cluster.tls.allow_plaintext_fallback = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    // Quorum/split-brain detection overrides
+    if (auto v = get_env("RANVIER_CLUSTER_QUORUM_ENABLED")) {
+        cluster.quorum_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_QUORUM_THRESHOLD")) {
+        try {
+            cluster.quorum_threshold = std::stod(*v);
+            if (cluster.quorum_threshold < 0.0) cluster.quorum_threshold = 0.0;
+            if (cluster.quorum_threshold > 1.0) cluster.quorum_threshold = 1.0;
+        } catch (...) {
+            // Ignore invalid values
+        }
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_REJECT_ROUTES_ON_QUORUM_LOSS")) {
+        cluster.reject_routes_on_quorum_loss = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_CLUSTER_QUORUM_WARNING_THRESHOLD")) {
+        cluster.quorum_warning_threshold = *v;
     }
 
     // K8s discovery overrides
@@ -967,6 +992,19 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
                     config.cluster.tls.allow_plaintext_fallback = t["allow_plaintext_fallback"].as<bool>();
                 }
             }
+            // Split-brain detection / Quorum settings
+            if (c["quorum_enabled"]) {
+                config.cluster.quorum_enabled = c["quorum_enabled"].as<bool>();
+            }
+            if (c["quorum_threshold"]) {
+                config.cluster.quorum_threshold = c["quorum_threshold"].as<double>();
+            }
+            if (c["reject_routes_on_quorum_loss"]) {
+                config.cluster.reject_routes_on_quorum_loss = c["reject_routes_on_quorum_loss"].as<bool>();
+            }
+            if (c["quorum_warning_threshold"]) {
+                config.cluster.quorum_warning_threshold = c["quorum_warning_threshold"].as<uint32_t>();
+            }
         }
 
         // K8s discovery section
@@ -1158,6 +1196,12 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
             }
             if (config.cluster.tls.cert_reload_interval.count() < 0) {
                 return "cluster.tls.cert_reload_interval must be non-negative";
+            }
+        }
+        // Validate quorum settings
+        if (config.cluster.quorum_enabled) {
+            if (config.cluster.quorum_threshold < 0.0 || config.cluster.quorum_threshold > 1.0) {
+                return "cluster.quorum_threshold must be between 0.0 and 1.0";
             }
         }
     }

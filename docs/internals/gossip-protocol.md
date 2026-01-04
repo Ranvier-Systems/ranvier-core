@@ -10,6 +10,7 @@ Ranvier uses a custom UDP-based gossip protocol to propagate route announcements
 - **Reliability**: ACK-based delivery with retries handles packet loss
 - **Duplicate suppression**: Sliding window filters retransmissions
 - **Simplicity**: Fire-and-forget semantics with best-effort ordering
+- **Split-brain detection**: Quorum-based health checks prevent divergent state
 
 ## Packet Types
 
@@ -145,6 +146,90 @@ Receivers maintain a **sliding window** of recently seen sequence numbers per pe
 
 **Why still ACK duplicates?** The sender may have missed our previous ACK, so we always respond to prevent unnecessary retries.
 
+## Split-Brain Detection
+
+Ranvier implements quorum-based split-brain detection to prevent divergent state when a network partition occurs.
+
+### Quorum State
+
+The cluster operates in one of two states:
+
+| State | Condition | Behavior |
+|-------|-----------|----------|
+| `HEALTHY` | ≥ quorum peers reachable | Full operations (read + write routes) |
+| `DEGRADED` | < quorum peers reachable | Read-only mode (serve existing routes, reject new writes) |
+
+### Quorum Calculation
+
+Quorum required = `floor(N × threshold) + 1`, capped at N
+
+Where:
+- **N** = total nodes (peers + self)
+- **threshold** = configurable (default: 0.5 for majority)
+
+Examples with default threshold (0.5):
+
+| Cluster Size | Quorum Required | Can Survive |
+|--------------|-----------------|-------------|
+| 1 node | 1 | 0 failures |
+| 2 nodes | 2 | 0 failures |
+| 3 nodes | 2 | 1 failure |
+| 5 nodes | 3 | 2 failures |
+| 7 nodes | 4 | 3 failures |
+
+### Warning Threshold
+
+When the cluster is healthy but approaching quorum loss, a warning is logged. The `quorum_warning_threshold` controls how many nodes above quorum triggers the warning.
+
+```
+alive_nodes = 4, required = 3, warning_threshold = 1
+margin = 4 - 3 = 1
+margin(1) <= threshold(1) → WARNING logged
+```
+
+Warnings are rate-limited: only logged when entering/exiting the warning zone, not on every liveness check.
+
+### Degraded Mode Behavior
+
+When quorum is lost:
+
+1. **Route writes rejected**: `broadcast_route()` returns immediately without sending
+2. **Existing routes served**: Cached routes remain valid for incoming requests
+3. **Metric updated**: `ranvier_cluster_quorum_state` gauge set to 0
+4. **Log emitted**: `WARN: Cluster quorum LOST`
+
+When quorum is restored:
+
+1. **Route writes enabled**: Normal gossip propagation resumes
+2. **Metric updated**: Gauge set to 1
+3. **Log emitted**: `INFO: Cluster quorum RESTORED`
+
+### Partition Scenarios
+
+**Scenario 1: 3-node cluster, 1 node isolated**
+```
+[A]---[B]---[C]    →    [A]   [B]---[C]
+
+Partition: A loses connectivity to B and C
+
+Node A: alive=1, required=2 → DEGRADED (read-only)
+Node B: alive=2, required=2 → HEALTHY
+Node C: alive=2, required=2 → HEALTHY
+```
+
+**Scenario 2: 3-node cluster, network split**
+```
+[A]---[B]---[C]    →    [A]   [B]   [C]
+
+Partition: All nodes isolated
+
+Node A: alive=1, required=2 → DEGRADED
+Node B: alive=1, required=2 → DEGRADED
+Node C: alive=1, required=2 → DEGRADED
+```
+
+All nodes enter read-only mode, preventing divergent writes.
+
 ## Configuration
 
 ### YAML
@@ -166,6 +251,12 @@ cluster:
   gossip_ack_timeout_ms: 100          # Initial retry timeout
   gossip_max_retries: 3               # Max retry attempts
   gossip_dedup_window: 1000           # Duplicate detection window
+
+  # Split-brain detection
+  quorum_enabled: true                # Enable quorum checks
+  quorum_threshold: 0.5               # Fraction for quorum (0.5 = majority)
+  reject_routes_on_quorum_loss: true  # Reject writes when degraded
+  quorum_warning_threshold: 1         # Warn when margin <= this (0 disables)
 ```
 
 ### Environment Variables
@@ -180,6 +271,12 @@ RANVIER_CLUSTER_GOSSIP_RELIABLE_DELIVERY=true
 RANVIER_CLUSTER_GOSSIP_ACK_TIMEOUT_MS=100
 RANVIER_CLUSTER_GOSSIP_MAX_RETRIES=3
 RANVIER_CLUSTER_GOSSIP_DEDUP_WINDOW=1000
+
+# Split-brain detection
+RANVIER_CLUSTER_QUORUM_ENABLED=true
+RANVIER_CLUSTER_QUORUM_THRESHOLD=0.5
+RANVIER_CLUSTER_REJECT_ROUTES_ON_QUORUM_LOSS=true
+RANVIER_CLUSTER_QUORUM_WARNING_THRESHOLD=1
 ```
 
 ## Metrics
@@ -213,6 +310,14 @@ All metrics are exposed via Prometheus on port 9180.
 | `ranvier_cluster_dns_discovery_success` | Successful DNS refreshes |
 | `ranvier_cluster_dns_discovery_failure` | Failed DNS refreshes |
 
+### Split-Brain Detection
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ranvier_cluster_quorum_state` | Gauge | Current quorum state (1=healthy, 0=degraded) |
+| `ranvier_cluster_quorum_transitions` | Counter | Total state transitions (healthy↔degraded) |
+| `ranvier_cluster_routes_rejected_degraded` | Counter | Routes rejected due to degraded state |
+
 ## Debugging
 
 ### Symptoms and Metrics
@@ -222,6 +327,8 @@ All metrics are exposed via Prometheus on port 9180.
 | Route divergence | `max_retries_exceeded` high | Network partition or peer overload |
 | High retries | `retries_sent` >> `acks_received` | Packet loss or slow peer |
 | Duplicate processing | `duplicates_suppressed` = 0 | `dedup_window` too small |
+| Routes rejected | `routes_rejected_degraded` > 0 | Cluster in degraded mode (quorum lost) |
+| Quorum flapping | `quorum_transitions` increasing | Unstable network or peer health |
 
 ### Log Levels
 
@@ -270,6 +377,7 @@ Example route announcement (12-byte header + 4 tokens):
 - GossipService runs only on **Shard 0**
 - Received routes broadcast to all shards via `smp::submit_to()`
 - No locks required (Seastar's shared-nothing architecture)
+- **Quorum state accessors** (`quorum_state()`, `has_quorum()`, `is_degraded()`) only return valid data on shard 0; use `submit_to(0, ...)` to query from other shards
 
 ### Memory Usage
 
@@ -284,6 +392,7 @@ Total overhead: ~6KB per peer (negligible for typical 3-node clusters)
 
 | File | Purpose |
 |------|---------|
-| `src/gossip_service.hpp` | Packet structs, GossipService class |
-| `src/gossip_service.cpp` | UDP send/receive, reliability logic |
-| `src/config.hpp` | ClusterConfig with reliability settings |
+| `src/gossip_service.hpp` | Packet structs, GossipService class, QuorumState enum |
+| `src/gossip_service.cpp` | UDP send/receive, reliability logic, quorum tracking |
+| `src/config.hpp` | ClusterConfig with reliability and quorum settings |
+| `tests/unit/quorum_test.cpp` | Unit tests for quorum calculation and state transitions |

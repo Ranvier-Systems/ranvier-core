@@ -281,6 +281,18 @@ target_link_libraries(prefix_affinity_test
 )
 gtest_discover_tests(prefix_affinity_test)
 
+# Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
+# Tests for quorum calculation and state transitions
+add_executable(quorum_test
+  tests/unit/quorum_test.cpp
+)
+target_include_directories(quorum_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(quorum_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(quorum_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
 if(Seastar_FOUND)
     add_executable(stream_parser_test
