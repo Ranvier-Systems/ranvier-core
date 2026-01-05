@@ -1047,3 +1047,455 @@ TEST_F(RadixTreeLRUTest, RouteEntryContainsCorrectData) {
         EXPECT_LT(age, std::chrono::seconds(1));
     });
 }
+
+// =============================================================================
+// RouteOrigin Tests (LOCAL vs REMOTE routes)
+// =============================================================================
+
+class RadixTreeRouteOriginTest : public ::testing::Test {
+protected:
+    RadixTree tree{1};
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+};
+
+TEST_F(RadixTreeRouteOriginTest, DefaultOriginIsLocal) {
+    tree.insert(tokens({1, 2, 3}), 1);
+
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        EXPECT_EQ(entry.origin, RouteOrigin::LOCAL);
+    });
+}
+
+TEST_F(RadixTreeRouteOriginTest, ExplicitLocalOrigin) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
+
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        EXPECT_EQ(entry.origin, RouteOrigin::LOCAL);
+    });
+}
+
+TEST_F(RadixTreeRouteOriginTest, RemoteOrigin) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::REMOTE);
+
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        EXPECT_EQ(entry.origin, RouteOrigin::REMOTE);
+    });
+}
+
+TEST_F(RadixTreeRouteOriginTest, MixedOrigins) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
+    tree.insert(tokens({4, 5, 6}), 2, RouteOrigin::REMOTE);
+    tree.insert(tokens({7, 8, 9}), 3, RouteOrigin::LOCAL);
+
+    int local_count = 0;
+    int remote_count = 0;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        if (entry.origin == RouteOrigin::LOCAL) local_count++;
+        if (entry.origin == RouteOrigin::REMOTE) remote_count++;
+    });
+
+    EXPECT_EQ(local_count, 2);
+    EXPECT_EQ(remote_count, 1);
+}
+
+TEST_F(RadixTreeRouteOriginTest, OverwritePreservesNewOrigin) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
+    tree.insert(tokens({1, 2, 3}), 2, RouteOrigin::REMOTE);  // Overwrite with different origin
+
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        EXPECT_EQ(entry.origin, RouteOrigin::REMOTE);
+        EXPECT_EQ(entry.backend, 2);
+    });
+}
+
+// -----------------------------------------------------------------------------
+// evict_oldest_remote() Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteEvictsRemoteFirst) {
+    // Insert LOCAL first (oldest)
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Insert REMOTE second (newer, but should be evicted first)
+    tree.insert(tokens({4, 5, 6}), 2, RouteOrigin::REMOTE);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Insert another LOCAL (newest)
+    tree.insert(tokens({7, 8, 9}), 3, RouteOrigin::LOCAL);
+
+    EXPECT_EQ(tree.route_count(), 3u);
+
+    // evict_oldest_remote should evict the REMOTE route, not the oldest LOCAL
+    bool evicted = tree.evict_oldest_remote();
+
+    EXPECT_TRUE(evicted);
+    EXPECT_EQ(tree.route_count(), 2u);
+
+    // REMOTE route should be evicted
+    EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
+
+    // LOCAL routes should remain
+    EXPECT_TRUE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({7, 8, 9})).has_value());
+}
+
+TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteFallsBackToLocal) {
+    // Insert only LOCAL routes
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    tree.insert(tokens({4, 5, 6}), 2, RouteOrigin::LOCAL);
+
+    EXPECT_EQ(tree.route_count(), 2u);
+
+    // No REMOTE routes, should fall back to evicting oldest LOCAL
+    bool evicted = tree.evict_oldest_remote();
+
+    EXPECT_TRUE(evicted);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    // Oldest LOCAL (backend 1) should be evicted
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteMultipleRemotes) {
+    // Insert multiple REMOTE routes at different times
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::REMOTE);  // Oldest REMOTE
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    tree.insert(tokens({4, 5, 6}), 2, RouteOrigin::REMOTE);  // Newer REMOTE
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    tree.insert(tokens({7, 8, 9}), 3, RouteOrigin::LOCAL);   // LOCAL
+
+    EXPECT_EQ(tree.route_count(), 3u);
+
+    // Should evict the oldest REMOTE (backend 1)
+    tree.evict_oldest_remote();
+    EXPECT_EQ(tree.route_count(), 2u);
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+
+    // Should evict the remaining REMOTE (backend 2)
+    tree.evict_oldest_remote();
+    EXPECT_EQ(tree.route_count(), 1u);
+    EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
+
+    // Now should fall back to LOCAL
+    tree.evict_oldest_remote();
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+TEST_F(RadixTreeRouteOriginTest, EvictOldestRemoteEmptyTree) {
+    bool evicted = tree.evict_oldest_remote();
+    EXPECT_FALSE(evicted);
+}
+
+// -----------------------------------------------------------------------------
+// remove_routes_by_backend() Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeRouteOriginTest, RemoveRoutesByBackendSingleMatch) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::REMOTE);
+    tree.insert(tokens({4, 5, 6}), 2, RouteOrigin::REMOTE);
+    tree.insert(tokens({7, 8, 9}), 1, RouteOrigin::LOCAL);  // Same backend, different origin
+
+    size_t removed = tree.remove_routes_by_backend(1, RouteOrigin::REMOTE);
+
+    EXPECT_EQ(removed, 1u);
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({7, 8, 9})).has_value());  // Different origin, not removed
+}
+
+TEST_F(RadixTreeRouteOriginTest, RemoveRoutesByBackendMultipleMatches) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::REMOTE);
+    tree.insert(tokens({4, 5, 6}), 1, RouteOrigin::REMOTE);
+    tree.insert(tokens({7, 8, 9}), 1, RouteOrigin::REMOTE);
+    tree.insert(tokens({10, 11, 12}), 2, RouteOrigin::REMOTE);
+
+    size_t removed = tree.remove_routes_by_backend(1, RouteOrigin::REMOTE);
+
+    EXPECT_EQ(removed, 3u);
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_FALSE(tree.lookup(tokens({4, 5, 6})).has_value());
+    EXPECT_FALSE(tree.lookup(tokens({7, 8, 9})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({10, 11, 12})).has_value());
+}
+
+TEST_F(RadixTreeRouteOriginTest, RemoveRoutesByBackendNoMatches) {
+    tree.insert(tokens({1, 2, 3}), 1, RouteOrigin::LOCAL);
+    tree.insert(tokens({4, 5, 6}), 2, RouteOrigin::REMOTE);
+
+    // Try to remove backend 1 with REMOTE origin (no match)
+    size_t removed = tree.remove_routes_by_backend(1, RouteOrigin::REMOTE);
+
+    EXPECT_EQ(removed, 0u);
+    EXPECT_TRUE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+TEST_F(RadixTreeRouteOriginTest, RemoveRoutesByBackendUpdatesRouteCount) {
+    for (int i = 0; i < 10; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}), 42, RouteOrigin::REMOTE);
+    }
+    EXPECT_EQ(tree.route_count(), 10u);
+
+    size_t removed = tree.remove_routes_by_backend(42, RouteOrigin::REMOTE);
+
+    EXPECT_EQ(removed, 10u);
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+// =============================================================================
+// Split Node with Many Children Tests
+// =============================================================================
+
+class RadixTreeSplitTest : public ::testing::Test {
+protected:
+    RadixTree tree{1};
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+};
+
+TEST_F(RadixTreeSplitTest, SplitNodeWithNode16Children) {
+    // Create a node with 10 children (Node16)
+    // All share prefix {100, 200}
+    for (int i = 0; i < 10; i++) {
+        tree.insert(tokens({100, 200, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Verify all routes exist
+    for (int i = 0; i < 10; i++) {
+        auto result = tree.lookup(tokens({100, 200, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Setup failed for i=" << i;
+    }
+
+    // Now insert a route that diverges at position 1 (causes split)
+    tree.insert(tokens({100, 999, 50}), 999);
+
+    // All original routes should still work
+    for (int i = 0; i < 10; i++) {
+        auto result = tree.lookup(tokens({100, 200, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Split broke route for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+
+    // New route should work
+    auto new_route = tree.lookup(tokens({100, 999, 50}));
+    ASSERT_TRUE(new_route.has_value());
+    EXPECT_EQ(new_route.value(), 999);
+}
+
+TEST_F(RadixTreeSplitTest, SplitNodeWithNode48Children) {
+    // Create a node with 30 children (Node48)
+    for (int i = 0; i < 30; i++) {
+        tree.insert(tokens({100, 200, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Verify all routes exist
+    for (int i = 0; i < 30; i++) {
+        auto result = tree.lookup(tokens({100, 200, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Setup failed for i=" << i;
+    }
+
+    // Insert a route that diverges at position 1
+    tree.insert(tokens({100, 888, 77}), 888);
+
+    // All original routes should still work
+    for (int i = 0; i < 30; i++) {
+        auto result = tree.lookup(tokens({100, 200, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Split broke route for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+
+    // New route should work
+    EXPECT_EQ(tree.lookup(tokens({100, 888, 77})).value(), 888);
+}
+
+TEST_F(RadixTreeSplitTest, SplitNodeWithNode256Children) {
+    // Create a node with 100 children (Node256)
+    for (int i = 0; i < 100; i++) {
+        tree.insert(tokens({100, 200, static_cast<TokenId>(i)}), static_cast<BackendId>(i % 128));
+    }
+
+    // Verify all routes exist
+    for (int i = 0; i < 100; i++) {
+        auto result = tree.lookup(tokens({100, 200, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Setup failed for i=" << i;
+    }
+
+    // Insert a route that diverges at position 1
+    tree.insert(tokens({100, 777, 88}), 77);
+
+    // All original routes should still work
+    for (int i = 0; i < 100; i++) {
+        auto result = tree.lookup(tokens({100, 200, static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Split broke route for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i % 128));
+    }
+
+    // New route should work
+    EXPECT_EQ(tree.lookup(tokens({100, 777, 88})).value(), 77);
+}
+
+TEST_F(RadixTreeSplitTest, SplitMidPrefixWithManyChildren) {
+    // Create a tree with a long prefix path, then force a mid-prefix split
+    // First, create base with long prefix
+    std::vector<TokenId> base = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    // Add many children at the end of the prefix
+    for (int i = 0; i < 20; i++) {
+        auto route = base;
+        route.push_back(static_cast<TokenId>(i));
+        tree.insert(route, static_cast<BackendId>(i));
+    }
+
+    // Now insert something that splits at position 4 (mid-prefix)
+    std::vector<TokenId> divergent = {1, 2, 3, 4, 99, 99, 99};
+    tree.insert(divergent, 999);
+
+    // All original routes should still work
+    for (int i = 0; i < 20; i++) {
+        auto route = base;
+        route.push_back(static_cast<TokenId>(i));
+        auto result = tree.lookup(route);
+        ASSERT_TRUE(result.has_value()) << "Mid-prefix split broke route for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+
+    // Divergent route should work
+    EXPECT_EQ(tree.lookup(divergent).value(), 999);
+}
+
+// =============================================================================
+// Iterative Lookup Edge Cases Tests
+// =============================================================================
+
+class RadixTreeLookupTest : public ::testing::Test {
+protected:
+    RadixTree tree{1};
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+};
+
+TEST_F(RadixTreeLookupTest, LookupExactMatchNoChildren) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    auto result = tree.lookup(tokens({1, 2, 3}));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 42);
+}
+
+TEST_F(RadixTreeLookupTest, LookupLongerThanRoute) {
+    tree.insert(tokens({1, 2}), 42);
+
+    // Lookup with longer sequence should match
+    auto result = tree.lookup(tokens({1, 2, 3, 4, 5}));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 42);
+}
+
+TEST_F(RadixTreeLookupTest, LookupShorterThanRoute) {
+    tree.insert(tokens({1, 2, 3, 4, 5}), 42);
+
+    // Lookup with shorter sequence should not match
+    auto result = tree.lookup(tokens({1, 2}));
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeLookupTest, LookupWithDivergence) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    // Lookup with divergent path should not match
+    auto result = tree.lookup(tokens({1, 2, 99}));
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeLookupTest, LookupMultipleLevelsDeep) {
+    // Create a deep tree
+    tree.insert(tokens({1}), 1);
+    tree.insert(tokens({1, 2}), 2);
+    tree.insert(tokens({1, 2, 3}), 3);
+    tree.insert(tokens({1, 2, 3, 4}), 4);
+    tree.insert(tokens({1, 2, 3, 4, 5}), 5);
+
+    // Each level should return correct value
+    EXPECT_EQ(tree.lookup(tokens({1})).value(), 1);
+    EXPECT_EQ(tree.lookup(tokens({1, 2})).value(), 2);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3})).value(), 3);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value(), 4);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4, 5})).value(), 5);
+
+    // Longer lookups should match deepest prefix
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4, 5, 6, 7})).value(), 5);
+}
+
+TEST_F(RadixTreeLookupTest, LookupReturnsLongestMatch) {
+    tree.insert(tokens({1, 2}), 10);
+    tree.insert(tokens({1, 2, 3, 4}), 20);
+
+    // {1, 2, 3} should match {1, 2} (longest available prefix)
+    auto result = tree.lookup(tokens({1, 2, 3}));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 10);
+
+    // {1, 2, 3, 4, 5} should match {1, 2, 3, 4} (longest available prefix)
+    auto result2 = tree.lookup(tokens({1, 2, 3, 4, 5}));
+    ASSERT_TRUE(result2.has_value());
+    EXPECT_EQ(result2.value(), 20);
+}
+
+TEST_F(RadixTreeLookupTest, LookupWithNoMatchingChild) {
+    tree.insert(tokens({1, 2, 3}), 10);
+    tree.insert(tokens({1, 2, 4}), 20);
+
+    // {1, 2, 5} has no matching child after {1, 2}
+    // Since {1, 2} has no value, should return nullopt
+    auto result = tree.lookup(tokens({1, 2, 5}));
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeLookupTest, LookupWithIntermediateValue) {
+    tree.insert(tokens({1, 2}), 10);          // Has value
+    tree.insert(tokens({1, 2, 3, 4}), 20);    // Deeper value
+
+    // {1, 2, 3} should match {1, 2} since {1, 2, 3} doesn't exist but {1, 2} does
+    auto result = tree.lookup(tokens({1, 2, 3}));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 10);
+
+    // {1, 2, 5} should also match {1, 2}
+    auto result2 = tree.lookup(tokens({1, 2, 5}));
+    ASSERT_TRUE(result2.has_value());
+    EXPECT_EQ(result2.value(), 10);
+}
+
+TEST_F(RadixTreeLookupTest, LookupEmptyTokens) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    auto result = tree.lookup(tokens({}));
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeLookupTest, LookupVeryLongSequence) {
+    // Insert short route
+    tree.insert(tokens({1, 2}), 42);
+
+    // Lookup with very long sequence
+    std::vector<TokenId> long_seq;
+    long_seq.push_back(1);
+    long_seq.push_back(2);
+    for (int i = 0; i < 1000; i++) {
+        long_seq.push_back(static_cast<TokenId>(i + 100));
+    }
+
+    auto result = tree.lookup(long_seq);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 42);
+}
