@@ -1,6 +1,7 @@
 // Ranvier Core - Application Bootstrap and Lifecycle Implementation
 
 #include "application.hpp"
+#include "gossip_service.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
 #include "sqlite_persistence.hpp"
@@ -12,6 +13,7 @@
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
@@ -378,7 +380,7 @@ seastar::future<> Application::stop_servers() {
         metrics_stop = _metrics_server->stop();
     }
 
-    return seastar::when_all_succeed(std::move(api_stop), std::move(metrics_stop)).discard_result();
+    return seastar::when_all(std::move(api_stop), std::move(metrics_stop)).discard_result();
 }
 
 void Application::setup_signal_handlers() {
