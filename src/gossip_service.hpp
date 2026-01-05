@@ -355,33 +355,61 @@ private:
     uint64_t _crypto_ops_offloaded = 0;        // Count of crypto ops offloaded to seastar::thread
     uint64_t _crypto_batch_broadcasts = 0;     // Count of batched broadcast operations
 
-    // Gate for cert reload handshakes (limits concurrent handshakes)
+    // Gate for cert reload handshakes - coordinates with stop() for graceful shutdown
     seastar::gate _handshake_gate;
 
-    // Configuration thresholds for crypto offloading
-    static constexpr size_t CRYPTO_OFFLOAD_PEER_THRESHOLD = 10;      // Offload if > N peers
+    // Crypto offloading thresholds - tune based on your hardware and latency requirements
+    // These control when crypto operations are offloaded to seastar::thread to avoid reactor stalls
+    static constexpr size_t CRYPTO_OFFLOAD_PEER_THRESHOLD = 10;      // Use batch mode if > N peers
     static constexpr size_t CRYPTO_OFFLOAD_BYTES_THRESHOLD = 1024;   // Offload if packet > N bytes
-    static constexpr uint64_t CRYPTO_STALL_WARNING_US = 100;         // Log warning if > 100μs
+    static constexpr uint64_t CRYPTO_STALL_WARNING_US = 100;         // Warn if single op > 100μs
 
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
     void update_quorum_state();  // Check and update quorum based on alive peers
 
-    // DTLS helper methods
+    //--------------------------------------------------------------------------
+    // DTLS Helper Methods
+    //--------------------------------------------------------------------------
+
+    // Lifecycle
     seastar::future<> initialize_dtls();
+    void cleanup_dtls_sessions();
+    seastar::future<> check_cert_reload();
+
+    // Encryption/Decryption
     seastar::future<> send_encrypted(const seastar::socket_address& peer,
                                       const std::vector<uint8_t>& plaintext);
     std::optional<std::vector<uint8_t>> decrypt_packet(const seastar::socket_address& peer,
                                                         const uint8_t* data, size_t len);
+
+    // Handshake handling
     seastar::future<> handle_dtls_handshake(const seastar::socket_address& peer,
                                              const uint8_t* data, size_t len);
-    seastar::future<> check_cert_reload();  // Now async with parallel handshakes
-    void cleanup_dtls_sessions();
+    seastar::future<> initiate_peer_handshake(const seastar::socket_address& peer);
 
-    // Parallel broadcast: batch encrypt and send to multiple peers
-    // Uses seastar::thread to offload CPU-intensive encryption when peer count is high
+    // Broadcast operations
     seastar::future<> broadcast_encrypted(const std::vector<seastar::socket_address>& peers,
                                            const std::vector<uint8_t>& plaintext);
+
+    //--------------------------------------------------------------------------
+    // Low-level Helpers (reduce code duplication)
+    //--------------------------------------------------------------------------
+
+    // Send raw bytes to a peer (creates owned buffer, handles exceptions)
+    void send_packet_async(const seastar::socket_address& peer,
+                           const std::vector<uint8_t>& data);
+
+    // Encrypt data for a peer, returns empty vector on failure
+    // Records timing metrics and logs stall warnings
+    std::vector<uint8_t> encrypt_with_timing(DtlsSession* session,
+                                              const uint8_t* data, size_t len,
+                                              const seastar::socket_address& peer);
+
+    // Check if DTLS context is valid and enabled (for use in async blocks)
+    bool is_dtls_ready() const {
+        return _dtls_context && _dtls_context->is_enabled();
+    }
 
     // Stall watchdog: measure and log crypto operation latency
     template<typename Func>

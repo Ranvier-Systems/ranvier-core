@@ -1065,21 +1065,7 @@ seastar::future<> GossipService::initialize_dtls() {
 
     // Initiate handshakes with all configured peers
     for (const auto& peer : _peer_addresses) {
-        auto* session = _dtls_context->get_or_create_session(peer, false);  // Client role
-        if (session) {
-            std::vector<uint8_t> handshake_data;
-            auto result = session->initiate_handshake(handshake_data);
-            if (result == DtlsResult::WANT_READ && !handshake_data.empty()) {
-                ++_dtls_handshakes_started;
-                // Send ClientHello to peer
-                seastar::temporary_buffer<char> buf(handshake_data.size());
-                std::memcpy(buf.get_write(), handshake_data.data(), handshake_data.size());
-                seastar::net::packet packet(std::move(buf));
-                (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
-                    log_gossip.debug("Failed to send DTLS handshake to {}: {}", peer, ep);
-                });
-            }
-        }
+        (void)initiate_peer_handshake(peer);
     }
 
     co_return;
@@ -1162,18 +1148,11 @@ seastar::future<> GossipService::send_encrypted(const seastar::socket_address& p
         });
     }
 
-    // Small packets: encrypt inline with stall watchdog
-    std::vector<uint8_t> encrypted;
-    auto encrypt_result = with_stall_watchdog("encrypt", [&]() {
-        return session->encrypt(plaintext.data(), plaintext.size(), encrypted);
-    });
-
-    if (encrypt_result != DtlsResult::SUCCESS || encrypted.empty()) {
-        log_gossip.debug("Failed to encrypt data for peer {}", peer);
+    // Small packets: encrypt inline with timing instrumentation
+    auto encrypted = encrypt_with_timing(session, plaintext.data(), plaintext.size(), peer);
+    if (encrypted.empty()) {
         return seastar::make_ready_future<>();
     }
-
-    ++_dtls_packets_encrypted;
 
     // Send encrypted data
     seastar::temporary_buffer<char> buf(encrypted.size());
@@ -1211,13 +1190,8 @@ std::optional<std::vector<uint8_t>> GossipService::decrypt_packet(const seastar:
         }
 
         // Send handshake response if any
-        if (!response.empty() && _channel) {
-            seastar::temporary_buffer<char> buf(response.size());
-            std::memcpy(buf.get_write(), response.data(), response.size());
-            seastar::net::packet packet(std::move(buf));
-            (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
-                log_gossip.debug("Failed to send DTLS handshake response to {}: {}", peer, ep);
-            });
+        if (!response.empty()) {
+            send_packet_async(peer, response);
         }
 
         // Handshake data processed, no application data to return
@@ -1242,11 +1216,8 @@ std::optional<std::vector<uint8_t>> GossipService::decrypt_packet(const seastar:
             // Might be more handshake data, process it
             std::vector<uint8_t> response;
             session->continue_handshake(data, len, response);
-            if (!response.empty() && _channel) {
-                seastar::temporary_buffer<char> buf(response.size());
-                std::memcpy(buf.get_write(), response.data(), response.size());
-                seastar::net::packet packet(std::move(buf));
-                (void)_channel->send(peer, std::move(packet));
+            if (!response.empty()) {
+                send_packet_async(peer, response);
             }
         }
         return std::nullopt;
@@ -1306,10 +1277,10 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
                     continue;
                 }
 
-                std::vector<uint8_t> encrypted;
-                auto result = session->encrypt(plaintext_copy->data(), plaintext_copy->size(), encrypted);
-                if (result == DtlsResult::SUCCESS && !encrypted.empty()) {
-                    ++_dtls_packets_encrypted;
+                // Use helper for timing-instrumented encryption
+                auto encrypted = encrypt_with_timing(session, plaintext_copy->data(),
+                                                      plaintext_copy->size(), peer);
+                if (!encrypted.empty()) {
                     encrypted_packets.emplace_back(peer, std::move(encrypted));
                 }
             }
@@ -1333,12 +1304,7 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
                     break;
                 }
 
-                seastar::temporary_buffer<char> buf(encrypted.size());
-                std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
-                seastar::net::packet packet(std::move(buf));
-                (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
-                    log_gossip.debug("Failed to send batched encrypted to {}: {}", peer, ep);
-                });
+                send_packet_async(peer, encrypted);
 
                 // Yield between sends to avoid monopolizing the reactor
                 seastar::thread::yield();
@@ -1376,23 +1342,7 @@ seastar::future<> GossipService::check_cert_reload() {
         // Use the gate to coordinate with shutdown
         try {
             [[maybe_unused]] auto holder = _handshake_gate.hold();
-
-            auto* session = _dtls_context->get_or_create_session(peer, false);
-            if (!session) {
-                co_return;
-            }
-
-            std::vector<uint8_t> handshake_data;
-            auto result = session->initiate_handshake(handshake_data);
-            if (result == DtlsResult::WANT_READ && !handshake_data.empty() && _channel) {
-                ++_dtls_handshakes_started;
-                seastar::temporary_buffer<char> buf(handshake_data.size());
-                std::memcpy(buf.get_write(), handshake_data.data(), handshake_data.size());
-                seastar::net::packet packet(std::move(buf));
-                co_await _channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
-                    log_gossip.debug("Failed to send handshake to {}: {}", peer, ep);
-                });
-            }
+            co_await initiate_peer_handshake(peer);
         } catch (const seastar::gate_closed_exception&) {
             // Service is shutting down, skip this handshake
             log_gossip.debug("Handshake skipped during shutdown for peer {}", peer);
@@ -1409,6 +1359,81 @@ void GossipService::cleanup_dtls_sessions() {
 
     // Clean up sessions idle for more than 5 minutes
     _dtls_context->cleanup_idle_sessions(std::chrono::seconds(300));
+}
+
+//------------------------------------------------------------------------------
+// Low-level Helper Methods
+//------------------------------------------------------------------------------
+
+void GossipService::send_packet_async(const seastar::socket_address& peer,
+                                       const std::vector<uint8_t>& data) {
+    if (!_channel || data.empty()) {
+        return;
+    }
+
+    // Create an owned buffer to avoid use-after-free with async send
+    // (temporary_buffer(ptr, len) creates a non-owning view)
+    seastar::temporary_buffer<char> buf(data.size());
+    std::memcpy(buf.get_write(), data.data(), data.size());
+    seastar::net::packet packet(std::move(buf));
+
+    (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_gossip.debug("Failed to send packet to {}: {}", peer, e.what());
+        }
+    });
+}
+
+std::vector<uint8_t> GossipService::encrypt_with_timing(DtlsSession* session,
+                                                         const uint8_t* data, size_t len,
+                                                         const seastar::socket_address& peer) {
+    std::vector<uint8_t> encrypted;
+
+    if (!session || !session->is_established()) {
+        return encrypted;  // Return empty vector on failure
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    auto result = session->encrypt(data, len, encrypted);
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+
+    if (static_cast<uint64_t>(elapsed_us) > CRYPTO_STALL_WARNING_US) {
+        ++_crypto_stall_warnings;
+        log_gossip.warn("Crypto stall: encrypt took {}μs for {} bytes to peer {}",
+                       elapsed_us, len, peer);
+    }
+
+    if (result != DtlsResult::SUCCESS) {
+        log_gossip.debug("Encryption failed for peer {}: {}", peer, session->last_error());
+        return {};  // Return empty vector on failure
+    }
+
+    ++_dtls_packets_encrypted;
+    return encrypted;
+}
+
+seastar::future<> GossipService::initiate_peer_handshake(const seastar::socket_address& peer) {
+    if (!_dtls_context || !_channel) {
+        return seastar::make_ready_future<>();
+    }
+
+    auto* session = _dtls_context->get_or_create_session(peer, false);  // Client role
+    if (!session) {
+        return seastar::make_ready_future<>();
+    }
+
+    std::vector<uint8_t> handshake_data;
+    auto result = session->initiate_handshake(handshake_data);
+
+    if (result == DtlsResult::WANT_READ && !handshake_data.empty()) {
+        ++_dtls_handshakes_started;
+        send_packet_async(peer, handshake_data);
+    }
+
+    return seastar::make_ready_future<>();
 }
 
 }  // namespace ranvier
