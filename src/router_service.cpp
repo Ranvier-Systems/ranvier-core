@@ -56,6 +56,33 @@ thread_local uint32_t local_block_alignment = 16;
 // Thread-local counter for prefix affinity routing
 thread_local uint64_t stats_prefix_affinity_routes = 0;
 
+// ============================================================================
+// Route Batching Helpers
+// ============================================================================
+
+// Apply a batch of remote routes to the local shard's RadixTree.
+// This function runs on each shard and processes all routes in the batch.
+// Called via smp::submit_to from flush_route_batch().
+static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute>& batch) {
+    if (!local_tree) return;
+
+    for (const auto& route : batch) {
+        // LRU eviction: prefer evicting REMOTE routes first when at capacity
+        if (local_max_routes > 0) {
+            while (local_tree->route_count() >= local_max_routes) {
+                if (local_tree->evict_oldest_remote()) {
+                    stats_routes_evicted++;
+                } else {
+                    break;  // No more routes to evict
+                }
+            }
+        }
+
+        // Insert with REMOTE origin (learned from cluster gossip)
+        local_tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
+    }
+}
+
 // FNV-1a hash constants for 64-bit
 constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
 constexpr uint64_t FNV_PRIME = 1099511628211ULL;
@@ -114,6 +141,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         _gossip->set_route_prune_callback([this](BackendId backend) {
             return remove_routes_for_backend(backend);
         });
+
+        // Pre-allocate buffer for route batching to avoid reallocations during operation
+        _pending_remote_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
 
         log_router.info("Cluster mode enabled with {} peers", _cluster_config.peers.size());
     }
@@ -444,23 +474,24 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
 }
 
-seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
-    // Learn route from cluster peer - mark as REMOTE origin
-    // REMOTE routes can be evicted more aggressively than LOCAL routes
-    //
-    // BATCHING STRATEGY: Instead of immediately broadcasting to all shards (which causes
-    // an "SMP storm" with high route ingestion rates), we buffer routes on shard 0 and
-    // flush them periodically or when the buffer is full. This reduces cross-core message
-    // traffic from O(routes * shards) to O(batches * shards).
+// ============================================================================
+// Route Batching Implementation
+// ============================================================================
+//
+// Remote routes arrive via GossipService on shard 0. Instead of immediately
+// broadcasting each route to all shards (which causes an "SMP storm" with high
+// ingestion rates), we batch them and flush periodically or when full.
+//
+// This reduces cross-core message traffic from O(routes × shards) to O(batches × shards).
 
+seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
     log_router.debug("Buffering remote route: {} tokens -> backend {}", tokens.size(), backend);
 
-    // Add to pending buffer
     _pending_remote_routes.push_back(PendingRemoteRoute{std::move(tokens), backend});
 
-    // Check if we should flush immediately due to buffer size limit
+    // Flush immediately if buffer is full (don't wait for timer)
     if (_pending_remote_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
-        log_router.debug("Route batch buffer full ({} routes), flushing immediately",
+        log_router.debug("Batch buffer full ({} routes), triggering immediate flush",
                          _pending_remote_routes.size());
         return flush_route_batch();
     }
@@ -469,85 +500,72 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
 }
 
 seastar::future<> RouterService::start_gossip() {
-    if (_gossip) {
-        // Start the batch flush timer when gossip is enabled
-        // (remote routes only arrive via gossip, so batching is only needed then)
-        start_batch_flush_timer();
-        return _gossip->start();
+    if (!_gossip) {
+        return seastar::make_ready_future<>();
     }
-    return seastar::make_ready_future<>();
+
+    start_batch_flush_timer();
+    return _gossip->start();
 }
 
 seastar::future<> RouterService::stop_gossip() {
-    if (_gossip) {
-        // Stop the batch flush timer and flush any remaining routes
-        stop_batch_flush_timer();
-        return _gossip->stop();
+    if (!_gossip) {
+        return seastar::make_ready_future<>();
     }
-    return seastar::make_ready_future<>();
+
+    // Shutdown sequence (order matters for correctness):
+    // 1. Cancel timer - prevents new timer-triggered flushes
+    // 2. Stop gossip - prevents new routes from arriving
+    // 3. Flush remaining - ensures no buffered routes are lost
+    _batch_flush_timer.cancel();
+
+    return _gossip->stop().then([this] {
+        log_router.info("Gossip stopped, flushing remaining route batch");
+        return flush_route_batch();
+    });
 }
 
 void RouterService::start_batch_flush_timer() {
     _batch_flush_timer.set_callback([this] {
-        // Fire-and-forget the flush - timer callback can't return a future
-        (void)flush_route_batch();
+        // Timer callbacks can't return futures, so handle errors inline
+        (void)flush_route_batch().handle_exception([](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_router.error("Route batch flush failed: {}", e.what());
+            }
+        });
     });
+
     _batch_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
     log_router.info("Route batch flush timer started (interval: {}ms, max_batch: {})",
                     RouteBatchConfig::FLUSH_INTERVAL.count(), RouteBatchConfig::MAX_BATCH_SIZE);
 }
 
-void RouterService::stop_batch_flush_timer() {
-    _batch_flush_timer.cancel();
-
-    // Flush any remaining pending routes before shutdown
-    if (!_pending_remote_routes.empty()) {
-        log_router.info("Flushing {} remaining routes before shutdown", _pending_remote_routes.size());
-        (void)flush_route_batch();
-    }
-
-    log_router.info("Route batch flush timer stopped");
-}
-
 seastar::future<> RouterService::flush_route_batch() {
-    // Nothing to flush?
     if (_pending_remote_routes.empty()) {
         return seastar::make_ready_future<>();
     }
 
-    // Move the pending routes out for processing, leaving buffer empty for new routes
-    std::vector<PendingRemoteRoute> batch = std::move(_pending_remote_routes);
-    _pending_remote_routes.clear();  // Ensure it's truly empty after move
+    // Atomically take ownership of pending routes, leaving buffer empty for new arrivals
+    // Note: C++ guarantees moved-from std::vector is empty
+    auto batch = std::move(_pending_remote_routes);
 
-    log_router.debug("Flushing batch of {} remote routes to {} shards",
+    log_router.debug("Broadcasting batch of {} routes to {} shards",
                      batch.size(), seastar::smp::count);
 
-    // Broadcast the entire batch to all shards in a SINGLE message per shard
-    // This reduces SMP message traffic from O(routes * shards) to O(shards)
+    // Send ONE message per shard containing the entire batch.
+    //
+    // PERFORMANCE NOTE: Each shard receives a COPY of the batch. This is required by
+    // Seastar's shared-nothing architecture - smp::submit_to serializes data to send
+    // it across cores. While this means O(shards) copies of the batch, the key win is
+    // reducing SMP message count from O(routes × shards) to O(shards). With 1000 routes/sec
+    // and 64 shards, this reduces messages from 64,000/sec to ~640/sec (at 100 routes/batch).
     return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& shared_batch) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [&shared_batch](unsigned shard_id) {
-                // Copy the batch for this shard (each shard needs its own copy)
                 return seastar::smp::submit_to(shard_id, [batch = shared_batch] {
-                    if (!local_tree) return seastar::make_ready_future<>();
-
-                    // Process all routes in the batch on this shard
-                    for (const auto& route : batch) {
-                        // LRU eviction: prefer evicting REMOTE routes first when at capacity
-                        if (local_max_routes > 0) {
-                            while (local_tree->route_count() >= local_max_routes) {
-                                if (local_tree->evict_oldest_remote()) {
-                                    stats_routes_evicted++;
-                                } else {
-                                    break;  // No more routes to evict
-                                }
-                            }
-                        }
-
-                        // Insert with REMOTE origin (learned from cluster gossip)
-                        local_tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
-                    }
-
+                    apply_route_batch_to_local_tree(batch);
                     return seastar::make_ready_future<>();
                 });
             });

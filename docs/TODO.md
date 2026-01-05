@@ -129,6 +129,12 @@ Hardening the gossip protocol and cluster coordination for production multi-node
   _Location:_ `src/gossip_service.cpp`
   _Complexity:_ High
 
+- [x] **Batch remote route updates to prevent SMP storm** ✓
+  _Justification:_ When GossipService on Shard 0 learns routes from remote peers, immediately broadcasting each route to all shards via `smp::submit_to` generates O(routes × shards) cross-core messages. With 1000 routes/sec and 64 shards, this creates 64,000 SMP messages/sec, risking Seastar's internal message bus saturation.
+  _Approach:_ Buffer incoming routes on Shard 0, flush batches via timer (10ms) or when buffer reaches 100 routes. Single message per shard contains entire batch. Reduces SMP traffic by 99% (64,000 → 640 messages/sec).
+  _Location:_ `src/router_service.cpp:457-543`, `src/router_service.hpp:19-38`
+  _Complexity:_ Medium
+
 - [x] **Prevent reactor stalls in DTLS crypto operations** ✓
   _Justification:_ OpenSSL encryption/decryption blocks Seastar's reactor thread. With 50+ peers, sequential crypto operations cause multi-millisecond stalls affecting all network I/O.
   _Approach:_ Adaptive offloading based on packet size (>1KB) and peer count (>10). Use `seastar::async` for large packets, `seastar::thread` with batching for high fan-out broadcasts. Add timing watchdog with 100μs threshold.
@@ -404,6 +410,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P1 - High** | Security | API key rotation | Medium | ✅ Done |
 | **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
 | **P1 - High** | Performance | Async persistence (reactor stall fix) | Medium | ✅ Done |
+| **P1 - High** | Performance | Batch remote route updates (SMP storm fix) | Medium | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
@@ -420,6 +427,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-05 | Batch remote route updates to prevent SMP storm (99% message reduction) | - |
 | 2026-01-05 | Decouple SQLite persistence from reactor thread (AsyncPersistenceManager) | - |
 | 2026-01-05 | Prevent reactor stalls in DTLS crypto operations (adaptive offloading) | - |
 | 2025-01-04 | Implement split-brain detection with quorum-aware health checks | - |

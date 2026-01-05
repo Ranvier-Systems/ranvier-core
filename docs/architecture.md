@@ -148,7 +148,7 @@ The GossipService operates on Shard 0 and uses UDP for low-latency route propaga
 2. **Packet Format (v2)**: Fixed 12-byte header + variable token array: `[type:1][version:1][seq_num:4][backend_id:4][token_count:2][tokens:4*N]`
 3. **Reliable Delivery**: ACK-based delivery with retries ensures route announcements aren't lost to UDP packet drops.
 4. **Duplicate Detection**: Sliding window per peer filters duplicate announcements from retransmissions.
-5. **Shard Broadcast**: Received routes are inserted into all local shards via `learn_route_global()`, maintaining Seastar's shared-nothing model.
+5. **Batched Shard Broadcast**: Remote routes are buffered on Shard 0 and broadcast in batches (every 10ms or 100 routes) to prevent "SMP storms". This reduces cross-core message traffic from O(routes × shards) to O(batches × shards), achieving 99% message reduction at high ingestion rates.
 6. **Peer Liveness**: Heartbeat mechanism tracks peer health; stale peers trigger route pruning callbacks.
 
 See [Gossip Protocol Internals](internals/gossip-protocol.md) for detailed wire format and reliability mechanisms.
