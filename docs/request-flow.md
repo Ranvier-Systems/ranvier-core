@@ -13,6 +13,7 @@ sequenceDiagram
     participant RT as RadixTree
     participant CP as ConnectionPool
     participant GPU as Backend GPU
+    participant APM as AsyncPersistence
     participant PS as SQLite
 
     Client->>HTTP: POST /v1/chat/completions
@@ -39,8 +40,12 @@ sequenceDiagram
     alt Success + Cache Miss
         HTTP->>RS: learn_route_global(tokens, backend_id)
         RS->>RT: insert (broadcast to all shards)
-        HTTP->>PS: save_route(tokens, backend_id)
+        HTTP->>APM: queue_save_route(tokens, backend_id)
+        Note over APM: Fire-and-forget (non-blocking)
     end
+
+    Note over APM,PS: Background (every 100ms)
+    APM->>PS: batch_save_routes()
 
     HTTP->>CP: put(connection)
     HTTP-->>Client: response
@@ -53,7 +58,8 @@ sequenceDiagram
 3. **Cache Hit**: Route directly to the backend that owns this prefix
 4. **Cache Miss**: Pick a random healthy backend
 5. **Snooping**: On successful response, learn the route for future requests
-6. **Persistence**: Learned routes are saved to SQLite for durability
+6. **Async Persistence**: Routes are queued for background persistence (non-blocking)
+7. **Batched Writes**: AsyncPersistenceManager flushes batches to SQLite every 100ms
 
 ## Backend Registration Flow
 
@@ -62,17 +68,22 @@ sequenceDiagram
     participant Admin
     participant HTTP as HttpController
     participant RS as RouterService
+    participant APM as AsyncPersistence
     participant PS as SQLite
     participant HS as HealthService
 
     Admin->>HTTP: POST /admin/backends?id=1&ip=X&port=Y
-    HTTP->>PS: save_backend(id, ip, port)
+    HTTP->>APM: queue_save_backend(id, ip, port)
+    Note over APM: Returns immediately
     HTTP->>RS: register_backend_global(id, addr)
 
     Note over RS: Broadcast to all CPU shards
 
     RS-->>HTTP: success
     HTTP-->>Admin: {"status": "ok"}
+
+    Note over APM,PS: Background flush
+    APM->>PS: save_backend(id, ip, port)
 
     loop Every 5 seconds
         HS->>RS: get_all_backend_ids()
@@ -92,17 +103,23 @@ sequenceDiagram
     participant Admin
     participant HTTP as HttpController
     participant RS as RouterService
+    participant APM as AsyncPersistence
     participant PS as SQLite
 
     Admin->>HTTP: DELETE /admin/backends?id=1
-    HTTP->>PS: remove_routes_for_backend(id)
-    HTTP->>PS: remove_backend(id)
+    HTTP->>APM: queue_remove_routes_for_backend(id)
+    HTTP->>APM: queue_remove_backend(id)
+    Note over APM: Operations queued (non-blocking)
     HTTP->>RS: unregister_backend_global(id)
 
     Note over RS: Broadcast removal to all CPU shards
 
     RS-->>HTTP: success
     HTTP-->>Admin: {"status": "ok", "backend_deleted": 1}
+
+    Note over APM,PS: Background flush
+    APM->>PS: remove_routes_for_backend(id)
+    APM->>PS: remove_backend(id)
 ```
 
 ## Token Forwarding Flow
