@@ -25,6 +25,9 @@ Application::Application(RanvierConfig config, std::string config_path)
     , _stop_signal(std::make_shared<seastar::promise<>>()) {
 }
 
+// Destructor defined here where GossipService is complete (via gossip_service.hpp)
+Application::~Application() = default;
+
 void Application::init_tokenizer() {
     std::ifstream t(_config.assets.tokenizer_path);
     if (!t.is_open()) {

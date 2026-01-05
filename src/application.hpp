@@ -54,7 +54,8 @@ public:
     Application(Application&&) = delete;
     Application& operator=(Application&&) = delete;
 
-    ~Application() = default;
+    // Destructor must be defined in .cpp where GossipService is complete
+    ~Application();
 
     // --- Lifecycle ---
 
