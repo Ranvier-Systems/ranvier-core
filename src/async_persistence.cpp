@@ -1,6 +1,5 @@
 #include "async_persistence.hpp"
 #include <seastar/core/thread.hh>
-#include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
 
 namespace ranvier {

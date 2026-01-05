@@ -151,7 +151,7 @@ private:
     AsyncPersistenceConfig _config;
     PersistenceStore* _store = nullptr;
 
-    // Queue for pending operations (protected by spinlock)
+    // Queue for pending operations (protected by mutex for cross-shard access)
     mutable std::mutex _queue_mutex;
     std::deque<PersistenceOp> _queue;
 
