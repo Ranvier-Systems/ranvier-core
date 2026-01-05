@@ -497,11 +497,44 @@ private:
         return n256;
     }
 
+    // Helper: Create appropriate node type based on child count
+    std::unique_ptr<Node> create_node_for_children(size_t child_count) {
+        if (child_count <= 4) {
+            return std::make_unique<Node4>();
+        } else if (child_count <= 16) {
+            return std::make_unique<Node16>();
+        } else if (child_count <= 48) {
+            return std::make_unique<Node48>();
+        } else {
+            return std::make_unique<Node256>();
+        }
+    }
+
     // Split a node's prefix - operates on raw pointer (modifies in place)
     void split_node(Node* node, size_t split_point) {
-        auto new_child = std::make_unique<Node4>();
-
         TokenId split_edge_key = node->prefix[split_point];
+
+        // Count existing children to determine appropriate node type
+        size_t child_count = 0;
+        switch (node->type) {
+            case NodeType::Node4:
+                child_count = static_cast<Node4*>(node)->keys.size();
+                break;
+            case NodeType::Node16:
+                child_count = static_cast<Node16*>(node)->keys.size();
+                break;
+            case NodeType::Node48:
+                child_count = static_cast<Node48*>(node)->keys.size();
+                break;
+            case NodeType::Node256:
+                for (int i = 0; i < 256; i++) {
+                    if (static_cast<Node256*>(node)->children[i]) child_count++;
+                }
+                break;
+        }
+
+        // Create new child with appropriate type for the number of children being moved
+        auto new_child = create_node_for_children(child_count);
 
         // Move suffix to new child
         if (split_point + 1 < node->prefix.size()) {
@@ -511,51 +544,93 @@ private:
             );
         }
 
-        // Move leaf value and children to new child
+        // Move leaf value to new child
         new_child->leaf_value = node->leaf_value;
         new_child->origin = node->origin;
         new_child->last_accessed = node->last_accessed;
         node->leaf_value = std::nullopt;
 
-        // Move children based on node type
+        // Move children based on source node type, placing into appropriate destination type
         switch (node->type) {
             case NodeType::Node4: {
                 auto* n4 = static_cast<Node4*>(node);
-                auto* new_n4 = static_cast<Node4*>(new_child.get());
-                new_n4->keys = std::move(n4->keys);
-                new_n4->children = std::move(n4->children);
+                // Destination is always Node4 since source has <=4 children
+                auto* dest = static_cast<Node4*>(new_child.get());
+                dest->keys = std::move(n4->keys);
+                dest->children = std::move(n4->children);
                 n4->keys.clear();
                 n4->children.clear();
                 break;
             }
             case NodeType::Node16: {
                 auto* n16 = static_cast<Node16*>(node);
-                auto* new_n4 = static_cast<Node4*>(new_child.get());
-                // Node16 becomes Node4 after split (only 1 child)
-                new_n4->keys = std::move(n16->keys);
-                new_n4->children = std::move(n16->children);
+                if (child_count <= 4) {
+                    auto* dest = static_cast<Node4*>(new_child.get());
+                    dest->keys = std::move(n16->keys);
+                    dest->children = std::move(n16->children);
+                } else {
+                    auto* dest = static_cast<Node16*>(new_child.get());
+                    dest->keys = std::move(n16->keys);
+                    dest->children = std::move(n16->children);
+                }
                 n16->keys.clear();
                 n16->children.clear();
                 break;
             }
             case NodeType::Node48: {
                 auto* n48 = static_cast<Node48*>(node);
-                auto* new_n4 = static_cast<Node4*>(new_child.get());
-                new_n4->keys = std::move(n48->keys);
-                new_n4->children = std::move(n48->children);
+                if (child_count <= 4) {
+                    auto* dest = static_cast<Node4*>(new_child.get());
+                    dest->keys = std::move(n48->keys);
+                    dest->children = std::move(n48->children);
+                } else if (child_count <= 16) {
+                    auto* dest = static_cast<Node16*>(new_child.get());
+                    dest->keys = std::move(n48->keys);
+                    dest->children = std::move(n48->children);
+                } else {
+                    auto* dest = static_cast<Node48*>(new_child.get());
+                    dest->keys = std::move(n48->keys);
+                    dest->children = std::move(n48->children);
+                    // Copy index array for Node48->Node48
+                    dest->index = n48->index;
+                }
                 n48->index.fill(Node48::EMPTY_MARKER);
                 n48->keys.clear();
                 n48->children.clear();
                 break;
             }
             case NodeType::Node256: {
-                // For Node256 split, we need to collect all children
                 auto* n256 = static_cast<Node256*>(node);
-                auto* new_n4 = static_cast<Node4*>(new_child.get());
-                for (int i = 0; i < 256; i++) {
-                    if (n256->children[i]) {
-                        new_n4->keys.push_back(static_cast<TokenId>(i));
-                        new_n4->children.push_back(std::move(n256->children[i]));
+                if (child_count <= 4) {
+                    auto* dest = static_cast<Node4*>(new_child.get());
+                    for (int i = 0; i < 256; i++) {
+                        if (n256->children[i]) {
+                            dest->keys.push_back(static_cast<TokenId>(i));
+                            dest->children.push_back(std::move(n256->children[i]));
+                        }
+                    }
+                } else if (child_count <= 16) {
+                    auto* dest = static_cast<Node16*>(new_child.get());
+                    for (int i = 0; i < 256; i++) {
+                        if (n256->children[i]) {
+                            dest->keys.push_back(static_cast<TokenId>(i));
+                            dest->children.push_back(std::move(n256->children[i]));
+                        }
+                    }
+                } else if (child_count <= 48) {
+                    auto* dest = static_cast<Node48*>(new_child.get());
+                    for (int i = 0; i < 256; i++) {
+                        if (n256->children[i]) {
+                            uint8_t pos = static_cast<uint8_t>(dest->children.size());
+                            dest->index[static_cast<uint8_t>(i)] = pos;
+                            dest->keys.push_back(static_cast<TokenId>(i));
+                            dest->children.push_back(std::move(n256->children[i]));
+                        }
+                    }
+                } else {
+                    auto* dest = static_cast<Node256*>(new_child.get());
+                    for (int i = 0; i < 256; i++) {
+                        dest->children[i] = std::move(n256->children[i]);
                     }
                 }
                 break;
