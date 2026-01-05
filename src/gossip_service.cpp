@@ -1114,8 +1114,21 @@ seastar::future<> GossipService::send_encrypted(const seastar::socket_address& p
 
         // Copy plaintext for the thread context (plaintext ref may not survive the async boundary)
         auto plaintext_copy = std::make_shared<std::vector<uint8_t>>(plaintext);
+        // Copy peer address since we need to look up session inside async (session ptr could become stale)
+        auto peer_copy = peer;
 
-        return seastar::async([this, peer, plaintext_copy, session]() {
+        return seastar::async([this, peer_copy, plaintext_copy]() {
+            // Re-lookup session inside async block to avoid dangling pointer
+            // (session could be invalidated by cert reload or cleanup)
+            if (!_dtls_context || !_dtls_context->is_enabled()) {
+                return;
+            }
+
+            auto* session = _dtls_context->get_or_create_session(peer_copy, false);
+            if (!session || !session->is_established()) {
+                return;
+            }
+
             // Run encryption in the thread context
             std::vector<uint8_t> encrypted;
             auto start = std::chrono::steady_clock::now();
@@ -1126,22 +1139,25 @@ seastar::future<> GossipService::send_encrypted(const seastar::socket_address& p
             if (static_cast<uint64_t>(elapsed_us) > CRYPTO_STALL_WARNING_US) {
                 ++_crypto_stall_warnings;
                 log_gossip.warn("Crypto stall (offloaded): encrypt took {}μs for {} bytes to peer {}",
-                               elapsed_us, plaintext_copy->size(), peer);
+                               elapsed_us, plaintext_copy->size(), peer_copy);
             }
 
             if (result != DtlsResult::SUCCESS || encrypted.empty()) {
-                log_gossip.debug("Failed to encrypt data for peer {}", peer);
+                log_gossip.debug("Failed to encrypt data for peer {}", peer_copy);
                 return;
             }
 
             ++_dtls_packets_encrypted;
 
-            // Send encrypted data (back on reactor context)
+            // Send encrypted data - check channel is still valid
+            if (!_channel) {
+                return;
+            }
             seastar::temporary_buffer<char> buf(encrypted.size());
             std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
             seastar::net::packet packet(std::move(buf));
-            (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
-                log_gossip.debug("Failed to send encrypted data to {}: {}", peer, ep);
+            (void)_channel->send(peer_copy, std::move(packet)).handle_exception([peer_copy](auto ep) {
+                log_gossip.debug("Failed to send encrypted data to {}: {}", peer_copy, ep);
             });
         });
     }
@@ -1268,6 +1284,11 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
         auto peers_copy = std::make_shared<std::vector<seastar::socket_address>>(peers);
 
         return seastar::async([this, plaintext_copy, peers_copy]() {
+            // Check context is still valid (could be invalidated during shutdown)
+            if (!_dtls_context || !_dtls_context->is_enabled()) {
+                return;
+            }
+
             // Pre-encrypt for all peers in the thread context with batch timing
             std::vector<std::pair<seastar::socket_address, std::vector<uint8_t>>> encrypted_packets;
             encrypted_packets.reserve(peers_copy->size());
@@ -1275,6 +1296,11 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
             auto batch_start = std::chrono::steady_clock::now();
 
             for (const auto& peer : *peers_copy) {
+                // Re-check context validity in loop (could be invalidated mid-loop)
+                if (!_dtls_context) {
+                    break;
+                }
+
                 auto* session = _dtls_context->get_or_create_session(peer, false);
                 if (!session || !session->is_established()) {
                     continue;
@@ -1302,6 +1328,11 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
 
             // Now send all encrypted packets (yields back to reactor between sends)
             for (auto& [peer, encrypted] : encrypted_packets) {
+                // Check channel is still valid before each send
+                if (!_channel) {
+                    break;
+                }
+
                 seastar::temporary_buffer<char> buf(encrypted.size());
                 std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
                 seastar::net::packet packet(std::move(buf));
@@ -1318,8 +1349,10 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
     }
 
     // For small peer counts, use parallel_for_each (existing behavior)
-    return seastar::parallel_for_each(peers, [this, &plaintext](const seastar::socket_address& peer) {
-        return send_encrypted(peer, plaintext);
+    // Copy plaintext to avoid dangling reference (parallel_for_each is async)
+    auto plaintext_copy = std::make_shared<std::vector<uint8_t>>(plaintext);
+    return seastar::parallel_for_each(peers, [this, plaintext_copy](const seastar::socket_address& peer) {
+        return send_encrypted(peer, *plaintext_copy);
     });
 }
 
