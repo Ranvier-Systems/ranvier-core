@@ -32,6 +32,7 @@ flowchart TB
         end
 
         subgraph "Persistence Layer"
+            APM[AsyncPersistenceManager<br/>Fire-and-Forget Queue]
             PS[(SqlitePersistence<br/>WAL Mode)]
         end
     end
@@ -52,7 +53,8 @@ flowchart TB
     RS --> RT
     RS --> CB
     HTTP -->|get/put connection| CP
-    HTTP -->|save/load| PS
+    HTTP -->|queue ops| APM
+    APM -->|batch write| PS
 
     %% Health checking
     HS -->|ping| GPU1
@@ -92,7 +94,8 @@ flowchart TB
 - **ConnectionPool**: Reusable connections with LRU eviction
 
 ### Persistence Layer
-- **SqlitePersistence**: Durable storage for routes and backends (survives restarts)
+- **AsyncPersistenceManager**: Fire-and-forget queue that decouples SQLite writes from the reactor thread. See [Async Persistence Internals](internals/async-persistence.md).
+- **SqlitePersistence**: Durable storage for routes and backends in WAL mode (survives restarts)
 
 ## Distributed State
 
