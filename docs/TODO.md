@@ -121,6 +121,12 @@ Hardening the gossip protocol and cluster coordination for production multi-node
   _Location:_ `src/gossip_service.cpp`
   _Complexity:_ High
 
+- [x] **Prevent reactor stalls in DTLS crypto operations** ✓
+  _Justification:_ OpenSSL encryption/decryption blocks Seastar's reactor thread. With 50+ peers, sequential crypto operations cause multi-millisecond stalls affecting all network I/O.
+  _Approach:_ Adaptive offloading based on packet size (>1KB) and peer count (>10). Use `seastar::async` for large packets, `seastar::thread` with batching for high fan-out broadcasts. Add timing watchdog with 100μs threshold.
+  _Location:_ `src/gossip_service.cpp:1074-1176` (send_encrypted), `src/gossip_service.cpp:1269-1357` (broadcast_encrypted)
+  _Complexity:_ Medium
+
 ---
 
 ## 3. Observability
@@ -405,6 +411,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-05 | Prevent reactor stalls in DTLS crypto operations (adaptive offloading) | - |
 | 2025-01-04 | Implement split-brain detection with quorum-aware health checks | - |
 | 2025-01-04 | Add development container (devcontainer) | - |
 | 2025-01-04 | Generate OpenAPI 3.0 specification for HTTP API | - |
