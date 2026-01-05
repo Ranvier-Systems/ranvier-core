@@ -385,7 +385,21 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `docs/runbook.md`
   _Complexity:_ Low
 
-### 5.4 Build System
+### 5.4 Application Bootstrap
+
+- [x] **Refactor initialization into Application class** ✓
+  _Justification:_ All service initialization and shutdown logic was inline in `main.cpp`, making it difficult to test, maintain, and understand the startup/shutdown sequence. The Application class centralizes service lifecycle management.
+  _Approach:_ Created `Application` class (`src/application.hpp/cpp`) that:
+  - Owns all `seastar::sharded` service instances as private members
+  - Implements `startup()` with correct service initialization order
+  - Implements `shutdown()` with reverse-order service termination
+  - Uses `seastar::gate` to ensure startup completes before shutdown
+  - Handles graceful draining of in-flight requests
+  - Supports configuration hot-reload via SIGHUP
+  _Location:_ `src/application.hpp`, `src/application.cpp`, `src/main.cpp`
+  _Complexity:_ Medium
+
+### 5.5 Build System
 
 - [ ] **Add Windows/macOS cross-compilation support**
   _Justification:_ Contributors on non-Linux need Docker for development. Native builds improve DX.
@@ -425,6 +439,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
 | **P3 - Low** | DX | OpenAPI specification | Low | ✅ Done |
 | **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
+| **P2 - Medium** | DX | Application bootstrap refactoring | Medium | ✅ Done |
 
 ---
 
@@ -434,6 +449,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-05 | Refactor initialization into Application class (service lifecycle management) | - |
 | 2026-01-05 | Replace shared_ptr with unique_ptr in RadixTree (Seastar optimization) | - |
 | 2026-01-05 | Batch remote route updates to prevent SMP storm (99% message reduction) | - |
 | 2026-01-05 | Decouple SQLite persistence from reactor thread (AsyncPersistenceManager) | - |

@@ -336,4 +336,33 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(async_persistence_test)
+
+    # Application Unit Tests (Requires Seastar types for header includes)
+    # Tests Application state machine, config builders, and accessors
+    add_executable(application_test
+      tests/unit/application_test.cpp
+      src/application.cpp
+      src/gossip_service.cpp
+      src/router_service.cpp
+      src/health_service.cpp
+      src/k8s_discovery_service.cpp
+      src/http_controller.cpp
+      src/async_persistence.cpp
+      src/sqlite_persistence.cpp
+      src/stream_parser.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    target_link_libraries(application_test
+      PRIVATE
+      Seastar::seastar
+      ${SQLITE3_LIBRARIES}
+      yaml-cpp::yaml-cpp
+      absl::flat_hash_map
+      absl::flat_hash_set
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(application_test)
 endif()

@@ -107,8 +107,8 @@ public:
     // Get the controller (for route registration in run())
     seastar::sharded<HttpController>& controller() { return _controller; }
 
-    // Get the router service
-    RouterService& router() { return *_router; }
+    // Get the router service (only valid after startup() succeeds)
+    RouterService* router() { return _router.get(); }
 
 private:
     // --- Configuration ---
@@ -117,6 +117,9 @@ private:
 
     // --- State ---
     ApplicationState _state = ApplicationState::CREATED;
+
+    // Track which services were successfully started (for safe shutdown)
+    bool _controller_started = false;
 
     // Gate to ensure startup completes before shutdown
     seastar::gate _lifecycle_gate;
@@ -152,13 +155,16 @@ private:
     // TLS credentials (if TLS enabled)
     seastar::shared_ptr<seastar::tls::server_credentials> _tls_creds;
 
-    // --- Private Helpers ---
+    // --- Private Helpers: Initialization ---
 
     // Initialize tokenizer from JSON file
     void init_tokenizer();
 
-    // Build HttpControllerConfig from RanvierConfig
-    HttpControllerConfig build_controller_config() const;
+    // Initialize health checker service
+    void init_health_checker();
+
+    // Initialize K8s discovery service (if enabled)
+    void init_k8s_discovery();
 
     // Initialize persistence layer
     seastar::future<> init_persistence();
@@ -166,11 +172,21 @@ private:
     // Load persisted state (backends and routes) from SQLite
     seastar::future<> load_persisted_state();
 
-    // Initialize health checker service
-    void init_health_checker();
+    // --- Private Helpers: Configuration ---
 
-    // Initialize K8s discovery service (if enabled)
-    void init_k8s_discovery();
+    // Build HttpControllerConfig from RanvierConfig
+    HttpControllerConfig build_controller_config() const;
+
+    // Build K8sDiscoveryConfig from RanvierConfig
+    K8sDiscoveryConfig build_k8s_config() const;
+
+    // Build HealthServiceConfig from RanvierConfig
+    HealthServiceConfig build_health_config() const;
+
+    // Build AsyncPersistenceConfig from RanvierConfig
+    AsyncPersistenceConfig build_persistence_config() const;
+
+    // --- Private Helpers: Server Lifecycle ---
 
     // Setup TLS credentials (if enabled)
     seastar::future<> setup_tls();
@@ -181,14 +197,16 @@ private:
     // Stop HTTP servers
     seastar::future<> stop_servers();
 
+    // Setup signal handlers (SIGHUP, SIGINT, SIGTERM)
+    void setup_signal_handlers();
+
+    // --- Private Helpers: Shutdown ---
+
     // Drain in-flight requests on all controller shards
     seastar::future<> drain_requests();
 
     // Stop all services in reverse order
     seastar::future<> stop_services();
-
-    // Setup signal handlers (SIGHUP, SIGINT, SIGTERM)
-    void setup_signal_handlers();
 
     // Cleanup on final shutdown
     void cleanup();

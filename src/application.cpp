@@ -38,69 +38,113 @@ void Application::init_tokenizer() {
     log_main.info("Services initialized (Tokenizer: {})", _config.assets.tokenizer_path);
 }
 
+// =============================================================================
+// Configuration Builders
+// =============================================================================
+
 HttpControllerConfig Application::build_controller_config() const {
-    HttpControllerConfig ctrl_config;
-    ctrl_config.pool.max_connections_per_host = _config.pool.max_connections_per_host;
-    ctrl_config.pool.idle_timeout = _config.pool.idle_timeout;
-    ctrl_config.pool.max_total_connections = _config.pool.max_total_connections;
-    ctrl_config.min_token_length = _config.routing.min_token_length;
-    ctrl_config.connect_timeout = _config.timeouts.connect_timeout;
-    ctrl_config.request_timeout = _config.timeouts.request_timeout;
-    ctrl_config.auth = _config.auth;
-    ctrl_config.rate_limit.enabled = _config.rate_limit.enabled;
-    ctrl_config.rate_limit.requests_per_second = _config.rate_limit.requests_per_second;
-    ctrl_config.rate_limit.burst_size = _config.rate_limit.burst_size;
-    ctrl_config.retry.max_retries = _config.retry.max_retries;
-    ctrl_config.retry.initial_backoff = _config.retry.initial_backoff;
-    ctrl_config.retry.max_backoff = _config.retry.max_backoff;
-    ctrl_config.retry.backoff_multiplier = _config.retry.backoff_multiplier;
-    ctrl_config.circuit_breaker.enabled = _config.circuit_breaker.enabled;
-    ctrl_config.circuit_breaker.failure_threshold = _config.circuit_breaker.failure_threshold;
-    ctrl_config.circuit_breaker.success_threshold = _config.circuit_breaker.success_threshold;
-    ctrl_config.circuit_breaker.recovery_timeout = _config.circuit_breaker.recovery_timeout;
-    ctrl_config.circuit_breaker.fallback_enabled = _config.circuit_breaker.fallback_enabled;
-    ctrl_config.drain_timeout = _config.shutdown.drain_timeout;
-    ctrl_config.enable_token_forwarding = _config.routing.enable_token_forwarding;
-    ctrl_config.accept_client_tokens = _config.routing.accept_client_tokens;
-    ctrl_config.max_token_id = _config.routing.max_token_id;
-    ctrl_config.routing_mode = _config.routing.routing_mode;
-    return ctrl_config;
+    HttpControllerConfig cfg;
+    // Connection pool settings
+    cfg.pool.max_connections_per_host = _config.pool.max_connections_per_host;
+    cfg.pool.idle_timeout = _config.pool.idle_timeout;
+    cfg.pool.max_total_connections = _config.pool.max_total_connections;
+    // Routing settings
+    cfg.min_token_length = _config.routing.min_token_length;
+    cfg.enable_token_forwarding = _config.routing.enable_token_forwarding;
+    cfg.accept_client_tokens = _config.routing.accept_client_tokens;
+    cfg.max_token_id = _config.routing.max_token_id;
+    cfg.routing_mode = _config.routing.routing_mode;
+    // Timeout settings
+    cfg.connect_timeout = _config.timeouts.connect_timeout;
+    cfg.request_timeout = _config.timeouts.request_timeout;
+    cfg.drain_timeout = _config.shutdown.drain_timeout;
+    // Auth settings
+    cfg.auth = _config.auth;
+    // Rate limiting
+    cfg.rate_limit.enabled = _config.rate_limit.enabled;
+    cfg.rate_limit.requests_per_second = _config.rate_limit.requests_per_second;
+    cfg.rate_limit.burst_size = _config.rate_limit.burst_size;
+    // Retry settings
+    cfg.retry.max_retries = _config.retry.max_retries;
+    cfg.retry.initial_backoff = _config.retry.initial_backoff;
+    cfg.retry.max_backoff = _config.retry.max_backoff;
+    cfg.retry.backoff_multiplier = _config.retry.backoff_multiplier;
+    // Circuit breaker
+    cfg.circuit_breaker.enabled = _config.circuit_breaker.enabled;
+    cfg.circuit_breaker.failure_threshold = _config.circuit_breaker.failure_threshold;
+    cfg.circuit_breaker.success_threshold = _config.circuit_breaker.success_threshold;
+    cfg.circuit_breaker.recovery_timeout = _config.circuit_breaker.recovery_timeout;
+    cfg.circuit_breaker.fallback_enabled = _config.circuit_breaker.fallback_enabled;
+    return cfg;
 }
+
+K8sDiscoveryConfig Application::build_k8s_config() const {
+    K8sDiscoveryConfig cfg;
+    cfg.enabled = _config.k8s_discovery.enabled;
+    cfg.api_server = _config.k8s_discovery.api_server;
+    cfg.namespace_name = _config.k8s_discovery.namespace_name;
+    cfg.service_name = _config.k8s_discovery.service_name;
+    cfg.target_port = _config.k8s_discovery.target_port;
+    cfg.token_path = _config.k8s_discovery.token_path;
+    cfg.ca_cert_path = _config.k8s_discovery.ca_cert_path;
+    cfg.poll_interval = _config.k8s_discovery.poll_interval;
+    cfg.watch_timeout = _config.k8s_discovery.watch_timeout;
+    cfg.watch_reconnect_delay = _config.k8s_discovery.watch_reconnect_delay;
+    cfg.watch_reconnect_max_delay = _config.k8s_discovery.watch_reconnect_max_delay;
+    cfg.verify_tls = _config.k8s_discovery.verify_tls;
+    cfg.label_selector = _config.k8s_discovery.label_selector;
+    return cfg;
+}
+
+HealthServiceConfig Application::build_health_config() const {
+    HealthServiceConfig cfg;
+    cfg.check_interval = _config.health.check_interval;
+    cfg.check_timeout = _config.health.check_timeout;
+    cfg.failure_threshold = _config.health.failure_threshold;
+    cfg.recovery_threshold = _config.health.recovery_threshold;
+    return cfg;
+}
+
+AsyncPersistenceConfig Application::build_persistence_config() const {
+    AsyncPersistenceConfig cfg;
+    cfg.flush_interval = std::chrono::milliseconds(100);
+    cfg.max_batch_size = 1000;
+    cfg.max_queue_depth = 100000;
+    cfg.enable_stats_logging = true;
+    cfg.stats_interval = std::chrono::seconds(60);
+    return cfg;
+}
+
+// =============================================================================
+// Service Initialization
+// =============================================================================
 
 seastar::future<> Application::init_persistence() {
     _persistence = create_persistence_store();
-    if (_persistence->open(_config.database.path)) {
-        log_main.info("Persistence initialized (SQLite: {})", _config.database.path);
-
-        // Checkpoint WAL on startup to ensure clean state after potential crash
-        if (_persistence->checkpoint()) {
-            log_main.debug("Persistence WAL checkpoint complete");
-        } else {
-            log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
-        }
-
-        // Create async persistence manager
-        AsyncPersistenceConfig async_config;
-        async_config.flush_interval = std::chrono::milliseconds(100);
-        async_config.max_batch_size = 1000;
-        async_config.max_queue_depth = 100000;
-        async_config.enable_stats_logging = true;
-        async_config.stats_interval = std::chrono::seconds(60);
-
-        _async_persistence = std::make_unique<AsyncPersistenceManager>(async_config);
-        _async_persistence->set_persistence_store(_persistence.get());
-
-        // Start the async persistence background flush loop
-        return _async_persistence->start().then([this] {
-            // Set async persistence on all shards
-            return _controller.invoke_on_all([this](HttpController& c) {
-                c.set_persistence(_async_persistence.get());
-            });
-        });
-    } else {
+    if (!_persistence->open(_config.database.path)) {
         log_main.warn("Failed to open persistence store - running without persistence");
         return seastar::make_ready_future<>();
     }
+
+    log_main.info("Persistence initialized (SQLite: {})", _config.database.path);
+
+    // Checkpoint WAL on startup to ensure clean state after potential crash
+    if (_persistence->checkpoint()) {
+        log_main.debug("Persistence WAL checkpoint complete");
+    } else {
+        log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
+    }
+
+    // Create and start async persistence manager
+    _async_persistence = std::make_unique<AsyncPersistenceManager>(build_persistence_config());
+    _async_persistence->set_persistence_store(_persistence.get());
+
+    return _async_persistence->start().then([this] {
+        // Set async persistence on all shards
+        return _controller.invoke_on_all([this](HttpController& c) {
+            c.set_persistence(_async_persistence.get());
+        });
+    });
 }
 
 seastar::future<> Application::load_persisted_state() {
@@ -190,12 +234,7 @@ seastar::future<> Application::load_persisted_state() {
 }
 
 void Application::init_health_checker() {
-    HealthServiceConfig health_config;
-    health_config.check_interval = _config.health.check_interval;
-    health_config.check_timeout = _config.health.check_timeout;
-    health_config.failure_threshold = _config.health.failure_threshold;
-    health_config.recovery_threshold = _config.health.recovery_threshold;
-    _health_checker = std::make_unique<HealthService>(*_router, health_config);
+    _health_checker = std::make_unique<HealthService>(*_router, build_health_config());
     _health_checker->start();
 }
 
@@ -204,24 +243,9 @@ void Application::init_k8s_discovery() {
         return;
     }
 
-    K8sDiscoveryConfig k8s_config;
-    k8s_config.enabled = _config.k8s_discovery.enabled;
-    k8s_config.api_server = _config.k8s_discovery.api_server;
-    k8s_config.namespace_name = _config.k8s_discovery.namespace_name;
-    k8s_config.service_name = _config.k8s_discovery.service_name;
-    k8s_config.target_port = _config.k8s_discovery.target_port;
-    k8s_config.token_path = _config.k8s_discovery.token_path;
-    k8s_config.ca_cert_path = _config.k8s_discovery.ca_cert_path;
-    k8s_config.poll_interval = _config.k8s_discovery.poll_interval;
-    k8s_config.watch_timeout = _config.k8s_discovery.watch_timeout;
-    k8s_config.watch_reconnect_delay = _config.k8s_discovery.watch_reconnect_delay;
-    k8s_config.watch_reconnect_max_delay = _config.k8s_discovery.watch_reconnect_max_delay;
-    k8s_config.verify_tls = _config.k8s_discovery.verify_tls;
-    k8s_config.label_selector = _config.k8s_discovery.label_selector;
+    _k8s_discovery = std::make_unique<K8sDiscoveryService>(build_k8s_config());
 
-    _k8s_discovery = std::make_unique<K8sDiscoveryService>(k8s_config);
-
-    // Connect K8s discovery to router
+    // Connect K8s discovery to router via callbacks
     _k8s_discovery->set_register_callback(
         [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority) {
             return _router->register_backend_global(id, addr, weight, priority);
@@ -258,6 +282,10 @@ seastar::future<> Application::setup_tls() {
         return seastar::make_exception_future<>(ep);
     });
 }
+
+// =============================================================================
+// Lifecycle Management
+// =============================================================================
 
 seastar::future<> Application::startup() {
     if (_state != ApplicationState::CREATED) {
@@ -302,6 +330,8 @@ seastar::future<> Application::startup() {
             // 6. Start HttpController on all shards
             return _controller.start(std::ref(_tokenizer), std::ref(*_router), ctrl_config);
         }).then([this] {
+            _controller_started = true;
+        }).then([this] {
             // 7. Initialize metrics on ALL shards
             return seastar::smp::invoke_on_all([] {
                 init_metrics();
@@ -342,6 +372,10 @@ seastar::future<> Application::startup() {
         });
     });
 }
+
+// =============================================================================
+// HTTP Server Management
+// =============================================================================
 
 seastar::future<> Application::start_servers() {
     _api_server = std::make_unique<seastar::httpd::http_server_control>();
@@ -457,8 +491,7 @@ void Application::signal_shutdown() {
 
 seastar::future<> Application::drain_requests() {
     // Only drain if controller was successfully started
-    if (_state == ApplicationState::CREATED || _state == ApplicationState::STARTING) {
-        // Controller may not be initialized yet
+    if (!_controller_started) {
         return seastar::make_ready_future<>();
     }
 
@@ -496,6 +529,10 @@ seastar::future<> Application::run() {
     });
 }
 
+// =============================================================================
+// Shutdown Management
+// =============================================================================
+
 seastar::future<> Application::stop_services() {
     _state = ApplicationState::STOPPING;
 
@@ -531,11 +568,11 @@ seastar::future<> Application::stop_services() {
     });
 
     // Stop the sharded HttpController (only if it was started)
-    chain = chain.then([this] {
-        // Check if controller was started by seeing if local() returns valid reference
-        // seastar::sharded<T>::stop() is safe to call even if not started
-        return _controller.stop();
-    });
+    if (_controller_started) {
+        chain = chain.then([this] {
+            return _controller.stop();
+        });
+    }
 
     // Stop async persistence manager
     chain = chain.then([this] {
@@ -586,6 +623,10 @@ seastar::future<> Application::shutdown() {
         return stop_services();
     });
 }
+
+// =============================================================================
+// Configuration Hot-Reload
+// =============================================================================
 
 seastar::future<> Application::reload_config() {
     log_main.info("SIGHUP received - reloading configuration from {}", _config_path);
