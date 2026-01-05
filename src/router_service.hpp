@@ -16,18 +16,24 @@
 
 namespace ranvier {
 
+// ============================================================================
+// Route Batching Types
+// ============================================================================
+// These types support batching of remote route updates to prevent "SMP storms"
+// when receiving high volumes of route announcements via cluster gossip.
+
 // A pending remote route waiting to be batched and broadcast to all shards
 struct PendingRemoteRoute {
     std::vector<int32_t> tokens;
     BackendId backend;
 };
 
-// Configuration for route batching to avoid SMP storm
+// Configuration constants for route batching behavior
 struct RouteBatchConfig {
-    // Maximum number of routes to buffer before forcing a flush
+    // Maximum routes to buffer before forcing an immediate flush
     static constexpr size_t MAX_BATCH_SIZE = 100;
 
-    // Flush interval in milliseconds (how often to flush even if batch not full)
+    // Timer interval for periodic flushes (ensures bounded latency)
     static constexpr std::chrono::milliseconds FLUSH_INTERVAL{10};
 };
 
@@ -70,19 +76,12 @@ public:
     seastar::future<> learn_route_remote(std::vector<int32_t> tokens, BackendId backend);
 
     // Start the gossip service (call after Seastar is initialized)
+    // Also starts the route batch flush timer for remote route updates
     seastar::future<> start_gossip();
 
     // Stop the gossip service (call before shutdown)
+    // Ensures all pending route batches are flushed before stopping
     seastar::future<> stop_gossip();
-
-    // Start the route batch flush timer (call after Seastar is initialized)
-    void start_batch_flush_timer();
-
-    // Stop the route batch flush timer (call before shutdown)
-    void stop_batch_flush_timer();
-
-    // Force an immediate flush of any pending batched routes
-    seastar::future<> flush_route_batch();
 
     // Teach the system a new server (ID -> IP:Port) with optional weight and priority
     // Weight: relative load balancing weight (default 100, higher = more traffic)
@@ -163,6 +162,15 @@ private:
 
     // Check for backends that have been draining long enough and fully remove them
     void run_draining_reaper();
+
+    // ---- Route Batching (private implementation) ----
+
+    // Start the periodic timer that flushes pending route batches
+    void start_batch_flush_timer();
+
+    // Flush all pending remote routes to all shards
+    // Returns a future that completes when all shards have processed the batch
+    seastar::future<> flush_route_batch();
 };
 
 } // namespace ranvier
