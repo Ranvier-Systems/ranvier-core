@@ -1277,10 +1277,11 @@ seastar::future<> GossipService::broadcast_encrypted(const std::vector<seastar::
                     continue;
                 }
 
-                // Use helper for timing-instrumented encryption
-                auto encrypted = encrypt_with_timing(session, plaintext_copy->data(),
-                                                      plaintext_copy->size(), peer);
-                if (!encrypted.empty()) {
+                // Direct encryption without per-op timing (batch timing covers this)
+                std::vector<uint8_t> encrypted;
+                auto result = session->encrypt(plaintext_copy->data(), plaintext_copy->size(), encrypted);
+                if (result == DtlsResult::SUCCESS && !encrypted.empty()) {
+                    ++_dtls_packets_encrypted;
                     encrypted_packets.emplace_back(peer, std::move(encrypted));
                 }
             }
