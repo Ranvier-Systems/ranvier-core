@@ -53,9 +53,41 @@ flowchart TB
 ### Source Location
 
 ```
-src/radix_tree.hpp    # Complete implementation (863 lines)
+src/radix_tree.hpp    # Complete implementation (~820 lines)
 src/router_service.cpp # Integration with Seastar shards
 ```
+
+### Ownership Model: `unique_ptr` for Seastar
+
+The RadixTree uses `std::unique_ptr<Node>` for all child ownership, optimized for Seastar's shared-nothing architecture:
+
+| Aspect | `shared_ptr` (Before) | `unique_ptr` (After) |
+|--------|----------------------|---------------------|
+| **Reference counting** | Atomic `lock xadd` per copy | None |
+| **Memory overhead** | +16 bytes control block | 0 bytes |
+| **Thread safety** | Required for cross-thread | Not needed (thread-local) |
+| **Ownership model** | Shared, unclear lifetime | Exclusive, clear hierarchy |
+
+**Why `unique_ptr` fits Seastar:**
+
+1. **Thread-local trees**: Each Seastar shard has its own `RadixTree` instance. Nodes are never shared across threads.
+
+2. **No atomic overhead**: `shared_ptr` uses atomic reference counting (`lock xadd` on x86), adding ~20 cycles per copy/destroy. With `unique_ptr`, ownership transfer is a simple pointer swap.
+
+3. **Clear ownership hierarchy**: Parent nodes exclusively own their children. When a parent is destroyed, children are automatically cleaned up.
+
+4. **Move semantics for mutations**: Node growth and splitting use `std::move()` to transfer ownership without copying:
+
+```cpp
+// Growth: move ownership to new parent
+n16->children.push_back(std::move(child));
+
+// Splitting: extract child ownership temporarily
+auto extracted = extract_child(node, key);
+add_child(new_parent, key, std::move(extracted));
+```
+
+**Raw pointers for traversal**: `find_child()` returns raw `Node*` for read-only traversal. The parent's `unique_ptr` maintains ownership throughout.
 
 ---
 
@@ -98,7 +130,7 @@ struct Node {
 ```cpp
 struct Node4 : public Node {
     std::vector<TokenId> keys;                  // Up to 4 keys
-    std::vector<std::shared_ptr<Node>> children; // Corresponding children
+    std::vector<std::unique_ptr<Node>> children; // Corresponding children (exclusive ownership)
 };
 ```
 
@@ -125,7 +157,7 @@ struct Node4 : public Node {
 ```cpp
 struct Node16 : public Node {
     std::vector<TokenId> keys;                  // Up to 16 keys
-    std::vector<std::shared_ptr<Node>> children;
+    std::vector<std::unique_ptr<Node>> children; // Exclusive ownership
 };
 ```
 
@@ -139,7 +171,7 @@ struct Node16 : public Node {
 │ ████████████████████████████████████████████████████    │
 │              ↑ SIMD-aligned for AVX2 comparison         │
 ├─────────────────────────────────────────────────────────┤
-│ children[0..15] (16 × shared_ptr)                       │
+│ children[0..15] (16 × unique_ptr)                       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -154,7 +186,7 @@ struct Node48 : public Node {
     static constexpr uint8_t EMPTY_MARKER = 255;
 
     std::array<uint8_t, 256> index;             // Maps key byte → child position
-    std::vector<std::shared_ptr<Node>> children; // Up to 48 children
+    std::vector<std::unique_ptr<Node>> children; // Up to 48 children (exclusive ownership)
     std::vector<TokenId> keys;                   // Original keys for iteration
 };
 ```
@@ -180,10 +212,10 @@ struct Node48 : public Node {
 **Lookup Algorithm:**
 
 ```cpp
-std::shared_ptr<Node> find_child(TokenId key) {
+Node* find_child(TokenId key) {
     uint8_t idx = index[key_byte(key)];  // O(1) array access
     if (idx != EMPTY_MARKER) {
-        return children[idx];             // O(1) pointer lookup
+        return children[idx].get();       // O(1) pointer lookup (raw pointer for traversal)
     }
     return nullptr;
 }
@@ -197,7 +229,7 @@ std::shared_ptr<Node> find_child(TokenId key) {
 
 ```cpp
 struct Node256 : public Node {
-    std::array<std::shared_ptr<Node>, 256> children;  // Direct mapping
+    std::array<std::unique_ptr<Node>, 256> children;  // Direct mapping (exclusive ownership)
 };
 ```
 
@@ -207,7 +239,7 @@ struct Node256 : public Node {
 ┌─────────────────────────────────────────────────────────┐
 │ Node Header                                              │
 ├─────────────────────────────────────────────────────────┤
-│ children[0..255] (256 × shared_ptr = 2KB on 64-bit)     │
+│ children[0..255] (256 × unique_ptr = 2KB on 64-bit)     │
 │ ┌────┬────┬────┬────┬─────────────────────┬────┬────┐   │
 │ │ p0 │ p1 │null│ p3 │ ...                 │p254│p255│   │
 │ └────┴────┴────┴────┴─────────────────────┴────┴────┘   │
@@ -218,14 +250,16 @@ struct Node256 : public Node {
 **Lookup Algorithm:**
 
 ```cpp
-std::shared_ptr<Node> find_child(TokenId key) {
-    return children[key_byte(key)];  // Single array access
+Node* find_child(TokenId key) {
+    return children[key_byte(key)].get();  // Single array access (raw pointer for traversal)
 }
 ```
 
 **Lookup Complexity:** O(1) direct array indexing.
 
 **Use Case:** Maximum branching scenarios, rare in practice due to path compression.
+
+> **Note on Pointer Types:** The `find_child()` functions return raw `Node*` pointers for traversal efficiency. Ownership remains with the parent node's `unique_ptr`. This is safe because traversal operations don't transfer ownership.
 
 ### Node Growth Transitions
 
@@ -254,27 +288,28 @@ sequenceDiagram
 **Growth Implementation (Node4 → Node16):**
 
 ```cpp
-std::shared_ptr<Node> grow_node4_to_node16(
-    std::shared_ptr<Node> parent, TokenId key, std::shared_ptr<Node> child)
+std::unique_ptr<Node> grow_node4_to_node16(
+    std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child)
 {
     auto* n4 = static_cast<Node4*>(parent.get());
-    auto n16 = std::make_shared<Node16>();
+    auto n16 = std::make_unique<Node16>();
 
     // Migrate metadata (preserves path compression)
-    n16->prefix = std::move(n4->prefix);
-    n16->leaf_value = n4->leaf_value;
+    copy_node_metadata(n4, n16.get());
 
-    // Migrate existing children (zero-copy move)
+    // Migrate existing children (zero-copy move of unique_ptrs)
     n16->keys = std::move(n4->keys);
     n16->children = std::move(n4->children);
 
     // Add the new child that triggered growth
     n16->keys.push_back(key);
-    n16->children.push_back(child);
+    n16->children.push_back(std::move(child));  // Transfer ownership
 
     return n16;
 }
 ```
+
+> **Ownership Transfer:** When growing nodes, `std::move()` transfers ownership of child `unique_ptr`s to the new parent. The old node's children vector becomes empty after the move.
 
 ### Memory Efficiency Analysis
 
@@ -354,11 +389,15 @@ graph TB
 Prefix compression uses **lazy expansion**: prefixes are only split when a new route diverges. The `split_node()` function handles this:
 
 ```cpp
-void split_node(std::shared_ptr<Node> node, size_t split_point) {
+void split_node(Node* node, size_t split_point) {
     // Original: prefix = [A, B, C, D, E]
     // Split at position 2: [A, B] | C | [D, E]
 
-    auto new_child = std::make_shared<Node4>();
+    // Count existing children to select appropriate node type
+    size_t num_children = child_count(node);
+
+    // Create node with capacity for existing children (not always Node4!)
+    auto new_child = create_node_for_capacity(num_children);
     TokenId split_edge_key = node->prefix[split_point];  // 'C'
 
     // Move suffix [D, E] to new child
@@ -367,18 +406,21 @@ void split_node(std::shared_ptr<Node> node, size_t split_point) {
         node->prefix.end()
     );
 
-    // Transfer leaf value and children to new_child
+    // Transfer leaf value and all children to new_child
     new_child->leaf_value = node->leaf_value;
     node->leaf_value = std::nullopt;
-    // ... move children ...
+    move_all_children(node, new_child.get());  // Moves unique_ptrs
 
     // Truncate parent prefix to [A, B]
     node->prefix.resize(split_point);
 
+    // Convert parent to Node4 (it now has exactly 1 child)
     // Add new_child under edge 'C'
-    add_child(node, split_edge_key, new_child);
+    add_child(node, split_edge_key, std::move(new_child));
 }
 ```
+
+> **Dynamic Node Type Selection:** When splitting, `create_node_for_capacity()` selects the appropriate node type based on how many children need to be moved. A node with 30 children creates a Node48, not a Node4. This prevents data loss and maintains tree invariants.
 
 **Split Visualization:**
 
@@ -405,44 +447,64 @@ sequenceDiagram
 
 ### Lookup with Path Compression
 
-The `lookup_recursive()` function handles compressed prefixes:
+The `lookup_recursive()` function uses **iterative traversal** for optimal performance on the hot path:
 
 ```cpp
 std::optional<BackendId> lookup_recursive(
-    std::shared_ptr<Node> node,
+    Node* node,
     std::span<const TokenId> tokens)
 {
-    // Step 1: Match prefix tokens
-    size_t match_len = 0;
-    while (match_len < node->prefix.size() && match_len < tokens.size()) {
-        if (node->prefix[match_len] != tokens[match_len]) {
-            return std::nullopt;  // Prefix mismatch = no route
+    std::optional<BackendId> best_match = std::nullopt;
+    Node* best_match_node = nullptr;
+
+    // Iterative traversal eliminates function call overhead per tree level
+    while (node != nullptr) {
+        // Step 1: Match prefix tokens
+        size_t prefix_len = node->prefix.size();
+        if (prefix_len > tokens.size()) {
+            break;  // Input shorter than prefix
         }
-        match_len++;
-    }
 
-    // Step 2: Check for partial prefix match (input shorter than prefix)
-    if (match_len < node->prefix.size()) {
-        return std::nullopt;
-    }
-
-    // Step 3: Continue to children with remaining tokens
-    auto remaining = tokens.subspan(match_len);
-    if (!remaining.empty()) {
-        auto child = find_child(node, remaining[0]);
-        if (child) {
-            auto result = lookup_recursive(child, remaining.subspan(1));
-            if (result.has_value()) {
-                child->last_accessed = now();  // LRU update
-                return result;
+        // Prefix comparison with early exit on mismatch
+        bool prefix_matches = true;
+        for (size_t i = 0; i < prefix_len; ++i) {
+            if (node->prefix[i] != tokens[i]) {
+                prefix_matches = false;
+                break;
             }
         }
+        if (!prefix_matches) {
+            break;
+        }
+
+        // Step 2: Update best match if this node has a leaf value
+        if (node->leaf_value.has_value()) [[likely]] {
+            best_match = node->leaf_value;
+            best_match_node = node;
+        }
+
+        // Step 3: Continue to child with remaining tokens
+        tokens = tokens.subspan(prefix_len);
+        if (tokens.empty()) {
+            break;  // Consumed all input tokens
+        }
+
+        node = find_child(node, tokens[0]);
+        if (node != nullptr) {
+            tokens = tokens.subspan(1);  // Consume edge key
+        }
     }
 
-    // Step 4: Return this node's value (longest prefix match)
-    return node->leaf_value;
+    // Deferred LRU update (single write at end)
+    if (best_match_node) {
+        best_match_node->last_accessed = std::chrono::steady_clock::now();
+    }
+
+    return best_match;
 }
 ```
+
+> **Performance Optimization:** The iterative implementation eliminates recursive function call overhead, which saves ~5-10 cycles per tree level. For deep trees (common with long LLM prefixes), this translates to measurable latency reduction. The `[[likely]]` hint helps branch prediction on the common case where nodes have leaf values.
 
 ### Cache Efficiency Gains
 
@@ -479,7 +541,7 @@ The Node16 layout is designed to be SIMD-friendly. With 16 × 4-byte TokenIds, t
 ```cpp
 #include <immintrin.h>
 
-std::shared_ptr<Node> find_child_simd(Node16* node, TokenId key) {
+Node* find_child_simd(Node16* node, TokenId key) {
     // Broadcast search key to all lanes
     __m256i search_key = _mm256_set1_epi32(key);
 
@@ -503,10 +565,10 @@ std::shared_ptr<Node> find_child_simd(Node16* node, TokenId key) {
 
     // Find first match position
     if (mask_lo) {
-        return node->children[__builtin_ctz(mask_lo)];
+        return node->children[__builtin_ctz(mask_lo)].get();
     }
     if (mask_hi) {
-        return node->children[8 + __builtin_ctz(mask_hi)];
+        return node->children[8 + __builtin_ctz(mask_hi)].get();
     }
 
     return nullptr;
@@ -550,7 +612,7 @@ gantt
    ```cpp
    struct Node16 : public Node {
        alignas(32) std::array<TokenId, 16> keys;  // Fixed-size, aligned
-       std::array<std::shared_ptr<Node>, 16> children;
+       std::array<std::unique_ptr<Node>, 16> children;
        uint8_t count;  // Actual number of keys
    };
    ```
