@@ -269,12 +269,13 @@ seastar::future<> Application::startup() {
 
     // Use the gate to track startup completion
     return seastar::try_with_gate(_lifecycle_gate, [this] {
-        // 1. Initialize tokenizer (synchronous)
+        // 1. Initialize tokenizer (synchronous) - failure is fatal
         try {
             init_tokenizer();
         } catch (const std::exception& e) {
             log_main.error("Service init failed: {}", e.what());
-            return seastar::make_ready_future<>();
+            return seastar::make_exception_future<>(
+                std::runtime_error("Tokenizer initialization failed: " + std::string(e.what())));
         }
 
         // 2. Initialize OpenTelemetry tracing
@@ -329,6 +330,15 @@ seastar::future<> Application::startup() {
         }).then([this] {
             _state = ApplicationState::RUNNING;
             log_main.info("Application startup complete");
+        }).handle_exception([this](auto ep) {
+            // Startup failed - log and re-throw
+            // State remains STARTING, which signals partial initialization
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_main.error("Application startup failed: {}", e.what());
+            }
+            return seastar::make_exception_future<>(ep);
         });
     });
 }
@@ -446,12 +456,26 @@ void Application::signal_shutdown() {
 }
 
 seastar::future<> Application::drain_requests() {
+    // Only drain if controller was successfully started
+    if (_state == ApplicationState::CREATED || _state == ApplicationState::STARTING) {
+        // Controller may not be initialized yet
+        return seastar::make_ready_future<>();
+    }
+
     return _controller.invoke_on_all([](HttpController& c) {
         c.start_draining();
     }).then([this] {
         return _controller.invoke_on_all([](HttpController& c) {
             return c.wait_for_drain();
         });
+    }).handle_exception([](auto ep) {
+        // Log but don't fail - we're shutting down anyway
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_main.warn("Error during request drain: {}", e.what());
+        }
+        return seastar::make_ready_future<>();
     });
 }
 
@@ -475,31 +499,56 @@ seastar::future<> Application::run() {
 seastar::future<> Application::stop_services() {
     _state = ApplicationState::STOPPING;
 
-    // Stop Health Checker FIRST
-    return _health_checker->stop().then([this] {
-        // Stop K8s discovery service
+    // Build the shutdown chain with null checks for partially-initialized state
+    seastar::future<> chain = seastar::make_ready_future<>();
+
+    // Stop Health Checker FIRST (if initialized)
+    if (_health_checker) {
+        chain = chain.then([this] {
+            return _health_checker->stop();
+        });
+    }
+
+    // Stop K8s discovery service (if initialized and enabled)
+    chain = chain.then([this] {
         if (_k8s_discovery && _k8s_discovery->is_enabled()) {
             return _k8s_discovery->stop();
         }
         return seastar::make_ready_future<>();
-    }).then([this] {
-        // Stop gossip service
-        return _router->stop_gossip();
-    }).then([this] {
-        // Stop HTTP servers
+    });
+
+    // Stop gossip service (if router initialized)
+    chain = chain.then([this] {
+        if (_router) {
+            return _router->stop_gossip();
+        }
+        return seastar::make_ready_future<>();
+    });
+
+    // Stop HTTP servers
+    chain = chain.then([this] {
         return stop_servers();
-    }).then([this] {
-        // Stop the sharded HttpController
+    });
+
+    // Stop the sharded HttpController (only if it was started)
+    chain = chain.then([this] {
+        // Check if controller was started by seeing if local() returns valid reference
+        // seastar::sharded<T>::stop() is safe to call even if not started
         return _controller.stop();
-    }).then([this] {
-        // Stop async persistence manager
+    });
+
+    // Stop async persistence manager
+    chain = chain.then([this] {
         if (_async_persistence) {
             return _async_persistence->stop().then([] {
                 log_main.info("Async persistence manager stopped (queue flushed)");
             });
         }
         return seastar::make_ready_future<>();
-    }).finally([this] {
+    });
+
+    // Final cleanup
+    return chain.finally([this] {
         cleanup();
     });
 }
