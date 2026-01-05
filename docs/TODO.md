@@ -51,7 +51,15 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/stream_parser.hpp`
   _Complexity:_ Medium
 
-### 1.3 Memory Efficiency
+### 1.3 Persistence I/O
+
+- [x] **Decouple SQLite persistence from reactor thread** ✓
+  _Justification:_ Synchronous SQLite calls (`save_route`, `save_backend`) in the request path block Seastar's reactor thread, causing multi-millisecond stalls that affect all concurrent requests.
+  _Approach:_ Implement `AsyncPersistenceManager` with fire-and-forget queue API. Background timer drains queue and writes to SQLite in batches via `seastar::async`. Semaphore serializes batches; gate tracks in-flight operations for clean shutdown.
+  _Location:_ `src/async_persistence.hpp`, `src/async_persistence.cpp`, `src/http_controller.cpp`
+  _Complexity:_ Medium
+
+### 1.4 Memory Efficiency
 
 - [ ] **Implement node pooling for Radix Tree allocations**
   _Justification:_ Frequent `std::shared_ptr<Node>` allocations fragment the heap. A slab allocator per shard reduces allocation overhead and improves cache locality.
@@ -395,6 +403,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
 | **P1 - High** | Security | API key rotation | Medium | ✅ Done |
 | **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
+| **P1 - High** | Performance | Async persistence (reactor stall fix) | Medium | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
@@ -411,6 +420,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-05 | Decouple SQLite persistence from reactor thread (AsyncPersistenceManager) | - |
 | 2026-01-05 | Prevent reactor stalls in DTLS crypto operations (adaptive offloading) | - |
 | 2025-01-04 | Implement split-brain detection with quorum-aware health checks | - |
 | 2025-01-04 | Add development container (devcontainer) | - |
