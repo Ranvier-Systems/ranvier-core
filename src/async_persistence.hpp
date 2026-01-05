@@ -164,8 +164,11 @@ private:
     // Gate for tracking in-flight flush operations
     seastar::gate _flush_gate;
 
-    // Flag to indicate shutdown
-    bool _stopping = false;
+    // Semaphore to serialize batch processing (ensures ordering)
+    seastar::semaphore _batch_semaphore{1};
+
+    // Flag to indicate shutdown (atomic for cross-shard access)
+    std::atomic<bool> _stopping{false};
 
     // Statistics
     std::atomic<uint64_t> _ops_processed{0};
