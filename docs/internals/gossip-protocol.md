@@ -91,6 +91,106 @@ All multi-byte integers are encoded **big-endian**.
 
 **Packet size**: 2 bytes (fixed)
 
+## DTLS Encryption
+
+Gossip traffic can be encrypted using DTLS 1.2 (Datagram TLS) for secure cluster communication. This provides mutual TLS authentication and encryption over UDP.
+
+### Enabling DTLS
+
+```yaml
+cluster:
+  tls:
+    enabled: true
+    cert_file: /etc/ranvier/cluster.crt
+    key_file: /etc/ranvier/cluster.key
+    ca_file: /etc/ranvier/ca.crt
+    verify_peer: true  # Enable mTLS
+```
+
+### Handshake Flow
+
+```
+Node A                              Node B
+   |                                   |
+   |  ClientHello                      |
+   |---------------------------------->|
+   |                                   |
+   |  ServerHello, Certificate,        |
+   |  CertificateRequest, ServerDone   |
+   |<----------------------------------|
+   |                                   |
+   |  Certificate, ClientKeyExchange,  |
+   |  CertificateVerify, Finished      |
+   |---------------------------------->|
+   |                                   |
+   |  Finished                         |
+   |<----------------------------------|
+   |                                   |
+   |  [Encrypted gossip traffic]       |
+   |<=================================>|
+```
+
+### Reactor Stall Prevention
+
+DTLS encryption uses OpenSSL which performs CPU-intensive operations. To prevent these from blocking Seastar's reactor thread (causing stalls that delay all other network I/O), the gossip service implements adaptive offloading:
+
+#### Thresholds
+
+| Threshold | Value | Description |
+|-----------|-------|-------------|
+| `CRYPTO_OFFLOAD_BYTES_THRESHOLD` | 1024 bytes | Packets larger than this are encrypted in background thread |
+| `CRYPTO_OFFLOAD_PEER_THRESHOLD` | 10 peers | Broadcasts to more peers use batch mode |
+| `CRYPTO_STALL_WARNING_US` | 100μs | Log warning if single crypto op exceeds this |
+
+#### Encryption Paths
+
+| Packet Size | Peer Count | Execution Path |
+|-------------|------------|----------------|
+| ≤1024 bytes | Any | Inline on reactor (with timing watchdog) |
+| >1024 bytes | Any | `seastar::async` background thread |
+| Any | ≤10 peers | `parallel_for_each` with per-peer encryption |
+| Any | >10 peers | `seastar::thread` with batched encryption + yield |
+
+#### Batch Broadcast Mode
+
+When broadcasting to many peers (>10), all encryptions are performed in a single `seastar::thread` context:
+
+1. Pre-encrypt for all peers (batch timing measured)
+2. Send all packets with `thread::yield()` between sends
+3. Single stall warning if batch exceeds `100μs × peer_count`
+
+This prevents 50+ sequential crypto operations from monopolizing the reactor.
+
+#### Typical Timing
+
+| Packet Size | Typical Encrypt Time | Path |
+|-------------|---------------------|------|
+| Heartbeat (2 bytes) | ~5μs | Inline |
+| Small route (52 bytes) | ~10μs | Inline |
+| Large route (1036 bytes) | ~50-80μs | Offloaded |
+| Batch of 50 peers | ~2-4ms total | Batch thread |
+
+### Certificate Hot-Reload
+
+Certificates can be reloaded without restart:
+
+```yaml
+cluster:
+  tls:
+    cert_reload_interval_seconds: 3600  # Check hourly
+```
+
+When certificates change:
+1. New certs loaded into DTLS context
+2. Existing sessions invalidated
+3. Handshakes re-initiated with all peers (parallel, gated)
+
+### Session Management
+
+- Sessions cached per peer address
+- Idle sessions cleaned up after 5 minutes
+- Graceful shutdown waits for in-flight handshakes via `seastar::gate`
+
 ## Reliable Delivery
 
 ### Sequence Numbers
@@ -318,6 +418,25 @@ All metrics are exposed via Prometheus on port 9180.
 | `ranvier_cluster_quorum_transitions` | Counter | Total state transitions (healthy↔degraded) |
 | `ranvier_cluster_routes_rejected_degraded` | Counter | Routes rejected due to degraded state |
 
+### DTLS Encryption
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ranvier_cluster_dtls_handshakes_started` | Counter | DTLS handshakes initiated |
+| `ranvier_cluster_dtls_handshakes_completed` | Counter | DTLS handshakes completed successfully |
+| `ranvier_cluster_dtls_handshakes_failed` | Counter | DTLS handshakes that failed |
+| `ranvier_cluster_dtls_packets_encrypted` | Counter | Packets encrypted with DTLS |
+| `ranvier_cluster_dtls_packets_decrypted` | Counter | Packets decrypted with DTLS |
+| `ranvier_cluster_dtls_cert_reloads` | Counter | Certificate hot-reloads performed |
+
+### Crypto Performance
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ranvier_cluster_crypto_stall_warnings` | Counter | Crypto ops exceeding 100μs stall threshold |
+| `ranvier_cluster_crypto_ops_offloaded` | Counter | Crypto ops offloaded to background thread |
+| `ranvier_cluster_crypto_batch_broadcasts` | Counter | Broadcasts using batch mode (>10 peers) |
+
 ## Debugging
 
 ### Symptoms and Metrics
@@ -329,6 +448,9 @@ All metrics are exposed via Prometheus on port 9180.
 | Duplicate processing | `duplicates_suppressed` = 0 | `dedup_window` too small |
 | Routes rejected | `routes_rejected_degraded` > 0 | Cluster in degraded mode (quorum lost) |
 | Quorum flapping | `quorum_transitions` increasing | Unstable network or peer health |
+| DTLS handshake failures | `dtls_handshakes_failed` > 0 | Certificate mismatch or expiry |
+| Crypto stalls | `crypto_stall_warnings` > 0 | CPU overload or slow crypto hardware |
+| High offload rate | `crypto_ops_offloaded` high | Many large packets (may indicate token explosion) |
 
 ### Log Levels
 
@@ -393,6 +515,9 @@ Total overhead: ~6KB per peer (negligible for typical 3-node clusters)
 | File | Purpose |
 |------|---------|
 | `src/gossip_service.hpp` | Packet structs, GossipService class, QuorumState enum |
-| `src/gossip_service.cpp` | UDP send/receive, reliability logic, quorum tracking |
-| `src/config.hpp` | ClusterConfig with reliability and quorum settings |
+| `src/gossip_service.cpp` | UDP send/receive, reliability logic, quorum tracking, DTLS crypto |
+| `src/dtls_context.hpp` | DtlsContext and DtlsSession classes |
+| `src/dtls_context.cpp` | OpenSSL-based DTLS implementation |
+| `src/config.hpp` | ClusterConfig with reliability, quorum, and TLS settings |
 | `tests/unit/quorum_test.cpp` | Unit tests for quorum calculation and state transitions |
+| `tests/unit/gossip_protocol_test.cpp` | Wire format tests and crypto offload threshold tests |
