@@ -61,8 +61,14 @@ Performance optimizations for the hot path: tokenization, routing, and response 
 
 ### 1.4 Memory Efficiency
 
+- [x] **Replace `shared_ptr` with `unique_ptr` in RadixTree** ✓
+  _Justification:_ `std::shared_ptr` uses atomic reference counting (`lock xadd` on x86), adding ~20 cycles per copy/destroy. Seastar's shared-nothing model means nodes are never shared across threads, making `unique_ptr` the correct ownership model.
+  _Approach:_ Replaced all `std::shared_ptr<Node>` with `std::unique_ptr<Node>`. Added `extract_child()` for ownership transfer during mutations. `find_child()` returns raw `Node*` for traversal. Converted recursive lookup to iterative for additional performance gains.
+  _Location:_ `src/radix_tree.hpp`
+  _Complexity:_ Medium
+
 - [ ] **Implement node pooling for Radix Tree allocations**
-  _Justification:_ Frequent `std::shared_ptr<Node>` allocations fragment the heap. A slab allocator per shard reduces allocation overhead and improves cache locality.
+  _Justification:_ Frequent `std::unique_ptr<Node>` allocations fragment the heap. A slab allocator per shard reduces allocation overhead and improves cache locality.
   _Location:_ `src/radix_tree.hpp`
   _Complexity:_ High
 
@@ -411,6 +417,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
 | **P1 - High** | Performance | Async persistence (reactor stall fix) | Medium | ✅ Done |
 | **P1 - High** | Performance | Batch remote route updates (SMP storm fix) | Medium | ✅ Done |
+| **P1 - High** | Performance | Replace shared_ptr with unique_ptr in RadixTree | Medium | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
@@ -427,6 +434,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-05 | Replace shared_ptr with unique_ptr in RadixTree (Seastar optimization) | - |
 | 2026-01-05 | Batch remote route updates to prevent SMP storm (99% message reduction) | - |
 | 2026-01-05 | Decouple SQLite persistence from reactor thread (AsyncPersistenceManager) | - |
 | 2026-01-05 | Prevent reactor stalls in DTLS crypto operations (adaptive offloading) | - |
