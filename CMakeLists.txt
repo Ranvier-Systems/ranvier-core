@@ -243,6 +243,18 @@ target_link_libraries(gossip_protocol_test
 )
 gtest_discover_tests(gossip_protocol_test)
 
+# Route Batching Unit Tests (Pure C++, no Seastar dependency)
+# Tests for route batching data structures and behavior
+add_executable(route_batching_test
+  tests/unit/route_batching_test.cpp
+)
+target_include_directories(route_batching_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(route_batching_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(route_batching_test)
+
 # K8s Discovery Unit Tests (Pure C++, no Seastar dependency)
 # Tests for K8s EndpointSlice parsing and JSON helpers
 add_executable(k8s_discovery_test
