@@ -1371,11 +1371,11 @@ seastar::future<> GossipService::check_cert_reload() {
                     _peer_addresses.size());
 
     // Re-initiate handshakes with all peers using parallel_for_each with gating
-    // The gate limits the number of concurrent handshakes to prevent SMP storms
+    // The gate allows graceful shutdown - stop() waits for gate.close() before resetting _dtls_context
     co_await seastar::parallel_for_each(_peer_addresses, [this](const seastar::socket_address& peer) -> seastar::future<> {
-        // Use the gate to limit concurrent handshakes
+        // Use the gate to coordinate with shutdown
         try {
-            auto holder = _handshake_gate.hold();
+            [[maybe_unused]] auto holder = _handshake_gate.hold();
 
             auto* session = _dtls_context->get_or_create_session(peer, false);
             if (!session) {
