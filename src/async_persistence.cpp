@@ -14,15 +14,20 @@ static seastar::logger log_async_persist("async_persist");
 
 class AsyncPersistenceManager::RouteAccumulator {
 public:
-    explicit RouteAccumulator(AsyncPersistenceManager& manager)
-        : _manager(manager) {}
+    explicit RouteAccumulator(AsyncPersistenceManager& manager, size_t capacity_hint = 0)
+        : _manager(manager) {
+        if (capacity_hint > 0) {
+            _routes.reserve(capacity_hint);
+        }
+    }
 
     ~RouteAccumulator() {
         flush();  // Ensure remaining routes are flushed on destruction
     }
 
     // Add a route to the batch (will be flushed later)
-    void add(std::vector<TokenId> tokens, BackendId backend_id) {
+    // Uses move semantics to avoid copying the token vector
+    void add(std::vector<TokenId>&& tokens, BackendId backend_id) {
         RouteRecord record;
         record.tokens = std::move(tokens);
         record.backend_id = backend_id;
@@ -241,7 +246,8 @@ void AsyncPersistenceManager::on_flush_timer() {
 void AsyncPersistenceManager::process_batch(std::vector<PersistenceOp> batch) {
     if (!_store || batch.empty()) return;
 
-    RouteAccumulator routes(*this);
+    // Pre-allocate for common case where batch is mostly routes
+    RouteAccumulator routes(*this, batch.size());
 
     for (auto& op : batch) {
         try {
@@ -261,9 +267,10 @@ void AsyncPersistenceManager::process_batch(std::vector<PersistenceOp> batch) {
 // Operation Handlers
 // ============================================================================
 
-void AsyncPersistenceManager::execute(const SaveRouteOp& op, RouteAccumulator& routes) {
+void AsyncPersistenceManager::execute(SaveRouteOp& op, RouteAccumulator& routes) {
     // Accumulate for batch insert (more efficient than individual inserts)
-    routes.add(op.tokens, op.backend_id);
+    // Move tokens to avoid copying the vector
+    routes.add(std::move(op.tokens), op.backend_id);
 }
 
 void AsyncPersistenceManager::execute(const SaveBackendOp& op, RouteAccumulator& routes) {

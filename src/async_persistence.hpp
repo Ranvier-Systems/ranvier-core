@@ -141,7 +141,8 @@ private:
     class RouteAccumulator;
 
     // Execute individual operations (called by process_batch).
-    void execute(const SaveRouteOp& op, RouteAccumulator& routes);
+    // Note: SaveRouteOp is passed by non-const ref to allow move semantics.
+    void execute(SaveRouteOp& op, RouteAccumulator& routes);
     void execute(const SaveBackendOp& op, RouteAccumulator& routes);
     void execute(const RemoveBackendOp& op, RouteAccumulator& routes);
     void execute(const RemoveRoutesForBackendOp& op, RouteAccumulator& routes);
