@@ -557,13 +557,18 @@ TEST_F(AsyncPersistenceQueueTest, MixedOperationTypes) {
     manager.set_persistence_store(mock_store_.get());
 
     // Queue different operation types
-    manager.queue_save_route({1, 2, 3}, 1);
+    std::vector<TokenId> tokens1 = {1, 2, 3};
+    std::vector<TokenId> tokens2 = {4, 5, 6};
+    std::vector<TokenId> tokens3 = {7, 8, 9};
+    std::vector<TokenId> tokens4 = {10, 11, 12};
+
+    manager.queue_save_route(tokens1, 1);
     manager.queue_save_backend(1, "127.0.0.1", 8080, 100, 0);
-    manager.queue_save_route({4, 5, 6}, 2);
+    manager.queue_save_route(tokens2, 2);
     manager.queue_remove_backend(1);
-    manager.queue_save_route({7, 8, 9}, 3);
+    manager.queue_save_route(tokens3, 3);
     manager.queue_remove_routes_for_backend(2);
-    manager.queue_save_route({10, 11, 12}, 4);
+    manager.queue_save_route(tokens4, 4);
 
     EXPECT_EQ(manager.queue_depth(), 7);
 }
@@ -601,7 +606,8 @@ TEST_F(AsyncPersistenceIntegrationTest, QueueWithRealStore) {
     manager.set_persistence_store(store_.get());
 
     // Queue operations
-    manager.queue_save_route({1, 2, 3}, 1);
+    std::vector<TokenId> tokens = {1, 2, 3};
+    manager.queue_save_route(tokens, 1);
     manager.queue_save_backend(1, "127.0.0.1", 8080, 100, 0);
 
     EXPECT_EQ(manager.queue_depth(), 2);
@@ -622,7 +628,8 @@ TEST_F(AsyncPersistenceIntegrationTest, DirectStoreAccessStillWorks) {
 
     // Write directly (simulating startup load)
     underlying->save_backend(1, "192.168.1.1", 11434, 100, 0);
-    underlying->save_route({100, 200, 300}, 1);
+    std::vector<TokenId> tokens = {100, 200, 300};
+    underlying->save_route(tokens, 1);
 
     // Verify writes persisted
     auto backends = underlying->load_backends();
