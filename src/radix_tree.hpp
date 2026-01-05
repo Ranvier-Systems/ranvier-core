@@ -262,33 +262,37 @@ private:
     // Child Access Operations
     // -------------------------------------------------------------------------
 
+    // Find child by key - hot path, optimized for common cases
     Node* find_child(Node* node, TokenId key) const {
         switch (node->type) {
             case NodeType::Node4: {
                 auto* n = static_cast<Node4*>(node);
+                // Small node: linear scan is cache-friendly
                 for (size_t i = 0; i < n->keys.size(); i++) {
                     if (n->keys[i] == key) return n->children[i].get();
                 }
-                break;
+                return nullptr;
             }
             case NodeType::Node16: {
                 auto* n = static_cast<Node16*>(node);
+                // Medium node: linear scan, SIMD-friendly in future
                 for (size_t i = 0; i < n->keys.size(); i++) {
                     if (n->keys[i] == key) return n->children[i].get();
                 }
-                break;
+                return nullptr;
             }
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
+                // O(1) index lookup
                 uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER) {
+                if (idx != Node48::EMPTY_MARKER) [[likely]] {
                     return n->children[idx].get();
                 }
-                break;
+                return nullptr;
             }
             case NodeType::Node256: {
-                auto* n = static_cast<Node256*>(node);
-                return n->children[key_byte(key)].get();
+                // O(1) direct array access - most common for dense nodes
+                return static_cast<Node256*>(node)->children[key_byte(key)].get();
             }
         }
         return nullptr;
@@ -698,35 +702,62 @@ private:
     // Lookup Implementation
     // -------------------------------------------------------------------------
 
+    // Iterative lookup for better performance (no recursion overhead)
     std::optional<BackendId> lookup_recursive(Node* node, std::span<const TokenId> tokens) {
-        // Check prefix match
-        size_t match_len = 0;
-        while (match_len < node->prefix.size() && match_len < tokens.size()) {
-            if (node->prefix[match_len] != tokens[match_len]) return std::nullopt;
-            match_len++;
-        }
+        std::optional<BackendId> best_match = std::nullopt;
+        Node* best_match_node = nullptr;
 
-        if (match_len < node->prefix.size()) return std::nullopt;
+        while (node != nullptr) {
+            // Check prefix match
+            const auto& prefix = node->prefix;
+            size_t prefix_len = prefix.size();
+            size_t tokens_len = tokens.size();
+            size_t match_len = 0;
 
-        auto remaining = tokens.subspan(match_len);
-
-        // Try deeper match
-        if (!remaining.empty()) {
-            Node* child = find_child(node, remaining[0]);
-            if (child) {
-                auto result = lookup_recursive(child, remaining.subspan(1));
-                if (result.has_value()) {
-                    child->last_accessed = std::chrono::steady_clock::now();
-                    return result;
+            // Fast prefix comparison
+            while (match_len < prefix_len && match_len < tokens_len) {
+                if (prefix[match_len] != tokens[match_len]) {
+                    // Prefix mismatch - return best match so far
+                    if (best_match_node) {
+                        best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    }
+                    return best_match;
                 }
+                match_len++;
             }
+
+            // Input shorter than prefix - return best match
+            if (match_len < prefix_len) {
+                if (best_match_node) {
+                    best_match_node->last_accessed = std::chrono::steady_clock::now();
+                }
+                return best_match;
+            }
+
+            // Update best match if this node has a value
+            if (node->leaf_value.has_value()) {
+                best_match = node->leaf_value;
+                best_match_node = node;
+            }
+
+            // Advance past matched prefix
+            tokens = tokens.subspan(match_len);
+
+            // If no more tokens, we're done
+            if (tokens.empty()) [[unlikely]] {
+                break;
+            }
+
+            // Find child for next token
+            node = find_child(node, tokens[0]);
+            tokens = tokens.subspan(1);
         }
 
-        // Return this node's value (longest prefix match)
-        if (node->leaf_value.has_value()) {
-            node->last_accessed = std::chrono::steady_clock::now();
+        // Touch LRU timestamp for matched node
+        if (best_match_node) {
+            best_match_node->last_accessed = std::chrono::steady_clock::now();
         }
-        return node->leaf_value;
+        return best_match;
     }
 
     // -------------------------------------------------------------------------
