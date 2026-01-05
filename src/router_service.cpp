@@ -142,6 +142,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             return remove_routes_for_backend(backend);
         });
 
+        // Pre-allocate buffer for route batching to avoid reallocations during operation
+        _pending_remote_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
+
         log_router.info("Cluster mode enabled with {} peers", _cluster_config.peers.size());
     }
 
@@ -551,7 +554,13 @@ seastar::future<> RouterService::flush_route_batch() {
     log_router.debug("Broadcasting batch of {} routes to {} shards",
                      batch.size(), seastar::smp::count);
 
-    // Send ONE message per shard containing the entire batch
+    // Send ONE message per shard containing the entire batch.
+    //
+    // PERFORMANCE NOTE: Each shard receives a COPY of the batch. This is required by
+    // Seastar's shared-nothing architecture - smp::submit_to serializes data to send
+    // it across cores. While this means O(shards) copies of the batch, the key win is
+    // reducing SMP message count from O(routes × shards) to O(shards). With 1000 routes/sec
+    // and 64 shards, this reduces messages from 64,000/sec to ~640/sec (at 100 routes/batch).
     return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& shared_batch) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [&shared_batch](unsigned shard_id) {
