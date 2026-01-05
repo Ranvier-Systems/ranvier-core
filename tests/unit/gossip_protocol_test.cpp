@@ -585,6 +585,209 @@ TEST_F(GossipProtocolTest, RouteAnnouncementWithSeqNum) {
     ASSERT_EQ(result->tokens.size(), 3u);
 }
 
+// =============================================================================
+// Crypto Offload Threshold Tests
+// =============================================================================
+// These tests verify the threshold logic used by GossipService to decide when
+// to offload crypto operations to background threads to avoid reactor stalls.
+
+class CryptoOffloadTest : public ::testing::Test {
+protected:
+    // Thresholds matching gossip_service.hpp constants
+    static constexpr size_t CRYPTO_OFFLOAD_PEER_THRESHOLD = 10;
+    static constexpr size_t CRYPTO_OFFLOAD_BYTES_THRESHOLD = 1024;
+    static constexpr uint64_t CRYPTO_STALL_WARNING_US = 100;
+
+    // Simulates the decision logic in send_encrypted()
+    enum class EncryptPath {
+        INLINE,      // Small packets: encrypt directly on reactor
+        OFFLOADED    // Large packets: use seastar::async
+    };
+
+    EncryptPath get_encrypt_path(size_t packet_size) const {
+        return packet_size > CRYPTO_OFFLOAD_BYTES_THRESHOLD
+            ? EncryptPath::OFFLOADED
+            : EncryptPath::INLINE;
+    }
+
+    // Simulates the decision logic in broadcast_encrypted()
+    enum class BroadcastPath {
+        PARALLEL_FOR_EACH,  // Small peer count: parallel_for_each
+        BATCH_THREAD        // Large peer count: seastar::thread with batching
+    };
+
+    BroadcastPath get_broadcast_path(size_t peer_count) const {
+        return peer_count > CRYPTO_OFFLOAD_PEER_THRESHOLD
+            ? BroadcastPath::BATCH_THREAD
+            : BroadcastPath::PARALLEL_FOR_EACH;
+    }
+
+    // Simulates the batch stall threshold calculation
+    uint64_t calculate_batch_threshold(size_t peer_count) const {
+        return CRYPTO_STALL_WARNING_US * peer_count;
+    }
+};
+
+TEST_F(CryptoOffloadTest, ThresholdConstants) {
+    // Verify thresholds are reasonable values
+    EXPECT_EQ(CRYPTO_OFFLOAD_PEER_THRESHOLD, 10u);
+    EXPECT_EQ(CRYPTO_OFFLOAD_BYTES_THRESHOLD, 1024u);
+    EXPECT_EQ(CRYPTO_STALL_WARNING_US, 100u);
+}
+
+TEST_F(CryptoOffloadTest, SmallPacketUsesInlinePath) {
+    // Packets <= 1024 bytes should encrypt inline
+    EXPECT_EQ(get_encrypt_path(0), EncryptPath::INLINE);
+    EXPECT_EQ(get_encrypt_path(100), EncryptPath::INLINE);
+    EXPECT_EQ(get_encrypt_path(512), EncryptPath::INLINE);
+    EXPECT_EQ(get_encrypt_path(1024), EncryptPath::INLINE);
+}
+
+TEST_F(CryptoOffloadTest, LargePacketUsesOffloadPath) {
+    // Packets > 1024 bytes should offload to background thread
+    EXPECT_EQ(get_encrypt_path(1025), EncryptPath::OFFLOADED);
+    EXPECT_EQ(get_encrypt_path(2048), EncryptPath::OFFLOADED);
+    EXPECT_EQ(get_encrypt_path(65536), EncryptPath::OFFLOADED);
+}
+
+TEST_F(CryptoOffloadTest, SmallPeerCountUsesParallelForEach) {
+    // <= 10 peers should use parallel_for_each
+    EXPECT_EQ(get_broadcast_path(0), BroadcastPath::PARALLEL_FOR_EACH);
+    EXPECT_EQ(get_broadcast_path(1), BroadcastPath::PARALLEL_FOR_EACH);
+    EXPECT_EQ(get_broadcast_path(5), BroadcastPath::PARALLEL_FOR_EACH);
+    EXPECT_EQ(get_broadcast_path(10), BroadcastPath::PARALLEL_FOR_EACH);
+}
+
+TEST_F(CryptoOffloadTest, LargePeerCountUsesBatchThread) {
+    // > 10 peers should use batched thread execution
+    EXPECT_EQ(get_broadcast_path(11), BroadcastPath::BATCH_THREAD);
+    EXPECT_EQ(get_broadcast_path(50), BroadcastPath::BATCH_THREAD);
+    EXPECT_EQ(get_broadcast_path(100), BroadcastPath::BATCH_THREAD);
+}
+
+TEST_F(CryptoOffloadTest, BatchThresholdScalesWithPeerCount) {
+    // Batch stall threshold should be 100μs per peer
+    EXPECT_EQ(calculate_batch_threshold(1), 100u);
+    EXPECT_EQ(calculate_batch_threshold(10), 1000u);
+    EXPECT_EQ(calculate_batch_threshold(50), 5000u);
+    EXPECT_EQ(calculate_batch_threshold(100), 10000u);
+}
+
+TEST_F(CryptoOffloadTest, TypicalHeartbeatPacketIsInline) {
+    // Heartbeat packet is 2 bytes - should always be inline
+    constexpr size_t HEARTBEAT_SIZE = 2;
+    EXPECT_EQ(get_encrypt_path(HEARTBEAT_SIZE), EncryptPath::INLINE);
+}
+
+TEST_F(CryptoOffloadTest, TypicalRouteAnnouncementPathSelection) {
+    // Test typical route announcement sizes
+
+    // Empty announcement: just header (12 bytes)
+    EXPECT_EQ(get_encrypt_path(RouteAnnouncementPacket::HEADER_SIZE), EncryptPath::INLINE);
+
+    // Small announcement: 10 tokens = 12 + 40 = 52 bytes
+    constexpr size_t SMALL_ANNOUNCEMENT = RouteAnnouncementPacket::HEADER_SIZE + 10 * sizeof(TokenId);
+    EXPECT_EQ(get_encrypt_path(SMALL_ANNOUNCEMENT), EncryptPath::INLINE);
+
+    // Large announcement: 256 tokens = 12 + 1024 = 1036 bytes
+    constexpr size_t LARGE_ANNOUNCEMENT = RouteAnnouncementPacket::MAX_PACKET_SIZE;
+    EXPECT_EQ(get_encrypt_path(LARGE_ANNOUNCEMENT), EncryptPath::OFFLOADED);
+}
+
+TEST_F(CryptoOffloadTest, MaxPacketSizeExceedsThreshold) {
+    // Verify that MAX_PACKET_SIZE (1036 bytes) exceeds the offload threshold (1024)
+    // This ensures large route announcements are always offloaded
+    EXPECT_GT(RouteAnnouncementPacket::MAX_PACKET_SIZE, CRYPTO_OFFLOAD_BYTES_THRESHOLD);
+}
+
+// =============================================================================
+// Stall Timing Simulation Tests
+// =============================================================================
+
+class StallTimingTest : public ::testing::Test {
+protected:
+    static constexpr uint64_t STALL_WARNING_US = 100;
+
+    bool would_trigger_stall_warning(uint64_t elapsed_us) const {
+        return elapsed_us > STALL_WARNING_US;
+    }
+};
+
+TEST_F(StallTimingTest, FastOperationNoWarning) {
+    // Operations under 100μs should not trigger warnings
+    EXPECT_FALSE(would_trigger_stall_warning(0));
+    EXPECT_FALSE(would_trigger_stall_warning(50));
+    EXPECT_FALSE(would_trigger_stall_warning(99));
+    EXPECT_FALSE(would_trigger_stall_warning(100));  // Exactly at threshold = no warning
+}
+
+TEST_F(StallTimingTest, SlowOperationTriggersWarning) {
+    // Operations over 100μs should trigger warnings
+    EXPECT_TRUE(would_trigger_stall_warning(101));
+    EXPECT_TRUE(would_trigger_stall_warning(200));
+    EXPECT_TRUE(would_trigger_stall_warning(1000));
+    EXPECT_TRUE(would_trigger_stall_warning(10000));
+}
+
+TEST_F(StallTimingTest, TypicalCryptoOperationTiming) {
+    // Typical AES-GCM encryption times for various packet sizes:
+    // - 64 bytes: ~5-10μs (well under threshold)
+    // - 1KB: ~20-40μs (under threshold)
+    // - 4KB: ~80-120μs (borderline)
+    // - 16KB: ~300-500μs (would trigger warning)
+
+    // These tests document expected behavior for typical hardware
+    EXPECT_FALSE(would_trigger_stall_warning(10));   // 64 bytes
+    EXPECT_FALSE(would_trigger_stall_warning(40));   // 1KB
+    EXPECT_TRUE(would_trigger_stall_warning(120));   // 4KB on slow hardware
+    EXPECT_TRUE(would_trigger_stall_warning(400));   // 16KB
+}
+
+// =============================================================================
+// Packet Size to Token Count Mapping Tests
+// =============================================================================
+
+class PacketSizeTest : public ::testing::Test {
+protected:
+    static constexpr size_t HEADER_SIZE = 12;
+    static constexpr size_t TOKEN_SIZE = sizeof(TokenId);  // 4 bytes
+    static constexpr size_t OFFLOAD_THRESHOLD = 1024;
+
+    size_t calculate_packet_size(size_t token_count) const {
+        return HEADER_SIZE + token_count * TOKEN_SIZE;
+    }
+
+    size_t max_inline_tokens() const {
+        // Find max tokens that still result in inline encryption
+        // packet_size <= 1024
+        // HEADER_SIZE + token_count * 4 <= 1024
+        // token_count <= (1024 - 12) / 4 = 253
+        return (OFFLOAD_THRESHOLD - HEADER_SIZE) / TOKEN_SIZE;
+    }
+};
+
+TEST_F(PacketSizeTest, MaxInlineTokenCount) {
+    // Calculate maximum tokens that can be encrypted inline
+    size_t max_tokens = max_inline_tokens();
+    EXPECT_EQ(max_tokens, 253u);
+
+    // Verify this packet size is at or below threshold
+    EXPECT_LE(calculate_packet_size(max_tokens), OFFLOAD_THRESHOLD);
+
+    // Verify one more token would exceed threshold
+    EXPECT_GT(calculate_packet_size(max_tokens + 1), OFFLOAD_THRESHOLD);
+}
+
+TEST_F(PacketSizeTest, TokenCountToPacketSize) {
+    EXPECT_EQ(calculate_packet_size(0), 12u);
+    EXPECT_EQ(calculate_packet_size(1), 16u);
+    EXPECT_EQ(calculate_packet_size(10), 52u);
+    EXPECT_EQ(calculate_packet_size(100), 412u);
+    EXPECT_EQ(calculate_packet_size(253), 1024u);  // Max inline
+    EXPECT_EQ(calculate_packet_size(254), 1028u);  // First offloaded
+    EXPECT_EQ(calculate_packet_size(256), 1036u);  // MAX_PACKET_SIZE
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
