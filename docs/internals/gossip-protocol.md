@@ -501,6 +501,34 @@ Example route announcement (12-byte header + 4 tokens):
 - No locks required (Seastar's shared-nothing architecture)
 - **Quorum state accessors** (`quorum_state()`, `has_quorum()`, `is_degraded()`) only return valid data on shard 0; use `submit_to(0, ...)` to query from other shards
 
+### Route Batching (SMP Storm Prevention)
+
+When receiving high volumes of remote route announcements, immediately broadcasting each route to all shards generates excessive cross-core traffic:
+
+**Problem**: With 1000 routes/sec and 64 shards, naive broadcasting creates 64,000 SMP messages/sec, risking Seastar's internal message bus saturation.
+
+**Solution**: Routes are buffered on Shard 0 and flushed in batches:
+
+| Trigger | Condition |
+|---------|-----------|
+| Timer | Every 10ms (configurable via `RouteBatchConfig::FLUSH_INTERVAL`) |
+| Buffer full | When buffer reaches 100 routes (configurable via `RouteBatchConfig::MAX_BATCH_SIZE`) |
+
+**Batch Broadcast Flow**:
+1. `learn_route_remote()` pushes route to `_pending_remote_routes` buffer
+2. Timer or buffer-full condition triggers `flush_route_batch()`
+3. Single `smp::submit_to()` per shard with entire batch (reduces messages from O(routes × shards) to O(shards))
+4. Each shard applies batch to local RadixTree via `apply_route_batch_to_local_tree()`
+
+**Performance Impact**:
+
+| Scenario | Without Batching | With Batching | Reduction |
+|----------|-----------------|---------------|-----------|
+| 1000 routes/sec, 64 shards | 64,000 msg/sec | 640 msg/sec | 99% |
+| 100 routes/sec, 16 shards | 1,600 msg/sec | 160 msg/sec | 90% |
+
+**Shutdown Sequence**: `stop_gossip()` cancels the timer, stops GossipService (preventing new routes), then flushes remaining buffered routes to ensure no data loss.
+
 ### Memory Usage
 
 Per peer:
@@ -516,8 +544,11 @@ Total overhead: ~6KB per peer (negligible for typical 3-node clusters)
 |------|---------|
 | `src/gossip_service.hpp` | Packet structs, GossipService class, QuorumState enum |
 | `src/gossip_service.cpp` | UDP send/receive, reliability logic, quorum tracking, DTLS crypto |
+| `src/router_service.hpp` | PendingRemoteRoute, RouteBatchConfig, batch buffer |
+| `src/router_service.cpp` | Route batching implementation (learn_route_remote, flush_route_batch) |
 | `src/dtls_context.hpp` | DtlsContext and DtlsSession classes |
 | `src/dtls_context.cpp` | OpenSSL-based DTLS implementation |
 | `src/config.hpp` | ClusterConfig with reliability, quorum, and TLS settings |
 | `tests/unit/quorum_test.cpp` | Unit tests for quorum calculation and state transitions |
 | `tests/unit/gossip_protocol_test.cpp` | Wire format tests and crypto offload threshold tests |
+| `tests/unit/route_batching_test.cpp` | Unit tests for route batching behavior |
