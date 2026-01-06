@@ -299,62 +299,69 @@ seastar::future<> Application::startup() {
 
     // Use the gate to track startup completion
     return seastar::try_with_gate(_lifecycle_gate, [this] {
-        // 1. Initialize tokenizer (synchronous) - failure is fatal
-        try {
-            init_tokenizer();
-        } catch (const std::exception& e) {
-            log_main.error("Service init failed: {}", e.what());
-            return seastar::make_exception_future<>(
-                std::runtime_error("Tokenizer initialization failed: " + std::string(e.what())));
-        }
+        // 1. Initialize sharded config - distribute config to all CPU cores
+        // This provides lock-free per-core access to configuration
+        return _sharded_config.start(_config).then([this] {
+            _sharded_config_started = true;
+            log_main.info("Sharded config initialized on {} cores", seastar::smp::count);
+        }).then([this] {
+            // 2. Initialize tokenizer (synchronous) - failure is fatal
+            try {
+                init_tokenizer();
+            } catch (const std::exception& e) {
+                log_main.error("Service init failed: {}", e.what());
+                return seastar::make_exception_future<>(
+                    std::runtime_error("Tokenizer initialization failed: " + std::string(e.what())));
+            }
 
-        // 2. Initialize OpenTelemetry tracing
-        TracingService::init(_config.telemetry);
-        if (_config.telemetry.enabled) {
-            log_main.info("OpenTelemetry tracing enabled (endpoint: {}, sample_rate: {:.2f})",
-                _config.telemetry.otlp_endpoint, _config.telemetry.sample_rate);
-        } else {
-            log_main.info("OpenTelemetry tracing disabled");
-        }
+            // 3. Initialize OpenTelemetry tracing
+            TracingService::init(_config.telemetry);
+            if (_config.telemetry.enabled) {
+                log_main.info("OpenTelemetry tracing enabled (endpoint: {}, sample_rate: {:.2f})",
+                    _config.telemetry.otlp_endpoint, _config.telemetry.sample_rate);
+            } else {
+                log_main.info("OpenTelemetry tracing disabled");
+            }
 
-        // 3. Initialize router
-        _router = std::make_unique<RouterService>(_config.routing, _config.cluster);
-        if (_config.cluster.enabled) {
-            log_main.info("Cluster mode: {} peers on port {}",
-                _config.cluster.peers.size(), _config.cluster.gossip_port);
-        }
+            // 4. Initialize router
+            _router = std::make_unique<RouterService>(_config.routing, _config.cluster);
+            if (_config.cluster.enabled) {
+                log_main.info("Cluster mode: {} peers on port {}",
+                    _config.cluster.peers.size(), _config.cluster.gossip_port);
+            }
 
-        // 4. Build controller config
-        auto ctrl_config = build_controller_config();
+            // 5. Build controller config
+            auto ctrl_config = build_controller_config();
 
-        // 5. Initialize router's thread-local data on all shards
-        return _router->initialize_shards().then([this, ctrl_config] {
-            // 6. Start HttpController on all shards
-            return _controller.start(std::ref(_tokenizer), std::ref(*_router), ctrl_config);
+            // 6. Initialize router's thread-local data on all shards
+            return _router->initialize_shards().then([this, ctrl_config] {
+                // 7. Start HttpController on all shards with config reference
+                return _controller.start(std::ref(_tokenizer), std::ref(*_router), ctrl_config);
+            });
         }).then([this] {
             _controller_started = true;
         }).then([this] {
-            // 7. Initialize metrics on ALL shards
+            // 8. Initialize metrics on ALL shards
             return seastar::smp::invoke_on_all([] {
                 init_metrics();
             });
         }).then([this] {
-            // 8. Initialize persistence
+            // 9. Initialize persistence
             return init_persistence();
         }).then([this] {
-            // 9. Initialize health checker
+            // 10. Initialize health checker
             init_health_checker();
 
-            // 10. Initialize K8s discovery (if enabled)
+            // 11. Initialize K8s discovery (if enabled)
             init_k8s_discovery();
 
-            // 11. Start gossip service if cluster mode is enabled
+            // 12. Start gossip service if cluster mode is enabled
             return _router->start_gossip();
         }).then([this] {
-            // 12. Load persisted state
+            // 13. Load persisted state
             return load_persisted_state();
         }).then([this] {
-            // 13. Start K8s discovery service if enabled
+            // 14. Start K8s discovery service if enabled
             if (_k8s_discovery && _k8s_discovery->is_enabled()) {
                 return _k8s_discovery->start();
             }
@@ -632,6 +639,15 @@ seastar::future<> Application::stop_services() {
         return seastar::make_ready_future<>();
     });
 
+    // Stop sharded config (if started)
+    if (_sharded_config_started) {
+        chain = chain.then([this] {
+            return _sharded_config.stop().then([] {
+                log_main.info("Sharded config stopped");
+            });
+        });
+    }
+
     // Final cleanup
     return chain.finally([this] {
         cleanup();
@@ -708,20 +724,28 @@ seastar::future<> Application::reload_config() {
             log_main.warn("Config reload: assets.tokenizer_path changes require restart to take effect");
         }
 
-        // Update stored config
+        // Update master config
         _config = new_config;
 
-        // Build updated controller config
-        auto ctrl_config = build_controller_config();
-
-        // Update HttpController config on all shards
-        return _controller.invoke_on_all([ctrl_config](HttpController& c) {
-            c.update_config(ctrl_config);
+        // Step 1: Update the sharded config across all cores using invoke_on_all
+        // This ensures each shard has the updated configuration for lock-free access
+        return _sharded_config.invoke_on_all([new_config](RanvierConfig& cfg) {
+            cfg.update(new_config);
         }).then([this] {
-            // Update routing config on all shards
+            log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
+
+            // Step 2: Build updated controller config from the new config
+            auto ctrl_config = build_controller_config();
+
+            // Step 3: Update HttpController config on all shards
+            return _controller.invoke_on_all([ctrl_config](HttpController& c) {
+                c.update_config(ctrl_config);
+            });
+        }).then([this] {
+            // Step 4: Update routing config on all shards via RouterService
             return _router->update_routing_config(_config.routing);
         }).then([] {
-            log_main.info("Configuration reloaded successfully");
+            log_main.info("Configuration reloaded successfully on all cores");
         });
 
     } catch (const std::exception& e) {

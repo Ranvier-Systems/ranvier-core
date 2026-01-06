@@ -102,8 +102,15 @@ public:
                _state == ApplicationState::STOPPED;
     }
 
-    // Get the configuration (for read-only access)
+    // Get the master configuration (for read-only access)
     const RanvierConfig& config() const { return _config; }
+
+    // Get the sharded config for the local shard (for services to use)
+    // This provides lock-free, per-core access to configuration
+    const RanvierConfig& local_config() const { return _sharded_config.local(); }
+
+    // Get the sharded config container (for invoke_on_all operations)
+    seastar::sharded<RanvierConfig>& sharded_config() { return _sharded_config; }
 
     // Get the controller (for route registration in run())
     seastar::sharded<HttpController>& controller() { return _controller; }
@@ -113,13 +120,19 @@ public:
 
 private:
     // --- Configuration ---
+    // Master config (used for initial loading and reload operations)
     RanvierConfig _config;
     std::string _config_path;
+
+    // Sharded config - one copy per CPU core for lock-free access
+    // Services can receive const RanvierConfig& from their local shard
+    seastar::sharded<RanvierConfig> _sharded_config;
 
     // --- State ---
     ApplicationState _state = ApplicationState::CREATED;
 
     // Track which services were successfully started (for safe shutdown)
+    bool _sharded_config_started = false;
     bool _controller_started = false;
 
     // Gate to ensure startup completes before shutdown
