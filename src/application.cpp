@@ -42,9 +42,9 @@ seastar::future<> Application::init_tokenizer() {
             std::runtime_error("Tokenizer path not configured (assets.tokenizer_path is empty)"));
     }
 
-    return seastar::file_exists(path).then([this, path](bool exists) -> seastar::future<> {
+    return seastar::file_exists(path).then([this, path](bool exists) {
         if (!exists) {
-            return seastar::make_exception_future<>(
+            return seastar::make_exception_future<seastar::file>(
                 std::runtime_error("Could not find tokenizer: " + path));
         }
 
