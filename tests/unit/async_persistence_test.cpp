@@ -646,3 +646,126 @@ TEST_F(AsyncPersistenceIntegrationTest, DelegatedReadMethodsWork) {
     EXPECT_EQ(manager.backend_count(), 0);
     EXPECT_EQ(manager.route_count(), 0);
 }
+
+// =============================================================================
+// Ownership and Lifecycle Tests
+// =============================================================================
+
+TEST(AsyncPersistenceOwnershipTest, ManagerOwnsStoreViaFactory) {
+    // Test production constructor uses factory and owns the store
+    AsyncPersistenceConfig config;
+    AsyncPersistenceManager manager(config);
+
+    // Store is created but not opened yet
+    EXPECT_FALSE(manager.is_open());
+
+    // Operations on closed store should be no-ops
+    std::vector<TokenId> tokens = {1, 2, 3};
+    manager.queue_save_route(tokens, 1);
+    EXPECT_EQ(manager.queue_depth(), 0);  // Not queued because store not open
+}
+
+TEST(AsyncPersistenceOwnershipTest, ManagerOwnsInjectedStore) {
+    // Test that manager takes ownership of injected store
+    AsyncPersistenceConfig config;
+    auto store = std::make_unique<MockPersistenceStore>();
+    auto* store_ptr = store.get();
+
+    // Manager takes ownership
+    AsyncPersistenceManager manager(config, std::move(store));
+
+    // Original unique_ptr should be null
+    EXPECT_EQ(store.get(), nullptr);
+
+    // Store should be accessible via manager
+    store_ptr->open("/tmp/test");
+    EXPECT_TRUE(manager.is_open());
+}
+
+TEST(AsyncPersistenceOwnershipTest, OpenAndCloseLifecycle) {
+    std::string test_db = "/tmp/async_persist_lifecycle_test.db";
+
+    // Cleanup any previous test artifacts
+    std::remove(test_db.c_str());
+    std::remove((test_db + "-wal").c_str());
+    std::remove((test_db + "-shm").c_str());
+
+    AsyncPersistenceConfig config;
+    AsyncPersistenceManager manager(config);
+
+    // Initially not open
+    EXPECT_FALSE(manager.is_open());
+
+    // Open should succeed
+    EXPECT_TRUE(manager.open(test_db));
+    EXPECT_TRUE(manager.is_open());
+
+    // Close
+    manager.close();
+    EXPECT_FALSE(manager.is_open());
+
+    // Close should be idempotent
+    manager.close();  // Should not crash
+    EXPECT_FALSE(manager.is_open());
+
+    // Cleanup
+    std::remove(test_db.c_str());
+    std::remove((test_db + "-wal").c_str());
+    std::remove((test_db + "-shm").c_str());
+}
+
+TEST(AsyncPersistenceOwnershipTest, CloseIsIdempotent) {
+    AsyncPersistenceConfig config;
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
+
+    EXPECT_TRUE(manager.is_open());
+
+    // First close
+    manager.close();
+    EXPECT_FALSE(manager.is_open());
+
+    // Second close should not crash
+    manager.close();
+    EXPECT_FALSE(manager.is_open());
+
+    // Third close should not crash
+    manager.close();
+    EXPECT_FALSE(manager.is_open());
+}
+
+TEST(AsyncPersistenceOwnershipTest, DelegatedMaintenanceMethods) {
+    AsyncPersistenceConfig config;
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
+
+    // Test delegated maintenance methods
+    EXPECT_TRUE(manager.checkpoint());
+    EXPECT_TRUE(manager.verify_integrity());
+    EXPECT_TRUE(manager.clear_all());
+    EXPECT_EQ(manager.last_load_skipped_count(), 0);
+}
+
+TEST(AsyncPersistenceOwnershipTest, DelegatedMethodsReturnDefaultsWhenClosed) {
+    AsyncPersistenceConfig config;
+    AsyncPersistenceManager manager(config);
+    // Note: not opened
+
+    // Read operations should return empty/defaults
+    auto backends = manager.load_backends();
+    EXPECT_TRUE(backends.empty());
+
+    auto routes = manager.load_routes();
+    EXPECT_TRUE(routes.empty());
+
+    EXPECT_EQ(manager.backend_count(), 0);
+    EXPECT_EQ(manager.route_count(), 0);
+    EXPECT_EQ(manager.last_load_skipped_count(), 0);
+
+    // Maintenance operations should return false
+    EXPECT_FALSE(manager.checkpoint());
+    EXPECT_FALSE(manager.verify_integrity());
+    EXPECT_FALSE(manager.clear_all());
+}
