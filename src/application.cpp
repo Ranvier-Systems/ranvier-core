@@ -8,6 +8,7 @@
 #include "tracing_service.hpp"
 
 #include <csignal>
+#include <cstdlib>
 #include <fstream>
 
 #include <seastar/core/prometheus.hh>
@@ -431,8 +432,16 @@ seastar::future<> Application::stop_servers() {
 }
 
 void Application::setup_signal_handlers() {
-    // SIGHUP handler for config hot-reload
+    // =========================================================================
+    // SIGHUP handler - Configuration hot-reload
+    // =========================================================================
+    // Uses Seastar-native signal handling which integrates with the reactor.
+    // The handler runs within the Seastar event loop context, allowing us to
+    // return futures and use async operations safely.
     seastar::engine().handle_signal(SIGHUP, [this] {
+        log_main.info("SIGHUP received - triggering configuration reload");
+        // reload_config() uses sharded<HttpController>::invoke_on_all to
+        // propagate configuration changes across all CPU cores
         (void)reload_config().handle_exception([](auto ep) {
             try {
                 std::rethrow_exception(ep);
@@ -456,13 +465,44 @@ void Application::setup_signal_handlers() {
     });
     log_main.info("Config reload callback registered for /admin/keys/reload endpoint");
 
-    // Graceful shutdown handler
-    auto graceful_shutdown = [this]() {
-        signal_shutdown();
-    };
+    // =========================================================================
+    // SIGINT handler - Graceful shutdown with hard kill on second signal
+    // =========================================================================
+    // First SIGINT: Initiates graceful shutdown sequence
+    //   - Sets state to DRAINING
+    //   - Drains in-flight requests
+    //   - Resolves _stop_signal promise to unblock run()
+    // Second SIGINT: Hard kill (immediate exit)
+    //   - For when graceful shutdown is stuck or taking too long
+    //   - Uses std::exit(1) to terminate immediately
+    seastar::engine().handle_signal(SIGINT, [this] {
+        _sigint_count++;
 
-    seastar::engine().handle_signal(SIGINT, graceful_shutdown);
-    seastar::engine().handle_signal(SIGTERM, graceful_shutdown);
+        if (_sigint_count == 1) {
+            // First SIGINT - graceful shutdown
+            log_main.info("SIGINT received - initiating graceful shutdown");
+            log_main.info("Press Ctrl+C again to force immediate termination");
+            signal_shutdown();
+        } else {
+            // Second (or more) SIGINT - hard kill
+            log_main.warn("Second SIGINT received - forcing immediate termination!");
+            std::exit(1);
+        }
+    });
+    log_main.info("SIGINT handler registered (graceful shutdown, double for hard kill)");
+
+    // =========================================================================
+    // SIGTERM handler - Graceful shutdown (no hard kill option)
+    // =========================================================================
+    // SIGTERM is typically sent by process managers (systemd, k8s) and should
+    // always trigger a graceful shutdown. Unlike SIGINT, we don't support
+    // hard kill on repeated SIGTERM since process managers have their own
+    // escalation (SIGKILL after timeout).
+    seastar::engine().handle_signal(SIGTERM, [this] {
+        log_main.info("SIGTERM received - initiating graceful shutdown");
+        signal_shutdown();
+    });
+    log_main.info("SIGTERM handler registered (graceful shutdown)");
 }
 
 void Application::signal_shutdown() {

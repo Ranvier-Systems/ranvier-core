@@ -127,6 +127,9 @@ private:
     // Promise/future for signaling shutdown
     std::shared_ptr<seastar::promise<>> _stop_signal;
 
+    // Counter for SIGINT signals - second SIGINT triggers hard kill
+    int _sigint_count = 0;
+
     // --- Services (owned by Application) ---
 
     // Infrastructure layer
