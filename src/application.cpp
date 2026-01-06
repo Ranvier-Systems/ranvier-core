@@ -43,23 +43,29 @@ seastar::future<> Application::init_tokenizer() {
     // Use DMA for non-blocking disk I/O
     return seastar::open_file_dma(path, seastar::open_flags::ro).then([this, path](seastar::file f) {
         return f.size().then([this, f, path](size_t size) mutable {
-            if (size > MAX_TOKENIZER_SIZE) {
-                return seastar::make_exception_future<>(std::runtime_error("Tokenizer file too large"));
+            // Sanity check: Empty file
+            if (size == 0) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("Tokenizer file is empty: " + path)
+                );
             }
 
-            // Read the entire file into a Seastar temporary buffer
+            // Safety check: Memory limit (100MB is a safe default for tokenizers)
+            if (size > MAX_TOKENIZER_SIZE) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("Tokenizer file exceeds maximum allowed size (100MB): " + path)
+                );
+            }
+
+            // Perform the optimized read
             return f.dma_read_bulk<char>(0, size).then([this, path](seastar::temporary_buffer<char> buf) {
+                // Double check the buffer isn't empty (redundant but safe)
                 if (buf.empty()) {
-                    throw std::runtime_error("Read empty tokenizer file");
+                    throw std::runtime_error("Failed to read data from tokenizer: " + path);
                 }
 
-                // Since the tokenizer service needs a const std::string&,
-                // we construct it here from the Seastar buffer.
-                // This is the only copy that will happen.
-                std::string content(buf.get(), buf.size());
-
-                _tokenizer.load_from_json(content);
-
+                // Final hand-off to the service
+                _tokenizer.load_from_json(std::string(buf.get(), buf.size()));
                 log_main.info("Tokenizer loaded: {} bytes", buf.size());
                 return seastar::make_ready_future<>();
             });
