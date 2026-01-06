@@ -186,7 +186,7 @@ def io_worker(worker_id: int, path: str):
                 # Release lock
                 try:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                except:
+                except OSError:
                     pass
 
                 # Small delay to prevent CPU saturation
@@ -198,7 +198,7 @@ def io_worker(worker_id: int, path: str):
         # Cleanup temp file
         try:
             os.unlink(temp_file)
-        except:
+        except OSError:
             pass
 
     print(f"Worker {worker_id}: writes={stats['writes']}, syncs={stats['syncs']}, "

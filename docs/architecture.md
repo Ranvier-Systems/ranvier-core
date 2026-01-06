@@ -207,3 +207,19 @@ cluster:
 ```
 
 For Kubernetes deployments, DNS-based peer discovery automatically resolves headless service endpoints.
+
+## Production Readiness
+
+### Validation Suite
+
+Ranvier includes a comprehensive validation suite to verify the shared-nothing
+architecture guarantees are maintained. Run `make validate` to test:
+
+| Test | What It Validates |
+|------|-------------------|
+| Reactor Stall Detection | No blocking ops with 100μs task quota |
+| Disk I/O Decoupling | Async persistence under disk stress |
+| SMP Gossip Storm | Cross-core messaging at 5000+ PPS |
+| Atomic-Free Execution | No shared_ptr in RadixTree hot paths |
+
+See [Validation Suite](validation.md) for full documentation.

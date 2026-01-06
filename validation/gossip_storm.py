@@ -91,23 +91,15 @@ def serialize_route_announcement(
     """
     token_count = min(len(tokens), MAX_TOKENS)
 
-    # Build header
+    # Build header: type(1) + version(1) + seq_num(4) + backend_id(4) + token_count(2) = 12 bytes
     header = struct.pack(
-        '>BBIHH',
+        '>BBIIH',
         GOSSIP_PACKET_TYPE_ROUTE_ANNOUNCEMENT,  # type (1 byte)
         PROTOCOL_VERSION,                        # version (1 byte)
         seq_num,                                 # seq_num (4 bytes, big-endian)
         backend_id,                              # backend_id (4 bytes, big-endian)
         token_count                              # token_count (2 bytes, big-endian)
     )
-
-    # Note: struct format for header is: B=1byte, B=1byte, I=4bytes, H=2bytes
-    # But we need seq_num as 4 bytes and backend_id as 4 bytes
-    # Let's fix the format string
-    header = struct.pack('>BB', GOSSIP_PACKET_TYPE_ROUTE_ANNOUNCEMENT, PROTOCOL_VERSION)
-    header += struct.pack('>I', seq_num)      # 4 bytes big-endian
-    header += struct.pack('>I', backend_id)   # 4 bytes big-endian
-    header += struct.pack('>H', token_count)  # 2 bytes big-endian
 
     # Build tokens (each 4 bytes, big-endian)
     token_data = b''.join(struct.pack('>I', t) for t in tokens[:token_count])
@@ -272,70 +264,52 @@ class GossipStormGenerator:
         except Exception:
             self.stats.send_errors += 1
 
-    def _worker_thread(self, worker_id: int, packets_per_worker: int):
-        """Worker thread that sends packets at controlled rate."""
-        sock = None
-        if not self.use_scapy:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
-
-        # Calculate target interval between packets
-        interval = 1.0 / (self.pps / 4)  # Assuming 4 workers
-
-        try:
-            while self.running and self.stats.packets_sent < packets_per_worker * 4:
-                start = time.perf_counter()
-
-                # Generate packet
-                self.seq_num += 1
-                packet = generate_random_packet(self.seq_num)
-
-                # Send
-                if self.use_scapy:
-                    source_ip = random.choice(self.source_ips)
-                    self._send_packet_scapy(packet, source_ip)
-                else:
-                    self._send_packet_socket(sock, packet)
-
-                # Rate limiting - sleep for remaining interval
-                elapsed = time.perf_counter() - start
-                sleep_time = interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-
-        finally:
-            if sock:
-                sock.close()
-
     def run_socket_burst(self):
         """High-performance socket-based burst sending."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        # Pre-generate packets for burst
-        burst_size = 100
+        # Optimize socket for high throughput
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1MB send buffer
+        except OSError:
+            pass  # May fail on some systems, continue anyway
+
+        # Pre-generate packets for burst - larger burst for better throughput
+        burst_size = 200
         packets = [generate_random_packet(i) for i in range(burst_size)]
+
+        # Pre-calculate packet sizes (avoid len() calls in hot loop)
+        packet_sizes = [len(p) for p in packets]
+        total_burst_bytes = sum(packet_sizes)
 
         target = (self.target_host, self.target_port)
         end_time = time.time() + self.duration
         batch_interval = burst_size / self.pps
+
+        # Track stats locally to avoid attribute lookup in hot path
+        packets_sent = 0
+        bytes_sent = 0
+        send_errors = 0
 
         try:
             while time.time() < end_time and self.running:
                 batch_start = time.perf_counter()
 
                 # Send burst of packets
-                for packet in packets:
+                for i, packet in enumerate(packets):
                     try:
                         sock.sendto(packet, target)
-                        self.stats.packets_sent += 1
-                        self.stats.bytes_sent += len(packet)
+                        packets_sent += 1
+                        bytes_sent += packet_sizes[i]
                     except OSError:
-                        self.stats.send_errors += 1
+                        send_errors += 1
 
-                # Regenerate some packets for diversity
-                for i in range(10):
+                # Regenerate some packets for diversity (fewer regenerations)
+                for _ in range(5):
                     self.seq_num += 1
-                    packets[random.randint(0, burst_size - 1)] = generate_random_packet(self.seq_num)
+                    idx = random.randint(0, burst_size - 1)
+                    packets[idx] = generate_random_packet(self.seq_num)
+                    packet_sizes[idx] = len(packets[idx])
 
                 # Rate control
                 elapsed = time.perf_counter() - batch_start
@@ -344,6 +318,10 @@ class GossipStormGenerator:
                     time.sleep(sleep_time)
 
         finally:
+            # Update stats object at end (atomic-ish update)
+            self.stats.packets_sent = packets_sent
+            self.stats.bytes_sent = bytes_sent
+            self.stats.send_errors = send_errors
             sock.close()
 
     def run(self, prometheus_endpoint: Optional[str] = None) -> StormStats:
@@ -500,6 +478,20 @@ Examples:
                         help='Quiet mode (minimal output)')
 
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.pps <= 0:
+        print("Error: --pps must be positive", file=sys.stderr)
+        return 1
+    if args.duration <= 0:
+        print("Error: --duration must be positive", file=sys.stderr)
+        return 1
+    if args.port <= 0 or args.port > 65535:
+        print("Error: --port must be between 1 and 65535", file=sys.stderr)
+        return 1
+    if args.threshold < 0:
+        print("Error: --threshold must be non-negative", file=sys.stderr)
+        return 1
 
     # Handle signals for graceful shutdown
     generator = None

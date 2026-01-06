@@ -32,24 +32,24 @@ export WRK_CONNECTIONS="${WRK_CONNECTIONS:-100}"
 export WRK_THREADS="${WRK_THREADS:-4}"
 
 # -----------------------------------------------------------------------------
-# Color Output
+# Color Output (exported for subshell access)
 # -----------------------------------------------------------------------------
 if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    BLUE='\033[0;34m'
-    CYAN='\033[0;36m'
-    BOLD='\033[1m'
-    NC='\033[0m'
+    export RED='\033[0;31m'
+    export GREEN='\033[0;32m'
+    export YELLOW='\033[0;33m'
+    export BLUE='\033[0;34m'
+    export CYAN='\033[0;36m'
+    export BOLD='\033[1m'
+    export NC='\033[0m'
 else
-    RED=''
-    GREEN=''
-    YELLOW=''
-    BLUE=''
-    CYAN=''
-    BOLD=''
-    NC=''
+    export RED=''
+    export GREEN=''
+    export YELLOW=''
+    export BLUE=''
+    export CYAN=''
+    export BOLD=''
+    export NC=''
 fi
 
 # -----------------------------------------------------------------------------
@@ -102,45 +102,43 @@ register_cleanup() {
     PIDS_TO_CLEANUP+=("$pid")
 }
 
+# Generic retry-with-timeout function
+# Usage: wait_with_retry "description" timeout_seconds check_command [args...]
+wait_with_retry() {
+    local description="$1"
+    local timeout="$2"
+    shift 2
+    local check_cmd=("$@")
+
+    log_info "Waiting for $description (timeout: ${timeout}s)..."
+
+    local count=0
+    while ! "${check_cmd[@]}" 2>/dev/null; do
+        sleep 1
+        count=$((count + 1))
+        if [[ $count -ge $timeout ]]; then
+            log_error "Timeout waiting for $description"
+            return 1
+        fi
+    done
+
+    log_success "$description is available"
+    return 0
+}
+
 wait_for_port() {
     local port="$1"
     local timeout="${2:-30}"
     local host="${3:-127.0.0.1}"
 
-    log_info "Waiting for port $port to be available (timeout: ${timeout}s)..."
-
-    local count=0
-    while ! nc -z "$host" "$port" 2>/dev/null; do
-        sleep 1
-        count=$((count + 1))
-        if [[ $count -ge $timeout ]]; then
-            log_error "Timeout waiting for port $port"
-            return 1
-        fi
-    done
-
-    log_success "Port $port is available"
-    return 0
+    wait_with_retry "port $port on $host" "$timeout" nc -z "$host" "$port"
 }
 
 wait_for_http() {
     local url="$1"
     local timeout="${2:-30}"
 
-    log_info "Waiting for HTTP endpoint $url (timeout: ${timeout}s)..."
-
-    local count=0
-    while ! curl -sf "$url" >/dev/null 2>&1; do
-        sleep 1
-        count=$((count + 1))
-        if [[ $count -ge $timeout ]]; then
-            log_error "Timeout waiting for HTTP endpoint $url"
-            return 1
-        fi
-    done
-
-    log_success "HTTP endpoint $url is available"
-    return 0
+    wait_with_retry "HTTP endpoint $url" "$timeout" curl -sf "$url" -o /dev/null
 }
 
 # -----------------------------------------------------------------------------
@@ -158,23 +156,35 @@ fetch_prometheus_histogram_p99() {
     local endpoint="${2:-http://127.0.0.1:${RANVIER_METRICS_PORT}/metrics}"
 
     # Fetch histogram and calculate P99 (approximation from bucket data)
+    # P99 is the bucket where cumulative count first exceeds 99% of total
     curl -sf "$endpoint" 2>/dev/null | grep "${metric_name}_bucket" | \
-        awk -F'[{},=]' '
-        BEGIN { total = 0; p99_le = 0 }
-        /le="[0-9.]+"/ {
-            for (i=1; i<=NF; i++) {
-                if ($i == "le") {
-                    le = $(i+1)
-                    gsub(/"/, "", le)
+        awk '
+        BEGIN { n = 0 }
+        {
+            # Parse le="X" and count from prometheus format
+            match($0, /le="([^"]+)"/, arr)
+            le = arr[1]
+            count = $NF
+            if (le != "+Inf") {
+                buckets[n] = le
+                counts[n] = count
+                n++
+            } else {
+                total = count
+            }
+        }
+        END {
+            if (total == 0) { print 0; exit }
+            target = total * 0.99
+            for (i = 0; i < n; i++) {
+                if (counts[i] >= target) {
+                    print buckets[i]
+                    exit
                 }
             }
-            count = $NF
-            if (count > total * 0.99 && p99_le == 0) {
-                p99_le = le
-            }
-            total = count
+            # Fallback to last bucket
+            if (n > 0) print buckets[n-1]
         }
-        END { print p99_le }
         '
 }
 

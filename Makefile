@@ -545,6 +545,32 @@ helm-dry-run:
 		--create-namespace \
 		--dry-run
 
+# =============================================================================
+# Validation Suite
+# =============================================================================
+
+# Run all validation tests (requires built binary)
+test-validation: build
+	@echo "Running validation suite unit tests..."
+	@python3 tests/unit/test_validation_gossip.py -v
+	@bash tests/unit/test_validation_common.sh
+
+# Run production readiness validation (full suite)
+# Requires: wrk, stress-ng (optional), perf (optional)
+validate: build
+	@echo "Running Production Readiness Validation Suite..."
+	@./validation/validate_v1.sh
+
+# Run quick validation (shorter durations)
+validate-quick: build
+	@echo "Running Quick Validation..."
+	@./validation/validate_v1.sh --quick
+
+# Run validation in CI mode (strict thresholds)
+validate-ci: build
+	@echo "Running CI Validation..."
+	@./validation/validate_v1.sh --ci --output validation/reports/ci_results.json
+
 # Show help
 help:
 	@echo "Ranvier Core Build System"
@@ -559,6 +585,12 @@ help:
 	@echo "  make test           - Run all tests (currently: unit tests)"
 	@echo "  make test-unit      - Run unit tests"
 	@echo "  make test-integration - Run multi-node integration tests"
+	@echo "  make test-validation  - Run validation suite unit tests"
+	@echo ""
+	@echo "Production Readiness Validation:"
+	@echo "  make validate       - Run full validation suite (all 4 tests)"
+	@echo "  make validate-quick - Run quick validation (shorter durations)"
+	@echo "  make validate-ci    - Run CI validation (strict thresholds)"
 	@echo ""
 	@echo "Mock Backend Benchmark (fast, validates router overhead):"
 	@echo "  make benchmark      - Run Locust load test with mock backends"

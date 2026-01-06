@@ -244,23 +244,37 @@ analyze_static() {
     # Disassemble entire binary (filtered for RadixTree)
     log_info "Disassembling RadixTree-related symbols..."
 
-    local disasm_count=0
     > "$DISASM_FILE"
 
     for pattern in "${HOTPATH_SYMBOLS[@]}"; do
         log_info "  Analyzing symbols matching: $pattern"
         disassemble_symbol_range "$BINARY" "$pattern" >> "$DISASM_FILE"
-        local count
-        count=$(wc -l < "$DISASM_FILE")
-        disasm_count=$count
     done
+
+    local disasm_count
+    disasm_count=$(wc -l < "$DISASM_FILE")
 
     if [[ $disasm_count -eq 0 ]]; then
         log_warn "No matching symbols found. Binary may be stripped."
-        log_info "Falling back to full binary analysis (may take longer)..."
+        log_info "Falling back to filtered binary analysis..."
 
-        # Full disassembly as fallback
-        objdump -d -C "$BINARY" > "$DISASM_FILE" 2>/dev/null
+        # Filtered disassembly - only extract relevant sections to avoid processing entire binary
+        # Focus on .text section and filter for our patterns during extraction
+        objdump -d -C "$BINARY" 2>/dev/null | \
+            awk '
+            /^[0-9a-f]+ <.*>:/ { in_func = 1; func = $0 }
+            in_func && /\t(lock|xadd|cmpxchg|xchg)\s/ {
+                if (func) { print func; func = "" }
+                print
+            }
+            /^$/ { in_func = 0 }
+            ' > "$DISASM_FILE"
+        disasm_count=$(wc -l < "$DISASM_FILE")
+
+        # If still no atomic instructions found, the test passes trivially
+        if [[ $disasm_count -eq 0 ]]; then
+            log_info "No atomic instructions found in binary (filtered analysis)"
+        fi
     fi
 
     log_info "Disassembly complete: $disasm_count lines"

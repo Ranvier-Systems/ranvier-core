@@ -283,28 +283,22 @@ verify_prerequisites() {
 }
 
 # -----------------------------------------------------------------------------
-# Test Runners
+# Test Runner Helper
 # -----------------------------------------------------------------------------
-run_stall_test() {
-    log_section "Test 1: Reactor Stall Detection"
+# Runs a test script and records results
+# Usage: run_test "test_name" "display_name" test_command [args...]
+run_test_wrapper() {
+    local test_name="$1"
+    local display_name="$2"
+    shift 2
 
-    local test_name="reactor_stall_detection"
     local start_time
     start_time=$(date +%s)
-
-    log_info "Duration: ${STALL_TEST_DURATION}s"
-    log_info "Task quota: ${TASK_QUOTA_MS:-0.1}ms"
-    log_info "Stall threshold: $STALL_THRESHOLD"
 
     local output
     local exit_code=0
 
-    output=$("${SCRIPT_DIR}/stall_watchdog.sh" \
-        --binary "$RANVIER_BINARY" \
-        --config "$RANVIER_CONFIG" \
-        --duration "${STALL_TEST_DURATION}s" \
-        --task-quota "${TASK_QUOTA_MS:-0.1}" \
-        2>&1) || exit_code=$?
+    output=$("$@" 2>&1) || exit_code=$?
 
     local end_time
     end_time=$(date +%s)
@@ -312,22 +306,40 @@ run_stall_test() {
 
     if [[ $exit_code -eq 0 ]]; then
         TEST_RESULTS[$test_name]="PASS"
-        log_success "Reactor Stall Test: PASSED (${duration}s)"
+        log_success "$display_name: PASSED (${duration}s)"
     else
         TEST_RESULTS[$test_name]="FAIL"
-        log_error "Reactor Stall Test: FAILED (${duration}s)"
+        log_error "$display_name: FAILED (${duration}s)"
     fi
 
     TEST_DETAILS[$test_name]="$output"
     return $exit_code
 }
 
+# -----------------------------------------------------------------------------
+# Test Runners
+# -----------------------------------------------------------------------------
+run_stall_test() {
+    log_section "Test 1: Reactor Stall Detection"
+
+    local test_name="reactor_stall_detection"
+
+    log_info "Duration: ${STALL_TEST_DURATION}s"
+    log_info "Task quota: ${TASK_QUOTA_MS:-0.1}ms"
+    log_info "Stall threshold: $STALL_THRESHOLD"
+
+    run_test_wrapper "$test_name" "Reactor Stall Test" \
+        "${SCRIPT_DIR}/stall_watchdog.sh" \
+        --binary "$RANVIER_BINARY" \
+        --config "$RANVIER_CONFIG" \
+        --duration "${STALL_TEST_DURATION}s" \
+        --task-quota "${TASK_QUOTA_MS:-0.1}"
+}
+
 run_disk_test() {
     log_section "Test 2: Disk I/O Decoupling"
 
     local test_name="disk_io_decoupling"
-    local start_time
-    start_time=$(date +%s)
 
     log_info "Duration: ${DISK_TEST_DURATION}s"
     log_info "Latency threshold: ${P99_LATENCY_DEGRADATION_THRESHOLD}%"
@@ -340,30 +352,12 @@ run_disk_test() {
         return 0
     fi
 
-    local output
-    local exit_code=0
-
-    output=$("${SCRIPT_DIR}/disk_stress.sh" \
+    run_test_wrapper "$test_name" "Disk I/O Decoupling Test" \
+        "${SCRIPT_DIR}/disk_stress.sh" \
         --binary "$RANVIER_BINARY" \
         --config "$RANVIER_CONFIG" \
         --threshold "$P99_LATENCY_DEGRADATION_THRESHOLD" \
-        --stress-duration "${DISK_TEST_DURATION}s" \
-        2>&1) || exit_code=$?
-
-    local end_time
-    end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-
-    if [[ $exit_code -eq 0 ]]; then
-        TEST_RESULTS[$test_name]="PASS"
-        log_success "Disk I/O Decoupling Test: PASSED (${duration}s)"
-    else
-        TEST_RESULTS[$test_name]="FAIL"
-        log_error "Disk I/O Decoupling Test: FAILED (${duration}s)"
-    fi
-
-    TEST_DETAILS[$test_name]="$output"
-    return $exit_code
+        --stress-duration "${DISK_TEST_DURATION}s"
 }
 
 run_gossip_test() {
@@ -411,8 +405,9 @@ run_gossip_test() {
         --output "${VALIDATION_LOG_DIR}/gossip_storm_report.json" \
         2>&1) || exit_code=$?
 
-    # Stop Ranvier
+    # Stop Ranvier and wait for cleanup
     kill -TERM "$ranvier_pid" 2>/dev/null || true
+    sleep 2  # Allow graceful shutdown
 
     local end_time
     end_time=$(date +%s)
@@ -434,8 +429,6 @@ run_atomic_test() {
     log_section "Test 4: Atomic-Free Execution Audit"
 
     local test_name="atomic_free_execution"
-    local start_time
-    start_time=$(date +%s)
 
     log_info "Binary: $RANVIER_BINARY"
     log_info "Threshold: $ATOMIC_INSTRUCTION_THRESHOLD atomic instructions"
@@ -448,29 +441,13 @@ run_atomic_test() {
         return 0
     fi
 
-    local output
-    local exit_code=0
+    # Build command with optional verbose flag
+    local cmd=("${SCRIPT_DIR}/atomic_audit.sh"
+        --binary "$RANVIER_BINARY"
+        --threshold "$ATOMIC_INSTRUCTION_THRESHOLD")
+    [[ -n "${VERBOSE:-}" ]] && cmd+=(--verbose)
 
-    output=$("${SCRIPT_DIR}/atomic_audit.sh" \
-        --binary "$RANVIER_BINARY" \
-        --threshold "$ATOMIC_INSTRUCTION_THRESHOLD" \
-        ${VERBOSE:+--verbose} \
-        2>&1) || exit_code=$?
-
-    local end_time
-    end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-
-    if [[ $exit_code -eq 0 ]]; then
-        TEST_RESULTS[$test_name]="PASS"
-        log_success "Atomic-Free Execution Test: PASSED (${duration}s)"
-    else
-        TEST_RESULTS[$test_name]="FAIL"
-        log_error "Atomic-Free Execution Test: FAILED (${duration}s)"
-    fi
-
-    TEST_DETAILS[$test_name]="$output"
-    return $exit_code
+    run_test_wrapper "$test_name" "Atomic-Free Execution Test" "${cmd[@]}"
 }
 
 # -----------------------------------------------------------------------------

@@ -139,11 +139,12 @@ start_ranvier_with_stall_detection() {
     log_info "Log file: $STALL_LOG_FILE"
 
     # Start Ranvier in background with stall detection
+    # Use process substitution to correctly capture Ranvier's PID (not tee's)
     # shellcheck disable=SC2086
     "$RANVIER_BINARY" \
         --config "$RANVIER_CONFIG" \
         $seastar_args \
-        2>&1 | tee "$STALL_LOG_FILE" &
+        > >(tee "$STALL_LOG_FILE") 2>&1 &
 
     local ranvier_pid=$!
     register_cleanup "$ranvier_pid"
