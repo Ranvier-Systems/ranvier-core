@@ -399,6 +399,17 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `src/application.hpp`, `src/application.cpp`, `src/main.cpp`
   _Complexity:_ Medium
 
+- [x] **Implement Seastar-native signal handling** ✓
+  _Justification:_ Standard C signal handlers (`std::signal`) run outside Seastar's reactor context, limiting them to setting flags. Seastar-native handlers integrate with the event loop, enabling async shutdown sequences that return futures.
+  _Approach:_ Replaced standard signal handling with `seastar::engine().handle_signal()`:
+  - **SIGINT**: First signal triggers graceful shutdown (drain requests, stop services). Second signal forces immediate termination via `std::exit(1)` for stuck shutdowns.
+  - **SIGTERM**: Always triggers graceful shutdown (process managers use SIGKILL for escalation).
+  - **SIGHUP**: Configuration hot-reload via `sharded<HttpController>::invoke_on_all()` to propagate changes across all CPU cores.
+  - Uses `seastar::promise<>` to bridge signal reception to main application loop.
+  - Uses `std::atomic<int>` for SIGINT counter for robustness.
+  _Location:_ `src/application.hpp`, `src/application.cpp`
+  _Complexity:_ Low
+
 ### 5.5 Build System
 
 - [ ] **Add Windows/macOS cross-compilation support**
@@ -440,6 +451,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P3 - Low** | DX | OpenAPI specification | Low | ✅ Done |
 | **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
 | **P2 - Medium** | DX | Application bootstrap refactoring | Medium | ✅ Done |
+| **P3 - Low** | DX | Seastar-native signal handling | Low | ✅ Done |
 
 ---
 
@@ -449,6 +461,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-06 | Implement Seastar-native signal handling (SIGINT hard kill, SIGTERM graceful, SIGHUP reload) | - |
 | 2026-01-05 | Refactor initialization into Application class (service lifecycle management) | - |
 | 2026-01-05 | Replace shared_ptr with unique_ptr in RadixTree (Seastar optimization) | - |
 | 2026-01-05 | Batch remote route updates to prevent SMP storm (99% message reduction) | - |

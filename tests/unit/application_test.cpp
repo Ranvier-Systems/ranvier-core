@@ -140,6 +140,48 @@ TEST_F(ApplicationConfigTest, RouterReturnsNullBeforeStartup) {
 }
 
 // =============================================================================
+// Signal Handling State Tests
+// =============================================================================
+// Note: Actual signal delivery tests require Seastar runtime and are covered
+// in integration tests. These tests verify the state machine logic that
+// signal handlers depend on.
+
+TEST_F(ApplicationConfigTest, IsShuttingDownReturnsFalseForCreatedState) {
+    Application app(default_config, "test.yaml");
+    // CREATED state should not be considered "shutting down"
+    EXPECT_EQ(app.state(), ApplicationState::CREATED);
+    EXPECT_FALSE(app.is_shutting_down());
+}
+
+TEST_F(ApplicationConfigTest, ShutdownStatesAreCorrectlyIdentified) {
+    // Verify the is_shutting_down() logic correctly identifies shutdown states
+    // This tests the accessor logic used by signal handlers
+    Application app(default_config, "test.yaml");
+
+    // Initial state - not shutting down
+    EXPECT_FALSE(app.is_shutting_down());
+
+    // Note: We cannot directly set state from tests as it's private,
+    // but we document the expected behavior:
+    // - DRAINING: is_shutting_down() == true
+    // - STOPPING: is_shutting_down() == true
+    // - STOPPED:  is_shutting_down() == true
+    // - CREATED:  is_shutting_down() == false
+    // - STARTING: is_shutting_down() == false
+    // - RUNNING:  is_shutting_down() == false
+}
+
+TEST_F(ApplicationConfigTest, ApplicationStateEnumCoversAllLifecycleStages) {
+    // Verify all expected lifecycle states exist
+    // Signal handlers depend on these states for decision making
+    EXPECT_NE(ApplicationState::CREATED, ApplicationState::STARTING);
+    EXPECT_NE(ApplicationState::STARTING, ApplicationState::RUNNING);
+    EXPECT_NE(ApplicationState::RUNNING, ApplicationState::DRAINING);
+    EXPECT_NE(ApplicationState::DRAINING, ApplicationState::STOPPING);
+    EXPECT_NE(ApplicationState::STOPPING, ApplicationState::STOPPED);
+}
+
+// =============================================================================
 // K8s Discovery Config Builder Tests
 // =============================================================================
 

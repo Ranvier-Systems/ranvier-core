@@ -22,6 +22,7 @@
 #include "router_service.hpp"
 #include "tokenizer_service.hpp"
 
+#include <atomic>
 #include <memory>
 
 #include <seastar/core/future.hh>
@@ -126,6 +127,10 @@ private:
 
     // Promise/future for signaling shutdown
     std::shared_ptr<seastar::promise<>> _stop_signal;
+
+    // Counter for SIGINT signals - second SIGINT triggers hard kill.
+    // Atomic for robustness, though Seastar signals run on shard 0.
+    std::atomic<int> _sigint_count{0};
 
     // --- Services (owned by Application) ---
 
