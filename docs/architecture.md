@@ -77,6 +77,27 @@ flowchart TB
     class GPU1,GPU2,GPU3,C1,C2 external
 ```
 
+## Application Bootstrap
+
+The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle of all Ranvier services. It manages:
+
+1. **Startup Sequence**: Initializes services in dependency order:
+   - TokenizerService → TracingService → RouterService → HttpController (sharded)
+   - MetricsService → PersistenceStore → AsyncPersistenceManager
+   - HealthService → K8sDiscoveryService → GossipService
+   - State restoration from SQLite
+
+2. **Shutdown Sequence**: Stops services in reverse order with graceful draining:
+   - HealthService → K8sDiscoveryService → GossipService → HTTP Servers
+   - HttpController → AsyncPersistenceManager → PersistenceStore
+   - WAL checkpoint and cleanup
+
+3. **Lifecycle Protection**: Uses `seastar::gate` to ensure startup completes before any shutdown can proceed.
+
+4. **State Machine**: Tracks lifecycle states (CREATED → STARTING → RUNNING → DRAINING → STOPPING → STOPPED)
+
+5. **Hot Reload**: Supports configuration reloading via SIGHUP without restart.
+
 ## Layer Responsibilities
 
 ### Presentation Layer
