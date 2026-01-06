@@ -44,40 +44,46 @@ void Application::init_tokenizer() {
 // Configuration Builders
 // =============================================================================
 
-HttpControllerConfig Application::build_controller_config() const {
+// Static helper that can work with any RanvierConfig (used during hot-reload)
+HttpControllerConfig Application::build_controller_config_from(const RanvierConfig& config) {
     HttpControllerConfig cfg;
     // Connection pool settings
-    cfg.pool.max_connections_per_host = _config.pool.max_connections_per_host;
-    cfg.pool.idle_timeout = _config.pool.idle_timeout;
-    cfg.pool.max_total_connections = _config.pool.max_total_connections;
+    cfg.pool.max_connections_per_host = config.pool.max_connections_per_host;
+    cfg.pool.idle_timeout = config.pool.idle_timeout;
+    cfg.pool.max_total_connections = config.pool.max_total_connections;
     // Routing settings
-    cfg.min_token_length = _config.routing.min_token_length;
-    cfg.enable_token_forwarding = _config.routing.enable_token_forwarding;
-    cfg.accept_client_tokens = _config.routing.accept_client_tokens;
-    cfg.max_token_id = _config.routing.max_token_id;
-    cfg.routing_mode = _config.routing.routing_mode;
+    cfg.min_token_length = config.routing.min_token_length;
+    cfg.enable_token_forwarding = config.routing.enable_token_forwarding;
+    cfg.accept_client_tokens = config.routing.accept_client_tokens;
+    cfg.max_token_id = config.routing.max_token_id;
+    cfg.routing_mode = config.routing.routing_mode;
     // Timeout settings
-    cfg.connect_timeout = _config.timeouts.connect_timeout;
-    cfg.request_timeout = _config.timeouts.request_timeout;
-    cfg.drain_timeout = _config.shutdown.drain_timeout;
+    cfg.connect_timeout = config.timeouts.connect_timeout;
+    cfg.request_timeout = config.timeouts.request_timeout;
+    cfg.drain_timeout = config.shutdown.drain_timeout;
     // Auth settings
-    cfg.auth = _config.auth;
+    cfg.auth = config.auth;
     // Rate limiting
-    cfg.rate_limit.enabled = _config.rate_limit.enabled;
-    cfg.rate_limit.requests_per_second = _config.rate_limit.requests_per_second;
-    cfg.rate_limit.burst_size = _config.rate_limit.burst_size;
+    cfg.rate_limit.enabled = config.rate_limit.enabled;
+    cfg.rate_limit.requests_per_second = config.rate_limit.requests_per_second;
+    cfg.rate_limit.burst_size = config.rate_limit.burst_size;
     // Retry settings
-    cfg.retry.max_retries = _config.retry.max_retries;
-    cfg.retry.initial_backoff = _config.retry.initial_backoff;
-    cfg.retry.max_backoff = _config.retry.max_backoff;
-    cfg.retry.backoff_multiplier = _config.retry.backoff_multiplier;
+    cfg.retry.max_retries = config.retry.max_retries;
+    cfg.retry.initial_backoff = config.retry.initial_backoff;
+    cfg.retry.max_backoff = config.retry.max_backoff;
+    cfg.retry.backoff_multiplier = config.retry.backoff_multiplier;
     // Circuit breaker
-    cfg.circuit_breaker.enabled = _config.circuit_breaker.enabled;
-    cfg.circuit_breaker.failure_threshold = _config.circuit_breaker.failure_threshold;
-    cfg.circuit_breaker.success_threshold = _config.circuit_breaker.success_threshold;
-    cfg.circuit_breaker.recovery_timeout = _config.circuit_breaker.recovery_timeout;
-    cfg.circuit_breaker.fallback_enabled = _config.circuit_breaker.fallback_enabled;
+    cfg.circuit_breaker.enabled = config.circuit_breaker.enabled;
+    cfg.circuit_breaker.failure_threshold = config.circuit_breaker.failure_threshold;
+    cfg.circuit_breaker.success_threshold = config.circuit_breaker.success_threshold;
+    cfg.circuit_breaker.recovery_timeout = config.circuit_breaker.recovery_timeout;
+    cfg.circuit_breaker.fallback_enabled = config.circuit_breaker.fallback_enabled;
     return cfg;
+}
+
+// Instance method delegates to static helper
+HttpControllerConfig Application::build_controller_config() const {
+    return build_controller_config_from(_config);
 }
 
 K8sDiscoveryConfig Application::build_k8s_config() const {
@@ -115,6 +121,42 @@ AsyncPersistenceConfig Application::build_persistence_config() const {
     cfg.enable_stats_logging = true;
     cfg.stats_interval = std::chrono::seconds(60);
     return cfg;
+}
+
+void Application::log_non_reloadable_changes(const RanvierConfig& new_config) const {
+    // Server settings require restart (port bindings)
+    if (new_config.server.api_port != _config.server.api_port ||
+        new_config.server.metrics_port != _config.server.metrics_port ||
+        new_config.server.bind_address != _config.server.bind_address) {
+        log_main.warn("Config reload: server.* changes require restart to take effect");
+    }
+
+    // Database path cannot be changed at runtime
+    if (new_config.database.path != _config.database.path) {
+        log_main.warn("Config reload: database.path changes require restart to take effect");
+    }
+
+    // TLS settings require server restart
+    if (new_config.tls.enabled != _config.tls.enabled ||
+        new_config.tls.cert_path != _config.tls.cert_path ||
+        new_config.tls.key_path != _config.tls.key_path) {
+        log_main.warn("Config reload: tls.* changes require restart to take effect");
+    }
+
+    // Tokenizer is loaded once at startup
+    if (new_config.assets.tokenizer_path != _config.assets.tokenizer_path) {
+        log_main.warn("Config reload: assets.tokenizer_path changes require restart to take effect");
+    }
+
+    // Cluster mode cannot be toggled at runtime
+    if (new_config.cluster.enabled != _config.cluster.enabled) {
+        log_main.warn("Config reload: cluster.enabled changes require restart to take effect");
+    }
+
+    // Telemetry initialization is one-time
+    if (new_config.telemetry.enabled != _config.telemetry.enabled) {
+        log_main.warn("Config reload: telemetry.enabled changes require restart to take effect");
+    }
 }
 
 // =============================================================================
@@ -299,62 +341,69 @@ seastar::future<> Application::startup() {
 
     // Use the gate to track startup completion
     return seastar::try_with_gate(_lifecycle_gate, [this] {
-        // 1. Initialize tokenizer (synchronous) - failure is fatal
-        try {
-            init_tokenizer();
-        } catch (const std::exception& e) {
-            log_main.error("Service init failed: {}", e.what());
-            return seastar::make_exception_future<>(
-                std::runtime_error("Tokenizer initialization failed: " + std::string(e.what())));
-        }
+        // 1. Initialize sharded config - distribute config to all CPU cores
+        // This provides lock-free per-core access to configuration
+        return _sharded_config.start(ShardedConfig(_config)).then([this] {
+            _sharded_config_started = true;
+            log_main.info("Sharded config initialized on {} cores", seastar::smp::count);
+        }).then([this] {
+            // 2. Initialize tokenizer (synchronous) - failure is fatal
+            try {
+                init_tokenizer();
+            } catch (const std::exception& e) {
+                log_main.error("Service init failed: {}", e.what());
+                return seastar::make_exception_future<>(
+                    std::runtime_error("Tokenizer initialization failed: " + std::string(e.what())));
+            }
 
-        // 2. Initialize OpenTelemetry tracing
-        TracingService::init(_config.telemetry);
-        if (_config.telemetry.enabled) {
-            log_main.info("OpenTelemetry tracing enabled (endpoint: {}, sample_rate: {:.2f})",
-                _config.telemetry.otlp_endpoint, _config.telemetry.sample_rate);
-        } else {
-            log_main.info("OpenTelemetry tracing disabled");
-        }
+            // 3. Initialize OpenTelemetry tracing
+            TracingService::init(_config.telemetry);
+            if (_config.telemetry.enabled) {
+                log_main.info("OpenTelemetry tracing enabled (endpoint: {}, sample_rate: {:.2f})",
+                    _config.telemetry.otlp_endpoint, _config.telemetry.sample_rate);
+            } else {
+                log_main.info("OpenTelemetry tracing disabled");
+            }
 
-        // 3. Initialize router
-        _router = std::make_unique<RouterService>(_config.routing, _config.cluster);
-        if (_config.cluster.enabled) {
-            log_main.info("Cluster mode: {} peers on port {}",
-                _config.cluster.peers.size(), _config.cluster.gossip_port);
-        }
+            // 4. Initialize router
+            _router = std::make_unique<RouterService>(_config.routing, _config.cluster);
+            if (_config.cluster.enabled) {
+                log_main.info("Cluster mode: {} peers on port {}",
+                    _config.cluster.peers.size(), _config.cluster.gossip_port);
+            }
 
-        // 4. Build controller config
-        auto ctrl_config = build_controller_config();
+            // 5. Build controller config
+            auto ctrl_config = build_controller_config();
 
-        // 5. Initialize router's thread-local data on all shards
-        return _router->initialize_shards().then([this, ctrl_config] {
-            // 6. Start HttpController on all shards
-            return _controller.start(std::ref(_tokenizer), std::ref(*_router), ctrl_config);
+            // 6. Initialize router's thread-local data on all shards
+            return _router->initialize_shards().then([this, ctrl_config] {
+                // 7. Start HttpController on all shards with config reference
+                return _controller.start(std::ref(_tokenizer), std::ref(*_router), ctrl_config);
+            });
         }).then([this] {
             _controller_started = true;
         }).then([this] {
-            // 7. Initialize metrics on ALL shards
+            // 8. Initialize metrics on ALL shards
             return seastar::smp::invoke_on_all([] {
                 init_metrics();
             });
         }).then([this] {
-            // 8. Initialize persistence
+            // 9. Initialize persistence
             return init_persistence();
         }).then([this] {
-            // 9. Initialize health checker
+            // 10. Initialize health checker
             init_health_checker();
 
-            // 10. Initialize K8s discovery (if enabled)
+            // 11. Initialize K8s discovery (if enabled)
             init_k8s_discovery();
 
-            // 11. Start gossip service if cluster mode is enabled
+            // 12. Start gossip service if cluster mode is enabled
             return _router->start_gossip();
         }).then([this] {
-            // 12. Load persisted state
+            // 13. Load persisted state
             return load_persisted_state();
         }).then([this] {
-            // 13. Start K8s discovery service if enabled
+            // 14. Start K8s discovery service if enabled
             if (_k8s_discovery && _k8s_discovery->is_enabled()) {
                 return _k8s_discovery->start();
             }
@@ -632,6 +681,15 @@ seastar::future<> Application::stop_services() {
         return seastar::make_ready_future<>();
     });
 
+    // Stop sharded config (if started)
+    if (_sharded_config_started) {
+        chain = chain.then([this] {
+            return _sharded_config.stop().then([] {
+                log_main.info("Sharded config stopped");
+            });
+        });
+    }
+
     // Final cleanup
     return chain.finally([this] {
         cleanup();
@@ -677,57 +735,61 @@ seastar::future<> Application::shutdown() {
 // =============================================================================
 
 seastar::future<> Application::reload_config() {
-    log_main.info("SIGHUP received - reloading configuration from {}", _config_path);
+    log_main.info("Reloading configuration from {}", _config_path);
 
+    // Load and validate new configuration synchronously
+    // This happens before any state is modified, so failures are safe
+    RanvierConfig new_config;
     try {
-        // Load new configuration
-        auto new_config = RanvierConfig::load(_config_path);
-
-        // Validate the new configuration
-        auto validation_error = RanvierConfig::validate(new_config);
-        if (validation_error) {
-            log_main.error("Config reload failed - validation error: {}", *validation_error);
-            return seastar::make_ready_future<>();
-        }
-
-        // Log warnings for settings that cannot be hot-reloaded
-        if (new_config.server.api_port != _config.server.api_port ||
-            new_config.server.metrics_port != _config.server.metrics_port ||
-            new_config.server.bind_address != _config.server.bind_address) {
-            log_main.warn("Config reload: server.* changes require restart to take effect");
-        }
-        if (new_config.database.path != _config.database.path) {
-            log_main.warn("Config reload: database.path changes require restart to take effect");
-        }
-        if (new_config.tls.enabled != _config.tls.enabled ||
-            new_config.tls.cert_path != _config.tls.cert_path ||
-            new_config.tls.key_path != _config.tls.key_path) {
-            log_main.warn("Config reload: tls.* changes require restart to take effect");
-        }
-        if (new_config.assets.tokenizer_path != _config.assets.tokenizer_path) {
-            log_main.warn("Config reload: assets.tokenizer_path changes require restart to take effect");
-        }
-
-        // Update stored config
-        _config = new_config;
-
-        // Build updated controller config
-        auto ctrl_config = build_controller_config();
-
-        // Update HttpController config on all shards
-        return _controller.invoke_on_all([ctrl_config](HttpController& c) {
-            c.update_config(ctrl_config);
-        }).then([this] {
-            // Update routing config on all shards
-            return _router->update_routing_config(_config.routing);
-        }).then([] {
-            log_main.info("Configuration reloaded successfully");
-        });
-
+        new_config = RanvierConfig::load(_config_path);
     } catch (const std::exception& e) {
-        log_main.error("Config reload failed: {}", e.what());
+        log_main.error("Config reload failed - could not load file: {}", e.what());
         return seastar::make_ready_future<>();
     }
+
+    // Validate the new configuration
+    auto validation_error = RanvierConfig::validate(new_config);
+    if (validation_error) {
+        log_main.error("Config reload failed - validation error: {}", *validation_error);
+        return seastar::make_ready_future<>();
+    }
+
+    // Log warnings for settings that cannot be hot-reloaded
+    log_non_reloadable_changes(new_config);
+
+    // Use shared_ptr to avoid copying config N times for N shards
+    auto config_ptr = std::make_shared<RanvierConfig>(std::move(new_config));
+
+    // Step 1: Update the sharded config across all cores using invoke_on_all
+    // This ensures each shard has the updated configuration for lock-free access
+    return _sharded_config.invoke_on_all([config_ptr](ShardedConfig& cfg) {
+        cfg.update(*config_ptr);
+    }).then([this, config_ptr] {
+        log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
+
+        // Step 2: Build updated controller config from the new config
+        auto ctrl_config = build_controller_config_from(*config_ptr);
+
+        // Step 3: Update HttpController config on all shards
+        return _controller.invoke_on_all([ctrl_config](HttpController& c) {
+            c.update_config(ctrl_config);
+        });
+    }).then([this, config_ptr] {
+        // Step 4: Update routing config on all shards via RouterService
+        return _router->update_routing_config(config_ptr->routing);
+    }).then([this, config_ptr] {
+        // Step 5: Only update master config after all shards succeeded
+        // This ensures consistency - if any step fails, master config is unchanged
+        _config = *config_ptr;
+        log_main.info("Configuration reloaded successfully on all cores");
+    }).handle_exception([](auto ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_main.error("Config reload failed during propagation: {}", e.what());
+        }
+        // Don't re-throw - config reload failure shouldn't crash the server
+    });
 }
 
 }  // namespace ranvier
