@@ -351,17 +351,25 @@ if(Seastar_FOUND)
       src/sqlite_persistence.cpp
       src/stream_parser.cpp
       src/dtls_context.cpp
+      src/tokenizer_service.cpp
+      src/tracing_service.cpp
     )
     target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    if(NOT WITH_TELEMETRY)
+        target_compile_definitions(application_test PRIVATE RANVIER_NO_TELEMETRY)
+    endif()
     target_link_libraries(application_test
       PRIVATE
       Seastar::seastar
       ${SQLITE3_LIBRARIES}
       yaml-cpp::yaml-cpp
+      rapidjson_interface
+      tokenizers_cpp
       absl::flat_hash_map
       absl::flat_hash_set
       OpenSSL::SSL
       OpenSSL::Crypto
+      ${OTEL_LIBS}
       GTest::gtest_main
     )
     gtest_discover_tests(application_test)
