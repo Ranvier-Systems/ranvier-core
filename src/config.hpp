@@ -4,9 +4,6 @@
 // 1. YAML config file (default: ranvier.yaml)
 // 2. Environment variables (override file settings)
 // 3. Built-in defaults (fallback)
-//
-// The RanvierConfig struct is designed to work with seastar::sharded<>
-// for per-core configuration distribution and hot-reload support.
 
 #pragma once
 
@@ -21,7 +18,6 @@
 #include <string>
 #include <vector>
 
-#include <seastar/core/future.hh>
 #include <yaml-cpp/yaml.h>
 
 namespace ranvier {
@@ -327,11 +323,6 @@ struct TelemetryConfig {
 };
 
 // Top-level configuration
-//
-// Designed to work with seastar::sharded<RanvierConfig> for:
-// - Per-core configuration distribution (one copy per shard)
-// - Hot-reload via SIGHUP using sharded::invoke_on_all()
-// - Thread-safe read access without locking (each shard has its own copy)
 struct RanvierConfig {
     ServerConfig server;
     DatabaseConfig database;
@@ -349,48 +340,6 @@ struct RanvierConfig {
     ClusterConfig cluster;
     K8sDiscoveryConfig k8s_discovery;
     TelemetryConfig telemetry;
-
-    // =========================================================================
-    // Seastar sharded<> compatibility
-    // =========================================================================
-
-    // Default constructor - creates config with built-in defaults
-    // Required for seastar::sharded<RanvierConfig>::start()
-    RanvierConfig() = default;
-
-    // Copy/move constructors for sharding
-    RanvierConfig(const RanvierConfig&) = default;
-    RanvierConfig(RanvierConfig&&) = default;
-    RanvierConfig& operator=(const RanvierConfig&) = default;
-    RanvierConfig& operator=(RanvierConfig&&) = default;
-
-    // Required by seastar::sharded<> - called during shutdown
-    seastar::future<> stop() { return seastar::make_ready_future<>(); }
-
-    // Update this config instance with new values (for hot-reload)
-    // Called via sharded::invoke_on_all() to propagate changes to all cores
-    void update(const RanvierConfig& new_config) {
-        server = new_config.server;
-        database = new_config.database;
-        health = new_config.health;
-        pool = new_config.pool;
-        routing = new_config.routing;
-        timeouts = new_config.timeouts;
-        assets = new_config.assets;
-        tls = new_config.tls;
-        auth = new_config.auth;
-        rate_limit = new_config.rate_limit;
-        retry = new_config.retry;
-        circuit_breaker = new_config.circuit_breaker;
-        shutdown = new_config.shutdown;
-        cluster = new_config.cluster;
-        k8s_discovery = new_config.k8s_discovery;
-        telemetry = new_config.telemetry;
-    }
-
-    // =========================================================================
-    // Static factory methods
-    // =========================================================================
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);

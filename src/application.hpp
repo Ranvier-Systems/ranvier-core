@@ -20,6 +20,7 @@
 #include "k8s_discovery_service.hpp"
 #include "persistence.hpp"
 #include "router_service.hpp"
+#include "sharded_config.hpp"
 #include "tokenizer_service.hpp"
 
 #include <atomic>
@@ -107,10 +108,10 @@ public:
 
     // Get the sharded config for the local shard (for services to use)
     // This provides lock-free, per-core access to configuration
-    const RanvierConfig& local_config() const { return _sharded_config.local(); }
+    const RanvierConfig& local_config() const { return _sharded_config.local().config(); }
 
     // Get the sharded config container (for invoke_on_all operations)
-    seastar::sharded<RanvierConfig>& sharded_config() { return _sharded_config; }
+    seastar::sharded<ShardedConfig>& sharded_config() { return _sharded_config; }
 
     // Get the controller (for route registration in run())
     seastar::sharded<HttpController>& controller() { return _controller; }
@@ -126,7 +127,7 @@ private:
 
     // Sharded config - one copy per CPU core for lock-free access
     // Services can receive const RanvierConfig& from their local shard
-    seastar::sharded<RanvierConfig> _sharded_config;
+    seastar::sharded<ShardedConfig> _sharded_config;
 
     // --- State ---
     ApplicationState _state = ApplicationState::CREATED;

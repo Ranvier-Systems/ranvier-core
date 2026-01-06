@@ -301,7 +301,7 @@ seastar::future<> Application::startup() {
     return seastar::try_with_gate(_lifecycle_gate, [this] {
         // 1. Initialize sharded config - distribute config to all CPU cores
         // This provides lock-free per-core access to configuration
-        return _sharded_config.start(_config).then([this] {
+        return _sharded_config.start(ShardedConfig(_config)).then([this] {
             _sharded_config_started = true;
             log_main.info("Sharded config initialized on {} cores", seastar::smp::count);
         }).then([this] {
@@ -729,7 +729,7 @@ seastar::future<> Application::reload_config() {
 
         // Step 1: Update the sharded config across all cores using invoke_on_all
         // This ensures each shard has the updated configuration for lock-free access
-        return _sharded_config.invoke_on_all([new_config](RanvierConfig& cfg) {
+        return _sharded_config.invoke_on_all([new_config](ShardedConfig& cfg) {
             cfg.update(new_config);
         }).then([this] {
             log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
