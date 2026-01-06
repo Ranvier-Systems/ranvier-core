@@ -84,6 +84,10 @@ struct AsyncPersistenceConfig {
 class AsyncPersistenceManager {
 public:
     explicit AsyncPersistenceManager(AsyncPersistenceConfig config = {});
+
+    // Constructor for testing: allows injecting a custom PersistenceStore
+    AsyncPersistenceManager(AsyncPersistenceConfig config, std::unique_ptr<PersistenceStore> store);
+
     ~AsyncPersistenceManager() = default;
 
     // Non-copyable, non-movable

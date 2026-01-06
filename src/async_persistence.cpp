@@ -68,6 +68,11 @@ AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config)
     : _config(std::move(config))
     , _store(create_persistence_store()) {}
 
+AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config,
+                                                   std::unique_ptr<PersistenceStore> store)
+    : _config(std::move(config))
+    , _store(std::move(store)) {}
+
 bool AsyncPersistenceManager::open(const std::string& path) {
     if (!_store) {
         log_async_persist.error("No persistence store available");

@@ -260,32 +260,30 @@ TEST(PersistenceOpTest, MoveSemantics) {
 
 class AsyncPersistenceQueueTest : public ::testing::Test {
 protected:
-    void SetUp() override {
-        mock_store_ = std::make_unique<MockPersistenceStore>();
-        mock_store_->open("/tmp/test");
-    }
-
-    std::unique_ptr<MockPersistenceStore> mock_store_;
+    // Tests create their own stores via the new constructor
 };
 
-TEST_F(AsyncPersistenceQueueTest, QueueWithoutStoreDoesNothing) {
+TEST_F(AsyncPersistenceQueueTest, QueueWithoutOpenStoreDoesNothing) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    // Note: set_persistence_store not called
+    // Create manager with mock store but don't open it
+    auto store = std::make_unique<MockPersistenceStore>();
+    AsyncPersistenceManager manager(config, std::move(store));
+    // Note: store is not opened
 
     std::vector<TokenId> tokens = {1, 2, 3};
     manager.queue_save_route(tokens, 1);
 
-    // Should not crash, queue_depth should be 0 (no store set)
+    // Should not crash, queue_depth should be 0 (store not open)
     EXPECT_EQ(manager.queue_depth(), 0);
 }
 
 TEST_F(AsyncPersistenceQueueTest, QueueAcceptsOperations) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     EXPECT_EQ(manager.queue_depth(), 0);
 
@@ -307,8 +305,9 @@ TEST_F(AsyncPersistenceQueueTest, QueueAcceptsOperations) {
 TEST_F(AsyncPersistenceQueueTest, BackpressureDropsOperations) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 5;  // Very small queue
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     // Fill the queue
     for (int i = 0; i < 5; ++i) {
@@ -337,8 +336,9 @@ TEST_F(AsyncPersistenceQueueTest, BackpressureDropsOperations) {
 TEST_F(AsyncPersistenceQueueTest, ClearAllClearsQueue) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     // Queue some operations
     for (int i = 0; i < 10; ++i) {
@@ -357,8 +357,9 @@ TEST_F(AsyncPersistenceQueueTest, ClearAllClearsQueue) {
 TEST_F(AsyncPersistenceQueueTest, ClearAllBypassesBackpressure) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 5;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     // Fill the queue
     for (int i = 0; i < 5; ++i) {
@@ -375,12 +376,16 @@ TEST_F(AsyncPersistenceQueueTest, ClearAllBypassesBackpressure) {
     EXPECT_FALSE(manager.is_backpressured());
 }
 
-TEST_F(AsyncPersistenceQueueTest, UnderlyingStoreAccessible) {
+TEST_F(AsyncPersistenceQueueTest, IsOpenReflectsStoreState) {
     AsyncPersistenceConfig config;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    auto* store_ptr = store.get();
+    AsyncPersistenceManager manager(config, std::move(store));
 
-    EXPECT_EQ(manager.underlying_store(), mock_store_.get());
+    EXPECT_FALSE(manager.is_open());
+
+    store_ptr->open("/tmp/test");
+    EXPECT_TRUE(manager.is_open());
 }
 
 TEST_F(AsyncPersistenceQueueTest, StatisticsInitializedToZero) {
@@ -400,8 +405,9 @@ TEST_F(AsyncPersistenceQueueTest, StatisticsInitializedToZero) {
 TEST_F(AsyncPersistenceQueueTest, LargeTokenVectorQueued) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     // Create a large token vector (simulating real LLM context)
     std::vector<TokenId> tokens(10000);
@@ -417,8 +423,9 @@ TEST_F(AsyncPersistenceQueueTest, LargeTokenVectorQueued) {
 TEST_F(AsyncPersistenceQueueTest, EmptyTokenVectorQueued) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     std::vector<TokenId> empty_tokens;
     manager.queue_save_route(empty_tokens, 1);
@@ -429,8 +436,9 @@ TEST_F(AsyncPersistenceQueueTest, EmptyTokenVectorQueued) {
 TEST_F(AsyncPersistenceQueueTest, SpanToVectorConversion) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     // Test with std::span input (simulating the API usage)
     std::vector<TokenId> original = {1, 2, 3, 4, 5};
@@ -452,8 +460,9 @@ TEST_F(AsyncPersistenceQueueTest, SpanToVectorConversion) {
 TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueOperations) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100000;  // Large enough for test
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     const int num_threads = 4;
     const int ops_per_thread = 1000;
@@ -481,8 +490,9 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueOperations) {
 TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;  // Small queue to trigger backpressure
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     const int num_threads = 4;
     const int ops_per_thread = 100;
@@ -517,8 +527,9 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
 TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 10000;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     std::atomic<bool> running{true};
     std::atomic<size_t> max_depth{0};
@@ -553,8 +564,9 @@ TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
 TEST_F(AsyncPersistenceQueueTest, MixedOperationTypes) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(mock_store_.get());
+    auto store = std::make_unique<MockPersistenceStore>();
+    store->open("/tmp/test");
+    AsyncPersistenceManager manager(config, std::move(store));
 
     // Queue different operation types
     std::vector<TokenId> tokens1 = {1, 2, 3};
@@ -589,7 +601,9 @@ protected:
     }
 
     void TearDown() override {
-        store_->close();
+        if (store_) {
+            store_->close();
+        }
         std::remove(test_db_path_.c_str());
         std::remove((test_db_path_ + "-wal").c_str());
         std::remove((test_db_path_ + "-shm").c_str());
@@ -602,8 +616,7 @@ protected:
 TEST_F(AsyncPersistenceIntegrationTest, QueueWithRealStore) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(store_.get());
+    AsyncPersistenceManager manager(config, std::move(store_));
 
     // Queue operations
     std::vector<TokenId> tokens = {1, 2, 3};
@@ -611,30 +624,25 @@ TEST_F(AsyncPersistenceIntegrationTest, QueueWithRealStore) {
     manager.queue_save_backend(1, "127.0.0.1", 8080, 100, 0);
 
     EXPECT_EQ(manager.queue_depth(), 2);
-
-    // underlying_store should be the real store
-    EXPECT_EQ(manager.underlying_store(), store_.get());
-    EXPECT_TRUE(manager.underlying_store()->is_open());
+    EXPECT_TRUE(manager.is_open());
 }
 
-TEST_F(AsyncPersistenceIntegrationTest, DirectStoreAccessStillWorks) {
+TEST_F(AsyncPersistenceIntegrationTest, DelegatedReadMethodsWork) {
     AsyncPersistenceConfig config;
-    AsyncPersistenceManager manager(config);
-    manager.set_persistence_store(store_.get());
+    AsyncPersistenceManager manager(config, std::move(store_));
 
-    // Can still use underlying store directly for reads
-    auto* underlying = manager.underlying_store();
-    ASSERT_NE(underlying, nullptr);
+    // The manager should delegate reads to the underlying store
+    EXPECT_TRUE(manager.is_open());
 
-    // Write directly (simulating startup load)
-    underlying->save_backend(1, "192.168.1.1", 11434, 100, 0);
-    std::vector<TokenId> tokens = {100, 200, 300};
-    underlying->save_route(tokens, 1);
+    // Initially empty
+    auto backends = manager.load_backends();
+    EXPECT_EQ(backends.size(), 0);
 
-    // Verify writes persisted
-    auto backends = underlying->load_backends();
-    EXPECT_EQ(backends.size(), 1);
+    auto routes = manager.load_routes();
+    EXPECT_EQ(routes.size(), 0);
 
-    auto routes = underlying->load_routes();
-    EXPECT_EQ(routes.size(), 1);
+    // Use the new API to verify integrity and counts
+    EXPECT_TRUE(manager.verify_integrity());
+    EXPECT_EQ(manager.backend_count(), 0);
+    EXPECT_EQ(manager.route_count(), 0);
 }
