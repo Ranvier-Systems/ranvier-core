@@ -290,6 +290,54 @@ TEST_F(ApplicationConfigTest, ClusterConfigIsPreserved) {
     EXPECT_EQ(app.config().cluster.peers[1], "192.168.1.2:9200");
 }
 
+// =============================================================================
+// Tokenizer Configuration Tests
+// =============================================================================
+// Note: Actual init_tokenizer() execution requires Seastar runtime and is tested
+// in integration tests. These tests verify configuration handling and document
+// expected behavior.
+
+TEST_F(ApplicationConfigTest, TokenizerPathIsPreserved) {
+    default_config.assets.tokenizer_path = "/models/gpt2-tokenizer.json";
+
+    Application app(default_config, "test.yaml");
+
+    EXPECT_EQ(app.config().assets.tokenizer_path, "/models/gpt2-tokenizer.json");
+}
+
+TEST_F(ApplicationConfigTest, TokenizerPathCanBeAbsolute) {
+    default_config.assets.tokenizer_path = "/usr/local/share/ranvier/tokenizer.json";
+
+    Application app(default_config, "test.yaml");
+
+    EXPECT_EQ(app.config().assets.tokenizer_path, "/usr/local/share/ranvier/tokenizer.json");
+}
+
+TEST_F(ApplicationConfigTest, TokenizerPathCanBeRelative) {
+    default_config.assets.tokenizer_path = "assets/tokenizer.json";
+
+    Application app(default_config, "test.yaml");
+
+    EXPECT_EQ(app.config().assets.tokenizer_path, "assets/tokenizer.json");
+}
+
+TEST_F(ApplicationConfigTest, EmptyTokenizerPathIsStoredAsIs) {
+    // Empty path will be rejected by init_tokenizer() at runtime
+    // (async method returns exception future)
+    default_config.assets.tokenizer_path = "";
+
+    Application app(default_config, "test.yaml");
+
+    EXPECT_TRUE(app.config().assets.tokenizer_path.empty());
+}
+
+// Document expected init_tokenizer() behavior (tested in integration tests):
+// - Empty path: returns exception future "Tokenizer path not configured"
+// - Non-existent file: returns exception future "Could not find tokenizer"
+// - Empty file (0 bytes): returns exception future "Tokenizer file is empty"
+// - File > 100MB: returns exception future "Tokenizer file too large"
+// - Valid file: loads tokenizer via DMA I/O and logs success
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

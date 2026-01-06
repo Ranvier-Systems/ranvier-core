@@ -81,8 +81,8 @@ flowchart TB
 
 The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle of all Ranvier services. It manages:
 
-1. **Startup Sequence**: Initializes services in dependency order:
-   - ShardedConfig (distributed to all cores) → TokenizerService → TracingService
+1. **Startup Sequence**: Initializes services in dependency order (all I/O is non-blocking):
+   - ShardedConfig (distributed to all cores) → TokenizerService (async DMA file load) → TracingService
    - RouterService → HttpController (sharded) → MetricsService
    - PersistenceStore → AsyncPersistenceManager → HealthService
    - K8sDiscoveryService → GossipService → State restoration from SQLite
@@ -124,7 +124,7 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 - **Circuit Breaker**: Quarantines unhealthy backends based on health check failures.
 
 ### Infrastructure Layer
-- **TokenizerService**: GPT-2 tokenization for request content
+- **TokenizerService**: GPT-2 tokenization for request content. Tokenizer vocabulary is loaded asynchronously at startup using Seastar's DMA file I/O (`open_file_dma`) to avoid blocking the reactor thread.
 - **HealthService**: Periodic health checks on backends
 - **ConnectionPool**: Reusable connections with LRU eviction
 

@@ -174,8 +174,8 @@ private:
 
     // --- Private Helpers: Initialization ---
 
-    // Initialize tokenizer from JSON file
-    void init_tokenizer();
+    // Initialize tokenizer from JSON file (async, uses Seastar DMA file I/O)
+    seastar::future<> init_tokenizer();
 
     // Initialize health checker service
     void init_health_checker();

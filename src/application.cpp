@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 
+#include <seastar/core/fstream.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/smp.hh>
@@ -29,14 +30,66 @@ Application::Application(RanvierConfig config, std::string config_path)
 // Destructor defined here where GossipService is complete (via gossip_service.hpp)
 Application::~Application() = default;
 
-void Application::init_tokenizer() {
-    std::ifstream t(_config.assets.tokenizer_path);
-    if (!t.is_open()) {
-        throw std::runtime_error("Could not find tokenizer: " + _config.assets.tokenizer_path);
+seastar::future<> Application::init_tokenizer() {
+    // Maximum tokenizer file size (100MB) - prevents OOM from misconfiguration
+    static constexpr uint64_t MAX_TOKENIZER_SIZE = 100 * 1024 * 1024;
+
+    const auto& path = _config.assets.tokenizer_path;
+
+    // Early validation - fail fast on empty path
+    if (path.empty()) {
+        return seastar::make_exception_future<>(
+            std::runtime_error("Tokenizer path not configured (assets.tokenizer_path is empty)"));
     }
-    std::string json_str((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
-    _tokenizer.load_from_json(json_str);
-    log_main.info("Services initialized (Tokenizer: {})", _config.assets.tokenizer_path);
+
+    return seastar::file_exists(path).then([this, path](bool exists) {
+        if (!exists) {
+            return seastar::make_exception_future<seastar::file>(
+                std::runtime_error("Could not find tokenizer: " + path));
+        }
+
+        // Open file with DMA for non-blocking I/O
+        return seastar::open_file_dma(path, seastar::open_flags::ro);
+    }).then([this, path](seastar::file f) {
+        // Get file size for pre-allocation and validation
+        return f.size().then([this, path, f](uint64_t size) -> seastar::future<> {
+            // Validate file size
+            if (size == 0) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("Tokenizer file is empty: " + path));
+            }
+            if (size > MAX_TOKENIZER_SIZE) {
+                return seastar::make_exception_future<>(std::runtime_error(
+                    "Tokenizer file too large (" + std::to_string(size) +
+                    " bytes, max " + std::to_string(MAX_TOKENIZER_SIZE) + "): " + path));
+            }
+
+            // Create input stream and read entire file
+            return seastar::do_with(
+                seastar::make_file_input_stream(f),
+                size,
+                [this, path](seastar::input_stream<char>& stream, uint64_t& file_size) {
+                    return stream.read_exactly(file_size).then(
+                        [this, path, &file_size](seastar::temporary_buffer<char> buf) {
+                            // Convert to string and load tokenizer
+                            std::string json_str(buf.get(), buf.size());
+                            _tokenizer.load_from_json(json_str);
+                            log_main.info("Services initialized (Tokenizer: {}, {} bytes)",
+                                          path, file_size);
+                        }).finally([&stream] {
+                            // Ensure stream is always closed, even on error
+                            return stream.close();
+                        });
+                });
+        });
+    }).handle_exception([path](auto ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_main.error("Failed to load tokenizer from {}: {}", path, e.what());
+        }
+        return seastar::make_exception_future<>(ep);
+    });
 }
 
 // =============================================================================
@@ -347,15 +400,9 @@ seastar::future<> Application::startup() {
             _sharded_config_started = true;
             log_main.info("Sharded config initialized on {} cores", seastar::smp::count);
         }).then([this] {
-            // 2. Initialize tokenizer (synchronous) - failure is fatal
-            try {
-                init_tokenizer();
-            } catch (const std::exception& e) {
-                log_main.error("Service init failed: {}", e.what());
-                return seastar::make_exception_future<>(
-                    std::runtime_error("Tokenizer initialization failed: " + std::string(e.what())));
-            }
-
+            // 2. Initialize tokenizer (async with DMA file I/O) - failure is fatal
+            return init_tokenizer();
+        }).then([this] {
             // 3. Initialize OpenTelemetry tracing
             TracingService::init(_config.telemetry);
             if (_config.telemetry.enabled) {
