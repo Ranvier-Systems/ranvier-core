@@ -14,10 +14,13 @@ SQLite operations (even in WAL mode) perform blocking I/O that can stall Seastar
 
 ## Architecture
 
+The AsyncPersistenceManager **owns** the underlying SQLite persistence store, providing complete encapsulation. HttpController interacts only with the AsyncPersistenceManager interface, with no direct access to SQLite.
+
 ```mermaid
 flowchart TB
     subgraph "Reactor Thread (Hot Path)"
         HTTP[HttpController]
+        APM[AsyncPersistenceManager]
         Q[Operation Queue<br/>std::deque + mutex]
     end
 
@@ -26,14 +29,17 @@ flowchart TB
         S[Batch Semaphore<br/>serializes batches]
     end
 
-    subgraph "Worker Thread (seastar::async)"
-        B[Batch Processor]
-        RA[RouteAccumulator]
-        SQL[(SQLite<br/>WAL Mode)]
+    subgraph "Owned by AsyncPersistenceManager"
+        subgraph "Worker Thread (seastar::async)"
+            B[Batch Processor]
+            RA[RouteAccumulator]
+        end
+        SQL[(SQLite Store<br/>WAL Mode)]
     end
 
-    HTTP -->|queue_save_route| Q
-    HTTP -->|queue_save_backend| Q
+    HTTP -->|queue_save_route| APM
+    HTTP -->|queue_save_backend| APM
+    APM --> Q
     T -->|extract_batch| Q
     T -->|wait for permit| S
     S -->|seastar::async| B
@@ -44,9 +50,28 @@ flowchart TB
 
     classDef hot fill:#ffa,stroke:#333
     classDef async fill:#aff,stroke:#333
-    class HTTP,Q hot
-    class B,RA,SQL async
+    classDef owned fill:#afa,stroke:#333
+    class HTTP,APM,Q hot
+    class B,RA async
+    class SQL owned
 ```
+
+### Ownership Model
+
+The AsyncPersistenceManager provides two constructors:
+
+```cpp
+// Production: creates SQLite store via factory
+explicit AsyncPersistenceManager(AsyncPersistenceConfig config = {});
+
+// Testing: accepts pre-configured mock store
+AsyncPersistenceManager(AsyncPersistenceConfig config, std::unique_ptr<PersistenceStore> store);
+```
+
+This design:
+- **Encapsulates SQLite**: Consumers never see the underlying store
+- **Enables testing**: Mock stores can be injected for unit tests
+- **Simplifies lifecycle**: Single owner manages database open/close
 
 ## Operation Types
 
@@ -112,7 +137,33 @@ While Seastar discourages mutexes, the queue mutex is safe because:
 
 ## Lifecycle
 
-### Startup
+The manager follows a strict lifecycle: **open → start → [use] → stop → close**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: constructor
+    Created --> Open: open(path)
+    Open --> Running: start()
+    Running --> Running: queue_* operations
+    Running --> Stopping: stop()
+    Stopping --> Stopped: drain complete
+    Stopped --> Closed: close()
+    Closed --> [*]
+```
+
+### Opening the Store
+
+```cpp
+// Create manager (factory creates underlying SQLite store)
+auto manager = std::make_unique<AsyncPersistenceManager>(config);
+
+// Open database at path (creates file if needed)
+if (!manager->open("/var/lib/ranvier/state.db")) {
+    // Handle failure
+}
+```
+
+### Starting the Timer
 
 ```cpp
 seastar::future<> start() {
@@ -135,7 +186,7 @@ seastar::future<> stop() {
 
     // Drain remaining operations
     auto remaining = drain_queue();
-    if (!remaining.empty()) {
+    if (!remaining.empty() && is_open()) {
         co_await seastar::async([this, ops = std::move(remaining)]() mutable {
             process_batch(std::move(ops));
         });
@@ -143,10 +194,18 @@ seastar::future<> stop() {
 }
 ```
 
+### Closing the Store
+
+```cpp
+// After stop() completes, close the database
+manager->close();  // Flushes WAL, closes file handles
+```
+
 The shutdown sequence ensures:
 1. No new timer callbacks fire
 2. In-flight batches complete (gate close)
 3. Remaining queued operations are flushed
+4. Database is properly closed (WAL checkpoint)
 
 ## Backpressure
 

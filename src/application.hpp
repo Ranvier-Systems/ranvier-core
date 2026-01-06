@@ -18,7 +18,6 @@
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "k8s_discovery_service.hpp"
-#include "persistence.hpp"
 #include "router_service.hpp"
 #include "sharded_config.hpp"
 #include "tokenizer_service.hpp"
@@ -160,8 +159,7 @@ private:
     // Health monitoring
     std::unique_ptr<HealthService> _health_checker;
 
-    // Persistence layer
-    std::unique_ptr<PersistenceStore> _persistence;
+    // Persistence layer (AsyncPersistenceManager owns the underlying SQLite store)
     std::unique_ptr<AsyncPersistenceManager> _async_persistence;
 
     // Service discovery

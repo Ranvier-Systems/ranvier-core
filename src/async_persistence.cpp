@@ -65,15 +65,35 @@ private:
 // ============================================================================
 
 AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config)
-    : _config(std::move(config)) {}
+    : _config(std::move(config))
+    , _store(create_persistence_store()) {}
 
-void AsyncPersistenceManager::set_persistence_store(PersistenceStore* store) {
-    _store = store;
+AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config,
+                                                   std::unique_ptr<PersistenceStore> store)
+    : _config(std::move(config))
+    , _store(std::move(store)) {}
+
+bool AsyncPersistenceManager::open(const std::string& path) {
+    if (!_store) {
+        log_async_persist.error("No persistence store available");
+        return false;
+    }
+    return _store->open(path);
+}
+
+void AsyncPersistenceManager::close() {
+    if (_store && _store->is_open()) {
+        _store->close();
+    }
+}
+
+bool AsyncPersistenceManager::is_open() const {
+    return _store && _store->is_open();
 }
 
 seastar::future<> AsyncPersistenceManager::start() {
-    if (!_store) {
-        log_async_persist.warn("AsyncPersistenceManager started without a persistence store");
+    if (!_store || !_store->is_open()) {
+        log_async_persist.warn("AsyncPersistenceManager started without an open persistence store");
         return seastar::make_ready_future<>();
     }
 
@@ -105,7 +125,7 @@ seastar::future<> AsyncPersistenceManager::stop() {
     return _flush_gate.close().then([this] {
         auto final_batch = drain_queue();
 
-        if (!final_batch.empty() && _store) {
+        if (!final_batch.empty() && is_open()) {
             log_async_persist.info("Flushing {} pending operations before shutdown",
                                    final_batch.size());
             return seastar::async([this, batch = std::move(final_batch)]() mutable {
@@ -122,7 +142,7 @@ seastar::future<> AsyncPersistenceManager::stop() {
 
 void AsyncPersistenceManager::queue_save_route(std::span<const TokenId> tokens,
                                                 BackendId backend_id) {
-    if (_stopping.load(std::memory_order_relaxed) || !_store) return;
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     SaveRouteOp op;
     op.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
@@ -133,28 +153,28 @@ void AsyncPersistenceManager::queue_save_route(std::span<const TokenId> tokens,
 void AsyncPersistenceManager::queue_save_backend(BackendId id, const std::string& ip,
                                                   uint16_t port, uint32_t weight,
                                                   uint32_t priority) {
-    if (_stopping.load(std::memory_order_relaxed) || !_store) return;
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     SaveBackendOp op{id, ip, port, weight, priority};
     try_enqueue(std::move(op));
 }
 
 void AsyncPersistenceManager::queue_remove_backend(BackendId id) {
-    if (_stopping.load(std::memory_order_relaxed) || !_store) return;
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     RemoveBackendOp op{id};
     try_enqueue(std::move(op));
 }
 
 void AsyncPersistenceManager::queue_remove_routes_for_backend(BackendId backend_id) {
-    if (_stopping.load(std::memory_order_relaxed) || !_store) return;
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     RemoveRoutesForBackendOp op{backend_id};
     try_enqueue(std::move(op));
 }
 
 void AsyncPersistenceManager::queue_clear_all() {
-    if (_stopping.load(std::memory_order_relaxed) || !_store) return;
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     std::lock_guard<std::mutex> lock(_queue_mutex);
     _queue.clear();  // Discard pending ops - they'll be cleared anyway
@@ -218,7 +238,7 @@ size_t AsyncPersistenceManager::queue_depth() const {
 // ============================================================================
 
 void AsyncPersistenceManager::on_flush_timer() {
-    if (_stopping.load(std::memory_order_relaxed) || !_store) return;
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     auto batch = extract_batch();
     if (batch.empty()) return;
@@ -244,7 +264,7 @@ void AsyncPersistenceManager::on_flush_timer() {
 }
 
 void AsyncPersistenceManager::process_batch(std::vector<PersistenceOp> batch) {
-    if (!_store || batch.empty()) return;
+    if (!is_open() || batch.empty()) return;
 
     // Pre-allocate for common case where batch is mostly routes
     RouteAccumulator routes(*this, batch.size());
@@ -335,6 +355,52 @@ void AsyncPersistenceManager::log_stats() {
                                "Consider increasing max_queue_depth or reducing request rate.",
                                dropped);
     }
+}
+
+// ============================================================================
+// Read Delegation Methods
+// ============================================================================
+// These methods delegate to the underlying store for synchronous reads.
+// Used during startup (state restoration) and shutdown (summary logging).
+
+std::vector<BackendRecord> AsyncPersistenceManager::load_backends() {
+    if (!is_open()) return {};
+    return _store->load_backends();
+}
+
+std::vector<RouteRecord> AsyncPersistenceManager::load_routes() {
+    if (!is_open()) return {};
+    return _store->load_routes();
+}
+
+bool AsyncPersistenceManager::checkpoint() {
+    if (!is_open()) return false;
+    return _store->checkpoint();
+}
+
+bool AsyncPersistenceManager::verify_integrity() {
+    if (!is_open()) return false;
+    return _store->verify_integrity();
+}
+
+bool AsyncPersistenceManager::clear_all() {
+    if (!is_open()) return false;
+    return _store->clear_all();
+}
+
+size_t AsyncPersistenceManager::last_load_skipped_count() const {
+    if (!is_open()) return 0;
+    return _store->last_load_skipped_count();
+}
+
+size_t AsyncPersistenceManager::backend_count() const {
+    if (!is_open()) return 0;
+    return _store->backend_count();
+}
+
+size_t AsyncPersistenceManager::route_count() const {
+    if (!is_open()) return 0;
+    return _store->route_count();
 }
 
 } // namespace ranvier

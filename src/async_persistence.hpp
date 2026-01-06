@@ -7,6 +7,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <variant>
 
@@ -65,6 +66,10 @@ struct AsyncPersistenceConfig {
 // ============================================================================
 // Decouples SQLite persistence from the Seastar reactor thread.
 //
+// This class owns the underlying PersistenceStore and provides a complete
+// abstraction over the persistence layer. Consumers should never need to
+// access the underlying SQLite implementation directly.
+//
 // Architecture:
 //   - Fire-and-forget queue API for the hot request path
 //   - Background timer drains queue and writes to SQLite in batches
@@ -78,24 +83,54 @@ struct AsyncPersistenceConfig {
 
 class AsyncPersistenceManager {
 public:
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    // Production constructor: creates the underlying SQLite store via factory.
     explicit AsyncPersistenceManager(AsyncPersistenceConfig config = {});
+
+    // Test constructor: allows injecting a custom PersistenceStore for mocking.
+    // The injected store must already be open, or open() must be called separately.
+    AsyncPersistenceManager(AsyncPersistenceConfig config, std::unique_ptr<PersistenceStore> store);
+
     ~AsyncPersistenceManager() = default;
 
-    // Non-copyable, non-movable
+    // Non-copyable, non-movable (owns unique resources)
     AsyncPersistenceManager(const AsyncPersistenceManager&) = delete;
     AsyncPersistenceManager& operator=(const AsyncPersistenceManager&) = delete;
     AsyncPersistenceManager(AsyncPersistenceManager&&) = delete;
     AsyncPersistenceManager& operator=(AsyncPersistenceManager&&) = delete;
 
-    // --- Lifecycle ---
+    // -------------------------------------------------------------------------
+    // Lifecycle (call in order: open -> start -> [use] -> stop -> close)
+    // -------------------------------------------------------------------------
 
-    void set_persistence_store(PersistenceStore* store);
+    // Open the persistence store at the given path.
+    // Creates the underlying SQLite database if it doesn't exist.
+    // Returns true on success, false on failure.
+    bool open(const std::string& path);
+
+    // Check if the persistence store is open and ready.
+    bool is_open() const;
+
+    // Start the async manager (arms flush timer).
+    // Must be called after open() succeeds.
     seastar::future<> start();
+
+    // Stop the async manager (flushes remaining queue).
+    // Must be called before close(). Safe to call multiple times.
     seastar::future<> stop();
 
-    // --- Fire-and-Forget Queue API (Hot Path) ---
-    // These methods queue operations and return immediately.
-    // Safe to call from any shard.
+    // Close the persistence store (flushes WAL and closes database).
+    // Must be called after stop() completes. Safe to call multiple times.
+    void close();
+
+    // -------------------------------------------------------------------------
+    // Write Operations (Fire-and-Forget Queue API)
+    // -------------------------------------------------------------------------
+    // These methods queue operations and return immediately (non-blocking).
+    // Safe to call from any shard. Operations silently dropped if store not open.
 
     void queue_save_route(std::span<const TokenId> tokens, BackendId backend_id);
     void queue_save_backend(BackendId id, const std::string& ip, uint16_t port,
@@ -104,11 +139,37 @@ public:
     void queue_remove_routes_for_backend(BackendId backend_id);
     void queue_clear_all();
 
-    // --- Direct Access (Startup/Shutdown Only) ---
+    // -------------------------------------------------------------------------
+    // Read Operations (Synchronous, for Startup/Recovery)
+    // -------------------------------------------------------------------------
+    // These operations read directly from the underlying store (blocking).
+    // Call during startup before serving requests, or during shutdown.
+    // Returns empty/zero values if store is not open.
 
-    PersistenceStore* underlying_store() const { return _store; }
+    std::vector<BackendRecord> load_backends();
+    std::vector<RouteRecord> load_routes();
+    size_t backend_count() const;
+    size_t route_count() const;
+    size_t last_load_skipped_count() const;
 
-    // --- Monitoring ---
+    // -------------------------------------------------------------------------
+    // Maintenance Operations (Synchronous)
+    // -------------------------------------------------------------------------
+    // Call during startup or shutdown only - not safe during normal operation.
+
+    // Flush WAL to main database file - call after critical writes
+    bool checkpoint();
+
+    // Run integrity check and validate data structures
+    bool verify_integrity();
+
+    // Clear all persisted data (synchronous).
+    // WARNING: For startup recovery only. Do not call while serving requests.
+    bool clear_all();
+
+    // -------------------------------------------------------------------------
+    // Monitoring (Thread-safe, can call anytime)
+    // -------------------------------------------------------------------------
 
     size_t queue_depth() const;
     uint64_t operations_processed() const { return _ops_processed.load(); }
@@ -155,7 +216,7 @@ private:
     // --- Member Variables ---
 
     AsyncPersistenceConfig _config;
-    PersistenceStore* _store = nullptr;
+    std::unique_ptr<PersistenceStore> _store;  // Owned persistence engine
 
     // Queue (protected by mutex for cross-shard access)
     mutable std::mutex _queue_mutex;
