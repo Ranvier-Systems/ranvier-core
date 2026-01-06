@@ -39,6 +39,12 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/tokenizer_service.cpp`
   _Complexity:_ Low
 
+- [x] **Use Seastar async file I/O for tokenizer loading** ✓
+  _Justification:_ Tokenizer loading used blocking `std::ifstream` during startup, blocking the reactor thread. This is an architectural hazard in Seastar that could cause stalls on slow storage.
+  _Approach:_ Replaced `std::ifstream` with Seastar's non-blocking DMA file I/O (`seastar::open_file_dma`, `seastar::make_file_input_stream`). Added validation for empty files, max file size (100MB), and proper stream cleanup via `finally()`. Method now returns `seastar::future<>` for proper async chaining in startup sequence.
+  _Location:_ `src/application.hpp`, `src/application.cpp`
+  _Complexity:_ Low
+
 ### 1.2 Zero-Copy SSE Parsing Refinements
 
 - [ ] **Implement scatter-gather I/O for backend responses**
@@ -473,6 +479,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P3 - Low** | DX | Seastar-native signal handling | Low | ✅ Done |
 | **P2 - Medium** | DX | Sharded configuration for per-core access | Medium | ✅ Done |
 | **P3 - Low** | DX | Encapsulate SQLite store within AsyncPersistenceManager | Low | ✅ Done |
+| **P3 - Low** | Performance | Async file I/O for tokenizer loading | Low | ✅ Done |
 
 ---
 
@@ -482,6 +489,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-06 | Use Seastar async file I/O for tokenizer loading (DMA file I/O, validation, proper cleanup) | - |
 | 2026-01-06 | Encapsulate SQLite store within AsyncPersistenceManager (clean ownership, lifecycle methods) | - |
 | 2026-01-06 | Refactor configuration for Seastar sharded container (per-core lock-free access, hot-reload) | - |
 | 2026-01-06 | Implement Seastar-native signal handling (SIGINT hard kill, SIGTERM graceful, SIGHUP reload) | - |

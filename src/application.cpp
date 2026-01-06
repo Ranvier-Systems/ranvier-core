@@ -31,7 +31,16 @@ Application::Application(RanvierConfig config, std::string config_path)
 Application::~Application() = default;
 
 seastar::future<> Application::init_tokenizer() {
+    // Maximum tokenizer file size (100MB) - prevents OOM from misconfiguration
+    static constexpr uint64_t MAX_TOKENIZER_SIZE = 100 * 1024 * 1024;
+
     const auto& path = _config.assets.tokenizer_path;
+
+    // Early validation - fail fast on empty path
+    if (path.empty()) {
+        return seastar::make_exception_future<>(
+            std::runtime_error("Tokenizer path not configured (assets.tokenizer_path is empty)"));
+    }
 
     return seastar::file_exists(path).then([this, path](bool exists) -> seastar::future<> {
         if (!exists) {
@@ -40,25 +49,38 @@ seastar::future<> Application::init_tokenizer() {
         }
 
         // Open file with DMA for non-blocking I/O
-        return seastar::open_file_dma(path, seastar::open_flags::ro).then([this, path](seastar::file f) {
-            // Get file size for efficient pre-allocation
-            return f.size().then([this, path, f](uint64_t size) {
-                // Create input stream and read entire file
-                return seastar::do_with(
-                    seastar::make_file_input_stream(f),
-                    size,
-                    [this, path](seastar::input_stream<char>& stream, uint64_t& file_size) {
-                        return stream.read_exactly(file_size).then(
-                            [this, path, &file_size, &stream](seastar::temporary_buffer<char> buf) {
-                                // Convert to string and load tokenizer
-                                std::string json_str(buf.get(), buf.size());
-                                _tokenizer.load_from_json(json_str);
-                                log_main.info("Services initialized (Tokenizer: {}, {} bytes)", path, file_size);
-                                // Close the stream properly
-                                return stream.close();
-                            });
-                    });
-            });
+        return seastar::open_file_dma(path, seastar::open_flags::ro);
+    }).then([this, path](seastar::file f) {
+        // Get file size for pre-allocation and validation
+        return f.size().then([this, path, f](uint64_t size) -> seastar::future<> {
+            // Validate file size
+            if (size == 0) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("Tokenizer file is empty: " + path));
+            }
+            if (size > MAX_TOKENIZER_SIZE) {
+                return seastar::make_exception_future<>(std::runtime_error(
+                    "Tokenizer file too large (" + std::to_string(size) +
+                    " bytes, max " + std::to_string(MAX_TOKENIZER_SIZE) + "): " + path));
+            }
+
+            // Create input stream and read entire file
+            return seastar::do_with(
+                seastar::make_file_input_stream(f),
+                size,
+                [this, path](seastar::input_stream<char>& stream, uint64_t& file_size) {
+                    return stream.read_exactly(file_size).then(
+                        [this, path, &file_size](seastar::temporary_buffer<char> buf) {
+                            // Convert to string and load tokenizer
+                            std::string json_str(buf.get(), buf.size());
+                            _tokenizer.load_from_json(json_str);
+                            log_main.info("Services initialized (Tokenizer: {}, {} bytes)",
+                                          path, file_size);
+                        }).finally([&stream] {
+                            // Ensure stream is always closed, even on error
+                            return stream.close();
+                        });
+                });
         });
     }).handle_exception([path](auto ep) {
         try {
