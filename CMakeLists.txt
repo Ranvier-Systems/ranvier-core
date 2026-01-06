@@ -351,6 +351,7 @@ if(Seastar_FOUND)
       src/sqlite_persistence.cpp
       src/stream_parser.cpp
       src/dtls_context.cpp
+      src/tokenizer_service.cpp
     )
     target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
     target_link_libraries(application_test
@@ -358,6 +359,8 @@ if(Seastar_FOUND)
       Seastar::seastar
       ${SQLITE3_LIBRARIES}
       yaml-cpp::yaml-cpp
+      rapidjson_interface
+      tokenizers_cpp
       absl::flat_hash_map
       absl::flat_hash_set
       OpenSSL::SSL
