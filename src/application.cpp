@@ -4,7 +4,6 @@
 #include "gossip_service.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
-#include "sqlite_persistence.hpp"
 #include "tracing_service.hpp"
 
 #include <csignal>
@@ -164,27 +163,28 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
 // =============================================================================
 
 seastar::future<> Application::init_persistence() {
-    _persistence = create_persistence_store();
-    if (!_persistence->open(_config.database.path)) {
+    // Create async persistence manager (which creates and owns the underlying SQLite store)
+    _async_persistence = std::make_unique<AsyncPersistenceManager>(build_persistence_config());
+
+    // Open the database
+    if (!_async_persistence->open(_config.database.path)) {
         log_main.warn("Failed to open persistence store - running without persistence");
+        _async_persistence.reset();
         return seastar::make_ready_future<>();
     }
 
     log_main.info("Persistence initialized (SQLite: {})", _config.database.path);
 
     // Checkpoint WAL on startup to ensure clean state after potential crash
-    if (_persistence->checkpoint()) {
+    if (_async_persistence->checkpoint()) {
         log_main.debug("Persistence WAL checkpoint complete");
     } else {
         log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
     }
 
-    // Create and start async persistence manager
-    _async_persistence = std::make_unique<AsyncPersistenceManager>(build_persistence_config());
-    _async_persistence->set_persistence_store(_persistence.get());
-
+    // Start async persistence manager (arms flush timer)
     return _async_persistence->start().then([this] {
-        // Set async persistence on all shards
+        // Distribute async persistence manager to all HttpController shards
         return _controller.invoke_on_all([this](HttpController& c) {
             c.set_persistence(_async_persistence.get());
         });
@@ -192,24 +192,24 @@ seastar::future<> Application::init_persistence() {
 }
 
 seastar::future<> Application::load_persisted_state() {
-    if (!_persistence || !_persistence->is_open()) {
+    if (!_async_persistence || !_async_persistence->is_open()) {
         log_main.info("No persistence store - starting with empty state");
         return seastar::make_ready_future<>();
     }
 
     // Step 1: Verify database integrity
-    if (!_persistence->verify_integrity()) {
+    if (!_async_persistence->verify_integrity()) {
         log_main.error("Persistence integrity check failed - clearing corrupted state");
-        _persistence->clear_all();
+        _async_persistence->clear_all();
         log_main.info("Persistence store cleared - starting fresh");
         return seastar::make_ready_future<>();
     }
 
     // Step 2: Load backends and routes
-    auto backends = _persistence->load_backends();
-    auto routes = _persistence->load_routes();
+    auto backends = _async_persistence->load_backends();
+    auto routes = _async_persistence->load_routes();
 
-    size_t skipped = _persistence->last_load_skipped_count();
+    size_t skipped = _async_persistence->last_load_skipped_count();
     if (skipped > 0) {
         log_main.warn("Skipped {} corrupted route records during load", skipped);
     }
@@ -698,19 +698,19 @@ seastar::future<> Application::stop_services() {
 
 void Application::cleanup() {
     // Log shutdown summary and close persistence
-    if (_persistence && _persistence->is_open()) {
+    if (_async_persistence && _async_persistence->is_open()) {
         log_main.info("Shutdown summary:");
-        log_main.info("  Persisted backends: {}", _persistence->backend_count());
-        log_main.info("  Persisted routes:   {}", _persistence->route_count());
+        log_main.info("  Persisted backends: {}", _async_persistence->backend_count());
+        log_main.info("  Persisted routes:   {}", _async_persistence->route_count());
 
         // Checkpoint WAL before closing
-        if (_persistence->checkpoint()) {
+        if (_async_persistence->checkpoint()) {
             log_main.debug("Final WAL checkpoint complete");
         } else {
             log_main.warn("Final WAL checkpoint failed - some data may be in WAL");
         }
 
-        _persistence->close();
+        _async_persistence->close();
         log_main.info("Persistence store closed");
     }
 

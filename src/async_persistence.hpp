@@ -7,6 +7,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <variant>
 
@@ -65,6 +66,10 @@ struct AsyncPersistenceConfig {
 // ============================================================================
 // Decouples SQLite persistence from the Seastar reactor thread.
 //
+// This class owns the underlying PersistenceStore and provides a complete
+// abstraction over the persistence layer. Consumers should never need to
+// access the underlying SQLite implementation directly.
+//
 // Architecture:
 //   - Fire-and-forget queue API for the hot request path
 //   - Background timer drains queue and writes to SQLite in batches
@@ -89,8 +94,24 @@ public:
 
     // --- Lifecycle ---
 
-    void set_persistence_store(PersistenceStore* store);
+    // Open the persistence store at the given path.
+    // Creates the underlying SQLite database if it doesn't exist.
+    // Returns true on success, false on failure.
+    bool open(const std::string& path);
+
+    // Close the persistence store (flushes WAL and closes database).
+    // Call only after stop() has completed.
+    void close();
+
+    // Check if the persistence store is open and ready.
+    bool is_open() const;
+
+    // Start the async manager (arms flush timer).
+    // Must be called after open().
     seastar::future<> start();
+
+    // Stop the async manager (flushes remaining queue).
+    // Call before close().
     seastar::future<> stop();
 
     // --- Fire-and-Forget Queue API (Hot Path) ---
@@ -104,9 +125,30 @@ public:
     void queue_remove_routes_for_backend(BackendId backend_id);
     void queue_clear_all();
 
-    // --- Direct Access (Startup/Shutdown Only) ---
+    // --- Read Operations (Synchronous, for Startup/Recovery) ---
+    // These operations read directly from the underlying store.
+    // Call during startup before serving requests, or during shutdown.
 
-    PersistenceStore* underlying_store() const { return _store; }
+    std::vector<BackendRecord> load_backends();
+    std::vector<RouteRecord> load_routes();
+
+    // --- Maintenance Operations ---
+
+    // Flush WAL to main database file - call after critical writes
+    bool checkpoint();
+
+    // Run integrity check and validate data structures
+    bool verify_integrity();
+
+    // Clear all persisted data (synchronous, for recovery)
+    bool clear_all();
+
+    // Returns count of records skipped during last load due to corruption
+    size_t last_load_skipped_count() const;
+
+    // Get current counts
+    size_t backend_count() const;
+    size_t route_count() const;
 
     // --- Monitoring ---
 
@@ -155,7 +197,7 @@ private:
     // --- Member Variables ---
 
     AsyncPersistenceConfig _config;
-    PersistenceStore* _store = nullptr;
+    std::unique_ptr<PersistenceStore> _store;  // Owned persistence engine
 
     // Queue (protected by mutex for cross-shard access)
     mutable std::mutex _queue_mutex;

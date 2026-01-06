@@ -5,7 +5,6 @@
 #include "config.hpp"
 #include "connection_pool.hpp"
 #include "metrics_service.hpp"
-#include "persistence.hpp"
 #include "rate_limiter.hpp"
 #include "router_service.hpp"
 #include "tokenizer_service.hpp"
