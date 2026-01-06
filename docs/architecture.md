@@ -96,7 +96,15 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 
 4. **State Machine**: Tracks lifecycle states (CREATED → STARTING → RUNNING → DRAINING → STOPPING → STOPPED)
 
-5. **Hot Reload**: Supports configuration reloading via SIGHUP without restart.
+5. **Signal Handling**: Uses Seastar-native signal handling for graceful lifecycle management:
+
+   | Signal | Behavior |
+   |--------|----------|
+   | `SIGINT` | First: Graceful shutdown (drain requests, stop services). Second: Hard kill via `std::exit(1)` for stuck shutdowns. |
+   | `SIGTERM` | Graceful shutdown (no hard kill option; process managers use SIGKILL for escalation). |
+   | `SIGHUP` | Configuration hot-reload via `sharded<HttpController>::invoke_on_all()` to propagate changes across all CPU cores. |
+
+   Signal handlers integrate with the Seastar reactor, enabling async operations within handlers. A `seastar::promise<>` bridges signal reception to the main application loop.
 
 ## Layer Responsibilities
 

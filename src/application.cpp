@@ -10,6 +10,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
@@ -475,17 +476,24 @@ void Application::setup_signal_handlers() {
     // Second SIGINT: Hard kill (immediate exit)
     //   - For when graceful shutdown is stuck or taking too long
     //   - Uses std::exit(1) to terminate immediately
+    // Note: If already shutting down (e.g., from SIGTERM), first SIGINT
+    //       triggers hard kill since graceful shutdown is already in progress.
     seastar::engine().handle_signal(SIGINT, [this] {
-        _sigint_count++;
+        int count = _sigint_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
-        if (_sigint_count == 1) {
-            // First SIGINT - graceful shutdown
+        if (count == 1 && !is_shutting_down()) {
+            // First SIGINT and not already shutting down - graceful shutdown
             log_main.info("SIGINT received - initiating graceful shutdown");
             log_main.info("Press Ctrl+C again to force immediate termination");
             signal_shutdown();
         } else {
-            // Second (or more) SIGINT - hard kill
-            log_main.warn("Second SIGINT received - forcing immediate termination!");
+            // Either: second+ SIGINT, or first SIGINT but already shutting down
+            // In both cases, user wants immediate termination
+            log_main.warn("Forcing immediate termination (signal count: {}, shutting_down: {})",
+                          count, is_shutting_down());
+            // Flush output streams to ensure log message is visible
+            std::cerr.flush();
+            std::cout.flush();
             std::exit(1);
         }
     });
