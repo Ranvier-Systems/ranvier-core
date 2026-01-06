@@ -193,8 +193,11 @@ private:
 
     // --- Private Helpers: Configuration ---
 
-    // Build HttpControllerConfig from RanvierConfig
+    // Build HttpControllerConfig from member _config
     HttpControllerConfig build_controller_config() const;
+
+    // Build HttpControllerConfig from a specific config (for hot-reload)
+    static HttpControllerConfig build_controller_config_from(const RanvierConfig& config);
 
     // Build K8sDiscoveryConfig from RanvierConfig
     K8sDiscoveryConfig build_k8s_config() const;
@@ -204,6 +207,9 @@ private:
 
     // Build AsyncPersistenceConfig from RanvierConfig
     AsyncPersistenceConfig build_persistence_config() const;
+
+    // Log warnings for config changes that require restart
+    void log_non_reloadable_changes(const RanvierConfig& new_config) const;
 
     // --- Private Helpers: Server Lifecycle ---
 

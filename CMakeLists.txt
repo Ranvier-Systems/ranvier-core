@@ -307,8 +307,22 @@ target_link_libraries(quorum_test
 )
 gtest_discover_tests(quorum_test)
 
-# StreamParser Unit Tests (Requires Seastar types)
+# ShardedConfig Unit Tests (Requires Seastar types for header includes)
+# Tests ShardedConfig wrapper class for per-core config distribution
 if(Seastar_FOUND)
+    add_executable(sharded_config_test
+      tests/unit/sharded_config_test.cpp
+    )
+    target_include_directories(sharded_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(sharded_config_test
+      PRIVATE
+      Seastar::seastar
+      yaml-cpp::yaml-cpp
+      GTest::gtest_main
+    )
+    gtest_discover_tests(sharded_config_test)
+
+# StreamParser Unit Tests (Requires Seastar types)
     add_executable(stream_parser_test
       tests/unit/stream_parser_test.cpp
       src/stream_parser.cpp

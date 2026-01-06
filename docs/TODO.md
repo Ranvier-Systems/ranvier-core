@@ -410,6 +410,19 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `src/application.hpp`, `src/application.cpp`
   _Complexity:_ Low
 
+- [x] **Refactor configuration for Seastar sharded container** ✓
+  _Justification:_ Global configuration access causes contention in multi-core Seastar deployments. Services need lock-free per-core configuration access with hot-reload capability.
+  _Approach:_ Created `ShardedConfig` wrapper class (`src/sharded_config.hpp`) that:
+  - Wraps `RanvierConfig` for `seastar::sharded<>` compatibility
+  - Provides `stop()` method required by Seastar
+  - Provides `update()` method for hot-reload via `invoke_on_all()`
+  - Each CPU core gets its own config copy for lock-free reads
+  - `Application::local_config()` provides per-shard access
+  - Master config only updated after all shards succeed (exception-safe)
+  - Uses `shared_ptr` to avoid N copies during hot-reload propagation
+  _Location:_ `src/sharded_config.hpp`, `src/application.hpp`, `src/application.cpp`
+  _Complexity:_ Medium
+
 ### 5.5 Build System
 
 - [ ] **Add Windows/macOS cross-compilation support**
@@ -452,6 +465,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
 | **P2 - Medium** | DX | Application bootstrap refactoring | Medium | ✅ Done |
 | **P3 - Low** | DX | Seastar-native signal handling | Low | ✅ Done |
+| **P2 - Medium** | DX | Sharded configuration for per-core access | Medium | ✅ Done |
 
 ---
 
@@ -461,6 +475,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-06 | Refactor configuration for Seastar sharded container (per-core lock-free access, hot-reload) | - |
 | 2026-01-06 | Implement Seastar-native signal handling (SIGINT hard kill, SIGTERM graceful, SIGHUP reload) | - |
 | 2026-01-05 | Refactor initialization into Application class (service lifecycle management) | - |
 | 2026-01-05 | Replace shared_ptr with unique_ptr in RadixTree (Seastar optimization) | - |

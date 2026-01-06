@@ -82,14 +82,14 @@ flowchart TB
 The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle of all Ranvier services. It manages:
 
 1. **Startup Sequence**: Initializes services in dependency order:
-   - TokenizerService → TracingService → RouterService → HttpController (sharded)
-   - MetricsService → PersistenceStore → AsyncPersistenceManager
-   - HealthService → K8sDiscoveryService → GossipService
-   - State restoration from SQLite
+   - ShardedConfig (distributed to all cores) → TokenizerService → TracingService
+   - RouterService → HttpController (sharded) → MetricsService
+   - PersistenceStore → AsyncPersistenceManager → HealthService
+   - K8sDiscoveryService → GossipService → State restoration from SQLite
 
 2. **Shutdown Sequence**: Stops services in reverse order with graceful draining:
    - HealthService → K8sDiscoveryService → GossipService → HTTP Servers
-   - HttpController → AsyncPersistenceManager → PersistenceStore
+   - HttpController → AsyncPersistenceManager → ShardedConfig
    - WAL checkpoint and cleanup
 
 3. **Lifecycle Protection**: Uses `seastar::gate` to ensure startup completes before any shutdown can proceed.
@@ -102,9 +102,15 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
    |--------|----------|
    | `SIGINT` | First: Graceful shutdown (drain requests, stop services). Second: Hard kill via `std::exit(1)` for stuck shutdowns. |
    | `SIGTERM` | Graceful shutdown (no hard kill option; process managers use SIGKILL for escalation). |
-   | `SIGHUP` | Configuration hot-reload via `sharded<HttpController>::invoke_on_all()` to propagate changes across all CPU cores. |
+   | `SIGHUP` | Configuration hot-reload via `sharded<>::invoke_on_all()` to propagate changes across all CPU cores. |
 
    Signal handlers integrate with the Seastar reactor, enabling async operations within handlers. A `seastar::promise<>` bridges signal reception to the main application loop.
+
+6. **Sharded Configuration**: Uses `seastar::sharded<ShardedConfig>` for per-core configuration distribution:
+   - Each CPU core has its own config copy for lock-free access
+   - Hot-reload updates all shards atomically via `invoke_on_all()`
+   - Services access config via `Application::local_config()` for their local shard
+   - Master config is only updated after all shards successfully update (exception-safe)
 
 ## Layer Responsibilities
 
