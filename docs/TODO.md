@@ -59,6 +59,12 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/async_persistence.hpp`, `src/async_persistence.cpp`, `src/http_controller.cpp`
   _Complexity:_ Medium
 
+- [x] **Encapsulate SQLite store within AsyncPersistenceManager** ✓
+  _Justification:_ Application class had separate ownership of both `PersistenceStore` and `AsyncPersistenceManager`, with leaky coupling via raw pointer. HttpController could potentially access the underlying SQLite store directly.
+  _Approach:_ AsyncPersistenceManager now owns the SQLite store via `std::unique_ptr<PersistenceStore>`. Added lifecycle methods (`open()`, `close()`, `is_open()`) and read delegation methods (`load_backends()`, `load_routes()`, `checkpoint()`, etc.). Removed direct persistence access from Application. HttpController sees only AsyncPersistenceManager interface.
+  _Location:_ `src/async_persistence.hpp`, `src/async_persistence.cpp`, `src/application.hpp`, `src/application.cpp`
+  _Complexity:_ Low
+
 ### 1.4 Memory Efficiency
 
 - [x] **Replace `shared_ptr` with `unique_ptr` in RadixTree** ✓
@@ -466,6 +472,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P2 - Medium** | DX | Application bootstrap refactoring | Medium | ✅ Done |
 | **P3 - Low** | DX | Seastar-native signal handling | Low | ✅ Done |
 | **P2 - Medium** | DX | Sharded configuration for per-core access | Medium | ✅ Done |
+| **P3 - Low** | DX | Encapsulate SQLite store within AsyncPersistenceManager | Low | ✅ Done |
 
 ---
 
@@ -475,6 +482,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-06 | Encapsulate SQLite store within AsyncPersistenceManager (clean ownership, lifecycle methods) | - |
 | 2026-01-06 | Refactor configuration for Seastar sharded container (per-core lock-free access, hot-reload) | - |
 | 2026-01-06 | Implement Seastar-native signal handling (SIGINT hard kill, SIGTERM graceful, SIGHUP reload) | - |
 | 2026-01-05 | Refactor initialization into Application class (service lifecycle management) | - |
