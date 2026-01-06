@@ -33,61 +33,41 @@ Application::~Application() = default;
 seastar::future<> Application::init_tokenizer() {
     // Maximum tokenizer file size (100MB) - prevents OOM from misconfiguration
     static constexpr uint64_t MAX_TOKENIZER_SIZE = 100 * 1024 * 1024;
-
     const auto& path = _config.assets.tokenizer_path;
 
     // Early validation - fail fast on empty path
     if (path.empty()) {
-        return seastar::make_exception_future<>(
-            std::runtime_error("Tokenizer path not configured (assets.tokenizer_path is empty)"));
+        return seastar::make_exception_future<>(std::runtime_error("Tokenizer path is empty"));
     }
 
-    return seastar::file_exists(path).then([this, path](bool exists) {
-        if (!exists) {
-            return seastar::make_exception_future<seastar::file>(
-                std::runtime_error("Could not find tokenizer: " + path));
-        }
-
-        // Open file with DMA for non-blocking I/O
-        return seastar::open_file_dma(path, seastar::open_flags::ro);
-    }).then([this, path](seastar::file f) {
-        // Get file size for pre-allocation and validation
-        return f.size().then([this, path, f](uint64_t size) -> seastar::future<> {
-            // Validate file size
-            if (size == 0) {
-                return seastar::make_exception_future<>(
-                    std::runtime_error("Tokenizer file is empty: " + path));
-            }
+    // Use DMA for non-blocking disk I/O
+    return seastar::open_file_dma(path, seastar::open_flags::ro).then([this, path](seastar::file f) {
+        return f.size().then([this, f, path](size_t size) mutable {
             if (size > MAX_TOKENIZER_SIZE) {
-                return seastar::make_exception_future<>(std::runtime_error(
-                    "Tokenizer file too large (" + std::to_string(size) +
-                    " bytes, max " + std::to_string(MAX_TOKENIZER_SIZE) + "): " + path));
+                return seastar::make_exception_future<>(std::runtime_error("Tokenizer file too large"));
             }
 
-            // Create input stream and read entire file
-            return seastar::do_with(
-                seastar::make_file_input_stream(f),
-                size,
-                [this, path](seastar::input_stream<char>& stream, uint64_t& file_size) {
-                    return stream.read_exactly(file_size).then(
-                        [this, path, &file_size](seastar::temporary_buffer<char> buf) {
-                            // Convert to string and load tokenizer
-                            std::string json_str(buf.get(), buf.size());
-                            _tokenizer.load_from_json(json_str);
-                            log_main.info("Services initialized (Tokenizer: {}, {} bytes)",
-                                          path, file_size);
-                        }).finally([&stream] {
-                            // Ensure stream is always closed, even on error
-                            return stream.close();
-                        });
-                });
+            // Read the entire file into a Seastar temporary buffer
+            return f.dma_read_bulk<char>(0, size).then([this, path](seastar::temporary_buffer<char> buf) {
+                if (buf.empty()) {
+                    throw std::runtime_error("Read empty tokenizer file");
+                }
+
+                // Since the tokenizer service needs a const std::string&,
+                // we construct it here from the Seastar buffer.
+                // This is the only copy that will happen.
+                std::string content(buf.get(), buf.size());
+
+                _tokenizer.load_from_json(content);
+
+                log_main.info("Tokenizer loaded: {} bytes", buf.size());
+                return seastar::make_ready_future<>();
+            });
+        }).finally([f]() mutable {
+            return f.close();
         });
     }).handle_exception([path](auto ep) {
-        try {
-            std::rethrow_exception(ep);
-        } catch (const std::exception& e) {
-            log_main.error("Failed to load tokenizer from {}: {}", path, e.what());
-        }
+        log_main.error("Failed to load tokenizer from {}: {}", path, ep);
         return seastar::make_exception_future<>(ep);
     });
 }
