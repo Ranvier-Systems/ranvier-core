@@ -125,7 +125,7 @@ seastar::future<> AsyncPersistenceManager::stop() {
     return _flush_gate.close().then([this] {
         auto final_batch = drain_queue();
 
-        if (!final_batch.empty() && _store) {
+        if (!final_batch.empty() && is_open()) {
             log_async_persist.info("Flushing {} pending operations before shutdown",
                                    final_batch.size());
             return seastar::async([this, batch = std::move(final_batch)]() mutable {

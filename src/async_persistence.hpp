@@ -83,44 +83,54 @@ struct AsyncPersistenceConfig {
 
 class AsyncPersistenceManager {
 public:
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    // Production constructor: creates the underlying SQLite store via factory.
     explicit AsyncPersistenceManager(AsyncPersistenceConfig config = {});
 
-    // Constructor for testing: allows injecting a custom PersistenceStore
+    // Test constructor: allows injecting a custom PersistenceStore for mocking.
+    // The injected store must already be open, or open() must be called separately.
     AsyncPersistenceManager(AsyncPersistenceConfig config, std::unique_ptr<PersistenceStore> store);
 
     ~AsyncPersistenceManager() = default;
 
-    // Non-copyable, non-movable
+    // Non-copyable, non-movable (owns unique resources)
     AsyncPersistenceManager(const AsyncPersistenceManager&) = delete;
     AsyncPersistenceManager& operator=(const AsyncPersistenceManager&) = delete;
     AsyncPersistenceManager(AsyncPersistenceManager&&) = delete;
     AsyncPersistenceManager& operator=(AsyncPersistenceManager&&) = delete;
 
-    // --- Lifecycle ---
+    // -------------------------------------------------------------------------
+    // Lifecycle (call in order: open -> start -> [use] -> stop -> close)
+    // -------------------------------------------------------------------------
 
     // Open the persistence store at the given path.
     // Creates the underlying SQLite database if it doesn't exist.
     // Returns true on success, false on failure.
     bool open(const std::string& path);
 
-    // Close the persistence store (flushes WAL and closes database).
-    // Call only after stop() has completed.
-    void close();
-
     // Check if the persistence store is open and ready.
     bool is_open() const;
 
     // Start the async manager (arms flush timer).
-    // Must be called after open().
+    // Must be called after open() succeeds.
     seastar::future<> start();
 
     // Stop the async manager (flushes remaining queue).
-    // Call before close().
+    // Must be called before close(). Safe to call multiple times.
     seastar::future<> stop();
 
-    // --- Fire-and-Forget Queue API (Hot Path) ---
-    // These methods queue operations and return immediately.
-    // Safe to call from any shard.
+    // Close the persistence store (flushes WAL and closes database).
+    // Must be called after stop() completes. Safe to call multiple times.
+    void close();
+
+    // -------------------------------------------------------------------------
+    // Write Operations (Fire-and-Forget Queue API)
+    // -------------------------------------------------------------------------
+    // These methods queue operations and return immediately (non-blocking).
+    // Safe to call from any shard. Operations silently dropped if store not open.
 
     void queue_save_route(std::span<const TokenId> tokens, BackendId backend_id);
     void queue_save_backend(BackendId id, const std::string& ip, uint16_t port,
@@ -129,14 +139,23 @@ public:
     void queue_remove_routes_for_backend(BackendId backend_id);
     void queue_clear_all();
 
-    // --- Read Operations (Synchronous, for Startup/Recovery) ---
-    // These operations read directly from the underlying store.
+    // -------------------------------------------------------------------------
+    // Read Operations (Synchronous, for Startup/Recovery)
+    // -------------------------------------------------------------------------
+    // These operations read directly from the underlying store (blocking).
     // Call during startup before serving requests, or during shutdown.
+    // Returns empty/zero values if store is not open.
 
     std::vector<BackendRecord> load_backends();
     std::vector<RouteRecord> load_routes();
+    size_t backend_count() const;
+    size_t route_count() const;
+    size_t last_load_skipped_count() const;
 
-    // --- Maintenance Operations ---
+    // -------------------------------------------------------------------------
+    // Maintenance Operations (Synchronous)
+    // -------------------------------------------------------------------------
+    // Call during startup or shutdown only - not safe during normal operation.
 
     // Flush WAL to main database file - call after critical writes
     bool checkpoint();
@@ -144,17 +163,13 @@ public:
     // Run integrity check and validate data structures
     bool verify_integrity();
 
-    // Clear all persisted data (synchronous, for recovery)
+    // Clear all persisted data (synchronous).
+    // WARNING: For startup recovery only. Do not call while serving requests.
     bool clear_all();
 
-    // Returns count of records skipped during last load due to corruption
-    size_t last_load_skipped_count() const;
-
-    // Get current counts
-    size_t backend_count() const;
-    size_t route_count() const;
-
-    // --- Monitoring ---
+    // -------------------------------------------------------------------------
+    // Monitoring (Thread-safe, can call anytime)
+    // -------------------------------------------------------------------------
 
     size_t queue_depth() const;
     uint64_t operations_processed() const { return _ops_processed.load(); }
