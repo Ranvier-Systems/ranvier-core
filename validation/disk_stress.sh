@@ -390,7 +390,8 @@ start_ranvier() {
     local ranvier_pid=$!
     register_cleanup "$ranvier_pid"
 
-    if ! wait_for_http "http://127.0.0.1:${RANVIER_API_PORT}/health" 60; then
+    # Wait for API port (Ranvier doesn't have a /health endpoint)
+    if ! wait_for_port "$RANVIER_API_PORT" 60; then
         log_error "Ranvier failed to start"
         return 1
     fi

@@ -143,8 +143,8 @@ start_ranvier_with_stall_detection() {
 
     log_info "Ranvier started with PID: $ranvier_pid"
 
-    # Wait for API to be ready
-    if ! wait_for_http "http://127.0.0.1:${RANVIER_API_PORT}/health" 60; then
+    # Wait for API port to be ready (Ranvier doesn't have a /health endpoint)
+    if ! wait_for_port "$RANVIER_API_PORT" 60; then
         log_error "Ranvier failed to start"
         return 1
     fi
