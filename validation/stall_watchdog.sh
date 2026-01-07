@@ -84,10 +84,6 @@ parse_args() {
                 TASK_QUOTA_MS="$2"
                 shift 2
                 ;;
-            -r|--reports)
-                BLOCKED_REACTOR_REPORTS="$2"
-                shift 2
-                ;;
             --poll-mode)
                 SEASTAR_POLL_MODE="--poll-mode"
                 shift
@@ -282,7 +278,6 @@ generate_report() {
   "stall_count": $stall_count,
   "threshold": $STALL_THRESHOLD,
   "task_quota_ms": $TASK_QUOTA_MS,
-  "blocked_reactor_reports": $BLOCKED_REACTOR_REPORTS,
   "load_duration": "$LOAD_DURATION",
   "log_file": "$STALL_LOG_FILE"
 }
