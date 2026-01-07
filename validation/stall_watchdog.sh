@@ -238,7 +238,7 @@ analyze_stalls() {
 
     # Count stall occurrences
     local stall_count
-    stall_count=$(grep -c "Reactor stall" "$log_file" 2>/dev/null || echo "0")
+    stall_count=$(grep -c "Reactor stall" "$log_file" 2>/dev/null) || stall_count=0
 
     log_info "Found $stall_count reactor stall(s)"
 
@@ -254,7 +254,7 @@ analyze_stalls() {
 
     # Check for other concerning patterns
     local blocked_count
-    blocked_count=$(grep -c "blocked reactor" "$log_file" 2>/dev/null || echo "0")
+    blocked_count=$(grep -c "blocked reactor" "$log_file" 2>/dev/null) || blocked_count=0
 
     if [[ "$blocked_count" -gt 0 ]]; then
         log_warn "Found $blocked_count 'blocked reactor' messages"
@@ -263,7 +263,7 @@ analyze_stalls() {
 
     # Look for sleep/blocking syscall warnings
     local sleep_count
-    sleep_count=$(grep -c -E "(sleep|nanosleep|usleep|blocking)" "$log_file" 2>/dev/null || echo "0")
+    sleep_count=$(grep -c -E "(sleep|nanosleep|usleep|blocking)" "$log_file" 2>/dev/null) || sleep_count=0
 
     if [[ "$sleep_count" -gt 0 ]]; then
         log_warn "Found $sleep_count potential blocking calls"
@@ -328,7 +328,7 @@ main() {
 
     # Analyze results
     local stall_count
-    stall_count=$(grep -c "Reactor stall" "$STALL_LOG_FILE" 2>/dev/null || echo "0")
+    stall_count=$(grep -c "Reactor stall" "$STALL_LOG_FILE" 2>/dev/null) || stall_count=0
 
     if analyze_stalls "$STALL_LOG_FILE"; then
         log_success "STALL WATCHDOG TEST: PASSED"

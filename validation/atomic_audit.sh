@@ -419,7 +419,7 @@ analyze_with_perf_annotate() {
 
     # Check annotations for atomic instructions
     local atomic_in_radix
-    atomic_in_radix=$(grep -c -E "\s(lock|xadd|cmpxchg)\s" "$annotate_file" 2>/dev/null || echo "0")
+    atomic_in_radix=$(grep -c -E "\s(lock|xadd|cmpxchg)\s" "$annotate_file" 2>/dev/null) || atomic_in_radix=0
 
     log_info "Atomic instructions in RadixTree annotations: $atomic_in_radix"
 
