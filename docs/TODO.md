@@ -330,6 +330,12 @@ Tooling, testing, and documentation improvements for contributors and operators.
 
 ### 5.1 CI/CD Pipeline
 
+- [x] **Add Production Readiness Validation Suite** ✓
+  _Justification:_ No automated verification that architectural refactors maintain Seastar shared-nothing guarantees. Manual testing cannot catch reactor stalls, SMP overflow, or atomic instruction regressions.
+  _Approach:_ Created comprehensive validation suite with four tests: (1) Reactor Stall Detection using `--task-quota-ms 0.1` to catch micro-stalls, (2) Disk I/O Decoupling test that validates async persistence under stress-ng load, (3) SMP Gossip Storm that floods UDP port with 5000+ PPS to test cross-core messaging, (4) Atomic-Free Execution audit that scans binary for lock/xadd/cmpxchg in RadixTree symbols.
+  _Location:_ `validation/validate_v1.sh`, `validation/stall_watchdog.sh`, `validation/disk_stress.sh`, `validation/gossip_storm.py`, `validation/atomic_audit.sh`
+  _Complexity:_ Medium
+
 - [ ] **Add automated benchmark regression testing**
   _Justification:_ Performance regressions detected manually. Add CI job that fails if P99 latency increases >10%.
   _Approach:_ Run Locust benchmark in CI, compare against baseline.

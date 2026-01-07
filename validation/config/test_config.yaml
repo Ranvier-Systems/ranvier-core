@@ -1,0 +1,118 @@
+# =============================================================================
+# Ranvier Core - Validation Suite Test Configuration
+# =============================================================================
+# This configuration is optimized for the validation test suite.
+# It configures Ranvier for testing without requiring real backends.
+# =============================================================================
+
+# Server configuration
+server:
+  bind_address: "0.0.0.0"
+  api_port: 8080
+  metrics_port: 9180
+
+# Database configuration
+# Uses a test-specific database file
+database:
+  path: "./validation/reports/ranvier_test.db"
+  journal_mode: "WAL"
+  synchronous: "NORMAL"
+
+# Health check configuration
+health:
+  check_interval: 5s
+  check_timeout: 3s
+  failure_threshold: 3
+  recovery_threshold: 2
+
+# Connection pool configuration
+pool:
+  max_connections_per_host: 10
+  idle_timeout: 60s
+  max_total_connections: 100
+  tcp_nodelay: true
+
+# Routing configuration
+# Using RADIX mode to exercise the RadixTree hot path
+routing:
+  min_token_length: 4
+  block_alignment: 16
+  max_routes: 100000
+  ttl_seconds: 3600
+  backend_drain_timeout: 60s
+  routing_mode: RADIX
+  prefix_token_length: 128
+  accept_client_tokens: false
+  max_token_id: 100000
+
+# Timeout configuration
+timeouts:
+  connect_timeout: 5s
+  request_timeout: 300s
+
+# Assets configuration
+assets:
+  tokenizer_path: "./assets/gpt2.json"
+
+# TLS configuration (disabled for testing)
+tls:
+  enabled: false
+
+# Authentication (disabled for testing)
+auth:
+  admin_api_key: ""
+  api_keys: []
+
+# Rate limiting (disabled for testing)
+rate_limit:
+  enabled: false
+
+# Retry configuration
+retry:
+  max_retries: 3
+  initial_backoff: 100ms
+  max_backoff: 5000ms
+  backoff_multiplier: 2.0
+
+# Circuit breaker configuration
+circuit_breaker:
+  enabled: true
+  failure_threshold: 5
+  success_threshold: 2
+  recovery_timeout: 30s
+  fallback_enabled: true
+
+# Shutdown configuration
+shutdown:
+  drain_timeout: 30s
+
+# Cluster configuration
+# Enabled with localhost as peer for gossip testing
+cluster:
+  enabled: true
+  gossip_port: 9190
+  peers: []
+  gossip_interval: 1000ms
+  gossip_heartbeat_interval: 5s
+  gossip_peer_timeout: 15s
+  discovery_dns_name: ""
+  discovery_type: STATIC
+  discovery_refresh_interval: 30s
+  gossip_reliable_delivery: true
+  gossip_ack_timeout: 100ms
+  gossip_max_retries: 3
+  gossip_dedup_window: 1000
+  tls:
+    enabled: false
+  quorum_enabled: false
+  quorum_threshold: 0.5
+  reject_routes_on_quorum_loss: false
+  quorum_warning_threshold: 1
+
+# Kubernetes discovery (disabled for testing)
+k8s_discovery:
+  enabled: false
+
+# Telemetry (disabled for testing)
+telemetry:
+  enabled: false

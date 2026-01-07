@@ -11,12 +11,16 @@ ARG BASE_IMAGE=ranvier-dev/ranvier-base:latest
 FROM ${BASE_IMAGE}
 
 # Install only dev-specific tools not in the base image
+# Note: wrk (HTTP benchmarking) is optional - validation suite uses curl fallback
 RUN dnf install -y \
         gdb \
         strace \
         valgrind \
         zip \
         unzip \
+        nmap-ncat \
+        stress-ng \
+        perf \
     && pip3 install --no-cache-dir docker requests \
     && dnf clean all \
     && rm -rf /var/cache/dnf
