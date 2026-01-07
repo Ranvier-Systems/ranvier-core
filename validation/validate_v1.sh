@@ -312,7 +312,20 @@ run_test_wrapper() {
         log_error "$display_name: FAILED (${duration}s)"
     fi
 
-    TEST_DETAILS[$test_name]="$output"
+    # Extract only the JSON portion of output (the block between { and })
+    # This avoids storing thousands of log lines in TEST_DETAILS
+    local json_output
+    # Use awk to extract the last JSON block (from { to })
+    json_output=$(echo "$output" | awk '/^\{/{p=1; buf=""} p{buf=buf $0 ORS} /^\}/{if(p) result=buf; p=0} END{printf "%s", result}') || json_output=""
+
+    if [[ -n "$json_output" && "$json_output" == "{"* ]]; then
+        # Compact the JSON to a single line for safe storage
+        TEST_DETAILS[$test_name]=$(echo "$json_output" | tr -d '\n' | sed 's/  */ /g')
+    else
+        # Fallback: store truncated output (last 10 lines) if no JSON found
+        TEST_DETAILS[$test_name]=$(echo "$output" | tail -10 | tr -d '\n' | head -c 1000)
+    fi
+
     return $exit_code
 }
 
