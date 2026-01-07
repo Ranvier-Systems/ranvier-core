@@ -134,6 +134,17 @@ struct SlabPoolConfig {
     }
 };
 
+// Compile-time verification that all slot sizes are cache-line aligned
+// This ensures optimal memory access patterns for the slab allocator
+static_assert(SlabPoolConfig::NODE4_SLOT_SIZE % SLAB_ALIGNMENT == 0,
+              "NODE4_SLOT_SIZE must be cache-line aligned");
+static_assert(SlabPoolConfig::NODE16_SLOT_SIZE % SLAB_ALIGNMENT == 0,
+              "NODE16_SLOT_SIZE must be cache-line aligned");
+static_assert(SlabPoolConfig::NODE48_SLOT_SIZE % SLAB_ALIGNMENT == 0,
+              "NODE48_SLOT_SIZE must be cache-line aligned");
+static_assert(SlabPoolConfig::NODE256_SLOT_SIZE % SLAB_ALIGNMENT == 0,
+              "NODE256_SLOT_SIZE must be cache-line aligned");
+
 // =============================================================================
 // NodeSlab Class
 // =============================================================================
@@ -197,7 +208,10 @@ private:
     // -------------------------------------------------------------------------
 
     struct Pool {
-        std::vector<void*> free_list;   // Stack of free slots (LIFO for cache locality)
+        // Intrusive free list: each free slot stores a pointer to the next free slot.
+        // This eliminates heap operations during alloc/dealloc (true O(1)).
+        void* free_head = nullptr;       // Head of intrusive free list
+        size_t free_count = 0;           // Number of slots in free list
         std::vector<void*> chunks;       // Owned chunk pointers (for cleanup)
         size_t slot_size;                // Size of each slot in this pool
         size_t slots_per_chunk;          // Number of slots per 2MB chunk
@@ -205,10 +219,7 @@ private:
         size_t peak_count = 0;           // Peak allocated nodes
 
         Pool(size_t slot_sz, size_t slots)
-            : slot_size(slot_sz), slots_per_chunk(slots) {
-            // Pre-reserve free list for one chunk
-            free_list.reserve(slots);
-        }
+            : slot_size(slot_sz), slots_per_chunk(slots) {}
     };
 
     Pool pools_[NUM_POOLS];

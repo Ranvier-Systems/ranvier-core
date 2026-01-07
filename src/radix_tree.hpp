@@ -127,7 +127,19 @@ class RadixTree {
 public:
     explicit RadixTree(uint32_t block_alignment = 16)
         : block_alignment_(block_alignment)
-        , root_(get_node_slab()->make_node<Node4>()) {}
+        , root_(make_initial_root()) {}
+
+private:
+    // Helper to create root node with proper null-check
+    static NodePtr make_initial_root() {
+        NodeSlab* s = get_node_slab();
+        if (!s) [[unlikely]] {
+            throw std::runtime_error("NodeSlab not initialized before RadixTree construction");
+        }
+        return s->make_node<Node4>();
+    }
+
+public:
 
     // -------------------------------------------------------------------------
     // Public API

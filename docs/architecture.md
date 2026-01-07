@@ -121,6 +121,7 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 ### Domain Layer
 - **RouterService**: Core routing logic with cross-shard broadcasting. Uses `absl::flat_hash_map` for backend lookups, providing SIMD-accelerated operations and improved cache locality over `std::unordered_map`.
 - **RadixTree**: Adaptive Radix Tree (ART) for O(k) prefix lookups with node sizes 4→16→48→256 for memory efficiency.
+- **NodeSlab**: Shard-local slab allocator for RadixTree nodes. Pre-allocates 2MB chunks with four size-classed pools (one per node type) providing O(1) allocation via intrusive free list. Eliminates malloc overhead on hot paths and improves cache locality for ART traversal.
 - **Circuit Breaker**: Quarantines unhealthy backends based on health check failures.
 
 ### Infrastructure Layer

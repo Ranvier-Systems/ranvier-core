@@ -79,9 +79,10 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/radix_tree.hpp`
   _Complexity:_ Medium
 
-- [ ] **Implement node pooling for Radix Tree allocations**
+- [x] **Implement node pooling for Radix Tree allocations** ✓
   _Justification:_ Frequent `std::unique_ptr<Node>` allocations fragment the heap. A slab allocator per shard reduces allocation overhead and improves cache locality.
-  _Location:_ `src/radix_tree.hpp`
+  _Approach:_ Implemented `NodeSlab` class with per-shard 2MB pre-allocated chunks. Four size-classed pools (one per node type: Node4, Node16, Node48, Node256) with intrusive free list for O(1) allocation/deallocation. Custom deleter (`SlabNodeDeleter`) returns memory to pool instead of calling `delete`. Thread-local storage (`thread_local NodeSlab*`) ensures no cross-shard synchronization. `ShardLocalTreeState` wrapper guarantees correct destruction order (tree before slab).
+  _Location:_ `src/node_slab.hpp`, `src/node_slab.cpp`, `src/router_service.cpp`
   _Complexity:_ High
 
 - [ ] **Add memory usage metrics per Radix Tree**

@@ -8,12 +8,13 @@ This document describes the Adaptive Radix Tree implementation used by Ranvier C
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Adaptive Node Design](#adaptive-node-design)
-3. [Path Compression & Lazy Expansion](#path-compression--lazy-expansion)
-4. [SIMD Key Search (Roadmap)](#simd-key-search-roadmap)
-5. [Concurrency Model](#concurrency-model)
-6. [Persistence Interface](#persistence-interface)
-7. [Performance Characteristics](#performance-characteristics)
+2. [Slab Allocator](#slab-allocator-o1-node-allocation)
+3. [Adaptive Node Design](#adaptive-node-design)
+4. [Path Compression & Lazy Expansion](#path-compression--lazy-expansion)
+5. [SIMD Key Search (Roadmap)](#simd-key-search-roadmap)
+6. [Concurrency Model](#concurrency-model)
+7. [Persistence Interface](#persistence-interface)
+8. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -88,6 +89,56 @@ add_child(new_parent, key, std::move(extracted));
 ```
 
 **Raw pointers for traversal**: `find_child()` returns raw `Node*` for read-only traversal. The parent's `unique_ptr` maintains ownership throughout.
+
+### Slab Allocator: O(1) Node Allocation
+
+The `NodeSlab` class provides a custom slab allocator for RadixTree nodes, eliminating malloc/free overhead on hot paths:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              2MB Chunk (Node4 Pool)                        │
+├────────┬────────┬────────┬────────┬────────┬────────┬────────┬─────────────┤
+│ Header │ Node4  │ Header │ Node4  │ Header │ Node4  │  ...   │   (free)    │
+│ 8 bytes│128 bytes│8 bytes│128 bytes│8 bytes│128 bytes│        │             │
+└────────┴────────┴────────┴────────┴────────┴────────┴────────┴─────────────┘
+```
+
+**Key Features:**
+
+| Feature | Implementation |
+|---------|----------------|
+| **O(1) Allocation** | Intrusive free list (no heap operations) |
+| **O(1) Deallocation** | Push to intrusive list head |
+| **Cache Locality** | Nodes of same type are physically adjacent |
+| **Per-Shard Isolation** | `thread_local` storage, no synchronization |
+| **Four Size Classes** | One pool per node type (Node4→Node256) |
+
+**Memory Layout:**
+
+Each allocation slot contains:
+1. **SlabHeader (8 bytes)**: Pool index for deallocation routing
+2. **Node storage**: Sized per node type (192B→2240B)
+
+**Custom Deleter:**
+
+The `NodePtr` type alias uses a custom deleter (`SlabNodeDeleter`) that returns memory to the slab instead of calling `delete`:
+
+```cpp
+using NodePtr = std::unique_ptr<Node, SlabNodeDeleter>;
+
+// Deallocation is O(1) - just push to intrusive list
+void SlabNodeDeleter::operator()(Node* ptr) const noexcept {
+    ptr->~Node();  // Virtual destructor call
+    slab->deallocate(ptr);  // Returns to pool's free list
+}
+```
+
+**Source Location:**
+
+```
+src/node_slab.hpp  # Class definition and pool configuration
+src/node_slab.cpp  # Implementation with intrusive free list
+```
 
 ---
 

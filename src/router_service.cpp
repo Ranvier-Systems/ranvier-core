@@ -28,13 +28,26 @@ struct BackendInfo {
     std::chrono::steady_clock::time_point drain_start_time;
 };
 
-// Thread-local NodeSlab for O(1) node allocation (initialized per-shard)
-// The slab pre-allocates 2MB chunks for each node type, providing cache-locality
-// and eliminating malloc overhead on the hot path.
-thread_local std::unique_ptr<NodeSlab> local_node_slab;
+// Thread-local NodeSlab and RadixTree bundled together to guarantee destruction order.
+// The tree MUST be destroyed before the slab, since tree nodes are allocated from the slab.
+// C++ destroys struct members in reverse declaration order, so tree goes before slab.
+struct ShardLocalTreeState {
+    std::unique_ptr<NodeSlab> node_slab;  // Destroyed last
+    std::unique_ptr<RadixTree> tree;       // Destroyed first
 
-// Thread-local RadixTree pointer (initialized per-shard with config)
-thread_local std::unique_ptr<RadixTree> local_tree;
+    ~ShardLocalTreeState() {
+        // Explicit destruction order for clarity and safety
+        tree.reset();
+        set_node_slab(nullptr);  // Clear thread-local pointer before destroying slab
+        node_slab.reset();
+    }
+};
+thread_local std::unique_ptr<ShardLocalTreeState> local_state;
+
+// Convenience accessors (maintain compatibility with existing code)
+static RadixTree* local_tree() {
+    return local_state ? local_state->tree.get() : nullptr;
+}
 // Using absl::flat_hash_map for SIMD-accelerated lookups and better cache locality
 // These remain shard-local to maintain Ranvier's lock-free architecture
 thread_local absl::flat_hash_map<BackendId, BackendInfo> local_backends;
@@ -70,13 +83,14 @@ thread_local uint64_t stats_prefix_affinity_routes = 0;
 // This function runs on each shard and processes all routes in the batch.
 // Called via smp::submit_to from flush_route_batch().
 static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute>& batch) {
-    if (!local_tree) return;
+    RadixTree* tree = local_tree();
+    if (!tree) return;
 
     for (const auto& route : batch) {
         // LRU eviction: prefer evicting REMOTE routes first when at capacity
         if (local_max_routes > 0) {
-            while (local_tree->route_count() >= local_max_routes) {
-                if (local_tree->evict_oldest_remote()) {
+            while (tree->route_count() >= local_max_routes) {
+                if (tree->evict_oldest_remote()) {
                     stats_routes_evicted++;
                 } else {
                     break;  // No more routes to evict
@@ -85,7 +99,7 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
         }
 
         // Insert with REMOTE origin (learned from cluster gossip)
-        local_tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
+        tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
     }
 }
 
@@ -125,12 +139,11 @@ RouterService::RouterService(const RoutingConfig& config)
 
 RouterService::RouterService(const RoutingConfig& routing_config, const ClusterConfig& cluster_config)
     : _config(routing_config), _cluster_config(cluster_config) {
-    // Initialize shard 0's slab allocator first (required by RadixTree)
-    local_node_slab = std::make_unique<NodeSlab>();
-    set_node_slab(local_node_slab.get());
-
-    // Initialize shard 0's local_tree (uses the slab allocator)
-    local_tree = std::make_unique<RadixTree>(routing_config.block_alignment);
+    // Initialize shard 0's ShardLocalTreeState (slab + tree)
+    local_state = std::make_unique<ShardLocalTreeState>();
+    local_state->node_slab = std::make_unique<NodeSlab>();
+    set_node_slab(local_state->node_slab.get());
+    local_state->tree = std::make_unique<RadixTree>(routing_config.block_alignment);
     local_max_routes = routing_config.max_routes;
     local_ttl_seconds = routing_config.ttl_seconds;
     local_backend_drain_timeout = routing_config.backend_drain_timeout;
@@ -186,12 +199,11 @@ seastar::future<> RouterService::initialize_shards() {
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
         [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length] {
-                // Initialize slab allocator first (required by RadixTree)
-                local_node_slab = std::make_unique<NodeSlab>();
-                set_node_slab(local_node_slab.get());
-
-                // Initialize RadixTree (uses the slab allocator)
-                local_tree = std::make_unique<RadixTree>(block_alignment);
+                // Initialize ShardLocalTreeState (slab + tree with guaranteed destruction order)
+                local_state = std::make_unique<ShardLocalTreeState>();
+                local_state->node_slab = std::make_unique<NodeSlab>();
+                set_node_slab(local_state->node_slab.get());
+                local_state->tree = std::make_unique<RadixTree>(block_alignment);
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;
                 local_backend_drain_timeout = drain_timeout;
@@ -221,8 +233,9 @@ void RouterService::run_ttl_cleanup() {
     // Run cleanup on all shards
     (void)seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [cutoff] {
-            if (local_tree) {
-                size_t removed = local_tree->remove_expired(cutoff);
+            RadixTree* tree = local_tree();
+            if (tree) {
+                size_t removed = tree->remove_expired(cutoff);
                 if (removed > 0) {
                     stats_routes_expired += removed;
                     log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
@@ -235,8 +248,9 @@ void RouterService::run_ttl_cleanup() {
 
 std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens,
                                                  const std::string& request_id) {
-    if (!local_tree) return std::nullopt;
-    auto result = local_tree->lookup(tokens);
+    RadixTree* tree = local_tree();
+    if (!tree) return std::nullopt;
+    auto result = tree->lookup(tokens);
 
     // Circuit breaker: if cache hit points to dead backend, treat as miss
     if (result.has_value()) {
@@ -390,9 +404,10 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     //    deterministic routing. The route will be learned after success.
 
     // Step 1: Try ART lookup for longest prefix match
-    if (local_tree) {
+    RadixTree* tree = local_tree();
+    if (tree) {
         std::span<const TokenId> token_span(tokens.data(), tokens.size());
-        auto art_result = local_tree->lookup(token_span);
+        auto art_result = tree->lookup(token_span);
 
         if (art_result.has_value()) {
             BackendId art_backend = art_result.value();
@@ -465,12 +480,13 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
-                if (!local_tree) return seastar::make_ready_future<>();
+                RadixTree* tree = local_tree();
+                if (!tree) return seastar::make_ready_future<>();
 
                 // LRU eviction: if at capacity, evict oldest routes first
                 if (local_max_routes > 0) {
-                    while (local_tree->route_count() >= local_max_routes) {
-                        if (local_tree->evict_oldest()) {
+                    while (tree->route_count() >= local_max_routes) {
+                        if (tree->evict_oldest()) {
                             stats_routes_evicted++;
                         } else {
                             break;  // No more routes to evict
@@ -479,7 +495,7 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
                 }
 
                 // Insert with LOCAL origin (direct request on this node)
-                local_tree->insert(tokens, backend, RouteOrigin::LOCAL);
+                tree->insert(tokens, backend, RouteOrigin::LOCAL);
                 return seastar::make_ready_future<>();
             });
         });
@@ -773,11 +789,12 @@ void RouterService::run_draining_reaper() {
 seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
     // Remove all REMOTE routes pointing to this backend
     // This is called when a cluster peer fails and we need to prune orphaned routes
-    if (!local_tree) {
+    RadixTree* tree = local_tree();
+    if (!tree) {
         return seastar::make_ready_future<>();
     }
 
-    size_t removed = local_tree->remove_routes_by_backend(b_id, RouteOrigin::REMOTE);
+    size_t removed = tree->remove_routes_by_backend(b_id, RouteOrigin::REMOTE);
     if (removed > 0) {
         stats_cluster_routes_pruned += removed;
         log_router.info("Shard {}: Pruned {} orphaned routes for failed peer backend {}",

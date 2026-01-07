@@ -1756,3 +1756,104 @@ TEST_F(NodeSlabTest, RadixTreeUsesSlabForAllNodeTypes) {
         EXPECT_EQ(result.value(), static_cast<BackendId>(i));
     }
 }
+
+TEST_F(NodeSlabTest, IntrusiveFreeListLIFO) {
+    // Verify that the intrusive free list follows LIFO order
+    // (last freed slot is first to be reallocated)
+    NodeSlab* slab = get_node_slab();
+
+    // Allocate three nodes
+    auto node1 = slab->make_node<Node4>();
+    auto node2 = slab->make_node<Node4>();
+    auto node3 = slab->make_node<Node4>();
+
+    void* ptr1 = node1.get();
+    void* ptr2 = node2.get();
+    void* ptr3 = node3.get();
+
+    // Free in order: node3, node2, node1
+    node3.reset();
+    node2.reset();
+    node1.reset();
+
+    // Reallocate - should get them back in reverse order (LIFO)
+    auto new_node1 = slab->make_node<Node4>();
+    auto new_node2 = slab->make_node<Node4>();
+    auto new_node3 = slab->make_node<Node4>();
+
+    EXPECT_EQ(new_node1.get(), ptr1);  // Last freed, first allocated
+    EXPECT_EQ(new_node2.get(), ptr2);
+    EXPECT_EQ(new_node3.get(), ptr3);
+}
+
+TEST_F(NodeSlabTest, FreeCountTracksCorrectly) {
+    // Verify that free_count is maintained correctly through alloc/dealloc
+    NodeSlab* slab = get_node_slab();
+
+    auto stats_before = slab->get_stats();
+    size_t initial_free = stats_before.free_list_size[0];
+    size_t initial_allocated = stats_before.allocated_nodes[0];
+
+    // Allocate 5 nodes
+    std::vector<NodePtr> nodes;
+    for (int i = 0; i < 5; i++) {
+        nodes.push_back(slab->make_node<Node4>());
+    }
+
+    auto stats_during = slab->get_stats();
+    EXPECT_EQ(stats_during.free_list_size[0], initial_free - 5);
+    EXPECT_EQ(stats_during.allocated_nodes[0], initial_allocated + 5);
+
+    // Free all nodes
+    nodes.clear();
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.free_list_size[0], initial_free);
+    EXPECT_EQ(stats_after.allocated_nodes[0], initial_allocated);
+}
+
+TEST_F(NodeSlabTest, MultiplePoolsIndependent) {
+    // Verify that different pools operate independently
+    NodeSlab* slab = get_node_slab();
+
+    auto stats_before = slab->get_stats();
+
+    // Allocate from different pools
+    auto node4 = slab->make_node<Node4>();
+    auto node16 = slab->make_node<Node16>();
+    auto node48 = slab->make_node<Node48>();
+    auto node256 = slab->make_node<Node256>();
+
+    auto stats_after = slab->get_stats();
+
+    // Each pool should have exactly one more allocation
+    EXPECT_EQ(stats_after.allocated_nodes[0], stats_before.allocated_nodes[0] + 1);
+    EXPECT_EQ(stats_after.allocated_nodes[1], stats_before.allocated_nodes[1] + 1);
+    EXPECT_EQ(stats_after.allocated_nodes[2], stats_before.allocated_nodes[2] + 1);
+    EXPECT_EQ(stats_after.allocated_nodes[3], stats_before.allocated_nodes[3] + 1);
+
+    // Free nodes in different order than allocation
+    node48.reset();
+    node4.reset();
+    node256.reset();
+    node16.reset();
+
+    auto stats_final = slab->get_stats();
+    EXPECT_EQ(stats_final.allocated_nodes[0], stats_before.allocated_nodes[0]);
+    EXPECT_EQ(stats_final.allocated_nodes[1], stats_before.allocated_nodes[1]);
+    EXPECT_EQ(stats_final.allocated_nodes[2], stats_before.allocated_nodes[2]);
+    EXPECT_EQ(stats_final.allocated_nodes[3], stats_before.allocated_nodes[3]);
+}
+
+TEST_F(NodeSlabTest, RadixTreeThrowsWithoutSlab) {
+    // Verify that RadixTree throws if slab is not initialized
+    NodeSlab* current_slab = get_node_slab();
+    set_node_slab(nullptr);  // Temporarily unset slab
+
+    EXPECT_THROW({
+        RadixTree tree{1};
+    }, std::runtime_error);
+
+    // Restore slab
+    set_node_slab(current_slab);
+}

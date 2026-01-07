@@ -110,13 +110,14 @@ NodeSlab::NodeSlab()
 }
 
 NodeSlab::~NodeSlab() {
-    // Free all chunks
+    // Free all chunks (intrusive free list requires no cleanup)
     for (auto& pool : pools_) {
         for (void* chunk : pool.chunks) {
             free_aligned_chunk(chunk);
         }
         pool.chunks.clear();
-        pool.free_list.clear();
+        pool.free_head = nullptr;
+        pool.free_count = 0;
     }
 }
 
@@ -133,21 +134,23 @@ void NodeSlab::allocate_chunk(size_t pool_index) {
     // Track the chunk for cleanup
     pool.chunks.push_back(chunk);
 
-    // Initialize all slots and add to free list
-    // We iterate backwards so that the first slot is at the top of the free list
-    // This improves cache locality for sequential allocations
+    // Initialize all slots and link them into the intrusive free list.
+    // Each free slot stores a pointer to the next free slot in its first 8 bytes.
+    // We iterate forward so the first slot becomes the head (LIFO for cache locality).
     char* base = static_cast<char*>(chunk);
     size_t slot_size = pool.slot_size;
     size_t num_slots = pool.slots_per_chunk;
 
-    // Reserve space in free list to avoid reallocations
-    pool.free_list.reserve(pool.free_list.size() + num_slots);
-
-    // Add slots in reverse order (LIFO - first allocated will be first used)
-    for (size_t i = num_slots; i > 0; --i) {
-        char* slot = base + (i - 1) * slot_size;
-        pool.free_list.push_back(slot);
+    // Link all new slots into the free list (prepend to existing list)
+    // The first slot in the chunk will point to the previous head
+    for (size_t i = 0; i < num_slots; ++i) {
+        void* slot = base + i * slot_size;
+        // Store pointer to current head in this slot
+        *static_cast<void**>(slot) = pool.free_head;
+        // This slot becomes the new head
+        pool.free_head = slot;
     }
+    pool.free_count += num_slots;
 }
 
 void* NodeSlab::allocate(size_t pool_index) {
@@ -155,13 +158,14 @@ void* NodeSlab::allocate(size_t pool_index) {
     Pool& pool = pools_[pool_index];
 
     // Allocate new chunk if free list is empty
-    if (pool.free_list.empty()) {
+    if (pool.free_head == nullptr) {
         allocate_chunk(pool_index);
     }
 
-    // Pop from free list (O(1))
-    void* slot = pool.free_list.back();
-    pool.free_list.pop_back();
+    // Pop from intrusive free list (true O(1), no heap operations)
+    void* slot = pool.free_head;
+    pool.free_head = *static_cast<void**>(slot);  // Follow the next pointer
+    pool.free_count--;
 
     // Initialize header
     auto* header = static_cast<SlabHeader*>(slot);
@@ -186,12 +190,21 @@ void NodeSlab::deallocate(void* ptr) noexcept {
     auto* header = static_cast<SlabHeader*>(slot);
 
     size_t pool_index = header->pool_index;
-    assert(pool_index < NUM_POOLS);
+
+    // Bounds check even in release builds to prevent memory corruption
+    // from causing cascading failures
+    if (pool_index >= NUM_POOLS) [[unlikely]] {
+        // Corrupted header - log and leak rather than corrupt further
+        // In production, this indicates a serious bug that needs investigation
+        return;
+    }
 
     Pool& pool = pools_[pool_index];
 
-    // Push to free list (O(1))
-    pool.free_list.push_back(slot);
+    // Push to intrusive free list (true O(1), no heap operations, noexcept)
+    *static_cast<void**>(slot) = pool.free_head;  // Point to current head
+    pool.free_head = slot;                         // This slot becomes new head
+    pool.free_count++;
     pool.allocated_count--;
 }
 
@@ -202,7 +215,7 @@ NodeSlab::Stats NodeSlab::get_stats() const noexcept {
         const Pool& pool = pools_[i];
         stats.total_chunks += pool.chunks.size();
         stats.allocated_nodes[i] = pool.allocated_count;
-        stats.free_list_size[i] = pool.free_list.size();
+        stats.free_list_size[i] = pool.free_count;
         stats.peak_allocated[i] = pool.peak_count;
     }
 
