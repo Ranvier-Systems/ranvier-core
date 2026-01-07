@@ -204,7 +204,7 @@ LUAEOF
     else
         log_warn "wrk not found, using curl-based load generation"
 
-        # Simple curl-based load generation
+        # Simple curl-based load generation with timeout
         local duration_seconds
         duration_seconds=$(echo "$duration" | sed 's/[^0-9]//g')
         local end_time=$((SECONDS + duration_seconds))
@@ -212,15 +212,20 @@ LUAEOF
         local count=0
         while [[ $SECONDS -lt $end_time ]]; do
             for _ in $(seq 1 10); do
-                curl -sf -X POST \
+                # Use short timeout since we're just generating load, not waiting for responses
+                curl -sf --max-time 2 -X POST \
                     -H "Content-Type: application/json" \
                     -d '{"model": "test", "messages": [{"role": "user", "content": "test"}]}' \
                     "http://127.0.0.1:${RANVIER_API_PORT}/v1/chat/completions" \
                     >/dev/null 2>&1 &
             done
-            wait
+            # Don't wait for all - just throttle slightly to avoid fork bomb
+            sleep 0.1
             count=$((count + 10))
         done
+
+        # Wait for remaining curl processes
+        wait 2>/dev/null || true
 
         log_info "Completed $count requests"
     fi
