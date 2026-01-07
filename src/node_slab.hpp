@@ -93,7 +93,7 @@ using NodePtr = std::unique_ptr<Node, SlabNodeDeleter>;
 
 // Slot sizes for each node type (including SlabHeader)
 // These are computed at compile time and rounded up for cache alignment
-struct PoolConfig {
+struct SlabPoolConfig {
     // Slot sizes must accommodate SlabHeader + sizeof(NodeType) + alignment padding
     // Values are determined empirically from sizeof() and aligned to cache lines
 

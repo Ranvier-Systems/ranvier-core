@@ -98,10 +98,10 @@ void free_aligned_chunk(void* ptr) {
 
 NodeSlab::NodeSlab()
     : pools_{
-        Pool{PoolConfig::NODE4_SLOT_SIZE, PoolConfig::NODE4_SLOTS_PER_CHUNK},
-        Pool{PoolConfig::NODE16_SLOT_SIZE, PoolConfig::NODE16_SLOTS_PER_CHUNK},
-        Pool{PoolConfig::NODE48_SLOT_SIZE, PoolConfig::NODE48_SLOTS_PER_CHUNK},
-        Pool{PoolConfig::NODE256_SLOT_SIZE, PoolConfig::NODE256_SLOTS_PER_CHUNK}
+        Pool{SlabPoolConfig::NODE4_SLOT_SIZE, SlabPoolConfig::NODE4_SLOTS_PER_CHUNK},
+        Pool{SlabPoolConfig::NODE16_SLOT_SIZE, SlabPoolConfig::NODE16_SLOTS_PER_CHUNK},
+        Pool{SlabPoolConfig::NODE48_SLOT_SIZE, SlabPoolConfig::NODE48_SLOTS_PER_CHUNK},
+        Pool{SlabPoolConfig::NODE256_SLOT_SIZE, SlabPoolConfig::NODE256_SLOTS_PER_CHUNK}
     }
 {
     // Pre-allocate one chunk for the most common node type (Node4)
@@ -282,22 +282,22 @@ NodePtr NodeSlab::make_node<Node256>() {
 // Verify that our slot sizes are sufficient for each node type
 // These will cause compile errors if the sizes are wrong
 static_assert(
-    PoolConfig::NODE4_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node4),
+    SlabPoolConfig::NODE4_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node4),
     "NODE4_SLOT_SIZE too small"
 );
 
 static_assert(
-    PoolConfig::NODE16_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node16),
+    SlabPoolConfig::NODE16_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node16),
     "NODE16_SLOT_SIZE too small"
 );
 
 static_assert(
-    PoolConfig::NODE48_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node48),
+    SlabPoolConfig::NODE48_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node48),
     "NODE48_SLOT_SIZE too small"
 );
 
 static_assert(
-    PoolConfig::NODE256_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node256),
+    SlabPoolConfig::NODE256_SLOT_SIZE >= sizeof(SlabHeader) + sizeof(Node256),
     "NODE256_SLOT_SIZE too small"
 );
 
