@@ -120,15 +120,16 @@ build_seastar_args() {
 }
 
 start_ranvier_with_stall_detection() {
-    log_info "Starting Ranvier with stall detection enabled..."
+    # All log output to stderr since this function's stdout is captured for PID
+    log_info "Starting Ranvier with stall detection enabled..." >&2
 
     local seastar_args
     seastar_args=$(build_seastar_args)
 
     mkdir -p "$(dirname "$STALL_LOG_FILE")"
 
-    log_info "Seastar arguments: $seastar_args"
-    log_info "Log file: $STALL_LOG_FILE"
+    log_info "Seastar arguments: $seastar_args" >&2
+    log_info "Log file: $STALL_LOG_FILE" >&2
 
     # Start Ranvier in background with stall detection
     # Use process substitution to correctly capture Ranvier's PID (not tee's)
@@ -141,14 +142,16 @@ start_ranvier_with_stall_detection() {
     local ranvier_pid=$!
     register_cleanup "$ranvier_pid"
 
-    log_info "Ranvier started with PID: $ranvier_pid"
+    log_info "Ranvier started with PID: $ranvier_pid" >&2
 
     # Wait for API port to be ready (Ranvier doesn't have a /health endpoint)
-    if ! wait_for_port "$RANVIER_API_PORT" 60; then
-        log_error "Ranvier failed to start"
+    # Redirect wait_for_port output to stderr as well
+    if ! wait_for_port "$RANVIER_API_PORT" 60 >&2; then
+        log_error "Ranvier failed to start" >&2
         return 1
     fi
 
+    # Only the PID goes to stdout
     echo "$ranvier_pid"
 }
 
