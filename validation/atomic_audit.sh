@@ -237,17 +237,18 @@ END {
 '
 
 analyze_static() {
-    log_info "Performing static analysis of binary: $BINARY"
+    # All log output goes to stderr so only the count is returned via stdout
+    log_info "Performing static analysis of binary: $BINARY" >&2
 
     mkdir -p "$OUTPUT_DIR"
 
     # Disassemble entire binary (filtered for RadixTree)
-    log_info "Disassembling RadixTree-related symbols..."
+    log_info "Disassembling RadixTree-related symbols..." >&2
 
     > "$DISASM_FILE"
 
     for pattern in "${HOTPATH_SYMBOLS[@]}"; do
-        log_info "  Analyzing symbols matching: $pattern"
+        log_info "  Analyzing symbols matching: $pattern" >&2
         disassemble_symbol_range "$BINARY" "$pattern" >> "$DISASM_FILE"
     done
 
@@ -255,8 +256,8 @@ analyze_static() {
     disasm_count=$(wc -l < "$DISASM_FILE")
 
     if [[ $disasm_count -eq 0 ]]; then
-        log_warn "No matching symbols found. Binary may be stripped."
-        log_info "Falling back to filtered binary analysis..."
+        log_warn "No matching symbols found. Binary may be stripped." >&2
+        log_info "Falling back to filtered binary analysis..." >&2
 
         # Filtered disassembly - only extract relevant sections to avoid processing entire binary
         # Focus on .text section and filter for our patterns during extraction
@@ -273,14 +274,14 @@ analyze_static() {
 
         # If still no atomic instructions found, the test passes trivially
         if [[ $disasm_count -eq 0 ]]; then
-            log_info "No atomic instructions found in binary (filtered analysis)"
+            log_info "No atomic instructions found in binary (filtered analysis)" >&2
         fi
     fi
 
-    log_info "Disassembly complete: $disasm_count lines"
+    log_info "Disassembly complete: $disasm_count lines" >&2
 
     # Analyze for atomic instructions
-    log_info "Analyzing for atomic instructions..."
+    log_info "Analyzing for atomic instructions..." >&2
 
     local analysis
     analysis=$(awk -v verbose="${VERBOSE:-0}" "$ATOMIC_AWK_SCRIPT" "$DISASM_FILE")
@@ -323,7 +324,8 @@ NOTES:
 
 EOF
 
-    cat "$ATOMIC_REPORT"
+    # Print report to stderr for visibility, only return count via stdout
+    cat "$ATOMIC_REPORT" >&2
 
     echo "$total_atomic"
 }
