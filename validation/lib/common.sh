@@ -10,7 +10,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Configuration Defaults
 # -----------------------------------------------------------------------------
-export RANVIER_BINARY="${RANVIER_BINARY:-./build/ranvier}"
+export RANVIER_BINARY="${RANVIER_BINARY:-./build/ranvier_server}"
 export RANVIER_CONFIG="${RANVIER_CONFIG:-./validation/config/test_config.yaml}"
 export RANVIER_API_PORT="${RANVIER_API_PORT:-8080}"
 export RANVIER_METRICS_PORT="${RANVIER_METRICS_PORT:-9180}"

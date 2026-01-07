@@ -140,7 +140,7 @@ ATOMIC_INSTRUCTION_THRESHOLD=0  # Maximum allowed atomic instructions
 **Running standalone:**
 ```bash
 ./validation/atomic_audit.sh \
-    --binary ./build/ranvier \
+    --binary ./build/ranvier_server \
     --threshold 0 \
     --verbose
 ```

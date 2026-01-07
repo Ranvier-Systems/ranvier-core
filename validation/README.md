@@ -133,7 +133,7 @@ Analyzes the compiled binary to verify that atomic reference counting
 
 **Run standalone:**
 ```bash
-./validation/atomic_audit.sh --binary ./build/ranvier --verbose
+./validation/atomic_audit.sh --binary ./build/ranvier_server --verbose
 ```
 
 **Runtime analysis of running process:**
@@ -147,7 +147,7 @@ Analyzes the compiled binary to verify that atomic reference counting
 
 ```bash
 # Binary and config paths
-export RANVIER_BINARY="./build/ranvier"
+export RANVIER_BINARY="./build/ranvier_server"
 export RANVIER_CONFIG="./validation/config/test_config.yaml"
 
 # Ports

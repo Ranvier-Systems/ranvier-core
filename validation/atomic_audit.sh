@@ -29,7 +29,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-BINARY="${RANVIER_BINARY:-./build/ranvier}"
+BINARY="${RANVIER_BINARY:-./build/ranvier_server}"
 OUTPUT_DIR="${VALIDATION_LOG_DIR:-./validation/reports/logs}"
 DISASM_FILE="${OUTPUT_DIR}/radix_tree_disasm.txt"
 ATOMIC_REPORT="${OUTPUT_DIR}/atomic_audit_report.txt"
