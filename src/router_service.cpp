@@ -2,6 +2,7 @@
 #include "gossip_service.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
+#include "node_slab.hpp"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/loop.hh>
@@ -26,6 +27,11 @@ struct BackendInfo {
     bool is_draining = false;
     std::chrono::steady_clock::time_point drain_start_time;
 };
+
+// Thread-local NodeSlab for O(1) node allocation (initialized per-shard)
+// The slab pre-allocates 2MB chunks for each node type, providing cache-locality
+// and eliminating malloc overhead on the hot path.
+thread_local std::unique_ptr<NodeSlab> local_node_slab;
 
 // Thread-local RadixTree pointer (initialized per-shard with config)
 thread_local std::unique_ptr<RadixTree> local_tree;
@@ -119,7 +125,11 @@ RouterService::RouterService(const RoutingConfig& config)
 
 RouterService::RouterService(const RoutingConfig& routing_config, const ClusterConfig& cluster_config)
     : _config(routing_config), _cluster_config(cluster_config) {
-    // Initialize shard 0's local_tree immediately
+    // Initialize shard 0's slab allocator first (required by RadixTree)
+    local_node_slab = std::make_unique<NodeSlab>();
+    set_node_slab(local_node_slab.get());
+
+    // Initialize shard 0's local_tree (uses the slab allocator)
     local_tree = std::make_unique<RadixTree>(routing_config.block_alignment);
     local_max_routes = routing_config.max_routes;
     local_ttl_seconds = routing_config.ttl_seconds;
@@ -165,7 +175,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
 }
 
 seastar::future<> RouterService::initialize_shards() {
-    // Initialize RadixTree on all other shards with the config from shard 0
+    // Initialize NodeSlab and RadixTree on all other shards with the config from shard 0
     uint32_t block_alignment = _config.block_alignment;
     size_t max_routes = _config.max_routes;
     auto ttl_seconds = _config.ttl_seconds;
@@ -176,6 +186,11 @@ seastar::future<> RouterService::initialize_shards() {
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
         [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length] {
+                // Initialize slab allocator first (required by RadixTree)
+                local_node_slab = std::make_unique<NodeSlab>();
+                set_node_slab(local_node_slab.get());
+
+                // Initialize RadixTree (uses the slab allocator)
                 local_tree = std::make_unique<RadixTree>(block_alignment);
                 local_max_routes = max_routes;
                 local_ttl_seconds = ttl_seconds;

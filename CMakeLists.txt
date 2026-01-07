@@ -144,6 +144,7 @@ if(Seastar_FOUND)
       src/health_service.cpp
       src/http_controller.cpp
       src/k8s_discovery_service.cpp
+      src/node_slab.cpp
       src/router_service.cpp
       src/stream_parser.cpp
       src/tokenizer_service.cpp
@@ -199,6 +200,7 @@ include(GoogleTest)
 # RadixTree Unit Tests (Pure C++, no Seastar dependency)
 add_executable(radix_tree_test
   tests/unit/radix_tree_test.cpp
+  src/node_slab.cpp
 )
 target_include_directories(radix_tree_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(radix_tree_test
@@ -357,6 +359,7 @@ if(Seastar_FOUND)
       tests/unit/application_test.cpp
       src/application.cpp
       src/gossip_service.cpp
+      src/node_slab.cpp
       src/router_service.cpp
       src/health_service.cpp
       src/k8s_discovery_service.cpp
