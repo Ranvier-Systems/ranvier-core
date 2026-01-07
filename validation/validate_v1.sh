@@ -379,6 +379,28 @@ run_gossip_test() {
         return 0
     fi
 
+    # Check if cluster peers are configured
+    # Ranvier only binds gossip port when peers are configured
+    local has_peers="false"
+    if [[ -f "$RANVIER_CONFIG" ]]; then
+        # Check for non-empty peers list in YAML config
+        if grep -E '^\s+peers:\s*$' "$RANVIER_CONFIG" &>/dev/null; then
+            # Found peers: key, check if next lines have list items
+            if grep -A5 '^\s+peers:' "$RANVIER_CONFIG" | grep -E '^\s+-\s+' &>/dev/null; then
+                has_peers="true"
+            fi
+        fi
+    fi
+
+    if [[ "$has_peers" != "true" ]]; then
+        log_warn "No cluster peers configured - gossip test requires multi-node setup"
+        log_info "This test validates SMP queue handling under peer-to-peer gossip load"
+        log_info "For single-node validation, this test is not applicable"
+        TEST_RESULTS[$test_name]="SKIP"
+        TEST_DETAILS[$test_name]='{"reason": "no cluster peers configured (single-node mode)"}'
+        return 0
+    fi
+
     # Start Ranvier for gossip test
     log_info "Starting Ranvier for gossip test..."
     "$RANVIER_BINARY" --config "$RANVIER_CONFIG" &
