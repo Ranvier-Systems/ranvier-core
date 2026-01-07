@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <cassert>
 
 #include "types.hpp"
+#include "node_slab.hpp"
 
 /*
 Adaptive Radix Tree (ART) Implementation
@@ -68,7 +70,7 @@ struct Node {
 
 struct Node4 : public Node {
     std::vector<TokenId> keys;
-    std::vector<std::unique_ptr<Node>> children;
+    std::vector<NodePtr> children;
 
     Node4() : Node(NodeType::Node4) {
         keys.reserve(4);
@@ -78,7 +80,7 @@ struct Node4 : public Node {
 
 struct Node16 : public Node {
     std::vector<TokenId> keys;
-    std::vector<std::unique_ptr<Node>> children;
+    std::vector<NodePtr> children;
 
     Node16() : Node(NodeType::Node16) {
         keys.reserve(16);
@@ -90,7 +92,7 @@ struct Node48 : public Node {
     static constexpr uint8_t EMPTY_MARKER = 255;
 
     std::array<uint8_t, 256> index;
-    std::vector<std::unique_ptr<Node>> children;
+    std::vector<NodePtr> children;
     std::vector<TokenId> keys;
 
     Node48() : Node(NodeType::Node48) {
@@ -101,7 +103,7 @@ struct Node48 : public Node {
 };
 
 struct Node256 : public Node {
-    std::array<std::unique_ptr<Node>, 256> children;
+    std::array<NodePtr, 256> children;
 
     Node256() : Node(NodeType::Node256) {}
 };
@@ -125,7 +127,19 @@ class RadixTree {
 public:
     explicit RadixTree(uint32_t block_alignment = 16)
         : block_alignment_(block_alignment)
-        , root_(std::make_unique<Node4>()) {}
+        , root_(make_initial_root()) {}
+
+private:
+    // Helper to create root node with proper null-check
+    static NodePtr make_initial_root() {
+        NodeSlab* s = get_node_slab();
+        if (!s) [[unlikely]] {
+            throw std::runtime_error("NodeSlab not initialized before RadixTree construction");
+        }
+        return s->make_node<Node4>();
+    }
+
+public:
 
     // -------------------------------------------------------------------------
     // Public API
@@ -187,9 +201,26 @@ public:
     }
 
 private:
-    std::unique_ptr<Node> root_;
+    NodePtr root_;
     uint32_t block_alignment_;
     size_t route_count_ = 0;
+
+    // -------------------------------------------------------------------------
+    // Slab Allocator Access
+    // -------------------------------------------------------------------------
+
+    // Get the thread-local slab allocator
+    NodeSlab* slab() const {
+        NodeSlab* s = get_node_slab();
+        assert(s != nullptr && "NodeSlab not initialized for this shard");
+        return s;
+    }
+
+    // Factory method to create nodes via the slab allocator
+    template<typename NodeT>
+    NodePtr make_node() const {
+        return slab()->make_node<NodeT>();
+    }
 
     // -------------------------------------------------------------------------
     // Node Visitor Helpers
@@ -298,7 +329,7 @@ private:
         return nullptr;
     }
 
-    std::unique_ptr<Node> extract_child(Node* node, TokenId key) {
+    NodePtr extract_child(Node* node, TokenId key) {
         switch (node->type) {
             case NodeType::Node4: {
                 auto* n = static_cast<Node4*>(node);
@@ -330,7 +361,7 @@ private:
         return nullptr;
     }
 
-    void set_child(Node* node, TokenId key, std::unique_ptr<Node> child) {
+    void set_child(Node* node, TokenId key, NodePtr child) {
         switch (node->type) {
             case NodeType::Node4: {
                 auto* n = static_cast<Node4*>(node);
@@ -379,7 +410,7 @@ private:
         dest->last_accessed = src->last_accessed;
     }
 
-    std::unique_ptr<Node> add_child(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
+    NodePtr add_child(NodePtr parent, TokenId key, NodePtr child) {
         switch (parent->type) {
             case NodeType::Node4: {
                 auto* n = static_cast<Node4*>(parent.get());
@@ -419,24 +450,26 @@ private:
         return parent;
     }
 
-    std::unique_ptr<Node> grow_to_node16(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
+    NodePtr grow_to_node16(NodePtr parent, TokenId key, NodePtr child) {
         auto* n4 = static_cast<Node4*>(parent.get());
-        auto n16 = std::make_unique<Node16>();
+        auto n16_ptr = make_node<Node16>();
+        auto* n16 = static_cast<Node16*>(n16_ptr.get());
 
-        copy_node_metadata(n16.get(), n4);
+        copy_node_metadata(n16, n4);
         n16->keys = std::move(n4->keys);
         n16->children = std::move(n4->children);
         n16->keys.push_back(key);
         n16->children.push_back(std::move(child));
 
-        return n16;
+        return n16_ptr;
     }
 
-    std::unique_ptr<Node> grow_to_node48(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
+    NodePtr grow_to_node48(NodePtr parent, TokenId key, NodePtr child) {
         auto* n16 = static_cast<Node16*>(parent.get());
-        auto n48 = std::make_unique<Node48>();
+        auto n48_ptr = make_node<Node48>();
+        auto* n48 = static_cast<Node48*>(n48_ptr.get());
 
-        copy_node_metadata(n48.get(), n16);
+        copy_node_metadata(n48, n16);
         for (size_t i = 0; i < n16->keys.size(); i++) {
             n48->index[key_byte(n16->keys[i])] = static_cast<uint8_t>(i);
             n48->children.push_back(std::move(n16->children[i]));
@@ -448,31 +481,32 @@ private:
         n48->children.push_back(std::move(child));
         n48->keys.push_back(key);
 
-        return n48;
+        return n48_ptr;
     }
 
-    std::unique_ptr<Node> grow_to_node256(std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child) {
+    NodePtr grow_to_node256(NodePtr parent, TokenId key, NodePtr child) {
         auto* n48 = static_cast<Node48*>(parent.get());
-        auto n256 = std::make_unique<Node256>();
+        auto n256_ptr = make_node<Node256>();
+        auto* n256 = static_cast<Node256*>(n256_ptr.get());
 
-        copy_node_metadata(n256.get(), n48);
+        copy_node_metadata(n256, n48);
         for (size_t i = 0; i < n48->keys.size(); i++) {
             n256->children[key_byte(n48->keys[i])] = std::move(n48->children[i]);
         }
         n256->children[key_byte(key)] = std::move(child);
 
-        return n256;
+        return n256_ptr;
     }
 
     // -------------------------------------------------------------------------
     // Node Creation Helper
     // -------------------------------------------------------------------------
 
-    static std::unique_ptr<Node> create_node_for_capacity(size_t capacity) {
-        if (capacity <= 4) return std::make_unique<Node4>();
-        if (capacity <= 16) return std::make_unique<Node16>();
-        if (capacity <= 48) return std::make_unique<Node48>();
-        return std::make_unique<Node256>();
+    NodePtr create_node_for_capacity(size_t capacity) const {
+        if (capacity <= 4) return make_node<Node4>();
+        if (capacity <= 16) return make_node<Node16>();
+        if (capacity <= 48) return make_node<Node48>();
+        return make_node<Node256>();
     }
 
     // -------------------------------------------------------------------------
@@ -620,7 +654,7 @@ private:
         }
     }
 
-    void add_single_child_after_split(Node* node, TokenId key, std::unique_ptr<Node> child) {
+    void add_single_child_after_split(Node* node, TokenId key, NodePtr child) {
         switch (node->type) {
             case NodeType::Node4: {
                 auto* n = static_cast<Node4*>(node);
@@ -653,10 +687,10 @@ private:
     // Insert Implementation
     // -------------------------------------------------------------------------
 
-    std::unique_ptr<Node> insert_recursive(std::unique_ptr<Node> node,
-                                           std::span<const TokenId> tokens,
-                                           BackendId backend,
-                                           RouteOrigin origin) {
+    NodePtr insert_recursive(NodePtr node,
+                             std::span<const TokenId> tokens,
+                             BackendId backend,
+                             RouteOrigin origin) {
         // Calculate prefix match length
         size_t match_len = 0;
         while (match_len < node->prefix.size() && match_len < tokens.size()) {
@@ -686,7 +720,7 @@ private:
             auto new_child = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin);
             set_child(node.get(), next_key, std::move(new_child));
         } else {
-            auto new_child = std::make_unique<Node4>();
+            auto new_child = make_node<Node4>();
             if (remaining.size() > 1) {
                 new_child->prefix.assign(remaining.begin() + 1, remaining.end());
             }

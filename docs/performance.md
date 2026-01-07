@@ -32,6 +32,7 @@ The improvement is attributed to:
 1. **SIMD-accelerated lookups**: `absl::flat_hash_map` uses SSE2/AVX2 for parallel key comparisons
 2. **Better cache locality**: Flat storage layout minimizes cache misses during routing decisions
 3. **Reduced allocations**: Abseil containers have lower allocation overhead than `std::unordered_map`
+4. **Slab allocation**: RadixTree nodes use a per-shard slab allocator (`NodeSlab`) with O(1) intrusive free list, eliminating malloc/free on hot paths
 
 ### Cache Hit vs. Miss Latency
 

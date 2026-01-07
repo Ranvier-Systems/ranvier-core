@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 #include "radix_tree.hpp"
+#include "node_slab.hpp"
 
 #include <vector>
 #include <optional>
@@ -18,6 +19,33 @@
 #include <chrono>
 
 using namespace ranvier;
+
+// =============================================================================
+// Slab Allocator Test Environment
+// =============================================================================
+
+// Global test environment that sets up the NodeSlab before any tests run.
+// This is required because RadixTree now uses the slab allocator.
+class SlabEnvironment : public ::testing::Environment {
+public:
+    void SetUp() override {
+        // Create a thread-local slab for tests
+        slab_ = std::make_unique<NodeSlab>();
+        set_node_slab(slab_.get());
+    }
+
+    void TearDown() override {
+        set_node_slab(nullptr);
+        slab_.reset();
+    }
+
+private:
+    std::unique_ptr<NodeSlab> slab_;
+};
+
+// Register the environment (called once before all tests)
+static ::testing::Environment* const slab_env =
+    ::testing::AddGlobalTestEnvironment(new SlabEnvironment());
 
 class RadixTreeTest : public ::testing::Test {
 protected:
@@ -1498,4 +1526,334 @@ TEST_F(RadixTreeLookupTest, LookupVeryLongSequence) {
     auto result = tree.lookup(long_seq);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value(), 42);
+}
+
+// =============================================================================
+// NodeSlab Allocator Unit Tests
+// =============================================================================
+
+class NodeSlabTest : public ::testing::Test {
+protected:
+    // Note: We use the global slab set up by SlabEnvironment
+    // These tests verify the slab allocator works correctly with RadixTree
+};
+
+TEST_F(NodeSlabTest, SlabInitializedCorrectly) {
+    NodeSlab* slab = get_node_slab();
+    ASSERT_NE(slab, nullptr);
+
+    auto stats = slab->get_stats();
+    // At least one chunk should be allocated (Node4 pool is pre-allocated)
+    EXPECT_GE(stats.total_chunks, 1u);
+}
+
+TEST_F(NodeSlabTest, SlabAllocatesNode4) {
+    NodeSlab* slab = get_node_slab();
+    auto stats_before = slab->get_stats();
+
+    auto node = slab->make_node<Node4>();
+    ASSERT_NE(node.get(), nullptr);
+    EXPECT_EQ(node->type, NodeType::Node4);
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.allocated_nodes[0], stats_before.allocated_nodes[0] + 1);
+
+    // Node should be properly initialized
+    EXPECT_TRUE(node->prefix.empty());
+    EXPECT_FALSE(node->leaf_value.has_value());
+}
+
+TEST_F(NodeSlabTest, SlabAllocatesNode16) {
+    NodeSlab* slab = get_node_slab();
+    auto stats_before = slab->get_stats();
+
+    auto node = slab->make_node<Node16>();
+    ASSERT_NE(node.get(), nullptr);
+    EXPECT_EQ(node->type, NodeType::Node16);
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.allocated_nodes[1], stats_before.allocated_nodes[1] + 1);
+}
+
+TEST_F(NodeSlabTest, SlabAllocatesNode48) {
+    NodeSlab* slab = get_node_slab();
+    auto stats_before = slab->get_stats();
+
+    auto node = slab->make_node<Node48>();
+    ASSERT_NE(node.get(), nullptr);
+    EXPECT_EQ(node->type, NodeType::Node48);
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.allocated_nodes[2], stats_before.allocated_nodes[2] + 1);
+
+    // Node48 should have its index array initialized
+    auto* n48 = static_cast<Node48*>(node.get());
+    for (int i = 0; i < 256; i++) {
+        EXPECT_EQ(n48->index[i], Node48::EMPTY_MARKER);
+    }
+}
+
+TEST_F(NodeSlabTest, SlabAllocatesNode256) {
+    NodeSlab* slab = get_node_slab();
+    auto stats_before = slab->get_stats();
+
+    auto node = slab->make_node<Node256>();
+    ASSERT_NE(node.get(), nullptr);
+    EXPECT_EQ(node->type, NodeType::Node256);
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.allocated_nodes[3], stats_before.allocated_nodes[3] + 1);
+}
+
+TEST_F(NodeSlabTest, SlabDeallocatesOnUniquePointerDestruction) {
+    NodeSlab* slab = get_node_slab();
+
+    size_t initial_allocated;
+    {
+        auto stats = slab->get_stats();
+        initial_allocated = stats.allocated_nodes[0];
+    }
+
+    {
+        auto node = slab->make_node<Node4>();
+        ASSERT_NE(node.get(), nullptr);
+
+        auto stats = slab->get_stats();
+        EXPECT_EQ(stats.allocated_nodes[0], initial_allocated + 1);
+    } // node goes out of scope, should be deallocated
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.allocated_nodes[0], initial_allocated);
+}
+
+TEST_F(NodeSlabTest, SlabReusesFreedMemory) {
+    NodeSlab* slab = get_node_slab();
+
+    // Get the initial free list size
+    auto stats_before = slab->get_stats();
+    size_t initial_free = stats_before.free_list_size[0];
+
+    // Allocate and deallocate
+    void* ptr;
+    {
+        auto node = slab->make_node<Node4>();
+        ptr = node.get();
+    }
+
+    // Allocate again - should reuse the freed slot
+    auto node2 = slab->make_node<Node4>();
+    EXPECT_EQ(node2.get(), ptr);  // Should get the same memory location
+}
+
+TEST_F(NodeSlabTest, SlabStatsTrackPeakAllocation) {
+    NodeSlab* slab = get_node_slab();
+
+    // Record initial state
+    auto stats_initial = slab->get_stats();
+    size_t initial_allocated = stats_initial.allocated_nodes[0];
+    size_t initial_peak = stats_initial.peak_allocated[0];
+
+    // Allocate several nodes
+    std::vector<NodePtr> nodes;
+    for (int i = 0; i < 10; i++) {
+        nodes.push_back(slab->make_node<Node4>());
+    }
+
+    auto stats_during = slab->get_stats();
+    size_t allocated_during = stats_during.allocated_nodes[0];
+    size_t peak_during = stats_during.peak_allocated[0];
+
+    // Should have allocated 10 more nodes
+    EXPECT_EQ(allocated_during, initial_allocated + 10);
+
+    // Peak should be at least as high as current allocation
+    EXPECT_GE(peak_during, allocated_during);
+
+    // Clear nodes (deallocate)
+    nodes.clear();
+
+    // Peak should remain at least as high as it was during allocation
+    auto stats_after = slab->get_stats();
+    EXPECT_GE(stats_after.peak_allocated[0], allocated_during);
+
+    // Current allocation should decrease
+    EXPECT_EQ(stats_after.allocated_nodes[0], initial_allocated);
+}
+
+TEST_F(NodeSlabTest, SlabHandlesManyAllocations) {
+    NodeSlab* slab = get_node_slab();
+
+    // Allocate many nodes of each type
+    std::vector<NodePtr> node4s, node16s, node48s, node256s;
+
+    for (int i = 0; i < 100; i++) {
+        node4s.push_back(slab->make_node<Node4>());
+        node16s.push_back(slab->make_node<Node16>());
+        node48s.push_back(slab->make_node<Node48>());
+        node256s.push_back(slab->make_node<Node256>());
+    }
+
+    auto stats = slab->get_stats();
+    EXPECT_GE(stats.allocated_nodes[0], 100u);
+    EXPECT_GE(stats.allocated_nodes[1], 100u);
+    EXPECT_GE(stats.allocated_nodes[2], 100u);
+    EXPECT_GE(stats.allocated_nodes[3], 100u);
+
+    // All allocations should be valid
+    for (int i = 0; i < 100; i++) {
+        EXPECT_EQ(node4s[i]->type, NodeType::Node4);
+        EXPECT_EQ(node16s[i]->type, NodeType::Node16);
+        EXPECT_EQ(node48s[i]->type, NodeType::Node48);
+        EXPECT_EQ(node256s[i]->type, NodeType::Node256);
+    }
+}
+
+TEST_F(NodeSlabTest, SlabAllocatesNewChunkWhenNeeded) {
+    NodeSlab* slab = get_node_slab();
+
+    auto stats_before = slab->get_stats();
+    size_t initial_chunks = stats_before.total_chunks;
+
+    // Allocate enough nodes to exhaust initial chunk
+    // Node4 slot is ~192 bytes, 2MB chunk = ~10922 slots
+    // We'll allocate more than one chunk's worth
+    std::vector<NodePtr> nodes;
+    for (int i = 0; i < 15000; i++) {
+        nodes.push_back(slab->make_node<Node4>());
+    }
+
+    auto stats_after = slab->get_stats();
+    // Should have allocated at least one more chunk
+    EXPECT_GT(stats_after.total_chunks, initial_chunks);
+}
+
+TEST_F(NodeSlabTest, RadixTreeUsesSlabForAllNodeTypes) {
+    // This test verifies that RadixTree correctly uses slab for all node types
+    // by triggering node growth from Node4 -> Node16 -> Node48 -> Node256
+    NodeSlab* slab = get_node_slab();
+    auto stats_before = slab->get_stats();
+
+    RadixTree tree{1};  // Uses slab allocator
+
+    // Insert enough routes to trigger growth to Node256
+    // Root node will grow: 1 child -> ... -> many children
+    for (int i = 0; i < 60; i++) {
+        std::vector<TokenId> tokens = {static_cast<TokenId>(i)};
+        tree.insert(tokens, static_cast<BackendId>(i));
+    }
+
+    auto stats_after = slab->get_stats();
+
+    // Should have allocated nodes of various types
+    // (exact counts depend on implementation details)
+    EXPECT_GT(stats_after.allocated_nodes[0], stats_before.allocated_nodes[0]);
+
+    // Verify routes work
+    for (int i = 0; i < 60; i++) {
+        std::vector<TokenId> tokens = {static_cast<TokenId>(i)};
+        auto result = tree.lookup(tokens);
+        ASSERT_TRUE(result.has_value()) << "Failed for i=" << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i));
+    }
+}
+
+TEST_F(NodeSlabTest, IntrusiveFreeListLIFO) {
+    // Verify that the intrusive free list follows LIFO order
+    // (last freed slot is first to be reallocated)
+    NodeSlab* slab = get_node_slab();
+
+    // Allocate three nodes
+    auto node1 = slab->make_node<Node4>();
+    auto node2 = slab->make_node<Node4>();
+    auto node3 = slab->make_node<Node4>();
+
+    void* ptr1 = node1.get();
+    void* ptr2 = node2.get();
+    void* ptr3 = node3.get();
+
+    // Free in order: node3, node2, node1
+    node3.reset();
+    node2.reset();
+    node1.reset();
+
+    // Reallocate - should get them back in reverse order (LIFO)
+    auto new_node1 = slab->make_node<Node4>();
+    auto new_node2 = slab->make_node<Node4>();
+    auto new_node3 = slab->make_node<Node4>();
+
+    EXPECT_EQ(new_node1.get(), ptr1);  // Last freed, first allocated
+    EXPECT_EQ(new_node2.get(), ptr2);
+    EXPECT_EQ(new_node3.get(), ptr3);
+}
+
+TEST_F(NodeSlabTest, FreeCountTracksCorrectly) {
+    // Verify that free_count is maintained correctly through alloc/dealloc
+    NodeSlab* slab = get_node_slab();
+
+    auto stats_before = slab->get_stats();
+    size_t initial_free = stats_before.free_list_size[0];
+    size_t initial_allocated = stats_before.allocated_nodes[0];
+
+    // Allocate 5 nodes
+    std::vector<NodePtr> nodes;
+    for (int i = 0; i < 5; i++) {
+        nodes.push_back(slab->make_node<Node4>());
+    }
+
+    auto stats_during = slab->get_stats();
+    EXPECT_EQ(stats_during.free_list_size[0], initial_free - 5);
+    EXPECT_EQ(stats_during.allocated_nodes[0], initial_allocated + 5);
+
+    // Free all nodes
+    nodes.clear();
+
+    auto stats_after = slab->get_stats();
+    EXPECT_EQ(stats_after.free_list_size[0], initial_free);
+    EXPECT_EQ(stats_after.allocated_nodes[0], initial_allocated);
+}
+
+TEST_F(NodeSlabTest, MultiplePoolsIndependent) {
+    // Verify that different pools operate independently
+    NodeSlab* slab = get_node_slab();
+
+    auto stats_before = slab->get_stats();
+
+    // Allocate from different pools
+    auto node4 = slab->make_node<Node4>();
+    auto node16 = slab->make_node<Node16>();
+    auto node48 = slab->make_node<Node48>();
+    auto node256 = slab->make_node<Node256>();
+
+    auto stats_after = slab->get_stats();
+
+    // Each pool should have exactly one more allocation
+    EXPECT_EQ(stats_after.allocated_nodes[0], stats_before.allocated_nodes[0] + 1);
+    EXPECT_EQ(stats_after.allocated_nodes[1], stats_before.allocated_nodes[1] + 1);
+    EXPECT_EQ(stats_after.allocated_nodes[2], stats_before.allocated_nodes[2] + 1);
+    EXPECT_EQ(stats_after.allocated_nodes[3], stats_before.allocated_nodes[3] + 1);
+
+    // Free nodes in different order than allocation
+    node48.reset();
+    node4.reset();
+    node256.reset();
+    node16.reset();
+
+    auto stats_final = slab->get_stats();
+    EXPECT_EQ(stats_final.allocated_nodes[0], stats_before.allocated_nodes[0]);
+    EXPECT_EQ(stats_final.allocated_nodes[1], stats_before.allocated_nodes[1]);
+    EXPECT_EQ(stats_final.allocated_nodes[2], stats_before.allocated_nodes[2]);
+    EXPECT_EQ(stats_final.allocated_nodes[3], stats_before.allocated_nodes[3]);
+}
+
+TEST_F(NodeSlabTest, RadixTreeThrowsWithoutSlab) {
+    // Verify that RadixTree throws if slab is not initialized
+    NodeSlab* current_slab = get_node_slab();
+    set_node_slab(nullptr);  // Temporarily unset slab
+
+    EXPECT_THROW({
+        RadixTree tree{1};
+    }, std::runtime_error);
+
+    // Restore slab
+    set_node_slab(current_slab);
 }
