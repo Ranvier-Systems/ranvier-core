@@ -252,6 +252,19 @@ public:
         _route_prune_callback = std::move(callback);
     }
 
+    // Gossip protection: check if service is accepting new tasks
+    // Returns false during shutdown or re-sync
+    bool is_accepting_tasks() const {
+        return _running && !_resyncing.load(std::memory_order_relaxed);
+    }
+
+    // Start re-sync mode: rejects new gossip tasks while flushing existing ones
+    // Call when recovering from a network partition or cluster split
+    void start_resync();
+
+    // End re-sync mode: resume normal gossip operations
+    void end_resync();
+
 private:
     ClusterConfig _config;
     RouteLearnCallback _route_learn_callback;
@@ -357,6 +370,13 @@ private:
 
     // Gate for cert reload handshakes - coordinates with stop() for graceful shutdown
     seastar::gate _handshake_gate;
+
+    // Gate for gossip tasks - ensures no new gossip tasks are accepted during shutdown/re-sync
+    // This provides backpressure protection for the gossip subsystem
+    seastar::gate _gossip_task_gate;
+
+    // Flag to indicate gossip is re-syncing (e.g., after network partition recovery)
+    std::atomic<bool> _resyncing{false};
 
     // Crypto offloading thresholds - tune based on your hardware and latency requirements
     // These control when crypto operations are offloaded to seastar::thread to avoid reactor stalls

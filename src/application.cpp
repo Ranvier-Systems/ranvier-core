@@ -116,6 +116,11 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.circuit_breaker.success_threshold = config.circuit_breaker.success_threshold;
     cfg.circuit_breaker.recovery_timeout = config.circuit_breaker.recovery_timeout;
     cfg.circuit_breaker.fallback_enabled = config.circuit_breaker.fallback_enabled;
+    // Backpressure settings
+    cfg.backpressure.max_concurrent_requests = config.backpressure.max_concurrent_requests;
+    cfg.backpressure.enable_persistence_backpressure = config.backpressure.enable_persistence_backpressure;
+    cfg.backpressure.persistence_queue_threshold = config.backpressure.persistence_queue_threshold;
+    cfg.backpressure.retry_after_seconds = config.backpressure.retry_after_seconds;
     return cfg;
 }
 

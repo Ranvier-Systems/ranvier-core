@@ -236,6 +236,19 @@ struct ShutdownConfig {
     std::chrono::seconds drain_timeout{30};           // Max time to wait for in-flight requests
 };
 
+// Backpressure configuration for system stability
+struct BackpressureConfig {
+    // Concurrency limits per shard
+    size_t max_concurrent_requests = 1000;            // Max concurrent requests per shard (0 = unlimited)
+
+    // Persistence queue integration
+    bool enable_persistence_backpressure = true;      // Throttle writes when persistence queue is full
+    double persistence_queue_threshold = 0.8;         // Start throttling at 80% of max_queue_depth
+
+    // Response configuration
+    uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
+};
+
 // Discovery type for DNS-based peer discovery
 enum class DiscoveryType {
     STATIC,  // Use static peer list only (default)
@@ -337,6 +350,7 @@ struct RanvierConfig {
     RetryConfig retry;
     CircuitBreakerConfig circuit_breaker;
     ShutdownConfig shutdown;
+    BackpressureConfig backpressure;
     ClusterConfig cluster;
     K8sDiscoveryConfig k8s_discovery;
     TelemetryConfig telemetry;
@@ -528,6 +542,26 @@ inline void RanvierConfig::apply_env_overrides() {
     // Shutdown overrides
     if (auto v = get_env_as<int>("RANVIER_SHUTDOWN_DRAIN_TIMEOUT")) {
         shutdown.drain_timeout = std::chrono::seconds(*v);
+    }
+
+    // Backpressure overrides
+    if (auto v = get_env_as<size_t>("RANVIER_BACKPRESSURE_MAX_CONCURRENT_REQUESTS")) {
+        backpressure.max_concurrent_requests = *v;
+    }
+    if (auto v = get_env("RANVIER_BACKPRESSURE_ENABLE_PERSISTENCE")) {
+        backpressure.enable_persistence_backpressure = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_BACKPRESSURE_PERSISTENCE_THRESHOLD")) {
+        try {
+            backpressure.persistence_queue_threshold = std::stod(*v);
+            if (backpressure.persistence_queue_threshold < 0.0) backpressure.persistence_queue_threshold = 0.0;
+            if (backpressure.persistence_queue_threshold > 1.0) backpressure.persistence_queue_threshold = 1.0;
+        } catch (...) {
+            // Ignore invalid values
+        }
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_BACKPRESSURE_RETRY_AFTER")) {
+        backpressure.retry_after_seconds = *v;
     }
 
     // Cluster overrides
@@ -918,6 +952,24 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
         }
 
+        // Backpressure section
+        if (yaml["backpressure"]) {
+            YAML::Node bp = yaml["backpressure"];
+            if (bp["max_concurrent_requests"]) {
+                config.backpressure.max_concurrent_requests = bp["max_concurrent_requests"].as<size_t>();
+            }
+            if (bp["enable_persistence_backpressure"]) {
+                config.backpressure.enable_persistence_backpressure = bp["enable_persistence_backpressure"].as<bool>();
+            }
+            if (bp["persistence_queue_threshold"]) {
+                double threshold = bp["persistence_queue_threshold"].as<double>();
+                config.backpressure.persistence_queue_threshold = std::max(0.0, std::min(1.0, threshold));
+            }
+            if (bp["retry_after_seconds"]) {
+                config.backpressure.retry_after_seconds = bp["retry_after_seconds"].as<uint32_t>();
+            }
+        }
+
         // Cluster section
         if (yaml["cluster"]) {
             YAML::Node c = yaml["cluster"];
@@ -1140,6 +1192,15 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
     // Validate shutdown settings
     if (config.shutdown.drain_timeout.count() == 0) {
         return "shutdown.drain_timeout must be positive";
+    }
+
+    // Validate backpressure settings
+    if (config.backpressure.persistence_queue_threshold < 0.0 ||
+        config.backpressure.persistence_queue_threshold > 1.0) {
+        return "backpressure.persistence_queue_threshold must be between 0.0 and 1.0";
+    }
+    if (config.backpressure.retry_after_seconds == 0) {
+        return "backpressure.retry_after_seconds must be positive";
     }
 
     // Validate cluster settings (if enabled)

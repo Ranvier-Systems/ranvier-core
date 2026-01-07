@@ -316,6 +316,33 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         co_return std::move(rep);
     }
 
+    // Backpressure: try to acquire semaphore unit (non-blocking)
+    // If semaphore is exhausted, immediately return 503 instead of queueing
+    auto semaphore_units = seastar::try_get_units(_request_semaphore, 1);
+    if (!semaphore_units) {
+        ++_requests_rejected_concurrency;
+        log_proxy.warn("[{}] Request rejected - concurrency limit reached ({} concurrent)",
+                       request_id, _config.backpressure.max_concurrent_requests);
+        metrics().record_backpressure_rejection();
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("X-Request-ID", request_id);
+        rep->add_header("Retry-After", std::to_string(_config.backpressure.retry_after_seconds));
+        rep->write_body("json", "{\"error\": \"Server overloaded - too many concurrent requests\"}");
+        co_return std::move(rep);
+    }
+
+    // Backpressure: check persistence queue depth
+    if (is_persistence_backpressured()) {
+        ++_requests_rejected_persistence;
+        log_proxy.warn("[{}] Request rejected - persistence queue backpressure", request_id);
+        metrics().record_backpressure_rejection();
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("X-Request-ID", request_id);
+        rep->add_header("Retry-After", std::to_string(_config.backpressure.retry_after_seconds));
+        rep->write_body("json", "{\"error\": \"Server overloaded - persistence queue full\"}");
+        co_return std::move(rep);
+    }
+
     // Track request start time for latency metrics (ingress timestamp)
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
@@ -1297,6 +1324,19 @@ future<> HttpController::wait_for_drain() {
 
 bool HttpController::is_draining() const {
     return _draining.load(std::memory_order_relaxed);
+}
+
+bool HttpController::is_persistence_backpressured() const {
+    if (!_config.backpressure.enable_persistence_backpressure || !_persistence) {
+        return false;
+    }
+
+    // Check if persistence queue is above threshold
+    size_t max_depth = 100000;  // Default from AsyncPersistenceConfig
+    size_t current_depth = _persistence->queue_depth();
+    double fill_ratio = static_cast<double>(current_depth) / static_cast<double>(max_depth);
+
+    return fill_ratio >= _config.backpressure.persistence_queue_threshold;
 }
 
 } // namespace ranvier
