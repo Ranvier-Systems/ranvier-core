@@ -7,7 +7,6 @@
 #
 # Seastar Flags Used:
 #   --task-quota-ms 0.1       : Task time slice of 100μs (catches micro-stalls)
-#   --blocked-reactor-reports-per-core 10 : Detailed backtraces per core
 #
 # Exit Codes:
 #   0 - No stalls detected
@@ -28,7 +27,6 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-10}"
 
 # Seastar stall detection configuration
 TASK_QUOTA_MS="${TASK_QUOTA_MS:-0.1}"
-BLOCKED_REACTOR_REPORTS="${BLOCKED_REACTOR_REPORTS:-10}"
 
 # Additional Seastar flags for diagnostics
 SEASTAR_POLL_MODE="${SEASTAR_POLL_MODE:-}"  # --poll-mode for spinloop (better stall detection)
@@ -47,7 +45,6 @@ Options:
   -d, --duration TIME      Load test duration (default: $LOAD_DURATION)
   -w, --warmup SECONDS     Warmup period before load (default: $WARMUP_SECONDS)
   -q, --task-quota MS      Seastar task quota in ms (default: $TASK_QUOTA_MS)
-  -r, --reports COUNT      Blocked reactor reports per core (default: $BLOCKED_REACTOR_REPORTS)
   --poll-mode              Enable Seastar poll mode (spinloop)
   -h, --help               Show this help message
 
@@ -111,7 +108,6 @@ parse_args() {
 build_seastar_args() {
     local args=(
         "--task-quota-ms" "$TASK_QUOTA_MS"
-        "--blocked-reactor-reports-per-core" "$BLOCKED_REACTOR_REPORTS"
     )
 
     # Optional poll mode for better stall detection

@@ -66,7 +66,6 @@ Launches Ranvier with aggressive Seastar stall detection:
 
 ```bash
 --task-quota-ms 0.1        # 100μs task quota (catches micro-stalls)
---blocked-reactor-reports-per-core 10  # Detailed backtraces
 ```
 
 **What it tests:**
