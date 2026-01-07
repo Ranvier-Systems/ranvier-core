@@ -17,6 +17,7 @@ RUN dnf install -y \
         valgrind \
         zip \
         unzip \
+        nmap-ncat \
     && pip3 install --no-cache-dir docker requests \
     && dnf clean all \
     && rm -rf /var/cache/dnf
