@@ -774,7 +774,7 @@ TEST(AsyncPersistenceOwnershipTest, DelegatedMethodsReturnDefaultsWhenClosed) {
 // max_queue_depth() accessor tests
 // =============================================================================
 
-TEST_F(AsyncPersistenceTest, MaxQueueDepthReturnsConfiguredValue) {
+TEST(AsyncPersistence, MaxQueueDepthReturnsConfiguredValue) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 50000;  // Custom value
 
@@ -782,7 +782,7 @@ TEST_F(AsyncPersistenceTest, MaxQueueDepthReturnsConfiguredValue) {
     EXPECT_EQ(manager.max_queue_depth(), 50000);
 }
 
-TEST_F(AsyncPersistenceTest, MaxQueueDepthReturnsDefaultValue) {
+TEST(AsyncPersistence, MaxQueueDepthReturnsDefaultValue) {
     AsyncPersistenceConfig config;  // Default max_queue_depth = 100000
 
     AsyncPersistenceManager manager(config, std::make_unique<MockPersistenceStore>());
