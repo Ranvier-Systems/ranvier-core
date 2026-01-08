@@ -1,6 +1,7 @@
 #include "http_controller.hpp"
 #include "logging.hpp"
 #include "request_rewriter.hpp"
+#include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
 
 #include "stream_parser.hpp"
@@ -347,6 +348,23 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
 
+    // Track shard load metrics for P2C load balancing
+    // Use a flag to track if we need to decrement on exit (for streaming lambda handoff)
+    bool shard_metrics_active = shard_load_metrics_initialized();
+    if (shard_metrics_active) {
+        shard_load_metrics().increment_active();
+    }
+
+    // Select target shard for request processing using P2C algorithm
+    // This evaluates shard load and may select a different shard for processing
+    uint32_t target_shard = select_target_shard();
+    uint32_t local_shard = seastar::this_shard_id();
+
+    // Log cross-shard dispatch decision for observability
+    if (target_shard != local_shard && _lb_config.enabled) {
+        log_proxy.debug("[{}] P2C selected shard {} (local: {})", request_id, target_shard, local_shard);
+    }
+
     // RAII guard ensures active request counter is decremented even if exception thrown
     // Guard is released before entering the lambda, which takes over responsibility
     ActiveRequestGuard active_request_guard(metrics());
@@ -569,7 +587,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     // Move gate_holder and semaphore_units into the lambda to keep them alive during streaming.
     // This ensures the gate stays held and the semaphore slot is occupied until streaming completes.
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id, backend_traceparent, gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id, backend_traceparent, shard_metrics_active, gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -664,6 +682,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             log_proxy.error("[{}] Backend connection failed after retries", request_id);
             metrics().record_failure();
             metrics().decrement_active_requests();
+            if (shard_metrics_active && shard_load_metrics_initialized()) {
+                shard_load_metrics().decrement_active();
+            }
             sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
             try {
                 co_await client_out.write(error_msg);
@@ -680,6 +701,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             log_proxy.warn("[{}] Request timeout before sending", request_id);
             metrics().record_timeout();
             metrics().decrement_active_requests();
+            if (shard_metrics_active && shard_load_metrics_initialized()) {
+                shard_load_metrics().decrement_active();
+            }
             bundle.is_valid = false;
             co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
@@ -739,6 +763,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (rethrow_exception) {
             metrics().record_failure();
             metrics().decrement_active_requests();
+            if (shard_metrics_active && shard_load_metrics_initialized()) {
+                shard_load_metrics().decrement_active();
+            }
             co_await bundle.close();
             try { co_await client_out.close(); } catch (...) {}
             stream_closed = true;
@@ -749,6 +776,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             // Clean up and send error to client
             metrics().record_failure();
             metrics().decrement_active_requests();
+            if (shard_metrics_active && shard_load_metrics_initialized()) {
+                shard_load_metrics().decrement_active();
+            }
             co_await bundle.close();
             sstring error_msg = "data: {\"error\": \"Backend connection lost during request\"}\n\n";
             try {
@@ -816,6 +846,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             if (rethrow_exception) {
                 metrics().record_failure();
                 metrics().decrement_active_requests();
+                if (shard_metrics_active && shard_load_metrics_initialized()) {
+                    shard_load_metrics().decrement_active();
+                }
                 bundle.is_valid = false;
                 co_await bundle.close();
                 try { co_await client_out.close(); } catch (...) {}
@@ -905,6 +938,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 if (rethrow_exception) {
                     metrics().record_failure();
                     metrics().decrement_active_requests();
+                    if (shard_metrics_active && shard_load_metrics_initialized()) {
+                        shard_load_metrics().decrement_active();
+                    }
                     bundle.is_valid = false;
                     stream_closed = true;
                     co_await bundle.close();
@@ -1008,8 +1044,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         // Record in new advanced histogram with optimized buckets
         metrics().record_router_total_latency(total_latency);
 
-        // Decrement active request counter
+        // Decrement active request counters
         metrics().decrement_active_requests();
+        if (shard_metrics_active && shard_load_metrics_initialized()) {
+            shard_load_metrics().decrement_active();
+            shard_load_metrics().record_request_completed();
+        }
     });
 
     co_return std::move(rep);
@@ -1346,6 +1386,33 @@ bool HttpController::is_persistence_backpressured() const {
     double fill_ratio = static_cast<double>(current_depth) / static_cast<double>(max_depth);
 
     return fill_ratio >= _config.backpressure.persistence_queue_threshold;
+}
+
+uint32_t HttpController::select_target_shard() {
+    uint32_t local_shard = seastar::this_shard_id();
+
+    // Fast path: load balancing disabled or single shard
+    if (!_lb_config.enabled || !_load_balancer || seastar::smp::count <= 1) {
+        ++_requests_local_dispatch;
+        return local_shard;
+    }
+
+    // Update local shard's metrics snapshot in the load balancer cache
+    if (shard_load_metrics_initialized()) {
+        _load_balancer->local().update_local_snapshot();
+    }
+
+    // Use P2C algorithm to select target shard
+    uint32_t target_shard = _load_balancer->local().select_shard();
+
+    // Track dispatch metrics
+    if (target_shard == local_shard) {
+        ++_requests_local_dispatch;
+    } else {
+        ++_requests_cross_shard_dispatch;
+    }
+
+    return target_shard;
 }
 
 } // namespace ranvier

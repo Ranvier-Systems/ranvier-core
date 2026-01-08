@@ -19,6 +19,7 @@
 #include "http_controller.hpp"
 #include "k8s_discovery_service.hpp"
 #include "router_service.hpp"
+#include "shard_load_balancer.hpp"
 #include "sharded_config.hpp"
 #include "tokenizer_service.hpp"
 
@@ -155,6 +156,10 @@ private:
 
     // Presentation layer (sharded for multi-core)
     seastar::sharded<HttpController> _controller;
+
+    // Shard load balancer (P2C algorithm for cross-shard dispatch)
+    seastar::sharded<ShardLoadBalancer> _load_balancer;
+    bool _load_balancer_started = false;
 
     // Health monitoring
     std::unique_ptr<HealthService> _health_checker;
