@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <random>
+#include <tuple>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -162,7 +163,10 @@ public:
         return seastar::when_all_succeed(
             fetch_shard_snapshot(candidate1),
             fetch_shard_snapshot(candidate2)
-        ).then([this, candidate1, candidate2](ShardLoadSnapshot snap1, ShardLoadSnapshot snap2) {
+        ).then([this, candidate1, candidate2](std::tuple<ShardLoadSnapshot, ShardLoadSnapshot> snapshots) {
+            auto& snap1 = std::get<0>(snapshots);
+            auto& snap2 = std::get<1>(snapshots);
+
             // Update cache
             _snapshot_cache[candidate1] = snap1;
             _snapshot_cache[candidate2] = snap2;
