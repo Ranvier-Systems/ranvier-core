@@ -769,3 +769,22 @@ TEST(AsyncPersistenceOwnershipTest, DelegatedMethodsReturnDefaultsWhenClosed) {
     EXPECT_FALSE(manager.verify_integrity());
     EXPECT_FALSE(manager.clear_all());
 }
+
+// =============================================================================
+// max_queue_depth() accessor tests
+// =============================================================================
+
+TEST(AsyncPersistence, MaxQueueDepthReturnsConfiguredValue) {
+    AsyncPersistenceConfig config;
+    config.max_queue_depth = 50000;  // Custom value
+
+    AsyncPersistenceManager manager(config, std::make_unique<MockPersistenceStore>());
+    EXPECT_EQ(manager.max_queue_depth(), 50000);
+}
+
+TEST(AsyncPersistence, MaxQueueDepthReturnsDefaultValue) {
+    AsyncPersistenceConfig config;  // Default max_queue_depth = 100000
+
+    AsyncPersistenceManager manager(config, std::make_unique<MockPersistenceStore>());
+    EXPECT_EQ(manager.max_queue_depth(), 100000);
+}

@@ -171,6 +171,9 @@ public:
             seastar::metrics::make_counter("fallback_attempts", _fallback_attempts,
                 seastar::metrics::description("Total number of fallback routing attempts")),
 
+            seastar::metrics::make_counter("http_requests_backpressure_rejected", _requests_backpressure,
+                seastar::metrics::description("Total number of requests rejected due to backpressure (concurrency or persistence)")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -240,6 +243,9 @@ public:
     // Record circuit breaker events
     void record_circuit_open() { _circuit_opens++; }
     void record_fallback() { _fallback_attempts++; }
+
+    // Record backpressure rejections (503 due to concurrency or persistence limits)
+    void record_backpressure_rejection() { _requests_backpressure++; }
 
     // Active request tracking
     void increment_active_requests() { _active_requests++; }
@@ -313,6 +319,7 @@ private:
     uint64_t _requests_timeout = 0;
     uint64_t _requests_rate_limited = 0;
     uint64_t _requests_connection_error = 0;
+    uint64_t _requests_backpressure = 0;
     uint64_t _circuit_opens = 0;
     uint64_t _fallback_attempts = 0;
 

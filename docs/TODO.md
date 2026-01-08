@@ -301,6 +301,13 @@ Hardening for production deployment environments.
 
 ### 4.4 Rate Limiting & DoS Protection
 
+- [x] **Implement system-wide backpressure mechanism** ✓
+  _Justification:_ Unbounded request acceptance during traffic spikes causes OOM crashes. Need fail-fast rejection with HTTP 503 rather than queueing to maintain predictable latency.
+  _Approach:_ Multi-layer backpressure using: (1) Per-shard `seastar::semaphore` for concurrency limits with `try_get_units()` for non-blocking acquisition, (2) Persistence queue depth monitoring with configurable threshold, (3) Gossip gate protection for route broadcasts during shutdown/resync. Rejected requests receive HTTP 503 with `Retry-After` header.
+  _Config:_ `backpressure.max_concurrent_requests`, `backpressure.enable_persistence_backpressure`, `backpressure.persistence_queue_threshold`, `backpressure.retry_after_seconds`
+  _Location:_ `src/http_controller.hpp`, `src/http_controller.cpp`, `src/config.hpp`, `src/gossip_service.hpp`, `src/gossip_service.cpp`
+  _Complexity:_ Medium
+
 - [ ] **Add request body size limits**
   _Justification:_ No maximum request size. Large payloads can exhaust memory.
   _Config:_ `max_request_body_bytes` (default: 10MB)
@@ -475,6 +482,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P1 - High** | Performance | Async persistence (reactor stall fix) | Medium | ✅ Done |
 | **P1 - High** | Performance | Batch remote route updates (SMP storm fix) | Medium | ✅ Done |
 | **P1 - High** | Performance | Replace shared_ptr with unique_ptr in RadixTree | Medium | ✅ Done |
+| **P1 - High** | Reliability | System-wide backpressure mechanism | Medium | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
@@ -496,6 +504,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-07 | Implement system-wide backpressure mechanism (semaphore concurrency limits, persistence queue integration, gossip gate protection) | - |
 | 2026-01-06 | Use Seastar async file I/O for tokenizer loading (DMA file I/O, validation, proper cleanup) | - |
 | 2026-01-06 | Encapsulate SQLite store within AsyncPersistenceManager (clean ownership, lifecycle methods) | - |
 | 2026-01-06 | Refactor configuration for Seastar sharded container (per-core lock-free access, hot-reload) | - |

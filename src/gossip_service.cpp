@@ -291,6 +291,10 @@ seastar::future<> GossipService::stop() {
     _cert_reload_timer.cancel();
     _dtls_session_cleanup_timer.cancel();
 
+    // Close the gossip task gate and wait for in-flight gossip tasks
+    co_await _gossip_task_gate.close();
+    log_gossip.debug("Gossip task gate closed");
+
     // Close the handshake gate and wait for in-flight handshakes to complete
     co_await _handshake_gate.close();
 
@@ -326,6 +330,23 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
         return seastar::make_ready_future<>();
     }
 
+    // Gossip protection: reject new gossip tasks during shutdown or re-sync
+    if (!is_accepting_tasks()) {
+        log_gossip.debug("Route broadcast rejected: gossip service not accepting tasks. "
+                        "tokens={}, backend={}", tokens.size(), backend);
+        return seastar::make_ready_future<>();
+    }
+
+    // Try to enter the gossip task gate (non-blocking for graceful rejection)
+    seastar::gate::holder gate_holder;
+    try {
+        gate_holder = _gossip_task_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_gossip.debug("Route broadcast rejected: gossip gate closed. tokens={}, backend={}",
+                        tokens.size(), backend);
+        return seastar::make_ready_future<>();
+    }
+
     // Split-brain protection: reject new route writes when quorum is lost
     if (_config.quorum_enabled && _config.reject_routes_on_quorum_loss && is_degraded()) {
         ++_routes_rejected_degraded;
@@ -339,7 +360,8 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
 
     // Send to each peer with per-peer sequence numbers
     // Note: Operators should ensure the peer list does not include the node's own address.
-    return seastar::parallel_for_each(_peer_addresses, [this, tokens, backend](const seastar::socket_address& peer) mutable {
+    // Capture gate_holder to keep it alive for the duration of the async operation
+    return seastar::parallel_for_each(_peer_addresses, [this, tokens, backend, gate_holder = std::move(gate_holder)](const seastar::socket_address& peer) mutable {
         // Create packet with per-peer sequence number
         RouteAnnouncementPacket pkt;
         pkt.backend_id = backend;
@@ -1435,6 +1457,34 @@ seastar::future<> GossipService::initiate_peer_handshake(const seastar::socket_a
     }
 
     return seastar::make_ready_future<>();
+}
+
+//------------------------------------------------------------------------------
+// Resync Methods for Graceful Recovery
+//------------------------------------------------------------------------------
+
+void GossipService::start_resync() {
+    if (!_config.enabled) {
+        return;
+    }
+
+    log_gossip.info("Starting gossip re-sync mode - rejecting new gossip tasks");
+    _resyncing.store(true, std::memory_order_relaxed);
+
+    // Clear pending ACKs to avoid stale retries during re-sync
+    _pending_acks.clear();
+
+    // Note: We don't close the gate here - we just set the flag
+    // This allows in-flight tasks to complete while new ones are rejected
+}
+
+void GossipService::end_resync() {
+    if (!_config.enabled) {
+        return;
+    }
+
+    log_gossip.info("Ending gossip re-sync mode - resuming normal gossip operations");
+    _resyncing.store(false, std::memory_order_relaxed);
 }
 
 }  // namespace ranvier

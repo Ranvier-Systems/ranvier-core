@@ -172,6 +172,7 @@ public:
     // -------------------------------------------------------------------------
 
     size_t queue_depth() const;
+    size_t max_queue_depth() const { return _config.max_queue_depth; }
     uint64_t operations_processed() const { return _ops_processed.load(); }
     uint64_t operations_dropped() const { return _ops_dropped.load(); }
     bool is_backpressured() const { return queue_depth() >= _config.max_queue_depth; }
