@@ -90,6 +90,20 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/radix_tree.hpp`, `src/metrics_service.hpp`
   _Complexity:_ Low
 
+### 1.5 Shard-Aware Load Balancing
+
+- [x] **Implement P2C load balancer for cross-shard request dispatch** ✓
+  _Justification:_ Seastar's shared-nothing architecture can create "hot shards" where one CPU core is at 100% while others are idle. This happens when incoming connections are not evenly distributed, causing requests to queue on overloaded shards while adjacent shards sit idle.
+  _Approach:_ Implemented Power of Two Choices (P2C) algorithm for O(1) shard selection:
+  - Per-shard load metrics tracking (active requests, queue depth) with thread-local storage for lock-free access
+  - P2C algorithm randomly selects 2 candidate shards and routes to the less loaded one
+  - Cross-shard dispatch via `seastar::smp::submit_to` with `foreign_ptr` for safe pointer transfer
+  - Zero-copy request context transfer using move semantics
+  - Configurable thresholds: local processing threshold, minimum load difference, snapshot refresh interval
+  - Prometheus metrics for monitoring dispatch patterns
+  _Location:_ `src/shard_load_metrics.hpp`, `src/shard_load_balancer.hpp`, `src/cross_shard_request.hpp`, `src/http_controller.cpp`, `src/application.cpp`
+  _Complexity:_ Medium
+
 ---
 
 ## 2. Distributed Reliability
@@ -483,6 +497,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P1 - High** | Performance | Batch remote route updates (SMP storm fix) | Medium | ✅ Done |
 | **P1 - High** | Performance | Replace shared_ptr with unique_ptr in RadixTree | Medium | ✅ Done |
 | **P1 - High** | Reliability | System-wide backpressure mechanism | Medium | ✅ Done |
+| **P1 - High** | Performance | Shard-aware P2C load balancer | Medium | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
@@ -504,6 +519,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-08 | Implement shard-aware P2C load balancer (per-shard metrics, cross-shard dispatch, zero-copy transfer) | - |
 | 2026-01-07 | Implement system-wide backpressure mechanism (semaphore concurrency limits, persistence queue integration, gossip gate protection) | - |
 | 2026-01-06 | Use Seastar async file I/O for tokenizer loading (DMA file I/O, validation, proper cleanup) | - |
 | 2026-01-06 | Encapsulate SQLite store within AsyncPersistenceManager (clean ownership, lifecycle methods) | - |

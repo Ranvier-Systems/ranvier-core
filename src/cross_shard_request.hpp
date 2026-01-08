@@ -144,6 +144,9 @@ class CrossShardDispatcher {
 public:
     // Dispatch a request to a specific shard for processing
     // The handler function is invoked on the target shard with moved context
+    //
+    // Note: This uses foreign_ptr to safely transfer ownership across shards.
+    // The context is wrapped in a unique_ptr, then foreign_ptr for safe cross-shard access.
     template<typename Handler>
     static seastar::future<CrossShardResult> dispatch(
         uint32_t target_shard,
@@ -155,20 +158,21 @@ public:
             return handler(std::move(ctx));
         }
 
-        // Cross-shard dispatch using submit_to
-        // Note: We use foreign_ptr for safe cross-shard pointer transfer
-        auto ctx_ptr = seastar::make_lw_shared<CrossShardRequestContext>(std::move(ctx));
+        // Wrap in unique_ptr then foreign_ptr for safe cross-shard transfer
+        auto ctx_ptr = std::make_unique<CrossShardRequestContext>(std::move(ctx));
+        auto foreign = seastar::make_foreign(std::move(ctx_ptr));
 
         return seastar::smp::submit_to(target_shard,
-            [ctx_ptr, handler = std::forward<Handler>(handler)]() mutable {
-                // Move context out of shared_ptr on target shard
-                CrossShardRequestContext local_ctx = std::move(*ctx_ptr);
+            [foreign = std::move(foreign), handler = std::forward<Handler>(handler)]() mutable {
+                // Move context out of foreign_ptr on target shard
+                // foreign_ptr allows the pointee to be moved out
+                CrossShardRequestContext local_ctx = std::move(*foreign);
                 return handler(std::move(local_ctx));
             });
     }
 
-    // Dispatch with foreign_ptr for explicit lifetime management
-    // Use this when the handler needs to access the context multiple times
+    // Dispatch with explicit unique_ptr ownership
+    // Provided for API compatibility; internally uses foreign_ptr
     template<typename Handler>
     static seastar::future<CrossShardResult> dispatch_with_foreign(
         uint32_t target_shard,
@@ -184,19 +188,8 @@ public:
 
         return seastar::smp::submit_to(target_shard,
             [foreign = std::move(foreign), handler = std::forward<Handler>(handler)]() mutable {
-                // Get the local pointer on target shard
-                auto& ctx = *foreign;
-                // Create a local copy for processing (foreign_ptr content can't be moved)
-                CrossShardRequestContext local_ctx;
-                local_ctx.body = std::move(ctx.body);
-                local_ctx.request_id = std::move(ctx.request_id);
-                local_ctx.client_ip = std::move(ctx.client_ip);
-                local_ctx.traceparent = std::move(ctx.traceparent);
-                local_ctx.client_tokens = std::move(ctx.client_tokens);
-                local_ctx.has_client_tokens = ctx.has_client_tokens;
-                local_ctx.method = std::move(ctx.method);
-                local_ctx.path = std::move(ctx.path);
-                local_ctx.origin_shard = ctx.origin_shard;
+                // Move context out on target shard
+                CrossShardRequestContext local_ctx = std::move(*foreign);
                 return handler(std::move(local_ctx));
             });
     }

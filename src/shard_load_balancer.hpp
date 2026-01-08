@@ -54,6 +54,11 @@ struct ShardLoadBalancerConfig {
 
     // Enable adaptive mode that learns from request latency patterns
     bool adaptive_mode = false;
+
+    // Validate configuration values
+    bool is_valid() const {
+        return min_load_difference >= 0.0 && min_load_difference <= 1.0;
+    }
 };
 
 // Shard Load Balancer - implements P2C algorithm for shard selection
@@ -225,7 +230,12 @@ public:
     uint32_t shard_count() const { return _shard_count; }
 
     // Get cached snapshot for a specific shard (for debugging/metrics)
+    // Returns empty snapshot if shard_id is out of bounds
     const ShardLoadSnapshot& get_cached_snapshot(uint32_t shard_id) const {
+        static const ShardLoadSnapshot empty_snapshot{};
+        if (shard_id >= _shard_count) {
+            return empty_snapshot;
+        }
         return _snapshot_cache[shard_id];
     }
 

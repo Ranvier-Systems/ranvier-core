@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/future.hh>
@@ -134,12 +135,12 @@ private:
 };
 
 // Thread-local shard load metrics instance
-inline thread_local ShardLoadMetrics* g_shard_load_metrics = nullptr;
+inline thread_local std::unique_ptr<ShardLoadMetrics> g_shard_load_metrics = nullptr;
 
 // Initialize shard load metrics for this shard (call once per shard)
 inline void init_shard_load_metrics() {
     if (!g_shard_load_metrics) {
-        g_shard_load_metrics = new ShardLoadMetrics();
+        g_shard_load_metrics = std::make_unique<ShardLoadMetrics>();
     }
 }
 
@@ -151,6 +152,12 @@ inline ShardLoadMetrics& shard_load_metrics() {
 // Check if shard load metrics are initialized
 inline bool shard_load_metrics_initialized() {
     return g_shard_load_metrics != nullptr;
+
+}
+
+// Cleanup shard load metrics (call during shutdown if needed)
+inline void cleanup_shard_load_metrics() {
+    g_shard_load_metrics.reset();
 }
 
 }  // namespace ranvier
