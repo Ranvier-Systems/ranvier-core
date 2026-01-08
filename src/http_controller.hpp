@@ -82,9 +82,16 @@ public:
               config.circuit_breaker.enabled
           }),
           _persistence(nullptr),
-          _request_semaphore(config.backpressure.max_concurrent_requests > 0
-                             ? config.backpressure.max_concurrent_requests
-                             : std::numeric_limits<size_t>::max()) {}
+          // Backpressure: 0 means unlimited (use max size_t as semaphore limit)
+          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)) {}
+
+private:
+    // Helper to compute effective semaphore limit (0 = unlimited)
+    static size_t effective_semaphore_limit(size_t configured_limit) {
+        return configured_limit > 0 ? configured_limit : std::numeric_limits<size_t>::max();
+    }
+
+public:
 
     // Set optional async persistence manager (call before serving requests)
     // Uses fire-and-forget queueing to avoid blocking the reactor

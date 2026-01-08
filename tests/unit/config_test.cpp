@@ -1450,6 +1450,68 @@ TEST_F(ConfigTest, ValidationPassesForZeroCertReloadInterval) {
     EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
 }
 
+// =============================================================================
+// Backpressure Configuration Validation Tests
+// =============================================================================
+
+TEST_F(ConfigTest, ValidationPassesForValidBackpressureConfig) {
+    RanvierConfig config;
+    config.backpressure.max_concurrent_requests = 1000;
+    config.backpressure.enable_persistence_backpressure = true;
+    config.backpressure.persistence_queue_threshold = 0.8;
+    config.backpressure.retry_after_seconds = 1;
+
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidationPassesForUnlimitedConcurrency) {
+    RanvierConfig config;
+    config.backpressure.max_concurrent_requests = 0;  // 0 means unlimited
+
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidationFailsForNegativePersistenceThreshold) {
+    RanvierConfig config;
+    config.backpressure.persistence_queue_threshold = -0.1;
+
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("persistence_queue_threshold"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationFailsForThresholdGreaterThanOne) {
+    RanvierConfig config;
+    config.backpressure.persistence_queue_threshold = 1.5;
+
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("persistence_queue_threshold"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationFailsForZeroRetryAfter) {
+    RanvierConfig config;
+    config.backpressure.retry_after_seconds = 0;
+
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("retry_after_seconds"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationPassesForEdgeCaseThresholds) {
+    // Test boundary values: 0.0 and 1.0 should be valid
+    RanvierConfig config;
+    config.backpressure.persistence_queue_threshold = 0.0;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Threshold 0.0 should be valid";
+
+    config.backpressure.persistence_queue_threshold = 1.0;
+    error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Threshold 1.0 should be valid";
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -209,6 +209,51 @@ cluster:
 
 For Kubernetes deployments, DNS-based peer discovery automatically resolves headless service endpoints.
 
+## Backpressure and Stability
+
+Ranvier implements a multi-layer backpressure mechanism to prevent OOM crashes during traffic spikes. The system uses fail-fast rejection (HTTP 503) rather than queueing to maintain predictable latency under load.
+
+### Concurrency Limits
+
+Per-shard semaphore limits prevent unbounded request accumulation:
+
+```yaml
+backpressure:
+  max_concurrent_requests: 1000  # Per shard (0 = unlimited)
+  retry_after_seconds: 1         # Retry-After header value
+```
+
+When the semaphore is exhausted, requests immediately receive HTTP 503 with a `Retry-After` header. The semaphore uses `seastar::try_get_units()` for non-blocking acquisition.
+
+### Persistence Queue Integration
+
+The HTTP controller monitors the `AsyncPersistenceManager` queue depth to prevent memory exhaustion from route learning:
+
+```yaml
+backpressure:
+  enable_persistence_backpressure: true
+  persistence_queue_threshold: 0.8  # 80% of max_queue_depth
+```
+
+When the persistence queue exceeds the threshold, new requests are rejected to allow the queue to drain.
+
+### Gossip Protection
+
+The `GossipService` uses `seastar::gate` to track in-flight gossip tasks:
+
+- `_gossip_task_gate`: Protects route broadcasts during shutdown and resync
+- `start_resync()` / `end_resync()`: Coordinates cluster resynchronization
+- Gates ensure graceful completion of in-flight operations before node shutdown
+
+### Monitoring
+
+The following Prometheus metrics track backpressure events:
+
+| Metric | Description |
+|--------|-------------|
+| `ranvier_http_requests_backpressure_rejected` | Total requests rejected due to backpressure |
+| `ranvier_active_proxy_requests` | Current in-flight proxy requests |
+
 ## Production Readiness
 
 ### Validation Suite

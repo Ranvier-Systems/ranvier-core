@@ -567,7 +567,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id, backend_traceparent](output_stream<char> client_out) -> future<> {
+    // Move gate_holder and semaphore_units into the lambda to keep them alive during streaming.
+    // This ensures the gate stays held and the semaphore slot is occupied until streaming completes.
+    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id, backend_traceparent, gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
 
         // Calculate request deadline
         auto request_deadline = lowres_clock::now() + request_timeout;
@@ -1331,8 +1333,15 @@ bool HttpController::is_persistence_backpressured() const {
         return false;
     }
 
-    // Check if persistence queue is above threshold
-    size_t max_depth = 100000;  // Default from AsyncPersistenceConfig
+    // Check if persistence queue is above threshold.
+    // Note: queue_depth() acquires a mutex, but this is acceptable for backpressure checks:
+    // 1. The mutex is uncontended on most requests (route learning is infrequent)
+    // 2. Operators can disable this check via enable_persistence_backpressure=false
+    // Future optimization: Use an atomic queue size counter if profiling shows contention.
+    size_t max_depth = _persistence->max_queue_depth();
+    if (max_depth == 0) {
+        return false;  // Avoid division by zero; 0 means unlimited
+    }
     size_t current_depth = _persistence->queue_depth();
     double fill_ratio = static_cast<double>(current_depth) / static_cast<double>(max_depth);
 
