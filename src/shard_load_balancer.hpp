@@ -27,6 +27,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/core/metrics_registration.hh>
 
 namespace ranvier {
