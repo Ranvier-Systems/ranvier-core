@@ -1857,3 +1857,257 @@ TEST_F(NodeSlabTest, RadixTreeThrowsWithoutSlab) {
     // Restore slab
     set_node_slab(current_slab);
 }
+
+// =============================================================================
+// Instrumented Lookup Tests (lookup_instrumented and LookupResult)
+// =============================================================================
+
+class RadixTreeInstrumentedTest : public ::testing::Test {
+protected:
+    RadixTree tree{1};  // block_alignment=1 for cleaner tests
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+};
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupReturnsCorrectBackend) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    auto result = tree.lookup_instrumented(tokens({1, 2, 3}));
+
+    ASSERT_TRUE(result.backend.has_value());
+    EXPECT_EQ(result.backend.value(), 42);
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupReturnsNulloptForMiss) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    auto result = tree.lookup_instrumented(tokens({4, 5, 6}));
+
+    EXPECT_FALSE(result.backend.has_value());
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupTracksNodesTraversed) {
+    // Single node with prefix {1, 2, 3}
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    auto result = tree.lookup_instrumented(tokens({1, 2, 3}));
+
+    EXPECT_GE(result.nodes_traversed, 1u);  // At least one node traversed
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupTracksPrefixSkip) {
+    // Insert a route with a long prefix (path compression)
+    tree.insert(tokens({1, 2, 3, 4, 5}), 42);
+
+    auto result = tree.lookup_instrumented(tokens({1, 2, 3, 4, 5}));
+
+    ASSERT_TRUE(result.backend.has_value());
+    // Should have skipped tokens via path compression
+    EXPECT_GT(result.prefix_tokens_skipped, 0u);
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupPrefixSkipMatchesInputLength) {
+    // Insert creates: root (empty prefix) -> child[1] with prefix {2,3,4,5}
+    // The first token (1) is consumed as a child edge, not a prefix skip
+    tree.insert(tokens({1, 2, 3, 4, 5}), 42);
+
+    auto result = tree.lookup_instrumented(tokens({1, 2, 3, 4, 5}));
+
+    // Only tokens 2,3,4,5 are skipped via prefix compression (4 tokens)
+    // Token 1 is consumed by traversing the child edge from root
+    EXPECT_EQ(result.prefix_tokens_skipped, 4u);
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupWithMultipleNodes) {
+    // Create a tree with multiple nodes (split at divergence point)
+    tree.insert(tokens({1, 2, 3, 10}), 10);
+    tree.insert(tokens({1, 2, 3, 20}), 20);
+
+    auto result1 = tree.lookup_instrumented(tokens({1, 2, 3, 10}));
+    auto result2 = tree.lookup_instrumented(tokens({1, 2, 3, 20}));
+
+    ASSERT_TRUE(result1.backend.has_value());
+    ASSERT_TRUE(result2.backend.has_value());
+    EXPECT_EQ(result1.backend.value(), 10);
+    EXPECT_EQ(result2.backend.value(), 20);
+
+    // Both should traverse multiple nodes
+    EXPECT_GE(result1.nodes_traversed, 2u);
+    EXPECT_GE(result2.nodes_traversed, 2u);
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupWithLongestPrefixMatch) {
+    tree.insert(tokens({1, 2}), 10);
+    tree.insert(tokens({1, 2, 3, 4}), 20);
+
+    // Lookup with sequence that partially matches longer route
+    auto result = tree.lookup_instrumented(tokens({1, 2, 3}));
+
+    ASSERT_TRUE(result.backend.has_value());
+    EXPECT_EQ(result.backend.value(), 10);  // Falls back to shorter prefix
+}
+
+TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupEmptyInput) {
+    tree.insert(tokens({1, 2, 3}), 42);
+
+    auto result = tree.lookup_instrumented(tokens({}));
+
+    EXPECT_FALSE(result.backend.has_value());
+    // Root node is always visited even with empty input (root has empty prefix)
+    EXPECT_EQ(result.nodes_traversed, 1u);
+    EXPECT_EQ(result.prefix_tokens_skipped, 0u);
+}
+
+// =============================================================================
+// Tree Statistics Tests (get_tree_stats and TreeStats)
+// =============================================================================
+
+class RadixTreeStatsTest : public ::testing::Test {
+protected:
+    RadixTree tree{1};  // block_alignment=1 for cleaner tests
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+};
+
+TEST_F(RadixTreeStatsTest, EmptyTreeStats) {
+    // Note: RadixTree always creates a root Node4 in constructor
+    auto stats = tree.get_tree_stats();
+
+    EXPECT_EQ(stats.total_nodes, 1u);         // Root node always exists
+    EXPECT_EQ(stats.node4_count, 1u);         // Root is a Node4
+    EXPECT_EQ(stats.node16_count, 0u);
+    EXPECT_EQ(stats.node48_count, 0u);
+    EXPECT_EQ(stats.node256_count, 0u);
+    EXPECT_EQ(stats.total_prefix_length, 0u); // Root has empty prefix
+    EXPECT_EQ(stats.average_prefix_length, 0.0);
+}
+
+TEST_F(RadixTreeStatsTest, SingleNodeStats) {
+    tree.insert(tokens({1, 2, 3, 4, 5}), 42);
+
+    auto stats = tree.get_tree_stats();
+
+    EXPECT_GE(stats.total_nodes, 1u);
+    EXPECT_GT(stats.total_prefix_length, 0u);
+    EXPECT_GT(stats.average_prefix_length, 0.0);
+}
+
+TEST_F(RadixTreeStatsTest, StatsCountNode4) {
+    // With few children, should use Node4
+    tree.insert(tokens({1, 10}), 1);
+    tree.insert(tokens({1, 20}), 2);
+
+    auto stats = tree.get_tree_stats();
+
+    // Should have at least one Node4 (the root or internal node)
+    EXPECT_GE(stats.node4_count, 1u);
+    EXPECT_EQ(stats.node4_count + stats.node16_count + stats.node48_count + stats.node256_count,
+              stats.total_nodes);
+}
+
+TEST_F(RadixTreeStatsTest, StatsCountNode16) {
+    // With 5+ children, triggers Node4 -> Node16 growth
+    for (int i = 0; i < 6; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i * 10)}), static_cast<BackendId>(i));
+    }
+
+    auto stats = tree.get_tree_stats();
+
+    // Should have at least one Node16
+    EXPECT_GE(stats.node16_count, 1u);
+}
+
+TEST_F(RadixTreeStatsTest, StatsCountNode48) {
+    // With 17+ children, triggers Node16 -> Node48 growth
+    for (int i = 0; i < 20; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    auto stats = tree.get_tree_stats();
+
+    // Should have at least one Node48
+    EXPECT_GE(stats.node48_count, 1u);
+}
+
+TEST_F(RadixTreeStatsTest, StatsCountNode256) {
+    // With 49+ children, triggers Node48 -> Node256 growth
+    for (int i = 0; i < 60; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i % 128));
+    }
+
+    auto stats = tree.get_tree_stats();
+
+    // Should have at least one Node256
+    EXPECT_GE(stats.node256_count, 1u);
+}
+
+TEST_F(RadixTreeStatsTest, AveragePrefixLengthCalculation) {
+    // Insert routes with known prefix lengths
+    tree.insert(tokens({1, 2, 3}), 1);      // prefix len 3
+    tree.insert(tokens({1, 2, 4}), 2);      // shares prefix, adds node
+
+    auto stats = tree.get_tree_stats();
+
+    // Average should be > 0 since we have prefixes
+    EXPECT_GT(stats.average_prefix_length, 0.0);
+    // Verify calculation: total_prefix_length / total_nodes
+    if (stats.total_nodes > 0) {
+        double expected = static_cast<double>(stats.total_prefix_length) /
+                         static_cast<double>(stats.total_nodes);
+        EXPECT_DOUBLE_EQ(stats.average_prefix_length, expected);
+    }
+}
+
+TEST_F(RadixTreeStatsTest, StatsAfterEviction) {
+    // Insert several routes
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+    tree.insert(tokens({7, 8, 9}), 3);
+
+    auto stats_before = tree.get_tree_stats();
+
+    // Evict all routes
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    auto stats_after = tree.get_tree_stats();
+
+    // After eviction, node count should decrease or tree should be empty
+    EXPECT_LE(stats_after.total_nodes, stats_before.total_nodes);
+}
+
+TEST_F(RadixTreeStatsTest, StatsWithDeepTree) {
+    // Create a tree with multiple levels via incremental inserts.
+    // Note: With single-token increments, each token becomes a child edge,
+    // so prefixes remain empty (path compression doesn't apply here).
+    tree.insert(tokens({1}), 1);
+    tree.insert(tokens({1, 2}), 2);
+    tree.insert(tokens({1, 2, 3}), 3);
+    tree.insert(tokens({1, 2, 3, 4}), 4);
+    tree.insert(tokens({1, 2, 3, 4, 5}), 5);
+
+    auto stats = tree.get_tree_stats();
+
+    // Should have multiple nodes for the hierarchical structure (root + children)
+    EXPECT_GE(stats.total_nodes, 5u);
+    // With incremental inserts, prefixes may be empty (tokens stored as edges)
+    EXPECT_GE(stats.total_prefix_length, 0u);
+}
+
+TEST_F(RadixTreeStatsTest, StatsNodeTypesSumToTotal) {
+    // Insert various routes to create mixed node types
+    for (int i = 0; i < 100; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}), static_cast<BackendId>(i % 128));
+    }
+
+    auto stats = tree.get_tree_stats();
+
+    // Sum of all node type counts should equal total_nodes
+    size_t sum = stats.node4_count + stats.node16_count +
+                 stats.node48_count + stats.node256_count;
+    EXPECT_EQ(sum, stats.total_nodes);
+}

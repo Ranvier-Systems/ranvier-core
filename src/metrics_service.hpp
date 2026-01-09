@@ -219,7 +219,21 @@ public:
                         return 0.0;  // Avoid divide-by-zero on startup
                     }
                     return static_cast<double>(_cache_hits) / static_cast<double>(total);
-                })
+                }),
+
+            // ================================================================
+            // Radix Tree Path Compression Metric
+            // Note: Lookup hit/miss counters, node counts, and slab utilization
+            // are registered in RouterService where the RadixTree and NodeSlab
+            // are accessible. This gauge aggregates path compression efficiency.
+            // ================================================================
+
+            // Average prefix skip length: measures path compression effectiveness
+            // Higher values indicate more efficient tree structure (fewer nodes traversed per lookup)
+            // This is the running average of tokens skipped via path compression during lookups
+            seastar::metrics::make_gauge("radix_tree_average_prefix_skip_length",
+                seastar::metrics::description("Average tokens skipped per lookup via path compression. Higher = better tree structure."),
+                [this] { return get_average_prefix_skip_length(); })
         });
     }
 
@@ -239,6 +253,25 @@ public:
     void record_cache_miss() { _cache_misses++; }
     uint64_t get_cache_hits() const { return _cache_hits; }
     uint64_t get_cache_misses() const { return _cache_misses; }
+
+    // Radix tree lookup hit/miss tracking
+    // Hits: lookup found a valid Backend route
+    // Misses: lookup failed to find any matching route
+    void record_radix_tree_lookup_hit() { _radix_tree_lookup_hits++; }
+    void record_radix_tree_lookup_miss() { _radix_tree_lookup_misses++; }
+    uint64_t get_radix_tree_lookup_hits() const { return _radix_tree_lookup_hits; }
+    uint64_t get_radix_tree_lookup_misses() const { return _radix_tree_lookup_misses; }
+
+    // Prefix skip length tracking for path compression efficiency
+    // Records the length of prefixes skipped during tree traversal
+    void record_prefix_skip(size_t length) {
+        _prefix_skip_length_sum += length;
+        _prefix_skip_count++;
+    }
+    double get_average_prefix_skip_length() const {
+        if (_prefix_skip_count == 0) return 0.0;
+        return static_cast<double>(_prefix_skip_length_sum) / static_cast<double>(_prefix_skip_count);
+    }
 
     // Record circuit breaker events
     void record_circuit_open() { _circuit_opens++; }
@@ -327,6 +360,17 @@ private:
     // Shard-local for lock-free hot path performance
     uint64_t _cache_hits = 0;
     uint64_t _cache_misses = 0;
+
+    // Radix tree lookup counters for efficiency tracking
+    // Hits: lookup found a valid Backend
+    // Misses: lookup failed to find a route
+    uint64_t _radix_tree_lookup_hits = 0;
+    uint64_t _radix_tree_lookup_misses = 0;
+
+    // Prefix skip length accumulator for path compression efficiency
+    // sum / count = average prefix skip length
+    uint64_t _prefix_skip_length_sum = 0;
+    uint64_t _prefix_skip_count = 0;
 
     // Active requests gauge
     uint64_t _active_requests = 0;

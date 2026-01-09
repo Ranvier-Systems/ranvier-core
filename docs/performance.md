@@ -157,6 +157,24 @@ Key Prometheus metrics to track performance:
 | `ranvier_pool_connections_reused` | Connection pool efficiency | High rate |
 | `ranvier_cluster_peers_alive` | Healthy cluster nodes | = expected nodes |
 
+### Radix Tree Performance Metrics
+
+These metrics help operators tune the tokenizer and routing table for maximum throughput:
+
+| Metric | Description | Interpretation |
+|--------|-------------|----------------|
+| `ranvier_radix_tree_lookup_hits_total` | Successful route lookups | Higher = better cache efficiency |
+| `ranvier_radix_tree_lookup_misses_total` | Failed route lookups | Monitor miss rate for capacity planning |
+| `ranvier_radix_tree_node_count{node_type="Node4\|16\|48\|256"}` | Node counts by type | High Node256 count may indicate suboptimal tokenization |
+| `ranvier_radix_tree_slab_utilization_ratio` | Slab memory efficiency (0.0-1.0) | Target >0.7 for good memory utilization |
+| `ranvier_radix_tree_average_prefix_skip_length` | Avg tokens skipped via path compression | Higher = better tree structure |
+
+**Tuning Guidance:**
+
+- **Low slab utilization (<0.5)**: Routes may have been evicted. Consider increasing `router.max_routes`.
+- **Low average prefix skip (<2.0)**: Tree has poor path compression. Check if tokenizer produces diverse first tokens.
+- **High Node256 ratio (>20%)**: May indicate tokenizer produces many unique first bytes. Consider adjusting `router.min_token_length`.
+
 ### Grafana Query Examples
 
 ```promql
@@ -166,6 +184,19 @@ sum(rate(ranvier_router_cache_hits[5m])) /
 
 # P99 latency by shard
 histogram_quantile(0.99, sum(rate(ranvier_http_request_duration_seconds_bucket[5m])) by (le, shard))
+
+# Radix tree lookup hit ratio
+sum(rate(ranvier_radix_tree_lookup_hits_total[5m])) /
+(sum(rate(ranvier_radix_tree_lookup_hits_total[5m])) + sum(rate(ranvier_radix_tree_lookup_misses_total[5m])))
+
+# Node type distribution (per shard)
+ranvier_radix_tree_node_count
+
+# Slab memory utilization
+avg(ranvier_radix_tree_slab_utilization_ratio)
+
+# Path compression effectiveness
+avg(ranvier_radix_tree_average_prefix_skip_length)
 ```
 
 ---

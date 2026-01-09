@@ -85,9 +85,15 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/node_slab.hpp`, `src/node_slab.cpp`, `src/router_service.cpp`
   _Complexity:_ High
 
-- [ ] **Add memory usage metrics per Radix Tree**
+- [x] **Add memory usage metrics per Radix Tree** ✓
   _Justification:_ No visibility into per-shard memory consumption. Required for capacity planning and debugging memory leaks.
-  _Location:_ `src/radix_tree.hpp`, `src/metrics_service.hpp`
+  _Approach:_ Added comprehensive radix tree performance metrics:
+  - `radix_tree_lookup_hits_total` / `radix_tree_lookup_misses_total`: Track lookup efficiency
+  - `radix_tree_node_count{node_type}`: Node counts by type (Node4/16/48/256) for memory distribution
+  - `radix_tree_slab_utilization_ratio`: Used vs pre-allocated slab memory (0.0-1.0)
+  - `radix_tree_average_prefix_skip_length`: Path compression effectiveness metric
+  Also added `lookup_instrumented()` method to RadixTree for detailed lookup statistics, and `get_tree_stats()` for tree structure analysis.
+  _Location:_ `src/radix_tree.hpp`, `src/metrics_service.hpp`, `src/router_service.cpp`
   _Complexity:_ Low
 
 ### 1.5 Shard-Aware Load Balancing
@@ -520,6 +526,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P2 - Medium** | DX | Sharded configuration for per-core access | Medium | ✅ Done |
 | **P3 - Low** | DX | Encapsulate SQLite store within AsyncPersistenceManager | Low | ✅ Done |
 | **P3 - Low** | Performance | Async file I/O for tokenizer loading | Low | ✅ Done |
+| **P3 - Low** | Observability | Radix tree performance metrics | Low | ✅ Done |
 
 ---
 
@@ -529,6 +536,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-09 | Add radix tree performance metrics (lookup hits/misses, node counts, slab utilization, path compression avg) | - |
 | 2026-01-09 | Quorum enforcement and DTLS lockdown (recently-seen quorum check, mTLS lockdown mode, sequence number hardening) | - |
 | 2026-01-08 | Implement shard-aware P2C load balancer (per-shard metrics, cross-shard dispatch, zero-copy transfer) | - |
 | 2026-01-07 | Implement system-wide backpressure mechanism (semaphore concurrency limits, persistence queue integration, gossip gate protection) | - |
