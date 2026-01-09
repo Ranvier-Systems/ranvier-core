@@ -64,6 +64,10 @@ thread_local uint64_t stats_routes_evicted = 0;
 thread_local uint64_t stats_routes_expired = 0;
 thread_local uint64_t stats_cluster_routes_pruned = 0;
 
+// Radix tree performance counters (for radix_tree_lookup_hits/misses_total)
+thread_local uint64_t stats_radix_tree_lookup_hits = 0;
+thread_local uint64_t stats_radix_tree_lookup_misses = 0;
+
 // Thread-local routing configuration (set during shard initialization)
 thread_local size_t local_max_routes = 100000;
 thread_local std::chrono::seconds local_ttl_seconds{3600};
@@ -183,7 +187,88 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_cluster_routes_pruned", stats_cluster_routes_pruned,
             seastar::metrics::description("Total number of routes pruned when cluster peer fails")),
         seastar::metrics::make_counter("router_prefix_affinity_routes", stats_prefix_affinity_routes,
-            seastar::metrics::description("Total number of requests routed via prefix affinity"))
+            seastar::metrics::description("Total number of requests routed via prefix affinity")),
+
+        // ====================================================================
+        // Radix Tree Performance Metrics
+        // ====================================================================
+
+        // Radix tree lookup hits: when find_node successfully finds a route
+        seastar::metrics::make_counter("radix_tree_lookup_hits_total", stats_radix_tree_lookup_hits,
+            seastar::metrics::description("Total number of radix tree lookups that found a valid Backend")),
+
+        // Radix tree lookup misses: when find_node fails to find a route
+        seastar::metrics::make_counter("radix_tree_lookup_misses_total", stats_radix_tree_lookup_misses,
+            seastar::metrics::description("Total number of radix tree lookups that failed to find a route")),
+
+        // Node count by type (Node4, Node16, Node48, Node256) - uses NodeSlab statistics
+        seastar::metrics::make_gauge("radix_tree_node_count",
+            seastar::metrics::description("Total number of radix tree nodes allocated (Node4 pool)"),
+            {{"node_type", "Node4"}},
+            [] {
+                NodeSlab* slab = get_node_slab();
+                if (!slab) return static_cast<double>(0);
+                auto stats = slab->get_stats();
+                return static_cast<double>(stats.allocated_nodes[0]);
+            }),
+        seastar::metrics::make_gauge("radix_tree_node_count",
+            seastar::metrics::description("Total number of radix tree nodes allocated (Node16 pool)"),
+            {{"node_type", "Node16"}},
+            [] {
+                NodeSlab* slab = get_node_slab();
+                if (!slab) return static_cast<double>(0);
+                auto stats = slab->get_stats();
+                return static_cast<double>(stats.allocated_nodes[1]);
+            }),
+        seastar::metrics::make_gauge("radix_tree_node_count",
+            seastar::metrics::description("Total number of radix tree nodes allocated (Node48 pool)"),
+            {{"node_type", "Node48"}},
+            [] {
+                NodeSlab* slab = get_node_slab();
+                if (!slab) return static_cast<double>(0);
+                auto stats = slab->get_stats();
+                return static_cast<double>(stats.allocated_nodes[2]);
+            }),
+        seastar::metrics::make_gauge("radix_tree_node_count",
+            seastar::metrics::description("Total number of radix tree nodes allocated (Node256 pool)"),
+            {{"node_type", "Node256"}},
+            [] {
+                NodeSlab* slab = get_node_slab();
+                if (!slab) return static_cast<double>(0);
+                auto stats = slab->get_stats();
+                return static_cast<double>(stats.allocated_nodes[3]);
+            }),
+
+        // Slab utilization ratio: used / (used + free) for memory efficiency monitoring
+        // A ratio close to 1.0 indicates high memory efficiency (little fragmentation)
+        // A low ratio may indicate memory fragmentation or over-allocation
+        seastar::metrics::make_gauge("radix_tree_slab_utilization_ratio",
+            seastar::metrics::description("Ratio of used to total pre-allocated slab memory (0.0-1.0). Higher values indicate better memory efficiency."),
+            [] {
+                NodeSlab* slab = get_node_slab();
+                if (!slab) return 0.0;
+                auto stats = slab->get_stats();
+                // Calculate total allocated and total capacity across all pools
+                size_t total_allocated = 0;
+                size_t total_capacity = 0;
+                for (size_t i = 0; i < 4; i++) {
+                    total_allocated += stats.allocated_nodes[i];
+                    total_capacity += stats.allocated_nodes[i] + stats.free_list_size[i];
+                }
+                if (total_capacity == 0) return 0.0;
+                return static_cast<double>(total_allocated) / static_cast<double>(total_capacity);
+            }),
+
+        // Average prefix skip length: measures path compression effectiveness
+        // Higher values indicate the tree is efficiently skipping tokens via compressed prefixes
+        seastar::metrics::make_gauge("radix_tree_average_prefix_skip_length",
+            seastar::metrics::description("Average number of tokens skipped per prefix during tree traversal. Higher values indicate better path compression."),
+            [] {
+                if (g_metrics) {
+                    return metrics().get_average_prefix_skip_length();
+                }
+                return 0.0;
+            })
     });
 }
 
@@ -250,7 +335,29 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
                                                  const std::string& request_id) {
     RadixTree* tree = local_tree();
     if (!tree) return std::nullopt;
-    auto result = tree->lookup(tokens);
+
+    // Use instrumented lookup to track prefix skip lengths for path compression metrics
+    auto lookup_result = tree->lookup_instrumented(tokens);
+    auto result = lookup_result.backend;
+
+    // Record radix tree lookup hit/miss for performance metrics
+    if (result.has_value()) {
+        stats_radix_tree_lookup_hits++;
+        if (g_metrics) {
+            metrics().record_radix_tree_lookup_hit();
+            // Record prefix skip length for path compression efficiency tracking
+            if (lookup_result.nodes_traversed > 0) {
+                // Average prefix skip per node = total skipped / nodes traversed
+                size_t avg_skip = lookup_result.prefix_tokens_skipped / lookup_result.nodes_traversed;
+                metrics().record_prefix_skip(avg_skip);
+            }
+        }
+    } else {
+        stats_radix_tree_lookup_misses++;
+        if (g_metrics) {
+            metrics().record_radix_tree_lookup_miss();
+        }
+    }
 
     // Circuit breaker: if cache hit points to dead backend, treat as miss
     if (result.has_value()) {

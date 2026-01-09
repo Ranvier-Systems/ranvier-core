@@ -119,6 +119,24 @@ struct RouteEntry {
     std::chrono::steady_clock::time_point last_accessed;
 };
 
+// Statistics about tree structure for performance monitoring
+struct TreeStats {
+    size_t total_nodes = 0;           // Total number of nodes in tree
+    size_t node4_count = 0;           // Number of Node4 nodes
+    size_t node16_count = 0;          // Number of Node16 nodes
+    size_t node48_count = 0;          // Number of Node48 nodes
+    size_t node256_count = 0;         // Number of Node256 nodes
+    size_t total_prefix_length = 0;   // Sum of all prefix lengths
+    double average_prefix_length = 0; // Average prefix length (path compression effectiveness)
+};
+
+// Result from lookup with instrumentation data
+struct LookupResult {
+    std::optional<BackendId> backend;
+    size_t prefix_tokens_skipped = 0; // Tokens skipped via path compression
+    size_t nodes_traversed = 0;       // Number of nodes visited during lookup
+};
+
 // =============================================================================
 // RadixTree Class
 // =============================================================================
@@ -158,7 +176,25 @@ public:
         return lookup_recursive(root_.get(), tokens);
     }
 
+    // Instrumented lookup that returns performance metrics alongside the result
+    // Use this variant when you need to track prefix skip lengths for metrics
+    LookupResult lookup_instrumented(std::span<const TokenId> tokens) {
+        return lookup_with_stats(root_.get(), tokens);
+    }
+
     size_t route_count() const { return route_count_; }
+
+    // Calculate tree statistics for monitoring path compression effectiveness
+    TreeStats get_tree_stats() const {
+        TreeStats stats;
+        calculate_tree_stats(root_.get(), stats);
+        if (stats.total_nodes > 0) {
+            stats.average_prefix_length =
+                static_cast<double>(stats.total_prefix_length) /
+                static_cast<double>(stats.total_nodes);
+        }
+        return stats;
+    }
 
     template<typename Callback>
     void for_each_leaf(Callback&& callback) const {
@@ -681,6 +717,108 @@ private:
                 break;
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Tree Statistics Implementation
+    // -------------------------------------------------------------------------
+
+    void calculate_tree_stats(Node* node, TreeStats& stats) const {
+        if (!node) return;
+
+        stats.total_nodes++;
+        stats.total_prefix_length += node->prefix.size();
+
+        switch (node->type) {
+            case NodeType::Node4:
+                stats.node4_count++;
+                break;
+            case NodeType::Node16:
+                stats.node16_count++;
+                break;
+            case NodeType::Node48:
+                stats.node48_count++;
+                break;
+            case NodeType::Node256:
+                stats.node256_count++;
+                break;
+        }
+
+        visit_children(node, [this, &stats](TokenId, Node* child) {
+            calculate_tree_stats(child, stats);
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Instrumented Lookup Implementation
+    // -------------------------------------------------------------------------
+
+    // Lookup with performance instrumentation
+    // Returns LookupResult with prefix_tokens_skipped and nodes_traversed
+    LookupResult lookup_with_stats(Node* node, std::span<const TokenId> tokens) {
+        LookupResult result;
+        std::optional<BackendId> best_match = std::nullopt;
+        Node* best_match_node = nullptr;
+
+        while (node != nullptr) {
+            result.nodes_traversed++;
+
+            // Check prefix match
+            const auto& prefix = node->prefix;
+            size_t prefix_len = prefix.size();
+            size_t tokens_len = tokens.size();
+            size_t match_len = 0;
+
+            // Fast prefix comparison
+            while (match_len < prefix_len && match_len < tokens_len) {
+                if (prefix[match_len] != tokens[match_len]) {
+                    // Prefix mismatch - return best match so far
+                    if (best_match_node) {
+                        best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    }
+                    result.backend = best_match;
+                    return result;
+                }
+                match_len++;
+            }
+
+            // Track tokens skipped via path compression
+            result.prefix_tokens_skipped += match_len;
+
+            // Input shorter than prefix - return best match
+            if (match_len < prefix_len) {
+                if (best_match_node) {
+                    best_match_node->last_accessed = std::chrono::steady_clock::now();
+                }
+                result.backend = best_match;
+                return result;
+            }
+
+            // Update best match if this node has a value
+            if (node->leaf_value.has_value()) {
+                best_match = node->leaf_value;
+                best_match_node = node;
+            }
+
+            // Advance past matched prefix
+            tokens = tokens.subspan(match_len);
+
+            // If no more tokens, we're done
+            if (tokens.empty()) [[unlikely]] {
+                break;
+            }
+
+            // Find child for next token
+            node = find_child(node, tokens[0]);
+            tokens = tokens.subspan(1);
+        }
+
+        // Touch LRU timestamp for matched node
+        if (best_match_node) {
+            best_match_node->last_accessed = std::chrono::steady_clock::now();
+        }
+        result.backend = best_match;
+        return result;
     }
 
     // -------------------------------------------------------------------------
