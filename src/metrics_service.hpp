@@ -222,21 +222,17 @@ public:
                 }),
 
             // ================================================================
-            // Radix Tree Performance Metrics
+            // Radix Tree Path Compression Metric
+            // Note: Lookup hit/miss counters, node counts, and slab utilization
+            // are registered in RouterService where the RadixTree and NodeSlab
+            // are accessible. This gauge aggregates path compression efficiency.
             // ================================================================
-
-            // Radix tree lookup hit counter: incremented when lookup finds a valid Backend
-            seastar::metrics::make_counter("radix_tree_lookup_hits_total", _radix_tree_lookup_hits,
-                seastar::metrics::description("Total number of radix tree lookups that found a valid Backend route")),
-
-            // Radix tree lookup miss counter: incremented when lookup fails to find a route
-            seastar::metrics::make_counter("radix_tree_lookup_misses_total", _radix_tree_lookup_misses,
-                seastar::metrics::description("Total number of radix tree lookups that failed to find a route")),
 
             // Average prefix skip length: measures path compression effectiveness
             // Higher values indicate more efficient tree structure (fewer nodes traversed per lookup)
+            // This is the running average of tokens skipped via path compression during lookups
             seastar::metrics::make_gauge("radix_tree_average_prefix_skip_length",
-                seastar::metrics::description("Average number of tokens skipped per prefix during tree traversal. Higher values indicate better path compression."),
+                seastar::metrics::description("Average tokens skipped per lookup via path compression. Higher = better tree structure."),
                 [this] { return get_average_prefix_skip_length(); })
         });
     }

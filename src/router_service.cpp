@@ -257,18 +257,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                 }
                 if (total_capacity == 0) return 0.0;
                 return static_cast<double>(total_allocated) / static_cast<double>(total_capacity);
-            }),
-
-        // Average prefix skip length: measures path compression effectiveness
-        // Higher values indicate the tree is efficiently skipping tokens via compressed prefixes
-        seastar::metrics::make_gauge("radix_tree_average_prefix_skip_length",
-            seastar::metrics::description("Average number of tokens skipped per prefix during tree traversal. Higher values indicate better path compression."),
-            [] {
-                if (g_metrics) {
-                    return metrics().get_average_prefix_skip_length();
-                }
-                return 0.0;
             })
+        // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
+        // since it aggregates path compression data across all lookups via record_prefix_skip()
     });
 }
 
@@ -346,10 +337,10 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
         if (g_metrics) {
             metrics().record_radix_tree_lookup_hit();
             // Record prefix skip length for path compression efficiency tracking
-            if (lookup_result.nodes_traversed > 0) {
-                // Average prefix skip per node = total skipped / nodes traversed
-                size_t avg_skip = lookup_result.prefix_tokens_skipped / lookup_result.nodes_traversed;
-                metrics().record_prefix_skip(avg_skip);
+            // We record the total tokens skipped via path compression during this lookup.
+            // The MetricsService tracks the running average across all lookups.
+            if (lookup_result.prefix_tokens_skipped > 0) {
+                metrics().record_prefix_skip(lookup_result.prefix_tokens_skipped);
             }
         }
     } else {
