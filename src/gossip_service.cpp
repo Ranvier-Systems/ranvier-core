@@ -1675,10 +1675,6 @@ void GossipService::initialize_crypto_offloader() {
 
     CryptoOffloaderConfig offloader_config;
 
-    // Configure based on cluster config
-    // Use 2 worker threads by default (enough for typical cluster sizes)
-    offloader_config.thread_pool_size = 2;
-
     // Size threshold: offload operations on data larger than 1KB
     offloader_config.size_threshold_bytes = CRYPTO_OFFLOAD_BYTES_THRESHOLD;
 
@@ -1706,11 +1702,12 @@ void GossipService::initialize_crypto_offloader() {
     // Register offloader metrics
     _crypto_offloader->register_metrics(_metrics);
 
-    log_gossip.info("Crypto offloader initialized with {} worker threads", offloader_config.thread_pool_size);
-    log_gossip.info("Adaptive offloading thresholds: size={}B, stall={}μs, offload={}μs",
+    log_gossip.info("Crypto offloader initialized (seastar::async mode)");
+    log_gossip.info("Adaptive offloading thresholds: size={}B, stall={}μs, offload={}μs, max_queue={}",
                     offloader_config.size_threshold_bytes,
                     offloader_config.stall_threshold_us,
-                    offloader_config.offload_latency_threshold_us);
+                    offloader_config.offload_latency_threshold_us,
+                    offloader_config.max_queue_depth);
 }
 
 seastar::future<std::vector<uint8_t>> GossipService::encrypt_with_offloading(

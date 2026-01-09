@@ -23,6 +23,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <type_traits>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/thread.hh>
@@ -48,24 +49,34 @@ enum class CryptoOpType : uint8_t {
     UNKNOWN
 };
 
+// Convert CryptoOpType to string for logging
+inline const char* crypto_op_type_name(CryptoOpType type) {
+    switch (type) {
+        case CryptoOpType::SYMMETRIC_ENCRYPT: return "symmetric_encrypt";
+        case CryptoOpType::SYMMETRIC_DECRYPT: return "symmetric_decrypt";
+        case CryptoOpType::HANDSHAKE_INITIATE: return "handshake_initiate";
+        case CryptoOpType::HANDSHAKE_CONTINUE: return "handshake_continue";
+        case CryptoOpType::UNKNOWN: return "unknown";
+        default: return "invalid";
+    }
+}
+
 // Crypto operation statistics
 struct CryptoOpStats {
     uint64_t total_ops = 0;              // Total crypto operations
-    uint64_t offloaded_ops = 0;          // Operations offloaded to thread pool
+    uint64_t offloaded_ops = 0;          // Operations offloaded to seastar::async
     uint64_t inline_ops = 0;             // Operations run inline on reactor
     uint64_t stalls_avoided = 0;         // Offloads that avoided potential stalls
     uint64_t stall_warnings = 0;         // Operations that exceeded stall threshold
     uint64_t handshakes_offloaded = 0;   // Handshake operations offloaded
     uint64_t symmetric_ops_inline = 0;   // Symmetric ops run inline
-    uint64_t thread_pool_queue_depth = 0; // Current queue depth
-    uint64_t thread_pool_peak_depth = 0; // Peak queue depth seen
+    uint64_t queue_depth = 0;            // Current in-flight async ops
+    uint64_t queue_peak = 0;             // Peak in-flight async ops
+    uint64_t queue_rejected = 0;         // Operations rejected due to queue limit
 };
 
 // Configuration for the crypto offloader
 struct CryptoOffloaderConfig {
-    // Number of worker threads in the pool
-    size_t thread_pool_size = 2;
-
     // Threshold for offloading based on data size (bytes)
     // Operations on data larger than this are more likely to be offloaded
     size_t size_threshold_bytes = 1024;
@@ -78,7 +89,8 @@ struct CryptoOffloaderConfig {
     // If predicted latency exceeds this, operation is offloaded
     uint64_t offload_latency_threshold_us = 100;
 
-    // Maximum queue depth before rejecting new operations
+    // Maximum number of in-flight async operations
+    // New operations are run inline when this limit is reached
     size_t max_queue_depth = 1024;
 
     // Enable/disable adaptive offloading
@@ -92,40 +104,6 @@ struct CryptoOffloaderConfig {
 
     // Always offload handshake operations
     bool handshake_always_offload = true;
-};
-
-// Forward declaration
-class CryptoOffloader;
-
-// Result holder for async crypto operations
-template<typename T>
-class CryptoOpResult {
-public:
-    CryptoOpResult() = default;
-    explicit CryptoOpResult(T value) : _value(std::move(value)), _has_value(true) {}
-
-    bool has_value() const { return _has_value; }
-    T& value() { return _value; }
-    const T& value() const { return _value; }
-
-    void set_value(T value) {
-        _value = std::move(value);
-        _has_value = true;
-    }
-
-    void set_error(std::string error) {
-        _error = std::move(error);
-        _has_error = true;
-    }
-
-    bool has_error() const { return _has_error; }
-    const std::string& error() const { return _error; }
-
-private:
-    T _value{};
-    std::string _error;
-    bool _has_value = false;
-    bool _has_error = false;
 };
 
 // Adaptive Crypto Offloader
@@ -150,14 +128,16 @@ public:
     // Stop the offloader
     void stop();
 
-    // Check if the offloader is running
-    bool is_running() const { return _running.load(std::memory_order_acquire); }
+    // Check if the offloader is running and enabled
+    bool is_running() const {
+        return _running.load(std::memory_order_acquire) && _config.enabled;
+    }
 
     // Wrap a crypto operation with adaptive offloading
     //
     // The operation will be executed either:
     // - Inline on the reactor thread (for fast symmetric ops)
-    // - On a background thread (for slow asymmetric ops or large data)
+    // - In a seastar::async context (for slow asymmetric ops or large data)
     //
     // Returns a future that resolves when the operation completes.
     //
@@ -173,13 +153,6 @@ public:
         size_t data_size,
         Func&& func);
 
-    // Wrap a crypto operation that returns void
-    template<typename Func>
-    seastar::future<> wrap_crypto_op_void(
-        CryptoOpType op_type,
-        size_t data_size,
-        Func&& func);
-
     // Get current statistics (thread-safe snapshot)
     CryptoOpStats get_stats() const;
 
@@ -187,19 +160,22 @@ public:
     size_t queue_depth() const { return _queue_depth.load(std::memory_order_relaxed); }
 
     // Predict whether an operation should be offloaded
-    // Returns true if the operation should be offloaded to thread pool
+    // Returns true if the operation should be offloaded
     bool should_offload(CryptoOpType op_type, size_t data_size) const;
 
     // Register metrics with Seastar metrics system
     void register_metrics(seastar::metrics::metric_groups& metrics);
 
+    // Get the configuration
+    const CryptoOffloaderConfig& config() const { return _config; }
+
 private:
     CryptoOffloaderConfig _config;
     std::atomic<bool> _running{false};
-    std::atomic<bool> _stopping{false};
 
     // Metrics for tracking in-flight async operations
     std::atomic<size_t> _queue_depth{0};
+    std::atomic<size_t> _peak_queue_depth{0};
 
     // Statistics (atomic for thread-safe updates)
     mutable std::atomic<uint64_t> _total_ops{0};
@@ -209,20 +185,26 @@ private:
     mutable std::atomic<uint64_t> _stall_warnings{0};
     mutable std::atomic<uint64_t> _handshakes_offloaded{0};
     mutable std::atomic<uint64_t> _symmetric_ops_inline{0};
-    mutable std::atomic<size_t> _peak_queue_depth{0};
-
-    // Worker thread function (not used in seastar::async mode)
-    void worker_loop();
-
-    // Submit work using seastar::async
-    // Returns a future that resolves when the work is complete
-    seastar::future<> submit_work(std::function<void()> task);
+    mutable std::atomic<uint64_t> _queue_rejected{0};
 
     // Estimate operation latency in microseconds
     uint64_t estimate_latency_us(CryptoOpType op_type, size_t data_size) const;
 
-    // Update peak queue depth
+    // Update peak queue depth atomically
     void update_peak_depth();
+
+    // Execute operation inline with timing instrumentation
+    template<typename Func>
+    seastar::future<std::invoke_result_t<Func>> execute_inline(
+        CryptoOpType op_type,
+        size_t data_size,
+        Func&& func);
+
+    // Execute operation in seastar::async context
+    template<typename Func>
+    seastar::future<std::invoke_result_t<Func>> execute_offloaded(
+        CryptoOpType op_type,
+        Func&& func);
 };
 
 //------------------------------------------------------------------------------
@@ -230,28 +212,38 @@ private:
 //------------------------------------------------------------------------------
 
 template<typename Func>
-seastar::future<std::invoke_result_t<Func>> CryptoOffloader::wrap_crypto_op(
+seastar::future<std::invoke_result_t<Func>> CryptoOffloader::execute_inline(
     CryptoOpType op_type,
     size_t data_size,
     Func&& func) {
 
     using ResultType = std::invoke_result_t<Func>;
 
-    ++_total_ops;
+    ++_inline_ops;
 
-    // Check if we should offload this operation
-    if (!should_offload(op_type, data_size)) {
-        // Run inline on reactor thread with timing
-        ++_inline_ops;
+    if (op_type == CryptoOpType::SYMMETRIC_ENCRYPT ||
+        op_type == CryptoOpType::SYMMETRIC_DECRYPT) {
+        ++_symmetric_ops_inline;
+    }
 
-        if (op_type == CryptoOpType::SYMMETRIC_ENCRYPT ||
-            op_type == CryptoOpType::SYMMETRIC_DECRYPT) {
-            ++_symmetric_ops_inline;
-        }
+    auto start = std::chrono::steady_clock::now();
 
-        auto start = std::chrono::steady_clock::now();
+    try {
+        if constexpr (std::is_void_v<ResultType>) {
+            func();
 
-        try {
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+
+            if (static_cast<uint64_t>(elapsed_us) > _config.stall_threshold_us) {
+                ++_stall_warnings;
+                log_crypto_offloader.warn(
+                    "Inline crypto op exceeded stall threshold: {}μs (threshold: {}μs, type: {}, size: {})",
+                    elapsed_us, _config.stall_threshold_us, crypto_op_type_name(op_type), data_size);
+            }
+
+            return seastar::make_ready_future<>();
+        } else {
             ResultType result = func();
 
             auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -261,16 +253,27 @@ seastar::future<std::invoke_result_t<Func>> CryptoOffloader::wrap_crypto_op(
                 ++_stall_warnings;
                 log_crypto_offloader.warn(
                     "Inline crypto op exceeded stall threshold: {}μs (threshold: {}μs, type: {}, size: {})",
-                    elapsed_us, _config.stall_threshold_us, static_cast<int>(op_type), data_size);
+                    elapsed_us, _config.stall_threshold_us, crypto_op_type_name(op_type), data_size);
             }
 
             return seastar::make_ready_future<ResultType>(std::move(result));
-        } catch (...) {
+        }
+    } catch (...) {
+        if constexpr (std::is_void_v<ResultType>) {
+            return seastar::make_exception_future<>(std::current_exception());
+        } else {
             return seastar::make_exception_future<ResultType>(std::current_exception());
         }
     }
+}
 
-    // Offload to thread pool
+template<typename Func>
+seastar::future<std::invoke_result_t<Func>> CryptoOffloader::execute_offloaded(
+    CryptoOpType op_type,
+    Func&& func) {
+
+    using ResultType = std::invoke_result_t<Func>;
+
     ++_offloaded_ops;
 
     if (op_type == CryptoOpType::HANDSHAKE_INITIATE ||
@@ -278,47 +281,73 @@ seastar::future<std::invoke_result_t<Func>> CryptoOffloader::wrap_crypto_op(
         ++_handshakes_offloaded;
     }
 
-    // Create promise/future pair for result
-    auto result_holder = seastar::make_lw_shared<CryptoOpResult<ResultType>>();
-    auto exception_holder = seastar::make_lw_shared<std::exception_ptr>();
+    // Check queue depth limit
+    size_t current_depth = _queue_depth.fetch_add(1, std::memory_order_relaxed);
+    if (current_depth >= _config.max_queue_depth) {
+        _queue_depth.fetch_sub(1, std::memory_order_relaxed);
+        ++_queue_rejected;
+        --_offloaded_ops;  // Correct the count since we're not actually offloading
 
-    // Capture function by value for thread safety
-    auto captured_func = std::forward<Func>(func);
+        log_crypto_offloader.warn(
+            "Crypto offloader queue full ({}/{}), running inline",
+            current_depth, _config.max_queue_depth);
+
+        // Fall back to inline execution
+        ++_inline_ops;
+        try {
+            if constexpr (std::is_void_v<ResultType>) {
+                func();
+                return seastar::make_ready_future<>();
+            } else {
+                return seastar::make_ready_future<ResultType>(func());
+            }
+        } catch (...) {
+            if constexpr (std::is_void_v<ResultType>) {
+                return seastar::make_exception_future<>(std::current_exception());
+            } else {
+                return seastar::make_exception_future<ResultType>(std::current_exception());
+            }
+        }
+    }
+
+    update_peak_depth();
 
     auto start_time = std::chrono::steady_clock::now();
     uint64_t stall_threshold = _config.stall_threshold_us;
-    std::atomic<uint64_t>* stalls_avoided_ptr = &_stalls_avoided;
+    auto* stalls_avoided_ptr = &_stalls_avoided;
+    auto* queue_depth_ptr = &_queue_depth;
 
-    return submit_work([result_holder, exception_holder, captured_func = std::move(captured_func),
-                       start_time, stall_threshold, stalls_avoided_ptr]() mutable {
-        try {
-            ResultType result = captured_func();
-            result_holder->set_value(std::move(result));
+    // Use seastar::async to run the operation in a Seastar thread context
+    return seastar::async([func = std::forward<Func>(func),
+                          start_time, stall_threshold, stalls_avoided_ptr]() mutable -> ResultType {
+        if constexpr (std::is_void_v<ResultType>) {
+            func();
 
-            // Check if we avoided a stall (operation took longer than threshold)
+            // Check if we avoided a stall
             auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - start_time).count();
-
             if (static_cast<uint64_t>(elapsed_us) > stall_threshold) {
-                ++(*stalls_avoided_ptr);
+                stalls_avoided_ptr->fetch_add(1, std::memory_order_relaxed);
             }
-        } catch (...) {
-            *exception_holder = std::current_exception();
+        } else {
+            ResultType result = func();
+
+            // Check if we avoided a stall
+            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            if (static_cast<uint64_t>(elapsed_us) > stall_threshold) {
+                stalls_avoided_ptr->fetch_add(1, std::memory_order_relaxed);
+            }
+
+            return result;
         }
-    }).then([result_holder, exception_holder]() -> seastar::future<ResultType> {
-        if (*exception_holder) {
-            return seastar::make_exception_future<ResultType>(*exception_holder);
-        }
-        if (result_holder->has_error()) {
-            return seastar::make_exception_future<ResultType>(
-                std::runtime_error(result_holder->error()));
-        }
-        return seastar::make_ready_future<ResultType>(std::move(result_holder->value()));
+    }).finally([queue_depth_ptr] {
+        queue_depth_ptr->fetch_sub(1, std::memory_order_relaxed);
     });
 }
 
 template<typename Func>
-seastar::future<> CryptoOffloader::wrap_crypto_op_void(
+seastar::future<std::invoke_result_t<Func>> CryptoOffloader::wrap_crypto_op(
     CryptoOpType op_type,
     size_t data_size,
     Func&& func) {
@@ -327,71 +356,10 @@ seastar::future<> CryptoOffloader::wrap_crypto_op_void(
 
     // Check if we should offload this operation
     if (!should_offload(op_type, data_size)) {
-        // Run inline on reactor thread with timing
-        ++_inline_ops;
-
-        if (op_type == CryptoOpType::SYMMETRIC_ENCRYPT ||
-            op_type == CryptoOpType::SYMMETRIC_DECRYPT) {
-            ++_symmetric_ops_inline;
-        }
-
-        auto start = std::chrono::steady_clock::now();
-
-        try {
-            func();
-
-            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - start).count();
-
-            if (static_cast<uint64_t>(elapsed_us) > _config.stall_threshold_us) {
-                ++_stall_warnings;
-                log_crypto_offloader.warn(
-                    "Inline crypto op (void) exceeded stall threshold: {}μs (threshold: {}μs, type: {}, size: {})",
-                    elapsed_us, _config.stall_threshold_us, static_cast<int>(op_type), data_size);
-            }
-
-            return seastar::make_ready_future<>();
-        } catch (...) {
-            return seastar::make_exception_future<>(std::current_exception());
-        }
+        return execute_inline(op_type, data_size, std::forward<Func>(func));
     }
 
-    // Offload to thread pool
-    ++_offloaded_ops;
-
-    if (op_type == CryptoOpType::HANDSHAKE_INITIATE ||
-        op_type == CryptoOpType::HANDSHAKE_CONTINUE) {
-        ++_handshakes_offloaded;
-    }
-
-    auto exception_holder = seastar::make_lw_shared<std::exception_ptr>();
-    auto captured_func = std::forward<Func>(func);
-
-    auto start_time = std::chrono::steady_clock::now();
-    uint64_t stall_threshold = _config.stall_threshold_us;
-    std::atomic<uint64_t>* stalls_avoided_ptr = &_stalls_avoided;
-
-    return submit_work([exception_holder, captured_func = std::move(captured_func),
-                       start_time, stall_threshold, stalls_avoided_ptr]() mutable {
-        try {
-            captured_func();
-
-            // Check if we avoided a stall
-            auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - start_time).count();
-
-            if (static_cast<uint64_t>(elapsed_us) > stall_threshold) {
-                ++(*stalls_avoided_ptr);
-            }
-        } catch (...) {
-            *exception_holder = std::current_exception();
-        }
-    }).then([exception_holder]() -> seastar::future<> {
-        if (*exception_holder) {
-            return seastar::make_exception_future<>(*exception_holder);
-        }
-        return seastar::make_ready_future<>();
-    });
+    return execute_offloaded(op_type, std::forward<Func>(func));
 }
 
 }  // namespace ranvier

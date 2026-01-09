@@ -132,43 +132,59 @@ Node A                              Node B
 
 ### Reactor Stall Prevention
 
-DTLS encryption uses OpenSSL which performs CPU-intensive operations. To prevent these from blocking Seastar's reactor thread (causing stalls that delay all other network I/O), the gossip service implements adaptive offloading:
+DTLS encryption uses OpenSSL which performs CPU-intensive operations. To prevent these from blocking Seastar's reactor thread (causing stalls that delay all other network I/O), the gossip service implements adaptive offloading via the `CryptoOffloader` class.
 
-#### Thresholds
+#### CryptoOffloader
 
-| Threshold | Value | Description |
-|-----------|-------|-------------|
-| `CRYPTO_OFFLOAD_BYTES_THRESHOLD` | 1024 bytes | Packets larger than this are encrypted in background thread |
-| `CRYPTO_OFFLOAD_PEER_THRESHOLD` | 10 peers | Broadcasts to more peers use batch mode |
-| `CRYPTO_STALL_WARNING_US` | 100μs | Log warning if single crypto op exceeds this |
+The `CryptoOffloader` class (`src/crypto_offloader.hpp`) provides intelligent routing of crypto operations:
 
-#### Encryption Paths
+- **Symmetric operations** (AES-GCM encrypt/decrypt): Fast (~1-50μs), run inline on reactor
+- **Asymmetric operations** (RSA/ECDH handshakes): Slow (~1-10ms), offloaded to `seastar::async`
 
-| Packet Size | Peer Count | Execution Path |
-|-------------|------------|----------------|
-| ≤1024 bytes | Any | Inline on reactor (with timing watchdog) |
-| >1024 bytes | Any | `seastar::async` background thread |
-| Any | ≤10 peers | `parallel_for_each` with per-peer encryption |
-| Any | >10 peers | `seastar::thread` with batched encryption + yield |
+The offloader uses **latency estimation** to predict operation cost before execution:
 
-#### Batch Broadcast Mode
+```cpp
+// Estimated latency in microseconds
+SYMMETRIC: 5 + (data_size / 1024)     // ~1μs per KB
+HANDSHAKE_INITIATE: 2000              // RSA/ECDHE key generation
+HANDSHAKE_CONTINUE: 500               // Signature verification
+UNKNOWN: 10 + (data_size * 10 / 1024) // Conservative estimate
+```
 
-When broadcasting to many peers (>10), all encryptions are performed in a single `seastar::thread` context:
+#### Configuration
 
-1. Pre-encrypt for all peers (batch timing measured)
-2. Send all packets with `thread::yield()` between sends
-3. Single stall warning if batch exceeds `100μs × peer_count`
+| Config | Default | Description |
+|--------|---------|-------------|
+| `size_threshold_bytes` | 1024 | Symmetric ops on data larger than this may be offloaded |
+| `stall_threshold_us` | 500 | Operations exceeding this trigger stall warnings |
+| `offload_latency_threshold_us` | 100 | Estimated latency above this triggers offloading |
+| `max_queue_depth` | 1024 | Maximum in-flight async operations |
+| `symmetric_always_inline` | true | Always run small symmetric ops inline |
+| `handshake_always_offload` | true | Always offload handshakes |
 
-This prevents 50+ sequential crypto operations from monopolizing the reactor.
+#### Offloading Decision Flow
+
+```
+1. Is offloader disabled? → Run inline
+2. Is force_offload enabled? → Offload
+3. Is it a handshake? → Offload (if handshake_always_offload)
+4. Is it symmetric + small data? → Run inline (if symmetric_always_inline)
+5. Estimate latency → Offload if > offload_latency_threshold_us
+```
 
 #### Typical Timing
 
-| Packet Size | Typical Encrypt Time | Path |
-|-------------|---------------------|------|
-| Heartbeat (2 bytes) | ~5μs | Inline |
-| Small route (52 bytes) | ~10μs | Inline |
-| Large route (1036 bytes) | ~50-80μs | Offloaded |
-| Batch of 50 peers | ~2-4ms total | Batch thread |
+| Operation | Typical Time | Path |
+|-----------|--------------|------|
+| Heartbeat encrypt (2 bytes) | ~5μs | Inline |
+| Small route encrypt (52 bytes) | ~10μs | Inline |
+| Large route encrypt (1036 bytes) | ~50-80μs | Inline (below latency threshold) |
+| DTLS handshake initiate | ~1-2ms | Offloaded (seastar::async) |
+| DTLS handshake continue | ~0.5ms | Offloaded (seastar::async) |
+
+#### Queue Depth Limiting
+
+When the async queue is full (`max_queue_depth` reached), operations fall back to inline execution with a warning logged. This prevents unbounded memory growth during crypto operation bursts.
 
 ### Certificate Hot-Reload
 

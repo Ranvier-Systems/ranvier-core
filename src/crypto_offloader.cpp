@@ -5,8 +5,6 @@
 
 #include "crypto_offloader.hpp"
 
-#include <algorithm>
-
 #include <seastar/core/thread.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
@@ -22,71 +20,41 @@ CryptoOffloader::~CryptoOffloader() {
 }
 
 void CryptoOffloader::start() {
-    if (_running.exchange(true, std::memory_order_acq_rel)) {
-        return;  // Already running
+    if (!_config.enabled) {
+        log_crypto_offloader.info("Crypto offloader disabled by configuration");
+        return;
     }
 
-    if (!_config.enabled) {
-        log_crypto_offloader.info("Crypto offloader disabled");
+    if (_running.exchange(true, std::memory_order_acq_rel)) {
+        log_crypto_offloader.debug("Crypto offloader already running");
         return;
     }
 
     log_crypto_offloader.info("Starting crypto offloader (seastar::async mode)");
-    log_crypto_offloader.info("Offload thresholds: size={}B, latency={}μs, stall={}μs",
+    log_crypto_offloader.info("Offload thresholds: size={}B, latency={}μs, stall={}μs, max_queue={}",
                               _config.size_threshold_bytes,
                               _config.offload_latency_threshold_us,
-                              _config.stall_threshold_us);
-
-    // No thread pool needed - we use seastar::async which runs in Seastar's
-    // internal thread pool and integrates with the cooperative scheduler
+                              _config.stall_threshold_us,
+                              _config.max_queue_depth);
+    log_crypto_offloader.info("Offload policies: symmetric_inline={}, handshake_offload={}",
+                              _config.symmetric_always_inline,
+                              _config.handshake_always_offload);
     log_crypto_offloader.info("Crypto offloader started");
 }
 
 void CryptoOffloader::stop() {
     if (!_running.exchange(false, std::memory_order_acq_rel)) {
-        return;  // Already stopped
+        return;  // Already stopped or never started
     }
 
     log_crypto_offloader.info("Stopping crypto offloader...");
 
-    // No cleanup needed - seastar::async futures are managed by Seastar
-    _stopping.store(true, std::memory_order_release);
+    // Note: In-flight seastar::async operations will complete on their own.
+    // We just prevent new operations from being offloaded.
 
-    log_crypto_offloader.info("Crypto offloader stopped");
-}
-
-void CryptoOffloader::worker_loop() {
-    // Not used in seastar::async mode
-}
-
-seastar::future<> CryptoOffloader::submit_work(std::function<void()> task) {
-    // Check if we're running
-    if (!_running.load(std::memory_order_acquire) || !_config.enabled) {
-        // Fall back to running inline if offloader not running
-        try {
-            task();
-            return seastar::make_ready_future<>();
-        } catch (...) {
-            return seastar::make_exception_future<>(std::current_exception());
-        }
-    }
-
-    // Track queue depth for metrics
-    _queue_depth.fetch_add(1, std::memory_order_relaxed);
-    update_peak_depth();
-
-    // Use seastar::async to run the task in a Seastar thread
-    // This allows blocking operations without stalling the reactor
-    return seastar::async([this, task = std::move(task)]() mutable {
-        try {
-            task();
-        } catch (...) {
-            // Re-throw to propagate to the future
-            throw;
-        }
-    }).finally([this] {
-        _queue_depth.fetch_sub(1, std::memory_order_relaxed);
-    });
+    log_crypto_offloader.info("Crypto offloader stopped (queue_depth={}, peak={})",
+                              _queue_depth.load(std::memory_order_relaxed),
+                              _peak_queue_depth.load(std::memory_order_relaxed));
 }
 
 bool CryptoOffloader::should_offload(CryptoOpType op_type, size_t data_size) const {
@@ -181,8 +149,9 @@ CryptoOpStats CryptoOffloader::get_stats() const {
     stats.stall_warnings = _stall_warnings.load(std::memory_order_relaxed);
     stats.handshakes_offloaded = _handshakes_offloaded.load(std::memory_order_relaxed);
     stats.symmetric_ops_inline = _symmetric_ops_inline.load(std::memory_order_relaxed);
-    stats.thread_pool_queue_depth = _queue_depth.load(std::memory_order_relaxed);
-    stats.thread_pool_peak_depth = _peak_queue_depth.load(std::memory_order_relaxed);
+    stats.queue_depth = _queue_depth.load(std::memory_order_relaxed);
+    stats.queue_peak = _peak_queue_depth.load(std::memory_order_relaxed);
+    stats.queue_rejected = _queue_rejected.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -222,6 +191,11 @@ void CryptoOffloader::register_metrics(seastar::metrics::metric_groups& metrics)
             "crypto_offloader_symmetric_inline",
             [this] { return _symmetric_ops_inline.load(std::memory_order_relaxed); },
             seastar::metrics::description("Symmetric encryption operations run inline")),
+
+        seastar::metrics::make_counter(
+            "crypto_offloader_queue_rejected",
+            [this] { return _queue_rejected.load(std::memory_order_relaxed); },
+            seastar::metrics::description("Operations rejected due to queue depth limit")),
 
         seastar::metrics::make_gauge(
             "crypto_offloader_queue_depth",
