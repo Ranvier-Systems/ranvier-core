@@ -191,6 +191,58 @@ When certificates change:
 - Idle sessions cleaned up after 5 minutes
 - Graceful shutdown waits for in-flight handshakes via `seastar::gate`
 
+### mTLS Lockdown Mode
+
+When `mtls_enabled` is set to `true`, the gossip service enforces strict DTLS-only communication. **Any packet that is not a valid DTLS packet from an established session is silently dropped.**
+
+```yaml
+cluster:
+  tls:
+    enabled: true
+    verify_peer: true
+  mtls_enabled: true  # Enforce DTLS-only communication
+```
+
+**Packet Filtering Logic:**
+
+When a packet arrives and `mtls_enabled` is true:
+
+1. **Check if DTLS handshake packet** (content type 20/21/22, version 0xFE):
+   - If yes → Allow through (needed to establish sessions)
+2. **Check if packet belongs to established DTLS session**:
+   - If yes → Allow through (will be decrypted)
+3. **Otherwise** → Drop silently, increment `dtls_lockdown_drops` counter
+
+**Allowed Content Types:**
+| Type | Name | Purpose |
+|------|------|---------|
+| 20 | ChangeCipherSpec | Part of handshake |
+| 21 | Alert | Handshake error handling |
+| 22 | Handshake | Actual handshake messages |
+| 23 | ApplicationData | Encrypted gossip (only after session established) |
+
+**Automatic Handshake Initiation:**
+
+When new peers are discovered via DNS, DTLS handshakes are automatically initiated **before** any routing data is exchanged:
+
+```cpp
+void refresh_peers() {
+    // ... discover new peers via DNS ...
+
+    for (const auto& peer : new_peers_for_handshake) {
+        // Initiate handshake before any route exchange
+        initiate_peer_handshake(peer);
+    }
+}
+```
+
+This ensures encrypted channels are established with all peers before sensitive routing data is transmitted.
+
+**Security Benefits:**
+- Prevents plaintext gossip traffic even if misconfigured
+- Ensures all route announcements are authenticated
+- Blocks rogue nodes from injecting routes without valid certificates
+
 ## Reliable Delivery
 
 ### Sequence Numbers
@@ -246,6 +298,29 @@ Receivers maintain a **sliding window** of recently seen sequence numbers per pe
 
 **Why still ACK duplicates?** The sender may have missed our previous ACK, so we always respond to prevent unnecessary retries.
 
+### Replay Attack Prevention (Sequence Number Hardening)
+
+The sliding window provides protection against **replay attacks** where an attacker captures old routing messages and re-sends them to overwrite newer routes:
+
+**Security Properties:**
+1. **Duplicate detection**: Prevents processing the same message twice
+2. **Replay attack prevention**: Old captured packets are rejected
+3. **Memory-bounded**: Window size limits memory usage while maintaining security
+
+**Critical Behavior:** The sliding window **persists across resync events**. When the gossip service enters resync mode (e.g., during network partition recovery), the sequence number windows are **NOT cleared**. This ensures attackers cannot exploit the resync to replay old captured packets.
+
+```cpp
+void start_resync() {
+    // SECURITY: DO NOT clear _received_seq_windows!
+    // Clearing would allow replay attacks after network recovery.
+    _pending_acks.clear();  // Only clear pending outbound acks
+}
+```
+
+**Window Sizing:** The window should be large enough to cover:
+- Maximum expected in-flight messages during normal operation
+- Any network delays that might cause out-of-order delivery
+
 ## Split-Brain Detection
 
 Ranvier implements quorum-based split-brain detection to prevent divergent state when a network partition occurs.
@@ -277,6 +352,44 @@ Examples with default threshold (0.5):
 | 5 nodes | 3 | 2 failures |
 | 7 nodes | 4 | 3 failures |
 
+### Recently-Seen Quorum Check
+
+In addition to the basic alive/dead peer tracking, Ranvier uses a **stricter quorum check** that counts only peers seen within a configurable time window:
+
+```yaml
+cluster:
+  quorum_check_window_seconds: 30  # Count peers seen within this window
+```
+
+**Why Recently-Seen?**
+
+The alive/dead state can lag behind actual network conditions:
+- A peer marked "alive" may not have communicated for several heartbeat intervals
+- During network partitions, the alive flag may not reflect current reachability
+
+The `check_quorum()` method counts peers based on `last_seen` timestamp:
+
+```
+recently_seen = count of peers where (now - last_seen) <= quorum_check_window
+quorum_nodes = recently_seen + 1 (self)
+state = (quorum_nodes >= required) ? HEALTHY : DEGRADED
+```
+
+**Example:**
+```
+Cluster: 5 nodes, threshold=0.5, quorum_check_window=30s
+
+Peer A: last_seen 5s ago  ✓ (recently seen)
+Peer B: last_seen 10s ago ✓ (recently seen)
+Peer C: last_seen 40s ago ✗ (stale)
+Peer D: last_seen 60s ago ✗ (stale)
+
+recently_seen = 2, total = 5, required = 3
+quorum_nodes = 2 + 1 (self) = 3 >= 3 → HEALTHY
+```
+
+This is more conservative than just checking alive flags and provides faster detection of network issues.
+
 ### Warning Threshold
 
 When the cluster is healthy but approaching quorum loss, a warning is logged. The `quorum_warning_threshold` controls how many nodes above quorum triggers the warning.
@@ -293,16 +406,25 @@ Warnings are rate-limited: only logged when entering/exiting the warning zone, n
 
 When quorum is lost:
 
-1. **Route writes rejected**: `broadcast_route()` returns immediately without sending
-2. **Existing routes served**: Cached routes remain valid for incoming requests
-3. **Metric updated**: `ranvier_cluster_quorum_state` gauge set to 0
-4. **Log emitted**: `WARN: Cluster quorum LOST`
+1. **Outbound route writes rejected**: `broadcast_route()` returns immediately without sending
+2. **Incoming routes rejected**: Route announcements from peers are ACKed but not applied
+3. **Existing routes served**: Cached routes remain valid for incoming requests
+4. **Metric updated**: `ranvier_cluster_quorum_state` gauge set to 0
+5. **Log emitted**: `ERROR: QUORUM LOST: Cluster entering DEGRADED mode`
+
+**Why reject incoming routes?**
+
+When a node loses quorum, it may be on the wrong side of a network partition. Accepting routes from the few peers it can still reach could lead to:
+- Accepting stale routes from similarly partitioned nodes
+- Diverging from the majority partition's routing state
+- Potential route hijacking if an attacker controls the minority partition
 
 When quorum is restored:
 
 1. **Route writes enabled**: Normal gossip propagation resumes
-2. **Metric updated**: Gauge set to 1
-3. **Log emitted**: `INFO: Cluster quorum RESTORED`
+2. **Incoming routes accepted**: Route announcements applied to RadixTree
+3. **Metric updated**: Gauge set to 1
+4. **Log emitted**: `INFO: QUORUM RESTORED: Cluster returning to HEALTHY mode`
 
 ### Partition Scenarios
 
@@ -353,10 +475,14 @@ cluster:
   gossip_dedup_window: 1000           # Duplicate detection window
 
   # Split-brain detection
-  quorum_enabled: true                # Enable quorum checks
-  quorum_threshold: 0.5               # Fraction for quorum (0.5 = majority)
-  reject_routes_on_quorum_loss: true  # Reject writes when degraded
-  quorum_warning_threshold: 1         # Warn when margin <= this (0 disables)
+  quorum_enabled: true                    # Enable quorum checks
+  quorum_threshold: 0.5                   # Fraction for quorum (0.5 = majority)
+  reject_routes_on_quorum_loss: true      # Reject writes when degraded
+  quorum_warning_threshold: 1             # Warn when margin <= this (0 disables)
+  quorum_check_window_seconds: 30         # Window for recently-seen check
+
+  # DTLS security lockdown
+  mtls_enabled: false                     # Enforce DTLS-only (drop plaintext packets)
 ```
 
 ### Environment Variables
@@ -377,6 +503,10 @@ RANVIER_CLUSTER_QUORUM_ENABLED=true
 RANVIER_CLUSTER_QUORUM_THRESHOLD=0.5
 RANVIER_CLUSTER_REJECT_ROUTES_ON_QUORUM_LOSS=true
 RANVIER_CLUSTER_QUORUM_WARNING_THRESHOLD=1
+RANVIER_CLUSTER_QUORUM_CHECK_WINDOW=30
+
+# DTLS security lockdown
+RANVIER_CLUSTER_MTLS_ENABLED=false
 ```
 
 ## Metrics
@@ -416,7 +546,9 @@ All metrics are exposed via Prometheus on port 9180.
 |--------|------|-------------|
 | `ranvier_cluster_quorum_state` | Gauge | Current quorum state (1=healthy, 0=degraded) |
 | `ranvier_cluster_quorum_transitions` | Counter | Total state transitions (healthy↔degraded) |
-| `ranvier_cluster_routes_rejected_degraded` | Counter | Routes rejected due to degraded state |
+| `ranvier_cluster_routes_rejected_degraded` | Counter | Outbound routes rejected due to degraded state |
+| `ranvier_cluster_routes_rejected_incoming_degraded` | Counter | Incoming routes rejected due to degraded state |
+| `ranvier_cluster_peers_recently_seen` | Gauge | Peers seen within quorum check window |
 
 ### DTLS Encryption
 
@@ -428,6 +560,7 @@ All metrics are exposed via Prometheus on port 9180.
 | `ranvier_cluster_dtls_packets_encrypted` | Counter | Packets encrypted with DTLS |
 | `ranvier_cluster_dtls_packets_decrypted` | Counter | Packets decrypted with DTLS |
 | `ranvier_cluster_dtls_cert_reloads` | Counter | Certificate hot-reloads performed |
+| `ranvier_cluster_dtls_lockdown_drops` | Counter | Packets dropped due to mTLS lockdown |
 
 ### Crypto Performance
 
@@ -446,9 +579,12 @@ All metrics are exposed via Prometheus on port 9180.
 | Route divergence | `max_retries_exceeded` high | Network partition or peer overload |
 | High retries | `retries_sent` >> `acks_received` | Packet loss or slow peer |
 | Duplicate processing | `duplicates_suppressed` = 0 | `dedup_window` too small |
-| Routes rejected | `routes_rejected_degraded` > 0 | Cluster in degraded mode (quorum lost) |
+| Routes rejected (outbound) | `routes_rejected_degraded` > 0 | Cluster in degraded mode (quorum lost) |
+| Routes rejected (inbound) | `routes_rejected_incoming_degraded` > 0 | Cluster in degraded mode (quorum lost) |
 | Quorum flapping | `quorum_transitions` increasing | Unstable network or peer health |
+| Stale peer detection | `peers_recently_seen` < `peers_alive` | Heartbeat interval too long or packet loss |
 | DTLS handshake failures | `dtls_handshakes_failed` > 0 | Certificate mismatch or expiry |
+| Packets dropped (mTLS) | `dtls_lockdown_drops` > 0 | Plaintext packets blocked by mTLS lockdown |
 | Crypto stalls | `crypto_stall_warnings` > 0 | CPU overload or slow crypto hardware |
 | High offload rate | `crypto_ops_offloaded` high | Many large packets (may indicate token explosion) |
 

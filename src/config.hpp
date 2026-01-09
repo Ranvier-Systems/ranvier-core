@@ -295,6 +295,10 @@ struct ClusterConfig {
     double quorum_threshold = 0.5;                         // Fraction of peers required (N*threshold+1 for majority)
     bool reject_routes_on_quorum_loss = true;              // Reject new route writes when quorum is lost
     uint32_t quorum_warning_threshold = 1;                 // Warn when alive peers <= required + this threshold
+    std::chrono::seconds quorum_check_window{30};          // Window to count recently seen peers (check_quorum)
+
+    // DTLS Security Lockdown
+    bool mtls_enabled = false;                             // Enforce mTLS: drop non-DTLS packets when TLS enabled
 };
 
 // Kubernetes service discovery configuration
@@ -672,6 +676,12 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env_as<uint32_t>("RANVIER_CLUSTER_QUORUM_WARNING_THRESHOLD")) {
         cluster.quorum_warning_threshold = *v;
+    }
+    if (auto v = get_env_as<int>("RANVIER_CLUSTER_QUORUM_CHECK_WINDOW")) {
+        cluster.quorum_check_window = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_MTLS_ENABLED")) {
+        cluster.mtls_enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
 
     // K8s discovery overrides
@@ -1067,6 +1077,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (c["quorum_warning_threshold"]) {
                 config.cluster.quorum_warning_threshold = c["quorum_warning_threshold"].as<uint32_t>();
             }
+            if (c["quorum_check_window_seconds"]) {
+                config.cluster.quorum_check_window = std::chrono::seconds(c["quorum_check_window_seconds"].as<int>());
+            }
+            if (c["mtls_enabled"]) {
+                config.cluster.mtls_enabled = c["mtls_enabled"].as<bool>();
+            }
         }
 
         // K8s discovery section
@@ -1274,6 +1290,13 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
             if (config.cluster.quorum_threshold < 0.0 || config.cluster.quorum_threshold > 1.0) {
                 return "cluster.quorum_threshold must be between 0.0 and 1.0";
             }
+            if (config.cluster.quorum_check_window.count() < 5) {
+                return "cluster.quorum_check_window must be at least 5 seconds";
+            }
+        }
+        // Validate mTLS lockdown settings
+        if (config.cluster.mtls_enabled && !config.cluster.tls.enabled) {
+            return "cluster.mtls_enabled requires cluster.tls.enabled to be true";
         }
     }
 
