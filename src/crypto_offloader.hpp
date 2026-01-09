@@ -1,10 +1,10 @@
 // Ranvier Core - Adaptive Crypto Offloader
 //
-// Provides adaptive offloading of cryptographic operations to background threads
+// Provides adaptive offloading of cryptographic operations using seastar::async
 // to maintain sub-millisecond reactor responsiveness during heavy cluster operations.
 //
 // Key features:
-// - Thread pool integration for CPU-intensive crypto work
+// - Uses seastar::async for CPU-intensive crypto work
 // - Threshold-based offloading: symmetric ops run on-shard, asymmetric ops offload
 // - Non-blocking futures that resolve when background work completes
 // - Stall tracking metrics to measure offloading effectiveness
@@ -21,16 +21,11 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <functional>
 #include <memory>
-#include <mutex>
-#include <queue>
-#include <thread>
-#include <vector>
 
 #include <seastar/core/future.hh>
-#include <seastar/core/reactor.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/shared_ptr.hh>
 
@@ -135,24 +130,24 @@ private:
 
 // Adaptive Crypto Offloader
 //
-// Manages a pool of background threads for offloading expensive crypto operations.
-// Uses adaptive logic to decide whether to run operations on the reactor thread
-// or offload them to the thread pool.
+// Uses seastar::async for offloading expensive crypto operations.
+// Adaptive logic decides whether to run operations on the reactor thread
+// or offload them to a Seastar thread context.
 class CryptoOffloader {
 public:
     explicit CryptoOffloader(const CryptoOffloaderConfig& config = CryptoOffloaderConfig{});
     ~CryptoOffloader();
 
-    // Non-copyable, non-movable (owns thread pool)
+    // Non-copyable, non-movable
     CryptoOffloader(const CryptoOffloader&) = delete;
     CryptoOffloader& operator=(const CryptoOffloader&) = delete;
     CryptoOffloader(CryptoOffloader&&) = delete;
     CryptoOffloader& operator=(CryptoOffloader&&) = delete;
 
-    // Start the thread pool (must be called before any operations)
+    // Start the offloader (must be called before any operations)
     void start();
 
-    // Stop the thread pool (blocks until all pending work completes)
+    // Stop the offloader
     void stop();
 
     // Check if the offloader is running
@@ -203,20 +198,10 @@ private:
     std::atomic<bool> _running{false};
     std::atomic<bool> _stopping{false};
 
-    // Thread pool
-    std::vector<std::thread> _workers;
-
-    // Work queue
-    struct WorkItem {
-        std::function<void()> task;
-        seastar::promise<> completion;
-    };
-    std::queue<WorkItem> _work_queue;
-    std::mutex _queue_mutex;
-    std::condition_variable _queue_cv;
+    // Metrics for tracking in-flight async operations
     std::atomic<size_t> _queue_depth{0};
 
-    // Statistics (atomic for thread-safe updates from workers)
+    // Statistics (atomic for thread-safe updates)
     mutable std::atomic<uint64_t> _total_ops{0};
     mutable std::atomic<uint64_t> _offloaded_ops{0};
     mutable std::atomic<uint64_t> _inline_ops{0};
@@ -226,10 +211,10 @@ private:
     mutable std::atomic<uint64_t> _symmetric_ops_inline{0};
     mutable std::atomic<size_t> _peak_queue_depth{0};
 
-    // Worker thread function
+    // Worker thread function (not used in seastar::async mode)
     void worker_loop();
 
-    // Submit work to the thread pool
+    // Submit work using seastar::async
     // Returns a future that resolves when the work is complete
     seastar::future<> submit_work(std::function<void()> task);
 

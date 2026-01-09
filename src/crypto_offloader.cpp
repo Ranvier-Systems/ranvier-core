@@ -1,11 +1,13 @@
 // Ranvier Core - Adaptive Crypto Offloader Implementation
 //
-// Thread pool-based offloading for expensive cryptographic operations
+// Uses seastar::async for offloading expensive cryptographic operations
+// to avoid reactor stalls while maintaining Seastar's cooperative model.
 
 #include "crypto_offloader.hpp"
 
 #include <algorithm>
 
+#include <seastar/core/thread.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
 
@@ -29,20 +31,14 @@ void CryptoOffloader::start() {
         return;
     }
 
-    log_crypto_offloader.info("Starting crypto offloader with {} worker threads", _config.thread_pool_size);
+    log_crypto_offloader.info("Starting crypto offloader (seastar::async mode)");
     log_crypto_offloader.info("Offload thresholds: size={}B, latency={}μs, stall={}μs",
                               _config.size_threshold_bytes,
                               _config.offload_latency_threshold_us,
                               _config.stall_threshold_us);
 
-    // Create worker threads
-    _workers.reserve(_config.thread_pool_size);
-    for (size_t i = 0; i < _config.thread_pool_size; ++i) {
-        _workers.emplace_back([this]() {
-            worker_loop();
-        });
-    }
-
+    // No thread pool needed - we use seastar::async which runs in Seastar's
+    // internal thread pool and integrates with the cooperative scheduler
     log_crypto_offloader.info("Crypto offloader started");
 }
 
@@ -53,81 +49,14 @@ void CryptoOffloader::stop() {
 
     log_crypto_offloader.info("Stopping crypto offloader...");
 
-    // Signal workers to stop
+    // No cleanup needed - seastar::async futures are managed by Seastar
     _stopping.store(true, std::memory_order_release);
 
-    // Wake up all workers
-    _queue_cv.notify_all();
-
-    // Wait for workers to finish
-    for (auto& worker : _workers) {
-        if (worker.joinable()) {
-            worker.join();
-        }
-    }
-    _workers.clear();
-
-    // Clear any remaining work items
-    {
-        std::lock_guard<std::mutex> lock(_queue_mutex);
-        while (!_work_queue.empty()) {
-            auto& item = _work_queue.front();
-            // Complete with broken promise (will throw on the reactor side)
-            item.completion.set_exception(std::runtime_error("Crypto offloader stopped"));
-            _work_queue.pop();
-        }
-    }
-
-    _stopping.store(false, std::memory_order_release);
     log_crypto_offloader.info("Crypto offloader stopped");
 }
 
 void CryptoOffloader::worker_loop() {
-    log_crypto_offloader.debug("Worker thread started");
-
-    while (true) {
-        WorkItem item;
-
-        {
-            std::unique_lock<std::mutex> lock(_queue_mutex);
-
-            // Wait for work or stop signal
-            _queue_cv.wait(lock, [this] {
-                return _stopping.load(std::memory_order_acquire) || !_work_queue.empty();
-            });
-
-            // Check stop condition
-            if (_stopping.load(std::memory_order_acquire) && _work_queue.empty()) {
-                break;
-            }
-
-            if (_work_queue.empty()) {
-                continue;
-            }
-
-            // Get work item
-            item = std::move(_work_queue.front());
-            _work_queue.pop();
-            _queue_depth.fetch_sub(1, std::memory_order_relaxed);
-        }
-
-        // Execute the task outside the lock
-        try {
-            item.task();
-            // Signal completion on the reactor thread
-            // We use submit_to() to safely complete the promise from a foreign thread
-            seastar::alien::submit_to(seastar::engine().alien(), 0, [p = std::move(item.completion)]() mutable {
-                p.set_value();
-            });
-        } catch (...) {
-            auto ex = std::current_exception();
-            seastar::alien::submit_to(seastar::engine().alien(), 0, [p = std::move(item.completion), ex]() mutable {
-                p.set_exception(ex);
-            });
-        }
-    }
-
-    log_crypto_offloader.debug("Worker thread exiting");
+    // Not used in seastar::async mode
 }
 
 seastar::future<> CryptoOffloader::submit_work(std::function<void()> task) {
@@ -142,35 +71,22 @@ seastar::future<> CryptoOffloader::submit_work(std::function<void()> task) {
         }
     }
 
-    // Check queue depth
-    size_t current_depth = _queue_depth.load(std::memory_order_relaxed);
-    if (current_depth >= _config.max_queue_depth) {
-        log_crypto_offloader.warn("Crypto offloader queue full ({}/{}), running inline",
-                                  current_depth, _config.max_queue_depth);
+    // Track queue depth for metrics
+    _queue_depth.fetch_add(1, std::memory_order_relaxed);
+    update_peak_depth();
+
+    // Use seastar::async to run the task in a Seastar thread
+    // This allows blocking operations without stalling the reactor
+    return seastar::async([this, task = std::move(task)]() mutable {
         try {
             task();
-            return seastar::make_ready_future<>();
         } catch (...) {
-            return seastar::make_exception_future<>(std::current_exception());
+            // Re-throw to propagate to the future
+            throw;
         }
-    }
-
-    // Create work item with promise
-    WorkItem item;
-    item.task = std::move(task);
-    auto fut = item.completion.get_future();
-
-    {
-        std::lock_guard<std::mutex> lock(_queue_mutex);
-        _work_queue.push(std::move(item));
-        _queue_depth.fetch_add(1, std::memory_order_relaxed);
-        update_peak_depth();
-    }
-
-    // Wake up a worker
-    _queue_cv.notify_one();
-
-    return fut;
+    }).finally([this] {
+        _queue_depth.fetch_sub(1, std::memory_order_relaxed);
+    });
 }
 
 bool CryptoOffloader::should_offload(CryptoOpType op_type, size_t data_size) const {
@@ -280,7 +196,7 @@ void CryptoOffloader::register_metrics(seastar::metrics::metric_groups& metrics)
         seastar::metrics::make_counter(
             "crypto_offloader_offloaded_ops",
             [this] { return _offloaded_ops.load(std::memory_order_relaxed); },
-            seastar::metrics::description("Crypto operations offloaded to thread pool")),
+            seastar::metrics::description("Crypto operations offloaded to seastar::async")),
 
         seastar::metrics::make_counter(
             "crypto_offloader_inline_ops",
@@ -310,12 +226,12 @@ void CryptoOffloader::register_metrics(seastar::metrics::metric_groups& metrics)
         seastar::metrics::make_gauge(
             "crypto_offloader_queue_depth",
             [this] { return static_cast<double>(_queue_depth.load(std::memory_order_relaxed)); },
-            seastar::metrics::description("Current thread pool queue depth")),
+            seastar::metrics::description("Current number of in-flight async operations")),
 
         seastar::metrics::make_gauge(
             "crypto_offloader_queue_peak",
             [this] { return static_cast<double>(_peak_queue_depth.load(std::memory_order_relaxed)); },
-            seastar::metrics::description("Peak thread pool queue depth")),
+            seastar::metrics::description("Peak number of in-flight async operations")),
 
         seastar::metrics::make_gauge(
             "crypto_offloader_enabled",
