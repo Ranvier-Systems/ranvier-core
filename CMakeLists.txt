@@ -139,6 +139,7 @@ if(Seastar_FOUND)
       src/main.cpp
       src/application.cpp
       src/async_persistence.cpp
+      src/crypto_offloader.cpp
       src/dtls_context.cpp
       src/gossip_service.cpp
       src/health_service.cpp
@@ -358,6 +359,7 @@ if(Seastar_FOUND)
     add_executable(application_test
       tests/unit/application_test.cpp
       src/application.cpp
+      src/crypto_offloader.cpp
       src/gossip_service.cpp
       src/node_slab.cpp
       src/router_service.cpp
