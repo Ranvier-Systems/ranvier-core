@@ -118,6 +118,15 @@ Hardening the gossip protocol and cluster coordination for production multi-node
   _Location:_ `src/gossip_service.cpp:375-403`
   _Complexity:_ High
 
+- [x] **Finalize quorum enforcement and DTLS lockdown** ✓
+  _Justification:_ Initial split-brain detection only checked alive/dead state. Network issues may not immediately update liveness. Need stricter recently-seen check and enforcement on both inbound/outbound routes. DTLS needed enforcement mode to reject plaintext packets. Sequence number window needed protection against replay attacks.
+  _Approach:_ Three-part implementation:
+  1. **Quorum Enforcement**: Added `check_quorum()` that counts peers seen within configurable window (default 30s), stricter than alive check. Both outbound (`broadcast_route`) and incoming routes (`handle_packet`) now rejected in DEGRADED mode.
+  2. **DTLS Security Lockdown**: Added `mtls_enabled` config option. When true, drops all non-DTLS packets except handshakes. Auto-triggers handshake for DNS-discovered peers before routing.
+  3. **Sequence Number Hardening**: Documented sliding window security properties. Ensured window persists across resync events to prevent replay attacks.
+  _Location:_ `src/gossip_service.cpp:649-713` (check_quorum), `src/gossip_service.cpp:1625-1695` (DTLS lockdown)
+  _Complexity:_ Medium
+
 - [ ] **Add partition healing with route reconciliation**
   _Justification:_ After partition heals, nodes have divergent route tables. Need incremental sync protocol to merge without full state transfer.
   _Location:_ `src/gossip_service.cpp`
@@ -490,6 +499,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P0 - Critical** | Security | Non-root container execution | Low | ✅ Done |
 | **P0 - Critical** | Security | mTLS for gossip protocol | High | ✅ Done |
 | **P1 - High** | Reliability | Split-brain detection | High | ✅ Done |
+| **P1 - High** | Reliability | Quorum enforcement and DTLS lockdown | Medium | ✅ Done |
 | **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
 | **P1 - High** | Security | API key rotation | Medium | ✅ Done |
 | **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
@@ -519,6 +529,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-09 | Quorum enforcement and DTLS lockdown (recently-seen quorum check, mTLS lockdown mode, sequence number hardening) | - |
 | 2026-01-08 | Implement shard-aware P2C load balancer (per-shard metrics, cross-shard dispatch, zero-copy transfer) | - |
 | 2026-01-07 | Implement system-wide backpressure mechanism (semaphore concurrency limits, persistence queue integration, gossip gate protection) | - |
 | 2026-01-06 | Use Seastar async file I/O for tokenizer loading (DMA file I/O, validation, proper cleanup) | - |

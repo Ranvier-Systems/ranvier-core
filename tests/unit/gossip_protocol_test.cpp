@@ -788,6 +788,211 @@ TEST_F(PacketSizeTest, TokenCountToPacketSize) {
     EXPECT_EQ(calculate_packet_size(256), 1036u);  // MAX_PACKET_SIZE
 }
 
+// =============================================================================
+// DTLS Lockdown Packet Detection Tests
+// =============================================================================
+// These tests verify the is_dtls_handshake_packet() logic used for mTLS lockdown
+
+class DtlsLockdownTest : public ::testing::Test {
+protected:
+    // DTLS content type constants (RFC 6347)
+    static constexpr uint8_t DTLS_CONTENT_CHANGE_CIPHER_SPEC = 20;
+    static constexpr uint8_t DTLS_CONTENT_ALERT = 21;
+    static constexpr uint8_t DTLS_CONTENT_HANDSHAKE = 22;
+    static constexpr uint8_t DTLS_CONTENT_APPLICATION_DATA = 23;
+    static constexpr uint8_t DTLS_VERSION_MARKER = 0xFE;
+    static constexpr size_t DTLS_RECORD_HEADER_SIZE = 13;
+
+    // Simulates the is_dtls_handshake_packet() function from GossipService
+    bool is_dtls_handshake_packet(const uint8_t* data, size_t len) const {
+        if (len < DTLS_RECORD_HEADER_SIZE) {
+            return false;
+        }
+
+        uint8_t content_type = data[0];
+
+        // Check for handshake-related content types
+        bool is_handshake_type = (content_type == DTLS_CONTENT_CHANGE_CIPHER_SPEC ||
+                                  content_type == DTLS_CONTENT_ALERT ||
+                                  content_type == DTLS_CONTENT_HANDSHAKE);
+        if (!is_handshake_type) {
+            return false;
+        }
+
+        // Verify DTLS version marker
+        if (data[1] != DTLS_VERSION_MARKER) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // Create a minimal valid DTLS record header
+    std::vector<uint8_t> create_dtls_header(uint8_t content_type, uint8_t version_major = 0xFE,
+                                             uint8_t version_minor = 0xFD) {
+        std::vector<uint8_t> header(DTLS_RECORD_HEADER_SIZE, 0);
+        header[0] = content_type;           // ContentType
+        header[1] = version_major;          // Version major (0xFE = DTLS)
+        header[2] = version_minor;          // Version minor
+        // Epoch (bytes 3-4) = 0
+        // Sequence (bytes 5-10) = 0
+        // Length (bytes 11-12) = 0
+        return header;
+    }
+};
+
+TEST_F(DtlsLockdownTest, HandshakePacketDetected) {
+    auto header = create_dtls_header(DTLS_CONTENT_HANDSHAKE);
+    EXPECT_TRUE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, ChangeCipherSpecDetected) {
+    auto header = create_dtls_header(DTLS_CONTENT_CHANGE_CIPHER_SPEC);
+    EXPECT_TRUE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, AlertPacketDetected) {
+    // Alert packets should be allowed through (needed for handshake errors)
+    auto header = create_dtls_header(DTLS_CONTENT_ALERT);
+    EXPECT_TRUE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, ApplicationDataNotDetected) {
+    // Application data should NOT be detected as handshake
+    // (it requires an established session)
+    auto header = create_dtls_header(DTLS_CONTENT_APPLICATION_DATA);
+    EXPECT_FALSE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, TooShortPacketRejected) {
+    // Packets shorter than header size should be rejected
+    std::vector<uint8_t> short_data = {DTLS_CONTENT_HANDSHAKE, 0xFE};
+    EXPECT_FALSE(is_dtls_handshake_packet(short_data.data(), short_data.size()));
+}
+
+TEST_F(DtlsLockdownTest, NonDtlsVersionRejected) {
+    // TLS (not DTLS) version marker should be rejected
+    auto header = create_dtls_header(DTLS_CONTENT_HANDSHAKE, 0x03, 0x03);  // TLS 1.2
+    EXPECT_FALSE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, Dtls10Detected) {
+    // DTLS 1.0 = version 0xFE 0xFF
+    auto header = create_dtls_header(DTLS_CONTENT_HANDSHAKE, 0xFE, 0xFF);
+    EXPECT_TRUE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, Dtls12Detected) {
+    // DTLS 1.2 = version 0xFE 0xFD
+    auto header = create_dtls_header(DTLS_CONTENT_HANDSHAKE, 0xFE, 0xFD);
+    EXPECT_TRUE(is_dtls_handshake_packet(header.data(), header.size()));
+}
+
+TEST_F(DtlsLockdownTest, PlaintextGossipPacketRejected) {
+    // Plaintext gossip packets should be rejected when mTLS is enabled
+    // Route announcement starts with 0x01, not a valid DTLS content type
+    std::vector<uint8_t> plaintext = {
+        0x01,  // ROUTE_ANNOUNCEMENT
+        0x02,  // Protocol version
+        // ... rest of packet
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+    EXPECT_FALSE(is_dtls_handshake_packet(plaintext.data(), plaintext.size()));
+}
+
+TEST_F(DtlsLockdownTest, HeartbeatPacketRejected) {
+    // Heartbeat packet (type 0x02) should be rejected as not DTLS
+    std::vector<uint8_t> heartbeat(13, 0);
+    heartbeat[0] = 0x02;  // Gossip HEARTBEAT
+    heartbeat[1] = 0x02;  // Protocol version
+    EXPECT_FALSE(is_dtls_handshake_packet(heartbeat.data(), heartbeat.size()));
+}
+
+TEST_F(DtlsLockdownTest, UnknownContentTypeRejected) {
+    // Unknown content types should be rejected
+    for (uint8_t type : {0, 19, 24, 25, 255}) {
+        auto header = create_dtls_header(type);
+        EXPECT_FALSE(is_dtls_handshake_packet(header.data(), header.size()))
+            << "Unexpectedly accepted content type " << static_cast<int>(type);
+    }
+}
+
+// =============================================================================
+// mTLS Lockdown Policy Tests
+// =============================================================================
+
+class MtlsLockdownPolicyTest : public ::testing::Test {
+protected:
+    struct MockDtlsSession {
+        bool established = false;
+        bool is_established() const { return established; }
+    };
+
+    // Simulates should_drop_packet_mtls_lockdown() logic
+    bool should_drop_packet(bool mtls_enabled, bool dtls_context_exists,
+                             const MockDtlsSession* session,
+                             bool is_handshake_packet) {
+        if (!mtls_enabled) {
+            return false;  // mTLS not enabled, don't drop
+        }
+
+        if (!dtls_context_exists) {
+            return true;  // mTLS enabled but no DTLS context - drop for security
+        }
+
+        if (is_handshake_packet) {
+            return false;  // Allow handshakes through
+        }
+
+        if (session && session->is_established()) {
+            return false;  // Established session - allow
+        }
+
+        return true;  // No session or not established - drop
+    }
+};
+
+TEST_F(MtlsLockdownPolicyTest, MtlsDisabledNeverDrops) {
+    // When mTLS is disabled, never drop packets
+    EXPECT_FALSE(should_drop_packet(false, true, nullptr, false));
+    EXPECT_FALSE(should_drop_packet(false, false, nullptr, false));
+    EXPECT_FALSE(should_drop_packet(false, true, nullptr, true));
+}
+
+TEST_F(MtlsLockdownPolicyTest, MtlsEnabledNoDtlsContextDrops) {
+    // If mTLS is enabled but DTLS context doesn't exist, drop for security
+    EXPECT_TRUE(should_drop_packet(true, false, nullptr, false));
+    EXPECT_TRUE(should_drop_packet(true, false, nullptr, true));
+}
+
+TEST_F(MtlsLockdownPolicyTest, HandshakePacketsAllowedThrough) {
+    // Handshake packets should be allowed through (needed to establish sessions)
+    EXPECT_FALSE(should_drop_packet(true, true, nullptr, true));
+
+    MockDtlsSession session;
+    session.established = false;
+    EXPECT_FALSE(should_drop_packet(true, true, &session, true));
+}
+
+TEST_F(MtlsLockdownPolicyTest, EstablishedSessionAllowed) {
+    // Packets with established DTLS sessions should be allowed
+    MockDtlsSession session;
+    session.established = true;
+    EXPECT_FALSE(should_drop_packet(true, true, &session, false));
+}
+
+TEST_F(MtlsLockdownPolicyTest, NoSessionDropsNonHandshake) {
+    // Non-handshake packets without a session should be dropped
+    EXPECT_TRUE(should_drop_packet(true, true, nullptr, false));
+}
+
+TEST_F(MtlsLockdownPolicyTest, UnestablishedSessionDrops) {
+    // Packets with session not yet established should be dropped
+    MockDtlsSession session;
+    session.established = false;
+    EXPECT_TRUE(should_drop_packet(true, true, &session, false));
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

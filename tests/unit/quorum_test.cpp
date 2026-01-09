@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
+#include <unordered_set>
+#include <vector>
 
 // =============================================================================
 // QuorumState - Replicated here to avoid Seastar dependencies
@@ -317,6 +320,287 @@ TEST_F(QuorumTest, WarningRateLimiting_EnterWarningZone) {
     // Another peer dies and we enter warning zone again
     EXPECT_TRUE(state.check_and_update(3, 4, 0.5, 1));
     EXPECT_TRUE(state.warning_active);
+}
+
+// =============================================================================
+// Recently-Seen Quorum Calculation Tests (check_quorum logic)
+// =============================================================================
+// The check_quorum() method uses a stricter "recently seen within window" count
+// rather than just the alive/dead state. These tests validate that logic.
+
+struct PeerState {
+    int64_t last_seen_seconds_ago;  // How many seconds ago was this peer seen
+    bool is_alive;
+};
+
+// Count peers seen within the quorum check window
+size_t count_recently_seen_peers(const std::vector<PeerState>& peers,
+                                   int64_t window_seconds) {
+    size_t count = 0;
+    for (const auto& peer : peers) {
+        if (peer.last_seen_seconds_ago <= window_seconds) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// Calculate quorum state using recently-seen count (stricter than alive count)
+QuorumState calculate_quorum_state_recently_seen(
+    const std::vector<PeerState>& peers,
+    int64_t window_seconds,
+    double threshold) {
+
+    size_t recently_seen = count_recently_seen_peers(peers, window_seconds);
+    size_t recently_seen_nodes = recently_seen + 1;  // +1 for self
+    size_t required = calculate_quorum_required(peers.size(), threshold);
+
+    return (recently_seen_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
+}
+
+TEST_F(QuorumTest, RecentlySeen_AllPeersRecentlySeen) {
+    // 5 nodes (4 peers + self), all seen within 30s window
+    std::vector<PeerState> peers = {
+        {5, true}, {10, true}, {15, true}, {20, true}
+    };
+
+    EXPECT_EQ(count_recently_seen_peers(peers, 30), 4u);
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers, 30, 0.5), QuorumState::HEALTHY);
+}
+
+TEST_F(QuorumTest, RecentlySeen_SomePeersStale) {
+    // 5 nodes (4 peers + self), 2 seen recently, 2 are stale
+    std::vector<PeerState> peers = {
+        {5, true},   // Recently seen
+        {10, true},  // Recently seen
+        {40, true},  // Stale (beyond 30s window) but still marked alive
+        {60, true}   // Stale (beyond 30s window) but still marked alive
+    };
+
+    // Only 2 peers seen recently + self = 3, need 3 -> HEALTHY
+    EXPECT_EQ(count_recently_seen_peers(peers, 30), 2u);
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers, 30, 0.5), QuorumState::HEALTHY);
+}
+
+TEST_F(QuorumTest, RecentlySeen_TooManyStale) {
+    // 5 nodes (4 peers + self), only 1 seen recently
+    std::vector<PeerState> peers = {
+        {5, true},   // Recently seen
+        {40, true},  // Stale
+        {50, true},  // Stale
+        {60, true}   // Stale
+    };
+
+    // Only 1 peer seen recently + self = 2, need 3 -> DEGRADED
+    EXPECT_EQ(count_recently_seen_peers(peers, 30), 1u);
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers, 30, 0.5), QuorumState::DEGRADED);
+}
+
+TEST_F(QuorumTest, RecentlySeen_AllPeersStale) {
+    // 5 nodes (4 peers + self), none seen recently
+    std::vector<PeerState> peers = {
+        {40, true}, {50, true}, {60, true}, {70, true}
+    };
+
+    // Only self = 1, need 3 -> DEGRADED
+    EXPECT_EQ(count_recently_seen_peers(peers, 30), 0u);
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers, 30, 0.5), QuorumState::DEGRADED);
+}
+
+TEST_F(QuorumTest, RecentlySeen_ExactlyAtWindowBoundary) {
+    // Test edge case: peer seen exactly at window boundary
+    std::vector<PeerState> peers = {
+        {30, true},  // Exactly at boundary (should count as recently seen)
+        {31, true},  // Just beyond boundary (should NOT count)
+    };
+
+    // 1 peer at boundary + self = 2, need 2 for 2-peer cluster
+    EXPECT_EQ(count_recently_seen_peers(peers, 30), 1u);
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers, 30, 0.5), QuorumState::HEALTHY);
+}
+
+TEST_F(QuorumTest, RecentlySeen_ConfigurableWindow) {
+    // Test with different window sizes
+    std::vector<PeerState> peers = {
+        {10, true}, {20, true}, {40, true}, {60, true}
+    };
+
+    // With 15s window: only 1 peer seen recently
+    EXPECT_EQ(count_recently_seen_peers(peers, 15), 1u);
+
+    // With 30s window: 2 peers seen recently
+    EXPECT_EQ(count_recently_seen_peers(peers, 30), 2u);
+
+    // With 50s window: 3 peers seen recently
+    EXPECT_EQ(count_recently_seen_peers(peers, 50), 3u);
+
+    // With 90s window: all 4 peers seen recently
+    EXPECT_EQ(count_recently_seen_peers(peers, 90), 4u);
+}
+
+TEST_F(QuorumTest, RecentlySeen_DifferentFromAliveCount) {
+    // Demonstrate that recently-seen is stricter than alive-count
+    std::vector<PeerState> peers = {
+        {5, true},    // Recent and alive
+        {10, true},   // Recent and alive
+        {40, true},   // NOT recent but alive (would pass alive check)
+        {50, false},  // Neither recent nor alive
+    };
+
+    // Alive count: 3 peers (ignoring is_alive=false)
+    // Recently seen: only 2 peers
+
+    // Using alive count (less strict): 3 + 1 = 4 >= 3 -> HEALTHY
+    EXPECT_EQ(calculate_quorum_state(3, 4, 0.5), QuorumState::HEALTHY);
+
+    // Using recently-seen (stricter): 2 + 1 = 3 >= 3 -> HEALTHY (just barely)
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers, 30, 0.5), QuorumState::HEALTHY);
+
+    // If we lose one more recent peer:
+    std::vector<PeerState> peers2 = {
+        {5, true},    // Recent and alive
+        {40, true},   // NOT recent but alive
+        {50, true},   // NOT recent but alive
+        {60, false},  // NOT recent and not alive
+    };
+
+    // Alive count: 3 peers -> 3 + 1 = 4 >= 3 -> HEALTHY
+    EXPECT_EQ(calculate_quorum_state(3, 4, 0.5), QuorumState::HEALTHY);
+
+    // Recently-seen: 1 peer -> 1 + 1 = 2 < 3 -> DEGRADED
+    EXPECT_EQ(calculate_quorum_state_recently_seen(peers2, 30, 0.5), QuorumState::DEGRADED);
+}
+
+// =============================================================================
+// Sequence Number Hardening Tests (Replay Attack Prevention)
+// =============================================================================
+
+// Simulate the sliding window duplicate detection
+class SequenceWindow {
+public:
+    explicit SequenceWindow(size_t max_size) : _max_size(max_size) {}
+
+    // Returns true if duplicate (already seen)
+    bool is_duplicate(uint32_t seq_num) {
+        if (_seen.count(seq_num) > 0) {
+            return true;
+        }
+
+        _seen.insert(seq_num);
+        _window.push_back(seq_num);
+
+        // Slide window
+        while (_window.size() > _max_size) {
+            uint32_t oldest = _window.front();
+            _window.pop_front();
+            _seen.erase(oldest);
+        }
+
+        return false;
+    }
+
+    size_t size() const { return _window.size(); }
+    bool contains(uint32_t seq_num) const { return _seen.count(seq_num) > 0; }
+
+    // SECURITY: This simulates what should happen during resync
+    // Notice we do NOT clear the window - this prevents replay attacks
+    void simulate_resync() {
+        // DO NOT clear _window or _seen!
+        // Clearing would allow replay attacks
+    }
+
+private:
+    size_t _max_size;
+    std::deque<uint32_t> _window;
+    std::unordered_set<uint32_t> _seen;
+};
+
+TEST_F(QuorumTest, SequenceWindow_DetectsDuplicates) {
+    SequenceWindow window(100);
+
+    // First occurrence is not a duplicate
+    EXPECT_FALSE(window.is_duplicate(1));
+    EXPECT_FALSE(window.is_duplicate(2));
+    EXPECT_FALSE(window.is_duplicate(3));
+
+    // Second occurrence IS a duplicate
+    EXPECT_TRUE(window.is_duplicate(1));
+    EXPECT_TRUE(window.is_duplicate(2));
+    EXPECT_TRUE(window.is_duplicate(3));
+}
+
+TEST_F(QuorumTest, SequenceWindow_SlidesCorrectly) {
+    SequenceWindow window(3);  // Small window for testing
+
+    // Fill window
+    EXPECT_FALSE(window.is_duplicate(1));
+    EXPECT_FALSE(window.is_duplicate(2));
+    EXPECT_FALSE(window.is_duplicate(3));
+
+    // Window is now: [1, 2, 3]
+    EXPECT_EQ(window.size(), 3u);
+    EXPECT_TRUE(window.contains(1));
+    EXPECT_TRUE(window.contains(2));
+    EXPECT_TRUE(window.contains(3));
+
+    // Add one more - should evict oldest (1)
+    EXPECT_FALSE(window.is_duplicate(4));
+
+    // Window is now: [2, 3, 4]
+    EXPECT_EQ(window.size(), 3u);
+    EXPECT_FALSE(window.contains(1));  // Evicted
+    EXPECT_TRUE(window.contains(2));
+    EXPECT_TRUE(window.contains(3));
+    EXPECT_TRUE(window.contains(4));
+
+    // 1 can now be reused (no longer in window)
+    EXPECT_FALSE(window.is_duplicate(1));
+}
+
+TEST_F(QuorumTest, SequenceWindow_PersistsAcrossResync) {
+    SequenceWindow window(100);
+
+    // Record some sequence numbers
+    EXPECT_FALSE(window.is_duplicate(100));
+    EXPECT_FALSE(window.is_duplicate(101));
+    EXPECT_FALSE(window.is_duplicate(102));
+
+    // Simulate resync - window should persist
+    window.simulate_resync();
+
+    // CRITICAL: Replay attack attempt should still be detected!
+    // If window was cleared, this would return false (security vulnerability)
+    EXPECT_TRUE(window.is_duplicate(100));
+    EXPECT_TRUE(window.is_duplicate(101));
+    EXPECT_TRUE(window.is_duplicate(102));
+
+    // New sequence numbers should still work
+    EXPECT_FALSE(window.is_duplicate(103));
+}
+
+TEST_F(QuorumTest, SequenceWindow_ReplayAttackPrevention) {
+    // Simulate a replay attack scenario
+    SequenceWindow window(1000);
+
+    // Attacker captures sequence numbers 1-50
+    for (uint32_t i = 1; i <= 50; ++i) {
+        EXPECT_FALSE(window.is_duplicate(i));
+    }
+
+    // System undergoes resync (network partition recovery, etc.)
+    window.simulate_resync();
+
+    // Attacker attempts to replay captured packets
+    // WITHOUT the security fix (clearing window), all would return false
+    // WITH the security fix (preserving window), all should return true
+    for (uint32_t i = 1; i <= 50; ++i) {
+        EXPECT_TRUE(window.is_duplicate(i))
+            << "Replay attack not detected for seq_num=" << i;
+    }
+
+    // Normal operation continues with new sequence numbers
+    EXPECT_FALSE(window.is_duplicate(51));
+    EXPECT_FALSE(window.is_duplicate(52));
 }
 
 int main(int argc, char** argv) {

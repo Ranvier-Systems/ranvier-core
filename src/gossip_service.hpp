@@ -392,11 +392,29 @@ private:
 
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
-    void update_quorum_state();  // Check and update quorum based on alive peers
-    void check_quorum();  // Count recently seen peers and update quorum state
 
-    // DTLS lockdown helpers
+    // Quorum state management (two strategies):
+    // - update_quorum_state(): Uses alive peer count (less strict, for startup)
+    // - check_quorum(): Uses recently-seen count within window (strict, for runtime)
+    void update_quorum_state();
+    void check_quorum();
+
+    //--------------------------------------------------------------------------
+    // DTLS Lockdown Helpers
+    //--------------------------------------------------------------------------
+
+    // DTLS record layer content type constants (RFC 6347)
+    static constexpr uint8_t DTLS_CONTENT_CHANGE_CIPHER_SPEC = 20;
+    static constexpr uint8_t DTLS_CONTENT_ALERT = 21;
+    static constexpr uint8_t DTLS_CONTENT_HANDSHAKE = 22;
+    static constexpr uint8_t DTLS_CONTENT_APPLICATION_DATA = 23;
+    static constexpr uint8_t DTLS_VERSION_MARKER = 0xFE;  // First byte of DTLS version
+    static constexpr size_t DTLS_RECORD_HEADER_SIZE = 13;
+
+    // Check if packet is a DTLS handshake/alert packet (allows through mTLS lockdown)
     bool is_dtls_handshake_packet(const uint8_t* data, size_t len) const;
+
+    // Check if packet should be dropped by mTLS lockdown policy
     bool should_drop_packet_mtls_lockdown(const seastar::socket_address& peer, const uint8_t* data, size_t len);
 
     //--------------------------------------------------------------------------

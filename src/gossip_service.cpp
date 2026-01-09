@@ -1627,29 +1627,32 @@ void GossipService::end_resync() {
 //------------------------------------------------------------------------------
 
 bool GossipService::is_dtls_handshake_packet(const uint8_t* data, size_t len) const {
-    // DTLS handshake packets have specific content type markers
-    // DTLS 1.0/1.2 record header:
-    //   - ContentType (1 byte): 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=Application
-    //   - Version (2 bytes): Major.Minor (e.g., 0xFE 0xFF for DTLS 1.0, 0xFE 0xFD for DTLS 1.2)
+    // DTLS record layer header format (DTLS 1.0/1.2, RFC 6347):
+    //   - ContentType (1 byte)
+    //   - Version (2 bytes): Major.Minor (0xFE 0xFF=DTLS 1.0, 0xFE 0xFD=DTLS 1.2)
     //   - Epoch (2 bytes)
     //   - Sequence number (6 bytes)
     //   - Length (2 bytes)
-    // Minimum header size is 13 bytes
+    //
+    // We allow Alert packets because they may be sent during handshake
+    // failures and must not be silently dropped.
 
-    if (len < 13) {
+    if (len < DTLS_RECORD_HEADER_SIZE) {
         return false;
     }
 
     uint8_t content_type = data[0];
 
-    // Check for handshake (22) or change cipher spec (20) - both are part of handshake flow
-    if (content_type != 20 && content_type != 22) {
+    // Check for handshake-related content types
+    bool is_handshake_type = (content_type == DTLS_CONTENT_CHANGE_CIPHER_SPEC ||
+                              content_type == DTLS_CONTENT_ALERT ||
+                              content_type == DTLS_CONTENT_HANDSHAKE);
+    if (!is_handshake_type) {
         return false;
     }
 
-    // Verify DTLS version marker (0xFE in first version byte indicates DTLS)
-    // DTLS 1.0 = 0xFE 0xFF, DTLS 1.2 = 0xFE 0xFD, DTLS 1.3 = 0xFE 0xFC
-    if (data[1] != 0xFE) {
+    // Verify DTLS version marker (distinguishes DTLS from TLS)
+    if (data[1] != DTLS_VERSION_MARKER) {
         return false;
     }
 
