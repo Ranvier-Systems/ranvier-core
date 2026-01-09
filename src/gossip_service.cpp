@@ -95,7 +95,14 @@ GossipService::GossipService(const ClusterConfig& config)
         seastar::metrics::make_counter("cluster_quorum_transitions", _quorum_transitions,
             seastar::metrics::description("Total number of quorum state transitions (healthy<->degraded)")),
         seastar::metrics::make_counter("cluster_routes_rejected_degraded", _routes_rejected_degraded,
-            seastar::metrics::description("Total number of route broadcasts rejected due to degraded quorum state"))
+            seastar::metrics::description("Total number of route broadcasts rejected due to degraded quorum state")),
+        seastar::metrics::make_counter("cluster_routes_rejected_incoming_degraded", _routes_rejected_incoming_degraded,
+            seastar::metrics::description("Total number of incoming routes rejected due to degraded quorum state")),
+        seastar::metrics::make_gauge("cluster_peers_recently_seen", _stats_peers_recently_seen,
+            seastar::metrics::description("Number of peers seen within quorum check window")),
+        // DTLS lockdown metrics
+        seastar::metrics::make_counter("cluster_dtls_lockdown_drops", _dtls_lockdown_drops,
+            seastar::metrics::description("Total number of packets dropped due to mTLS lockdown enforcement"))
     });
 }
 
@@ -443,8 +450,6 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
         return seastar::make_ready_future<>();
     }
 
-    update_peer_liveness(src_addr);
-
     // Move the packet out and linearize it
     seastar::net::packet data = std::move(dgram.get_data());
 
@@ -454,6 +459,15 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     // Now it is safe to access the full length from the first fragment
     const uint8_t* raw_ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
     size_t raw_len = data.len();
+
+    // DTLS Security Lockdown: when mTLS is enabled, drop any packet that
+    // is not a DTLS handshake and does not belong to an active DTLS session
+    if (should_drop_packet_mtls_lockdown(src_addr, raw_ptr, raw_len)) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Update liveness after security checks pass
+    update_peer_liveness(src_addr);
 
     // Decrypt if DTLS is enabled
     const uint8_t* ptr = raw_ptr;
@@ -511,6 +525,19 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
             // Still send ACK for duplicate (sender may not have received our previous ACK)
             return send_ack(src_addr, pkt->seq_num);
         }
+    }
+
+    // Split-brain protection: reject incoming route propagation when quorum is lost
+    // This prevents a partitioned node from accepting potentially stale routes
+    if (_config.quorum_enabled && _config.reject_routes_on_quorum_loss && is_degraded()) {
+        ++_routes_rejected_incoming_degraded;
+        log_gossip.debug("Incoming route rejected: cluster in DEGRADED mode (no quorum). "
+                        "peer={}, tokens={}, backend={}", src_addr, pkt->tokens.size(), pkt->backend_id);
+        // Still send ACK to avoid sender retries (we're explicitly rejecting, not failing)
+        if (_config.gossip_reliable_delivery) {
+            return send_ack(src_addr, pkt->seq_num);
+        }
+        return seastar::make_ready_future<>();
     }
 
     // Map this peer address to the backend ID it just announced
@@ -623,7 +650,8 @@ void GossipService::check_liveness() {
 
     // Update quorum state after liveness check
     if (_config.quorum_enabled) {
-        update_quorum_state();
+        // Use check_quorum() for stricter recently-seen counting
+        check_quorum();
     }
 }
 
@@ -637,6 +665,72 @@ size_t GossipService::quorum_required() const {
     // Cap at total_nodes to prevent impossible quorum requirements
     // (e.g., threshold=1.0 would give N+1 which exceeds cluster size)
     return std::min(required, total_nodes);
+}
+
+void GossipService::check_quorum() {
+    // Only run on shard 0 since it manages the peer table
+    if (seastar::this_shard_id() != 0) {
+        return;
+    }
+
+    auto now = seastar::lowres_clock::now();
+    size_t recently_seen = 0;
+
+    // Count peers seen within the quorum check window
+    for (const auto& [addr, state] : _peer_table) {
+        auto time_since_seen = std::chrono::duration_cast<std::chrono::seconds>(now - state.last_seen);
+        if (time_since_seen <= _config.quorum_check_window) {
+            ++recently_seen;
+        }
+    }
+
+    _stats_peers_recently_seen = recently_seen;
+
+    // Use recently seen count for quorum calculation (more strict than just alive)
+    size_t total_nodes = _peer_table.size() + 1;  // +1 for self
+    size_t recently_seen_nodes = recently_seen + 1;  // +1 for self (we're always "seen")
+    size_t required = quorum_required();
+
+    QuorumState new_state = (recently_seen_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
+
+    // Handle state transitions
+    if (new_state != _quorum_state) {
+        ++_quorum_transitions;
+
+        if (new_state == QuorumState::DEGRADED) {
+            _quorum_warning_active = false;
+            log_gossip.error("QUORUM LOST (check_quorum): Cluster entering DEGRADED mode. "
+                            "Only {}/{} nodes recently seen within {}s window (need {} for quorum). "
+                            "New route propagation will be rejected to prevent split-brain divergence.",
+                            recently_seen_nodes, total_nodes, _config.quorum_check_window.count(), required);
+        } else {
+            log_gossip.info("QUORUM RESTORED (check_quorum): Cluster returning to HEALTHY mode. "
+                           "{}/{} nodes recently seen within {}s window (need {} for quorum). "
+                           "Route propagation re-enabled.",
+                           recently_seen_nodes, total_nodes, _config.quorum_check_window.count(), required);
+        }
+
+        _quorum_state = new_state;
+        _stats_quorum_state = (new_state == QuorumState::HEALTHY) ? 1 : 0;
+    }
+
+    // Check for warning threshold
+    if (_config.quorum_warning_threshold > 0 && new_state == QuorumState::HEALTHY) {
+        size_t margin = recently_seen_nodes - required;
+        bool should_warn = margin <= _config.quorum_warning_threshold;
+
+        if (should_warn && !_quorum_warning_active) {
+            _quorum_warning_active = true;
+            log_gossip.warn("QUORUM WARNING: Only {} node(s) above quorum threshold "
+                           "(recently_seen={}, required={}, total={}). Cluster at risk of split-brain.",
+                           margin, recently_seen_nodes, required, total_nodes);
+        } else if (!should_warn && _quorum_warning_active) {
+            _quorum_warning_active = false;
+            log_gossip.info("QUORUM WARNING CLEARED: Cluster has sufficient margin "
+                           "(recently_seen={}, required={}, total={}).",
+                           recently_seen_nodes, required, total_nodes);
+        }
+    }
 }
 
 void GossipService::update_quorum_state() {
@@ -788,6 +882,9 @@ seastar::future<> GossipService::refresh_peers() {
         auto now = seastar::lowres_clock::now();
         std::unordered_map<seastar::socket_address, PeerState> new_peer_table;
 
+        // Track newly discovered peers for DTLS handshake initiation
+        std::vector<seastar::socket_address> new_peers_for_handshake;
+
         for (const auto& addr : new_peer_addresses) {
             auto it = _peer_table.find(addr);
             if (it != _peer_table.end()) {
@@ -797,6 +894,10 @@ seastar::future<> GossipService::refresh_peers() {
                 // New peer - initialize with current time
                 new_peer_table[addr] = { now, true, std::nullopt };
                 log_gossip.info("DNS discovery: new peer added: {}", addr);
+                // Mark for DTLS handshake if DTLS is enabled
+                if (_dtls_context && _dtls_context->is_enabled()) {
+                    new_peers_for_handshake.push_back(addr);
+                }
             }
         }
 
@@ -844,6 +945,15 @@ seastar::future<> GossipService::refresh_peers() {
                         _peer_addresses.size(), discovered_addresses.size());
 
         ++_dns_discovery_success;
+
+        // Auto-trigger DTLS handshakes for newly discovered peers BEFORE any routing data exchange
+        // This ensures encrypted channels are established first when mTLS is enabled
+        if (!new_peers_for_handshake.empty()) {
+            log_gossip.info("Initiating DTLS handshakes with {} newly discovered peers", new_peers_for_handshake.size());
+            for (const auto& peer : new_peers_for_handshake) {
+                (void)initiate_peer_handshake(peer);
+            }
+        }
 
     } catch (const std::exception& e) {
         log_gossip.warn("DNS discovery failed: {}", e.what());
@@ -919,12 +1029,25 @@ void GossipService::handle_ack(const seastar::socket_address& peer, uint32_t seq
     }
 }
 
-// Reliable delivery: check if a sequence number is a duplicate
+// Reliable delivery: check if a sequence number is a duplicate (SECURITY-CRITICAL)
+//
+// This function implements a sliding window for sequence number tracking that
+// provides protection against replay attacks. The window MUST persist across
+// resync events - clearing it would allow an attacker to replay old messages.
+//
+// Security properties:
+// 1. Duplicate detection: Prevents processing the same message twice
+// 2. Replay attack prevention: Old captured packets cannot be replayed
+// 3. Window size limits memory usage while maintaining security
+//
+// The window size (gossip_dedup_window) should be large enough to cover
+// the maximum expected in-flight messages during normal operation and
+// any network partitions that might delay delivery.
 bool GossipService::is_duplicate(const seastar::socket_address& peer, uint32_t seq_num) {
     auto& seq_set = _received_seq_sets[peer];
     auto& seq_window = _received_seq_windows[peer];
 
-    // Check if we've seen this sequence number
+    // Check if we've seen this sequence number (potential duplicate or replay attack)
     if (seq_set.count(seq_num) > 0) {
         return true;
     }
@@ -933,7 +1056,8 @@ bool GossipService::is_duplicate(const seastar::socket_address& peer, uint32_t s
     seq_set.insert(seq_num);
     seq_window.push_back(seq_num);
 
-    // Slide window if too large
+    // Slide window if too large - evict oldest sequence numbers
+    // Note: We only evict the oldest entries, never clear the whole window
     while (seq_window.size() > _config.gossip_dedup_window) {
         uint32_t oldest = seq_window.front();
         seq_window.pop_front();
@@ -1474,6 +1598,17 @@ void GossipService::start_resync() {
     // Clear pending ACKs to avoid stale retries during re-sync
     _pending_acks.clear();
 
+    // SECURITY: DO NOT clear _received_seq_windows and _received_seq_sets!
+    // These sliding windows MUST persist across resync events to prevent
+    // "Replay Attacks" where an attacker re-sends old routing messages
+    // to overwrite newer routes. If we cleared these windows, an attacker
+    // could capture old sequence numbers and replay them after a resync
+    // to inject stale/malicious routes into the routing table.
+    //
+    // The sequence numbers in the sliding window prevent this by ensuring
+    // that even after a resync, previously-seen sequence numbers are still
+    // rejected as duplicates.
+
     // Note: We don't close the gate here - we just set the flag
     // This allows in-flight tasks to complete while new ones are rejected
 }
@@ -1485,6 +1620,74 @@ void GossipService::end_resync() {
 
     log_gossip.info("Ending gossip re-sync mode - resuming normal gossip operations");
     _resyncing.store(false, std::memory_order_relaxed);
+}
+
+//------------------------------------------------------------------------------
+// DTLS Lockdown Helper Methods
+//------------------------------------------------------------------------------
+
+bool GossipService::is_dtls_handshake_packet(const uint8_t* data, size_t len) const {
+    // DTLS handshake packets have specific content type markers
+    // DTLS 1.0/1.2 record header:
+    //   - ContentType (1 byte): 20=ChangeCipherSpec, 21=Alert, 22=Handshake, 23=Application
+    //   - Version (2 bytes): Major.Minor (e.g., 0xFE 0xFF for DTLS 1.0, 0xFE 0xFD for DTLS 1.2)
+    //   - Epoch (2 bytes)
+    //   - Sequence number (6 bytes)
+    //   - Length (2 bytes)
+    // Minimum header size is 13 bytes
+
+    if (len < 13) {
+        return false;
+    }
+
+    uint8_t content_type = data[0];
+
+    // Check for handshake (22) or change cipher spec (20) - both are part of handshake flow
+    if (content_type != 20 && content_type != 22) {
+        return false;
+    }
+
+    // Verify DTLS version marker (0xFE in first version byte indicates DTLS)
+    // DTLS 1.0 = 0xFE 0xFF, DTLS 1.2 = 0xFE 0xFD, DTLS 1.3 = 0xFE 0xFC
+    if (data[1] != 0xFE) {
+        return false;
+    }
+
+    return true;
+}
+
+bool GossipService::should_drop_packet_mtls_lockdown(const seastar::socket_address& peer,
+                                                       const uint8_t* data, size_t len) {
+    // If mTLS lockdown is not enabled, don't drop anything
+    if (!_config.mtls_enabled) {
+        return false;
+    }
+
+    // DTLS must be configured and enabled for mTLS to work
+    if (!_dtls_context || !_dtls_context->is_enabled()) {
+        // DTLS not initialized - this shouldn't happen with mtls_enabled
+        // but if it does, we must drop all packets for security
+        log_gossip.warn("mTLS lockdown active but DTLS not initialized - dropping packet from {}", peer);
+        ++_dtls_lockdown_drops;
+        return true;
+    }
+
+    // Allow DTLS handshake packets through (needed to establish sessions)
+    if (is_dtls_handshake_packet(data, len)) {
+        return false;
+    }
+
+    // Check if we have an established DTLS session for this peer
+    auto* session = _dtls_context->get_or_create_session(peer, true);
+    if (session && session->is_established()) {
+        // Active session exists - packet is allowed (will be decrypted)
+        return false;
+    }
+
+    // No established session and not a handshake packet - drop it
+    log_gossip.debug("mTLS lockdown: dropping non-DTLS packet from {} (no established session)", peer);
+    ++_dtls_lockdown_drops;
+    return true;
 }
 
 }  // namespace ranvier

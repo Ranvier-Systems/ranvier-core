@@ -244,6 +244,7 @@ public:
     size_t quorum_required() const;  // N/2+1
     size_t peers_alive_count() const { return _stats_cluster_peers_alive; }
     size_t total_peers_count() const { return _peer_table.size(); }
+    size_t peers_recently_seen_count() const { return _stats_peers_recently_seen; }
 
     // Callback type for pruning routes
     using RoutePruneCallback = std::function<seastar::future<>(BackendId)>;
@@ -292,7 +293,12 @@ private:
     uint64_t _stats_quorum_state = 1;  // 1=healthy, 0=degraded (for Prometheus gauge)
     uint64_t _quorum_transitions = 0;  // Count of state transitions
     uint64_t _routes_rejected_degraded = 0;  // Routes rejected due to degraded state
+    uint64_t _routes_rejected_incoming_degraded = 0;  // Incoming routes rejected due to degraded state
+    uint64_t _stats_peers_recently_seen = 0;  // Count of peers seen within quorum check window
     bool _quorum_warning_active = false;  // Track if we've already logged a warning (rate limiting)
+
+    // DTLS lockdown metrics
+    uint64_t _dtls_lockdown_drops = 0;  // Packets dropped due to mTLS lockdown (non-DTLS when mTLS required)
 
     // Reliable delivery metrics
     uint64_t _acks_sent = 0;
@@ -387,6 +393,11 @@ private:
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
     void update_quorum_state();  // Check and update quorum based on alive peers
+    void check_quorum();  // Count recently seen peers and update quorum state
+
+    // DTLS lockdown helpers
+    bool is_dtls_handshake_packet(const uint8_t* data, size_t len) const;
+    bool should_drop_packet_mtls_lockdown(const seastar::socket_address& peer, const uint8_t* data, size_t len);
 
     //--------------------------------------------------------------------------
     // DTLS Helper Methods
