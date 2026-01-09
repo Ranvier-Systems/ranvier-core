@@ -4,6 +4,7 @@
 #include "gossip_service.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
+#include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
 
 #include <csignal>
@@ -121,6 +122,11 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.backpressure.enable_persistence_backpressure = config.backpressure.enable_persistence_backpressure;
     cfg.backpressure.persistence_queue_threshold = config.backpressure.persistence_queue_threshold;
     cfg.backpressure.retry_after_seconds = config.backpressure.retry_after_seconds;
+    // Load balancing settings (P2C algorithm)
+    cfg.load_balancing.enabled = config.load_balancing.enabled;
+    cfg.load_balancing.min_load_difference = config.load_balancing.min_load_difference;
+    cfg.load_balancing.local_processing_threshold = config.load_balancing.local_processing_threshold;
+    cfg.load_balancing.snapshot_refresh_interval_us = config.load_balancing.snapshot_refresh_interval_us;
     return cfg;
 }
 
@@ -421,12 +427,39 @@ seastar::future<> Application::startup() {
         }).then([this] {
             _controller_started = true;
         }).then([this] {
-            // 8. Initialize metrics on ALL shards
+            // 8. Initialize metrics and shard load metrics on ALL shards
             return seastar::smp::invoke_on_all([] {
                 init_metrics();
+                init_shard_load_metrics();
             });
         }).then([this] {
-            // 9. Initialize persistence
+            // 9. Start shard load balancer (P2C algorithm for cross-shard dispatch)
+            ShardLoadBalancerConfig lb_config;
+            lb_config.enabled = _config.load_balancing.enabled;
+            lb_config.min_load_difference = _config.load_balancing.min_load_difference;
+            lb_config.local_processing_threshold = _config.load_balancing.local_processing_threshold;
+            lb_config.snapshot_refresh_interval_us = _config.load_balancing.snapshot_refresh_interval_us;
+            return _load_balancer.start(lb_config);
+        }).then([this] {
+            _load_balancer_started = true;
+            // Connect load balancer to HttpController on all shards
+            return _controller.invoke_on_all([this](HttpController& c) {
+                c.set_load_balancer(&_load_balancer);
+            });
+        }).then([this] {
+            // Register load balancer metrics on all shards
+            return _load_balancer.invoke_on_all([](ShardLoadBalancer& lb) {
+                lb.register_metrics();
+            });
+        }).then([this] {
+            if (_config.load_balancing.enabled) {
+                log_main.info("Shard load balancer initialized (P2C algorithm, {} shards)",
+                    seastar::smp::count);
+            } else {
+                log_main.info("Shard load balancer disabled (requests processed locally)");
+            }
+        }).then([this] {
+            // 10. Initialize persistence
             return init_persistence();
         }).then([this] {
             // 10. Initialize health checker
@@ -706,6 +739,15 @@ seastar::future<> Application::stop_services() {
     if (_controller_started) {
         chain = chain.then([this] {
             return _controller.stop();
+        });
+    }
+
+    // Stop the shard load balancer (only if it was started)
+    if (_load_balancer_started) {
+        chain = chain.then([this] {
+            return _load_balancer.stop().then([] {
+                log_main.info("Shard load balancer stopped");
+            });
         });
     }
 

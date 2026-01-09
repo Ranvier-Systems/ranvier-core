@@ -4,9 +4,12 @@
 #include "circuit_breaker.hpp"
 #include "config.hpp"
 #include "connection_pool.hpp"
+#include "cross_shard_request.hpp"
 #include "metrics_service.hpp"
 #include "rate_limiter.hpp"
 #include "router_service.hpp"
+#include "shard_load_balancer.hpp"
+#include "shard_load_metrics.hpp"
 #include "tokenizer_service.hpp"
 
 #include <atomic>
@@ -15,6 +18,7 @@
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/request.hh>
 #include <seastar/http/reply.hh>
@@ -46,6 +50,14 @@ struct BackpressureSettings {
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
 };
 
+// Shard load balancing settings
+struct LoadBalancingSettings {
+    bool enabled = true;                              // Enable cross-shard load balancing
+    double min_load_difference = 0.2;                 // Min load difference (ratio) to trigger dispatch
+    uint64_t local_processing_threshold = 10;         // Process locally if active < this threshold
+    uint64_t snapshot_refresh_interval_us = 1000;     // Snapshot cache refresh interval (microseconds)
+};
+
 // HTTP controller configuration
 struct HttpControllerConfig {
     ConnectionPoolConfig pool;
@@ -57,6 +69,7 @@ struct HttpControllerConfig {
     RetrySettings retry;                        // Retry configuration
     CircuitBreakerSettings circuit_breaker;     // Circuit breaker configuration
     BackpressureSettings backpressure;          // Backpressure configuration
+    LoadBalancingSettings load_balancing;       // Shard load balancing configuration
     std::chrono::seconds drain_timeout{30};     // Max time to wait for in-flight requests during shutdown
     bool enable_token_forwarding = false;       // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;          // Accept pre-tokenized prompt_token_ids from clients for routing
@@ -82,8 +95,15 @@ public:
               config.circuit_breaker.enabled
           }),
           _persistence(nullptr),
+          _load_balancer(nullptr),
           // Backpressure: 0 means unlimited (use max size_t as semaphore limit)
-          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)) {}
+          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)) {
+        // Initialize load balancer configuration
+        _lb_config.enabled = config.load_balancing.enabled;
+        _lb_config.min_load_difference = config.load_balancing.min_load_difference;
+        _lb_config.local_processing_threshold = config.load_balancing.local_processing_threshold;
+        _lb_config.snapshot_refresh_interval_us = config.load_balancing.snapshot_refresh_interval_us;
+    }
 
 private:
     // Helper to compute effective semaphore limit (0 = unlimited)
@@ -96,6 +116,10 @@ public:
     // Set optional async persistence manager (call before serving requests)
     // Uses fire-and-forget queueing to avoid blocking the reactor
     void set_persistence(AsyncPersistenceManager* manager) { _persistence = manager; }
+
+    // Set optional shard load balancer (call before serving requests)
+    // Enables cross-shard request dispatch using Power of Two Choices algorithm
+    void set_load_balancer(seastar::sharded<ShardLoadBalancer>* lb) { _load_balancer = lb; }
 
     // Set config reload callback (for /admin/keys/reload endpoint)
     // Callback returns true on success, false on failure
@@ -113,6 +137,14 @@ public:
             config.circuit_breaker.recovery_timeout,
             config.circuit_breaker.enabled
         });
+        // Update load balancer config
+        _lb_config.enabled = config.load_balancing.enabled;
+        _lb_config.min_load_difference = config.load_balancing.min_load_difference;
+        _lb_config.local_processing_threshold = config.load_balancing.local_processing_threshold;
+        _lb_config.snapshot_refresh_interval_us = config.load_balancing.snapshot_refresh_interval_us;
+        if (_load_balancer) {
+            _load_balancer->local().update_config(_lb_config);
+        }
     }
 
     // Register all endpoints
@@ -140,6 +172,10 @@ private:
     AsyncPersistenceManager* _persistence;  // Async persistence (fire-and-forget, non-blocking)
     ConfigReloadCallback _config_reload_callback;  // Callback for config hot-reload
 
+    // Shard load balancing (P2C algorithm)
+    seastar::sharded<ShardLoadBalancer>* _load_balancer;  // Cross-shard load balancer
+    ShardLoadBalancerConfig _lb_config;  // Local copy of load balancer config
+
     // Graceful shutdown state
     std::atomic<bool> _draining{false};  // Set to true to reject new requests
     seastar::gate _request_gate;         // Tracks in-flight requests
@@ -152,8 +188,16 @@ private:
     std::atomic<uint64_t> _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
     std::atomic<uint64_t> _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
 
+    // Shard load balancing metrics
+    std::atomic<uint64_t> _requests_local_dispatch{0};         // Requests processed locally
+    std::atomic<uint64_t> _requests_cross_shard_dispatch{0};   // Requests dispatched cross-shard
+
     // Check if persistence queue is under backpressure
     bool is_persistence_backpressured() const;
+
+    // Select target shard for request processing using P2C algorithm
+    // Returns local shard if load balancing disabled or not beneficial
+    uint32_t select_target_shard();
 
     // Helper handlers
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);

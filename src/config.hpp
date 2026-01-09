@@ -335,6 +335,15 @@ struct TelemetryConfig {
     size_t max_export_batch_size = 512;                    // Max spans per export batch
 };
 
+// Shard load balancing configuration (P2C algorithm)
+// Distributes requests across CPU cores to prevent hot shards
+struct LoadBalancingConfig {
+    bool enabled = true;                                   // Enable cross-shard load balancing
+    double min_load_difference = 0.2;                      // Min load difference ratio to trigger dispatch
+    uint64_t local_processing_threshold = 10;              // Process locally if active requests < threshold
+    uint64_t snapshot_refresh_interval_us = 1000;          // Shard metrics snapshot refresh interval (microseconds)
+};
+
 // Top-level configuration
 struct RanvierConfig {
     ServerConfig server;
@@ -354,6 +363,7 @@ struct RanvierConfig {
     ClusterConfig cluster;
     K8sDiscoveryConfig k8s_discovery;
     TelemetryConfig telemetry;
+    LoadBalancingConfig load_balancing;
 
     // Load configuration from YAML file
     static RanvierConfig load(const std::string& config_path);
