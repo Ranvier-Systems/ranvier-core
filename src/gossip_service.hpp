@@ -332,6 +332,34 @@ public:
     size_t total_peers_count() const { return _peer_table.size(); }
     size_t peers_recently_seen_count() const { return _stats_peers_recently_seen; }
 
+    // ==========================================================================
+    // Admin API - Cluster State Inspection
+    // ==========================================================================
+
+    // Peer state for admin API
+    struct PeerInfo {
+        std::string address;
+        uint16_t port;
+        bool is_alive;
+        int64_t last_seen_ms;  // Milliseconds since epoch
+        std::optional<BackendId> associated_backend;
+    };
+
+    // Cluster state for admin API
+    struct ClusterState {
+        std::string quorum_state;  // "HEALTHY" or "DEGRADED"
+        size_t quorum_required;
+        size_t peers_alive;
+        size_t total_peers;
+        size_t peers_recently_seen;
+        bool is_draining;
+        BackendId local_backend_id;
+        std::vector<PeerInfo> peers;
+    };
+
+    // Get current cluster state for admin inspection
+    ClusterState get_cluster_state() const;
+
     // Callback type for pruning routes
     using RoutePruneCallback = std::function<seastar::future<>(BackendId)>;
 

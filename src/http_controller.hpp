@@ -210,6 +210,12 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
+    // State inspection handlers (for rvctl CLI)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_tree(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_cluster(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_backends(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_drain_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;
 

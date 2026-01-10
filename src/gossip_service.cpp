@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <unordered_set>
 
 #include <boost/range/irange.hpp>
@@ -1933,6 +1934,46 @@ void GossipService::sync_crypto_offloader_stats() {
     // These add to existing metrics rather than replace
     _crypto_stalls_avoided += stats.stalls_avoided;
     _crypto_stall_warnings += stats.stall_warnings;
+}
+
+GossipService::ClusterState GossipService::get_cluster_state() const {
+    ClusterState state;
+
+    state.quorum_state = (_quorum_state == QuorumState::HEALTHY) ? "HEALTHY" : "DEGRADED";
+    state.quorum_required = quorum_required();
+    state.peers_alive = _stats_cluster_peers_alive;
+    state.total_peers = _peer_table.size();
+    state.peers_recently_seen = _stats_peers_recently_seen;
+    state.is_draining = _draining.load(std::memory_order_relaxed);
+    state.local_backend_id = _local_backend_id;
+
+    // Collect peer information
+    for (const auto& [addr, peer_state] : _peer_table) {
+        PeerInfo info;
+
+        // Extract address and port from socket_address
+        std::ostringstream oss;
+        oss << addr;
+        std::string addr_str = oss.str();
+
+        auto colon_pos = addr_str.find_last_of(':');
+        if (colon_pos != std::string::npos) {
+            info.address = addr_str.substr(0, colon_pos);
+            info.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+        } else {
+            info.address = addr_str;
+            info.port = 0;
+        }
+
+        info.is_alive = peer_state.is_alive;
+        info.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            peer_state.last_seen.time_since_epoch()).count();
+        info.associated_backend = peer_state.associated_backend;
+
+        state.peers.push_back(std::move(info));
+    }
+
+    return state;
 }
 
 }  // namespace ranvier

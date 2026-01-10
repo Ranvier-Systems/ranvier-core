@@ -7,6 +7,7 @@
 #include "stream_parser.hpp"
 
 #include <algorithm>
+#include <sstream>
 #include <system_error>
 
 #include <seastar/core/coroutine.hh>
@@ -275,6 +276,24 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     // 4. API KEY MANAGEMENT
     r.add(operation_type::POST, url("/admin/keys/reload"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_keys_reload(std::move(req), std::move(rep));
+    }));
+
+    // 5. STATE INSPECTION (for rvctl CLI)
+    r.add(operation_type::GET, url("/admin/dump/tree"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_dump_tree(std::move(req), std::move(rep));
+    }));
+
+    r.add(operation_type::GET, url("/admin/dump/cluster"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_dump_cluster(std::move(req), std::move(rep));
+    }));
+
+    r.add(operation_type::GET, url("/admin/dump/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_dump_backends(std::move(req), std::move(rep));
+    }));
+
+    // 6. MANAGEMENT OPERATIONS
+    r.add(operation_type::POST, url("/admin/drain"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_drain_backend(std::move(req), std::move(rep));
     }));
 }
 
@@ -1440,6 +1459,270 @@ uint32_t HttpController::select_target_shard() {
     }
 
     return target_shard;
+}
+
+// ---------------------------------------------------------
+// STATE INSPECTION HANDLERS (for rvctl CLI)
+// ---------------------------------------------------------
+
+// Helper to serialize a DumpNode to JSON
+static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent_level = 0) {
+    std::ostringstream ss;
+    std::string indent(indent_level * 2, ' ');
+    std::string inner_indent((indent_level + 1) * 2, ' ');
+
+    ss << "{\n";
+    ss << inner_indent << "\"type\": \"" << node.type << "\",\n";
+
+    // Prefix array
+    ss << inner_indent << "\"prefix\": [";
+    for (size_t i = 0; i < node.prefix.size(); ++i) {
+        if (i > 0) ss << ", ";
+        ss << node.prefix[i];
+    }
+    ss << "],\n";
+
+    // Backend (optional)
+    if (node.backend.has_value()) {
+        ss << inner_indent << "\"backend\": " << node.backend.value() << ",\n";
+    } else {
+        ss << inner_indent << "\"backend\": null,\n";
+    }
+
+    ss << inner_indent << "\"origin\": \"" << node.origin << "\",\n";
+    ss << inner_indent << "\"last_accessed_ms\": " << node.last_accessed_ms << ",\n";
+
+    // Children array
+    ss << inner_indent << "\"children\": [";
+    if (!node.children.empty()) {
+        ss << "\n";
+        for (size_t i = 0; i < node.children.size(); ++i) {
+            if (i > 0) ss << ",\n";
+            ss << inner_indent << "  {\"edge\": " << node.children[i].first << ", \"node\": ";
+            ss << dump_node_to_json(node.children[i].second, indent_level + 2);
+            ss << "}";
+        }
+        ss << "\n" << inner_indent;
+    }
+    ss << "]\n";
+
+    ss << indent << "}";
+    return ss.str();
+}
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_tree(
+    std::unique_ptr<seastar::httpd::request> req,
+    std::unique_ptr<seastar::httpd::reply> rep) {
+
+    // Check for optional prefix filter (comma-separated token IDs)
+    sstring prefix_str = req->get_query_param("prefix");
+
+    std::vector<TokenId> prefix_filter;
+    if (!prefix_str.empty()) {
+        // Parse comma-separated token IDs
+        std::istringstream iss(std::string(prefix_str));
+        std::string token_str;
+        while (std::getline(iss, token_str, ',')) {
+            try {
+                prefix_filter.push_back(std::stoi(token_str));
+            } catch (const std::exception& e) {
+                log_control.warn("GET /admin/dump/tree: invalid prefix token '{}'", token_str);
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->write_body("json", "{\"error\": \"Invalid prefix token ID\"}");
+                return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+            }
+        }
+    }
+
+    // Get tree dump
+    std::string json_response;
+    if (prefix_filter.empty()) {
+        auto dump = _router.get_tree_dump();
+        auto tree_stats = _router.get_all_backend_ids().size();  // For route count context
+
+        std::ostringstream oss;
+        oss << "{\n";
+        oss << "  \"shard_id\": " << seastar::this_shard_id() << ",\n";
+        oss << "  \"tree\": " << dump_node_to_json(dump, 1) << "\n";
+        oss << "}";
+        json_response = oss.str();
+    } else {
+        auto dump = _router.get_tree_dump_with_prefix(prefix_filter);
+        if (dump.has_value()) {
+            std::ostringstream oss;
+            oss << "{\n";
+            oss << "  \"shard_id\": " << seastar::this_shard_id() << ",\n";
+            oss << "  \"prefix_filter\": [";
+            for (size_t i = 0; i < prefix_filter.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << prefix_filter[i];
+            }
+            oss << "],\n";
+            oss << "  \"tree\": " << dump_node_to_json(dump.value(), 1) << "\n";
+            oss << "}";
+            json_response = oss.str();
+        } else {
+            std::ostringstream oss;
+            oss << "{\n";
+            oss << "  \"shard_id\": " << seastar::this_shard_id() << ",\n";
+            oss << "  \"prefix_filter\": [";
+            for (size_t i = 0; i < prefix_filter.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << prefix_filter[i];
+            }
+            oss << "],\n";
+            oss << "  \"tree\": null,\n";
+            oss << "  \"error\": \"Prefix not found in tree\"\n";
+            oss << "}";
+            json_response = oss.str();
+        }
+    }
+
+    rep->write_body("json", json_response);
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_cluster(
+    std::unique_ptr<seastar::httpd::request> req,
+    std::unique_ptr<seastar::httpd::reply> rep) {
+
+    // GossipService is only on shard 0
+    auto* gossip = _router.gossip_service();
+    if (!gossip) {
+        std::string response = "{\n"
+            "  \"error\": \"Cluster mode not enabled\",\n"
+            "  \"cluster_enabled\": false\n"
+            "}";
+        rep->write_body("json", response);
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    auto state = gossip->get_cluster_state();
+
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"cluster_enabled\": true,\n";
+    oss << "  \"quorum_state\": \"" << state.quorum_state << "\",\n";
+    oss << "  \"quorum_required\": " << state.quorum_required << ",\n";
+    oss << "  \"peers_alive\": " << state.peers_alive << ",\n";
+    oss << "  \"total_peers\": " << state.total_peers << ",\n";
+    oss << "  \"peers_recently_seen\": " << state.peers_recently_seen << ",\n";
+    oss << "  \"is_draining\": " << (state.is_draining ? "true" : "false") << ",\n";
+    oss << "  \"local_backend_id\": " << state.local_backend_id << ",\n";
+    oss << "  \"peers\": [\n";
+
+    for (size_t i = 0; i < state.peers.size(); ++i) {
+        const auto& peer = state.peers[i];
+        oss << "    {\n";
+        oss << "      \"address\": \"" << peer.address << "\",\n";
+        oss << "      \"port\": " << peer.port << ",\n";
+        oss << "      \"is_alive\": " << (peer.is_alive ? "true" : "false") << ",\n";
+        oss << "      \"last_seen_ms\": " << peer.last_seen_ms;
+        if (peer.associated_backend.has_value()) {
+            oss << ",\n      \"associated_backend\": " << peer.associated_backend.value() << "\n";
+        } else {
+            oss << ",\n      \"associated_backend\": null\n";
+        }
+        oss << "    }";
+        if (i < state.peers.size() - 1) oss << ",";
+        oss << "\n";
+    }
+
+    oss << "  ]\n";
+    oss << "}";
+
+    rep->write_body("json", oss.str());
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_backends(
+    std::unique_ptr<seastar::httpd::request> req,
+    std::unique_ptr<seastar::httpd::reply> rep) {
+
+    auto backends = _router.get_all_backend_states();
+
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"shard_id\": " << seastar::this_shard_id() << ",\n";
+    oss << "  \"backend_count\": " << backends.size() << ",\n";
+    oss << "  \"backends\": [\n";
+
+    for (size_t i = 0; i < backends.size(); ++i) {
+        const auto& b = backends[i];
+        oss << "    {\n";
+        oss << "      \"id\": " << b.id << ",\n";
+        oss << "      \"address\": \"" << b.address << "\",\n";
+        oss << "      \"port\": " << b.port << ",\n";
+        oss << "      \"weight\": " << b.weight << ",\n";
+        oss << "      \"priority\": " << b.priority << ",\n";
+        oss << "      \"is_draining\": " << (b.is_draining ? "true" : "false") << ",\n";
+        oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false");
+        if (b.drain_start_ms > 0) {
+            oss << ",\n      \"drain_start_ms\": " << b.drain_start_ms << "\n";
+        } else {
+            oss << "\n";
+        }
+        oss << "    }";
+        if (i < backends.size() - 1) oss << ",";
+        oss << "\n";
+    }
+
+    oss << "  ]\n";
+    oss << "}";
+
+    rep->write_body("json", oss.str());
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_backend(
+    std::unique_ptr<seastar::httpd::request> req,
+    std::unique_ptr<seastar::httpd::reply> rep) {
+
+    // Usage: POST /admin/drain?backend_id=1
+    sstring id_str = req->get_query_param("backend_id");
+
+    if (id_str.empty()) {
+        log_control.warn("POST /admin/drain: missing backend_id parameter");
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    int backend_id;
+    try {
+        backend_id = std::stoi(std::string(id_str));
+    } catch (const std::exception& e) {
+        log_control.warn("POST /admin/drain: invalid backend_id '{}': {}", id_str, e.what());
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    log_control.info("POST /admin/drain: initiating drain for backend {}", backend_id);
+
+    // Initiate drain and optionally broadcast to cluster
+    return _router.drain_backend_global(backend_id).then([this, backend_id, rep = std::move(rep)]() mutable {
+        // If gossip is enabled, broadcast the draining state to cluster peers
+        auto* gossip = _router.gossip_service();
+        if (gossip && gossip->is_enabled()) {
+            // Note: We can't easily broadcast for a specific backend from here
+            // as broadcast_node_state uses the local backend ID.
+            // For a full implementation, GossipService would need a method
+            // to broadcast draining for arbitrary backend IDs.
+            log_control.info("Backend {} marked as draining (cluster notification not sent - use node-level drain for cluster-wide notification)", backend_id);
+        }
+
+        std::ostringstream oss;
+        oss << "{\n";
+        oss << "  \"status\": \"ok\",\n";
+        oss << "  \"backend_id\": " << backend_id << ",\n";
+        oss << "  \"action\": \"drain_initiated\",\n";
+        oss << "  \"message\": \"Backend will be removed after drain timeout\"\n";
+        oss << "}";
+
+        rep->write_body("json", oss.str());
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    });
 }
 
 } // namespace ranvier

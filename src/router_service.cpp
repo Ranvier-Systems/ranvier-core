@@ -16,6 +16,7 @@
 #include <map>
 #include <random>
 #include <chrono>
+#include <sstream>
 
 namespace ranvier {
 
@@ -764,6 +765,65 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
 
 std::vector<BackendId> RouterService::get_all_backend_ids() const {
     return local_backend_ids;
+}
+
+std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {
+    std::vector<BackendState> result;
+    result.reserve(local_backends.size());
+
+    for (const auto& [id, info] : local_backends) {
+        BackendState state;
+        state.id = id;
+
+        // Extract address and port from socket_address
+        // Assuming IPv4 for now
+        auto addr = info.addr;
+        std::ostringstream oss;
+        oss << addr;
+        std::string addr_str = oss.str();
+
+        // Parse "IP:port" format
+        auto colon_pos = addr_str.find_last_of(':');
+        if (colon_pos != std::string::npos) {
+            state.address = addr_str.substr(0, colon_pos);
+            state.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+        } else {
+            state.address = addr_str;
+            state.port = 0;
+        }
+
+        state.weight = info.weight;
+        state.priority = info.priority;
+        state.is_draining = info.is_draining;
+        state.is_dead = local_dead_backends.contains(id);
+
+        if (info.is_draining) {
+            state.drain_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                info.drain_start_time.time_since_epoch()).count();
+        } else {
+            state.drain_start_ms = 0;
+        }
+
+        result.push_back(std::move(state));
+    }
+
+    return result;
+}
+
+RadixTree::DumpNode RouterService::get_tree_dump() const {
+    RadixTree* tree = local_tree();
+    if (!tree) {
+        return RadixTree::DumpNode{"empty", {}, std::nullopt, "LOCAL", 0, {}};
+    }
+    return tree->dump();
+}
+
+std::optional<RadixTree::DumpNode> RouterService::get_tree_dump_with_prefix(const std::vector<TokenId>& prefix) const {
+    RadixTree* tree = local_tree();
+    if (!tree) {
+        return std::nullopt;
+    }
+    return tree->dump_with_prefix(prefix);
 }
 
 seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is_alive) {

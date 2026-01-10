@@ -108,6 +108,31 @@ public:
     // Get list of all IDs (For the Health Checker to iterate)
     std::vector<BackendId> get_all_backend_ids() const;
 
+    // ==========================================================================
+    // Admin API - State Inspection
+    // ==========================================================================
+
+    // Backend info for admin API
+    struct BackendState {
+        BackendId id;
+        std::string address;
+        uint16_t port;
+        uint32_t weight;
+        uint32_t priority;
+        bool is_draining;
+        bool is_dead;
+        int64_t drain_start_ms;  // 0 if not draining
+    };
+
+    // Get all backend states for admin inspection
+    std::vector<BackendState> get_all_backend_states() const;
+
+    // Get tree dump for admin inspection (local shard only)
+    RadixTree::DumpNode get_tree_dump() const;
+
+    // Get tree dump with prefix filter (local shard only)
+    std::optional<RadixTree::DumpNode> get_tree_dump_with_prefix(const std::vector<TokenId>& prefix) const;
+
     // Circuit Breaker API
     seastar::future<> set_backend_status_global(BackendId id, bool is_alive);
 
