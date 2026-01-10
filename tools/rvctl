@@ -10,6 +10,8 @@ Usage:
     rvctl inspect backends
     rvctl cluster status
     rvctl drain <backend_id>
+    rvctl route add --backend <id> --content "prompt text"
+    rvctl route add --backend <id> --stdin < file.txt
 
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
@@ -29,6 +31,12 @@ Examples:
 
     # Drain a specific backend
     rvctl drain 1
+
+    # Add a route for a backend (content from argument)
+    rvctl route add --backend 1 --content "You are a helpful assistant."
+
+    # Add a route for a backend (content from stdin)
+    echo "System prompt here" | rvctl route add --backend 1 --stdin
 """
 
 import argparse
@@ -73,10 +81,11 @@ if not sys.stdout.isatty():
 
 
 def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
-                 data: Optional[bytes] = None) -> Dict[str, Any]:
+                 data: Optional[bytes] = None,
+                 content_type: str = 'application/json') -> Dict[str, Any]:
     """Make an HTTP request to the Ranvier Admin API."""
     headers = {
-        'Content-Type': 'application/json',
+        'Content-Type': content_type,
         'Accept': 'application/json',
     }
 
@@ -436,6 +445,56 @@ def cmd_drain(args):
             print(f"  {message}")
 
 
+def cmd_route_add(args):
+    """Handle 'route add' command."""
+    backend_id = args.backend
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/routes?backend_id={backend_id}"
+
+    # Get content from --content argument or --stdin
+    if args.stdin:
+        content = sys.stdin.read()
+        if not content:
+            print(f"{Colors.RED}Error:{Colors.RESET} No content provided on stdin", file=sys.stderr)
+            sys.exit(1)
+    elif args.content:
+        content = args.content
+    else:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must provide --content or --stdin", file=sys.stderr)
+        sys.exit(1)
+
+    content = content.strip()
+    if not content:
+        print(f"{Colors.RED}Error:{Colors.RESET} Content cannot be empty", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"{Colors.BOLD}Adding route for backend {backend_id}...{Colors.RESET}")
+    if args.verbose:
+        preview = content[:80] + "..." if len(content) > 80 else content
+        print(f"  Content: {Colors.GRAY}{preview}{Colors.RESET}")
+
+    data = make_request(
+        url,
+        method='POST',
+        admin_key=args.admin_key,
+        data=content.encode('utf-8'),
+        content_type='text/plain'
+    )
+
+    status = data.get('status', 'unknown')
+    route_added = data.get('route_added', 0)
+
+    if status == 'ok':
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Route added for backend {backend_id}")
+        print(f"  Content length: {len(content)} chars")
+        if route_added:
+            print(f"  Routes added: {route_added}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
@@ -479,6 +538,19 @@ def main():
     drain_parser = subparsers.add_parser('drain', help='Drain a backend')
     drain_parser.add_argument('backend_id', type=int, help='Backend ID to drain')
 
+    # route command
+    route_parser = subparsers.add_parser('route', help='Route management')
+    route_subparsers = route_parser.add_subparsers(dest='route_action', help='Route action')
+
+    # route add
+    route_add_parser = route_subparsers.add_parser('add', help='Add a route for a backend')
+    route_add_parser.add_argument('--backend', '-b', type=int, required=True,
+                                   help='Backend ID to add route for')
+    route_add_parser.add_argument('--content', '-c',
+                                   help='Content/prompt to register as route')
+    route_add_parser.add_argument('--stdin', '-i', action='store_true',
+                                   help='Read content from stdin')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -514,6 +586,18 @@ def main():
     # Handle drain command
     elif args.command == 'drain':
         cmd_drain(args)
+
+    # Handle route command
+    elif args.command == 'route':
+        if not args.route_action:
+            route_parser.print_help()
+            sys.exit(1)
+
+        if args.route_action == 'add':
+            cmd_route_add(args)
+        else:
+            print(f"Unknown route action: {args.route_action}", file=sys.stderr)
+            sys.exit(1)
 
     else:
         print(f"Unknown command: {args.command}", file=sys.stderr)
