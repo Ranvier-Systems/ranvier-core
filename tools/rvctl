@@ -486,9 +486,16 @@ def cmd_route_add(args):
     if status == 'ok':
         tokens = data.get('tokens', 0)
         stored_tokens = data.get('stored_tokens', 0)
-        print(f"{Colors.GREEN}Success:{Colors.RESET} Route added for backend {backend_id}")
-        print(f"  Content: {len(content)} chars -> {tokens} tokens")
-        print(f"  Stored:  {stored_tokens} tokens (block-aligned)")
+        warning = data.get('warning')
+
+        if warning:
+            print(f"{Colors.YELLOW}Warning:{Colors.RESET} Route not stored for backend {backend_id}")
+            print(f"  Content: {len(content)} chars -> {tokens} tokens")
+            print(f"  {warning}")
+        else:
+            print(f"{Colors.GREEN}Success:{Colors.RESET} Route added for backend {backend_id}")
+            print(f"  Content: {len(content)} chars -> {tokens} tokens")
+            print(f"  Stored:  {stored_tokens} tokens (block-aligned)")
     else:
         error = data.get('error', 'Unknown error')
         print(f"{Colors.RED}Error:{Colors.RESET} {error}")

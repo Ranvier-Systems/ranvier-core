@@ -1137,13 +1137,17 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     // Check if route will actually be stored (must meet block_alignment minimum)
     size_t token_count = tokens.size();
     size_t aligned_len = (token_count / _config.block_alignment) * _config.block_alignment;
+
+    // If too short, return success with warning (be lenient like the proxy handler)
     if (aligned_len == 0) {
-        log_control.warn("POST /admin/routes: content too short ({} tokens, need at least {} for block_alignment={})",
-                         token_count, _config.block_alignment, _config.block_alignment);
-        rep->set_status(seastar::http::reply::status_type::bad_request);
+        log_control.info("POST /admin/routes: content too short ({} tokens, need {} for block_alignment), route not stored",
+                         token_count, _config.block_alignment);
         std::ostringstream oss;
-        oss << "{\"error\": \"Content too short: " << token_count << " tokens, need at least "
-            << _config.block_alignment << " (block_alignment)\"}";
+        oss << "{\"status\": \"ok\", \"backend_id\": " << backend_id
+            << ", \"tokens\": " << token_count
+            << ", \"stored_tokens\": 0"
+            << ", \"warning\": \"Content too short (" << token_count << " tokens), need at least "
+            << _config.block_alignment << " for block_alignment. Route not stored.\"}";
         rep->write_body("json", oss.str());
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
