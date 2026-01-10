@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <tokenizers_cpp.h>
@@ -15,7 +16,8 @@ public:
     void load_from_json(const std::string& json_content);
 
     // The main API: Text -> Integers
-    std::vector<int32_t> encode(const std::string& text) const;
+    // Accepts string_view for zero-copy tokenization from temporary_buffer
+    std::vector<int32_t> encode(std::string_view text) const;
 
     // Check if ready
     bool is_loaded() const;

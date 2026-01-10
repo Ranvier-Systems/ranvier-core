@@ -6,6 +6,7 @@
 #include <chrono>
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <fmt/format.h>
 
 namespace ranvier {
@@ -29,40 +30,56 @@ inline std::string generate_request_id() {
                        seastar::this_shard_id(), micros, seq & 0xFFFFFF);
 }
 
-// Extract request ID from incoming HTTP headers
+// Extract request ID from incoming HTTP headers as string_view (zero-copy)
 // Checks X-Request-ID first, then X-Correlation-ID
-// Returns empty string if neither header is present
-inline std::string extract_request_id(const auto& headers) {
+// Returns empty string_view if neither header is present
+// WARNING: The returned view is only valid while the headers map exists
+inline std::string_view extract_request_id_view(const auto& headers) {
     // Check X-Request-ID first
     auto req_id_it = headers.find("X-Request-ID");
     if (req_id_it != headers.end() && !req_id_it->second.empty()) {
-        return std::string(req_id_it->second);
+        return std::string_view(req_id_it->second);
     }
 
     // Fall back to X-Correlation-ID
     auto corr_id_it = headers.find("X-Correlation-ID");
     if (corr_id_it != headers.end() && !corr_id_it->second.empty()) {
-        return std::string(corr_id_it->second);
+        return std::string_view(corr_id_it->second);
     }
 
-    return "";
+    return std::string_view{};
 }
 
-// Extract W3C Trace Context (traceparent header) from incoming HTTP headers
-// Returns empty string if header is not present
+// Extract request ID from incoming HTTP headers (copies into string)
+// Use extract_request_id_view for zero-copy access when possible
+inline std::string extract_request_id(const auto& headers) {
+    auto view = extract_request_id_view(headers);
+    return std::string(view);
+}
+
+// Extract W3C Trace Context (traceparent header) from incoming HTTP headers as string_view
+// Returns empty string_view if header is not present
 // Format: "{version}-{trace-id}-{parent-span-id}-{trace-flags}"
 // Example: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
-inline std::string extract_traceparent(const auto& headers) {
+// WARNING: The returned view is only valid while the headers map exists
+inline std::string_view extract_traceparent_view(const auto& headers) {
     auto it = headers.find("traceparent");
     if (it != headers.end() && !it->second.empty()) {
-        return std::string(it->second);
+        return std::string_view(it->second);
     }
     // Also check lowercase (HTTP/2 uses lowercase headers)
     it = headers.find("Traceparent");
     if (it != headers.end() && !it->second.empty()) {
-        return std::string(it->second);
+        return std::string_view(it->second);
     }
-    return "";
+    return std::string_view{};
+}
+
+// Extract W3C Trace Context (traceparent header) from incoming HTTP headers
+// Use extract_traceparent_view for zero-copy access when possible
+inline std::string extract_traceparent(const auto& headers) {
+    auto view = extract_traceparent_view(headers);
+    return std::string(view);
 }
 
 // Ranvier loggers - one per component for fine-grained control

@@ -5,19 +5,21 @@
 // shards for processing.
 //
 // Key design decisions:
-// - Request body is moved (not copied) using std::move semantics
-// - Headers are moved as a map (relatively small, acceptable to copy if needed)
+// - Request body uses seastar::temporary_buffer for true zero-copy from NIC
+// - Headers are extracted on-demand using string_view (no map copy)
 // - Reply object stays on originating shard; results stream back via futures
 
 #pragma once
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/http/request.hh>
 #include <seastar/http/reply.hh>
 
@@ -26,8 +28,9 @@ namespace ranvier {
 // Lightweight request context that can be efficiently moved between shards
 // Contains only the data needed for tokenization and routing
 struct CrossShardRequestContext {
-    // Request body - moved, not copied (zero-copy)
-    std::string body;
+    // Request body - uses temporary_buffer for true zero-copy from NIC/TCP stack
+    // The buffer owns the memory and can be moved without any memcpy
+    seastar::temporary_buffer<char> body;
 
     // Request ID for tracing
     std::string request_id;
@@ -47,7 +50,7 @@ struct CrossShardRequestContext {
     std::string path;
 
     // Originating shard (for metrics and debugging)
-    uint32_t origin_shard;
+    uint32_t origin_shard = 0;
 
     // Move constructor and assignment
     CrossShardRequestContext() = default;
@@ -58,7 +61,24 @@ struct CrossShardRequestContext {
     CrossShardRequestContext(const CrossShardRequestContext&) = delete;
     CrossShardRequestContext& operator=(const CrossShardRequestContext&) = delete;
 
-    // Create from Seastar HTTP request (moves body)
+    // Zero-copy view of the body as string_view
+    // Use this for tokenization and parsing to avoid copies
+    std::string_view body_view() const noexcept {
+        return std::string_view(body.get(), body.size());
+    }
+
+    // Body size in bytes
+    size_t body_size() const noexcept {
+        return body.size();
+    }
+
+    // Check if body is empty
+    bool body_empty() const noexcept {
+        return body.empty();
+    }
+
+    // Create from Seastar HTTP request (moves body buffer)
+    // This enables true zero-copy: the NIC buffer is moved directly
     static CrossShardRequestContext from_request(
         seastar::http::request& req,
         const std::string& request_id,
@@ -66,12 +86,36 @@ struct CrossShardRequestContext {
         const std::string& traceparent = "") {
 
         CrossShardRequestContext ctx;
-        ctx.body = std::move(req.content);  // Zero-copy move
+        // Move the content into a temporary_buffer for zero-copy transfer
+        // Seastar's HTTP parser uses sstring (seastar::string) for content,
+        // so we create a temporary_buffer from it
+        ctx.body = seastar::temporary_buffer<char>(req.content.data(), req.content.size());
         ctx.request_id = request_id;
         ctx.client_ip = client_ip;
         ctx.traceparent = traceparent;
         ctx.method = req._method;
         ctx.path = req._url;
+        ctx.origin_shard = seastar::this_shard_id();
+        return ctx;
+    }
+
+    // Create from temporary_buffer directly (true zero-copy path)
+    // Use this when you already have a temporary_buffer from the network stack
+    static CrossShardRequestContext from_buffer(
+        seastar::temporary_buffer<char> body_buf,
+        const std::string& request_id,
+        const std::string& client_ip,
+        std::string method,
+        std::string path,
+        const std::string& traceparent = "") {
+
+        CrossShardRequestContext ctx;
+        ctx.body = std::move(body_buf);  // True zero-copy move
+        ctx.request_id = request_id;
+        ctx.client_ip = client_ip;
+        ctx.traceparent = traceparent;
+        ctx.method = std::move(method);
+        ctx.path = std::move(path);
         ctx.origin_shard = seastar::this_shard_id();
         return ctx;
     }

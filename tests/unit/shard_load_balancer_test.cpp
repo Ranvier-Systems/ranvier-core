@@ -7,6 +7,8 @@
 #include "shard_load_balancer.hpp"
 #include "cross_shard_request.hpp"
 #include <gtest/gtest.h>
+#include <string>
+#include <string_view>
 
 using namespace ranvier;
 
@@ -106,7 +108,8 @@ protected:
 };
 
 TEST_F(CrossShardRequestContextTest, DefaultConstructorCreatesEmptyContext) {
-    EXPECT_TRUE(ctx.body.empty());
+    EXPECT_TRUE(ctx.body_empty());
+    EXPECT_EQ(ctx.body_size(), 0u);
     EXPECT_TRUE(ctx.request_id.empty());
     EXPECT_TRUE(ctx.client_ip.empty());
     EXPECT_FALSE(ctx.has_client_tokens);
@@ -114,25 +117,28 @@ TEST_F(CrossShardRequestContextTest, DefaultConstructorCreatesEmptyContext) {
 }
 
 TEST_F(CrossShardRequestContextTest, MoveConstructorWorks) {
-    ctx.body = "test body";
+    // Create temporary_buffer with test data
+    std::string test_body = "test body";
+    ctx.body = seastar::temporary_buffer<char>(test_body.data(), test_body.size());
     ctx.request_id = "req-123";
     ctx.client_ip = "192.168.1.1";
 
     CrossShardRequestContext moved(std::move(ctx));
 
-    EXPECT_EQ(moved.body, "test body");
+    EXPECT_EQ(moved.body_view(), "test body");
     EXPECT_EQ(moved.request_id, "req-123");
     EXPECT_EQ(moved.client_ip, "192.168.1.1");
 }
 
 TEST_F(CrossShardRequestContextTest, MoveAssignmentWorks) {
-    ctx.body = "test body";
+    std::string test_body = "test body";
+    ctx.body = seastar::temporary_buffer<char>(test_body.data(), test_body.size());
     ctx.request_id = "req-456";
 
     CrossShardRequestContext target;
     target = std::move(ctx);
 
-    EXPECT_EQ(target.body, "test body");
+    EXPECT_EQ(target.body_view(), "test body");
     EXPECT_EQ(target.request_id, "req-456");
 }
 
@@ -144,6 +150,36 @@ TEST_F(CrossShardRequestContextTest, TokensCanBeSet) {
     EXPECT_EQ(ctx.client_tokens.size(), 5u);
     EXPECT_EQ(ctx.client_tokens[0], 1);
     EXPECT_EQ(ctx.client_tokens[4], 5);
+}
+
+TEST_F(CrossShardRequestContextTest, BodyViewReturnsCorrectStringView) {
+    std::string test_data = "Hello, World!";
+    ctx.body = seastar::temporary_buffer<char>(test_data.data(), test_data.size());
+
+    std::string_view view = ctx.body_view();
+    EXPECT_EQ(view, "Hello, World!");
+    EXPECT_EQ(view.size(), 13u);
+}
+
+TEST_F(CrossShardRequestContextTest, FromBufferFactoryMethod) {
+    std::string test_body = "request payload";
+    auto buffer = seastar::temporary_buffer<char>(test_body.data(), test_body.size());
+
+    auto ctx2 = CrossShardRequestContext::from_buffer(
+        std::move(buffer),
+        "req-789",
+        "10.0.0.1",
+        "POST",
+        "/v1/chat/completions",
+        "00-trace-span-01"
+    );
+
+    EXPECT_EQ(ctx2.body_view(), "request payload");
+    EXPECT_EQ(ctx2.request_id, "req-789");
+    EXPECT_EQ(ctx2.client_ip, "10.0.0.1");
+    EXPECT_EQ(ctx2.method, "POST");
+    EXPECT_EQ(ctx2.path, "/v1/chat/completions");
+    EXPECT_EQ(ctx2.traceparent, "00-trace-span-01");
 }
 
 // =============================================================================
