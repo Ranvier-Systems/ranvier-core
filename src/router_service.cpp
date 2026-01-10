@@ -818,8 +818,12 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         state.is_dead = local_dead_backends.contains(id);
 
         if (info.is_draining) {
+            // Convert steady_clock to wall-clock time:
+            // Calculate elapsed time since drain started, then subtract from current wall time
+            auto elapsed = std::chrono::steady_clock::now() - info.drain_start_time;
+            auto wall_start = std::chrono::system_clock::now() - elapsed;
             state.drain_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                info.drain_start_time.time_since_epoch()).count();
+                wall_start.time_since_epoch()).count();
         } else {
             state.drain_start_ms = 0;
         }
