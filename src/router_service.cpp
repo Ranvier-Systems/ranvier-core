@@ -73,7 +73,7 @@ thread_local uint64_t stats_radix_tree_lookup_misses = 0;
 thread_local size_t local_max_routes = 100000;
 thread_local std::chrono::seconds local_ttl_seconds{3600};
 thread_local std::chrono::seconds local_backend_drain_timeout{60};
-thread_local RoutingConfig::RoutingMode local_routing_mode = RoutingConfig::RoutingMode::PREFIX;
+thread_local RoutingConfig::RoutingMode local_routing_mode = RoutingConfig::RoutingMode::RADIX;
 thread_local size_t local_prefix_token_length = 128;
 thread_local uint32_t local_block_alignment = 16;
 
