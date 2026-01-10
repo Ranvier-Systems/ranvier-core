@@ -169,6 +169,12 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             return remove_routes_for_backend(backend);
         });
 
+        // Set up callback to handle node state changes (e.g., DRAINING notifications)
+        // When a peer broadcasts DRAINING, set their backend weight to 0 to stop new traffic
+        _gossip->set_node_state_callback([this](BackendId backend, NodeState state) {
+            return handle_node_state_change(backend, state);
+        });
+
         // Pre-allocate buffer for route batching to avoid reallocations during operation
         _pending_remote_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
 
@@ -897,6 +903,51 @@ seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
         stats_cluster_routes_pruned += removed;
         log_router.info("Shard {}: Pruned {} orphaned routes for failed peer backend {}",
                         seastar::this_shard_id(), removed, b_id);
+    }
+
+    return seastar::make_ready_future<>();
+}
+
+seastar::future<> RouterService::handle_node_state_change(BackendId backend, NodeState state) {
+    if (state == NodeState::DRAINING) {
+        log_router.info("Received DRAINING notification for backend {} - setting weight to 0", backend);
+
+        // Broadcast weight=0 to all shards to stop new traffic to this backend
+        // This is more graceful than removing the backend entirely, as it allows
+        // in-flight requests to complete while preventing new routing decisions
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            [backend](unsigned shard_id) {
+                return seastar::smp::submit_to(shard_id, [backend] {
+                    auto it = local_backends.find(backend);
+                    if (it != local_backends.end()) {
+                        // Set weight to 0 - backend won't be selected for new requests
+                        // but existing connections continue working
+                        it->second.weight = 0;
+                        it->second.is_draining = true;
+                        it->second.drain_start_time = std::chrono::steady_clock::now();
+                        log_router.debug("Shard {}: Backend {} weight set to 0 (draining)",
+                                        seastar::this_shard_id(), backend);
+                    }
+                    return seastar::make_ready_future<>();
+                });
+            });
+    } else if (state == NodeState::ACTIVE) {
+        // Node is back online - restore default weight (could be enhanced to store original weight)
+        log_router.info("Received ACTIVE notification for backend {} - restoring weight", backend);
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            [backend](unsigned shard_id) {
+                return seastar::smp::submit_to(shard_id, [backend] {
+                    auto it = local_backends.find(backend);
+                    if (it != local_backends.end() && it->second.is_draining) {
+                        // Restore default weight
+                        it->second.weight = 100;
+                        it->second.is_draining = false;
+                        log_router.debug("Shard {}: Backend {} restored to active (weight=100)",
+                                        seastar::this_shard_id(), backend);
+                    }
+                    return seastar::make_ready_future<>();
+                });
+            });
     }
 
     return seastar::make_ready_future<>();

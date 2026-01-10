@@ -106,7 +106,12 @@ GossipService::GossipService(const ClusterConfig& config)
             seastar::metrics::description("Number of peers seen within quorum check window")),
         // DTLS lockdown metrics
         seastar::metrics::make_counter("cluster_dtls_lockdown_drops", _dtls_lockdown_drops,
-            seastar::metrics::description("Total number of packets dropped due to mTLS lockdown enforcement"))
+            seastar::metrics::description("Total number of packets dropped due to mTLS lockdown enforcement")),
+        // Node state notification metrics
+        seastar::metrics::make_counter("cluster_node_state_sent", _node_state_sent,
+            seastar::metrics::description("Total number of node state notifications sent (e.g., DRAINING)")),
+        seastar::metrics::make_counter("cluster_node_state_received", _node_state_received,
+            seastar::metrics::description("Total number of node state notifications received from peers"))
     });
 }
 
@@ -347,6 +352,55 @@ void GossipService::set_route_learn_callback(RouteLearnCallback callback) {
     _route_learn_callback = std::move(callback);
 }
 
+void GossipService::set_node_state_callback(NodeStateCallback callback) {
+    _node_state_callback = std::move(callback);
+}
+
+seastar::future<> GossipService::broadcast_node_state(NodeState state) {
+    if (!_config.enabled || !_channel || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Mark this node as draining if applicable
+    if (state == NodeState::DRAINING) {
+        _draining.store(true, std::memory_order_relaxed);
+        log_gossip.info("Broadcasting DRAINING state to {} peers (local_backend_id={})",
+                       _peer_addresses.size(), _local_backend_id);
+    }
+
+    // Create the node state packet
+    NodeStatePacket pkt;
+    pkt.state = state;
+    pkt.backend_id = _local_backend_id;
+    auto serialized = pkt.serialize();
+
+    // Broadcast to all peers
+    // Use DTLS encryption if enabled
+    if (_dtls_context && _dtls_context->is_enabled()) {
+        return broadcast_encrypted(_peer_addresses, serialized).then([this] {
+            ++_node_state_sent;
+        });
+    }
+
+    // Plaintext mode: create an owned buffer for async send
+    auto serialized_copy = std::make_shared<std::vector<uint8_t>>(std::move(serialized));
+    return seastar::parallel_for_each(_peer_addresses, [this, serialized_copy](const seastar::socket_address& peer) {
+        seastar::temporary_buffer<char> buf(serialized_copy->size());
+        std::memcpy(buf.get_write(), serialized_copy->data(), serialized_copy->size());
+        seastar::net::packet packet(std::move(buf));
+
+        return _channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_gossip.debug("Failed to send node state to peer {}: {}", peer, e.what());
+            }
+        });
+    }).then([this] {
+        ++_node_state_sent;
+    });
+}
+
 seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
     if (!_config.enabled || !_channel || _peer_addresses.empty()) {
         return seastar::make_ready_future<>();
@@ -510,6 +564,26 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
 
     if (type == GossipPacketType::HEARTBEAT) {
         log_gossip.debug("Received heartbeat from {}", dgram.get_src());
+        return seastar::make_ready_future<>();
+    }
+
+    // Handle node state packets (e.g., DRAINING notifications)
+    if (type == GossipPacketType::NODE_STATE) {
+        auto state_pkt = NodeStatePacket::deserialize(ptr, len);
+        if (!state_pkt) {
+            _packets_invalid++;
+            return seastar::make_ready_future<>();
+        }
+
+        ++_node_state_received;
+        log_gossip.info("Received NODE_STATE packet from {}: backend={}, state={}",
+                       src_addr, state_pkt->backend_id,
+                       state_pkt->state == NodeState::DRAINING ? "DRAINING" : "ACTIVE");
+
+        // Invoke the callback to handle the state change
+        if (_node_state_callback) {
+            return _node_state_callback(state_pkt->backend_id, state_pkt->state);
+        }
         return seastar::make_ready_future<>();
     }
 
