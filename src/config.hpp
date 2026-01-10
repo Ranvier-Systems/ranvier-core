@@ -70,7 +70,7 @@ struct RoutingConfig {
     // - "radix": Radix tree learning with random fallback (adaptive route learning)
     // - "round_robin": True random/weighted distribution (baseline, no learning)
     enum class RoutingMode { PREFIX, RADIX, ROUND_ROBIN };
-    RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity for KV cache optimization
+    RoutingMode routing_mode = RoutingMode::RADIX;  // Default: adaptive radix tree routing
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
     // Helper to check routing mode

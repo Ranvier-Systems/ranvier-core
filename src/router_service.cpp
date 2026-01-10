@@ -16,6 +16,7 @@
 #include <map>
 #include <random>
 #include <chrono>
+#include <sstream>
 
 namespace ranvier {
 
@@ -72,7 +73,7 @@ thread_local uint64_t stats_radix_tree_lookup_misses = 0;
 thread_local size_t local_max_routes = 100000;
 thread_local std::chrono::seconds local_ttl_seconds{3600};
 thread_local std::chrono::seconds local_backend_drain_timeout{60};
-thread_local RoutingConfig::RoutingMode local_routing_mode = RoutingConfig::RoutingMode::PREFIX;
+thread_local RoutingConfig::RoutingMode local_routing_mode = RoutingConfig::RoutingMode::RADIX;
 thread_local size_t local_prefix_token_length = 128;
 thread_local uint32_t local_block_alignment = 16;
 
@@ -764,6 +765,89 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
 
 std::vector<BackendId> RouterService::get_all_backend_ids() const {
     return local_backend_ids;
+}
+
+std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {
+    std::vector<BackendState> result;
+    result.reserve(local_backends.size());
+
+    for (const auto& [id, info] : local_backends) {
+        BackendState state;
+        state.id = id;
+
+        // Extract address and port from socket_address
+        auto addr = info.addr;
+        std::ostringstream oss;
+        oss << addr;
+        std::string addr_str = oss.str();
+
+        // Parse address:port format
+        // Handle both IPv4 (192.168.1.1:8080) and IPv6 ([::1]:8080) formats
+        // Seastar formats IPv6 as [addr]:port
+        if (!addr_str.empty() && addr_str.back() >= '0' && addr_str.back() <= '9') {
+            auto colon_pos = addr_str.find_last_of(':');
+            // For IPv6, the colon before port comes after the closing bracket
+            // For IPv4, it's just the last colon
+            if (colon_pos != std::string::npos && colon_pos > 0) {
+                // Verify this is the port separator, not part of IPv6 address
+                bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
+                                         (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
+                if (is_port_separator) {
+                    state.address = addr_str.substr(0, colon_pos);
+                    try {
+                        state.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+                    } catch (const std::exception&) {
+                        state.port = 0;  // Failed to parse port
+                    }
+                } else {
+                    state.address = addr_str;
+                    state.port = 0;
+                }
+            } else {
+                state.address = addr_str;
+                state.port = 0;
+            }
+        } else {
+            state.address = addr_str;
+            state.port = 0;
+        }
+
+        state.weight = info.weight;
+        state.priority = info.priority;
+        state.is_draining = info.is_draining;
+        state.is_dead = local_dead_backends.contains(id);
+
+        if (info.is_draining) {
+            // Convert steady_clock to wall-clock time:
+            // Calculate elapsed time since drain started, then subtract from current wall time
+            auto elapsed = std::chrono::steady_clock::now() - info.drain_start_time;
+            auto wall_start = std::chrono::system_clock::now() - elapsed;
+            state.drain_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                wall_start.time_since_epoch()).count();
+        } else {
+            state.drain_start_ms = 0;
+        }
+
+        result.push_back(std::move(state));
+    }
+
+    return result;
+}
+
+RadixTree::DumpNode RouterService::get_tree_dump() const {
+    RadixTree* tree = local_tree();
+    if (!tree) {
+        return RadixTree::DumpNode{"empty", {}, std::nullopt, "LOCAL", 0, {}};
+    }
+    return tree->dump();
+}
+
+std::optional<RadixTree::DumpNode> RouterService::get_tree_dump_with_prefix(const std::vector<TokenId>& prefix) const {
+    RadixTree* tree = local_tree();
+    if (!tree) {
+        return std::nullopt;
+    }
+    return tree->dump_with_prefix(prefix);
 }
 
 seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is_alive) {

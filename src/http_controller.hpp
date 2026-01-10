@@ -74,7 +74,8 @@ struct HttpControllerConfig {
     bool enable_token_forwarding = false;       // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;          // Accept pre-tokenized prompt_token_ids from clients for routing
     int32_t max_token_id = 100000;              // Maximum valid token ID for validation (security)
-    RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;  // Routing mode
+    RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::RADIX;  // Routing mode
+    uint32_t block_alignment = 16;              // vLLM PagedAttention block size for route alignment
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
@@ -209,6 +210,12 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_routes(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // State inspection handlers (for rvctl CLI)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_tree(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_cluster(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_backends(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_drain_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;

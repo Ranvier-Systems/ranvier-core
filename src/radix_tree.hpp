@@ -202,6 +202,96 @@ public:
         for_each_leaf_recursive(root_.get(), path, std::forward<Callback>(callback));
     }
 
+    // =============================================================================
+    // Tree Dump/Serialization for Admin API
+    // =============================================================================
+
+    // Represents a node in the serialized tree structure
+    struct DumpNode {
+        std::string type;                    // "Node4", "Node16", "Node48", "Node256"
+        std::vector<TokenId> prefix;         // Path compression prefix
+        std::optional<BackendId> backend;    // Leaf value (if any)
+        std::string origin;                  // "LOCAL" or "REMOTE"
+        int64_t last_accessed_ms;            // Milliseconds since epoch
+        std::vector<std::pair<TokenId, DumpNode>> children;
+    };
+
+    // Dump the entire tree structure for inspection
+    DumpNode dump() const {
+        return dump_node(root_.get());
+    }
+
+    // Dump subtree starting from a specific prefix (returns nullopt if prefix not found)
+    std::optional<DumpNode> dump_with_prefix(std::span<const TokenId> prefix_filter) const {
+        // Navigate to the node matching the prefix
+        Node* node = root_.get();
+        size_t remaining_prefix = 0;
+
+        while (node != nullptr && remaining_prefix < prefix_filter.size()) {
+            // Check how much of the node's prefix matches
+            size_t match_len = 0;
+            while (match_len < node->prefix.size() &&
+                   remaining_prefix + match_len < prefix_filter.size() &&
+                   node->prefix[match_len] == prefix_filter[remaining_prefix + match_len]) {
+                match_len++;
+            }
+
+            // If we didn't match the entire node prefix, prefix not found
+            if (match_len < node->prefix.size()) {
+                // Partial match - return this subtree if we matched something
+                if (remaining_prefix > 0 || match_len > 0) {
+                    return dump_node(node);
+                }
+                return std::nullopt;
+            }
+
+            remaining_prefix += match_len;
+
+            // If we've consumed the entire filter, return this subtree
+            if (remaining_prefix >= prefix_filter.size()) {
+                return dump_node(node);
+            }
+
+            // Navigate to child
+            node = find_child(node, prefix_filter[remaining_prefix]);
+            remaining_prefix++;
+        }
+
+        if (node) {
+            return dump_node(node);
+        }
+        return std::nullopt;
+    }
+
+private:
+    DumpNode dump_node(Node* node) const {
+        if (!node) {
+            return DumpNode{"empty", {}, std::nullopt, "LOCAL", 0, {}};
+        }
+
+        DumpNode result;
+        switch (node->type) {
+            case NodeType::Node4: result.type = "Node4"; break;
+            case NodeType::Node16: result.type = "Node16"; break;
+            case NodeType::Node48: result.type = "Node48"; break;
+            case NodeType::Node256: result.type = "Node256"; break;
+        }
+        result.prefix = node->prefix;
+        result.backend = node->leaf_value;
+        result.origin = (node->origin == RouteOrigin::LOCAL) ? "LOCAL" : "REMOTE";
+        result.last_accessed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            node->last_accessed.time_since_epoch()).count();
+
+        // Collect children
+        visit_children(node, [this, &result](TokenId key, Node* child) {
+            result.children.emplace_back(key, dump_node(child));
+        });
+
+        return result;
+    }
+
+public:
+
     size_t remove_expired(std::chrono::steady_clock::time_point cutoff) {
         size_t removed = 0;
         remove_expired_recursive(root_.get(), cutoff, removed);

@@ -55,6 +55,13 @@ pool:
 
 # Routing and caching configuration
 routing:
+  # Routing mode determines how requests are routed to backends (RANVIER_ROUTING_MODE)
+  # Options:
+  #   - "radix": Adaptive radix tree routing - learns and caches prefix patterns (default)
+  #   - "prefix": Consistent hash on prefix tokens - simpler, good for KV cache affinity
+  #   - "round_robin": Weighted random distribution - no learning, baseline mode
+  routing_mode: radix
+
   # Minimum number of tokens before a route is learned/cached (RANVIER_MIN_TOKEN_LENGTH)
   # Set higher (e.g., 64) in production to avoid caching short prompts
   min_token_length: 4

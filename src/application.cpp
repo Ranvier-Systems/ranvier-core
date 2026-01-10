@@ -96,6 +96,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.accept_client_tokens = config.routing.accept_client_tokens;
     cfg.max_token_id = config.routing.max_token_id;
     cfg.routing_mode = config.routing.routing_mode;
+    cfg.block_alignment = config.routing.block_alignment;
     // Timeout settings
     cfg.connect_timeout = config.timeouts.connect_timeout;
     cfg.request_timeout = config.timeouts.request_timeout;
@@ -471,10 +472,14 @@ seastar::future<> Application::startup() {
             // 12. Start gossip service if cluster mode is enabled
             return _router->start_gossip();
         }).then([this] {
-            // 13. Load persisted state
+            // 13. Start draining backend reaper timer
+            _router->start_draining_reaper();
+            return seastar::make_ready_future<>();
+        }).then([this] {
+            // 14. Load persisted state
             return load_persisted_state();
         }).then([this] {
-            // 14. Start K8s discovery service if enabled
+            // 15. Start K8s discovery service if enabled
             if (_k8s_discovery && _k8s_discovery->is_enabled()) {
                 return _k8s_discovery->start();
             }
@@ -733,9 +738,10 @@ seastar::future<> Application::stop_services() {
         return seastar::make_ready_future<>();
     });
 
-    // Stop gossip service (if router initialized)
+    // Stop gossip service and draining reaper (if router initialized)
     chain = chain.then([this] {
         if (_router) {
+            _router->stop_draining_reaper();
             return _router->stop_gossip();
         }
         return seastar::make_ready_future<>();
