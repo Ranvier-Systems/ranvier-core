@@ -922,6 +922,23 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             auto res = parser.push(std::move(chunk));
 
+            // Check for parsing errors (malformed chunked encoding, size limits, etc.)
+            if (res.has_error) {
+                log_proxy.warn("[{}] Stream parsing error: {}", request_id, res.error_message);
+                // Parsing error is non-recoverable; close connection and report error
+                bundle.is_valid = false;
+                metrics().record_failure();
+                sstring error_msg = "data: {\"error\": \"Backend response parsing error: " +
+                                    sstring(res.error_message) + "\"}\n\n";
+                try {
+                    co_await client_out.write(error_msg);
+                    co_await client_out.flush();
+                } catch (...) {
+                    // Client may have disconnected, ignore write errors
+                }
+                break;
+            }
+
             // Snooping Logic - record success and learn route
             if (res.header_snoop_success) {
                 // Backend responded successfully - record for circuit breaker
