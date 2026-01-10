@@ -1956,10 +1956,29 @@ GossipService::ClusterState GossipService::get_cluster_state() const {
         oss << addr;
         std::string addr_str = oss.str();
 
-        auto colon_pos = addr_str.find_last_of(':');
-        if (colon_pos != std::string::npos) {
-            info.address = addr_str.substr(0, colon_pos);
-            info.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+        // Parse address:port format
+        // Handle both IPv4 (192.168.1.1:8080) and IPv6 ([::1]:8080) formats
+        if (!addr_str.empty() && addr_str.back() >= '0' && addr_str.back() <= '9') {
+            auto colon_pos = addr_str.find_last_of(':');
+            if (colon_pos != std::string::npos && colon_pos > 0) {
+                // Verify this is the port separator, not part of IPv6 address
+                bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||
+                                         (addr_str.find('[') == std::string::npos);
+                if (is_port_separator) {
+                    info.address = addr_str.substr(0, colon_pos);
+                    try {
+                        info.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+                    } catch (const std::exception&) {
+                        info.port = 0;
+                    }
+                } else {
+                    info.address = addr_str;
+                    info.port = 0;
+                }
+            } else {
+                info.address = addr_str;
+                info.port = 0;
+            }
         } else {
             info.address = addr_str;
             info.port = 0;

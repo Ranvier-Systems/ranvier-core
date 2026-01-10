@@ -153,6 +153,10 @@ class TreePrinter:
         if path is None:
             path = []
 
+        # Guard against None or empty nodes
+        if not node:
+            return
+
         # Build the connection characters
         connector = "└── " if is_last else "├── "
         extension = "    " if is_last else "│   "
@@ -253,9 +257,12 @@ def cmd_inspect_routes(args):
 
     # Count routes (leaf nodes with backends)
     def count_routes(node: Dict) -> int:
+        if not node:
+            return 0
         count = 1 if node.get('backend') is not None else 0
         for child in node.get('children', []):
-            count += count_routes(child.get('node', {}))
+            child_node = child.get('node') if child else None
+            count += count_routes(child_node) if child_node else 0
         return count
 
     route_count = count_routes(tree)

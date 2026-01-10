@@ -776,17 +776,37 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         state.id = id;
 
         // Extract address and port from socket_address
-        // Assuming IPv4 for now
         auto addr = info.addr;
         std::ostringstream oss;
         oss << addr;
         std::string addr_str = oss.str();
 
-        // Parse "IP:port" format
-        auto colon_pos = addr_str.find_last_of(':');
-        if (colon_pos != std::string::npos) {
-            state.address = addr_str.substr(0, colon_pos);
-            state.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+        // Parse address:port format
+        // Handle both IPv4 (192.168.1.1:8080) and IPv6 ([::1]:8080) formats
+        // Seastar formats IPv6 as [addr]:port
+        if (!addr_str.empty() && addr_str.back() >= '0' && addr_str.back() <= '9') {
+            auto colon_pos = addr_str.find_last_of(':');
+            // For IPv6, the colon before port comes after the closing bracket
+            // For IPv4, it's just the last colon
+            if (colon_pos != std::string::npos && colon_pos > 0) {
+                // Verify this is the port separator, not part of IPv6 address
+                bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
+                                         (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
+                if (is_port_separator) {
+                    state.address = addr_str.substr(0, colon_pos);
+                    try {
+                        state.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+                    } catch (const std::exception&) {
+                        state.port = 0;  // Failed to parse port
+                    }
+                } else {
+                    state.address = addr_str;
+                    state.port = 0;
+                }
+            } else {
+                state.address = addr_str;
+                state.port = 0;
+            }
         } else {
             state.address = addr_str;
             state.port = 0;
