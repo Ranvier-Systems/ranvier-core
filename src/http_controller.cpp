@@ -96,6 +96,7 @@ struct async_handler : public seastar::httpd::handler_base {
 // Check admin authentication - returns pair<authorized, error_message>
 // If authorized, error_message contains the key identifier for audit logging
 // If not authorized, error_message contains the reason for failure
+// Uses string_view internally for zero-copy header inspection
 std::pair<bool, std::string> HttpController::check_admin_auth_with_info(const seastar::http::request& req) const {
     // If no API key configured, allow all requests (auth disabled)
     if (!_config.auth.is_enabled()) {
@@ -103,19 +104,26 @@ std::pair<bool, std::string> HttpController::check_admin_auth_with_info(const se
     }
 
     // Check Authorization header: "Bearer <token>"
+    // Access header directly without copying the entire map
     auto auth_it = req._headers.find("Authorization");
     if (auth_it == req._headers.end()) {
         return {false, "missing Authorization header"};
     }
 
-    const auto& auth_header = auth_it->second;
-    const std::string bearer_prefix = "Bearer ";
+    // Use string_view for zero-copy parsing of the Authorization header
+    std::string_view auth_header(auth_it->second);
+    constexpr std::string_view bearer_prefix = "Bearer ";
+
     if (auth_header.size() <= bearer_prefix.size() ||
         auth_header.substr(0, bearer_prefix.size()) != bearer_prefix) {
         return {false, "invalid Authorization format (expected 'Bearer <token>')"};
     }
 
-    std::string token = auth_header.substr(bearer_prefix.size());
+    // Extract token as string_view - no allocation until validation
+    std::string_view token_view = auth_header.substr(bearer_prefix.size());
+
+    // validate_token needs a string, so convert only the token portion
+    std::string token(token_view);
 
     // Use constant-time comparison with expiry checking
     auto [valid, key_name] = _config.auth.validate_token(token);
@@ -141,16 +149,20 @@ bool HttpController::check_admin_auth(const seastar::http::request& req) const {
 }
 
 // Get client IP from request, checking X-Forwarded-For for proxied requests
+// Uses string_view internally to minimize copies during header inspection
 std::string HttpController::get_client_ip(const seastar::http::request& req) {
     // Check X-Forwarded-For header first (for proxied requests)
+    // Access header directly without map copy
     auto xff_it = req._headers.find("X-Forwarded-For");
     if (xff_it != req._headers.end() && !xff_it->second.empty()) {
         // X-Forwarded-For can contain multiple IPs; take the first (original client)
-        auto& xff = xff_it->second;
+        std::string_view xff(xff_it->second);
         auto comma_pos = xff.find(',');
-        if (comma_pos != std::string::npos) {
+        if (comma_pos != std::string_view::npos) {
+            // Only allocate string for the first IP (before comma)
             return std::string(xff.substr(0, comma_pos));
         }
+        // Single IP - must copy for return
         return std::string(xff);
     }
 
@@ -369,11 +381,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Guard is released before entering the lambda, which takes over responsibility
     ActiveRequestGuard active_request_guard(metrics());
 
-    std::string body = req->content;
+    // Zero-copy body access: use string_view for tokenization and parsing,
+    // only create string copy when we need to forward/modify the body
+    std::string_view body_view(req->content.data(), req->content.size());
     std::string client_ip = get_client_ip(*req);
 
     log_proxy.info("[{}] Request received from {} ({} bytes)",
-                   request_id, client_ip, body.size());
+                   request_id, client_ip, body_view.size());
 
     // 1. Validation
     if (!_tokenizer.is_loaded()) {
@@ -398,7 +412,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
         // First, check if client provided pre-tokenized prompt_token_ids
         if (_config.accept_client_tokens) {
-            auto token_result = RequestRewriter::extract_prompt_token_ids(body, _config.max_token_id);
+            // Use string_view for zero-copy token extraction
+            auto token_result = RequestRewriter::extract_prompt_token_ids(body_view, _config.max_token_id);
             if (token_result.found) {
                 if (token_result.valid) {
                     tokens = std::move(token_result.tokens);
@@ -425,12 +440,15 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         if (!used_client_tokens) {
             // Extract text from request body for tokenization (prompt or messages content)
             // This ensures we tokenize exactly what we use for routing, not metadata
-            auto extracted_text = RequestRewriter::extract_text(body);
+            // Uses string_view for zero-copy extraction
+            auto extracted_text = RequestRewriter::extract_text(body_view);
             if (extracted_text.has_value()) {
+                // TokenizerService now accepts string_view
                 tokens = _tokenizer.encode(extracted_text.value());
             } else {
                 // Fallback: tokenize the entire body (legacy behavior)
-                tokens = _tokenizer.encode(body);
+                // Use string_view for zero-copy tokenization
+                tokens = _tokenizer.encode(body_view);
             }
             tokenize_span.set_attribute("ranvier.token_source", "local");
             tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
@@ -439,17 +457,24 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     // Rewrite request body with token IDs if enabled and we tokenized locally
     // Skip rewriting if client already provided prompt_token_ids (it's already in the body)
-    std::string forwarded_body = body;
+    // Only allocate the forwarded_body string when we need to forward/rewrite
+    std::string forwarded_body;
     if (_config.enable_token_forwarding && !tokens.empty() && !used_client_tokens) {
-        auto rewrite_result = RequestRewriter::rewrite(body, tokens);
+        // RequestRewriter::rewrite accepts string_view, returns modified body
+        auto rewrite_result = RequestRewriter::rewrite(body_view, tokens);
         if (rewrite_result.success) {
             forwarded_body = std::move(rewrite_result.body);
             log_proxy.debug("[{}] Request rewritten with {} token IDs ({} -> {} bytes)",
-                           request_id, tokens.size(), body.size(), forwarded_body.size());
+                           request_id, tokens.size(), body_view.size(), forwarded_body.size());
         } else {
+            // Rewrite failed, use original body (single copy here)
+            forwarded_body = std::string(body_view);
             log_proxy.debug("[{}] Request rewrite skipped: {}",
                            request_id, rewrite_result.error);
         }
+    } else {
+        // No rewriting needed - single copy for forwarding
+        forwarded_body = std::string(body_view);
     }
 
     BackendId target_id;
@@ -1080,7 +1105,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
     std::vector<int32_t> tokens;
     try {
-        tokens = _tokenizer.encode(req->content);
+        // Use string_view for zero-copy tokenization
+        std::string_view content_view(req->content.data(), req->content.size());
+        tokens = _tokenizer.encode(content_view);
     } catch (const std::exception& e) {
         log_control.warn("POST /admin/routes: failed to tokenize content for backend {}: {}", backend_id, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
