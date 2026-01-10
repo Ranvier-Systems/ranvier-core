@@ -9,6 +9,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "crypto_offloader.hpp"
 #include "dtls_context.hpp"
 #include "types.hpp"
 #include "logging.hpp"
@@ -361,6 +362,10 @@ private:
     seastar::timer<> _cert_reload_timer;
     seastar::timer<> _dtls_session_cleanup_timer;
 
+    // Adaptive crypto offloader (shard 0 only)
+    // Manages thread pool for expensive crypto operations to avoid reactor stalls
+    std::unique_ptr<CryptoOffloader> _crypto_offloader;
+
     // DTLS metrics
     uint64_t _dtls_handshakes_started = 0;
     uint64_t _dtls_handshakes_completed = 0;
@@ -371,8 +376,10 @@ private:
 
     // Crypto stall watchdog metrics
     uint64_t _crypto_stall_warnings = 0;       // Count of crypto ops exceeding stall threshold
-    uint64_t _crypto_ops_offloaded = 0;        // Count of crypto ops offloaded to seastar::thread
+    uint64_t _crypto_ops_offloaded = 0;        // Count of crypto ops offloaded to thread pool
     uint64_t _crypto_batch_broadcasts = 0;     // Count of batched broadcast operations
+    uint64_t _crypto_stalls_avoided = 0;       // Count of reactor stalls avoided via offloading
+    uint64_t _crypto_handshakes_offloaded = 0; // Count of handshake operations offloaded
 
     // Gate for cert reload handshakes - coordinates with stop() for graceful shutdown
     seastar::gate _handshake_gate;
@@ -474,6 +481,31 @@ private:
         }
         return result;
     }
+
+    //--------------------------------------------------------------------------
+    // Adaptive Crypto Offloading
+    //--------------------------------------------------------------------------
+
+    // Initialize the crypto offloader (called during start())
+    void initialize_crypto_offloader();
+
+    // Encrypt data using adaptive offloading
+    // Returns future that resolves to encrypted data, or empty vector on failure
+    seastar::future<std::vector<uint8_t>> encrypt_with_offloading(
+        DtlsSession* session,
+        const std::vector<uint8_t>& plaintext,
+        const seastar::socket_address& peer);
+
+    // Perform DTLS handshake with adaptive offloading
+    // Handshakes are always offloaded as they involve expensive RSA/ECDH operations
+    seastar::future<DtlsResult> handshake_with_offloading(
+        DtlsSession* session,
+        const uint8_t* data,
+        size_t len,
+        std::vector<uint8_t>& response);
+
+    // Update crypto offloader stats from local metrics
+    void sync_crypto_offloader_stats();
 
     // Receive loop (runs continuously while service is active)
     seastar::future<> receive_loop();

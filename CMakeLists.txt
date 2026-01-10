@@ -139,6 +139,7 @@ if(Seastar_FOUND)
       src/main.cpp
       src/application.cpp
       src/async_persistence.cpp
+      src/crypto_offloader.cpp
       src/dtls_context.cpp
       src/gossip_service.cpp
       src/health_service.cpp
@@ -324,6 +325,20 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(sharded_config_test)
 
+    # CryptoOffloader Unit Tests (Requires Seastar types)
+    # Tests adaptive crypto offloading decision logic and configuration
+    add_executable(crypto_offloader_test
+      tests/unit/crypto_offloader_test.cpp
+      src/crypto_offloader.cpp
+    )
+    target_include_directories(crypto_offloader_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(crypto_offloader_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest_main
+    )
+    gtest_discover_tests(crypto_offloader_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
     add_executable(stream_parser_test
       tests/unit/stream_parser_test.cpp
@@ -358,6 +373,7 @@ if(Seastar_FOUND)
     add_executable(application_test
       tests/unit/application_test.cpp
       src/application.cpp
+      src/crypto_offloader.cpp
       src/gossip_service.cpp
       src/node_slab.cpp
       src/router_service.cpp

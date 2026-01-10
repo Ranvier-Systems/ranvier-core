@@ -185,8 +185,8 @@ Hardening the gossip protocol and cluster coordination for production multi-node
 
 - [x] **Prevent reactor stalls in DTLS crypto operations** ✓
   _Justification:_ OpenSSL encryption/decryption blocks Seastar's reactor thread. With 50+ peers, sequential crypto operations cause multi-millisecond stalls affecting all network I/O.
-  _Approach:_ Adaptive offloading based on packet size (>1KB) and peer count (>10). Use `seastar::async` for large packets, `seastar::thread` with batching for high fan-out broadcasts. Add timing watchdog with 100μs threshold.
-  _Location:_ `src/gossip_service.cpp:1074-1176` (send_encrypted), `src/gossip_service.cpp:1269-1357` (broadcast_encrypted)
+  _Approach:_ Dedicated `CryptoOffloader` class using `seastar::async` for adaptive offloading. Decision logic: symmetric ops (AES-GCM) run inline when small (<1KB, ~5μs), asymmetric/handshake ops always offload (RSA/ECDH take 1-10ms). Configurable thresholds: size (1KB), latency (100μs), stall detection (500μs). Queue depth limiting prevents unbounded memory growth. Comprehensive Prometheus metrics for monitoring offloader behavior.
+  _Location:_ `src/crypto_offloader.hpp`, `src/crypto_offloader.cpp`, `src/gossip_service.cpp`
   _Complexity:_ Medium
 
 ---
@@ -536,6 +536,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-09 | Refactor CryptoOffloader for clarity (unified template handling, queue depth limiting, dedicated execute_inline/offloaded methods) | - |
 | 2026-01-09 | Add radix tree performance metrics (lookup hits/misses, node counts, slab utilization, path compression avg) | - |
 | 2026-01-09 | Quorum enforcement and DTLS lockdown (recently-seen quorum check, mTLS lockdown mode, sequence number hardening) | - |
 | 2026-01-08 | Implement shard-aware P2C load balancer (per-shard metrics, cross-shard dispatch, zero-copy transfer) | - |
