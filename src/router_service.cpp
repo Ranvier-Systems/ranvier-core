@@ -159,6 +159,14 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     if (_cluster_config.enabled) {
         _gossip = std::make_unique<GossipService>(_cluster_config);
 
+        // Set the local backend ID for this node (used when broadcasting DRAINING on shutdown)
+        _gossip->set_local_backend_id(_cluster_config.self_backend_id);
+        if (_cluster_config.self_backend_id == 0) {
+            log_router.warn("cluster.self_backend_id is 0 - graceful shutdown DRAINING "
+                           "notifications will not identify this node correctly to peers. "
+                           "Set self_backend_id to this node's backend ID for proper cluster drain.");
+        }
+
         // Set up callback to handle incoming route announcements
         _gossip->set_route_learn_callback([this](std::vector<TokenId> tokens, BackendId backend) {
             return learn_route_remote(std::move(tokens), backend);

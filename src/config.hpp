@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -299,6 +300,11 @@ struct ClusterConfig {
 
     // DTLS Security Lockdown
     bool mtls_enabled = false;                             // Enforce mTLS: drop non-DTLS packets when TLS enabled
+
+    // Node self-identification for graceful shutdown notifications
+    // When this node shuts down, it broadcasts DRAINING with this ID so peers
+    // can set the backend's weight to 0 and stop sending new traffic
+    int32_t self_backend_id = 0;                           // This node's backend ID (0 = unset, must configure for cluster)
 };
 
 // Kubernetes service discovery configuration
@@ -1083,6 +1089,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (c["mtls_enabled"]) {
                 config.cluster.mtls_enabled = c["mtls_enabled"].as<bool>();
             }
+            if (c["self_backend_id"]) {
+                config.cluster.self_backend_id = c["self_backend_id"].as<int32_t>();
+            }
         }
 
         // K8s discovery section
@@ -1298,6 +1307,8 @@ inline std::optional<std::string> RanvierConfig::validate(const RanvierConfig& c
         if (config.cluster.mtls_enabled && !config.cluster.tls.enabled) {
             return "cluster.mtls_enabled requires cluster.tls.enabled to be true";
         }
+        // Note: self_backend_id=0 is allowed but will log a warning at startup
+        // It's needed for graceful shutdown notifications to work correctly
     }
 
     // Validate K8s discovery settings (if enabled)
