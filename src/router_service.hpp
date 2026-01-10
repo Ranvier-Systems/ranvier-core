@@ -2,6 +2,7 @@
 
 #include "radix_tree.hpp"
 #include "config.hpp"
+#include "gossip_service.hpp"  // For NodeState
 
 #include <functional>
 #include <memory>
@@ -126,6 +127,13 @@ public:
     void stop_draining_reaper();
 
     seastar::future<> remove_routes_for_backend(BackendId b_id);
+
+    // Handle node state change notifications from cluster peers
+    // When a peer broadcasts DRAINING, this sets their backend weight to 0
+    seastar::future<> handle_node_state_change(BackendId backend, NodeState state);
+
+    // Get the gossip service (for broadcasting node state on shutdown)
+    GossipService* gossip_service() { return _gossip.get(); }
 
 private:
     // Thread-local metrics group

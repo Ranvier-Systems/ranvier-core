@@ -48,6 +48,13 @@ enum class GossipPacketType : uint8_t {
     ROUTE_ANNOUNCEMENT = 0x01,  // New route learned
     HEARTBEAT = 0x02,           // Keep-alive
     ROUTE_ACK = 0x03,           // Acknowledgment for route announcement
+    NODE_STATE = 0x04,          // Node state change (e.g., draining)
+};
+
+// Node state values for cluster-wide notifications
+enum class NodeState : uint8_t {
+    ACTIVE = 0x00,    // Normal operation
+    DRAINING = 0x01,  // Shutting down gracefully, stop sending traffic
 };
 
 // Wire format for route announcements (v2 with sequence numbers)
@@ -206,9 +213,70 @@ struct RouteAckPacket {
     }
 };
 
+// Wire format for node state notifications
+// Format: [type:1][version:1][node_state:1][backend_id:4]
+// Peers receiving DRAINING state should set weight of routes to that backend to 0
+struct NodeStatePacket {
+    static constexpr uint8_t PROTOCOL_VERSION = 2;
+    static constexpr size_t PACKET_SIZE = 7;  // type + version + state + backend_id
+
+    GossipPacketType type = GossipPacketType::NODE_STATE;
+    uint8_t version = PROTOCOL_VERSION;
+    NodeState state = NodeState::ACTIVE;
+    BackendId backend_id = 0;  // The backend ID this node represents
+
+    // Serialize to bytes for UDP transmission
+    std::vector<uint8_t> serialize() const {
+        std::vector<uint8_t> buffer;
+        buffer.reserve(PACKET_SIZE);
+
+        buffer.push_back(static_cast<uint8_t>(type));
+        buffer.push_back(version);
+        buffer.push_back(static_cast<uint8_t>(state));
+
+        // Backend ID (big-endian)
+        buffer.push_back((backend_id >> 24) & 0xFF);
+        buffer.push_back((backend_id >> 16) & 0xFF);
+        buffer.push_back((backend_id >> 8) & 0xFF);
+        buffer.push_back(backend_id & 0xFF);
+
+        return buffer;
+    }
+
+    // Deserialize from bytes received via UDP
+    static std::optional<NodeStatePacket> deserialize(const uint8_t* data, size_t len) {
+        if (len != PACKET_SIZE) {
+            return std::nullopt;
+        }
+
+        NodeStatePacket pkt;
+        pkt.type = static_cast<GossipPacketType>(data[0]);
+        pkt.version = data[1];
+
+        if (pkt.type != GossipPacketType::NODE_STATE || pkt.version != PROTOCOL_VERSION) {
+            return std::nullopt;
+        }
+
+        pkt.state = static_cast<NodeState>(data[2]);
+
+        // Backend ID (big-endian)
+        pkt.backend_id = (static_cast<BackendId>(data[3]) << 24) |
+                         (static_cast<BackendId>(data[4]) << 16) |
+                         (static_cast<BackendId>(data[5]) << 8) |
+                         static_cast<BackendId>(data[6]);
+
+        return pkt;
+    }
+};
+
 // Callback for handling received route announcements
 // Called with (tokens, backend_id) when a route announcement is received
 using RouteLearnCallback = std::function<seastar::future<>(std::vector<TokenId>, BackendId)>;
+
+// Callback for handling node state changes (e.g., draining notifications)
+// Called with (backend_id, state) when a peer broadcasts a state change
+// The callback should handle setting the backend weight to 0 for DRAINING
+using NodeStateCallback = std::function<seastar::future<>(BackendId, NodeState)>;
 
 // GossipService: Thread-local UDP gossip for cluster state sync
 // Runs on shard 0 only (broadcasts received routes to all shards via RouterService)
@@ -224,6 +292,23 @@ public:
 
     // Set callback for handling received route announcements
     void set_route_learn_callback(RouteLearnCallback callback);
+
+    // Set callback for handling node state changes (e.g., DRAINING notifications)
+    void set_node_state_callback(NodeStateCallback callback);
+
+    // Set the local backend ID that this node represents
+    // Used when broadcasting node state changes (e.g., DRAINING on shutdown)
+    void set_local_backend_id(BackendId id) { _local_backend_id = id; }
+
+    // Get the local backend ID
+    BackendId local_backend_id() const { return _local_backend_id; }
+
+    // Broadcast a node state change to all peers
+    // Call with NodeState::DRAINING on SIGTERM to notify peers to stop sending traffic
+    seastar::future<> broadcast_node_state(NodeState state);
+
+    // Check if this node is in draining state
+    bool is_draining() const { return _draining.load(std::memory_order_relaxed); }
 
     // Broadcast a route announcement to all peers
     // Called by RouterService when a new route is learned locally
@@ -270,6 +355,14 @@ public:
 private:
     ClusterConfig _config;
     RouteLearnCallback _route_learn_callback;
+    NodeStateCallback _node_state_callback;
+
+    // Local backend ID - identifies which backend this node represents
+    // Used when broadcasting node state changes (e.g., DRAINING)
+    BackendId _local_backend_id = 0;
+
+    // Draining flag - set when this node is shutting down
+    std::atomic<bool> _draining{false};
 
     // UDP channel for gossip
     std::optional<seastar::net::udp_channel> _channel;
@@ -300,6 +393,10 @@ private:
 
     // DTLS lockdown metrics
     uint64_t _dtls_lockdown_drops = 0;  // Packets dropped due to mTLS lockdown (non-DTLS when mTLS required)
+
+    // Node state notification metrics
+    uint64_t _node_state_sent = 0;       // Node state packets sent (e.g., DRAINING)
+    uint64_t _node_state_received = 0;   // Node state packets received from peers
 
     // Reliable delivery metrics
     uint64_t _acks_sent = 0;

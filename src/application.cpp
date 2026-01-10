@@ -643,8 +643,19 @@ void Application::signal_shutdown() {
     log_main.info("Shutdown signal received - initiating graceful shutdown");
     _state = ApplicationState::DRAINING;
 
-    // Start draining on ALL shards (reject new requests)
-    (void)drain_requests().then([this] {
+    // First, broadcast DRAINING state to cluster peers
+    // This notifies other nodes to stop sending traffic to this node
+    seastar::future<> gossip_future = seastar::make_ready_future<>();
+    if (_router && _router->gossip_service() && _router->gossip_service()->is_enabled()) {
+        log_main.info("Broadcasting DRAINING state to cluster peers...");
+        gossip_future = _router->gossip_service()->broadcast_node_state(NodeState::DRAINING);
+    }
+
+    // Then start draining on ALL shards (reject new requests)
+    (void)gossip_future.then([this] {
+        log_main.info("Starting request drain (timeout: {}s)...", _config.shutdown.drain_timeout.count());
+        return drain_requests();
+    }).then([this] {
         _stop_signal->set_value();
     }).handle_exception([this](auto ep) {
         try {
