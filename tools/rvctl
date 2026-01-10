@@ -482,13 +482,13 @@ def cmd_route_add(args):
     )
 
     status = data.get('status', 'unknown')
-    route_added = data.get('route_added', 0)
 
     if status == 'ok':
+        tokens = data.get('tokens', 0)
+        stored_tokens = data.get('stored_tokens', 0)
         print(f"{Colors.GREEN}Success:{Colors.RESET} Route added for backend {backend_id}")
-        print(f"  Content length: {len(content)} chars")
-        if route_added:
-            print(f"  Routes added: {route_added}")
+        print(f"  Content: {len(content)} chars -> {tokens} tokens")
+        print(f"  Stored:  {stored_tokens} tokens (block-aligned)")
     else:
         error = data.get('error', 'Unknown error')
         print(f"{Colors.RED}Error:{Colors.RESET} {error}")

@@ -1134,13 +1134,31 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
+    // Check if route will actually be stored (must meet block_alignment minimum)
+    size_t token_count = tokens.size();
+    size_t aligned_len = (token_count / _config.block_alignment) * _config.block_alignment;
+    if (aligned_len == 0) {
+        log_control.warn("POST /admin/routes: content too short ({} tokens, need at least {} for block_alignment={})",
+                         token_count, _config.block_alignment, _config.block_alignment);
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        std::ostringstream oss;
+        oss << "{\"error\": \"Content too short: " << token_count << " tokens, need at least "
+            << _config.block_alignment << " (block_alignment)\"}";
+        rep->write_body("json", oss.str());
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
     // Queue route for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
         _persistence->queue_save_route(tokens, backend_id);
     }
 
-    return _router.learn_route_global(tokens, backend_id).then([backend_id, rep = std::move(rep)]() mutable {
-         rep->write_body("json", "{\"status\": \"ok\", \"route_added\": " + std::to_string(backend_id) + "}");
+    return _router.learn_route_global(tokens, backend_id).then([backend_id, token_count, aligned_len, rep = std::move(rep)]() mutable {
+         std::ostringstream oss;
+         oss << "{\"status\": \"ok\", \"backend_id\": " << backend_id
+             << ", \"tokens\": " << token_count
+             << ", \"stored_tokens\": " << aligned_len << "}";
+         rep->write_body("json", oss.str());
          return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     });
 }

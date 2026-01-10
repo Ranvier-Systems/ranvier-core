@@ -96,6 +96,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.accept_client_tokens = config.routing.accept_client_tokens;
     cfg.max_token_id = config.routing.max_token_id;
     cfg.routing_mode = config.routing.routing_mode;
+    cfg.block_alignment = config.routing.block_alignment;
     // Timeout settings
     cfg.connect_timeout = config.timeouts.connect_timeout;
     cfg.request_timeout = config.timeouts.request_timeout;

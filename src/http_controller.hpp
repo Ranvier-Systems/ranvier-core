@@ -75,6 +75,7 @@ struct HttpControllerConfig {
     bool accept_client_tokens = false;          // Accept pre-tokenized prompt_token_ids from clients for routing
     int32_t max_token_id = 100000;              // Maximum valid token ID for validation (security)
     RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::RADIX;  // Routing mode
+    uint32_t block_alignment = 16;              // vLLM PagedAttention block size for route alignment
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
