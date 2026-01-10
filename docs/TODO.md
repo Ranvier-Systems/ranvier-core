@@ -424,10 +424,11 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Output:_ `docs/openapi.yaml`
   _Complexity:_ Low
 
-- [ ] **Add Python admin SDK**
+- [x] **Add Python admin SDK** ✓
   _Justification:_ Operators script backend registration. SDK simplifies integration.
   _Features:_ Backend CRUD, route inspection, metrics fetching
-  _Location:_ `sdk/python/`
+  _Approach:_ Implemented as `rvctl` CLI tool with commands: `inspect routes`, `inspect backends`, `cluster status`, `drain`, `route add`. Supports JSON/HTTP communication with Admin API, colorized output, tree visualization, and environment variable authentication.
+  _Location:_ `tools/rvctl`
   _Complexity:_ Medium
 
 - [x] **Create Helm chart for Kubernetes deployment** ✓
@@ -527,6 +528,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P3 - Low** | DX | Encapsulate SQLite store within AsyncPersistenceManager | Low | ✅ Done |
 | **P3 - Low** | Performance | Async file I/O for tokenizer loading | Low | ✅ Done |
 | **P3 - Low** | Observability | Radix tree performance metrics | Low | ✅ Done |
+| **P2 - Medium** | DX | Python admin SDK (rvctl CLI) | Medium | ✅ Done |
 
 ---
 
@@ -536,6 +538,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-10 | Create rvctl CLI tool for Ranvier management (inspect routes/backends, cluster status, drain, route add) | #110 |
 | 2026-01-09 | Refactor CryptoOffloader for clarity (unified template handling, queue depth limiting, dedicated execute_inline/offloaded methods) | - |
 | 2026-01-09 | Add radix tree performance metrics (lookup hits/misses, node counts, slab utilization, path compression avg) | - |
 | 2026-01-09 | Quorum enforcement and DTLS lockdown (recently-seen quorum check, mTLS lockdown mode, sequence number hardening) | - |
