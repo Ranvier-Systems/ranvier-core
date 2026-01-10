@@ -1520,7 +1520,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_tree(
     std::vector<TokenId> prefix_filter;
     if (!prefix_str.empty()) {
         // Parse comma-separated token IDs
-        std::istringstream iss(std::string(prefix_str));
+        std::string prefix_string{prefix_str};
+        std::istringstream iss{prefix_string};
         std::string token_str;
         while (std::getline(iss, token_str, ',')) {
             try {
