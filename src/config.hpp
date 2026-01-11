@@ -235,6 +235,8 @@ struct CircuitBreakerConfig {
 // Shutdown configuration for graceful drain
 struct ShutdownConfig {
     std::chrono::seconds drain_timeout{30};           // Max time to wait for in-flight requests
+    std::chrono::seconds shutdown_timeout{60};        // Max time for entire shutdown sequence
+    std::chrono::milliseconds gossip_broadcast_timeout{5000}; // Max time to broadcast DRAINING state
 };
 
 // Backpressure configuration for system stability
