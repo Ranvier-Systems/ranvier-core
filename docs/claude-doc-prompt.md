@@ -1,5 +1,5 @@
-1. Ref doc/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /doc or /assets folders.
+1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+2. DO NOT read the full /docs or /assets folders.
 
 I have implemented the code for: <INSERT_TASK_NAME>
 The final logic is verified. Now, complete the maintenance:
