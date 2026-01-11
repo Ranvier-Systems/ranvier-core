@@ -15,6 +15,7 @@ This document identifies missing features and optimizations required to promote 
 3. [Observability](#3-observability)
 4. [Infrastructure & Security](#4-infrastructure--security)
 5. [Developer Experience](#5-developer-experience)
+6. [Integration Tests (End-to-End Validation)](#6-integration-tests-end-to-end-validation)
 
 ---
 
@@ -587,6 +588,159 @@ _Move completed items here with completion date and PR reference._
 | 2024-12-XX | Abseil high-performance containers | #48 |
 | 2024-12-XX | Multi-node integration tests | #47 |
 | 2024-12-XX | Request rewriting for token forwarding | #46 |
+
+---
+
+## 6. Integration Tests (End-to-End Validation)
+
+Comprehensive E2E tests validating the full request pipeline:
+`Client → HttpController → TokenizerService → RouterService → RadixTree → ConnectionPool → Backend`
+
+All tests must follow the **No Locks/Async Only** constraints from `docs/claude-context.md`.
+
+### 6.1 Test Infrastructure Setup
+
+- [ ] **Create shared test fixtures**
+  _Description:_ Create `tests/integration/conftest.py` with pytest fixtures for cluster lifecycle, health polling, and request utilities.
+  _Files:_ `tests/integration/conftest.py` (new)
+  _Complexity:_ Low
+
+- [ ] **Enhance mock backend capabilities**
+  _Description:_ Extend `mock_backend.py` with configurable latency injection, failure mode simulation (5xx, timeouts, connection resets), request logging endpoint (`/debug/requests`), and prefix echo mode.
+  _Files:_ `tests/integration/mock_backend.py`
+  _Complexity:_ Medium
+
+- [ ] **Add Docker Compose test profiles**
+  _Description:_ Add single-node profile for fast isolated tests, health check failure simulation service, and configurable backend response modes.
+  _Files:_ `docker-compose.test.yml`
+  _Complexity:_ Low
+
+- [ ] **Add Makefile test targets**
+  _Description:_ Add `test-integration-fast` (single-node), `test-integration-full` (multi-node), and `test-integration-ci` (JUnit XML output) targets.
+  _Files:_ `Makefile`
+  _Complexity:_ Low
+
+### 6.2 HTTP Request Pipeline Tests
+
+- [ ] **Create HTTP pipeline test suite**
+  _Description:_ Create `test_http_pipeline.py` with tests for: POST `/v1/chat/completions` returns valid streaming response, request headers forwarded correctly, Content-Type validation, invalid JSON returns 400.
+  _Files:_ `tests/integration/test_http_pipeline.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Create streaming response test suite**
+  _Description:_ Create `test_streaming.py` with tests for: SSE format validation, chunked transfer encoding, stream interruption handling, `[DONE]` sentinel verification.
+  _Files:_ `tests/integration/test_streaming.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Test request rewriting with token injection**
+  _Description:_ Verify token IDs injected when forwarding enabled, original request preserved when disabled, large message arrays (10+) handled correctly.
+  _Files:_ `tests/integration/test_http_pipeline.py`
+  _Complexity:_ Low
+
+### 6.3 Routing Logic Tests
+
+- [ ] **Create prefix affinity routing test suite**
+  _Description:_ Create `test_prefix_routing.py` with tests for: same prefix routes to same backend consistently, different prefixes can route to different backends, route learning verified via metrics, min token length threshold respected.
+  _Files:_ `tests/integration/test_prefix_routing.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Extend route propagation tests**
+  _Description:_ Add tests for: routes learned on Node1 visible on Node2 after gossip interval, updates propagate within timeout, verify `router_cluster_sync_*` metrics.
+  _Files:_ `tests/integration/test_cluster.py`
+  _Complexity:_ Medium
+
+- [ ] **Test backend selection and lifecycle**
+  _Description:_ Verify: requests route to healthy backends only, backend registration creates routable backend, backend removal stops routing.
+  _Files:_ `tests/integration/test_prefix_routing.py`
+  _Complexity:_ Low
+
+### 6.4 Resilience and Fault Tolerance Tests
+
+- [ ] **Create health/circuit breaker test suite**
+  _Description:_ Create `test_health_circuit_breaker.py` with tests for: unhealthy backend detection and removal, backend recovery and re-addition, health check interval configuration.
+  _Files:_ `tests/integration/test_health_circuit_breaker.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Test circuit breaker state transitions**
+  _Description:_ Verify: consecutive failures trigger open state, half-open state allows probes, successful probe closes circuit.
+  _Files:_ `tests/integration/test_health_circuit_breaker.py`
+  _Complexity:_ Medium
+
+- [ ] **Test connection pool resilience**
+  _Description:_ Verify: connection reuse across requests, recovery after backend restart, timeout handling for slow backends.
+  _Files:_ `tests/integration/test_health_circuit_breaker.py`
+  _Complexity:_ Medium
+
+- [ ] **Test rate limiting behavior**
+  _Description:_ Verify: requests exceeding limit return 429, limit resets after window, rate limit metrics exposed.
+  _Files:_ `tests/integration/test_health_circuit_breaker.py`
+  _Complexity:_ Low
+
+### 6.5 Observability Tests
+
+- [ ] **Create metrics test suite**
+  _Description:_ Create `test_metrics.py` with tests for: `/metrics` returns valid Prometheus format, request count increments, latency histograms recorded, backend health metrics accurate.
+  _Files:_ `tests/integration/test_metrics.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Test cluster metrics**
+  _Description:_ Verify: `cluster_peers_alive` reflects actual peers, gossip counters increment during sync, per-shard metrics available.
+  _Files:_ `tests/integration/test_metrics.py`
+  _Complexity:_ Low
+
+### 6.6 Lifecycle and Persistence Tests
+
+- [ ] **Create graceful shutdown test suite**
+  _Description:_ Create `test_graceful_shutdown.py` with tests for: in-flight requests complete, new connections rejected after signal, shutdown within timeout, exit code 0 for clean shutdown.
+  _Files:_ `tests/integration/test_graceful_shutdown.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Create persistence recovery test suite**
+  _Description:_ Create `test_persistence_recovery.py` with tests for: backends persist across restart, routes persist in SQLite, WAL mode concurrent access, corrupted DB handled gracefully.
+  _Files:_ `tests/integration/test_persistence_recovery.py` (new)
+  _Complexity:_ Medium
+
+- [ ] **Create configuration loading test suite**
+  _Description:_ Create `test_config_loading.py` with tests for: YAML config loaded correctly, env vars override YAML, `--dry-run` validates without starting, invalid config produces clear error.
+  _Files:_ `tests/integration/test_config_loading.py` (new)
+  _Complexity:_ Low
+
+### 6.7 Edge Cases and Error Handling Tests
+
+- [ ] **Test error response validation**
+  _Description:_ Verify: 404 for unknown endpoints, 405 for unsupported methods, 503 when no backends, structured JSON error bodies.
+  _Files:_ `tests/integration/test_http_pipeline.py`
+  _Complexity:_ Low
+
+- [ ] **Test large payload handling**
+  _Description:_ Verify: large request bodies (>1MB) processed, large streaming responses (>10MB) delivered, memory stable during processing.
+  _Files:_ `tests/integration/test_streaming.py`
+  _Complexity:_ Medium
+
+- [ ] **Test concurrent request handling**
+  _Description:_ Verify: 100 concurrent requests without errors, request ordering preserved per-connection, no cross-contamination under load.
+  _Files:_ `tests/integration/test_http_pipeline.py`
+  _Complexity:_ Medium
+
+### Integration Test Summary: Files Affected
+
+| File | Action | Description |
+|------|--------|-------------|
+| `tests/integration/conftest.py` | Create | Shared pytest fixtures |
+| `tests/integration/mock_backend.py` | Modify | Add failure modes, logging |
+| `tests/integration/test_http_pipeline.py` | Create | HTTP request flow tests |
+| `tests/integration/test_streaming.py` | Create | SSE/chunked response tests |
+| `tests/integration/test_prefix_routing.py` | Create | Prefix affinity tests |
+| `tests/integration/test_cluster.py` | Modify | Extend route propagation |
+| `tests/integration/test_health_circuit_breaker.py` | Create | Resilience tests |
+| `tests/integration/test_metrics.py` | Create | Prometheus metrics tests |
+| `tests/integration/test_graceful_shutdown.py` | Create | Shutdown behavior tests |
+| `tests/integration/test_persistence_recovery.py` | Create | SQLite persistence tests |
+| `tests/integration/test_config_loading.py` | Create | Configuration tests |
+| `docker-compose.test.yml` | Modify | Add test profiles/services |
+| `Makefile` | Modify | Add test targets |
+
+**Total: 13 files (9 new, 4 modified)**
 
 ---
 
