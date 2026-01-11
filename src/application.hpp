@@ -146,6 +146,13 @@ private:
     // Atomic for robustness, though Seastar signals run on shard 0.
     std::atomic<int> _sigint_count{0};
 
+    // Atomic flag to ensure signal_shutdown() is idempotent and race-safe.
+    // Prevents concurrent execution from multiple signal handlers.
+    std::atomic<bool> _shutdown_initiated{false};
+
+    // Shutdown timing for metrics/debugging
+    std::chrono::steady_clock::time_point _shutdown_start_time;
+
     // --- Services (owned by Application) ---
 
     // Infrastructure layer
@@ -230,7 +237,16 @@ private:
 
     // --- Private Helpers: Shutdown ---
 
-    // Drain in-flight requests on all controller shards
+    // Phase 1: Broadcast DRAINING state to cluster peers (with timeout)
+    seastar::future<> phase_broadcast_draining();
+
+    // Phase 2: Drain in-flight requests on all controller shards (with timeout)
+    seastar::future<> phase_drain_requests();
+
+    // Phase 3: Stop all services in reverse order
+    seastar::future<> phase_stop_services();
+
+    // Legacy: Called by phase_drain_requests
     seastar::future<> drain_requests();
 
     // Stop all services in reverse order
@@ -238,6 +254,10 @@ private:
 
     // Cleanup on final shutdown
     void cleanup();
+
+    // Log shutdown phase completion with timing
+    void log_phase_complete(const char* phase_name,
+                            std::chrono::steady_clock::time_point phase_start) const;
 };
 
 }  // namespace ranvier

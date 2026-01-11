@@ -639,37 +639,124 @@ void Application::setup_signal_handlers() {
 }
 
 void Application::signal_shutdown() {
+    // Use atomic compare-exchange to ensure exactly one thread executes shutdown.
+    // This handles the race between SIGINT and SIGTERM arriving simultaneously.
+    bool expected = false;
+    if (!_shutdown_initiated.compare_exchange_strong(expected, true,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+        log_main.debug("Shutdown already initiated - ignoring duplicate signal");
+        return;
+    }
+
+    // Also check state (belt-and-suspenders for code paths that set state directly)
     if (_state == ApplicationState::DRAINING ||
         _state == ApplicationState::STOPPING ||
         _state == ApplicationState::STOPPED) {
-        return;  // Already shutting down
+        return;
     }
 
-    log_main.info("Shutdown signal received - initiating graceful shutdown");
+    _shutdown_start_time = std::chrono::steady_clock::now();
+    log_main.info("=== GRACEFUL SHUTDOWN INITIATED ===");
+    log_main.info("Shutdown timeout: {}s, Drain timeout: {}s",
+                  _config.shutdown.shutdown_timeout.count(),
+                  _config.shutdown.drain_timeout.count());
     _state = ApplicationState::DRAINING;
 
-    // First, broadcast DRAINING state to cluster peers
-    // This notifies other nodes to stop sending traffic to this node
-    seastar::future<> gossip_future = seastar::make_ready_future<>();
-    if (_router && _router->gossip_service() && _router->gossip_service()->is_enabled()) {
-        log_main.info("Broadcasting DRAINING state to cluster peers...");
-        gossip_future = _router->gossip_service()->broadcast_node_state(NodeState::DRAINING);
+    // Execute shutdown phases with overall timeout protection
+    auto shutdown_deadline = seastar::lowres_clock::now() + _config.shutdown.shutdown_timeout;
+
+    // Chain the shutdown phases
+    auto shutdown_future = phase_broadcast_draining()
+        .then([this] {
+            return phase_drain_requests();
+        })
+        .then([this] {
+            log_main.info("Drain complete - signaling main loop to stop");
+            _stop_signal->set_value();
+        })
+        .handle_exception([this](auto ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_main.error("Error during shutdown sequence: {}", e.what());
+            }
+            // Always signal stop, even on error - we must not hang
+            try {
+                _stop_signal->set_value();
+            } catch (...) {
+                // Promise may already be fulfilled - ignore
+            }
+        });
+
+    // Apply overall shutdown timeout
+    (void)seastar::with_timeout(shutdown_deadline, std::move(shutdown_future))
+        .handle_exception_type([this](const seastar::timed_out_error&) {
+            log_main.error("Shutdown timeout ({}s) exceeded - forcing stop signal",
+                          _config.shutdown.shutdown_timeout.count());
+            try {
+                _stop_signal->set_value();
+            } catch (...) {
+                // Promise may already be fulfilled
+            }
+        });
+}
+
+void Application::log_phase_complete(const char* phase_name,
+                                      std::chrono::steady_clock::time_point phase_start) const {
+    auto elapsed = std::chrono::steady_clock::now() - phase_start;
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    log_main.info("  [{}] completed in {}ms", phase_name, elapsed_ms);
+}
+
+seastar::future<> Application::phase_broadcast_draining() {
+    auto phase_start = std::chrono::steady_clock::now();
+    log_main.info("Phase 1/3: Broadcasting DRAINING state to cluster...");
+
+    // Skip if clustering is not enabled or gossip not available
+    if (!_router || !_router->gossip_service() || !_router->gossip_service()->is_enabled()) {
+        log_main.info("  Cluster mode disabled - skipping gossip broadcast");
+        log_phase_complete("BROADCAST", phase_start);
+        return seastar::make_ready_future<>();
     }
 
-    // Then start draining on ALL shards (reject new requests)
-    (void)gossip_future.then([this] {
-        log_main.info("Starting request drain (timeout: {}s)...", _config.shutdown.drain_timeout.count());
-        return drain_requests();
-    }).then([this] {
-        _stop_signal->set_value();
-    }).handle_exception([this](auto ep) {
+    // Broadcast with timeout to avoid blocking shutdown on network issues
+    auto broadcast_deadline = seastar::lowres_clock::now() + _config.shutdown.gossip_broadcast_timeout;
+
+    return seastar::with_timeout(
+        broadcast_deadline,
+        _router->gossip_service()->broadcast_node_state(NodeState::DRAINING)
+    ).then([this, phase_start] {
+        log_main.info("  Successfully notified cluster peers");
+        log_phase_complete("BROADCAST", phase_start);
+    }).handle_exception_type([this, phase_start](const seastar::timed_out_error&) {
+        log_main.warn("  Gossip broadcast timed out after {}ms - continuing shutdown",
+                     _config.shutdown.gossip_broadcast_timeout.count());
+        log_phase_complete("BROADCAST", phase_start);
+    }).handle_exception([this, phase_start](auto ep) {
         try {
             std::rethrow_exception(ep);
         } catch (const std::exception& e) {
-            log_main.error("Error during drain: {}", e.what());
+            log_main.warn("  Gossip broadcast failed: {} - continuing shutdown", e.what());
         }
-        // Still proceed with shutdown even on error
-        _stop_signal->set_value();
+        log_phase_complete("BROADCAST", phase_start);
+    });
+}
+
+seastar::future<> Application::phase_drain_requests() {
+    auto phase_start = std::chrono::steady_clock::now();
+    log_main.info("Phase 2/3: Draining in-flight requests (timeout: {}s)...",
+                  _config.shutdown.drain_timeout.count());
+
+    return drain_requests().then([this, phase_start] {
+        log_phase_complete("DRAIN", phase_start);
+    }).handle_exception([this, phase_start](auto ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_main.warn("  Drain encountered error: {} - continuing shutdown", e.what());
+        }
+        log_phase_complete("DRAIN", phase_start);
     });
 }
 
@@ -705,10 +792,10 @@ seastar::future<> Application::run() {
     return start_servers().then([this] {
         setup_signal_handlers();
 
-        // Wait for shutdown signal
+        // Wait for shutdown signal (set by signal_shutdown())
         return _stop_signal->get_future();
     }).then([this] {
-        log_main.info("Drain complete - stopping Ranvier...");
+        // Phase 3 is logged inside stop_services()
         return shutdown();
     });
 }
@@ -718,85 +805,113 @@ seastar::future<> Application::run() {
 // =============================================================================
 
 seastar::future<> Application::stop_services() {
+    auto phase_start = std::chrono::steady_clock::now();
+    log_main.info("Phase 3/3: Stopping services in reverse order...");
     _state = ApplicationState::STOPPING;
 
-    // Build the shutdown chain with null checks for partially-initialized state
-    seastar::future<> chain = seastar::make_ready_future<>();
+    // -------------------------------------------------------------------------
+    // Step 1: Stop services that don't need request handling (parallel)
+    // Health checker and K8s discovery can stop independently
+    // -------------------------------------------------------------------------
+    std::vector<seastar::future<>> parallel_stops;
 
-    // Stop Health Checker FIRST (if initialized)
     if (_health_checker) {
-        chain = chain.then([this] {
-            return _health_checker->stop();
-        });
+        parallel_stops.push_back(
+            _health_checker->stop().then([] {
+                log_main.debug("  Health checker stopped");
+            }).handle_exception([](auto ep) {
+                log_main.warn("  Health checker stop error (ignored)");
+            })
+        );
     }
 
-    // Stop K8s discovery service (if initialized and enabled)
-    chain = chain.then([this] {
-        if (_k8s_discovery && _k8s_discovery->is_enabled()) {
-            return _k8s_discovery->stop();
-        }
-        return seastar::make_ready_future<>();
-    });
-
-    // Stop gossip service and draining reaper (if router initialized)
-    chain = chain.then([this] {
-        if (_router) {
-            _router->stop_draining_reaper();
-            return _router->stop_gossip();
-        }
-        return seastar::make_ready_future<>();
-    });
-
-    // Stop HTTP servers
-    chain = chain.then([this] {
-        return stop_servers();
-    });
-
-    // Stop the sharded HttpController (only if it was started)
-    if (_controller_started) {
-        chain = chain.then([this] {
-            return _controller.stop();
-        });
+    if (_k8s_discovery && _k8s_discovery->is_enabled()) {
+        parallel_stops.push_back(
+            _k8s_discovery->stop().then([] {
+                log_main.debug("  K8s discovery stopped");
+            }).handle_exception([](auto ep) {
+                log_main.warn("  K8s discovery stop error (ignored)");
+            })
+        );
     }
 
-    // Stop the shard load balancer (only if it was started)
-    if (_load_balancer_started) {
-        chain = chain.then([this] {
+    return seastar::when_all_succeed(parallel_stops.begin(), parallel_stops.end())
+        .discard_result()
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 2: Stop gossip service and draining reaper
+            // Must happen after health checker (which may use routing info)
+            // -------------------------------------------------------------------------
+            if (_router) {
+                _router->stop_draining_reaper();
+                return _router->stop_gossip().then([] {
+                    log_main.debug("  Gossip service stopped");
+                }).handle_exception([](auto ep) {
+                    log_main.warn("  Gossip service stop error (ignored)");
+                    return seastar::make_ready_future<>();
+                });
+            }
+            return seastar::make_ready_future<>();
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 3: Stop HTTP servers (parallel - API and metrics are independent)
+            // -------------------------------------------------------------------------
+            return stop_servers().then([] {
+                log_main.debug("  HTTP servers stopped");
+            });
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 4: Stop sharded services (sequential - correct shutdown order)
+            // -------------------------------------------------------------------------
+            if (!_controller_started) {
+                return seastar::make_ready_future<>();
+            }
+            return _controller.stop().then([] {
+                log_main.debug("  HttpController stopped on all shards");
+            });
+        })
+        .then([this] {
+            if (!_load_balancer_started) {
+                return seastar::make_ready_future<>();
+            }
             return _load_balancer.stop().then([] {
-                log_main.info("Shard load balancer stopped");
+                log_main.debug("  Shard load balancer stopped");
             });
-        });
-    }
-
-    // Stop async persistence manager
-    chain = chain.then([this] {
-        if (_async_persistence) {
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 5: Stop persistence (flushes pending writes)
+            // -------------------------------------------------------------------------
+            if (!_async_persistence) {
+                return seastar::make_ready_future<>();
+            }
             return _async_persistence->stop().then([] {
-                log_main.info("Async persistence manager stopped (queue flushed)");
+                log_main.debug("  Async persistence stopped (queue flushed)");
             });
-        }
-        return seastar::make_ready_future<>();
-    });
-
-    // Stop sharded config (if started)
-    if (_sharded_config_started) {
-        chain = chain.then([this] {
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 6: Stop sharded config (last infrastructure component)
+            // -------------------------------------------------------------------------
+            if (!_sharded_config_started) {
+                return seastar::make_ready_future<>();
+            }
             return _sharded_config.stop().then([] {
-                log_main.info("Sharded config stopped");
+                log_main.debug("  Sharded config stopped");
             });
+        })
+        .finally([this, phase_start] {
+            log_phase_complete("STOP_SERVICES", phase_start);
+            cleanup();
         });
-    }
-
-    // Final cleanup
-    return chain.finally([this] {
-        cleanup();
-    });
 }
 
 void Application::cleanup() {
     // Log shutdown summary and close persistence
     if (_async_persistence && _async_persistence->is_open()) {
-        log_main.info("Shutdown summary:");
+        log_main.info("Persistence shutdown summary:");
         log_main.info("  Persisted backends: {}", _async_persistence->backend_count());
         log_main.info("  Persisted routes:   {}", _async_persistence->route_count());
 
@@ -808,16 +923,25 @@ void Application::cleanup() {
         }
 
         _async_persistence->close();
-        log_main.info("Persistence store closed");
+        log_main.debug("Persistence store closed");
     }
 
     // Shutdown OpenTelemetry tracing
     if (TracingService::is_enabled()) {
         TracingService::shutdown();
-        log_main.info("OpenTelemetry tracing shutdown complete");
+        log_main.debug("OpenTelemetry tracing shutdown complete");
     }
 
     _state = ApplicationState::STOPPED;
+
+    // Log total shutdown time if we have a valid start time
+    if (_shutdown_start_time.time_since_epoch().count() > 0) {
+        auto total_elapsed = std::chrono::steady_clock::now() - _shutdown_start_time;
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(total_elapsed).count();
+        log_main.info("=== GRACEFUL SHUTDOWN COMPLETE (total: {}ms) ===", total_ms);
+    } else {
+        log_main.info("=== SHUTDOWN COMPLETE ===");
+    }
 }
 
 seastar::future<> Application::shutdown() {
