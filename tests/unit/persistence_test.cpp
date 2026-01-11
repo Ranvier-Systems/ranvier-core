@@ -411,3 +411,143 @@ TEST_F(PersistenceTest, BackendWeightAndPrioritySurviveReopen) {
         EXPECT_EQ(backends[0].priority, 1);
     }
 }
+
+// =============================================================================
+// NULL Value Handling Tests (Security Audit Item 7.2.1)
+// =============================================================================
+
+// Helper to create a corrupted database with NULL-allowing schema
+// This simulates DB corruption, failed migration, or manual edits that bypass constraints
+static void create_corrupted_db_with_null_ip(const std::string& path, int null_id) {
+    sqlite3* db;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+
+    // Create table WITHOUT NOT NULL constraint (simulating corruption/old schema)
+    const char* create_sql = R"(
+        CREATE TABLE IF NOT EXISTS backends (
+            id INTEGER PRIMARY KEY,
+            ip TEXT,
+            port INTEGER NOT NULL,
+            weight INTEGER NOT NULL DEFAULT 100,
+            priority INTEGER NOT NULL DEFAULT 0
+        )
+    )";
+    ASSERT_EQ(sqlite3_exec(db, create_sql, nullptr, nullptr, nullptr), SQLITE_OK);
+
+    // Insert a row with NULL ip
+    std::string insert_sql = "INSERT INTO backends (id, ip, port, weight, priority) VALUES ("
+        + std::to_string(null_id) + ", NULL, 8080, 100, 0)";
+    ASSERT_EQ(sqlite3_exec(db, insert_sql.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+
+    sqlite3_close(db);
+}
+
+// Test that NULL IP values don't crash and are skipped gracefully
+TEST_F(PersistenceTest, BackendWithNullIpIsSkipped) {
+    // Create corrupted database first (before opening with our store)
+    create_corrupted_db_with_null_ip(test_db_path_, 2);
+
+    // Open with our store - it will try to add columns if needed but won't change existing data
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Add a valid backend
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434));
+
+    // Close and reopen to ensure fresh load
+    store_->close();
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Load backends - should only return the valid one, skipping the NULL one
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1);
+    EXPECT_EQ(backends[0].id, 1);
+    EXPECT_EQ(backends[0].ip, "192.168.1.100");
+
+    // Verify that we tracked the skipped record
+    EXPECT_GE(store_->last_load_skipped_count(), 1);
+}
+
+// Test that empty string IP values are also skipped
+TEST_F(PersistenceTest, BackendWithEmptyIpIsSkipped) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Add a valid backend
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8080));
+
+    // Close store, then manually insert an empty-string IP backend
+    store_->close();
+
+    sqlite3* db;
+    ASSERT_EQ(sqlite3_open(test_db_path_.c_str(), &db), SQLITE_OK);
+    // Empty string is allowed by NOT NULL constraint
+    const char* sql = "INSERT INTO backends (id, ip, port, weight, priority) VALUES (2, '', 8080, 100, 0)";
+    ASSERT_EQ(sqlite3_exec(db, sql, nullptr, nullptr, nullptr), SQLITE_OK);
+    sqlite3_close(db);
+
+    // Reopen and verify
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Load backends - should only return the valid one
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1);
+    EXPECT_EQ(backends[0].id, 1);
+    EXPECT_EQ(backends[0].ip, "10.0.0.1");
+}
+
+// Helper to create a corrupted database with multiple NULL IPs
+static void create_corrupted_db_with_multiple_nulls(const std::string& path) {
+    sqlite3* db;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+
+    // Create table WITHOUT NOT NULL constraint
+    const char* create_sql = R"(
+        CREATE TABLE IF NOT EXISTS backends (
+            id INTEGER PRIMARY KEY,
+            ip TEXT,
+            port INTEGER NOT NULL,
+            weight INTEGER NOT NULL DEFAULT 100,
+            priority INTEGER NOT NULL DEFAULT 0
+        )
+    )";
+    ASSERT_EQ(sqlite3_exec(db, create_sql, nullptr, nullptr, nullptr), SQLITE_OK);
+
+    // Insert rows with NULL/empty ips
+    ASSERT_EQ(sqlite3_exec(db, "INSERT INTO backends (id, ip, port, weight, priority) VALUES (2, NULL, 8080, 100, 0)", nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db, "INSERT INTO backends (id, ip, port, weight, priority) VALUES (3, NULL, 8080, 100, 0)", nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db, "INSERT INTO backends (id, ip, port, weight, priority) VALUES (4, '', 8080, 100, 0)", nullptr, nullptr, nullptr), SQLITE_OK);
+
+    sqlite3_close(db);
+}
+
+// Test multiple NULL values are all skipped correctly
+TEST_F(PersistenceTest, MultipleBackendsWithNullIpAreSkipped) {
+    // Create corrupted database first
+    create_corrupted_db_with_multiple_nulls(test_db_path_);
+
+    // Open with our store
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Add valid backends
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.1", 8080));
+    EXPECT_TRUE(store_->save_backend(5, "192.168.1.5", 8080));
+
+    // Close and reopen
+    store_->close();
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Load backends - should only return the 2 valid ones
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 2);
+
+    // Verify valid backends are present
+    bool found_1 = false, found_5 = false;
+    for (const auto& b : backends) {
+        if (b.id == 1) found_1 = true;
+        if (b.id == 5) found_5 = true;
+    }
+    EXPECT_TRUE(found_1);
+    EXPECT_TRUE(found_5);
+
+    // Verify skipped count includes the 3 invalid records
+    EXPECT_GE(store_->last_load_skipped_count(), 3);
+}

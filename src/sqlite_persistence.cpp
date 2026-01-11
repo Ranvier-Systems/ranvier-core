@@ -4,6 +4,12 @@
 
 namespace ranvier {
 
+// Helper: safely extract text column, returns empty string for NULL
+static std::string safe_column_text(sqlite3_stmt* stmt, int col) {
+    auto ptr = sqlite3_column_text(stmt, col);
+    return ptr ? reinterpret_cast<const char*>(ptr) : "";
+}
+
 SqlitePersistence::~SqlitePersistence() {
     close();
 }
@@ -142,6 +148,8 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
     std::lock_guard<std::mutex> lock(_mutex);
 
     std::vector<BackendRecord> results;
+    size_t skipped_count = 0;
+
     if (!_db) return results;
 
     const char* sql = "SELECT id, ip, port, weight, priority FROM backends";
@@ -153,7 +161,14 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         BackendRecord record;
         record.id = sqlite3_column_int(stmt, 0);
-        record.ip = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        record.ip = safe_column_text(stmt, 1);
+
+        // Skip backends with NULL or empty IP (required field)
+        if (record.ip.empty()) {
+            skipped_count++;
+            continue;
+        }
+
         record.port = static_cast<uint16_t>(sqlite3_column_int(stmt, 2));
         record.weight = static_cast<uint32_t>(sqlite3_column_int(stmt, 3));
         record.priority = static_cast<uint32_t>(sqlite3_column_int(stmt, 4));
@@ -161,6 +176,10 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
     }
 
     sqlite3_finalize(stmt);
+
+    // Track skipped count (caller can check via last_load_skipped_count())
+    _last_load_skipped_count += skipped_count;
+
     return results;
 }
 
@@ -422,9 +441,9 @@ bool SqlitePersistence::verify_integrity() {
 
     bool is_ok = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char* result = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        std::string result = safe_column_text(stmt, 0);
         // "ok" means the database passed integrity check
-        is_ok = (result && std::strcmp(result, "ok") == 0);
+        is_ok = (result == "ok");
     }
 
     sqlite3_finalize(stmt);
