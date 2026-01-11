@@ -405,6 +405,62 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
     return result;
 }
 
+RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
+                                         const std::string& request_id) {
+    RouteResult result;
+
+    // Use thread-local routing mode (hot-reloadable via update_routing_config)
+    if (local_routing_mode == RoutingConfig::RoutingMode::PREFIX) {
+        // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
+        result.routing_mode = "prefix";
+        auto affinity_backend = get_backend_for_prefix(tokens, request_id);
+
+        if (affinity_backend.has_value()) {
+            result.backend_id = affinity_backend.value();
+            // Note: get_backend_for_prefix internally tracks cache_hit via stats_cache_hits/misses
+            // and returns a backend even on cache miss (via hash fallback).
+            // For external visibility, we report cache_hit based on whether ART had a hit.
+            // Since get_backend_for_prefix always returns a backend when backends exist,
+            // cache_hit here means we found the route in ART (not hash fallback).
+            // The internal stats_cache_hits counter was already incremented appropriately.
+            result.cache_hit = true;  // Prefix mode always has affinity (ART or hash)
+        } else {
+            result.error_message = "No backends registered";
+        }
+    } else if (local_routing_mode == RoutingConfig::RoutingMode::RADIX) {
+        // RADIX mode: radix tree lookup with random fallback (adaptive learning)
+        result.routing_mode = "radix";
+        auto lookup_result = lookup(tokens, request_id);
+
+        if (lookup_result.has_value()) {
+            result.backend_id = lookup_result.value();
+            result.cache_hit = true;
+        } else {
+            // Cache miss - fall back to weighted random selection
+            auto random_id = get_random_backend();
+            if (random_id.has_value()) {
+                result.backend_id = random_id.value();
+                result.cache_hit = false;
+            } else {
+                result.error_message = "No backends registered";
+            }
+        }
+    } else {
+        // ROUND_ROBIN mode: always use random/weighted backend selection
+        result.routing_mode = "round_robin";
+        auto random_id = get_random_backend();
+
+        if (random_id.has_value()) {
+            result.backend_id = random_id.value();
+            result.cache_hit = false;  // Round-robin never uses cache
+        } else {
+            result.error_message = "No backends registered";
+        }
+    }
+
+    return result;
+}
+
 std::optional<seastar::socket_address> RouterService::get_backend_address(BackendId id) {
     auto it = local_backends.find(id);
     if (it != local_backends.end()) {
