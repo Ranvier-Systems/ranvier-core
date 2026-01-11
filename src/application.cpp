@@ -17,6 +17,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
