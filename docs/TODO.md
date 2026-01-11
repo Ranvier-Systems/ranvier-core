@@ -680,19 +680,20 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 ## 7. Security Audit Findings (Adversarial System Audit)
 
-> **Criticality Score: 6/10 (Moderate-High Risk)**
-> Generated: 2026-01-11
+> **Criticality Score: 4/10 (Moderate Risk)** _(was 6/10 before high-severity fixes)_
+> Generated: 2026-01-11 | Updated: 2026-01-11
 > Audit Scope: `src/` directory against `docs/claude-context.md` constraints
 
 Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, Architecture Drift, and Scale & Leak.
 
 ### 7.1 Async Integrity Violations (No Locks/Async Only)
 
-- [ ] **Remove blocking mutex from `queue_depth()` in AsyncPersistenceManager**
+- [x] **Remove blocking mutex from `queue_depth()` in AsyncPersistenceManager** ✓
   _Issue:_ `std::lock_guard<std::mutex>` at `src/async_persistence.cpp:232` blocks reactor thread when called from metrics collection.
   _Fix:_ Use `std::atomic<size_t>` for queue size tracking or implement lock-free queue depth estimation.
   _Location:_ `src/async_persistence.cpp:231-234`
   _Severity:_ High
+  _Fixed:_ PR #118 - Replaced with `std::atomic<size_t>` for lock-free access
 
 - [ ] **Replace sequential awaits with parallel_for_each in K8s discovery**
   _Issue:_ Loop at `src/k8s_discovery_service.cpp:413-424` awaits each endpoint sequentially, causing O(n) latency for n endpoints.
@@ -708,11 +709,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
 
 ### 7.2 Edge-Case Crash Scenarios
 
-- [ ] **Add null check before sqlite3_column_text dereference**
+- [x] **Add null check before sqlite3_column_text dereference** ✓
   _Issue:_ `src/sqlite_persistence.cpp:156` dereferences `sqlite3_column_text()` without null check. NULL returned for SQL NULL values causes segfault.
   _Fix:_ Add null guard: `auto ptr = sqlite3_column_text(...); record.ip = ptr ? reinterpret_cast<const char*>(ptr) : "";`
   _Location:_ `src/sqlite_persistence.cpp:156`
   _Severity:_ High
+  _Fixed:_ PR #119 - Added `safe_column_text()` helper, skip records with NULL required fields
 
 - [ ] **Add port validation before stoi conversion in K8s discovery**
   _Issue:_ `src/k8s_discovery_service.cpp:243` uses `std::stoi()` without validation. Non-numeric or out-of-range values throw uncaught exceptions.
@@ -760,11 +762,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
 
 ### 7.4 Scale & Leak Vulnerabilities
 
-- [ ] **Add bounds checking to pending remote routes buffer**
+- [x] **Add bounds checking to pending remote routes buffer** ✓
   _Issue:_ `src/router_service.cpp:631-643` `_pending_remote_routes.push_back()` has no upper bound. Malicious gossip flood causes unbounded memory growth.
   _Fix:_ Add max buffer size check; drop oldest routes or reject when full.
   _Location:_ `src/router_service.cpp:631-643`
   _Severity:_ High
+  _Fixed:_ PR #120 - Added MAX_BUFFER_SIZE (10000) with batch-drop strategy and overflow metric
 
 - [ ] **Add connection pool max age reaping**
   _Issue:_ Connection pool lacks TTL for idle connections. Long-running instances accumulate stale connections.
@@ -835,6 +838,9 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-11 | **[Security Audit 7.4.1]** Add bounds checking to pending remote routes buffer (MAX_BUFFER_SIZE=10000, batch-drop, overflow metric) | #120 |
+| 2026-01-11 | **[Security Audit 7.2.1]** Add null guards for sqlite3_column_text (safe_column_text helper, skip NULL records) | #119 |
+| 2026-01-11 | **[Security Audit 7.1.1]** Replace blocking mutex with atomic in queue_depth() (std::atomic for lock-free access) | #118 |
 | 2026-01-11 | Optimize StreamParser with read-position tracking (zero-copy parsing, buffer compaction, size limits) | - |
 | 2026-01-11 | Add validated factory functions for CrossShardRequestContext (size limits, memory estimation) | - |
 | 2026-01-10 | Create rvctl CLI tool for Ranvier management (inspect routes/backends, cluster status, drain, route add) | #110 |
