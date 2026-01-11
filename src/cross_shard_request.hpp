@@ -8,6 +8,12 @@
 // - Request body uses seastar::temporary_buffer for true zero-copy from NIC
 // - Headers are extracted on-demand using string_view (no map copy)
 // - Reply object stays on originating shard; results stream back via futures
+// - No locks: Each context is owned by exactly one shard at a time
+//
+// Memory safety:
+// - Move-only semantics prevent accidental copies
+// - Buffer size limits prevent memory exhaustion
+// - Validation helpers check invariants
 
 #pragma once
 
@@ -15,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <optional>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -24,6 +31,21 @@
 #include <seastar/http/reply.hh>
 
 namespace ranvier {
+
+// Configuration limits for request context
+struct CrossShardRequestLimits {
+    // Maximum request body size (prevents OOM on malicious large requests)
+    static constexpr size_t max_body_size = 128 * 1024 * 1024;  // 128 MB
+
+    // Maximum number of client-provided tokens
+    static constexpr size_t max_client_tokens = 128 * 1024;  // 128K tokens
+
+    // Maximum length for string fields (request_id, client_ip, etc.)
+    static constexpr size_t max_string_field_length = 4096;
+
+    // Maximum URL path length
+    static constexpr size_t max_path_length = 8192;
+};
 
 // Lightweight request context that can be efficiently moved between shards
 // Contains only the data needed for tokenization and routing
@@ -75,6 +97,29 @@ struct CrossShardRequestContext {
     // Check if body is empty
     bool body_empty() const noexcept {
         return body.empty();
+    }
+
+    // Validate the context's internal state
+    // Returns true if all fields are within acceptable limits
+    bool is_valid() const noexcept {
+        if (body.size() > CrossShardRequestLimits::max_body_size) return false;
+        if (request_id.size() > CrossShardRequestLimits::max_string_field_length) return false;
+        if (client_ip.size() > CrossShardRequestLimits::max_string_field_length) return false;
+        if (traceparent.size() > CrossShardRequestLimits::max_string_field_length) return false;
+        if (path.size() > CrossShardRequestLimits::max_path_length) return false;
+        if (client_tokens.size() > CrossShardRequestLimits::max_client_tokens) return false;
+        return true;
+    }
+
+    // Get estimated memory footprint for this context (useful for backpressure)
+    size_t estimated_memory_usage() const noexcept {
+        return body.size() +
+               request_id.capacity() +
+               client_ip.capacity() +
+               traceparent.capacity() +
+               method.capacity() +
+               path.capacity() +
+               (client_tokens.capacity() * sizeof(int32_t));
     }
 
     // Create from Seastar HTTP request
@@ -136,6 +181,109 @@ struct CrossShardRequestContext {
         return ctx;
     }
 };
+
+// Result of creating a CrossShardRequestContext with validation
+// Used by the try_create_* factory functions
+struct CrossShardRequestCreateResult {
+    std::optional<CrossShardRequestContext> context;
+    bool success = false;
+    std::string error;
+
+    static CrossShardRequestCreateResult ok(CrossShardRequestContext ctx) {
+        CrossShardRequestCreateResult r;
+        r.context = std::move(ctx);
+        r.success = true;
+        return r;
+    }
+
+    static CrossShardRequestCreateResult fail(std::string msg) {
+        CrossShardRequestCreateResult r;
+        r.error = std::move(msg);
+        return r;
+    }
+};
+
+// Validated factory functions for CrossShardRequestContext
+// These perform size limit checks before allocation
+namespace cross_shard {
+
+// Create from Seastar HTTP request with validation
+// Returns: Result with context if valid, or error message if validation fails
+inline CrossShardRequestCreateResult try_create_from_request(
+    seastar::http::request& req,
+    const std::string& request_id,
+    const std::string& client_ip,
+    const std::string& traceparent = "") {
+
+    // Validate body size before copying
+    if (req.content.size() > CrossShardRequestLimits::max_body_size) {
+        return CrossShardRequestCreateResult::fail("Request body exceeds maximum size");
+    }
+
+    // Validate string field lengths
+    if (request_id.size() > CrossShardRequestLimits::max_string_field_length) {
+        return CrossShardRequestCreateResult::fail("Request ID exceeds maximum length");
+    }
+    if (client_ip.size() > CrossShardRequestLimits::max_string_field_length) {
+        return CrossShardRequestCreateResult::fail("Client IP exceeds maximum length");
+    }
+    if (req._url.size() > CrossShardRequestLimits::max_path_length) {
+        return CrossShardRequestCreateResult::fail("URL path exceeds maximum length");
+    }
+
+    return CrossShardRequestCreateResult::ok(
+        CrossShardRequestContext::from_request(req, request_id, client_ip, traceparent));
+}
+
+// Create from temporary_buffer with validation (true zero-copy path)
+inline CrossShardRequestCreateResult try_create_from_buffer(
+    seastar::temporary_buffer<char> body_buf,
+    const std::string& request_id,
+    const std::string& client_ip,
+    std::string method,
+    std::string path,
+    const std::string& traceparent = "") {
+
+    // Validate sizes before storing
+    if (body_buf.size() > CrossShardRequestLimits::max_body_size) {
+        return CrossShardRequestCreateResult::fail("Request body exceeds maximum size");
+    }
+    if (request_id.size() > CrossShardRequestLimits::max_string_field_length) {
+        return CrossShardRequestCreateResult::fail("Request ID exceeds maximum length");
+    }
+    if (path.size() > CrossShardRequestLimits::max_path_length) {
+        return CrossShardRequestCreateResult::fail("URL path exceeds maximum length");
+    }
+
+    return CrossShardRequestCreateResult::ok(
+        CrossShardRequestContext::from_buffer(std::move(body_buf), request_id, client_ip,
+                                              std::move(method), std::move(path), traceparent));
+}
+
+// Create with pre-tokenized tokens (validated)
+inline CrossShardRequestCreateResult try_create_with_tokens(
+    seastar::http::request& req,
+    const std::string& request_id,
+    const std::string& client_ip,
+    std::vector<int32_t> tokens,
+    const std::string& traceparent = "") {
+
+    // Validate token count
+    if (tokens.size() > CrossShardRequestLimits::max_client_tokens) {
+        return CrossShardRequestCreateResult::fail("Token count exceeds maximum");
+    }
+
+    auto result = try_create_from_request(req, request_id, client_ip, traceparent);
+    if (!result.success) {
+        return result;
+    }
+
+    result.context->client_tokens = std::move(tokens);
+    result.context->has_client_tokens = true;
+    return result;
+}
+
+}  // namespace cross_shard
 
 // Result of cross-shard request processing
 // Returned from the target shard to the originating shard
