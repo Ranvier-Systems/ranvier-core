@@ -680,7 +680,7 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 ## 7. Security Audit Findings (Adversarial System Audit)
 
-> **Criticality Score: 3/10 (Low-Moderate Risk)** _(was 6/10 → 4/10 → 3/10)_
+> **Criticality Score: 2/10 (Low Risk)** _(was 6/10 → 4/10 → 3/10 → 2/10)_
 > Generated: 2026-01-11 | Updated: 2026-01-11
 > Audit Scope: `src/` directory against `docs/claude-context.md` constraints
 
@@ -725,11 +725,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Severity:_ Medium
   _Fixed:_ PR #124 - Added `parse_port()` helper with validation (1-65535 range), 22 unit tests
 
-- [ ] **Handle DNS resolution exceptions in K8s discovery**
+- [x] **Handle DNS resolution exceptions in K8s discovery** ✓
   _Issue:_ DNS resolution at `src/k8s_discovery_service.cpp:276-279` can throw unhandled exceptions on network failure.
   _Fix:_ Wrap DNS calls in try-catch with appropriate error handling and logging.
   _Location:_ `src/k8s_discovery_service.cpp:276-279`
   _Severity:_ Medium
+  _Fixed:_ PR #126 - Async DNS resolver with retry, exponential backoff, caching, and graceful degradation
 
 - [ ] **Fix silent exception swallowing in annotation parsing**
   _Issue:_ `src/k8s_discovery_service.cpp:682-686` catches all exceptions silently, masking configuration errors.
@@ -737,11 +738,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Location:_ `src/k8s_discovery_service.cpp:682-686`
   _Severity:_ Low
 
-- [ ] **Eliminate global static state race in tracing service**
+- [x] **Eliminate global static state race in tracing service** ✓
   _Issue:_ `src/tracing_service.cpp:40-44` uses global statics (`g_tracer`, `g_provider`, `g_enabled`) without synchronization. Concurrent init/shutdown causes data races.
   _Fix:_ Use `std::call_once` for initialization or move to per-shard thread_local storage.
   _Location:_ `src/tracing_service.cpp:40-44`
   _Severity:_ Medium
+  _Fixed:_ PR #127 - std::call_once for init, std::atomic for enabled flag, shutdown guard
 
 ### 7.3 Architecture Drift
 
@@ -751,11 +753,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Location:_ `src/sqlite_persistence.cpp:173-196`
   _Severity:_ Low
 
-- [ ] **Move routing mode decisions from HttpController to RouterService**
+- [x] **Move routing mode decisions from HttpController to RouterService** ✓
   _Issue:_ `src/http_controller.cpp:506-566` contains routing logic (mode selection, backend choice) that should be in RouterService.
   _Fix:_ Create RouterService API for routing decisions; HttpController should only coordinate.
   _Location:_ `src/http_controller.cpp:506-566`
   _Severity:_ Medium
+  _Fixed:_ PR #128 - RouteResult struct, unified route_request() API, single error path
 
 - [ ] **Encapsulate thread_local variables into ShardLocalState struct**
   _Issue:_ `src/router_service.cpp:46-79` scatters 18+ thread_local variables at file scope, making state management fragile.
@@ -841,6 +844,9 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-11 | **[Security Audit 7.3.2]** Move routing mode decisions to RouterService (RouteResult struct, unified API) | #128 |
+| 2026-01-11 | **[Security Audit 7.2.5]** Eliminate tracing service global static race (call_once, atomic, shutdown guard) | #127 |
+| 2026-01-11 | **[Security Audit 7.2.3]** Handle DNS resolution exceptions in K8s discovery (async resolver, retry, caching) | #126 |
 | 2026-01-11 | **[Security Audit 7.2.2]** Add port validation in K8s discovery (parse_port helper, 22 unit tests) | #124 |
 | 2026-01-11 | **[Security Audit 7.1.3]** Audit SQLite mutex threading model (documentation, friend declarations, private constructor) | #123 |
 | 2026-01-11 | **[Security Audit 7.1.2]** Parallelize K8s endpoint reconciliation (max_concurrent_for_each, 16-op limit) | #122 |
