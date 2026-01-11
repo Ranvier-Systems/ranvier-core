@@ -16,6 +16,7 @@ This document identifies missing features and optimizations required to promote 
 4. [Infrastructure & Security](#4-infrastructure--security)
 5. [Developer Experience](#5-developer-experience)
 6. [Integration Tests (End-to-End Validation)](#6-integration-tests-end-to-end-validation)
+7. [Security Audit Findings](#7-security-audit-findings-adversarial-system-audit)
 
 ---
 
@@ -674,6 +675,120 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 | `Makefile` | Modify | Add test targets |
 
 **Total: 13 files (9 new, 4 modified)**
+
+---
+
+## 7. Security Audit Findings (Adversarial System Audit)
+
+> **Criticality Score: 6/10 (Moderate-High Risk)**
+> Generated: 2026-01-11
+> Audit Scope: `src/` directory against `docs/claude-context.md` constraints
+
+Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, Architecture Drift, and Scale & Leak.
+
+### 7.1 Async Integrity Violations (No Locks/Async Only)
+
+- [ ] **Remove blocking mutex from `queue_depth()` in AsyncPersistenceManager**
+  _Issue:_ `std::lock_guard<std::mutex>` at `src/async_persistence.cpp:232` blocks reactor thread when called from metrics collection.
+  _Fix:_ Use `std::atomic<size_t>` for queue size tracking or implement lock-free queue depth estimation.
+  _Location:_ `src/async_persistence.cpp:231-234`
+  _Severity:_ High
+
+- [ ] **Replace sequential awaits with parallel_for_each in K8s discovery**
+  _Issue:_ Loop at `src/k8s_discovery_service.cpp:413-424` awaits each endpoint sequentially, causing O(n) latency for n endpoints.
+  _Fix:_ Use `seastar::parallel_for_each` or `seastar::do_for_each` with batching.
+  _Location:_ `src/k8s_discovery_service.cpp:413-424`
+  _Severity:_ Medium
+
+- [ ] **Audit 16+ mutex usages in SQLite persistence layer**
+  _Issue:_ `src/sqlite_persistence.cpp` contains 16+ `std::lock_guard<std::mutex>` calls. While these run in `seastar::async`, any path that bypasses async wrapper blocks reactor.
+  _Fix:_ Ensure all SQLite access is routed through AsyncPersistenceManager; add static analysis to prevent direct access.
+  _Location:_ `src/sqlite_persistence.cpp` (multiple locations)
+  _Severity:_ Medium
+
+### 7.2 Edge-Case Crash Scenarios
+
+- [ ] **Add null check before sqlite3_column_text dereference**
+  _Issue:_ `src/sqlite_persistence.cpp:156` dereferences `sqlite3_column_text()` without null check. NULL returned for SQL NULL values causes segfault.
+  _Fix:_ Add null guard: `auto ptr = sqlite3_column_text(...); record.ip = ptr ? reinterpret_cast<const char*>(ptr) : "";`
+  _Location:_ `src/sqlite_persistence.cpp:156`
+  _Severity:_ High
+
+- [ ] **Add port validation before stoi conversion in K8s discovery**
+  _Issue:_ `src/k8s_discovery_service.cpp:243` uses `std::stoi()` without validation. Non-numeric or out-of-range values throw uncaught exceptions.
+  _Fix:_ Add try-catch or use `std::from_chars` with validation before `static_cast<uint16_t>`.
+  _Location:_ `src/k8s_discovery_service.cpp:243`
+  _Severity:_ Medium
+
+- [ ] **Handle DNS resolution exceptions in K8s discovery**
+  _Issue:_ DNS resolution at `src/k8s_discovery_service.cpp:276-279` can throw unhandled exceptions on network failure.
+  _Fix:_ Wrap DNS calls in try-catch with appropriate error handling and logging.
+  _Location:_ `src/k8s_discovery_service.cpp:276-279`
+  _Severity:_ Medium
+
+- [ ] **Fix silent exception swallowing in annotation parsing**
+  _Issue:_ `src/k8s_discovery_service.cpp:682-686` catches all exceptions silently, masking configuration errors.
+  _Fix:_ Log caught exceptions at warn level; consider propagating critical parsing failures.
+  _Location:_ `src/k8s_discovery_service.cpp:682-686`
+  _Severity:_ Low
+
+- [ ] **Eliminate global static state race in tracing service**
+  _Issue:_ `src/tracing_service.cpp:40-44` uses global statics (`g_tracer`, `g_provider`, `g_enabled`) without synchronization. Concurrent init/shutdown causes data races.
+  _Fix:_ Use `std::call_once` for initialization or move to per-shard thread_local storage.
+  _Location:_ `src/tracing_service.cpp:40-44`
+  _Severity:_ Medium
+
+### 7.3 Architecture Drift
+
+- [ ] **Move token count limits from persistence layer to business layer**
+  _Issue:_ `src/sqlite_persistence.cpp:173-196` contains business logic (token count limits) that belongs in RouterService.
+  _Fix:_ Extract validation to RouterService; persistence layer should only handle storage.
+  _Location:_ `src/sqlite_persistence.cpp:173-196`
+  _Severity:_ Low
+
+- [ ] **Move routing mode decisions from HttpController to RouterService**
+  _Issue:_ `src/http_controller.cpp:506-566` contains routing logic (mode selection, backend choice) that should be in RouterService.
+  _Fix:_ Create RouterService API for routing decisions; HttpController should only coordinate.
+  _Location:_ `src/http_controller.cpp:506-566`
+  _Severity:_ Medium
+
+- [ ] **Encapsulate thread_local variables into ShardLocalState struct**
+  _Issue:_ `src/router_service.cpp:46-79` scatters 18+ thread_local variables at file scope, making state management fragile.
+  _Fix:_ Consolidate into single `ShardLocalState` struct with clear lifecycle management.
+  _Location:_ `src/router_service.cpp:46-79`
+  _Severity:_ Low
+
+### 7.4 Scale & Leak Vulnerabilities
+
+- [ ] **Add bounds checking to pending remote routes buffer**
+  _Issue:_ `src/router_service.cpp:631-643` `_pending_remote_routes.push_back()` has no upper bound. Malicious gossip flood causes unbounded memory growth.
+  _Fix:_ Add max buffer size check; drop oldest routes or reject when full.
+  _Location:_ `src/router_service.cpp:631-643`
+  _Severity:_ High
+
+- [ ] **Add connection pool max age reaping**
+  _Issue:_ Connection pool lacks TTL for idle connections. Long-running instances accumulate stale connections.
+  _Fix:_ Add configurable `max_connection_age` with periodic reaping.
+  _Location:_ `src/connection_pool.hpp`
+  _Severity:_ Medium
+
+- [ ] **Add RAII guards for timer callbacks**
+  _Issue:_ Timer callbacks in `src/async_persistence.cpp` and `src/gossip_service.cpp` capture `this` without ensuring object lifetime.
+  _Fix:_ Use weak_ptr or explicit cancellation in destructor; verify all timers cancelled before object destruction.
+  _Location:_ `src/async_persistence.cpp:106-112`, `src/gossip_service.cpp`
+  _Severity:_ Medium
+
+- [ ] **Add lifetime guards for metrics lambda captures**
+  _Issue:_ `src/router_service.cpp:227-228` metrics lambdas capture `this` without lifetime protection. Metrics collection after service shutdown causes use-after-free.
+  _Fix:_ Use weak_ptr capture or ensure metrics deregistration in destructor.
+  _Location:_ `src/router_service.cpp:227-228`
+  _Severity:_ Medium
+
+- [ ] **Add upper bound to StreamParser accumulator**
+  _Issue:_ `src/stream_parser.cpp:26` accumulator can grow to ~1MB per connection before detection. Slowloris-style attack exhausts memory.
+  _Fix:_ Add incremental size checking; reject early when approaching limit.
+  _Location:_ `src/stream_parser.cpp:26`
+  _Severity:_ Medium
 
 ---
 
