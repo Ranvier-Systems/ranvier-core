@@ -5,7 +5,9 @@
 #include "k8s_discovery_service.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <sstream>
 
@@ -28,6 +30,39 @@ namespace ranvier {
 
 // Maximum concurrent endpoint operations to prevent overwhelming backends
 constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
+
+// Parse a port string and validate it's in the valid range (1-65535).
+// Returns std::nullopt for invalid input (empty, non-numeric, out of range).
+static std::optional<uint16_t> parse_port(const std::string& port_str) {
+    if (port_str.empty()) {
+        return std::nullopt;
+    }
+
+    // Reject strings with leading/trailing whitespace or non-digit characters
+    for (size_t i = 0; i < port_str.size(); ++i) {
+        char c = port_str[i];
+        // Allow leading minus for negative number detection
+        if (i == 0 && c == '-') {
+            // Negative numbers are invalid ports, but let stoi parse to give clear error
+            continue;
+        }
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return std::nullopt;
+        }
+    }
+
+    try {
+        int port_int = std::stoi(port_str);
+        if (port_int < 1 || port_int > 65535) {
+            return std::nullopt;
+        }
+        return static_cast<uint16_t>(port_int);
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    } catch (const std::out_of_range&) {
+        return std::nullopt;
+    }
+}
 
 // Generate a stable BackendId from endpoint UID
 BackendId K8sEndpoint::to_backend_id() const {
@@ -244,7 +279,12 @@ std::pair<std::string, uint16_t> K8sDiscoveryService::parse_api_server() const {
         if (slash_pos != std::string::npos) {
             port_str = port_str.substr(0, slash_pos - colon_pos - 1);
         }
-        port = static_cast<uint16_t>(std::stoi(port_str));
+        auto parsed_port = parse_port(port_str);
+        if (!parsed_port) {
+            log_k8s.error("Invalid port in API server URL: '{}' (must be 1-65535)", port_str);
+            throw std::invalid_argument("Invalid port number in K8s API server URL: " + port_str);
+        }
+        port = *parsed_port;
     } else {
         // No port specified, use default
         if (slash_pos != std::string::npos) {

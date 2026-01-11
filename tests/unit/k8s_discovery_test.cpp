@@ -4,6 +4,7 @@
 // These tests don't require Seastar runtime or actual K8s API access.
 
 #include <gtest/gtest.h>
+#include <cctype>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -766,6 +767,183 @@ TEST_F(K8sRealWorldTest, ParseTypicalGpuServiceEndpointSlice) {
     // Third endpoint (terminating)
     EXPECT_EQ(endpoints[2].address, "10.244.3.25");
     EXPECT_FALSE(endpoints[2].ready);
+}
+
+// =============================================================================
+// Port Validation Tests
+// =============================================================================
+
+// Replicate the parse_port function from k8s_discovery_service.cpp for testing
+// (avoids Seastar dependency while testing the same logic)
+namespace port_validation {
+
+static std::optional<uint16_t> parse_port(const std::string& port_str) {
+    if (port_str.empty()) {
+        return std::nullopt;
+    }
+
+    // Reject strings with leading/trailing whitespace or non-digit characters
+    for (size_t i = 0; i < port_str.size(); ++i) {
+        char c = port_str[i];
+        // Allow leading minus for negative number detection
+        if (i == 0 && c == '-') {
+            continue;
+        }
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+            return std::nullopt;
+        }
+    }
+
+    try {
+        int port_int = std::stoi(port_str);
+        if (port_int < 1 || port_int > 65535) {
+            return std::nullopt;
+        }
+        return static_cast<uint16_t>(port_int);
+    } catch (const std::invalid_argument&) {
+        return std::nullopt;
+    } catch (const std::out_of_range&) {
+        return std::nullopt;
+    }
+}
+
+}  // namespace port_validation
+
+class PortValidationTest : public ::testing::Test {};
+
+// Valid port cases
+TEST_F(PortValidationTest, ValidPortMinimum) {
+    auto result = port_validation::parse_port("1");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1);
+}
+
+TEST_F(PortValidationTest, ValidPortMaximum) {
+    auto result = port_validation::parse_port("65535");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 65535);
+}
+
+TEST_F(PortValidationTest, ValidPortTypical) {
+    auto result = port_validation::parse_port("8080");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 8080);
+}
+
+TEST_F(PortValidationTest, ValidPortHttps) {
+    auto result = port_validation::parse_port("443");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 443);
+}
+
+TEST_F(PortValidationTest, ValidPortKubernetesApi) {
+    auto result = port_validation::parse_port("6443");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 6443);
+}
+
+// Invalid port cases - empty string
+TEST_F(PortValidationTest, InvalidPortEmpty) {
+    auto result = port_validation::parse_port("");
+    EXPECT_FALSE(result.has_value());
+}
+
+// Invalid port cases - non-numeric
+TEST_F(PortValidationTest, InvalidPortAlphabetic) {
+    auto result = port_validation::parse_port("abc");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortMixedAlphanumeric) {
+    auto result = port_validation::parse_port("80a80");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortLeadingAlpha) {
+    auto result = port_validation::parse_port("a8080");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortTrailingAlpha) {
+    auto result = port_validation::parse_port("8080a");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortSpecialChars) {
+    auto result = port_validation::parse_port("80:80");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortWhitespace) {
+    auto result = port_validation::parse_port(" 8080");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortTrailingWhitespace) {
+    auto result = port_validation::parse_port("8080 ");
+    EXPECT_FALSE(result.has_value());
+}
+
+// Invalid port cases - out of range
+TEST_F(PortValidationTest, InvalidPortZero) {
+    auto result = port_validation::parse_port("0");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortNegative) {
+    auto result = port_validation::parse_port("-1");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortNegativeLarge) {
+    auto result = port_validation::parse_port("-8080");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortTooLarge) {
+    auto result = port_validation::parse_port("65536");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortOverflow) {
+    // This would cause uint16_t wrap-around if not validated
+    auto result = port_validation::parse_port("70000");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortMassiveOverflow) {
+    // Exceeds int range - should not throw, just return nullopt
+    auto result = port_validation::parse_port("999999999999");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortIntMaxOverflow) {
+    // Exceeds INT_MAX
+    auto result = port_validation::parse_port("2147483648");
+    EXPECT_FALSE(result.has_value());
+}
+
+// Edge cases
+TEST_F(PortValidationTest, ValidPortLeadingZeros) {
+    // "0443" should be parsed as 443 (octal not expected, stoi uses base 10)
+    auto result = port_validation::parse_port("0443");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 443);
+}
+
+TEST_F(PortValidationTest, InvalidPortOnlyZeros) {
+    auto result = port_validation::parse_port("0000");
+    EXPECT_FALSE(result.has_value());  // 0 is not a valid port
+}
+
+TEST_F(PortValidationTest, InvalidPortFloat) {
+    auto result = port_validation::parse_port("8080.5");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(PortValidationTest, InvalidPortHex) {
+    auto result = port_validation::parse_port("0x1F90");
+    EXPECT_FALSE(result.has_value());
 }
 
 int main(int argc, char** argv) {
