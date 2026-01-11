@@ -680,8 +680,8 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 ## 7. Security Audit Findings (Adversarial System Audit)
 
-> **Criticality Score: 1/10 (Minimal Risk)** _(was 6/10 → 4/10 → 3/10 → 2/10 → 1/10)_
-> Generated: 2026-01-11 | Updated: 2026-01-11
+> **Criticality Score: 0/10 (All Issues Resolved)** ✅ _(was 6/10 → 4/10 → 3/10 → 2/10 → 1/10 → 0/10)_
+> Generated: 2026-01-11 | Completed: 2026-01-11
 > Audit Scope: `src/` directory against `docs/claude-context.md` constraints
 
 Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, Architecture Drift, and Scale & Leak.
@@ -732,11 +732,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Severity:_ Medium
   _Fixed:_ PR #126 - Async DNS resolver with retry, exponential backoff, caching, and graceful degradation
 
-- [ ] **Fix silent exception swallowing in annotation parsing**
+- [x] **Fix silent exception swallowing in annotation parsing** ✓
   _Issue:_ `src/k8s_discovery_service.cpp:682-686` catches all exceptions silently, masking configuration errors.
   _Fix:_ Log caught exceptions at warn level; consider propagating critical parsing failures.
   _Location:_ `src/k8s_discovery_service.cpp:682-686`
   _Severity:_ Low
+  _Fixed:_ PR #135 - Log warnings with annotation name/value, add max constants, clamp out-of-range values
 
 - [x] **Eliminate global static state race in tracing service** ✓
   _Issue:_ `src/tracing_service.cpp:40-44` uses global statics (`g_tracer`, `g_provider`, `g_enabled`) without synchronization. Concurrent init/shutdown causes data races.
@@ -747,11 +748,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
 
 ### 7.3 Architecture Drift
 
-- [ ] **Move token count limits from persistence layer to business layer**
+- [x] **Move token count limits from persistence layer to business layer** ✓
   _Issue:_ `src/sqlite_persistence.cpp:173-196` contains business logic (token count limits) that belongs in RouterService.
   _Fix:_ Extract validation to RouterService; persistence layer should only handle storage.
   _Location:_ `src/sqlite_persistence.cpp:173-196`
   _Severity:_ Low
+  _Fixed:_ PR #137 - Added max_route_tokens config, validate in learn_route_global/remote, persistence only stores
 
 - [x] **Move routing mode decisions from HttpController to RouterService** ✓
   _Issue:_ `src/http_controller.cpp:506-566` contains routing logic (mode selection, backend choice) that should be in RouterService.
@@ -760,11 +762,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Severity:_ Medium
   _Fixed:_ PR #128 - RouteResult struct, unified route_request() API, single error path
 
-- [ ] **Encapsulate thread_local variables into ShardLocalState struct**
+- [x] **Encapsulate thread_local variables into ShardLocalState struct** ✓
   _Issue:_ `src/router_service.cpp:46-79` scatters 18+ thread_local variables at file scope, making state management fragile.
   _Fix:_ Consolidate into single `ShardLocalState` struct with clear lifecycle management.
   _Location:_ `src/router_service.cpp:46-79`
   _Severity:_ Low
+  _Fixed:_ PR #136 - Unified ShardLocalState with Stats/Config structs, init/reset lifecycle, reset_for_testing()
 
 ### 7.4 Scale & Leak Vulnerabilities
 
@@ -848,6 +851,9 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-11 | **[Security Audit 7.3.1]** Move token count limits to business layer (max_route_tokens config) | #137 |
+| 2026-01-11 | **[Security Audit 7.3.3]** Encapsulate thread_local into ShardLocalState (unified lifecycle, reset_for_testing) | #136 |
+| 2026-01-11 | **[Security Audit 7.2.4]** Fix silent exception swallowing in annotation parsing (log warnings, clamp values) | #135 |
 | 2026-01-11 | **[Security Audit 7.4.5]** Add upper bound to StreamParser accumulator (1MB limit, early rejection) | #133 |
 | 2026-01-11 | **[Security Audit 7.4.4]** Add lifecycle guards for RouterService metrics lambdas (stop() clears metrics first) | #132 |
 | 2026-01-11 | **[Security Audit 7.4.3]** Add RAII guards for timer callbacks (_timer_gate in AsyncPersistence/GossipService) | #131 |
