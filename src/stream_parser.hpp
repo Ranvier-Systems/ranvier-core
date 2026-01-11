@@ -30,6 +30,15 @@ struct StreamParserConfig {
     // Maximum single chunk size (vLLM typically sends small SSE chunks)
     static constexpr size_t max_chunk_size = 1024 * 1024;  // 1 MB
 
+    // Maximum total accumulator size before rejecting (prevents Slowloris-style attacks)
+    // This is the hard upper limit checked BEFORE appending new data.
+    // 1000 concurrent connections at max size = 1GB memory consumption.
+    static constexpr size_t max_accumulator_size = 1024 * 1024;  // 1 MB
+
+    // Threshold for early warning when accumulator is approaching limit (90% of max)
+    // Log debug message when first crossing this threshold to aid in monitoring
+    static constexpr size_t early_warning_threshold = (max_accumulator_size * 9) / 10;  // 921.6 KB
+
     // Initial output buffer reservation (typical SSE event size)
     static constexpr size_t initial_output_reserve = 4096;
 

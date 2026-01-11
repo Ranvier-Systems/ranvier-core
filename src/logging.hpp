@@ -110,4 +110,7 @@ inline seastar::logger log_control("ranvier.control");
 // Connection pool
 inline seastar::logger log_pool("ranvier.pool");
 
+// Stream parser (for security/size limit logging)
+inline seastar::logger log_parser("ranvier.parser");
+
 } // namespace ranvier

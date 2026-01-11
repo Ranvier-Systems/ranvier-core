@@ -174,6 +174,9 @@ public:
             seastar::metrics::make_counter("http_requests_backpressure_rejected", _requests_backpressure,
                 seastar::metrics::description("Total number of requests rejected due to backpressure (concurrency or persistence)")),
 
+            seastar::metrics::make_counter("stream_parser_size_limit_rejections", _stream_parser_size_rejections,
+                seastar::metrics::description("Total number of connections rejected due to stream parser accumulator size limit (Slowloris defense)")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -280,6 +283,9 @@ public:
     // Record backpressure rejections (503 due to concurrency or persistence limits)
     void record_backpressure_rejection() { _requests_backpressure++; }
 
+    // Record stream parser size limit rejections (Slowloris defense)
+    void record_stream_parser_size_rejection() { _stream_parser_size_rejections++; }
+
     // Active request tracking
     void increment_active_requests() { _active_requests++; }
     void decrement_active_requests() { _active_requests--; }
@@ -355,6 +361,7 @@ private:
     uint64_t _requests_backpressure = 0;
     uint64_t _circuit_opens = 0;
     uint64_t _fallback_attempts = 0;
+    uint64_t _stream_parser_size_rejections = 0;
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance
