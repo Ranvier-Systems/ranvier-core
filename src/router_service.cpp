@@ -86,6 +86,7 @@ struct ShardLocalState {
     // ========================================================================
     struct Config {
         size_t max_routes = 100000;
+        size_t max_route_tokens = 8192;  // Business-level limit on tokens per route
         std::chrono::seconds ttl_seconds{3600};
         std::chrono::seconds backend_drain_timeout{60};
         RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::RADIX;
@@ -112,6 +113,7 @@ struct ShardLocalState {
 
         // Copy configuration for lock-free access
         config.max_routes = cfg.max_routes;
+        config.max_route_tokens = cfg.max_route_tokens;
         config.ttl_seconds = cfg.ttl_seconds;
         config.backend_drain_timeout = cfg.backend_drain_timeout;
         config.routing_mode = cfg.routing_mode;
@@ -127,6 +129,7 @@ struct ShardLocalState {
     // Update configuration on hot-reload (called from update_routing_config)
     void update_config(const RoutingConfig& cfg) {
         config.max_routes = cfg.max_routes;
+        config.max_route_tokens = cfg.max_route_tokens;
         config.ttl_seconds = cfg.ttl_seconds;
         config.backend_drain_timeout = cfg.backend_drain_timeout;
         config.routing_mode = cfg.routing_mode;
@@ -792,6 +795,19 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
         tokens.resize(prefix_len);
     }
 
+    // ========================================================================
+    // Business-Layer Token Count Validation
+    // ========================================================================
+    // Validate token count AFTER truncation to enforce business-level limits.
+    // This check belongs in RouterService (business layer), not persistence.
+    // The persistence layer only handles serialization and storage.
+    if (_config.max_route_tokens > 0 && tokens.size() > _config.max_route_tokens) {
+        log_router.warn("Route rejected: {} tokens exceeds limit {} (backend={}, request={})",
+                        tokens.size(), _config.max_route_tokens, backend,
+                        request_id.empty() ? "N/A" : request_id);
+        return seastar::make_ready_future<>();
+    }
+
     // Log route learning with request_id on shard 0 before broadcasting
     if (!request_id.empty()) {
         log_router.info("[{}] Learning route: {} tokens (prefix) -> backend {}",
@@ -847,6 +863,17 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
 // This reduces cross-core message traffic from O(routes × shards) to O(batches × shards).
 
 seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
+    // ========================================================================
+    // Business-Layer Token Count Validation (Remote Routes)
+    // ========================================================================
+    // Validate remote routes before buffering. Remote peers should also enforce
+    // this limit, but we validate defensively to reject malformed gossip messages.
+    if (_config.max_route_tokens > 0 && tokens.size() > _config.max_route_tokens) {
+        log_router.warn("Remote route rejected: {} tokens exceeds limit {} (backend={})",
+                        tokens.size(), _config.max_route_tokens, backend);
+        return seastar::make_ready_future<>();
+    }
+
     log_router.debug("Buffering remote route: {} tokens -> backend {}", tokens.size(), backend);
 
     // Enforce hard buffer limit to prevent OOM from gossip flooding

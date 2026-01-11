@@ -59,6 +59,7 @@ struct RoutingConfig {
     uint32_t backend_retry_limit = 5;  // Max attempts to find a live backend
     uint32_t block_alignment = 16;  // vLLM PagedAttention block size for route alignment
     size_t max_routes = 100000;  // Maximum number of routes in the prefix cache (0 = unlimited)
+    size_t max_route_tokens = 8192;  // Maximum tokens per route (business-level limit, 0 = unlimited)
     std::chrono::seconds ttl_seconds{3600};  // TTL for cached routes (1 hour default)
     std::chrono::seconds backend_drain_timeout{60};  // Time to wait before fully removing a draining backend
     bool enable_token_forwarding = false;  // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
@@ -469,6 +470,9 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_MAX_ROUTES")) {
         routing.max_routes = *v;
     }
+    if (auto v = get_env_as<size_t>("RANVIER_MAX_ROUTE_TOKENS")) {
+        routing.max_route_tokens = *v;
+    }
     if (auto v = get_env_as<int>("RANVIER_ROUTE_TTL_SECONDS")) {
         routing.ttl_seconds = std::chrono::seconds(*v);
     }
@@ -860,6 +864,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["max_routes"]) {
                 config.routing.max_routes = r["max_routes"].as<size_t>();
+            }
+            if (r["max_route_tokens"]) {
+                config.routing.max_route_tokens = r["max_route_tokens"].as<size_t>();
             }
             if (r["ttl_seconds"]) {
                 config.routing.ttl_seconds = std::chrono::seconds(r["ttl_seconds"].as<int>());
