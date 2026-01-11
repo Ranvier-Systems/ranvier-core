@@ -7,4 +7,4 @@ Context: We have recently completed <LIST_LAST_3_TASKS>.
 TASK:
 - Review the current file tree and context for "Architecture Drift."
 - Are we maintaining the "No Locks/Async Only" rule across these new changes?
-- Identify 1-2 technical debt items to add to the TODO list.
+- Identify 1-2 technical debt items to add to the docs/TODO.md list.
