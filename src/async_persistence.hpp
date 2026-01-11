@@ -222,6 +222,7 @@ private:
     // Queue (protected by mutex for cross-shard access)
     mutable std::mutex _queue_mutex;
     std::deque<PersistenceOp> _queue;
+    std::atomic<size_t> _queue_size{0};  // Lock-free queue depth for metrics
 
     // Timers
     seastar::timer<> _flush_timer;
