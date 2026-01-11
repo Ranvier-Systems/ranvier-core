@@ -50,6 +50,20 @@ struct RouteBatchConfig {
 // Forward declaration
 class GossipService;
 
+// ============================================================================
+// Unified Route Result
+// ============================================================================
+// Encapsulates all routing decisions in a single return type.
+// This enables HttpController to make one call and handle one error path,
+// moving routing mode logic into RouterService where it belongs.
+
+struct RouteResult {
+    std::optional<BackendId> backend_id;  // Selected backend (nullopt if routing failed)
+    std::string routing_mode;             // "prefix", "radix", or "round_robin"
+    bool cache_hit = false;               // True if route was found in cache (ART or prefix affinity)
+    std::string error_message;            // Non-empty if backend_id is nullopt
+};
+
 class RouterService {
 public:
     RouterService();
@@ -66,7 +80,15 @@ public:
     void stop_ttl_timer();
 
     // 1. DATA PLANE (Fast Lookups)
-    // Find which Backend ID owns this prefix
+
+    // Unified routing entry point - encapsulates all routing mode logic
+    // Returns RouteResult with backend_id, routing_mode, cache_hit, and error_message
+    // This is the primary method HttpController should call for routing decisions.
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    RouteResult route_request(const std::vector<int32_t>& tokens,
+                              const std::string& request_id = "");
+
+    // Find which Backend ID owns this prefix (radix tree lookup)
     // request_id: Optional request ID for tracing (empty string if not tracing)
     std::optional<BackendId> lookup(const std::vector<int32_t>& tokens,
                                      const std::string& request_id = "");

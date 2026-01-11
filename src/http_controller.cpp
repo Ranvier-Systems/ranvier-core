@@ -503,63 +503,24 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     {
         auto route_span = TracingService::start_child_span("ranvier.route_lookup");
 
-        if (_config.is_prefix_mode()) {
-            // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
-            routing_mode_str = "prefix";
-            route_span.set_attribute("ranvier.routing_mode", "prefix");
-            auto affinity_backend = _router.get_backend_for_prefix(tokens, request_id);
-            if (affinity_backend.has_value()) {
-                target_id = affinity_backend.value();
-                route_span.set_attribute("ranvier.cache_hit", true);
-                log_proxy.debug("[{}] Prefix affinity -> backend {}", request_id, target_id);
-            } else {
-                log_proxy.warn("[{}] No backends registered", request_id);
-                route_span.set_error("No backends registered");
-                metrics().record_failure();
-                rep->add_header("X-Request-ID", request_id);
-                rep->write_body("json", "{\"error\": \"No backends registered!\"}");
-                co_return std::move(rep);
-            }
-        } else if (_config.is_radix_mode()) {
-            // RADIX mode: radix tree lookup with random fallback (adaptive learning)
-            routing_mode_str = "radix";
-            route_span.set_attribute("ranvier.routing_mode", "radix");
-            auto lookup_result = _router.lookup(tokens, request_id);
-            if (lookup_result.has_value()) {
-                target_id = lookup_result.value();
-                route_span.set_attribute("ranvier.cache_hit", true);
-                log_proxy.debug("[{}] Radix tree hit -> backend {}", request_id, target_id);
-            } else {
-                auto random_id = _router.get_random_backend();
-                if (!random_id.has_value()) {
-                    log_proxy.warn("[{}] No backends registered", request_id);
-                    route_span.set_error("No backends registered");
-                    metrics().record_failure();
-                    rep->add_header("X-Request-ID", request_id);
-                    rep->write_body("json", "{\"error\": \"No backends registered!\"}");
-                    co_return std::move(rep);
-                }
-                target_id = random_id.value();
-                route_span.set_attribute("ranvier.cache_hit", false);
-                log_proxy.debug("[{}] Radix tree miss, random -> backend {}", request_id, target_id);
-            }
-        } else {
-            // ROUND_ROBIN mode: always use random/weighted backend selection
-            routing_mode_str = "round_robin";
-            route_span.set_attribute("ranvier.routing_mode", "round_robin");
-            auto random_id = _router.get_random_backend();
-            if (!random_id.has_value()) {
-                log_proxy.warn("[{}] No backends registered", request_id);
-                route_span.set_error("No backends registered");
-                metrics().record_failure();
-                rep->add_header("X-Request-ID", request_id);
-                rep->write_body("json", "{\"error\": \"No backends registered!\"}");
-                co_return std::move(rep);
-            }
-            target_id = random_id.value();
-            route_span.set_attribute("ranvier.cache_hit", false);
-            log_proxy.debug("[{}] Round-robin -> backend {}", request_id, target_id);
+        // Unified routing decision - all mode logic is encapsulated in RouterService
+        auto route_result = _router.route_request(tokens, request_id);
+        routing_mode_str = route_result.routing_mode;
+        route_span.set_attribute("ranvier.routing_mode", route_result.routing_mode);
+        route_span.set_attribute("ranvier.cache_hit", route_result.cache_hit);
+
+        if (!route_result.backend_id.has_value()) {
+            log_proxy.warn("[{}] {}", request_id, route_result.error_message);
+            route_span.set_error(route_result.error_message);
+            metrics().record_failure();
+            rep->add_header("X-Request-ID", request_id);
+            rep->write_body("json", "{\"error\": \"" + route_result.error_message + "!\"}");
+            co_return std::move(rep);
         }
+
+        target_id = route_result.backend_id.value();
+        log_proxy.debug("[{}] Route decision: {} mode, cache_hit={} -> backend {}",
+                        request_id, route_result.routing_mode, route_result.cache_hit, target_id);
 
         route_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
     } // route_span ends here
