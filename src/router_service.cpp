@@ -29,56 +29,161 @@ struct BackendInfo {
     std::chrono::steady_clock::time_point drain_start_time;
 };
 
-// Thread-local NodeSlab and RadixTree bundled together to guarantee destruction order.
-// The tree MUST be destroyed before the slab, since tree nodes are allocated from the slab.
-// C++ destroys struct members in reverse declaration order, so tree goes before slab.
-struct ShardLocalTreeState {
+// ============================================================================
+// ShardLocalState: Unified Per-Shard State
+// ============================================================================
+//
+// Encapsulates all thread-local state for a single shard. This provides:
+//   1. Clear lifecycle management - init() in start(), reset() in stop()
+//   2. Guaranteed destruction order - tree before slab
+//   3. Easy testing - reset_for_testing() clears all state
+//   4. Configuration hot-reload via update_config()
+//
+// Each shard has its own instance, accessed via g_shard_state.
+// This follows Seastar's shared-nothing architecture (no locks needed).
+//
+struct ShardLocalState {
+    // ========================================================================
+    // Tree State (destruction order: tree before slab)
+    // ========================================================================
     std::unique_ptr<NodeSlab> node_slab;  // Destroyed last
     std::unique_ptr<RadixTree> tree;       // Destroyed first
 
-    ~ShardLocalTreeState() {
-        // Explicit destruction order for clarity and safety
+    // ========================================================================
+    // Backend Tracking (SIMD-accelerated containers for lock-free lookups)
+    // ========================================================================
+    absl::flat_hash_map<BackendId, BackendInfo> backends;
+    std::vector<BackendId> backend_ids;
+    absl::flat_hash_set<BackendId> dead_backends;  // Circuit breaker blacklist
+
+    // ========================================================================
+    // Statistics Counters
+    // ========================================================================
+    struct Stats {
+        uint64_t cache_hits = 0;
+        uint64_t cache_misses = 0;
+        uint64_t routes_evicted = 0;
+        uint64_t routes_expired = 0;
+        uint64_t cluster_routes_pruned = 0;
+        uint64_t radix_tree_lookup_hits = 0;
+        uint64_t radix_tree_lookup_misses = 0;
+        uint64_t prefix_affinity_routes = 0;
+
+        void reset() {
+            cache_hits = 0;
+            cache_misses = 0;
+            routes_evicted = 0;
+            routes_expired = 0;
+            cluster_routes_pruned = 0;
+            radix_tree_lookup_hits = 0;
+            radix_tree_lookup_misses = 0;
+            prefix_affinity_routes = 0;
+        }
+    } stats;
+
+    // ========================================================================
+    // Configuration (per-shard copy for lock-free access)
+    // ========================================================================
+    struct Config {
+        size_t max_routes = 100000;
+        std::chrono::seconds ttl_seconds{3600};
+        std::chrono::seconds backend_drain_timeout{60};
+        RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::RADIX;
+        size_t prefix_token_length = 128;
+        uint32_t block_alignment = 16;
+    } config;
+
+    // ========================================================================
+    // Random Number Generator (seeded per-shard for deterministic testing)
+    // ========================================================================
+    std::mt19937 rng;
+
+    // ========================================================================
+    // Lifecycle Methods
+    // ========================================================================
+
+    // Initialize shard state with the given routing configuration.
+    // Called once per shard during RouterService::start() / initialize_shards().
+    void init(const RoutingConfig& cfg) {
+        // Initialize tree state with guaranteed destruction order
+        node_slab = std::make_unique<NodeSlab>();
+        set_node_slab(node_slab.get());
+        tree = std::make_unique<RadixTree>(cfg.block_alignment);
+
+        // Copy configuration for lock-free access
+        config.max_routes = cfg.max_routes;
+        config.ttl_seconds = cfg.ttl_seconds;
+        config.backend_drain_timeout = cfg.backend_drain_timeout;
+        config.routing_mode = cfg.routing_mode;
+        config.prefix_token_length = cfg.prefix_token_length;
+        config.block_alignment = cfg.block_alignment;
+
+        // Seed RNG with random device and time for better entropy
+        std::random_device rd;
+        auto time_seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        rng.seed(rd() ^ static_cast<std::mt19937::result_type>(time_seed));
+    }
+
+    // Update configuration on hot-reload (called from update_routing_config)
+    void update_config(const RoutingConfig& cfg) {
+        config.max_routes = cfg.max_routes;
+        config.ttl_seconds = cfg.ttl_seconds;
+        config.backend_drain_timeout = cfg.backend_drain_timeout;
+        config.routing_mode = cfg.routing_mode;
+        config.prefix_token_length = cfg.prefix_token_length;
+        config.block_alignment = cfg.block_alignment;
+    }
+
+    // Reset all state (for testing or reconfiguration)
+    void reset() {
+        // Clear tree first (nodes allocated from slab)
         tree.reset();
-        set_node_slab(nullptr);  // Clear thread-local pointer before destroying slab
+        set_node_slab(nullptr);
+        node_slab.reset();
+
+        // Clear backend tracking
+        backends.clear();
+        backend_ids.clear();
+        dead_backends.clear();
+
+        // Reset statistics
+        stats.reset();
+    }
+
+    // Reset for unit testing - clears all state and optionally reinitializes
+    void reset_for_testing(const RoutingConfig* cfg = nullptr) {
+        reset();
+        if (cfg) {
+            init(*cfg);
+        }
+    }
+
+    // Destructor ensures proper cleanup order
+    ~ShardLocalState() {
+        // Explicit destruction order: tree before slab
+        tree.reset();
+        set_node_slab(nullptr);
         node_slab.reset();
     }
 };
-thread_local std::unique_ptr<ShardLocalTreeState> local_state;
 
-// Convenience accessors (maintain compatibility with existing code)
-static RadixTree* local_tree() {
-    return local_state ? local_state->tree.get() : nullptr;
+// Single thread_local instance per shard
+thread_local std::unique_ptr<ShardLocalState> g_shard_state;
+
+// ============================================================================
+// Accessor Functions
+// ============================================================================
+
+// Get reference to shard state (asserts initialized)
+static ShardLocalState& shard_state() {
+    assert(g_shard_state && "Shard state not initialized - call init() first");
+    return *g_shard_state;
 }
-// Using absl::flat_hash_map for SIMD-accelerated lookups and better cache locality
-// These remain shard-local to maintain Ranvier's lock-free architecture
-thread_local absl::flat_hash_map<BackendId, BackendInfo> local_backends;
-thread_local std::vector<BackendId> local_backend_ids;
 
-// The "Blacklist" for circuit breaker
-// Using absl::flat_hash_set for O(1) SIMD-accelerated membership checks
-thread_local absl::flat_hash_set<BackendId> local_dead_backends;
-
-// Thread-local counters for metrics
-thread_local uint64_t stats_cache_hits = 0;
-thread_local uint64_t stats_cache_misses = 0;
-thread_local uint64_t stats_routes_evicted = 0;
-thread_local uint64_t stats_routes_expired = 0;
-thread_local uint64_t stats_cluster_routes_pruned = 0;
-
-// Radix tree performance counters (for radix_tree_lookup_hits/misses_total)
-thread_local uint64_t stats_radix_tree_lookup_hits = 0;
-thread_local uint64_t stats_radix_tree_lookup_misses = 0;
-
-// Thread-local routing configuration (set during shard initialization)
-thread_local size_t local_max_routes = 100000;
-thread_local std::chrono::seconds local_ttl_seconds{3600};
-thread_local std::chrono::seconds local_backend_drain_timeout{60};
-thread_local RoutingConfig::RoutingMode local_routing_mode = RoutingConfig::RoutingMode::RADIX;
-thread_local size_t local_prefix_token_length = 128;
-thread_local uint32_t local_block_alignment = 16;
-
-// Thread-local counter for prefix affinity routing
-thread_local uint64_t stats_prefix_affinity_routes = 0;
+// Convenience accessor for RadixTree (returns nullptr if not initialized)
+static RadixTree* local_tree() {
+    return g_shard_state ? g_shard_state->tree.get() : nullptr;
+}
 
 // ============================================================================
 // Route Batching Helpers
@@ -88,15 +193,17 @@ thread_local uint64_t stats_prefix_affinity_routes = 0;
 // This function runs on each shard and processes all routes in the batch.
 // Called via smp::submit_to from flush_route_batch().
 static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute>& batch) {
-    RadixTree* tree = local_tree();
+    if (!g_shard_state) return;
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
     if (!tree) return;
 
     for (const auto& route : batch) {
         // LRU eviction: prefer evicting REMOTE routes first when at capacity
-        if (local_max_routes > 0) {
-            while (tree->route_count() >= local_max_routes) {
+        if (state.config.max_routes > 0) {
+            while (tree->route_count() >= state.config.max_routes) {
                 if (tree->evict_oldest_remote()) {
-                    stats_routes_evicted++;
+                    state.stats.routes_evicted++;
                 } else {
                     break;  // No more routes to evict
                 }
@@ -131,12 +238,6 @@ inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_
     return hash;
 }
 
-thread_local std::mt19937 rng([]() {
-    std::random_device rd;
-    auto time_seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    return std::mt19937(rd() ^ time_seed);
-}());
-
 RouterService::RouterService() : RouterService(RoutingConfig{}) {}
 
 RouterService::RouterService(const RoutingConfig& config)
@@ -144,17 +245,9 @@ RouterService::RouterService(const RoutingConfig& config)
 
 RouterService::RouterService(const RoutingConfig& routing_config, const ClusterConfig& cluster_config)
     : _config(routing_config), _cluster_config(cluster_config) {
-    // Initialize shard 0's ShardLocalTreeState (slab + tree)
-    local_state = std::make_unique<ShardLocalTreeState>();
-    local_state->node_slab = std::make_unique<NodeSlab>();
-    set_node_slab(local_state->node_slab.get());
-    local_state->tree = std::make_unique<RadixTree>(routing_config.block_alignment);
-    local_max_routes = routing_config.max_routes;
-    local_ttl_seconds = routing_config.ttl_seconds;
-    local_backend_drain_timeout = routing_config.backend_drain_timeout;
-    local_routing_mode = routing_config.routing_mode;
-    local_prefix_token_length = routing_config.prefix_token_length;
-    local_block_alignment = routing_config.block_alignment;
+    // Initialize shard 0's ShardLocalState
+    g_shard_state = std::make_unique<ShardLocalState>();
+    g_shard_state->init(routing_config);
 
     // Create GossipService if cluster mode is enabled
     if (_cluster_config.enabled) {
@@ -207,17 +300,25 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     //   - Prometheus cannot scrape deregistered metrics
     //
     _metrics.add_group("ranvier", {
-        seastar::metrics::make_counter("router_cache_hits", stats_cache_hits,
+        // Note: Metrics access g_shard_state->stats. Null-checks are defense-in-depth;
+        // primary safety is _metrics.clear() in stop() before g_shard_state is destroyed.
+        seastar::metrics::make_counter("router_cache_hits",
+            [] { return g_shard_state ? g_shard_state->stats.cache_hits : 0UL; },
             seastar::metrics::description("Total number of prefix cache hits")),
-        seastar::metrics::make_counter("router_cache_misses", stats_cache_misses,
+        seastar::metrics::make_counter("router_cache_misses",
+            [] { return g_shard_state ? g_shard_state->stats.cache_misses : 0UL; },
             seastar::metrics::description("Total number of prefix cache misses")),
-        seastar::metrics::make_counter("router_routes_evicted", stats_routes_evicted,
+        seastar::metrics::make_counter("router_routes_evicted",
+            [] { return g_shard_state ? g_shard_state->stats.routes_evicted : 0UL; },
             seastar::metrics::description("Total number of routes evicted due to capacity limits")),
-        seastar::metrics::make_counter("router_routes_expired", stats_routes_expired,
+        seastar::metrics::make_counter("router_routes_expired",
+            [] { return g_shard_state ? g_shard_state->stats.routes_expired : 0UL; },
             seastar::metrics::description("Total number of routes expired due to TTL")),
-        seastar::metrics::make_counter("router_cluster_routes_pruned", stats_cluster_routes_pruned,
+        seastar::metrics::make_counter("router_cluster_routes_pruned",
+            [] { return g_shard_state ? g_shard_state->stats.cluster_routes_pruned : 0UL; },
             seastar::metrics::description("Total number of routes pruned when cluster peer fails")),
-        seastar::metrics::make_counter("router_prefix_affinity_routes", stats_prefix_affinity_routes,
+        seastar::metrics::make_counter("router_prefix_affinity_routes",
+            [] { return g_shard_state ? g_shard_state->stats.prefix_affinity_routes : 0UL; },
             seastar::metrics::description("Total number of requests routed via prefix affinity")),
         seastar::metrics::make_counter("router_routes_dropped_buffer_overflow_total",
             [this] { return _routes_dropped_overflow; },
@@ -228,11 +329,13 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // ====================================================================
 
         // Radix tree lookup hits: when find_node successfully finds a route
-        seastar::metrics::make_counter("radix_tree_lookup_hits_total", stats_radix_tree_lookup_hits,
+        seastar::metrics::make_counter("radix_tree_lookup_hits_total",
+            [] { return g_shard_state ? g_shard_state->stats.radix_tree_lookup_hits : 0UL; },
             seastar::metrics::description("Total number of radix tree lookups that found a valid Backend")),
 
         // Radix tree lookup misses: when find_node fails to find a route
-        seastar::metrics::make_counter("radix_tree_lookup_misses_total", stats_radix_tree_lookup_misses,
+        seastar::metrics::make_counter("radix_tree_lookup_misses_total",
+            [] { return g_shard_state ? g_shard_state->stats.radix_tree_lookup_misses : 0UL; },
             seastar::metrics::description("Total number of radix tree lookups that failed to find a route")),
 
         // Node count by type (Node4, Node16, Node48, Node256) - uses NodeSlab statistics
@@ -301,28 +404,16 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
 }
 
 seastar::future<> RouterService::initialize_shards() {
-    // Initialize NodeSlab and RadixTree on all other shards with the config from shard 0
-    uint32_t block_alignment = _config.block_alignment;
-    size_t max_routes = _config.max_routes;
-    auto ttl_seconds = _config.ttl_seconds;
-    auto drain_timeout = _config.backend_drain_timeout;
-    auto routing_mode = _config.routing_mode;
-    size_t prefix_token_length = _config.prefix_token_length;
+    // Initialize ShardLocalState on all other shards with the config from shard 0
+    // Shard 0 is already initialized in the constructor
+    RoutingConfig cfg = _config;  // Copy config for cross-shard transfer
 
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
-        [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [block_alignment, max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length] {
-                // Initialize ShardLocalTreeState (slab + tree with guaranteed destruction order)
-                local_state = std::make_unique<ShardLocalTreeState>();
-                local_state->node_slab = std::make_unique<NodeSlab>();
-                set_node_slab(local_state->node_slab.get());
-                local_state->tree = std::make_unique<RadixTree>(block_alignment);
-                local_max_routes = max_routes;
-                local_ttl_seconds = ttl_seconds;
-                local_backend_drain_timeout = drain_timeout;
-                local_routing_mode = routing_mode;
-                local_prefix_token_length = prefix_token_length;
-                local_block_alignment = block_alignment;
+        [cfg](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [cfg] {
+                // Initialize ShardLocalState with unified init() method
+                g_shard_state = std::make_unique<ShardLocalState>();
+                g_shard_state->init(cfg);
                 return seastar::make_ready_future<>();
             });
         });
@@ -373,16 +464,18 @@ seastar::future<> RouterService::stop() {
 }
 
 void RouterService::run_ttl_cleanup() {
-    auto cutoff = std::chrono::steady_clock::now() - local_ttl_seconds;
+    auto cutoff = std::chrono::steady_clock::now() - shard_state().config.ttl_seconds;
 
     // Run cleanup on all shards
     (void)seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [cutoff] {
-            RadixTree* tree = local_tree();
+            if (!g_shard_state) return seastar::make_ready_future<>();
+            auto& state = shard_state();
+            RadixTree* tree = state.tree.get();
             if (tree) {
                 size_t removed = tree->remove_expired(cutoff);
                 if (removed > 0) {
-                    stats_routes_expired += removed;
+                    state.stats.routes_expired += removed;
                     log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
                 }
             }
@@ -393,7 +486,9 @@ void RouterService::run_ttl_cleanup() {
 
 std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens,
                                                  const std::string& request_id) {
-    RadixTree* tree = local_tree();
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
     if (!tree) return std::nullopt;
 
     // Use instrumented lookup to track prefix skip lengths for path compression metrics
@@ -402,7 +497,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 
     // Record radix tree lookup hit/miss for performance metrics
     if (result.has_value()) {
-        stats_radix_tree_lookup_hits++;
+        state.stats.radix_tree_lookup_hits++;
         if (g_metrics) {
             metrics().record_radix_tree_lookup_hit();
             // Record prefix skip length for path compression efficiency tracking
@@ -413,7 +508,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
             }
         }
     } else {
-        stats_radix_tree_lookup_misses++;
+        state.stats.radix_tree_lookup_misses++;
         if (g_metrics) {
             metrics().record_radix_tree_lookup_miss();
         }
@@ -421,12 +516,12 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 
     // Circuit breaker: if cache hit points to dead backend, treat as miss
     if (result.has_value()) {
-        if (local_dead_backends.contains(result.value())) {
+        if (state.dead_backends.contains(result.value())) {
             if (!request_id.empty()) {
                 log_router.debug("[{}] Cache hit for dead backend {}, treating as miss",
                                  request_id, result.value());
             }
-            stats_cache_misses++;
+            state.stats.cache_misses++;
             // Update MetricsService for ranvier_cache_hit_ratio gauge
             if (g_metrics) {
                 metrics().record_cache_miss();
@@ -437,7 +532,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
             log_router.debug("[{}] Cache hit: {} tokens -> backend {}",
                              request_id, tokens.size(), result.value());
         }
-        stats_cache_hits++;
+        state.stats.cache_hits++;
         // Update MetricsService for ranvier_cache_hit_ratio gauge
         if (g_metrics) {
             metrics().record_cache_hit();
@@ -446,7 +541,7 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
         if (!request_id.empty()) {
             log_router.debug("[{}] Cache miss for {} tokens", request_id, tokens.size());
         }
-        stats_cache_misses++;
+        state.stats.cache_misses++;
         // Update MetricsService for ranvier_cache_hit_ratio gauge
         if (g_metrics) {
             metrics().record_cache_miss();
@@ -460,25 +555,28 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
                                          const std::string& request_id) {
     RouteResult result;
 
-    // Use thread-local routing mode (hot-reloadable via update_routing_config)
-    if (local_routing_mode == RoutingConfig::RoutingMode::PREFIX) {
+    // Use shard-local routing mode (hot-reloadable via update_routing_config)
+    auto routing_mode = g_shard_state ? shard_state().config.routing_mode
+                                      : RoutingConfig::RoutingMode::RADIX;
+
+    if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
         result.routing_mode = "prefix";
         auto affinity_backend = get_backend_for_prefix(tokens, request_id);
 
         if (affinity_backend.has_value()) {
             result.backend_id = affinity_backend.value();
-            // Note: get_backend_for_prefix internally tracks cache_hit via stats_cache_hits/misses
+            // Note: get_backend_for_prefix internally tracks cache_hit via stats.cache_hits/misses
             // and returns a backend even on cache miss (via hash fallback).
             // For external visibility, we report cache_hit based on whether ART had a hit.
             // Since get_backend_for_prefix always returns a backend when backends exist,
             // cache_hit here means we found the route in ART (not hash fallback).
-            // The internal stats_cache_hits counter was already incremented appropriately.
+            // The internal stats.cache_hits counter was already incremented appropriately.
             result.cache_hit = true;  // Prefix mode always has affinity (ART or hash)
         } else {
             result.error_message = "No backends registered";
         }
-    } else if (local_routing_mode == RoutingConfig::RoutingMode::RADIX) {
+    } else if (routing_mode == RoutingConfig::RoutingMode::RADIX) {
         // RADIX mode: radix tree lookup with random fallback (adaptive learning)
         result.routing_mode = "radix";
         auto lookup_result = lookup(tokens, request_id);
@@ -513,15 +611,20 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
 }
 
 std::optional<seastar::socket_address> RouterService::get_backend_address(BackendId id) {
-    auto it = local_backends.find(id);
-    if (it != local_backends.end()) {
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it != state.backends.end()) {
         return it->second.addr;
     }
     return std::nullopt;
 }
 
 std::optional<BackendId> RouterService::get_random_backend() {
-    if (local_backend_ids.empty()) {
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+
+    if (state.backend_ids.empty()) {
         return std::nullopt;
     }
 
@@ -529,12 +632,12 @@ std::optional<BackendId> RouterService::get_random_backend() {
     // Priority 0 = highest, backends with lower priority number are tried first
     std::map<uint32_t, std::vector<std::pair<BackendId, uint32_t>>> priority_groups;
 
-    for (BackendId id : local_backend_ids) {
-        if (local_dead_backends.contains(id)) {
+    for (BackendId id : state.backend_ids) {
+        if (state.dead_backends.contains(id)) {
             continue;  // Skip dead backends
         }
-        auto it = local_backends.find(id);
-        if (it == local_backends.end()) {
+        auto it = state.backends.find(id);
+        if (it == state.backends.end()) {
             continue;
         }
         const auto& info = it->second;
@@ -565,7 +668,7 @@ std::optional<BackendId> RouterService::get_random_backend() {
 
     // Weighted random selection
     std::uniform_int_distribution<uint64_t> dist(0, total_weight - 1);
-    uint64_t roll = dist(rng);
+    uint64_t roll = dist(state.rng);
 
     uint64_t cumulative = 0;
     for (const auto& [id, weight] : candidates) {
@@ -581,18 +684,21 @@ std::optional<BackendId> RouterService::get_random_backend() {
 
 std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
                                                                  const std::string& request_id) {
-    if (local_backend_ids.empty()) {
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+
+    if (state.backend_ids.empty()) {
         return std::nullopt;
     }
 
     // Collect live backends (not dead, not draining)
     std::vector<BackendId> live_backends;
-    for (BackendId id : local_backend_ids) {
-        if (local_dead_backends.contains(id)) {
+    for (BackendId id : state.backend_ids) {
+        if (state.dead_backends.contains(id)) {
             continue;  // Skip dead backends
         }
-        auto it = local_backends.find(id);
-        if (it == local_backends.end()) {
+        auto it = state.backends.find(id);
+        if (it == state.backends.end()) {
             continue;
         }
         if (it->second.is_draining) {
@@ -609,7 +715,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     std::sort(live_backends.begin(), live_backends.end());
 
     // Extract prefix (first N tokens)
-    size_t prefix_len = std::min(tokens.size(), local_prefix_token_length);
+    size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
     if (prefix_len == 0) {
         // No tokens to route on, fall back to first backend
         return live_backends[0];
@@ -627,7 +733,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     //    deterministic routing. The route will be learned after success.
 
     // Step 1: Try ART lookup for longest prefix match
-    RadixTree* tree = local_tree();
+    RadixTree* tree = state.tree.get();
     if (tree) {
         std::span<const TokenId> token_span(tokens.data(), tokens.size());
         auto art_result = tree->lookup(token_span);
@@ -642,8 +748,8 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                     log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
                                      request_id, tokens.size(), art_backend);
                 }
-                stats_cache_hits++;
-                stats_prefix_affinity_routes++;
+                state.stats.cache_hits++;
+                state.stats.prefix_affinity_routes++;
                 if (g_metrics) {
                     metrics().record_cache_hit();
                 }
@@ -657,7 +763,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
 
     // Step 2: No ART match (or backend unavailable) - use consistent hashing
     // This provides deterministic routing for new prefixes
-    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, local_block_alignment);
+    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
     size_t index = prefix_hash % live_backends.size();
     BackendId selected = live_backends[index];
 
@@ -667,8 +773,8 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     }
 
     // This is a cache miss - the route will be learned after successful response
-    stats_cache_misses++;
-    stats_prefix_affinity_routes++;
+    state.stats.cache_misses++;
+    state.stats.prefix_affinity_routes++;
     if (g_metrics) {
         metrics().record_cache_miss();
     }
@@ -703,14 +809,16 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
-                RadixTree* tree = local_tree();
+                if (!g_shard_state) return seastar::make_ready_future<>();
+                auto& state = shard_state();
+                RadixTree* tree = state.tree.get();
                 if (!tree) return seastar::make_ready_future<>();
 
                 // LRU eviction: if at capacity, evict oldest routes first
-                if (local_max_routes > 0) {
-                    while (tree->route_count() >= local_max_routes) {
+                if (state.config.max_routes > 0) {
+                    while (tree->route_count() >= state.config.max_routes) {
                         if (tree->evict_oldest()) {
-                            stats_routes_evicted++;
+                            state.stats.routes_evicted++;
                         } else {
                             break;  // No more routes to evict
                         }
@@ -854,15 +962,17 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
             return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
                                                        weight = shared_weight,
                                                        priority = shared_priority] {
-                local_backends[id] = BackendInfo{addr, weight, priority};
+                if (!g_shard_state) return seastar::make_ready_future<>();
+                auto& state = shard_state();
+                state.backends[id] = BackendInfo{addr, weight, priority};
 
                 // Update vector (check for duplicates)
                 bool exists = false;
-                for (auto existing : local_backend_ids) {
+                for (auto existing : state.backend_ids) {
                     if (existing == id) { exists = true; break; }
                 }
                 if (!exists) {
-                    local_backend_ids.push_back(id);
+                    state.backend_ids.push_back(id);
                 }
 
                 return seastar::make_ready_future<>();
@@ -874,17 +984,20 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
 seastar::future<> RouterService::unregister_backend_global(BackendId id) {
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id] (unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [id] {
+            if (!g_shard_state) return seastar::make_ready_future<>();
+            auto& state = shard_state();
+
             // Remove from backends map
-            local_backends.erase(id);
+            state.backends.erase(id);
 
             // Remove from backend IDs vector
-            auto it = std::find(local_backend_ids.begin(), local_backend_ids.end(), id);
-            if (it != local_backend_ids.end()) {
-                local_backend_ids.erase(it);
+            auto it = std::find(state.backend_ids.begin(), state.backend_ids.end(), id);
+            if (it != state.backend_ids.end()) {
+                state.backend_ids.erase(it);
             }
 
             // Also remove from dead backends set if present
-            local_dead_backends.erase(id);
+            state.dead_backends.erase(id);
 
             return seastar::make_ready_future<>();
         });
@@ -892,16 +1005,19 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
 }
 
 std::vector<BackendId> RouterService::get_all_backend_ids() const {
-    return local_backend_ids;
+    if (!g_shard_state) return {};
+    return shard_state().backend_ids;
 }
 
 std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {
+    if (!g_shard_state) return {};
+    auto& shard = shard_state();
     std::vector<BackendState> result;
-    result.reserve(local_backends.size());
+    result.reserve(shard.backends.size());
 
-    for (const auto& [id, info] : local_backends) {
-        BackendState state;
-        state.id = id;
+    for (const auto& [id, info] : shard.backends) {
+        BackendState bs;
+        bs.id = id;
 
         // Extract address and port from socket_address
         auto addr = info.addr;
@@ -921,42 +1037,42 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
                 bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
                                          (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
                 if (is_port_separator) {
-                    state.address = addr_str.substr(0, colon_pos);
+                    bs.address = addr_str.substr(0, colon_pos);
                     try {
-                        state.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
+                        bs.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
                     } catch (const std::exception&) {
-                        state.port = 0;  // Failed to parse port
+                        bs.port = 0;  // Failed to parse port
                     }
                 } else {
-                    state.address = addr_str;
-                    state.port = 0;
+                    bs.address = addr_str;
+                    bs.port = 0;
                 }
             } else {
-                state.address = addr_str;
-                state.port = 0;
+                bs.address = addr_str;
+                bs.port = 0;
             }
         } else {
-            state.address = addr_str;
-            state.port = 0;
+            bs.address = addr_str;
+            bs.port = 0;
         }
 
-        state.weight = info.weight;
-        state.priority = info.priority;
-        state.is_draining = info.is_draining;
-        state.is_dead = local_dead_backends.contains(id);
+        bs.weight = info.weight;
+        bs.priority = info.priority;
+        bs.is_draining = info.is_draining;
+        bs.is_dead = shard.dead_backends.contains(id);
 
         if (info.is_draining) {
             // Convert steady_clock to wall-clock time:
             // Calculate elapsed time since drain started, then subtract from current wall time
             auto elapsed = std::chrono::steady_clock::now() - info.drain_start_time;
             auto wall_start = std::chrono::system_clock::now() - elapsed;
-            state.drain_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            bs.drain_start_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 wall_start.time_since_epoch()).count();
         } else {
-            state.drain_start_ms = 0;
+            bs.drain_start_ms = 0;
         }
 
-        result.push_back(std::move(state));
+        result.push_back(std::move(bs));
     }
 
     return result;
@@ -980,7 +1096,8 @@ std::optional<RadixTree::DumpNode> RouterService::get_tree_dump_with_prefix(cons
 
 seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is_alive) {
     // Check local state (Core 0) to deduplicate logs
-    bool is_currently_marked_dead = local_dead_backends.contains(id);
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    bool is_currently_marked_dead = shard_state().dead_backends.contains(id);
 
     // No state change needed
     if (is_alive != is_currently_marked_dead) {
@@ -997,10 +1114,12 @@ seastar::future<> RouterService::set_backend_status_global(BackendId id, bool is
     // Broadcast to all cores
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, is_alive] (unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [id, is_alive] {
+            if (!g_shard_state) return seastar::make_ready_future<>();
+            auto& state = shard_state();
             if (is_alive) {
-                local_dead_backends.erase(id);
+                state.dead_backends.erase(id);
             } else {
-                local_dead_backends.insert(id);
+                state.dead_backends.insert(id);
             }
             return seastar::make_ready_future<>();
         });
@@ -1011,29 +1130,20 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     // Update local config on shard 0
     _config = config;
 
-    // Capture values to broadcast
-    size_t max_routes = config.max_routes;
-    auto ttl_seconds = config.ttl_seconds;
-    auto drain_timeout = config.backend_drain_timeout;
-    auto routing_mode = config.routing_mode;
-    size_t prefix_token_length = config.prefix_token_length;
-    uint32_t block_alignment = config.block_alignment;
-
-    const char* mode_str = routing_mode == RoutingConfig::RoutingMode::PREFIX ? "prefix" :
-                           routing_mode == RoutingConfig::RoutingMode::RADIX ? "radix" : "round_robin";
+    const char* mode_str = config.routing_mode == RoutingConfig::RoutingMode::PREFIX ? "prefix" :
+                           config.routing_mode == RoutingConfig::RoutingMode::RADIX ? "radix" : "round_robin";
     log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, mode={}, prefix_len={})",
-                  max_routes, ttl_seconds.count(), drain_timeout.count(), mode_str, prefix_token_length);
+                  config.max_routes, config.ttl_seconds.count(), config.backend_drain_timeout.count(),
+                  mode_str, config.prefix_token_length);
 
     // Broadcast to all shards using Seastar's async message passing
+    // Copy config for cross-shard transfer
+    RoutingConfig cfg = config;
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-        [max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length, block_alignment](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [max_routes, ttl_seconds, drain_timeout, routing_mode, prefix_token_length, block_alignment] {
-                local_max_routes = max_routes;
-                local_ttl_seconds = ttl_seconds;
-                local_backend_drain_timeout = drain_timeout;
-                local_routing_mode = routing_mode;
-                local_prefix_token_length = prefix_token_length;
-                local_block_alignment = block_alignment;
+        [cfg](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [cfg] {
+                if (!g_shard_state) return seastar::make_ready_future<>();
+                shard_state().update_config(cfg);
                 return seastar::make_ready_future<>();
             });
         });
@@ -1041,8 +1151,10 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
 
 seastar::future<> RouterService::drain_backend_global(BackendId id) {
     // Check if backend exists and get its address for logging
-    auto it = local_backends.find(id);
-    if (it == local_backends.end()) {
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    auto& shard = shard_state();
+    auto it = shard.backends.find(id);
+    if (it == shard.backends.end()) {
         log_router.warn("Cannot drain backend {}: not found", id);
         return seastar::make_ready_future<>();
     }
@@ -1054,8 +1166,10 @@ seastar::future<> RouterService::drain_backend_global(BackendId id) {
     // Broadcast draining state to all shards
     return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [id, now](unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [id, now] {
-            auto it = local_backends.find(id);
-            if (it != local_backends.end()) {
+            if (!g_shard_state) return seastar::make_ready_future<>();
+            auto& state = shard_state();
+            auto it = state.backends.find(id);
+            if (it != state.backends.end()) {
                 it->second.is_draining = true;
                 it->second.drain_start_time = now;
             }
@@ -1082,15 +1196,17 @@ void RouterService::stop_draining_reaper() {
 }
 
 void RouterService::run_draining_reaper() {
+    if (!g_shard_state) return;
+    auto& shard = shard_state();
     auto now = std::chrono::steady_clock::now();
 
     // Find backends on shard 0 that have been draining longer than the timeout
     std::vector<std::pair<BackendId, seastar::socket_address>> to_remove;
 
-    for (const auto& [id, info] : local_backends) {
+    for (const auto& [id, info] : shard.backends) {
         if (info.is_draining) {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - info.drain_start_time);
-            if (elapsed >= local_backend_drain_timeout) {
+            if (elapsed >= shard.config.backend_drain_timeout) {
                 to_remove.emplace_back(id, info.addr);
             }
         }
@@ -1113,14 +1229,16 @@ void RouterService::run_draining_reaper() {
 seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
     // Remove all REMOTE routes pointing to this backend
     // This is called when a cluster peer fails and we need to prune orphaned routes
-    RadixTree* tree = local_tree();
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
     if (!tree) {
         return seastar::make_ready_future<>();
     }
 
     size_t removed = tree->remove_routes_by_backend(b_id, RouteOrigin::REMOTE);
     if (removed > 0) {
-        stats_cluster_routes_pruned += removed;
+        state.stats.cluster_routes_pruned += removed;
         log_router.info("Shard {}: Pruned {} orphaned routes for failed peer backend {}",
                         seastar::this_shard_id(), removed, b_id);
     }
@@ -1128,8 +1246,8 @@ seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
     return seastar::make_ready_future<>();
 }
 
-seastar::future<> RouterService::handle_node_state_change(BackendId backend, NodeState state) {
-    if (state == NodeState::DRAINING) {
+seastar::future<> RouterService::handle_node_state_change(BackendId backend, NodeState node_state) {
+    if (node_state == NodeState::DRAINING) {
         log_router.info("Received DRAINING notification for backend {} - setting weight to 0", backend);
 
         // Broadcast weight=0 to all shards to stop new traffic to this backend
@@ -1138,8 +1256,10 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
-                    auto it = local_backends.find(backend);
-                    if (it != local_backends.end()) {
+                    if (!g_shard_state) return seastar::make_ready_future<>();
+                    auto& state = shard_state();
+                    auto it = state.backends.find(backend);
+                    if (it != state.backends.end()) {
                         // Set weight to 0 - backend won't be selected for new requests
                         // but existing connections continue working
                         it->second.weight = 0;
@@ -1151,14 +1271,16 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
                     return seastar::make_ready_future<>();
                 });
             });
-    } else if (state == NodeState::ACTIVE) {
+    } else if (node_state == NodeState::ACTIVE) {
         // Node is back online - restore default weight (could be enhanced to store original weight)
         log_router.info("Received ACTIVE notification for backend {} - restoring weight", backend);
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
-                    auto it = local_backends.find(backend);
-                    if (it != local_backends.end() && it->second.is_draining) {
+                    if (!g_shard_state) return seastar::make_ready_future<>();
+                    auto& state = shard_state();
+                    auto it = state.backends.find(backend);
+                    if (it != state.backends.end() && it->second.is_draining) {
                         // Restore default weight
                         it->second.weight = 100;
                         it->second.is_draining = false;
@@ -1171,6 +1293,20 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
     }
 
     return seastar::make_ready_future<>();
+}
+
+// ============================================================================
+// Testing Support
+// ============================================================================
+
+void RouterService::reset_shard_state_for_testing(const RoutingConfig* cfg) {
+    if (g_shard_state) {
+        g_shard_state->reset_for_testing(cfg);
+    } else if (cfg) {
+        // If no state exists but config provided, create new state
+        g_shard_state = std::make_unique<ShardLocalState>();
+        g_shard_state->init(*cfg);
+    }
 }
 
 } // namespace ranvier

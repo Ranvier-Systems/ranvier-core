@@ -207,6 +207,16 @@ public:
     // Get the gossip service (for broadcasting node state on shutdown)
     GossipService* gossip_service() { return _gossip.get(); }
 
+    // ==========================================================================
+    // Testing Support
+    // ==========================================================================
+    // Reset shard-local state for unit testing. This clears all per-shard state
+    // including backends, routes, and statistics. If a config is provided, the
+    // state will be reinitialized with that configuration.
+    //
+    // IMPORTANT: Only call this in test code, not in production.
+    static void reset_shard_state_for_testing(const RoutingConfig* cfg = nullptr);
+
 private:
     // Thread-local metrics group
     // This holds the handle that keeps the metrics alive
