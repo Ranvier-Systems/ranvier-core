@@ -203,6 +203,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("Total number of routes pruned when cluster peer fails")),
         seastar::metrics::make_counter("router_prefix_affinity_routes", stats_prefix_affinity_routes,
             seastar::metrics::description("Total number of requests routed via prefix affinity")),
+        seastar::metrics::make_counter("router_routes_dropped_buffer_overflow_total",
+            [this] { return _routes_dropped_overflow; },
+            seastar::metrics::description("Total routes dropped due to remote route buffer overflow")),
 
         // ====================================================================
         // Radix Tree Performance Metrics
@@ -631,6 +634,22 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
 seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
     log_router.debug("Buffering remote route: {} tokens -> backend {}", tokens.size(), backend);
 
+    // Enforce hard buffer limit to prevent OOM from gossip flooding
+    // Strategy: batch-drop oldest routes to amortize O(n) erase cost
+    // We drop OVERFLOW_DROP_COUNT routes at once rather than one per insert
+    if (_pending_remote_routes.size() >= RouteBatchConfig::MAX_BUFFER_SIZE) {
+        // Calculate how many to drop (at least 1, up to OVERFLOW_DROP_COUNT)
+        size_t drop_count = std::min(RouteBatchConfig::OVERFLOW_DROP_COUNT,
+                                     _pending_remote_routes.size());
+        _pending_remote_routes.erase(_pending_remote_routes.begin(),
+                                     _pending_remote_routes.begin() + static_cast<ptrdiff_t>(drop_count));
+        _routes_dropped_overflow += drop_count;
+
+        // Log warning on each batch drop (already rate-limited by drop batching)
+        log_router.warn("Route buffer overflow, dropped {} oldest routes (total dropped: {})",
+                       drop_count, _routes_dropped_overflow);
+    }
+
     _pending_remote_routes.push_back(PendingRemoteRoute{std::move(tokens), backend});
 
     // Flush immediately if buffer is full (don't wait for timer)
@@ -682,8 +701,10 @@ void RouterService::start_batch_flush_timer() {
     });
 
     _batch_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
-    log_router.info("Route batch flush timer started (interval: {}ms, max_batch: {})",
-                    RouteBatchConfig::FLUSH_INTERVAL.count(), RouteBatchConfig::MAX_BATCH_SIZE);
+    log_router.info("Route batch flush timer started (interval: {}ms, max_batch: {}, max_buffer: {})",
+                    RouteBatchConfig::FLUSH_INTERVAL.count(),
+                    RouteBatchConfig::MAX_BATCH_SIZE,
+                    RouteBatchConfig::MAX_BUFFER_SIZE);
 }
 
 seastar::future<> RouterService::flush_route_batch() {
