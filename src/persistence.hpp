@@ -11,6 +11,18 @@
 
 namespace ranvier {
 
+/**
+ * @file persistence.hpp
+ * @brief Abstract interface for persistence backends.
+ *
+ * WARNING: Do not use PersistenceStore implementations directly from
+ * reactor-thread code. All persistence operations must go through
+ * AsyncPersistenceManager to avoid blocking the Seastar reactor.
+ *
+ * @see AsyncPersistenceManager for reactor-safe access.
+ * @see SqlitePersistence for the default SQLite implementation.
+ */
+
 // Record types for bulk loading
 struct BackendRecord {
     BackendId id;
@@ -25,8 +37,18 @@ struct RouteRecord {
     BackendId backend_id;
 };
 
-// Abstract interface for persistence backends
-// This allows swapping SQLite for RocksDB or other stores in the future
+/**
+ * @brief Abstract interface for persistence backends.
+ *
+ * This allows swapping SQLite for RocksDB or other stores in the future.
+ *
+ * IMPORTANT - THREADING CONTRACT:
+ * Implementations may use blocking operations (mutexes, I/O). Callers MUST
+ * invoke these methods from seastar::async context, NOT from the reactor thread.
+ * Use AsyncPersistenceManager as the reactor-safe wrapper.
+ *
+ * @see AsyncPersistenceManager for reactor-safe access patterns.
+ */
 class PersistenceStore {
 public:
     virtual ~PersistenceStore() = default;

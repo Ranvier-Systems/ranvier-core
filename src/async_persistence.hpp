@@ -13,6 +13,35 @@
 
 namespace ranvier {
 
+/**
+ * @file async_persistence.hpp
+ * @brief Reactor-safe async wrapper for SQLite persistence.
+ *
+ * IMPORTANT: This is the ONLY valid entry point for persistence operations
+ * from reactor-thread code (HttpController, RouterService, etc.).
+ *
+ * THREADING MODEL:
+ * The underlying SqlitePersistence uses std::mutex because SQLite is not
+ * thread-safe. To avoid blocking the Seastar reactor thread, this class:
+ *
+ *   1. Provides fire-and-forget queue_*() methods for writes (non-blocking)
+ *   2. Processes queued operations in batches via seastar::async()
+ *   3. Runs SQLite operations on Seastar's thread pool (not the reactor)
+ *
+ * The std::mutex in the queue (_queue_mutex) is acceptable because:
+ *   - Lock contention is minimal (queue operations are O(1))
+ *   - The critical section is extremely short (push/pop from deque)
+ *   - Cross-shard access requires some synchronization
+ *
+ * ARCHITECTURAL GUARANTEE:
+ *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
+ *                 ↑                                    ↓
+ *           (reactor thread)                  (thread pool, mutex OK)
+ *
+ * @see SqlitePersistence for the underlying mutex-protected implementation.
+ * @see docs/claude-context.md "No Locks/Async Only" section.
+ */
+
 // ============================================================================
 // Operation Types
 // ============================================================================
@@ -64,22 +93,39 @@ struct AsyncPersistenceConfig {
 // ============================================================================
 // AsyncPersistenceManager
 // ============================================================================
-// Decouples SQLite persistence from the Seastar reactor thread.
-//
-// This class owns the underlying PersistenceStore and provides a complete
-// abstraction over the persistence layer. Consumers should never need to
-// access the underlying SQLite implementation directly.
-//
-// Architecture:
-//   - Fire-and-forget queue API for the hot request path
-//   - Background timer drains queue and writes to SQLite in batches
-//   - SQLite operations run in seastar::async (off the reactor thread)
-//   - Semaphore ensures batches are processed in order
-//
-// Thread Safety:
-//   - Queue protected by std::mutex (safe for cross-shard access)
-//   - SQLite operations serialized via semaphore
-//   - Shutdown flag is atomic for visibility across shards
+/**
+ * @brief Reactor-safe async wrapper for SQLite persistence operations.
+ *
+ * This class owns the underlying PersistenceStore and provides a complete
+ * abstraction over the persistence layer. Consumers should NEVER access
+ * the underlying SqlitePersistence implementation directly.
+ *
+ * WHY THIS CLASS EXISTS:
+ * The "No Locks/Async Only" rule in Seastar means reactor threads must never
+ * block. However, SQLite requires mutex protection because it's not thread-safe.
+ * This class bridges the gap by:
+ *   1. Accepting operations on the reactor thread (non-blocking queue)
+ *   2. Processing them in seastar::async() on a separate thread pool
+ *   3. Using mutex protection safely (thread pool threads can block)
+ *
+ * Architecture:
+ *   - Fire-and-forget queue API for the hot request path
+ *   - Background timer drains queue and writes to SQLite in batches
+ *   - SQLite operations run in seastar::async (off the reactor thread)
+ *   - Semaphore ensures batches are processed in order
+ *
+ * Thread Safety:
+ *   - Queue protected by std::mutex (safe for cross-shard access)
+ *   - SQLite operations serialized via semaphore
+ *   - Shutdown flag is atomic for visibility across shards
+ *
+ * MUTEX JUSTIFICATION (per docs/claude-context.md):
+ * The _queue_mutex is acceptable because:
+ *   1. Critical sections are extremely short (deque push/pop)
+ *   2. No blocking I/O occurs while holding the lock
+ *   3. Cross-shard access to the shared queue requires synchronization
+ *   4. The alternative (per-shard queues) would complicate shutdown ordering
+ */
 
 class AsyncPersistenceManager {
 public:

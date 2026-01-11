@@ -6,9 +6,49 @@
 
 namespace ranvier {
 
+// Forward declaration for friend access
+class AsyncPersistenceManager;
+
+/**
+ * @brief SQLite-backed persistence store for routes and backends.
+ *
+ * THREADING MODEL:
+ * This class uses std::mutex for thread safety because SQLite is not
+ * thread-safe. All public methods MUST be called from seastar::async
+ * context, NOT from the reactor thread.
+ *
+ * DO NOT call these methods directly from HttpController, RouterService,
+ * or any other reactor-thread code. Use AsyncPersistenceManager instead,
+ * which wraps all calls in seastar::async to run on a thread pool.
+ *
+ * The mutex is SAFE here because:
+ *   1. seastar::async runs on a separate thread pool (not the reactor)
+ *   2. AsyncPersistenceManager serializes batch processing via semaphore
+ *   3. The reactor thread never blocks on these mutexes
+ *
+ * CORRECT CALL PATTERN:
+ *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
+ *                                                    ↓
+ *                                          (thread pool, mutex OK)
+ *
+ * DANGEROUS PATTERN (must not exist):
+ *   HttpController → SqlitePersistence::method()  ← BLOCKS REACTOR!
+ *
+ * @see AsyncPersistenceManager for the reactor-safe wrapper.
+ * @see docs/claude-context.md "No Locks/Async Only" section.
+ */
 class SqlitePersistence : public PersistenceStore {
-public:
+    // Only AsyncPersistenceManager (and factory function) may construct instances
+    friend class AsyncPersistenceManager;
+    friend std::unique_ptr<PersistenceStore> create_persistence_store();
+
+private:
+    // Private constructor - only accessible via friend classes
+    // This enforces that SqlitePersistence can only be created through
+    // AsyncPersistenceManager or the create_persistence_store() factory.
     SqlitePersistence() = default;
+
+public:
     ~SqlitePersistence() override;
 
     // Non-copyable, non-movable (owns sqlite3* handle)
@@ -16,6 +56,12 @@ public:
     SqlitePersistence& operator=(const SqlitePersistence&) = delete;
     SqlitePersistence(SqlitePersistence&&) = delete;
     SqlitePersistence& operator=(SqlitePersistence&&) = delete;
+
+    // -------------------------------------------------------------------------
+    // Public Interface (called from seastar::async context only)
+    // -------------------------------------------------------------------------
+    // WARNING: All methods below acquire _mutex and may block.
+    // Only call from AsyncPersistenceManager within seastar::async context.
 
     // Lifecycle
     bool open(const std::string& path) override;

@@ -480,8 +480,11 @@ size_t SqlitePersistence::last_load_skipped_count() const {
 }
 
 // Factory function implementation
+// Note: Cannot use make_unique here because SqlitePersistence has a private
+// constructor. The friend declaration allows this function to call new directly,
+// but make_unique's internal new call would fail the access check.
 std::unique_ptr<PersistenceStore> create_persistence_store() {
-    return std::make_unique<SqlitePersistence>();
+    return std::unique_ptr<PersistenceStore>(new SqlitePersistence());
 }
 
 } // namespace ranvier
