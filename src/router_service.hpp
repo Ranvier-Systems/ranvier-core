@@ -79,6 +79,22 @@ public:
     // Stop the TTL cleanup timer (call before shutdown)
     void stop_ttl_timer();
 
+    // ==========================================================================
+    // Lifecycle Management
+    // ==========================================================================
+    //
+    // RouterService registers metrics lambdas that may capture 'this' or access
+    // thread-local state (NodeSlab). To prevent use-after-free when Prometheus
+    // scrapes during/after shutdown:
+    //
+    // 1. stop() MUST be called before RouterService destruction
+    // 2. Metrics are deregistered FIRST, before any other cleanup
+    // 3. Only then are timers cancelled and gossip stopped
+    //
+    // Destruction order: metrics -> timers -> gossip -> destructor
+    //
+    seastar::future<> stop();
+
     // 1. DATA PLANE (Fast Lookups)
 
     // Unified routing entry point - encapsulates all routing mode logic
