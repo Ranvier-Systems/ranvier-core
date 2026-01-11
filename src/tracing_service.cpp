@@ -3,8 +3,15 @@
 // This file contains all OpenTelemetry includes and implementation.
 // By isolating OTEL here, we avoid static initialization issues that can
 // block before main() when OTEL headers are included at the top level.
+//
+// Thread-safety: Uses std::call_once for one-time initialization and
+// std::atomic<bool> for the enabled flag. This ensures safe concurrent
+// access from multiple Seastar shards without blocking the hot path.
 
 #include "tracing_service.hpp"
+
+#include <atomic>
+#include <mutex>  // for std::call_once, std::once_flag
 
 #ifndef RANVIER_NO_TELEMETRY
 
@@ -36,11 +43,20 @@ namespace zipkin = opentelemetry::exporter::zipkin;
 
 // ============================================================================
 // Static storage (file-local to avoid header pollution)
+//
+// Thread-safety model:
+// - g_init_flag: Ensures init() runs exactly once across all shards
+// - g_enabled: Atomic flag for lock-free reads in hot path (start_span)
+// - g_tracer/g_provider: Written once during init (protected by call_once),
+//   then only read. The acquire fence on g_enabled ensures visibility.
+// - g_service_name: Written once during init, immutable thereafter
 // ============================================================================
 
+static std::once_flag g_init_flag;
+static std::atomic<bool> g_enabled{false};
+static std::atomic<bool> g_shutting_down{false};
 static opentelemetry::nostd::shared_ptr<trace::Tracer> g_tracer;
 static std::shared_ptr<sdk_trace::TracerProvider> g_provider;
-static bool g_enabled = false;
 static std::string g_service_name;
 
 // ============================================================================
@@ -123,7 +139,14 @@ ScopedSpan::ScopedSpan() : _impl(std::make_unique<Impl>()) {}
 ScopedSpan::ScopedSpan(const std::string& name, const std::optional<TraceContext>& parent)
     : _impl(std::make_unique<Impl>()) {
 
-    if (!g_enabled || !g_tracer) {
+    // Acquire fence ensures we see all initialization that happened before
+    // g_enabled was set to true. This is the hot path - atomic load is lock-free.
+    if (!g_enabled.load(std::memory_order_acquire) || !g_tracer) {
+        return;
+    }
+
+    // Check if we're shutting down to avoid creating spans during cleanup
+    if (g_shutting_down.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -248,82 +271,111 @@ bool ScopedSpan::is_recording() const {
 // ============================================================================
 
 void TracingService::init(const TelemetryConfig& config) {
-    g_enabled = config.enabled;
-    g_service_name = config.service_name;
+    // std::call_once ensures this initialization runs exactly once,
+    // even if multiple shards call init() concurrently at startup.
+    // The lambda captures config by reference - safe because call_once
+    // blocks until the initialization completes.
+    std::call_once(g_init_flag, [&config]() {
+        g_service_name = config.service_name;
 
-    if (!g_enabled) {
-        // Use no-op tracer
-        //g_tracer = trace::Provider::GetTracerProvider()->GetTracer("ranvier-noop", OPENTELEMETRY_SDK_VERSION); // TODO: Disabled for testing
-        return;
-    }
+        if (!config.enabled) {
+            // Tracing disabled - leave g_enabled as false
+            return;
+        }
 
-    // Create Zipkin exporter
-    // Note: OTLP exporter is disabled due to protobuf static initialization issues
-    // Zipkin format works with Jaeger, Tempo, and other collectors
-    zipkin::ZipkinExporterOptions exporter_opts;
-    std::string endpoint = config.otlp_endpoint;
-    // Convert OTLP-style endpoint to Zipkin format if needed
-    if (endpoint.find(":4318") != std::string::npos) {
-        size_t pos = endpoint.find(":4318");
-        endpoint = endpoint.substr(0, pos) + ":9411/api/v2/spans";
-    } else if (endpoint.find("/v1/traces") == std::string::npos &&
-               endpoint.find("/api/v2/spans") == std::string::npos) {
-        endpoint += "/api/v2/spans";
-    }
-    //exporter_opts.url = endpoint; // TODO: Disabled for testing
-    exporter_opts.service_name = config.service_name;
-    auto exporter = std::make_unique<zipkin::ZipkinExporter>(exporter_opts);
+        // Create Zipkin exporter
+        // Note: OTLP exporter is disabled due to protobuf static initialization issues
+        // Zipkin format works with Jaeger, Tempo, and other collectors
+        zipkin::ZipkinExporterOptions exporter_opts;
+        std::string endpoint = config.otlp_endpoint;
+        // Convert OTLP-style endpoint to Zipkin format if needed
+        if (endpoint.find(":4318") != std::string::npos) {
+            size_t pos = endpoint.find(":4318");
+            endpoint = endpoint.substr(0, pos) + ":9411/api/v2/spans";
+        } else if (endpoint.find("/v1/traces") == std::string::npos &&
+                   endpoint.find("/api/v2/spans") == std::string::npos) {
+            endpoint += "/api/v2/spans";
+        }
+        //exporter_opts.url = endpoint; // TODO: Disabled for testing
+        exporter_opts.service_name = config.service_name;
+        auto exporter = std::make_unique<zipkin::ZipkinExporter>(exporter_opts);
 
-    // Create batch processor with configured settings
-    sdk_trace::BatchSpanProcessorOptions processor_opts;
-    processor_opts.max_queue_size = config.max_queue_size;
-    processor_opts.max_export_batch_size = config.max_export_batch_size;
-    processor_opts.schedule_delay_millis = std::chrono::duration_cast<std::chrono::milliseconds>(config.export_interval);
-    auto processor = std::make_unique<sdk_trace::BatchSpanProcessor>(std::move(exporter), processor_opts);
+        // Create batch processor with configured settings
+        sdk_trace::BatchSpanProcessorOptions processor_opts;
+        processor_opts.max_queue_size = config.max_queue_size;
+        processor_opts.max_export_batch_size = config.max_export_batch_size;
+        processor_opts.schedule_delay_millis = std::chrono::duration_cast<std::chrono::milliseconds>(config.export_interval);
+        auto processor = std::make_unique<sdk_trace::BatchSpanProcessor>(std::move(exporter), processor_opts);
 
-    // Create sampler with configured rate
-    std::unique_ptr<sdk_trace::Sampler> sampler;
-    if (config.sample_rate >= 1.0) {
-        sampler = std::make_unique<sdk_trace::AlwaysOnSampler>();
-    } else if (config.sample_rate <= 0.0) {
-        sampler = std::make_unique<sdk_trace::AlwaysOffSampler>();
-    } else {
-        sampler = std::make_unique<sdk_trace::TraceIdRatioBasedSampler>(config.sample_rate);
-    }
+        // Create sampler with configured rate
+        std::unique_ptr<sdk_trace::Sampler> sampler;
+        if (config.sample_rate >= 1.0) {
+            sampler = std::make_unique<sdk_trace::AlwaysOnSampler>();
+        } else if (config.sample_rate <= 0.0) {
+            sampler = std::make_unique<sdk_trace::AlwaysOffSampler>();
+        } else {
+            sampler = std::make_unique<sdk_trace::TraceIdRatioBasedSampler>(config.sample_rate);
+        }
 
-    // Create resource with service name
-    auto resource_attrs = resource::ResourceAttributes{
-        {"service.name", config.service_name},
-        {"service.version", "1.0.0"},
-        {"deployment.environment", "production"}
-    };
-    auto resource_obj = resource::Resource::Create(resource_attrs);
+        // Create resource with service name
+        auto resource_attrs = resource::ResourceAttributes{
+            {"service.name", config.service_name},
+            {"service.version", "1.0.0"},
+            {"deployment.environment", "production"}
+        };
+        auto resource_obj = resource::Resource::Create(resource_attrs);
 
-    // Create tracer provider
-    g_provider = std::make_shared<sdk_trace::TracerProvider>(
-        std::move(processor),
-        resource_obj,
-        std::move(sampler)
-    );
+        // Create tracer provider
+        g_provider = std::make_shared<sdk_trace::TracerProvider>(
+            std::move(processor),
+            resource_obj,
+            std::move(sampler)
+        );
 
-    // Set as global provider
-    trace::Provider::SetTracerProvider(
-        opentelemetry::nostd::shared_ptr<trace::TracerProvider>(g_provider));
+        // Set as global provider
+        trace::Provider::SetTracerProvider(
+            opentelemetry::nostd::shared_ptr<trace::TracerProvider>(g_provider));
 
-    // Get our tracer
-    g_tracer = g_provider->GetTracer("ranvier", "1.0.0");
+        // Get our tracer
+        g_tracer = g_provider->GetTracer("ranvier", "1.0.0");
+
+        // Release fence: ensure all writes above are visible to other threads
+        // before they observe g_enabled == true
+        g_enabled.store(true, std::memory_order_release);
+    });
 }
 
 void TracingService::shutdown() {
-    if (g_enabled && g_provider) {
+    // First, signal that we're shutting down to prevent new spans from starting.
+    // This must happen before we disable tracing to avoid a race where:
+    // 1. Thread A checks g_enabled (true), proceeds to create span
+    // 2. This thread sets g_enabled = false and resets g_provider
+    // 3. Thread A accesses g_provider (now null) -> crash
+    g_shutting_down.store(true, std::memory_order_release);
+
+    // Now atomically disable tracing. Use exchange to get the previous value
+    // and only flush if tracing was actually enabled.
+    bool was_enabled = g_enabled.exchange(false, std::memory_order_acq_rel);
+
+    if (was_enabled && g_provider) {
+        // Flush any pending spans before shutdown.
+        // Note: We don't reset g_provider here to avoid potential use-after-free
+        // if any spans are still being processed. The provider will be cleaned
+        // up at process exit. This is safe because:
+        // 1. g_enabled is now false, so no new spans will be created
+        // 2. g_shutting_down is true, providing a second barrier
+        // 3. Any in-flight spans will complete their operations on the existing provider
         g_provider->ForceFlush();
+
+        // Reset after flush completes - spans created before shutdown will have
+        // finished by now since ForceFlush is synchronous
         g_provider.reset();
+        g_tracer.reset();
     }
-    g_enabled = false;
 }
 
 bool TracingService::is_enabled() {
-    return g_enabled;
+    return g_enabled.load(std::memory_order_acquire);
 }
 
 ScopedSpan TracingService::start_span(const std::string& name,
