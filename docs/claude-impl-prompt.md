@@ -11,3 +11,7 @@ Pass 2: Refactor for clarity and modularity.
 Pass 3: Optimize for performance within our Async constraints.
 
 OUTPUT: Provide the final code for the modified files. Explain any architectural trade-offs.
+
+1. Static Analysis Only: Do not attempt to run cmake or build in your environment. Our dependencies (Seastar) are too heavy for the sandbox.
+2. API Verification: Verify syntax against the Seastar documentation logic.
+3. Manual Verification: I will handle the build in my Docker container and provide you with the logs if it fails.
