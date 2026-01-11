@@ -203,10 +203,22 @@ std::vector<TokenId> SqlitePersistence::deserialize_tokens(const void* data, siz
 
     size_t count = size / sizeof(TokenId);
 
-    // Sanity check: reject unreasonably large token sequences (> 1M tokens)
-    // This prevents allocation failures from corrupted size data
-    constexpr size_t MAX_TOKEN_COUNT = 1'000'000;
-    if (count > MAX_TOKEN_COUNT) {
+    // ========================================================================
+    // Persistence-Layer Corruption Safeguard (NOT Business Logic)
+    // ========================================================================
+    // This limit is a STORAGE SAFETY check to prevent allocation failures from
+    // corrupted blob data in the database. It is NOT a business-level validation.
+    //
+    // Business-level token count limits (e.g., max_route_tokens = 8192) are
+    // enforced in RouterService BEFORE data reaches the persistence layer.
+    // This follows the principle of separation of concerns:
+    //   - Business Layer (RouterService): Policy enforcement, route validation
+    //   - Persistence Layer (SqlitePersistence): Storage, serialization, corruption protection
+    //
+    // The 1M limit here is intentionally much higher than any business limit
+    // to catch only corrupted/malformed database records, not valid routes.
+    constexpr size_t MAX_TOKEN_COUNT_CORRUPTION_SAFEGUARD = 1'000'000;
+    if (count > MAX_TOKEN_COUNT_CORRUPTION_SAFEGUARD) {
         return {};
     }
 
