@@ -20,11 +20,21 @@ Layer 7+ load balancer for LLM inference using **Prefix Caching** to prevent KV-
 
 ## Anti-Patterns & Lessons Learned
 
-- Never use std::shared_ptr for Seastar objects; always use seastar::shared_ptr to avoid cross-CPU core deletion issues
-
 ### Security Audit Post-Mortem (2026-01-11)
 
 The following patterns were identified during an adversarial security audit. Each represents a "seemingly reasonable" approach that violates our Seastar/shared-nothing architecture or creates latent bugs in a 12k LOC C++20 codebase.
+
+---
+
+#### 0. The Cross-Core shared_ptr Anti-Pattern
+
+**THE PATTERN:** Using `std::shared_ptr<T>` for objects that live within a Seastar service, assuming "shared ownership" is always safe.
+
+**THE CONSEQUENCE:** `std::shared_ptr` uses atomic reference counting. When the last reference is released on a different CPU core than where the object was allocated, the destructor runs on the "wrong" shard—violating Seastar's shared-nothing model. This causes subtle data races, memory corruption, or crashes when the destructor accesses shard-local state.
+
+**THE LESSON:** *Hard Rule: For shard-local objects, prefer `std::unique_ptr`.* When shared ownership is truly needed within a single shard, use `seastar::lw_shared_ptr` (lightweight, non-atomic). Only use `seastar::shared_ptr` (with atomic refcount) when the pointer genuinely crosses shard boundaries via `seastar::foreign_ptr`.
+
+**PROMPT GUARD:** "Never use std::shared_ptr in Seastar code—use unique_ptr for single ownership, seastar::lw_shared_ptr for shard-local sharing, or foreign_ptr<shared_ptr<T>> for cross-shard transfer."
 
 ---
 
@@ -160,10 +170,11 @@ The following patterns were identified during an adversarial security audit. Eac
 
 ---
 
-### Quick Reference: The 11 Hard Rules
+### Quick Reference: The 12 Hard Rules
 
 | # | Rule | Violation |
 |---|------|-----------|
+| 0 | Prefer `unique_ptr`; use `lw_shared_ptr` for shard-local sharing | `std::shared_ptr` in Seastar code |
 | 1 | Metrics accessors must be lock-free | `std::mutex` in query method |
 | 2 | No `co_await` inside loops over external resources | Sequential await in for-loop |
 | 3 | Null-guard all C string returns | Direct cast of `sqlite3_column_text` |
