@@ -12,7 +12,11 @@ Layer 7+ load balancer for LLM inference using **Prefix Caching** to prevent KV-
 1. **NO LOCKS:** This is a Seastar project. Never use `std::mutex` or atomics. Use `seastar::smp::submit_to` for cross-core communication.
 2. **Async Only:** All I/O and cross-shard calls must return `seastar::future<>`.
 3. **Prefix Logic:** Routing is based on the Adaptive Radix Tree (ART) lookup of token sequences.
+4. **Visualize the FutureChain** Since Seastar relies heavily on Future/Promise chains, "Visualize the Future Chain" in ASCII or Mermaid diagrams before writing the code to prevent "Future Leaks" or blocking the reactor.
 
 ## Documentation Map
 - **API:** Admin on `:8080`, Data on `:8080`, Metrics on `:9180`.
 - **Persistence:** SQLite tracks backends and routes.
+
+## Anti-Patterns & Lessons Learned
+- Never use std::shared_ptr for Seastar objects; always use seastar::shared_ptr to avoid cross-CPU core deletion issues
