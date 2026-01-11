@@ -680,7 +680,7 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 ## 7. Security Audit Findings (Adversarial System Audit)
 
-> **Criticality Score: 4/10 (Moderate Risk)** _(was 6/10 before high-severity fixes)_
+> **Criticality Score: 3/10 (Low-Moderate Risk)** _(was 6/10 → 4/10 → 3/10)_
 > Generated: 2026-01-11 | Updated: 2026-01-11
 > Audit Scope: `src/` directory against `docs/claude-context.md` constraints
 
@@ -695,17 +695,19 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Severity:_ High
   _Fixed:_ PR #118 - Replaced with `std::atomic<size_t>` for lock-free access
 
-- [ ] **Replace sequential awaits with parallel_for_each in K8s discovery**
+- [x] **Replace sequential awaits with parallel_for_each in K8s discovery** ✓
   _Issue:_ Loop at `src/k8s_discovery_service.cpp:413-424` awaits each endpoint sequentially, causing O(n) latency for n endpoints.
   _Fix:_ Use `seastar::parallel_for_each` or `seastar::do_for_each` with batching.
   _Location:_ `src/k8s_discovery_service.cpp:413-424`
   _Severity:_ Medium
+  _Fixed:_ PR #122 - Added `max_concurrent_for_each` with 16-op limit, per-endpoint error handling
 
-- [ ] **Audit 16+ mutex usages in SQLite persistence layer**
+- [x] **Audit 16+ mutex usages in SQLite persistence layer** ✓
   _Issue:_ `src/sqlite_persistence.cpp` contains 16+ `std::lock_guard<std::mutex>` calls. While these run in `seastar::async`, any path that bypasses async wrapper blocks reactor.
   _Fix:_ Ensure all SQLite access is routed through AsyncPersistenceManager; add static analysis to prevent direct access.
   _Location:_ `src/sqlite_persistence.cpp` (multiple locations)
   _Severity:_ Medium
+  _Fixed:_ PR #123 - Documented threading model, added friend declarations and private constructor for compile-time access control
 
 ### 7.2 Edge-Case Crash Scenarios
 
@@ -716,11 +718,12 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Severity:_ High
   _Fixed:_ PR #119 - Added `safe_column_text()` helper, skip records with NULL required fields
 
-- [ ] **Add port validation before stoi conversion in K8s discovery**
+- [x] **Add port validation before stoi conversion in K8s discovery** ✓
   _Issue:_ `src/k8s_discovery_service.cpp:243` uses `std::stoi()` without validation. Non-numeric or out-of-range values throw uncaught exceptions.
   _Fix:_ Add try-catch or use `std::from_chars` with validation before `static_cast<uint16_t>`.
   _Location:_ `src/k8s_discovery_service.cpp:243`
   _Severity:_ Medium
+  _Fixed:_ PR #124 - Added `parse_port()` helper with validation (1-65535 range), 22 unit tests
 
 - [ ] **Handle DNS resolution exceptions in K8s discovery**
   _Issue:_ DNS resolution at `src/k8s_discovery_service.cpp:276-279` can throw unhandled exceptions on network failure.
@@ -838,6 +841,9 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-11 | **[Security Audit 7.2.2]** Add port validation in K8s discovery (parse_port helper, 22 unit tests) | #124 |
+| 2026-01-11 | **[Security Audit 7.1.3]** Audit SQLite mutex threading model (documentation, friend declarations, private constructor) | #123 |
+| 2026-01-11 | **[Security Audit 7.1.2]** Parallelize K8s endpoint reconciliation (max_concurrent_for_each, 16-op limit) | #122 |
 | 2026-01-11 | **[Security Audit 7.4.1]** Add bounds checking to pending remote routes buffer (MAX_BUFFER_SIZE=10000, batch-drop, overflow metric) | #120 |
 | 2026-01-11 | **[Security Audit 7.2.1]** Add null guards for sqlite3_column_text (safe_column_text helper, skip NULL records) | #119 |
 | 2026-01-11 | **[Security Audit 7.1.1]** Replace blocking mutex with atomic in queue_depth() (std::atomic for lock-free access) | #118 |
