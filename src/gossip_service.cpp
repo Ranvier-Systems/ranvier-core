@@ -236,8 +236,15 @@ seastar::future<> GossipService::start() {
                 }
             });
 
-            // Set up periodic discovery refresh
+            // Set up periodic discovery refresh with RAII timer safety
             _discovery_timer.set_callback([this] {
+                // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+                try {
+                    [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+                } catch (const seastar::gate_closed_exception&) {
+                    return;
+                }
+
                 if (_discovery_enabled && _running) {
                     (void)refresh_peers().handle_exception([](auto ep) {
                         try {
@@ -268,6 +275,20 @@ seastar::future<> GossipService::stop() {
 
     log_gossip.info("Stopping gossip service");
     _running = false;
+
+    // RAII Timer Safety: Close the timer gate FIRST to ensure no timer callbacks
+    // can execute during or after shutdown. This waits for any in-flight timer
+    // callbacks to complete before proceeding.
+    //
+    // Order is critical:
+    //   1. Set _running = false
+    //   2. Close _timer_gate (waits for in-flight callbacks)
+    //   3. Cancel all timers (prevents future callbacks)
+    //   4. Shutdown channel and other resources
+    //
+    // This guarantees no timer callback can access `this` after stop() returns.
+    co_await _timer_gate.close();
+    log_gossip.debug("Timer gate closed - all timer callbacks completed");
 
     // Important: Shutdown the channel first.
     // This wakes up the pending _channel->receive() call with an exception.
@@ -670,6 +691,14 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
 }
 
 seastar::future<> GossipService::broadcast_heartbeat() {
+    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), exit safely without accessing state.
+    try {
+        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return seastar::make_ready_future<>();
+    }
+
     if (!_channel || _peer_addresses.empty()) {
         return seastar::make_ready_future<>();
     }
@@ -708,6 +737,14 @@ void GossipService::update_peer_liveness(const seastar::socket_address& addr) {
 }
 
 void GossipService::check_liveness() {
+    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), exit safely without accessing state.
+    try {
+        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return;
+    }
+
     auto now = seastar::lowres_clock::now();
     uint64_t alive_count = 0;
 
@@ -1159,6 +1196,14 @@ bool GossipService::is_duplicate(const seastar::socket_address& peer, uint32_t s
 
 // Reliable delivery: process pending retries
 void GossipService::process_retries() {
+    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), exit safely without accessing state.
+    try {
+        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return;
+    }
+
     if (!_channel || !_running) {
         return;
     }
@@ -1278,11 +1323,18 @@ seastar::future<> GossipService::initialize_dtls() {
     log_gossip.info("DTLS initialized successfully");
     log_gossip.info("DTLS peer verification: {}", _config.tls.verify_peer ? "enabled (mTLS)" : "disabled");
 
-    // Set up certificate reload timer if enabled
+    // Set up certificate reload timer if enabled with RAII timer safety
     if (_config.tls.cert_reload_interval.count() > 0) {
         log_gossip.info("Certificate hot-reload enabled: interval={}s",
                         _config.tls.cert_reload_interval.count());
         _cert_reload_timer.set_callback([this] {
+            // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+            try {
+                [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+            } catch (const seastar::gate_closed_exception&) {
+                return;
+            }
+
             // Fire-and-forget the async cert reload check
             (void)check_cert_reload().handle_exception([](auto ep) {
                 try {
@@ -1546,6 +1598,14 @@ seastar::future<> GossipService::check_cert_reload() {
 }
 
 void GossipService::cleanup_dtls_sessions() {
+    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), exit safely without accessing state.
+    try {
+        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return;
+    }
+
     if (!_dtls_context) {
         return;
     }
