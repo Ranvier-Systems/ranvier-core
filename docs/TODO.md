@@ -512,85 +512,6 @@ Tooling, testing, and documentation improvements for contributors and operators.
 
 ---
 
-## Priority Matrix
-
-| Priority | Category | Item | Effort | Status |
-|----------|----------|------|--------|--------|
-| **P0 - Critical** | Security | Non-root container execution | Low | ✅ Done |
-| **P0 - Critical** | Security | mTLS for gossip protocol | High | ✅ Done |
-| **P1 - High** | Reliability | Split-brain detection | High | ✅ Done |
-| **P1 - High** | Reliability | Quorum enforcement and DTLS lockdown | Medium | ✅ Done |
-| **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
-| **P1 - High** | Security | API key rotation | Medium | ✅ Done |
-| **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
-| **P1 - High** | Performance | Async persistence (reactor stall fix) | Medium | ✅ Done |
-| **P1 - High** | Performance | Batch remote route updates (SMP storm fix) | Medium | ✅ Done |
-| **P1 - High** | Performance | Replace shared_ptr with unique_ptr in RadixTree | Medium | ✅ Done |
-| **P1 - High** | Reliability | System-wide backpressure mechanism | Medium | ✅ Done |
-| **P1 - High** | Performance | Shard-aware P2C load balancer | Medium | ✅ Done |
-| **P2 - Medium** | Performance | Zero-copy StreamParser optimization | Medium | ✅ Done |
-| **P2 - Medium** | Reliability | CrossShardRequest size validation | Low | ✅ Done |
-| **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
-| **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
-| **P2 - Medium** | DX | Benchmark regression CI | Medium | |
-| **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
-| **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
-| **P3 - Low** | DX | OpenAPI specification | Low | ✅ Done |
-| **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
-| **P2 - Medium** | DX | Application bootstrap refactoring | Medium | ✅ Done |
-| **P3 - Low** | DX | Seastar-native signal handling | Low | ✅ Done |
-| **P2 - Medium** | DX | Sharded configuration for per-core access | Medium | ✅ Done |
-| **P3 - Low** | DX | Encapsulate SQLite store within AsyncPersistenceManager | Low | ✅ Done |
-| **P3 - Low** | Performance | Async file I/O for tokenizer loading | Low | ✅ Done |
-| **P3 - Low** | Observability | Radix tree performance metrics | Low | ✅ Done |
-| **P2 - Medium** | DX | Python admin SDK (rvctl CLI) | Medium | ✅ Done |
-
----
-
-## Completed Items
-
-_Move completed items here with completion date and PR reference._
-
-| Date | Item | PR |
-|------|------|----|
-| 2026-01-11 | Optimize StreamParser with read-position tracking (zero-copy parsing, buffer compaction, size limits) | - |
-| 2026-01-11 | Add validated factory functions for CrossShardRequestContext (size limits, memory estimation) | - |
-| 2026-01-10 | Create rvctl CLI tool for Ranvier management (inspect routes/backends, cluster status, drain, route add) | #110 |
-| 2026-01-09 | Refactor CryptoOffloader for clarity (unified template handling, queue depth limiting, dedicated execute_inline/offloaded methods) | - |
-| 2026-01-09 | Add radix tree performance metrics (lookup hits/misses, node counts, slab utilization, path compression avg) | - |
-| 2026-01-09 | Quorum enforcement and DTLS lockdown (recently-seen quorum check, mTLS lockdown mode, sequence number hardening) | - |
-| 2026-01-08 | Implement shard-aware P2C load balancer (per-shard metrics, cross-shard dispatch, zero-copy transfer) | - |
-| 2026-01-07 | Implement system-wide backpressure mechanism (semaphore concurrency limits, persistence queue integration, gossip gate protection) | - |
-| 2026-01-06 | Use Seastar async file I/O for tokenizer loading (DMA file I/O, validation, proper cleanup) | - |
-| 2026-01-06 | Encapsulate SQLite store within AsyncPersistenceManager (clean ownership, lifecycle methods) | - |
-| 2026-01-06 | Refactor configuration for Seastar sharded container (per-core lock-free access, hot-reload) | - |
-| 2026-01-06 | Implement Seastar-native signal handling (SIGINT hard kill, SIGTERM graceful, SIGHUP reload) | - |
-| 2026-01-05 | Refactor initialization into Application class (service lifecycle management) | - |
-| 2026-01-05 | Replace shared_ptr with unique_ptr in RadixTree (Seastar optimization) | - |
-| 2026-01-05 | Batch remote route updates to prevent SMP storm (99% message reduction) | - |
-| 2026-01-05 | Decouple SQLite persistence from reactor thread (AsyncPersistenceManager) | - |
-| 2026-01-05 | Prevent reactor stalls in DTLS crypto operations (adaptive offloading) | - |
-| 2025-01-04 | Implement split-brain detection with quorum-aware health checks | - |
-| 2025-01-04 | Add development container (devcontainer) | - |
-| 2025-01-04 | Generate OpenAPI 3.0 specification for HTTP API | - |
-| 2025-01-04 | Implement mTLS/DTLS encryption for gossip protocol (P0 security) | - |
-| 2025-01-04 | Add pre-built Docker images to GHCR | - |
-| 2025-01-03 | Create Helm chart for Kubernetes deployment | - |
-| 2025-01-03 | API key rotation mechanism with expiry and hot-reload | - |
-| 2025-01-03 | Add cache hit/miss ratio gauge (Prometheus) | - |
-| 2025-01-03 | Add per-backend latency histograms (Prometheus) | - |
-| 2025-01-02 | Add reliable delivery with acknowledgments (gossip protocol) | - |
-| 2025-01-02 | Implement duplicate suppression (gossip protocol) | - |
-| 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
-| 2025-01-01 | Fix: Persistence state corruption after crash | - |
-| 2024-12-XX | Accept pre-tokenized client input | #50 |
-| 2024-12-XX | Locust load testing infrastructure | #49 |
-| 2024-12-XX | Abseil high-performance containers | #48 |
-| 2024-12-XX | Multi-node integration tests | #47 |
-| 2024-12-XX | Request rewriting for token forwarding | #46 |
-
----
-
 ## 6. Integration Tests (End-to-End Validation)
 
 Comprehensive E2E tests validating the full request pipeline:
@@ -741,6 +662,85 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 | `Makefile` | Modify | Add test targets |
 
 **Total: 13 files (9 new, 4 modified)**
+
+---
+
+## Priority Matrix
+
+| Priority | Category | Item | Effort | Status |
+|----------|----------|------|--------|--------|
+| **P0 - Critical** | Security | Non-root container execution | Low | ✅ Done |
+| **P0 - Critical** | Security | mTLS for gossip protocol | High | ✅ Done |
+| **P1 - High** | Reliability | Split-brain detection | High | ✅ Done |
+| **P1 - High** | Reliability | Quorum enforcement and DTLS lockdown | Medium | ✅ Done |
+| **P1 - High** | Reliability | Reliable gossip delivery | Medium | ✅ Done |
+| **P1 - High** | Security | API key rotation | Medium | ✅ Done |
+| **P1 - High** | Observability | OpenTelemetry integration | Medium | ✅ Done |
+| **P1 - High** | Performance | Async persistence (reactor stall fix) | Medium | ✅ Done |
+| **P1 - High** | Performance | Batch remote route updates (SMP storm fix) | Medium | ✅ Done |
+| **P1 - High** | Performance | Replace shared_ptr with unique_ptr in RadixTree | Medium | ✅ Done |
+| **P1 - High** | Reliability | System-wide backpressure mechanism | Medium | ✅ Done |
+| **P1 - High** | Performance | Shard-aware P2C load balancer | Medium | ✅ Done |
+| **P2 - Medium** | Performance | Zero-copy StreamParser optimization | Medium | ✅ Done |
+| **P2 - Medium** | Reliability | CrossShardRequest size validation | Low | ✅ Done |
+| **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
+| **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
+| **P2 - Medium** | DX | Benchmark regression CI | Medium | |
+| **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
+| **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
+| **P3 - Low** | DX | OpenAPI specification | Low | ✅ Done |
+| **P3 - Low** | DX | Pre-built Docker images | Low | ✅ Done |
+| **P2 - Medium** | DX | Application bootstrap refactoring | Medium | ✅ Done |
+| **P3 - Low** | DX | Seastar-native signal handling | Low | ✅ Done |
+| **P2 - Medium** | DX | Sharded configuration for per-core access | Medium | ✅ Done |
+| **P3 - Low** | DX | Encapsulate SQLite store within AsyncPersistenceManager | Low | ✅ Done |
+| **P3 - Low** | Performance | Async file I/O for tokenizer loading | Low | ✅ Done |
+| **P3 - Low** | Observability | Radix tree performance metrics | Low | ✅ Done |
+| **P2 - Medium** | DX | Python admin SDK (rvctl CLI) | Medium | ✅ Done |
+
+---
+
+## Completed Items
+
+_Move completed items here with completion date and PR reference._
+
+| Date | Item | PR |
+|------|------|----|
+| 2026-01-11 | Optimize StreamParser with read-position tracking (zero-copy parsing, buffer compaction, size limits) | - |
+| 2026-01-11 | Add validated factory functions for CrossShardRequestContext (size limits, memory estimation) | - |
+| 2026-01-10 | Create rvctl CLI tool for Ranvier management (inspect routes/backends, cluster status, drain, route add) | #110 |
+| 2026-01-09 | Refactor CryptoOffloader for clarity (unified template handling, queue depth limiting, dedicated execute_inline/offloaded methods) | - |
+| 2026-01-09 | Add radix tree performance metrics (lookup hits/misses, node counts, slab utilization, path compression avg) | - |
+| 2026-01-09 | Quorum enforcement and DTLS lockdown (recently-seen quorum check, mTLS lockdown mode, sequence number hardening) | - |
+| 2026-01-08 | Implement shard-aware P2C load balancer (per-shard metrics, cross-shard dispatch, zero-copy transfer) | - |
+| 2026-01-07 | Implement system-wide backpressure mechanism (semaphore concurrency limits, persistence queue integration, gossip gate protection) | - |
+| 2026-01-06 | Use Seastar async file I/O for tokenizer loading (DMA file I/O, validation, proper cleanup) | - |
+| 2026-01-06 | Encapsulate SQLite store within AsyncPersistenceManager (clean ownership, lifecycle methods) | - |
+| 2026-01-06 | Refactor configuration for Seastar sharded container (per-core lock-free access, hot-reload) | - |
+| 2026-01-06 | Implement Seastar-native signal handling (SIGINT hard kill, SIGTERM graceful, SIGHUP reload) | - |
+| 2026-01-05 | Refactor initialization into Application class (service lifecycle management) | - |
+| 2026-01-05 | Replace shared_ptr with unique_ptr in RadixTree (Seastar optimization) | - |
+| 2026-01-05 | Batch remote route updates to prevent SMP storm (99% message reduction) | - |
+| 2026-01-05 | Decouple SQLite persistence from reactor thread (AsyncPersistenceManager) | - |
+| 2026-01-05 | Prevent reactor stalls in DTLS crypto operations (adaptive offloading) | - |
+| 2025-01-04 | Implement split-brain detection with quorum-aware health checks | - |
+| 2025-01-04 | Add development container (devcontainer) | - |
+| 2025-01-04 | Generate OpenAPI 3.0 specification for HTTP API | - |
+| 2025-01-04 | Implement mTLS/DTLS encryption for gossip protocol (P0 security) | - |
+| 2025-01-04 | Add pre-built Docker images to GHCR | - |
+| 2025-01-03 | Create Helm chart for Kubernetes deployment | - |
+| 2025-01-03 | API key rotation mechanism with expiry and hot-reload | - |
+| 2025-01-03 | Add cache hit/miss ratio gauge (Prometheus) | - |
+| 2025-01-03 | Add per-backend latency histograms (Prometheus) | - |
+| 2025-01-02 | Add reliable delivery with acknowledgments (gossip protocol) | - |
+| 2025-01-02 | Implement duplicate suppression (gossip protocol) | - |
+| 2025-01-01 | Fix: Seastar output_stream assertion failure under load | - |
+| 2025-01-01 | Fix: Persistence state corruption after crash | - |
+| 2024-12-XX | Accept pre-tokenized client input | #50 |
+| 2024-12-XX | Locust load testing infrastructure | #49 |
+| 2024-12-XX | Abseil high-performance containers | #48 |
+| 2024-12-XX | Multi-node integration tests | #47 |
+| 2024-12-XX | Request rewriting for token forwarding | #46 |
 
 ---
 
