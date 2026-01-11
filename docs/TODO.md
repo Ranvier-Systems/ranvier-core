@@ -680,7 +680,7 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 ## 7. Security Audit Findings (Adversarial System Audit)
 
-> **Criticality Score: 2/10 (Low Risk)** _(was 6/10 → 4/10 → 3/10 → 2/10)_
+> **Criticality Score: 1/10 (Minimal Risk)** _(was 6/10 → 4/10 → 3/10 → 2/10 → 1/10)_
 > Generated: 2026-01-11 | Updated: 2026-01-11
 > Audit Scope: `src/` directory against `docs/claude-context.md` constraints
 
@@ -775,29 +775,33 @@ Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, 
   _Severity:_ High
   _Fixed:_ PR #120 - Added MAX_BUFFER_SIZE (10000) with batch-drop strategy and overflow metric
 
-- [ ] **Add connection pool max age reaping**
+- [x] **Add connection pool max age reaping** ✓
   _Issue:_ Connection pool lacks TTL for idle connections. Long-running instances accumulate stale connections.
   _Fix:_ Add configurable `max_connection_age` with periodic reaping.
   _Location:_ `src/connection_pool.hpp`
   _Severity:_ Medium
+  _Fixed:_ PR #130 - Added created_at timestamp, is_too_old(), max_connection_age config (default 5min)
 
-- [ ] **Add RAII guards for timer callbacks**
+- [x] **Add RAII guards for timer callbacks** ✓
   _Issue:_ Timer callbacks in `src/async_persistence.cpp` and `src/gossip_service.cpp` capture `this` without ensuring object lifetime.
   _Fix:_ Use weak_ptr or explicit cancellation in destructor; verify all timers cancelled before object destruction.
   _Location:_ `src/async_persistence.cpp:106-112`, `src/gossip_service.cpp`
   _Severity:_ Medium
+  _Fixed:_ PR #131 - Added _timer_gate to both services, callbacks acquire holder, stop() closes gate first
 
-- [ ] **Add lifetime guards for metrics lambda captures**
+- [x] **Add lifetime guards for metrics lambda captures** ✓
   _Issue:_ `src/router_service.cpp:227-228` metrics lambdas capture `this` without lifetime protection. Metrics collection after service shutdown causes use-after-free.
   _Fix:_ Use weak_ptr capture or ensure metrics deregistration in destructor.
   _Location:_ `src/router_service.cpp:227-228`
   _Severity:_ Medium
+  _Fixed:_ PR #132 - Added stop() that calls _metrics.clear() first, deregisters before destruction
 
-- [ ] **Add upper bound to StreamParser accumulator**
+- [x] **Add upper bound to StreamParser accumulator** ✓
   _Issue:_ `src/stream_parser.cpp:26` accumulator can grow to ~1MB per connection before detection. Slowloris-style attack exhausts memory.
   _Fix:_ Add incremental size checking; reject early when approaching limit.
   _Location:_ `src/stream_parser.cpp:26`
   _Severity:_ Medium
+  _Fixed:_ PR #133 - Added max_accumulator_size (1MB), early check before append, rejection counter
 
 ---
 
@@ -844,6 +848,10 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-11 | **[Security Audit 7.4.5]** Add upper bound to StreamParser accumulator (1MB limit, early rejection) | #133 |
+| 2026-01-11 | **[Security Audit 7.4.4]** Add lifecycle guards for RouterService metrics lambdas (stop() clears metrics first) | #132 |
+| 2026-01-11 | **[Security Audit 7.4.3]** Add RAII guards for timer callbacks (_timer_gate in AsyncPersistence/GossipService) | #131 |
+| 2026-01-11 | **[Security Audit 7.4.2]** Add connection pool max age reaping (TTL, created_at, is_too_old) | #130 |
 | 2026-01-11 | **[Security Audit 7.3.2]** Move routing mode decisions to RouterService (RouteResult struct, unified API) | #128 |
 | 2026-01-11 | **[Security Audit 7.2.5]** Eliminate tracing service global static race (call_once, atomic, shutdown guard) | #127 |
 | 2026-01-11 | **[Security Audit 7.2.3]** Handle DNS resolution exceptions in K8s discovery (async resolver, retry, caching) | #126 |
