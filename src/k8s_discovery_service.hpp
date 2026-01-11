@@ -49,6 +49,12 @@ constexpr const char* K8S_ANNOTATION_PRIORITY = "ranvier.io/priority";
 constexpr uint32_t K8S_DEFAULT_WEIGHT = 100;
 constexpr uint32_t K8S_DEFAULT_PRIORITY = 0;
 
+// Maximum allowed values (for sanity checks)
+// Weight: 1,000,000 allows fine-grained load distribution
+// Priority: 1000 levels should be more than enough for any deployment
+constexpr uint32_t K8S_MAX_WEIGHT = 1000000;
+constexpr uint32_t K8S_MAX_PRIORITY = 1000;
+
 // Represents a discovered backend endpoint
 struct K8sEndpoint {
     std::string uid;                      // Unique identifier (pod UID + address)
