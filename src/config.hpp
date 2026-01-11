@@ -334,6 +334,11 @@ struct K8sDiscoveryConfig {
 
     // Label selector (optional, filters EndpointSlices)
     std::string label_selector;
+
+    // DNS resolution settings
+    std::chrono::seconds dns_timeout{5};                   // Timeout for DNS resolution
+    uint32_t dns_max_retries = 3;                          // Max retry attempts for transient DNS failures
+    std::chrono::milliseconds dns_initial_backoff{100};    // Initial backoff delay for DNS retries
 };
 
 // OpenTelemetry distributed tracing configuration
@@ -732,6 +737,15 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_K8S_LABEL_SELECTOR")) {
         k8s_discovery.label_selector = *v;
     }
+    if (auto v = get_env_as<int>("RANVIER_K8S_DNS_TIMEOUT")) {
+        k8s_discovery.dns_timeout = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_K8S_DNS_MAX_RETRIES")) {
+        k8s_discovery.dns_max_retries = *v;
+    }
+    if (auto v = get_env_as<int>("RANVIER_K8S_DNS_INITIAL_BACKOFF_MS")) {
+        k8s_discovery.dns_initial_backoff = std::chrono::milliseconds(*v);
+    }
 
     // Telemetry overrides
     if (auto v = get_env("RANVIER_TELEMETRY_ENABLED")) {
@@ -1120,6 +1134,15 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (k["verify_tls"]) config.k8s_discovery.verify_tls = k["verify_tls"].as<bool>();
             if (k["label_selector"]) config.k8s_discovery.label_selector = k["label_selector"].as<std::string>();
+            if (k["dns_timeout_seconds"]) {
+                config.k8s_discovery.dns_timeout = std::chrono::seconds(k["dns_timeout_seconds"].as<int>());
+            }
+            if (k["dns_max_retries"]) {
+                config.k8s_discovery.dns_max_retries = k["dns_max_retries"].as<uint32_t>();
+            }
+            if (k["dns_initial_backoff_ms"]) {
+                config.k8s_discovery.dns_initial_backoff = std::chrono::milliseconds(k["dns_initial_backoff_ms"].as<int>());
+            }
         }
 
         // Telemetry section (OpenTelemetry distributed tracing)

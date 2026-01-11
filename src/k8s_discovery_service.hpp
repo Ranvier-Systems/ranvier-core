@@ -32,6 +32,7 @@
 #include <seastar/core/timer.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/tls.hh>
 
@@ -134,12 +135,24 @@ private:
     uint64_t _endpoints_added = 0;
     uint64_t _endpoints_removed = 0;
     uint64_t _watch_reconnects = 0;
+    uint64_t _dns_resolutions = 0;
+    uint64_t _dns_failures = 0;
+    uint64_t _dns_timeouts = 0;
+    uint64_t _dns_cache_hits = 0;
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;
 
     // Futures for background tasks
     seastar::future<> _watch_future;
+
+    // Cached API server address for graceful degradation
+    std::optional<seastar::socket_address> _cached_api_server_addr;
+
+    // Resolve API server hostname to socket address with retry and caching
+    // Returns resolved address, or uses cached address on transient failures
+    seastar::future<seastar::socket_address> resolve_api_server(
+        const std::string& host, uint16_t port);
 
     // Load service account token from file
     seastar::future<> load_service_account_token();

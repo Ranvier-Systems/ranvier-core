@@ -21,8 +21,11 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 #include <seastar/net/tls.hh>
 
@@ -97,7 +100,15 @@ K8sDiscoveryService::K8sDiscoveryService(const K8sDiscoveryConfig& config)
         seastar::metrics::make_counter("k8s_watch_reconnects", _watch_reconnects,
             seastar::metrics::description("Total number of K8s watch reconnections")),
         seastar::metrics::make_gauge("k8s_endpoints_current", [this] { return _endpoints.size(); },
-            seastar::metrics::description("Current number of discovered K8s endpoints"))
+            seastar::metrics::description("Current number of discovered K8s endpoints")),
+        seastar::metrics::make_counter("k8s_dns_resolutions", _dns_resolutions,
+            seastar::metrics::description("Total number of DNS resolutions for K8s API server")),
+        seastar::metrics::make_counter("k8s_dns_failures", _dns_failures,
+            seastar::metrics::description("Total number of DNS resolution failures")),
+        seastar::metrics::make_counter("k8s_dns_timeouts", _dns_timeouts,
+            seastar::metrics::description("Total number of DNS resolution timeouts")),
+        seastar::metrics::make_counter("k8s_dns_cache_hits", _dns_cache_hits,
+            seastar::metrics::description("Total number of DNS cache hits (fallback to cached address)"))
     });
 }
 
@@ -298,6 +309,121 @@ std::pair<std::string, uint16_t> K8sDiscoveryService::parse_api_server() const {
     return {host, port};
 }
 
+seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server(
+    const std::string& host, uint16_t port) {
+
+    // Fast path: Try parsing as direct IP address
+    try {
+        seastar::net::inet_address inet_addr(host);
+        auto addr = seastar::socket_address(inet_addr, port);
+        // Cache successful resolution for graceful degradation
+        _cached_api_server_addr = addr;
+        co_return addr;
+    } catch (...) {
+        // Not a valid IP, proceed with DNS resolution
+    }
+
+    // DNS resolution with retry and exponential backoff
+    uint32_t attempt = 0;
+    auto backoff = _config.dns_initial_backoff;
+    std::exception_ptr last_exception;
+
+    while (attempt <= _config.dns_max_retries) {
+        try {
+            ++_dns_resolutions;
+
+            // Use Seastar's async DNS resolver with timeout
+            auto deadline = seastar::lowres_clock::now() + _config.dns_timeout;
+
+            auto hostent = co_await seastar::with_timeout(
+                deadline,
+                seastar::net::dns::get_host_by_name(host)
+            );
+
+            if (hostent.addr_list.empty()) {
+                log_k8s.error("DNS resolution returned no addresses for: {} - "
+                              "check CoreDNS/kube-dns configuration and network connectivity",
+                              host);
+                ++_dns_failures;
+                throw std::runtime_error("DNS resolution returned no addresses for: " + host);
+            }
+
+            // Use the first address
+            auto addr = seastar::socket_address(hostent.addr_list[0], port);
+
+            // Cache successful resolution for graceful degradation
+            _cached_api_server_addr = addr;
+
+            log_k8s.debug("DNS resolved {} to {} (attempt {})",
+                          host, hostent.addr_list[0], attempt + 1);
+
+            co_return addr;
+
+        } catch (const seastar::timed_out_error&) {
+            ++_dns_timeouts;
+            last_exception = std::current_exception();
+
+            log_k8s.warn("DNS resolution timed out for {} (attempt {}/{}, timeout={}s) - "
+                         "check network connectivity and DNS server responsiveness",
+                         host, attempt + 1, _config.dns_max_retries + 1,
+                         _config.dns_timeout.count());
+
+        } catch (const std::system_error& e) {
+            ++_dns_failures;
+            last_exception = std::current_exception();
+
+            // Provide actionable guidance based on error type
+            if (e.code().value() == ENOENT || e.code().value() == ENOTDIR) {
+                log_k8s.warn("DNS resolution failed for {} (attempt {}/{}) - "
+                             "host not found: {} - verify kubernetes.default.svc is resolvable "
+                             "and /etc/resolv.conf points to cluster DNS",
+                             host, attempt + 1, _config.dns_max_retries + 1, e.what());
+            } else {
+                log_k8s.warn("DNS resolution failed for {} (attempt {}/{}): {} - "
+                             "check network connectivity and DNS configuration",
+                             host, attempt + 1, _config.dns_max_retries + 1, e.what());
+            }
+
+        } catch (const std::exception& e) {
+            ++_dns_failures;
+            last_exception = std::current_exception();
+
+            log_k8s.warn("DNS resolution failed for {} (attempt {}/{}): {}",
+                         host, attempt + 1, _config.dns_max_retries + 1, e.what());
+        }
+
+        // Check if we should retry
+        if (attempt < _config.dns_max_retries) {
+            log_k8s.debug("Retrying DNS resolution in {}ms", backoff.count());
+            co_await seastar::sleep(backoff);
+
+            // Exponential backoff with 2x multiplier, capped at 5 seconds
+            backoff = std::min(backoff * 2, std::chrono::milliseconds(5000));
+        }
+
+        ++attempt;
+    }
+
+    // All retries exhausted - try to use cached address for graceful degradation
+    if (_cached_api_server_addr.has_value()) {
+        ++_dns_cache_hits;
+        log_k8s.warn("DNS resolution failed after {} attempts for {} - "
+                     "falling back to cached address {} for graceful degradation",
+                     _config.dns_max_retries + 1, host, _cached_api_server_addr.value());
+        co_return _cached_api_server_addr.value();
+    }
+
+    // No cached address available - must fail
+    log_k8s.error("DNS resolution failed after {} attempts for {} with no cached fallback - "
+                  "discovery service will be unavailable until DNS is restored. "
+                  "Actions: 1) Check CoreDNS pods are running: kubectl get pods -n kube-system -l k8s-app=kube-dns "
+                  "2) Verify /etc/resolv.conf in the pod "
+                  "3) Test with: kubectl exec <pod> -- nslookup {}",
+                  _config.dns_max_retries + 1, host, host);
+
+    std::rethrow_exception(last_exception);
+}
+
 std::string K8sDiscoveryService::build_url(const std::string& path) const {
     return _config.api_server + path;
 }
@@ -311,17 +437,8 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
     log_k8s.debug("K8s GET {} (host={}, port={}, tls={})", path, host, port, use_tls);
 
     try {
-        // Resolve host
-        seastar::socket_address addr;
-        try {
-            seastar::net::inet_address inet_addr(host);
-            addr = seastar::socket_address(inet_addr, port);
-        } catch (...) {
-            // Host might be a DNS name - in K8s, kubernetes.default.svc resolves via DNS
-            // For now, try direct IP parsing; real implementation would use DNS resolver
-            log_k8s.error("Cannot resolve host: {} - DNS resolution not implemented", host);
-            throw std::runtime_error("Cannot resolve host: " + host);
-        }
+        // Resolve host using DNS-aware resolver with retry and graceful degradation
+        seastar::socket_address addr = co_await resolve_api_server(host, port);
 
         // Connect
         seastar::connected_socket sock;
@@ -851,7 +968,8 @@ seastar::future<> K8sDiscoveryService::k8s_watch(
     auto [host, port] = parse_api_server();
     bool use_tls = _config.api_server.starts_with("https://");
 
-    seastar::socket_address addr(seastar::net::inet_address(host), port);
+    // Resolve host using DNS-aware resolver with retry and graceful degradation
+    seastar::socket_address addr = co_await resolve_api_server(host, port);
 
     seastar::connected_socket sock;
     if (use_tls && _tls_creds) {
