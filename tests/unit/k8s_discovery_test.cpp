@@ -228,6 +228,8 @@ std::string get_error_message(const std::string& json) {
 
 constexpr uint32_t K8S_DEFAULT_WEIGHT = 100;
 constexpr uint32_t K8S_DEFAULT_PRIORITY = 0;
+constexpr uint32_t K8S_MAX_WEIGHT = 1000000;
+constexpr uint32_t K8S_MAX_PRIORITY = 1000;
 
 struct K8sEndpoint {
     std::string uid;
@@ -384,6 +386,7 @@ TEST_F(K8sJsonTest, GetErrorMessage) {
 class K8sEndpointSliceTest : public ::testing::Test {
 protected:
     // Simulate parsing an EndpointSlice
+    // This mirrors the logic in k8s_discovery_service.cpp::parse_endpoint_slice()
     std::vector<K8sEndpoint> parse_endpoint_slice(const std::string& json, uint16_t default_port = 8080) {
         std::vector<K8sEndpoint> endpoints;
 
@@ -398,15 +401,47 @@ protected:
                 auto weight_str = k8s_json::get_string(*annotations, "ranvier.io/weight");
                 if (weight_str) {
                     try {
-                        default_weight = static_cast<uint32_t>(std::stoul(*weight_str));
-                    } catch (...) {}
+                        // Reject negative values (stoul wraps them)
+                        if (!weight_str->empty() && (*weight_str)[0] == '-') {
+                            throw std::invalid_argument("negative value not allowed");
+                        }
+                        size_t pos = 0;
+                        unsigned long parsed = std::stoul(*weight_str, &pos);
+                        // Ensure entire string was consumed (no trailing garbage)
+                        if (pos != weight_str->size()) {
+                            throw std::invalid_argument("contains non-numeric characters");
+                        }
+                        if (parsed > K8S_MAX_WEIGHT) {
+                            default_weight = K8S_MAX_WEIGHT;  // Clamp to max
+                        } else {
+                            default_weight = static_cast<uint32_t>(parsed);
+                        }
+                    } catch (const std::exception&) {
+                        // Keep default_weight on parse failure (logging in real impl)
+                    }
                 }
 
                 auto priority_str = k8s_json::get_string(*annotations, "ranvier.io/priority");
                 if (priority_str) {
                     try {
-                        default_priority = static_cast<uint32_t>(std::stoul(*priority_str));
-                    } catch (...) {}
+                        // Reject negative values (stoul wraps them)
+                        if (!priority_str->empty() && (*priority_str)[0] == '-') {
+                            throw std::invalid_argument("negative value not allowed");
+                        }
+                        size_t pos = 0;
+                        unsigned long parsed = std::stoul(*priority_str, &pos);
+                        // Ensure entire string was consumed (no trailing garbage)
+                        if (pos != priority_str->size()) {
+                            throw std::invalid_argument("contains non-numeric characters");
+                        }
+                        if (parsed > K8S_MAX_PRIORITY) {
+                            default_priority = K8S_MAX_PRIORITY;  // Clamp to max
+                        } else {
+                            default_priority = static_cast<uint32_t>(parsed);
+                        }
+                    } catch (const std::exception&) {
+                        // Keep default_priority on parse failure (logging in real impl)
+                    }
                 }
             }
         }
@@ -538,6 +573,204 @@ TEST_F(K8sEndpointSliceTest, ParseWithAnnotations) {
     EXPECT_EQ(endpoints[0].priority, 1u);
 }
 
+// =============================================================================
+// Invalid Annotation Tests - Verify defaults are used on parse errors
+// =============================================================================
+
+TEST_F(K8sEndpointSliceTest, ParseWithInvalidWeightTypo) {
+    // Common typo: letter 'O' instead of digit '0'
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "1O0",
+                "ranvier.io/priority": "1"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Invalid weight should fall back to default
+    EXPECT_EQ(endpoints[0].weight, K8S_DEFAULT_WEIGHT);
+    // Valid priority should be parsed correctly
+    EXPECT_EQ(endpoints[0].priority, 1u);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseWithInvalidPriorityNonNumeric) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "200",
+                "ranvier.io/priority": "high"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Valid weight should be parsed correctly
+    EXPECT_EQ(endpoints[0].weight, 200u);
+    // Invalid priority should fall back to default
+    EXPECT_EQ(endpoints[0].priority, K8S_DEFAULT_PRIORITY);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseWithNegativeWeight) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "-100",
+                "ranvier.io/priority": "0"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Negative weight should fall back to default (stoul throws on negative)
+    EXPECT_EQ(endpoints[0].weight, K8S_DEFAULT_WEIGHT);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseWithEmptyAnnotationValues) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "",
+                "ranvier.io/priority": ""
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Empty values should fall back to defaults
+    EXPECT_EQ(endpoints[0].weight, K8S_DEFAULT_WEIGHT);
+    EXPECT_EQ(endpoints[0].priority, K8S_DEFAULT_PRIORITY);
+}
+
+// =============================================================================
+// Range Validation Tests - Verify clamping for out-of-range values
+// =============================================================================
+
+TEST_F(K8sEndpointSliceTest, ParseWithWeightExceedingMax) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "2000000",
+                "ranvier.io/priority": "0"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Weight exceeding max should be clamped to K8S_MAX_WEIGHT
+    EXPECT_EQ(endpoints[0].weight, K8S_MAX_WEIGHT);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseWithPriorityExceedingMax) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "100",
+                "ranvier.io/priority": "5000"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Priority exceeding max should be clamped to K8S_MAX_PRIORITY
+    EXPECT_EQ(endpoints[0].priority, K8S_MAX_PRIORITY);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseWithWeightAtExactMax) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "1000000",
+                "ranvier.io/priority": "0"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Weight at exact max should be accepted
+    EXPECT_EQ(endpoints[0].weight, K8S_MAX_WEIGHT);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseWithPriorityAtExactMax) {
+    std::string json = R"({
+        "metadata": {
+            "name": "gpu-service-abc",
+            "annotations": {
+                "ranvier.io/weight": "100",
+                "ranvier.io/priority": "1000"
+            }
+        },
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-123"}
+        }]
+    })";
+
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    // Priority at exact max should be accepted
+    EXPECT_EQ(endpoints[0].priority, K8S_MAX_PRIORITY);
+}
+
 TEST_F(K8sEndpointSliceTest, ParseMultipleAddressesPerEndpoint) {
     std::string json = R"({
         "ports": [{"port": 8080}],
@@ -641,15 +874,39 @@ protected:
                 auto weight_str = k8s_json::get_string(*annotations, "ranvier.io/weight");
                 if (weight_str) {
                     try {
-                        default_weight = static_cast<uint32_t>(std::stoul(*weight_str));
-                    } catch (...) {}
+                        if (!weight_str->empty() && (*weight_str)[0] == '-') {
+                            throw std::invalid_argument("negative value not allowed");
+                        }
+                        size_t pos = 0;
+                        unsigned long parsed = std::stoul(*weight_str, &pos);
+                        if (pos != weight_str->size()) {
+                            throw std::invalid_argument("contains non-numeric characters");
+                        }
+                        if (parsed > K8S_MAX_WEIGHT) {
+                            default_weight = K8S_MAX_WEIGHT;
+                        } else {
+                            default_weight = static_cast<uint32_t>(parsed);
+                        }
+                    } catch (const std::exception&) {}
                 }
 
                 auto priority_str = k8s_json::get_string(*annotations, "ranvier.io/priority");
                 if (priority_str) {
                     try {
-                        default_priority = static_cast<uint32_t>(std::stoul(*priority_str));
-                    } catch (...) {}
+                        if (!priority_str->empty() && (*priority_str)[0] == '-') {
+                            throw std::invalid_argument("negative value not allowed");
+                        }
+                        size_t pos = 0;
+                        unsigned long parsed = std::stoul(*priority_str, &pos);
+                        if (pos != priority_str->size()) {
+                            throw std::invalid_argument("contains non-numeric characters");
+                        }
+                        if (parsed > K8S_MAX_PRIORITY) {
+                            default_priority = K8S_MAX_PRIORITY;
+                        } else {
+                            default_priority = static_cast<uint32_t>(parsed);
+                        }
+                    } catch (const std::exception&) {}
                 }
             }
         }

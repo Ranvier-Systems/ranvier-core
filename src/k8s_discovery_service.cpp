@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <regex>
@@ -905,10 +906,54 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
         if (meta.HasMember("annotations") && meta["annotations"].IsObject()) {
             const auto& ann = meta["annotations"];
             if (ann.HasMember(K8S_ANNOTATION_WEIGHT) && ann[K8S_ANNOTATION_WEIGHT].IsString()) {
-                try { base_weight = std::stoul(ann[K8S_ANNOTATION_WEIGHT].GetString()); } catch (...) {}
+                const char* weight_str = ann[K8S_ANNOTATION_WEIGHT].GetString();
+                try {
+                    // Reject negative values (stoul wraps them)
+                    if (weight_str[0] == '-') {
+                        throw std::invalid_argument("negative value not allowed");
+                    }
+                    size_t pos = 0;
+                    unsigned long parsed = std::stoul(weight_str, &pos);
+                    // Ensure entire string was consumed (no trailing garbage like "1O0")
+                    if (pos != std::strlen(weight_str)) {
+                        throw std::invalid_argument("contains non-numeric characters");
+                    }
+                    if (parsed > K8S_MAX_WEIGHT) {
+                        log_k8s.warn("Annotation '{}' value '{}' exceeds maximum {} - clamping to max",
+                                     K8S_ANNOTATION_WEIGHT, weight_str, K8S_MAX_WEIGHT);
+                        base_weight = K8S_MAX_WEIGHT;
+                    } else {
+                        base_weight = static_cast<uint32_t>(parsed);
+                    }
+                } catch (const std::exception& e) {
+                    log_k8s.warn("Invalid '{}' annotation value '{}': {} - using default {}",
+                                 K8S_ANNOTATION_WEIGHT, weight_str, e.what(), base_weight);
+                }
             }
             if (ann.HasMember(K8S_ANNOTATION_PRIORITY) && ann[K8S_ANNOTATION_PRIORITY].IsString()) {
-                try { base_priority = std::stoul(ann[K8S_ANNOTATION_PRIORITY].GetString()); } catch (...) {}
+                const char* priority_str = ann[K8S_ANNOTATION_PRIORITY].GetString();
+                try {
+                    // Reject negative values (stoul wraps them)
+                    if (priority_str[0] == '-') {
+                        throw std::invalid_argument("negative value not allowed");
+                    }
+                    size_t pos = 0;
+                    unsigned long parsed = std::stoul(priority_str, &pos);
+                    // Ensure entire string was consumed (no trailing garbage)
+                    if (pos != std::strlen(priority_str)) {
+                        throw std::invalid_argument("contains non-numeric characters");
+                    }
+                    if (parsed > K8S_MAX_PRIORITY) {
+                        log_k8s.warn("Annotation '{}' value '{}' exceeds maximum {} - clamping to max",
+                                     K8S_ANNOTATION_PRIORITY, priority_str, K8S_MAX_PRIORITY);
+                        base_priority = K8S_MAX_PRIORITY;
+                    } else {
+                        base_priority = static_cast<uint32_t>(parsed);
+                    }
+                } catch (const std::exception& e) {
+                    log_k8s.warn("Invalid '{}' annotation value '{}': {} - using default {}",
+                                 K8S_ANNOTATION_PRIORITY, priority_str, e.what(), base_priority);
+                }
             }
         }
     }
