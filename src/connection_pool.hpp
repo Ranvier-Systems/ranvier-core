@@ -27,6 +27,7 @@ struct ConnectionPoolConfig {
     std::chrono::seconds keepalive_idle{30};    // Time before first keepalive probe
     std::chrono::seconds keepalive_interval{10};// Interval between keepalive probes
     unsigned keepalive_count = 3;               // Number of failed probes before closing
+    std::chrono::seconds max_connection_age{300}; // Max lifetime of a connection (5 min default)
 };
 
 // A bundle representing an active connection with timestamp tracking
@@ -36,9 +37,12 @@ struct ConnectionBundle {
     seastar::output_stream<char> out;
     seastar::socket_address addr;
     bool is_valid = true;
+    std::chrono::steady_clock::time_point created_at;
     std::chrono::steady_clock::time_point last_used;
 
-    ConnectionBundle() : last_used(std::chrono::steady_clock::now()) {}
+    ConnectionBundle()
+        : created_at(std::chrono::steady_clock::now())
+        , last_used(std::chrono::steady_clock::now()) {}
 
     ConnectionBundle(seastar::connected_socket&& socket,
                      seastar::input_stream<char>&& input,
@@ -49,6 +53,7 @@ struct ConnectionBundle {
         , out(std::move(output))
         , addr(address)
         , is_valid(true)
+        , created_at(std::chrono::steady_clock::now())
         , last_used(std::chrono::steady_clock::now()) {}
 
     // Close the connection
@@ -64,6 +69,13 @@ struct ConnectionBundle {
     bool is_expired(std::chrono::seconds timeout) const {
         auto now = std::chrono::steady_clock::now();
         return (now - last_used) > timeout;
+    }
+
+    // Check if connection has exceeded its maximum age (TTL)
+    // Returns true if connection should be closed regardless of recent activity
+    bool is_too_old(std::chrono::seconds max_age) const {
+        auto now = std::chrono::steady_clock::now();
+        return (now - created_at) > max_age;
     }
 
     // Update last used timestamp
@@ -116,6 +128,19 @@ public:
                                    request_id, addr);
                 }
                 _dead_connections_reaped++;
+                // Move to heap to keep alive during async close
+                close_bundle_async(std::move(bundle));
+                continue;
+            }
+
+            // Skip connections that exceeded max age (TTL)
+            if (bundle.is_too_old(_config.max_connection_age)) {
+                if (!request_id.empty()) {
+                    log_pool.debug("[{}] Closing max-age pooled connection to {} (created too long ago)",
+                                   request_id, addr);
+                }
+                _dead_connections_reaped++;
+                _connections_reaped_max_age++;
                 // Move to heap to keep alive during async close
                 close_bundle_async(std::move(bundle));
                 continue;
@@ -235,7 +260,8 @@ public:
         size_t num_backends;
         size_t max_per_host;
         size_t max_total;
-        size_t dead_connections_reaped;  // Total dead connections detected and closed
+        size_t dead_connections_reaped;      // Total dead connections detected and closed
+        size_t connections_reaped_max_age;   // Connections closed due to exceeding max age
     };
 
     Stats stats() const {
@@ -244,7 +270,8 @@ public:
             _pools.size(),
             _config.max_connections_per_host,
             _config.max_total_connections,
-            _dead_connections_reaped
+            _dead_connections_reaped,
+            _connections_reaped_max_age
         };
     }
 
@@ -272,18 +299,25 @@ public:
         return closed;
     }
 
-    // Cleanup expired and half-open connections (call periodically)
+    // Cleanup expired, max-age, and half-open connections (call periodically)
     size_t cleanup_expired() {
         size_t closed = 0;
         for (auto& [addr, pool] : _pools) {
             auto it = pool.begin();
             while (it != pool.end()) {
                 bool should_close = false;
+                bool is_max_age = false;
 
                 // Check for expired (idle too long)
                 if (it->is_expired(_config.idle_timeout)) {
                     log_pool.trace("Reaping expired connection to {}", addr);
                     should_close = true;
+                }
+                // Check for max age exceeded (TTL)
+                else if (it->is_too_old(_config.max_connection_age)) {
+                    log_pool.trace("Reaping max-age connection to {} (created too long ago)", addr);
+                    should_close = true;
+                    is_max_age = true;
                 }
                 // Check for half-open (backend closed)
                 else if (it->is_half_open()) {
@@ -297,6 +331,9 @@ public:
                     it = pool.erase(it);
                     _total_idle_connections--;
                     _dead_connections_reaped++;
+                    if (is_max_age) {
+                        _connections_reaped_max_age++;
+                    }
                     closed++;
                 } else {
                     ++it;
@@ -311,6 +348,7 @@ private:
     std::unordered_map<seastar::socket_address, std::deque<ConnectionBundle>> _pools;
     size_t _total_idle_connections = 0;
     size_t _dead_connections_reaped = 0;
+    size_t _connections_reaped_max_age = 0;
     seastar::timer<> _reaper_timer;
 
     // Arm the reaper timer for next execution
