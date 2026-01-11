@@ -109,6 +109,18 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/radix_tree.hpp`, `src/metrics_service.hpp`, `src/router_service.cpp`
   _Complexity:_ Low
 
+- [ ] **Remove unnecessary atomics from ShardLoadMetrics**
+  _Justification:_ `ShardLoadMetrics` uses `std::atomic<uint64_t>` for `_active_requests`, `_queued_requests`, and `_total_requests`, but since each shard has its own thread-local instance (`thread_local std::unique_ptr<ShardLoadMetrics>`), atomic operations are unnecessary overhead. With Seastar's shared-nothing model, regular `uint64_t` would suffice since there's no cross-thread access to the same instance.
+  _Approach:_ Replace `std::atomic<uint64_t>` with `uint64_t` for all metrics counters. Update accessor methods to remove memory ordering parameters.
+  _Location:_ `src/shard_load_metrics.hpp:132-134`
+  _Complexity:_ Low
+
+- [ ] **Batch CryptoOffloader statistics updates**
+  _Justification:_ `CryptoOffloader` increments multiple atomic counters (`_total_ops`, `_inline_ops`, `_offloaded_ops`, etc.) on every crypto operation. While these are lightweight (relaxed memory order), they add overhead in high-throughput scenarios. More concerning is `_queue_depth` which uses `fetch_add`/`fetch_sub` for every offloaded operation.
+  _Approach:_ Use per-operation local counters that batch into atomics periodically (e.g., every 100 ops or via timer). Consider non-atomic counters for same-shard-only statistics, exposing them via snapshot functions.
+  _Location:_ `src/crypto_offloader.hpp:181-188`
+  _Complexity:_ Medium
+
 ### 1.5 Shard-Aware Load Balancing
 
 - [x] **Implement P2C load balancer for cross-shard request dispatch** ✓
@@ -697,6 +709,8 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 | **P3 - Low** | Performance | Async file I/O for tokenizer loading | Low | ✅ Done |
 | **P3 - Low** | Observability | Radix tree performance metrics | Low | ✅ Done |
 | **P2 - Medium** | DX | Python admin SDK (rvctl CLI) | Medium | ✅ Done |
+| **P3 - Low** | Performance | Remove unnecessary atomics from ShardLoadMetrics | Low | |
+| **P3 - Low** | Performance | Batch CryptoOffloader statistics updates | Medium | |
 
 ---
 
