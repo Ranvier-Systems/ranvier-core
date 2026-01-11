@@ -179,6 +179,7 @@ void AsyncPersistenceManager::queue_clear_all() {
     std::lock_guard<std::mutex> lock(_queue_mutex);
     _queue.clear();  // Discard pending ops - they'll be cleared anyway
     _queue.push_back(ClearAllOp{});
+    _queue_size.store(1, std::memory_order_relaxed);  // Queue now contains only ClearAllOp
 }
 
 // ============================================================================
@@ -194,6 +195,7 @@ bool AsyncPersistenceManager::try_enqueue(PersistenceOp op) {
     }
 
     _queue.push_back(std::move(op));
+    _queue_size.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -211,6 +213,7 @@ std::vector<PersistenceOp> AsyncPersistenceManager::extract_batch() {
         _queue.pop_front();
     }
 
+    _queue_size.fetch_sub(batch_size, std::memory_order_relaxed);
     return batch;
 }
 
@@ -225,12 +228,13 @@ std::vector<PersistenceOp> AsyncPersistenceManager::drain_queue() {
         _queue.pop_front();
     }
 
+    _queue_size.store(0, std::memory_order_relaxed);
     return all_ops;
 }
 
 size_t AsyncPersistenceManager::queue_depth() const {
-    std::lock_guard<std::mutex> lock(_queue_mutex);
-    return _queue.size();
+    // Lock-free: safe to call from reactor thread without blocking
+    return _queue_size.load(std::memory_order_relaxed);
 }
 
 // ============================================================================
