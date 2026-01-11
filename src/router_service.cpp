@@ -190,6 +190,22 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         log_router.info("Cluster mode enabled with {} peers", _cluster_config.peers.size());
     }
 
+    // ========================================================================
+    // Metrics Registration
+    // ========================================================================
+    //
+    // LIFECYCLE SAFETY:
+    // These metrics lambdas access thread-local state (get_node_slab) and
+    // member variables ([this] capture). To prevent use-after-free:
+    //
+    //   1. stop() MUST be called before RouterService destruction
+    //   2. stop() calls _metrics.clear() FIRST, deregistering all lambdas
+    //   3. Defense-in-depth: get_node_slab() lambdas have null-checks
+    //
+    // The [this] capture for _routes_dropped_overflow is safe because:
+    //   - _metrics.clear() in stop() deregisters before 'this' is destroyed
+    //   - Prometheus cannot scrape deregistered metrics
+    //
     _metrics.add_group("ranvier", {
         seastar::metrics::make_counter("router_cache_hits", stats_cache_hits,
             seastar::metrics::description("Total number of prefix cache hits")),
@@ -220,6 +236,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("Total number of radix tree lookups that failed to find a route")),
 
         // Node count by type (Node4, Node16, Node48, Node256) - uses NodeSlab statistics
+        // Note: Each lambda includes a null-check on get_node_slab() as defense-in-depth.
+        // Primary safety is _metrics.clear() in stop(), but null-checks protect against
+        // edge cases where NodeSlab is destroyed before metrics deregistration completes.
         seastar::metrics::make_gauge("radix_tree_node_count",
             seastar::metrics::description("Total number of radix tree nodes allocated (Node4 pool)"),
             {{"node_type", "Node4"}},
@@ -319,6 +338,38 @@ void RouterService::start_ttl_timer() {
 void RouterService::stop_ttl_timer() {
     _ttl_timer.cancel();
     log_main.info("TTL cleanup timer stopped");
+}
+
+seastar::future<> RouterService::stop() {
+    // ==========================================================================
+    // CRITICAL: Metrics Deregistration Must Happen First
+    // ==========================================================================
+    //
+    // Metrics lambdas capture 'this' (for _routes_dropped_overflow) and access
+    // thread-local state via get_node_slab(). If Prometheus scrapes during or
+    // after shutdown:
+    //   - [this] captures would access destroyed RouterService members
+    //   - get_node_slab() could return dangling pointer to destroyed NodeSlab
+    //
+    // By clearing metrics first, we guarantee no metric collection can occur
+    // during the rest of the shutdown sequence. The lambdas are deregistered
+    // and will no longer be called by the metrics subsystem.
+    //
+    // Note: The get_node_slab() lambdas have null-checks as defense-in-depth,
+    // but deregistration is the primary safety mechanism.
+    //
+    log_main.info("RouterService stopping: deregistering metrics");
+    _metrics.clear();  // Deregister all metrics lambdas - prevents use-after-free
+
+    // Now safe to stop timers (no metrics can observe partially-destroyed state)
+    stop_ttl_timer();
+    stop_draining_reaper();
+
+    // Stop gossip last (returns future, may have pending operations)
+    return stop_gossip().then([] {
+        log_main.info("RouterService stopped");
+        return seastar::make_ready_future<>();
+    });
 }
 
 void RouterService::run_ttl_cleanup() {
