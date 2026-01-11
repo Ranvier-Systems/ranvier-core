@@ -34,6 +34,15 @@ struct RouteBatchConfig {
     // Maximum routes to buffer before forcing an immediate flush
     static constexpr size_t MAX_BATCH_SIZE = 100;
 
+    // Hard upper limit on buffer size to prevent OOM from gossip flooding
+    // When exceeded, oldest routes are dropped to make room for new ones
+    static constexpr size_t MAX_BUFFER_SIZE = 10000;
+
+    // Number of routes to drop at once when buffer overflows
+    // Batching drops amortizes the O(n) vector erase cost across multiple inserts
+    // Drop count chosen to clear ~10% of buffer, reducing drop frequency while preserving recency
+    static constexpr size_t OVERFLOW_DROP_COUNT = 1000;
+
     // Timer interval for periodic flushes (ensures bounded latency)
     static constexpr std::chrono::milliseconds FLUSH_INTERVAL{10};
 };
@@ -186,6 +195,9 @@ private:
     // Buffer for pending remote routes (shard 0 only)
     // Routes are accumulated here and broadcast in batches to reduce SMP message traffic
     std::vector<PendingRemoteRoute> _pending_remote_routes;
+
+    // Counter for routes dropped due to buffer overflow (for metrics and rate-limited logging)
+    uint64_t _routes_dropped_overflow = 0;
 
     // Callback for pool cleanup when a backend is fully removed
     PoolCleanupCallback _pool_cleanup_callback;
