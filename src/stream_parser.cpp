@@ -4,6 +4,8 @@
 // Uses read position tracking to avoid O(n) substring copies in the hot path.
 
 #include "stream_parser.hpp"
+#include "logging.hpp"
+#include "metrics_service.hpp"
 
 #include <charconv>
 #include <cstring>
@@ -18,6 +20,35 @@ StreamParser::Result StreamParser::push(seastar::temporary_buffer<char> chunk) {
         res.has_error = true;
         res.error_message = "Parser in error state";
         return res;
+    }
+
+    // Early exit for empty chunks
+    if (chunk.empty()) {
+        return res;
+    }
+
+    // SECURITY: Early size check BEFORE appending new data
+    // Prevents Slowloris-style attacks that slowly accumulate data to exhaust memory.
+    // Check is performed before append to reject immediately rather than after growth.
+    size_t new_size = _accum.size() + chunk.size();
+    if (new_size > StreamParserConfig::max_accumulator_size) {
+        log_parser.warn("Accumulator size limit exceeded: {} + {} > {} bytes",
+                        _accum.size(), chunk.size(), StreamParserConfig::max_accumulator_size);
+        _state = State::Error;
+        res.has_error = true;
+        res.error_message = "Request too large";
+        if (g_metrics) {
+            g_metrics->record_stream_parser_size_rejection();
+        }
+        return res;
+    }
+
+    // Debug log when approaching limit (crossing early warning threshold for first time)
+    // This aids in monitoring slow accumulation patterns before hard rejection
+    if (new_size > StreamParserConfig::early_warning_threshold &&
+        _accum.size() <= StreamParserConfig::early_warning_threshold) {
+        log_parser.debug("Accumulator approaching limit: {}/{} bytes (90% threshold crossed)",
+                         new_size, StreamParserConfig::max_accumulator_size);
     }
 
     // Append incoming chunk to accumulator
