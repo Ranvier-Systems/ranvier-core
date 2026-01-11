@@ -33,6 +33,30 @@ The improvement is attributed to:
 2. **Better cache locality**: Flat storage layout minimizes cache misses during routing decisions
 3. **Reduced allocations**: Abseil containers have lower allocation overhead than `std::unordered_map`
 4. **Slab allocation**: RadixTree nodes use a per-shard slab allocator (`NodeSlab`) with O(1) intrusive free list, eliminating malloc/free on hot paths
+5. **Zero-copy buffer management**: Request bodies use `seastar::temporary_buffer` with `string_view` access, avoiding copies in tokenization and routing paths
+
+### Zero-Copy Buffer Management
+
+The streaming response path uses optimized buffer management to minimize allocations:
+
+| Component | Technique | Benefit |
+|-----------|-----------|---------|
+| `CrossShardRequestContext` | `temporary_buffer<char>` with move semantics | Zero-copy cross-shard transfer |
+| `StreamParser` | Read-position offset tracking | Avoids O(n) `substr()` copies |
+| `TokenizerService` | `string_view` input | No tokenization input copies |
+| `logging.hpp` | `extract_*_view()` helpers | Zero-copy header extraction |
+
+**StreamParser Optimizations:**
+- Uses `_read_pos` offset instead of `substr()` to track consumed data
+- Compacts buffer when >50% consumed (prevents unbounded growth)
+- Size limits: 16KB headers, 1MB chunks (prevents OOM attacks)
+- Error state handling for malformed chunked encoding
+
+**CrossShardRequestContext Limits:**
+- Max body size: 128MB
+- Max tokens: 128K
+- Max path length: 8KB
+- Validated via `cross_shard::try_create_*` factory functions
 
 ### Cache Hit vs. Miss Latency
 

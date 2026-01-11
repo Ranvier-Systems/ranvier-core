@@ -47,6 +47,18 @@ Performance optimizations for the hot path: tokenization, routing, and response 
 
 ### 1.2 Zero-Copy SSE Parsing Refinements
 
+- [x] **Optimize StreamParser with read-position tracking** ✓
+  _Justification:_ Original parser used `substr()` after each chunk parse, causing O(n) copies. Read-position offset enables zero-copy parsing by tracking consumed bytes without buffer mutation.
+  _Approach:_ Replaced substr-based parsing with `_read_pos` offset and `string_view` accessors. Added buffer compaction when >50% consumed to prevent unbounded growth. Added size limits (16KB headers, 1MB chunks) and error state handling for malformed chunked encoding. HttpController now handles parser errors gracefully with client notification.
+  _Location:_ `src/stream_parser.hpp`, `src/stream_parser.cpp`, `src/http_controller.cpp:925-940`
+  _Complexity:_ Medium
+
+- [x] **Add validated factory functions for CrossShardRequestContext** ✓
+  _Justification:_ Cross-shard request dispatch allocated buffers without size validation, risking OOM on malicious large requests.
+  _Approach:_ Added `CrossShardRequestLimits` config (128MB body, 128K tokens, 8KB path). New `cross_shard::try_create_*` factory functions validate sizes before allocation and return error results. Added `is_valid()` and `estimated_memory_usage()` helpers for runtime checks and backpressure.
+  _Location:_ `src/cross_shard_request.hpp`
+  _Complexity:_ Low
+
 - [ ] **Implement scatter-gather I/O for backend responses**
   _Justification:_ Currently SSE chunks are copied between buffers. Using Seastar's `scattered_message` can eliminate copies in the streaming path.
   _Location:_ `src/stream_parser.cpp`, `src/http_controller.cpp:400+`
@@ -515,6 +527,8 @@ Tooling, testing, and documentation improvements for contributors and operators.
 | **P1 - High** | Performance | Replace shared_ptr with unique_ptr in RadixTree | Medium | ✅ Done |
 | **P1 - High** | Reliability | System-wide backpressure mechanism | Medium | ✅ Done |
 | **P1 - High** | Performance | Shard-aware P2C load balancer | Medium | ✅ Done |
+| **P2 - Medium** | Performance | Zero-copy StreamParser optimization | Medium | ✅ Done |
+| **P2 - Medium** | Reliability | CrossShardRequest size validation | Low | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
@@ -538,6 +552,8 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-11 | Optimize StreamParser with read-position tracking (zero-copy parsing, buffer compaction, size limits) | - |
+| 2026-01-11 | Add validated factory functions for CrossShardRequestContext (size limits, memory estimation) | - |
 | 2026-01-10 | Create rvctl CLI tool for Ranvier management (inspect routes/backends, cluster status, drain, route add) | #110 |
 | 2026-01-09 | Refactor CryptoOffloader for clarity (unified template handling, queue depth limiting, dedicated execute_inline/offloaded methods) | - |
 | 2026-01-09 | Add radix tree performance metrics (lookup hits/misses, node counts, slab utilization, path compression avg) | - |
