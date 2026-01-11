@@ -25,10 +25,8 @@ StreamParser::Result StreamParser::push(seastar::temporary_buffer<char> chunk) {
     // Seastar's temporary_buffer owns the memory from the TCP stack.
     _accum.append(chunk.get(), chunk.size());
 
-    // Reserve output buffer for typical SSE response
-    if (res.data.empty()) {
-        res.data.reserve(StreamParserConfig::initial_output_reserve);
-    }
+    // Note: seastar::sstring doesn't support reserve(), so we rely on
+    // its small-string optimization and natural growth pattern
 
     // Parse loop: process as much data as possible
     while (_read_pos < _accum.size() && _state != State::Error) {
@@ -77,7 +75,7 @@ StreamParser::Result StreamParser::push(seastar::temporary_buffer<char> chunk) {
 
 void StreamParser::reset() noexcept {
     _state = State::Headers;
-    _accum.clear();
+    _accum = seastar::sstring();  // sstring doesn't have clear()
     _read_pos = 0;
     _chunk_bytes_needed = 0;
 }
