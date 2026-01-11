@@ -118,11 +118,24 @@ seastar::future<> AsyncPersistenceManager::stop() {
     log_async_persist.info("Stopping async persistence manager...");
     _stopping.store(true, std::memory_order_relaxed);
 
-    _flush_timer.cancel();
-    _stats_timer.cancel();
+    // RAII Timer Safety: Close the timer gate FIRST to ensure no timer callbacks
+    // can execute during or after shutdown. This waits for any in-flight timer
+    // callbacks to complete before proceeding.
+    //
+    // Order is critical:
+    //   1. Close _timer_gate (waits for in-flight callbacks)
+    //   2. Cancel timers (prevents future callbacks)
+    //   3. Close _flush_gate (waits for in-flight flush operations)
+    //   4. Flush remaining queue
+    //
+    // This guarantees no timer callback can access `this` after stop() returns.
+    return _timer_gate.close().then([this] {
+        _flush_timer.cancel();
+        _stats_timer.cancel();
 
-    // Wait for in-flight batches, then flush remaining queue
-    return _flush_gate.close().then([this] {
+        // Wait for in-flight batches, then flush remaining queue
+        return _flush_gate.close();
+    }).then([this] {
         auto final_batch = drain_queue();
 
         if (!final_batch.empty() && is_open()) {
@@ -242,13 +255,26 @@ size_t AsyncPersistenceManager::queue_depth() const {
 // ============================================================================
 
 void AsyncPersistenceManager::on_flush_timer() {
+    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), this throws gate_closed_exception
+    // and the callback safely exits without accessing any member state.
+    seastar::gate::holder timer_holder;
+    try {
+        timer_holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        // Gate closed - stop() is in progress, exit safely
+        return;
+    }
+
     if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
     auto batch = extract_batch();
     if (batch.empty()) return;
 
-    // Process batch off the reactor thread, serialized by semaphore
-    (void)seastar::try_with_gate(_flush_gate, [this, batch = std::move(batch)]() mutable {
+    // Process batch off the reactor thread, serialized by semaphore.
+    // Note: timer_holder is moved into the lambda to extend its lifetime
+    // until the async operation completes.
+    (void)seastar::try_with_gate(_flush_gate, [this, batch = std::move(batch), timer_holder = std::move(timer_holder)]() mutable {
         return seastar::get_units(_batch_semaphore, 1).then(
             [this, batch = std::move(batch)](seastar::semaphore_units<> units) mutable {
                 return seastar::async(
@@ -343,6 +369,16 @@ void AsyncPersistenceManager::execute(const ClearAllOp& /*op*/, RouteAccumulator
 // ============================================================================
 
 void AsyncPersistenceManager::log_stats() {
+    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), this throws gate_closed_exception
+    // and the callback safely exits without accessing any member state.
+    try {
+        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        // Gate closed - stop() is in progress, exit safely
+        return;
+    }
+
     if (_stopping.load(std::memory_order_relaxed)) return;
 
     auto depth = queue_depth();

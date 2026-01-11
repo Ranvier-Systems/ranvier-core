@@ -513,6 +513,24 @@ private:
     // This provides backpressure protection for the gossip subsystem
     seastar::gate _gossip_task_gate;
 
+    // TIMER CALLBACK SAFETY (RAII Guard Pattern):
+    // Timer callbacks capture `this`, creating a potential use-after-free if the
+    // callback executes after destruction begins. The race window is:
+    //   1. Timer fires, callback is queued on reactor
+    //   2. stop() is called, cancels timer (but callback is already queued)
+    //   3. stop() returns, destructor can begin
+    //   4. Queued callback executes with dangling `this`
+    //
+    // Solution: _timer_gate ensures timer callbacks cannot execute during shutdown.
+    // - Timer callbacks acquire a gate::holder at entry (fails if gate is closed)
+    // - stop() closes the gate FIRST (waits for in-flight callbacks to complete)
+    // - Only then are timers cancelled and resources freed
+    //
+    // This guarantees: No timer callback can access `this` after stop() returns.
+    // Protected callbacks: heartbeat, liveness check, retry, discovery, cert reload,
+    //                      DTLS session cleanup
+    seastar::gate _timer_gate;
+
     // Flag to indicate gossip is re-syncing (e.g., after network partition recovery)
     std::atomic<bool> _resyncing{false};
 
