@@ -15,6 +15,7 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
@@ -24,6 +25,9 @@
 #include <seastar/net/tls.hh>
 
 namespace ranvier {
+
+// Maximum concurrent endpoint operations to prevent overwhelming backends
+constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
 
 // Generate a stable BackendId from endpoint UID
 BackendId K8sEndpoint::to_backend_id() const {
@@ -410,19 +414,36 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
     // Using absl::flat_hash_set for SIMD-accelerated UID tracking
     absl::flat_hash_set<std::string> current_uids;
 
+    // Collect all operations first, then process in parallel
+    // Pair: {endpoint, is_new}
+    std::vector<std::pair<K8sEndpoint, bool>> operations;
+
     if (doc.HasMember("items") && doc["items"].IsArray()) {
         for (const auto& item : doc["items"].GetArray()) {
             auto discovered = parse_endpoint_slice(item);
             for (const auto& ep : discovered) {
                 current_uids.insert(ep.uid);
-                if (_endpoints.find(ep.uid) == _endpoints.end()) {
+                bool is_new = _endpoints.find(ep.uid) == _endpoints.end();
+                operations.emplace_back(ep, is_new);
+            }
+        }
+    }
+
+    // Process endpoints in parallel with concurrency limit
+    // Error in one endpoint doesn't fail the entire batch
+    co_await seastar::max_concurrent_for_each(operations, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+        [this](const std::pair<K8sEndpoint, bool>& op) -> seastar::future<> {
+            const auto& [ep, is_new] = op;
+            try {
+                if (is_new) {
                     co_await handle_endpoint_added(ep);
                 } else {
                     co_await handle_endpoint_modified(ep);
                 }
+            } catch (const std::exception& e) {
+                log_k8s.warn("Failed to process endpoint {}: {}", ep.uid, e.what());
             }
-        }
-    }
+        });
 
     // Garbage collect endpoints no longer present in K8s
     for (auto it = _endpoints.begin(); it != _endpoints.end(); ) {
@@ -452,26 +473,48 @@ seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discov
         }
     }
 
-    // Remove stale endpoints
-    for (const auto& uid : to_remove) {
-        co_await handle_endpoint_removed(uid);
-    }
+    // Remove stale endpoints in parallel
+    co_await seastar::max_concurrent_for_each(to_remove, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+        [this](const std::string& uid) -> seastar::future<> {
+            try {
+                co_await handle_endpoint_removed(uid);
+            } catch (const std::exception& e) {
+                log_k8s.warn("Failed to remove endpoint {}: {}", uid, e.what());
+            }
+        });
 
-    // Add or update discovered endpoints
-    for (auto& ep : discovered) {
+    // Collect add/update operations first, then process in parallel
+    // Pair: {endpoint, is_new}
+    std::vector<std::pair<K8sEndpoint, bool>> operations;
+    for (const auto& ep : discovered) {
         auto it = _endpoints.find(ep.uid);
         if (it == _endpoints.end()) {
             // New endpoint
-            co_await handle_endpoint_added(ep);
+            operations.emplace_back(ep, true);
         } else {
             // Check if endpoint changed (weight, priority, readiness)
             if (it->second.ready != ep.ready ||
                 it->second.weight != ep.weight ||
                 it->second.priority != ep.priority) {
-                co_await handle_endpoint_modified(ep);
+                operations.emplace_back(ep, false);
             }
         }
     }
+
+    // Process add/update operations in parallel
+    co_await seastar::max_concurrent_for_each(operations, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+        [this](const std::pair<K8sEndpoint, bool>& op) -> seastar::future<> {
+            const auto& [ep, is_new] = op;
+            try {
+                if (is_new) {
+                    co_await handle_endpoint_added(ep);
+                } else {
+                    co_await handle_endpoint_modified(ep);
+                }
+            } catch (const std::exception& e) {
+                log_k8s.warn("Failed to process endpoint {}: {}", ep.uid, e.what());
+            }
+        });
 
     co_return;
 }
@@ -617,15 +660,41 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             auto discovered = parse_endpoint_slice(obj);
 
             if (type == "ADDED" || type == "MODIFIED") {
+                // Collect add/modify operations first, then process in parallel
+                std::vector<std::pair<K8sEndpoint, bool>> operations;
                 for (const auto& ep : discovered) {
-                    auto it = _endpoints.find(ep.uid);
-                    if (it == _endpoints.end()) co_await handle_endpoint_added(ep);
-                    else co_await handle_endpoint_modified(ep);
+                    bool is_new = _endpoints.find(ep.uid) == _endpoints.end();
+                    operations.emplace_back(ep, is_new);
                 }
+
+                co_await seastar::max_concurrent_for_each(operations, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+                    [this](const std::pair<K8sEndpoint, bool>& op) -> seastar::future<> {
+                        const auto& [ep, is_new] = op;
+                        try {
+                            if (is_new) {
+                                co_await handle_endpoint_added(ep);
+                            } else {
+                                co_await handle_endpoint_modified(ep);
+                            }
+                        } catch (const std::exception& e) {
+                            log_k8s.warn("Failed to process endpoint {}: {}", ep.uid, e.what());
+                        }
+                    });
             } else if (type == "DELETED") {
+                // Collect UIDs and remove in parallel
+                std::vector<std::string> uids_to_remove;
                 for (const auto& ep : discovered) {
-                    co_await handle_endpoint_removed(ep.uid);
+                    uids_to_remove.push_back(ep.uid);
                 }
+
+                co_await seastar::max_concurrent_for_each(uids_to_remove, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+                    [this](const std::string& uid) -> seastar::future<> {
+                        try {
+                            co_await handle_endpoint_removed(uid);
+                        } catch (const std::exception& e) {
+                            log_k8s.warn("Failed to remove endpoint {}: {}", uid, e.what());
+                        }
+                    });
             }
 
             co_return true;
