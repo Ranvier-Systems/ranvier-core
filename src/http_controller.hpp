@@ -74,14 +74,15 @@ struct HttpControllerConfig {
     bool enable_token_forwarding = false;       // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;          // Accept pre-tokenized prompt_token_ids from clients for routing
     int32_t max_token_id = 100000;              // Maximum valid token ID for validation (security)
-    RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::RADIX;  // Routing mode
+    RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;  // Routing mode
     uint32_t block_alignment = 16;              // vLLM PagedAttention block size for route alignment
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
-    bool is_radix_mode() const { return routing_mode == RoutingConfig::RoutingMode::RADIX; }
-    bool is_round_robin_mode() const { return routing_mode == RoutingConfig::RoutingMode::ROUND_ROBIN; }
-    bool should_learn_routes() const { return routing_mode != RoutingConfig::RoutingMode::ROUND_ROBIN; }
+    bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }
+    bool is_random_mode() const { return routing_mode == RoutingConfig::RoutingMode::RANDOM; }
+    bool uses_art() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
+    bool should_learn_routes() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
 };
 
 class HttpController {

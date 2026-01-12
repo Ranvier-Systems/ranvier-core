@@ -67,18 +67,19 @@ struct RoutingConfig {
     int32_t max_token_id = 100000;  // Maximum valid token ID for validation (security: reject out-of-range tokens)
 
     // Routing mode: determines how requests are routed to backends
-    // - "prefix": Prefix-affinity routing using consistent hashing on prefix tokens (best for KV cache reuse)
-    // - "radix": Radix tree learning with random fallback (adaptive route learning)
-    // - "round_robin": True random/weighted distribution (baseline, no learning)
-    enum class RoutingMode { PREFIX, RADIX, ROUND_ROBIN };
-    RoutingMode routing_mode = RoutingMode::RADIX;  // Default: adaptive radix tree routing
+    // - "prefix": ART lookup + consistent hash fallback (best for KV cache, learns routes)
+    // - "hash": Consistent hash only (no ART, no learning - measures hash baseline)
+    // - "random": Weighted random distribution (baseline, no affinity)
+    enum class RoutingMode { PREFIX, HASH, RANDOM };
+    RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity with ART
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
-    bool is_radix_mode() const { return routing_mode == RoutingMode::RADIX; }
-    bool is_round_robin_mode() const { return routing_mode == RoutingMode::ROUND_ROBIN; }
-    bool should_learn_routes() const { return routing_mode != RoutingMode::ROUND_ROBIN; }
+    bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
+    bool is_random_mode() const { return routing_mode == RoutingMode::RANDOM; }
+    bool uses_art() const { return routing_mode == RoutingMode::PREFIX; }
+    bool should_learn_routes() const { return routing_mode == RoutingMode::PREFIX; }
 };
 
 // Timeout configuration
@@ -488,22 +489,23 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int32_t>("RANVIER_MAX_TOKEN_ID")) {
         routing.max_token_id = *v;
     }
-    // Legacy: RANVIER_PREFIX_AFFINITY_ENABLED (true=prefix, false=round_robin)
+    // Legacy: RANVIER_PREFIX_AFFINITY_ENABLED (true=prefix, false=random)
     if (auto v = get_env("RANVIER_PREFIX_AFFINITY_ENABLED")) {
         if (*v == "1" || *v == "true" || *v == "yes") {
             routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
         } else {
-            routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+            routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
         }
     }
-    // RANVIER_ROUTING_MODE: "prefix", "radix", or "round_robin"
+    // RANVIER_ROUTING_MODE: "prefix", "hash", or "random"
     if (auto v = get_env("RANVIER_ROUTING_MODE")) {
         if (*v == "prefix") {
             routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
-        } else if (*v == "radix") {
-            routing.routing_mode = RoutingConfig::RoutingMode::RADIX;
-        } else if (*v == "round_robin") {
-            routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+        } else if (*v == "hash") {
+            routing.routing_mode = RoutingConfig::RoutingMode::HASH;
+        } else if (*v == "random" || *v == "round_robin") {
+            // "round_robin" accepted as alias for backward compatibility
+            routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
         }
     }
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
@@ -888,18 +890,19 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 if (r["prefix_affinity_enabled"].as<bool>()) {
                     config.routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
                 } else {
-                    config.routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
                 }
             }
-            // New: routing_mode (string: "prefix", "radix", "round_robin")
+            // routing_mode: "prefix", "hash", or "random"
             if (r["routing_mode"]) {
                 std::string mode = r["routing_mode"].as<std::string>();
                 if (mode == "prefix") {
                     config.routing.routing_mode = RoutingConfig::RoutingMode::PREFIX;
-                } else if (mode == "radix") {
-                    config.routing.routing_mode = RoutingConfig::RoutingMode::RADIX;
-                } else if (mode == "round_robin") {
-                    config.routing.routing_mode = RoutingConfig::RoutingMode::ROUND_ROBIN;
+                } else if (mode == "hash") {
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::HASH;
+                } else if (mode == "random" || mode == "round_robin") {
+                    // "round_robin" accepted as alias for backward compatibility
+                    config.routing.routing_mode = RoutingConfig::RoutingMode::RANDOM;
                 }
             }
             if (r["prefix_token_length"]) {

@@ -17,12 +17,18 @@ Key Metrics:
 Environment Variables:
     Backend Configuration:
         NUM_BACKENDS          - Number of vLLM backends (default: 2)
-        BACKEND{N}_IP         - IP address for backend N (default: 172.29.1.{9+N})
-        BACKEND{N}_PORT       - Port for backend N (default: 8000)
+        BACKEND_BASE_IP       - Base IP for sequential port config (e.g., 172.17.0.1)
+        BACKEND_PORT_START    - Starting port for sequential config (default: 8000)
+        BACKEND{N}_IP         - Per-backend IP override (default: 172.29.1.{9+N})
+        BACKEND{N}_PORT       - Per-backend port override (default: 8000)
+        SKIP_BACKEND_REGISTRATION - Skip auto-registration if backends already registered
         SINGLE_BACKEND_MODE   - Legacy: set to "true" for single backend
 
     Ranvier Node Configuration:
         NUM_RANVIER_NODES     - Number of Ranvier router nodes (default: 3)
+        RANVIER_BASE_IP       - Base IP for sequential port config (e.g., localhost)
+        RANVIER_PORT_START    - Starting port for sequential config (default: 8080)
+        RANVIER_METRICS_PORT_START - Starting metrics port for sequential config (default: 9180)
         RANVIER_NODE{N}       - Full URL for node N (e.g., http://host:8080)
         RANVIER_NODE{N}_IP    - IP address for node N (default: 172.29.2.{N})
         RANVIER_NODE{N}_PORT  - Port for node N (default: 8080)
@@ -30,7 +36,7 @@ Environment Variables:
         RANVIER_METRICS{N}_PORT - Metrics port for node N (default: 9180)
 
     Benchmark Configuration:
-        BENCHMARK_MODE        - "prefix" (default) or "round_robin"
+        BENCHMARK_MODE        - "prefix" (default), "hash", or "random"
         PROMPT_DISTRIBUTION   - "mixed", "short", "medium", "long", "large-prefix", "stress"
         SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
         P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
@@ -41,10 +47,19 @@ Environment Variables:
         NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
 
 Usage:
-    # With 2 backends (default):
-    make benchmark-real
+    # 8 backends on same host with sequential ports (simplest for multi-GPU):
+    NUM_BACKENDS=8 BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 \
+    locust -f tests/integration/locustfile_real.py --headless ...
 
-    # With 4 backends for multi-GPU testing:
+    # 3 Ranvier nodes on same host with sequential ports:
+    NUM_RANVIER_NODES=3 RANVIER_BASE_IP=localhost RANVIER_PORT_START=8081 \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # Skip registration if backends already registered via curl:
+    SKIP_BACKEND_REGISTRATION=true NUM_RANVIER_NODES=1 RANVIER_NODE1=http://localhost:8081 \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # With 4 backends on different hosts:
     NUM_BACKENDS=4 \
     BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 \
     BACKEND3_IP=10.0.0.3 BACKEND4_IP=10.0.0.4 \
@@ -77,48 +92,71 @@ logger = logging.getLogger(__name__)
 # Environment Configuration
 # ============================================================================
 
+# Skip backend registration if backends are already registered manually
+# Use this when you've already registered backends via curl or admin API
+SKIP_BACKEND_REGISTRATION = os.environ.get("SKIP_BACKEND_REGISTRATION", "false").lower() in ("true", "1", "yes")
+
 # Support single-backend mode for single-GPU testing (legacy, prefer NUM_BACKENDS=1)
 SINGLE_BACKEND_MODE = os.environ.get("SINGLE_BACKEND_MODE", "false").lower() == "true"
 
 # Configurable backend count (1-16 backends supported)
 # Set NUM_BACKENDS to control how many backends to use
-# Each backend requires BACKEND{N}_IP and optionally BACKEND{N}_PORT environment variables
 if SINGLE_BACKEND_MODE:
     NUM_BACKENDS = 1
 else:
     NUM_BACKENDS = int(os.environ.get("NUM_BACKENDS", "2"))
 
-# Default backend IP patterns (can be overridden per-backend)
+# Simplified backend config for sequential ports on same host (common for multi-GPU)
+# If BACKEND_BASE_IP is set, all backends use that IP with sequential ports starting from BACKEND_PORT_START
+# Example: BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 NUM_BACKENDS=8
+#   -> Backend 1: 172.17.0.1:8000, Backend 2: 172.17.0.1:8001, ..., Backend 8: 172.17.0.1:8007
+BACKEND_BASE_IP = os.environ.get("BACKEND_BASE_IP")
+BACKEND_PORT_START = int(os.environ.get("BACKEND_PORT_START", "8000"))
+
+# Default backend IP patterns (used when BACKEND_BASE_IP is not set)
 DEFAULT_BACKEND_IP_PATTERN = "172.29.1.{}"  # {} is replaced with 10 + backend_index
 DEFAULT_BACKEND_PORT = 8000
 
-# Dynamically build backends list based on NUM_BACKENDS
+
 def _build_backends_list(num_backends: int) -> List[dict]:
     """Build the backends list dynamically based on environment configuration.
 
-    For each backend N (1-indexed), checks for:
-    - BACKEND{N}_IP: IP address (default: 172.29.1.{9+N})
-    - BACKEND{N}_PORT: Port number (default: 8000)
+    Configuration modes (in order of precedence):
+    1. BACKEND_BASE_IP + BACKEND_PORT_START: Sequential ports on same host
+       Example: BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 NUM_BACKENDS=8
+         -> 172.17.0.1:8000, 172.17.0.1:8001, ..., 172.17.0.1:8007
 
-    Examples:
-        NUM_BACKENDS=4 with defaults:
-          Backend 1: 172.29.1.10:8000
-          Backend 2: 172.29.1.11:8000
-          Backend 3: 172.29.1.12:8000
-          Backend 4: 172.29.1.13:8000
+    2. Per-backend overrides: BACKEND{N}_IP and BACKEND{N}_PORT
+       Example: BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 NUM_BACKENDS=2
 
-        With custom IPs:
-          BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 NUM_BACKENDS=2
+    3. Defaults: Different IPs (172.29.1.10, .11, ...), same port (8000)
+       Example: NUM_BACKENDS=4
+         -> 172.29.1.10:8000, 172.29.1.11:8000, 172.29.1.12:8000, 172.29.1.13:8000
     """
     backends = []
+
     for i in range(1, num_backends + 1):
-        default_ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
-        backends.append({
-            "id": i,
-            "ip": os.environ.get(f"BACKEND{i}_IP", default_ip),
-            "port": int(os.environ.get(f"BACKEND{i}_PORT", str(DEFAULT_BACKEND_PORT))),
-        })
+        # Check for per-backend override first
+        backend_ip = os.environ.get(f"BACKEND{i}_IP")
+        backend_port = os.environ.get(f"BACKEND{i}_PORT")
+
+        if backend_ip is not None:
+            # Per-backend override takes precedence
+            ip = backend_ip
+            port = int(backend_port) if backend_port else DEFAULT_BACKEND_PORT
+        elif BACKEND_BASE_IP:
+            # Use simplified sequential port config
+            ip = BACKEND_BASE_IP
+            port = BACKEND_PORT_START + (i - 1)
+        else:
+            # Fall back to default pattern (different IPs, same port)
+            ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
+            port = DEFAULT_BACKEND_PORT
+
+        backends.append({"id": i, "ip": ip, "port": port})
+
     return backends
+
 
 BACKENDS = _build_backends_list(NUM_BACKENDS)
 
@@ -126,46 +164,161 @@ BACKENDS = _build_backends_list(NUM_BACKENDS)
 # Set NUM_RANVIER_NODES to control how many router nodes to use
 NUM_RANVIER_NODES = int(os.environ.get("NUM_RANVIER_NODES", "3"))
 
-# Default Ranvier node patterns
+# Simplified Ranvier config for sequential ports on same host (common for multi-node testing)
+# If RANVIER_BASE_IP is set, all nodes use that IP with sequential ports starting from RANVIER_PORT_START
+# Example: RANVIER_BASE_IP=localhost RANVIER_PORT_START=8081 NUM_RANVIER_NODES=3
+#   -> Node 1: localhost:8081, Node 2: localhost:8082, Node 3: localhost:8083
+#   -> Metrics 1: localhost:9181, Metrics 2: localhost:9182, Metrics 3: localhost:9183
+RANVIER_BASE_IP = os.environ.get("RANVIER_BASE_IP")
+RANVIER_PORT_START = int(os.environ.get("RANVIER_PORT_START", "8080"))
+RANVIER_METRICS_PORT_START = int(os.environ.get("RANVIER_METRICS_PORT_START", "9180"))
+
+# Default Ranvier node patterns (used when RANVIER_BASE_IP is not set)
 DEFAULT_RANVIER_IP_PATTERN = "172.29.2.{}"  # {} is replaced with node_index
 DEFAULT_RANVIER_PORT = 8080
 DEFAULT_RANVIER_METRICS_PORT = 9180
 
+
 def _build_ranvier_nodes_list(num_nodes: int) -> List[str]:
-    """Build the Ranvier nodes list dynamically."""
+    """Build the Ranvier nodes list dynamically.
+
+    Configuration modes (in order of precedence):
+    1. RANVIER_NODE{N}: Full URL override (e.g., http://host:8080)
+
+    2. RANVIER_BASE_IP + RANVIER_PORT_START: Sequential ports on same host
+       Example: RANVIER_BASE_IP=localhost RANVIER_PORT_START=8081 NUM_RANVIER_NODES=3
+         -> http://localhost:8081, http://localhost:8082, http://localhost:8083
+
+    3. Per-node overrides: RANVIER_NODE{N}_IP and RANVIER_NODE{N}_PORT
+       Example: RANVIER_NODE1_IP=10.0.0.1 RANVIER_NODE2_IP=10.0.0.2
+
+    4. Defaults: Different IPs (172.29.2.1, .2, ...), same port (8080)
+    """
     nodes = []
     for i in range(1, num_nodes + 1):
-        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
-        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
-        port = os.environ.get(f"RANVIER_NODE{i}_PORT", str(DEFAULT_RANVIER_PORT))
-        # Support full URL override
+        # Check for full URL override first (highest precedence)
         full_url = os.environ.get(f"RANVIER_NODE{i}")
         if full_url:
             nodes.append(full_url)
+            continue
+
+        # Check for per-node IP override
+        node_ip = os.environ.get(f"RANVIER_NODE{i}_IP")
+        node_port = os.environ.get(f"RANVIER_NODE{i}_PORT")
+
+        if node_ip is not None:
+            # Per-node override
+            ip = node_ip
+            port = int(node_port) if node_port else DEFAULT_RANVIER_PORT
+        elif RANVIER_BASE_IP:
+            # Use simplified sequential port config
+            ip = RANVIER_BASE_IP
+            port = RANVIER_PORT_START + (i - 1)
         else:
-            nodes.append(f"http://{ip}:{port}")
+            # Fall back to default pattern (different IPs, same port)
+            ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+            port = DEFAULT_RANVIER_PORT
+
+        nodes.append(f"http://{ip}:{port}")
     return nodes
 
+
 def _build_ranvier_metrics_list(num_nodes: int) -> List[str]:
-    """Build the Ranvier metrics endpoints list dynamically."""
+    """Build the Ranvier metrics endpoints list dynamically.
+
+    Configuration modes (in order of precedence):
+    1. RANVIER_METRICS{N}: Full URL override
+
+    2. RANVIER_BASE_IP + RANVIER_METRICS_PORT_START: Sequential ports on same host
+       Example: RANVIER_BASE_IP=localhost RANVIER_METRICS_PORT_START=9181 NUM_RANVIER_NODES=3
+         -> http://localhost:9181, http://localhost:9182, http://localhost:9183
+
+    3. Per-node overrides: RANVIER_NODE{N}_IP + RANVIER_METRICS{N}_PORT
+
+    4. Defaults: Different IPs (172.29.2.1, .2, ...), same port (9180)
+    """
     metrics = []
     for i in range(1, num_nodes + 1):
-        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
-        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
-        port = os.environ.get(f"RANVIER_METRICS{i}_PORT", str(DEFAULT_RANVIER_METRICS_PORT))
-        # Support full URL override
+        # Check for full URL override first (highest precedence)
         full_url = os.environ.get(f"RANVIER_METRICS{i}")
         if full_url:
             metrics.append(full_url)
+            continue
+
+        # Check for per-node IP override (from node config, reused for metrics)
+        node_ip = os.environ.get(f"RANVIER_NODE{i}_IP")
+        metrics_port = os.environ.get(f"RANVIER_METRICS{i}_PORT")
+
+        if node_ip is not None:
+            # Per-node override
+            ip = node_ip
+            port = int(metrics_port) if metrics_port else DEFAULT_RANVIER_METRICS_PORT
+        elif RANVIER_BASE_IP:
+            # Use simplified sequential port config
+            ip = RANVIER_BASE_IP
+            port = RANVIER_METRICS_PORT_START + (i - 1)
         else:
-            metrics.append(f"http://{ip}:{port}")
+            # Fall back to default pattern (different IPs, same port)
+            ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+            port = DEFAULT_RANVIER_METRICS_PORT
+
+        metrics.append(f"http://{ip}:{port}")
     return metrics
 
 RANVIER_NODES = _build_ranvier_nodes_list(NUM_RANVIER_NODES)
 RANVIER_METRICS = _build_ranvier_metrics_list(NUM_RANVIER_NODES)
 
-# Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
+# Benchmark mode: "prefix" for ART+hash, "hash" for hash-only, "random" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
+
+
+def verify_routing_mode_matches() -> Tuple[bool, Optional[str]]:
+    """Verify that the server's actual routing mode matches BENCHMARK_MODE.
+
+    Makes a probe request to check the X-Routing-Mode response header.
+    Returns (matches, actual_mode) tuple.
+    """
+    if not RANVIER_NODES:
+        logger.warning("No Ranvier nodes configured, skipping routing mode verification")
+        return True, None
+
+    probe_url = f"{RANVIER_NODES[0]}/v1/chat/completions"
+    probe_payload = {
+        "model": "probe",
+        "messages": [{"role": "user", "content": "routing mode check"}],
+        "max_tokens": 1,
+        "stream": False
+    }
+
+    try:
+        # Use a short timeout - we just need the headers, not a full response
+        # The request may fail (no backends), but we'll still get headers
+        resp = requests.post(probe_url, json=probe_payload, timeout=5)
+        actual_mode = resp.headers.get("X-Routing-Mode")
+
+        if actual_mode is None:
+            logger.warning("Server did not return X-Routing-Mode header - "
+                          "ensure Ranvier is updated with header support")
+            return True, None  # Can't verify, assume OK
+
+        if actual_mode != BENCHMARK_MODE:
+            logger.error("=" * 70)
+            logger.error("ROUTING MODE MISMATCH DETECTED!")
+            logger.error(f"  BENCHMARK_MODE (client label): {BENCHMARK_MODE}")
+            logger.error(f"  X-Routing-Mode (server actual): {actual_mode}")
+            logger.error("")
+            logger.error("Your benchmark results will be mislabeled!")
+            logger.error("Fix: Set RANVIER_ROUTING_MODE=%s before starting the server", BENCHMARK_MODE)
+            logger.error("=" * 70)
+            return False, actual_mode
+
+        logger.info(f"Routing mode verified: server is running in '{actual_mode}' mode")
+        return True, actual_mode
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Could not verify routing mode (probe request failed): {e}")
+        return True, None  # Can't verify, assume OK
+
 
 # Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress"
 PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "mixed")
@@ -2063,7 +2216,14 @@ def register_backends_on_all_nodes():
     if _backends_registered:
         return
 
+    if SKIP_BACKEND_REGISTRATION:
+        logger.info("Skipping backend registration (SKIP_BACKEND_REGISTRATION=true)")
+        logger.info("Ensure backends are already registered via admin API or curl")
+        _backends_registered = True
+        return
+
     logger.info("Registering backends on all Ranvier nodes...")
+    logger.info(f"Backends to register: {BACKENDS}")
 
     for node_url in RANVIER_NODES:
         for backend in BACKENDS:
@@ -2391,6 +2551,12 @@ def on_test_start(environment, **kwargs):
     # Wait for backends to be ready
     logger.info("Waiting for backends to warm up...")
     time.sleep(5)
+
+    # Verify routing mode matches expectations (catches BENCHMARK_MODE vs RANVIER_ROUTING_MODE mismatch)
+    mode_matches, actual_mode = verify_routing_mode_matches()
+    if not mode_matches:
+        # Continue anyway but results will be clearly marked as potentially invalid
+        logger.warning("Proceeding despite routing mode mismatch - results may be unreliable!")
 
     # Capture initial sync errors
     capture_initial_sync_errors()

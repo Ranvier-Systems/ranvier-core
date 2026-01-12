@@ -89,7 +89,7 @@ struct ShardLocalState {
         size_t max_route_tokens = 8192;  // Business-level limit on tokens per route
         std::chrono::seconds ttl_seconds{3600};
         std::chrono::seconds backend_drain_timeout{60};
-        RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::RADIX;
+        RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;
         size_t prefix_token_length = 128;
         uint32_t block_alignment = 16;
     } config;
@@ -560,10 +560,10 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
 
     // Use shard-local routing mode (hot-reloadable via update_routing_config)
     auto routing_mode = g_shard_state ? shard_state().config.routing_mode
-                                      : RoutingConfig::RoutingMode::RADIX;
+                                      : RoutingConfig::RoutingMode::PREFIX;
 
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
-        // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
+        // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
         auto affinity_backend = get_backend_for_prefix(tokens, request_id);
 
@@ -579,32 +579,26 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
         } else {
             result.error_message = "No backends registered";
         }
-    } else if (routing_mode == RoutingConfig::RoutingMode::RADIX) {
-        // RADIX mode: radix tree lookup with random fallback (adaptive learning)
-        result.routing_mode = "radix";
-        auto lookup_result = lookup(tokens, request_id);
+    } else if (routing_mode == RoutingConfig::RoutingMode::HASH) {
+        // HASH mode: consistent hash only (no ART, no learning)
+        // Use this to measure baseline hash performance vs ART
+        result.routing_mode = "hash";
+        auto hash_backend = get_backend_by_hash(tokens, request_id);
 
-        if (lookup_result.has_value()) {
-            result.backend_id = lookup_result.value();
-            result.cache_hit = true;
+        if (hash_backend.has_value()) {
+            result.backend_id = hash_backend.value();
+            result.cache_hit = true;  // Hash always provides affinity
         } else {
-            // Cache miss - fall back to weighted random selection
-            auto random_id = get_random_backend();
-            if (random_id.has_value()) {
-                result.backend_id = random_id.value();
-                result.cache_hit = false;
-            } else {
-                result.error_message = "No backends registered";
-            }
+            result.error_message = "No backends registered";
         }
     } else {
-        // ROUND_ROBIN mode: always use random/weighted backend selection
-        result.routing_mode = "round_robin";
+        // RANDOM mode: weighted random selection (baseline, no affinity)
+        result.routing_mode = "random";
         auto random_id = get_random_backend();
 
         if (random_id.has_value()) {
             result.backend_id = random_id.value();
-            result.cache_hit = false;  // Round-robin never uses cache
+            result.cache_hit = false;  // Random never uses cache
         } else {
             result.error_message = "No backends registered";
         }
@@ -782,6 +776,63 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
         metrics().record_cache_miss();
     }
 
+    return selected;
+}
+
+std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
+                                                             const std::string& request_id) {
+    // HASH-ONLY mode: consistent hashing without ART lookup or learning
+    // This provides a baseline to measure ART's added value:
+    // - Same prefix → same backend (deterministic)
+    // - Different suffix on same prefix → likely different backend (no LPM)
+    if (!g_shard_state) return std::nullopt;
+    auto& state = shard_state();
+
+    if (state.backend_ids.empty()) {
+        return std::nullopt;
+    }
+
+    // Collect live backends (not dead, not draining)
+    std::vector<BackendId> live_backends;
+    for (BackendId id : state.backend_ids) {
+        if (state.dead_backends.contains(id)) {
+            continue;
+        }
+        auto it = state.backends.find(id);
+        if (it == state.backends.end()) {
+            continue;
+        }
+        if (it->second.is_draining) {
+            continue;
+        }
+        live_backends.push_back(id);
+    }
+
+    if (live_backends.empty()) {
+        return std::nullopt;
+    }
+
+    // Sort for deterministic ordering across shards
+    std::sort(live_backends.begin(), live_backends.end());
+
+    // Extract prefix (first N tokens)
+    size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    if (prefix_len == 0) {
+        return live_backends[0];
+    }
+
+    // Consistent hash on prefix tokens
+    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+    size_t index = prefix_hash % live_backends.size();
+    BackendId selected = live_backends[index];
+
+    if (!request_id.empty()) {
+        log_router.debug("[{}] Hash routing: {} tokens, hash={}, index={}/{} -> backend {}",
+                         request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
+    }
+
+    // No ART involvement - no cache_hit/miss tracking for stats
+    // (hash mode is for measuring baseline, not production metrics)
     return selected;
 }
 
@@ -1158,7 +1209,7 @@ seastar::future<> RouterService::update_routing_config(const RoutingConfig& conf
     _config = config;
 
     const char* mode_str = config.routing_mode == RoutingConfig::RoutingMode::PREFIX ? "prefix" :
-                           config.routing_mode == RoutingConfig::RoutingMode::RADIX ? "radix" : "round_robin";
+                           config.routing_mode == RoutingConfig::RoutingMode::HASH ? "hash" : "random";
     log_main.info("Hot-reload: Updating routing config on all shards (max_routes={}, ttl={}s, drain_timeout={}s, mode={}, prefix_len={})",
                   config.max_routes, config.ttl_seconds.count(), config.backend_drain_timeout.count(),
                   mode_str, config.prefix_token_length);

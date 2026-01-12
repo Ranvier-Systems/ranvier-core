@@ -431,10 +431,18 @@ Use `make benchmark-single-gpu` for basic validation.
 |----------|---------|-------------|
 | `VLLM_ENDPOINT_1` | - | URL of first vLLM backend (required for external) |
 | `VLLM_ENDPOINT_2` | - | URL of second vLLM backend (required for external) |
+| `NUM_BACKENDS` | 2 | Number of vLLM backends |
+| `BACKEND_BASE_IP` | - | Base IP for sequential ports (e.g., `172.17.0.1`) |
+| `BACKEND_PORT_START` | 8000 | Starting port when using `BACKEND_BASE_IP` |
+| `SKIP_BACKEND_REGISTRATION` | false | Skip auto-registration if backends already registered |
+| `NUM_RANVIER_NODES` | 3 | Number of Ranvier router nodes |
+| `RANVIER_BASE_IP` | - | Base IP for sequential ports (e.g., `localhost`) |
+| `RANVIER_PORT_START` | 8080 | Starting port when using `RANVIER_BASE_IP` |
+| `RANVIER_METRICS_PORT_START` | 9180 | Starting metrics port when using `RANVIER_BASE_IP` |
 | `BENCHMARK_REAL_DURATION` | 5m | Test duration |
 | `BENCHMARK_REAL_USERS` | 10 | Concurrent users |
 | `BENCHMARK_REAL_SPAWN_RATE` | 2 | Users spawned per second |
-| `RANVIER_ROUTING_MODE` | prefix | Routing mode: `prefix` or `round_robin` |
+| `RANVIER_ROUTING_MODE` | prefix | Routing mode: `prefix`, `hash`, or `random` |
 | `PROMPT_DISTRIBUTION` | mixed | Prompt lengths: `short`, `medium`, `long`, `mixed` |
 | `SHARED_PREFIX_RATIO` | 0.7 | Ratio of requests sharing a prefix (0.0-1.0) |
 | `VLLM_MODEL` | Llama-3.2-1B | Model for local vLLM |

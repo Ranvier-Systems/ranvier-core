@@ -4,7 +4,7 @@ Benchmark Comparison Script for Ranvier Core
 
 This script runs the same workload twice:
 1. With prefix-aware routing enabled (Ranvier's default)
-2. With round-robin routing (baseline, no prefix optimization)
+2. With random routing (baseline, no prefix optimization)
 
 It then compares the results to demonstrate the value of prefix-aware routing.
 
@@ -63,8 +63,8 @@ Output:
     - benchmark-reports/comparison_<timestamp>/
         - prefix_aware_output.log
         - prefix_aware_stats.csv
-        - round_robin_output.log
-        - round_robin_stats.csv
+        - random_output.log
+        - random_stats.csv
         - comparison_summary.txt
         - stress_report.txt (if --stress mode)
 """
@@ -181,11 +181,11 @@ def parse_locust_output(log_file: str) -> Dict:
     return results
 
 
-def format_comparison_table(prefix_results: Dict, roundrobin_results: Dict) -> str:
+def format_comparison_table(prefix_results: Dict, random_results: Dict) -> str:
     """Generate a formatted comparison table."""
     lines = []
     lines.append("=" * 80)
-    lines.append("BENCHMARK COMPARISON: Prefix-Aware Routing vs Round-Robin")
+    lines.append("BENCHMARK COMPARISON: Prefix-Aware Routing vs Random")
     lines.append("=" * 80)
     lines.append("")
 
@@ -202,11 +202,11 @@ def format_comparison_table(prefix_results: Dict, roundrobin_results: Dict) -> s
         ("Requests/sec", "requests_per_sec", False),
     ]
 
-    lines.append(f"{'Metric':<30} {'Round-Robin':>15} {'Prefix-Aware':>15} {'Improvement':>20}")
+    lines.append(f"{'Metric':<30} {'Random':>15} {'Prefix-Aware':>15} {'Improvement':>20}")
     lines.append("-" * 80)
 
     for name, key, lower_is_better in metrics:
-        rr_val = roundrobin_results.get(key)
+        rr_val = random_results.get(key)
         pa_val = prefix_results.get(key)
 
         rr_str = f"{rr_val:.2f}" if rr_val is not None else "N/A"
@@ -262,14 +262,14 @@ def format_comparison_table(prefix_results: Dict, roundrobin_results: Dict) -> s
 
 def format_stress_test_report(
     prefix_results: Dict,
-    roundrobin_results: Dict,
+    random_results: Dict,
     config: Dict
 ) -> str:
     """Generate a detailed stress test report with per-bucket analysis.
 
     Args:
         prefix_results: Results from prefix-affinity routing run
-        roundrobin_results: Results from round-robin routing run
+        random_results: Results from random routing run
         config: Configuration used for the stress test
     """
     lines = []
@@ -297,11 +297,11 @@ def format_stress_test_report(
     lines.append("-" * 100)
 
     pa_hit_rate = prefix_results.get("cache_hit_rate_pct", 0)
-    rr_hit_rate = roundrobin_results.get("cache_hit_rate_pct", 0)
-    lines.append(f"  Cache Hit Rate: {rr_hit_rate:.1f}% (round-robin) -> {pa_hit_rate:.1f}% (prefix-affinity)")
+    rr_hit_rate = random_results.get("cache_hit_rate_pct", 0)
+    lines.append(f"  Cache Hit Rate: {rr_hit_rate:.1f}% (random) -> {pa_hit_rate:.1f}% (prefix-affinity)")
 
     pa_improvement = prefix_results.get("ttft_improvement_pct")
-    rr_improvement = roundrobin_results.get("ttft_improvement_pct")
+    rr_improvement = random_results.get("ttft_improvement_pct")
     if pa_improvement:
         lines.append(f"  TTFT Improvement (Cache Hit vs Miss): {pa_improvement:.1f}%")
     lines.append("")
@@ -313,7 +313,7 @@ def format_stress_test_report(
     lines.append("")
 
     pa_buckets = prefix_results.get("bucket_stats", {})
-    rr_buckets = roundrobin_results.get("bucket_stats", {})
+    rr_buckets = random_results.get("bucket_stats", {})
 
     bucket_info = [
         ("tiny", "0-100 tokens", "Negligible prefill time - no visible KV cache benefit"),
@@ -336,7 +336,7 @@ def format_stress_test_report(
 
         pa_requests = pa_bucket.get("requests", 0)
         rr_requests = rr_bucket.get("requests", 0)
-        lines.append(f"    Requests: {rr_requests} (round-robin), {pa_requests} (prefix-affinity)")
+        lines.append(f"    Requests: {rr_requests} (random), {pa_requests} (prefix-affinity)")
 
         # TTFT comparison
         pa_hit_p50 = pa_bucket.get("cache_hit_ttft_p50_ms")
@@ -349,9 +349,9 @@ def format_stress_test_report(
         if pa_miss_p50:
             lines.append(f"    Prefix-Affinity Cache Miss P50: {pa_miss_p50:.1f}ms")
         if rr_hit_p50:
-            lines.append(f"    Round-Robin Cache Hit P50: {rr_hit_p50:.1f}ms")
+            lines.append(f"    Random Cache Hit P50: {rr_hit_p50:.1f}ms")
         if rr_miss_p50:
-            lines.append(f"    Round-Robin Cache Miss P50: {rr_miss_p50:.1f}ms")
+            lines.append(f"    Random Cache Miss P50: {rr_miss_p50:.1f}ms")
 
         # Calculate improvements
         pa_improv = pa_bucket.get("ttft_improvement_pct")
@@ -547,7 +547,7 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run benchmark comparison: Prefix-Aware vs Round-Robin routing"
+        description="Run benchmark comparison: Prefix-Aware vs Random routing"
     )
     parser.add_argument(
         "--duration", "-d",
@@ -577,14 +577,14 @@ def main():
         help="Output directory (default: benchmark-reports/comparison_<timestamp>)",
     )
     parser.add_argument(
-        "--skip-roundrobin",
+        "--skip-random",
         action="store_true",
-        help="Skip round-robin baseline (only run prefix-aware)",
+        help="Skip random baseline (only run prefix-aware)",
     )
     parser.add_argument(
         "--skip-prefix",
         action="store_true",
-        help="Skip prefix-aware (only run round-robin baseline)",
+        help="Skip prefix-aware (only run random baseline)",
     )
     parser.add_argument(
         "--stress",
@@ -699,16 +699,16 @@ def main():
         print(f"  Expected Random Cache Hit Rate: {expected_random_hit:.1f}%")
         print("")
 
-    roundrobin_results = {}
+    random_results = {}
     prefix_results = {}
 
-    # Run round-robin baseline
-    if not args.skip_roundrobin:
-        success, roundrobin_results = run_benchmark(
+    # Run random baseline
+    if not args.skip_random:
+        success, random_results = run_benchmark(
             docker_compose=docker_compose,
             output_dir=output_dir,
-            label="Round-Robin",
-            routing_mode="round_robin",
+            label="Random",
+            routing_mode="random",
             duration=args.duration,
             users=args.users,
             spawn_rate=args.spawn_rate,
@@ -716,7 +716,7 @@ def main():
             extra_env=extra_env,
         )
         if not success:
-            print("Warning: Round-robin benchmark had errors")
+            print("Warning: Random benchmark had errors")
 
         # Cool-down period between runs
         if not args.skip_prefix:
@@ -740,8 +740,8 @@ def main():
             print("Warning: Prefix-aware benchmark had errors")
 
     # Generate comparison if both ran
-    if roundrobin_results and prefix_results:
-        comparison = format_comparison_table(prefix_results, roundrobin_results)
+    if random_results and prefix_results:
+        comparison = format_comparison_table(prefix_results, random_results)
         print("\n" + comparison)
 
         # Save comparison summary
@@ -753,7 +753,7 @@ def main():
         # Generate stress test report if in stress mode
         if args.stress or prompt_distribution in ["large-prefix", "stress"]:
             stress_report = format_stress_test_report(
-                prefix_results, roundrobin_results, stress_config
+                prefix_results, random_results, stress_config
             )
             print("\n" + stress_report)
 
@@ -780,9 +780,9 @@ def main():
                 f.write(stress_report)
             print(f"\nStress report saved to: {stress_report_file}")
 
-    elif roundrobin_results:
-        print("\nRound-robin results:")
-        for k, v in roundrobin_results.items():
+    elif random_results:
+        print("\nRandom results:")
+        for k, v in random_results.items():
             if v is not None and k != "bucket_stats":
                 print(f"  {k}: {v}")
 
