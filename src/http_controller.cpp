@@ -568,9 +568,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     auto retry_config = _config.retry;
     auto fallback_enabled = _config.circuit_breaker.fallback_enabled;
 
-    // Add X-Request-ID and X-Backend-ID to response headers before streaming
+    // Add debugging headers to response before streaming
+    // X-Request-ID: correlation ID for distributed tracing
+    // X-Backend-ID: which backend was selected
+    // X-Routing-Mode: actual routing mode used (helps catch config mismatches)
     rep->add_header("X-Request-ID", request_id);
     rep->add_header("X-Backend-ID", std::to_string(target_id));
+    rep->add_header("X-Routing-Mode", routing_mode_str);
 
     // Set final attributes on request span before entering streaming lambda
     request_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
