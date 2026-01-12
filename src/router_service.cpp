@@ -565,17 +565,13 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: consistent hashing on prefix tokens for KV cache reuse
         result.routing_mode = "prefix";
-        auto affinity_backend = get_backend_for_prefix(tokens, request_id);
+        auto prefix_result = get_backend_for_prefix(tokens, request_id);
 
-        if (affinity_backend.has_value()) {
-            result.backend_id = affinity_backend.value();
-            // Note: get_backend_for_prefix internally tracks cache_hit via stats.cache_hits/misses
-            // and returns a backend even on cache miss (via hash fallback).
-            // For external visibility, we report cache_hit based on whether ART had a hit.
-            // Since get_backend_for_prefix always returns a backend when backends exist,
-            // cache_hit here means we found the route in ART (not hash fallback).
-            // The internal stats.cache_hits counter was already incremented appropriately.
-            result.cache_hit = true;  // Prefix mode always has affinity (ART or hash)
+        if (prefix_result.backend_id.has_value()) {
+            result.backend_id = prefix_result.backend_id.value();
+            // cache_hit reflects whether we found the route in ART (true) or used hash fallback (false)
+            // This enables accurate metrics: ART hit = KV cache likely warm, hash = cold start
+            result.cache_hit = prefix_result.cache_hit;
         } else {
             result.error_message = "No backends registered";
         }
@@ -685,13 +681,14 @@ std::optional<BackendId> RouterService::get_random_backend() {
     return candidates.back().first;
 }
 
-std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                                 const std::string& request_id) {
-    if (!g_shard_state) return std::nullopt;
+PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                                         const std::string& request_id) {
+    PrefixRouteResult result;
+    if (!g_shard_state) return result;
     auto& state = shard_state();
 
     if (state.backend_ids.empty()) {
-        return std::nullopt;
+        return result;
     }
 
     // Collect live backends (not dead, not draining)
@@ -711,7 +708,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     }
 
     if (live_backends.empty()) {
-        return std::nullopt;
+        return result;
     }
 
     // Sort for deterministic ordering across shards
@@ -720,8 +717,10 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     // Extract prefix (first N tokens)
     size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
     if (prefix_len == 0) {
-        // No tokens to route on, fall back to first backend
-        return live_backends[0];
+        // No tokens to route on, fall back to first backend (not a cache hit)
+        result.backend_id = live_backends[0];
+        result.cache_hit = false;
+        return result;
     }
 
     // HYBRID ROUTING: ART lookup first, hash fallback
@@ -756,7 +755,9 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                 if (g_metrics) {
                     metrics().record_cache_hit();
                 }
-                return art_backend;
+                result.backend_id = art_backend;
+                result.cache_hit = true;  // ART hit - KV cache likely warm
+                return result;
             }
             // Backend is dead/draining, fall through to hash-based selection
             log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
@@ -782,7 +783,9 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
         metrics().record_cache_miss();
     }
 
-    return selected;
+    result.backend_id = selected;
+    result.cache_hit = false;  // Hash fallback - KV cache cold, will learn route after success
+    return result;
 }
 
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,

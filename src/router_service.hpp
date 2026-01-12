@@ -60,8 +60,14 @@ class GossipService;
 struct RouteResult {
     std::optional<BackendId> backend_id;  // Selected backend (nullopt if routing failed)
     std::string routing_mode;             // "prefix", "radix", or "round_robin"
-    bool cache_hit = false;               // True if route was found in cache (ART or prefix affinity)
+    bool cache_hit = false;               // True if route was found in cache (ART lookup hit)
     std::string error_message;            // Non-empty if backend_id is nullopt
+};
+
+// Result from prefix-affinity routing, distinguishing ART hits from hash fallbacks
+struct PrefixRouteResult {
+    std::optional<BackendId> backend_id;  // Selected backend (nullopt if no backends available)
+    bool cache_hit = false;               // True if found in ART, false if hash fallback
 };
 
 class RouterService {
@@ -149,8 +155,9 @@ public:
 
     // Get a backend using prefix-affinity routing (consistent hashing on prefix tokens)
     // Routes requests with the same prefix to the same backend for KV cache reuse
-    std::optional<BackendId> get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                     const std::string& request_id = "");
+    // Returns PrefixRouteResult with backend_id and cache_hit (ART hit vs hash fallback)
+    PrefixRouteResult get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                              const std::string& request_id = "");
 
     // Get list of all IDs (For the Health Checker to iterate)
     std::vector<BackendId> get_all_backend_ids() const;
