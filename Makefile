@@ -618,7 +618,7 @@ help:
 	@echo "    P99_LATENCY_THRESHOLD_MS=100 - P99 TTFT threshold (mock: 100ms, real: 5000ms)"
 	@echo "    BENCHMARK_LABEL=<name>   - Label prefix for output files"
 	@echo "    BENCHMARK_BUILD=1        - Set to 0 to skip rebuilding images"
-	@echo "    RANVIER_ROUTING_MODE=prefix - Routing mode: prefix or round_robin"
+	@echo "    RANVIER_ROUTING_MODE=prefix - Routing mode: prefix, hash, or random"
 	@echo "    PROMPT_DISTRIBUTION=mixed   - Prompt length: short, medium, long, mixed"
 	@echo "    SHARED_PREFIX_RATIO=0.7     - Ratio of requests with shared prefix"
 	@echo ""

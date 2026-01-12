@@ -438,7 +438,7 @@ Use `make benchmark-single-gpu` for basic validation.
 | `BENCHMARK_REAL_DURATION` | 5m | Test duration |
 | `BENCHMARK_REAL_USERS` | 10 | Concurrent users |
 | `BENCHMARK_REAL_SPAWN_RATE` | 2 | Users spawned per second |
-| `RANVIER_ROUTING_MODE` | prefix | Routing mode: `prefix` or `round_robin` |
+| `RANVIER_ROUTING_MODE` | prefix | Routing mode: `prefix`, `hash`, or `random` |
 | `PROMPT_DISTRIBUTION` | mixed | Prompt lengths: `short`, `medium`, `long`, `mixed` |
 | `SHARED_PREFIX_RATIO` | 0.7 | Ratio of requests sharing a prefix (0.0-1.0) |
 | `VLLM_MODEL` | Llama-3.2-1B | Model for local vLLM |

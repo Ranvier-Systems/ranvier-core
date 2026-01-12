@@ -33,7 +33,7 @@ Environment Variables:
         RANVIER_METRICS{N}_PORT - Metrics port for node N (default: 9180)
 
     Benchmark Configuration:
-        BENCHMARK_MODE        - "prefix" (default) or "round_robin"
+        BENCHMARK_MODE        - "prefix" (default), "hash", or "random"
         PROMPT_DISTRIBUTION   - "mixed", "short", "medium", "long", "large-prefix", "stress"
         SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
         P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
@@ -195,7 +195,7 @@ def _build_ranvier_metrics_list(num_nodes: int) -> List[str]:
 RANVIER_NODES = _build_ranvier_nodes_list(NUM_RANVIER_NODES)
 RANVIER_METRICS = _build_ranvier_metrics_list(NUM_RANVIER_NODES)
 
-# Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
+# Benchmark mode: "prefix" for ART+hash, "hash" for hash-only, "random" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
 
 

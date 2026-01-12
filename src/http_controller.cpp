@@ -923,7 +923,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 }
 
                 // Learn route in the ART for future prefix matching
-                // Learn routes in PREFIX and RADIX modes; skip for ROUND_ROBIN mode
+                // Learn routes only in PREFIX mode; skip for HASH and RANDOM modes
                 // The ART insert is idempotent - existing routes just get their timestamp updated
                 if (_config.should_learn_routes() && tokens.size() >= _config.min_token_length) {
                     // Route learning is best-effort; don't fail the request if it fails

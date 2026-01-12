@@ -85,9 +85,20 @@ Ranvier supports three routing modes configurable via `RANVIER_ROUTING_MODE`:
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| `prefix` | Hybrid ART + consistent hashing | **Recommended for LLM inference** |
-| `radix` | ART lookup + random fallback | Adaptive learning scenarios |
-| `round_robin` | Pure random/weighted | Baseline, stateless routing |
+| `prefix` | ART lookup + consistent hash (learns routes) | **Production** - best KV cache reuse |
+| `hash` | Consistent hash only (no ART, no learning) | Measures hash baseline vs ART |
+| `random` | Weighted random (no affinity) | Baseline comparison |
+
+### Mode Comparison
+
+| Scenario | `random` | `hash` | `prefix` |
+|----------|----------|--------|----------|
+| Same exact prefix | Different backend | Same backend ✓ | Same backend ✓ |
+| Similar prefix (90% overlap) | Different backend | Likely different | Same backend ✓ (LPM) |
+| Learning over time | No | No | Yes |
+| Backend changes | Random redistribution | Hash redistribution | ART re-learns |
+
+The `prefix` mode's **Longest Prefix Match (LPM)** via ART is the key differentiator - it handles prefix variations (same system prompt, different user queries) that pure hashing cannot.
 
 ### Configuration Variables
 
@@ -98,7 +109,7 @@ There are two separate environment variables to be aware of:
 | `RANVIER_ROUTING_MODE` | **Server** | Controls actual routing behavior in Ranvier |
 | `BENCHMARK_MODE` | **Client** | Labels test results in locust benchmark script |
 
-**Important:** These must be synchronized when running benchmarks! If you set `BENCHMARK_MODE=round_robin` but forget to set `RANVIER_ROUTING_MODE=round_robin`, the server will use its default (`prefix`) while your test results are mislabeled.
+**Important:** These must be synchronized when running benchmarks! If you set `BENCHMARK_MODE=random` but forget to set `RANVIER_ROUTING_MODE=random`, the server will use its default (`prefix`) while your test results are mislabeled.
 
 ### Verifying Configuration
 
@@ -112,8 +123,8 @@ curl -s -D - http://localhost:8081/v1/chat/completions \
 
 # Expected output shows actual server-side routing mode:
 # X-Routing-Mode: prefix
-# X-Routing-Mode: round_robin
-# X-Routing-Mode: radix
+# X-Routing-Mode: hash
+# X-Routing-Mode: random
 ```
 
 This header is invaluable for debugging configuration mismatches between client expectations and server behavior.
