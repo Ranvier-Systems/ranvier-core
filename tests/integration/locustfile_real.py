@@ -167,6 +167,55 @@ RANVIER_METRICS = _build_ranvier_metrics_list(NUM_RANVIER_NODES)
 # Benchmark mode: "prefix" for prefix-aware, "round_robin" for baseline
 BENCHMARK_MODE = os.environ.get("BENCHMARK_MODE", "prefix")
 
+
+def verify_routing_mode_matches() -> Tuple[bool, Optional[str]]:
+    """Verify that the server's actual routing mode matches BENCHMARK_MODE.
+
+    Makes a probe request to check the X-Routing-Mode response header.
+    Returns (matches, actual_mode) tuple.
+    """
+    if not RANVIER_NODES:
+        logger.warning("No Ranvier nodes configured, skipping routing mode verification")
+        return True, None
+
+    probe_url = f"{RANVIER_NODES[0]}/v1/chat/completions"
+    probe_payload = {
+        "model": "probe",
+        "messages": [{"role": "user", "content": "routing mode check"}],
+        "max_tokens": 1,
+        "stream": False
+    }
+
+    try:
+        # Use a short timeout - we just need the headers, not a full response
+        # The request may fail (no backends), but we'll still get headers
+        resp = requests.post(probe_url, json=probe_payload, timeout=5)
+        actual_mode = resp.headers.get("X-Routing-Mode")
+
+        if actual_mode is None:
+            logger.warning("Server did not return X-Routing-Mode header - "
+                          "ensure Ranvier is updated with header support")
+            return True, None  # Can't verify, assume OK
+
+        if actual_mode != BENCHMARK_MODE:
+            logger.error("=" * 70)
+            logger.error("ROUTING MODE MISMATCH DETECTED!")
+            logger.error(f"  BENCHMARK_MODE (client label): {BENCHMARK_MODE}")
+            logger.error(f"  X-Routing-Mode (server actual): {actual_mode}")
+            logger.error("")
+            logger.error("Your benchmark results will be mislabeled!")
+            logger.error("Fix: Set RANVIER_ROUTING_MODE=%s before starting the server", BENCHMARK_MODE)
+            logger.error("=" * 70)
+            return False, actual_mode
+
+        logger.info(f"Routing mode verified: server is running in '{actual_mode}' mode")
+        return True, actual_mode
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Could not verify routing mode (probe request failed): {e}")
+        return True, None  # Can't verify, assume OK
+
+
 # Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress"
 PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "mixed")
 
@@ -2391,6 +2440,12 @@ def on_test_start(environment, **kwargs):
     # Wait for backends to be ready
     logger.info("Waiting for backends to warm up...")
     time.sleep(5)
+
+    # Verify routing mode matches expectations (catches BENCHMARK_MODE vs RANVIER_ROUTING_MODE mismatch)
+    mode_matches, actual_mode = verify_routing_mode_matches()
+    if not mode_matches:
+        # Continue anyway but results will be clearly marked as potentially invalid
+        logger.warning("Proceeding despite routing mode mismatch - results may be unreliable!")
 
     # Capture initial sync errors
     capture_initial_sync_errors()
