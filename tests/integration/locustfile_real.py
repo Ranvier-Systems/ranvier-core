@@ -2175,6 +2175,15 @@ def get_backend_from_response(headers: dict) -> Optional[str]:
     return headers.get("X-Backend-ID") or headers.get("x-backend-id")
 
 
+def get_routing_mode_from_response(headers: dict) -> Optional[str]:
+    """Extract routing mode from response headers.
+
+    Ranvier adds X-Routing-Mode header to responses.
+    This helps verify the actual routing mode used by Ranvier matches expectations.
+    """
+    return headers.get("X-Routing-Mode") or headers.get("x-routing-mode")
+
+
 # ============================================================================
 # Prompt Generation
 # ============================================================================
@@ -2360,7 +2369,9 @@ def on_test_start(environment, **kwargs):
     logger.info("=" * 70)
     logger.info("Starting Ranvier Real Backend Load Test")
     logger.info("=" * 70)
-    logger.info(f"Benchmark Mode: {BENCHMARK_MODE}")
+    logger.info(f"Benchmark Mode (label): {BENCHMARK_MODE}")
+    logger.info(f"  NOTE: Actual routing mode is determined by RANVIER_ROUTING_MODE env var")
+    logger.info(f"  in your Docker container. Check X-Routing-Mode response header to verify.")
     logger.info(f"Prompt Distribution: {PROMPT_DISTRIBUTION}")
     logger.info(f"Shared Prefix Ratio: {SHARED_PREFIX_RATIO}")
     logger.info(f"P99 Latency Threshold: {P99_LATENCY_THRESHOLD_MS}ms")
@@ -2586,7 +2597,8 @@ class RealBackendUser(HttpUser):
             )
 
             # Get backend ID from response headers (Ranvier sets X-Backend-ID)
-            metrics.backend_id = get_backend_from_response(dict(resp.headers))
+            resp_headers = dict(resp.headers)
+            metrics.backend_id = get_backend_from_response(resp_headers)
             if metrics.backend_id is None:
                 if SINGLE_BACKEND_MODE:
                     # Single backend mode: all requests go to backend 1
@@ -2596,6 +2608,21 @@ class RealBackendUser(HttpUser):
                     # This means X-Backend-ID header is missing - cache tracking will be wrong
                     logger.warning("X-Backend-ID header missing - cache tracking may be inaccurate")
                     metrics.backend_id = str((node_index % len(BACKENDS)) + 1)
+
+            # Check for routing mode mismatch (warn once per mode combination)
+            actual_mode = get_routing_mode_from_response(resp_headers)
+            if actual_mode:
+                # Use actual mode from Ranvier for accurate tracking
+                metrics.routing_mode = actual_mode
+                if actual_mode != BENCHMARK_MODE:
+                    # Only warn once to avoid log spam
+                    if not hasattr(self, "_mode_mismatch_warned"):
+                        self._mode_mismatch_warned = True
+                        logger.warning(
+                            f"ROUTING MODE MISMATCH: BENCHMARK_MODE='{BENCHMARK_MODE}' but "
+                            f"Ranvier is using '{actual_mode}'. Set RANVIER_ROUTING_MODE={BENCHMARK_MODE} "
+                            f"in your Docker environment to fix this."
+                        )
 
             if resp.status_code != 200:
                 events.request.fire(
