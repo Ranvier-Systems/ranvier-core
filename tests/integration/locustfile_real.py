@@ -17,8 +17,11 @@ Key Metrics:
 Environment Variables:
     Backend Configuration:
         NUM_BACKENDS          - Number of vLLM backends (default: 2)
-        BACKEND{N}_IP         - IP address for backend N (default: 172.29.1.{9+N})
-        BACKEND{N}_PORT       - Port for backend N (default: 8000)
+        BACKEND_BASE_IP       - Base IP for sequential port config (e.g., 172.17.0.1)
+        BACKEND_PORT_START    - Starting port for sequential config (default: 8000)
+        BACKEND{N}_IP         - Per-backend IP override (default: 172.29.1.{9+N})
+        BACKEND{N}_PORT       - Per-backend port override (default: 8000)
+        SKIP_BACKEND_REGISTRATION - Skip auto-registration if backends already registered
         SINGLE_BACKEND_MODE   - Legacy: set to "true" for single backend
 
     Ranvier Node Configuration:
@@ -41,10 +44,15 @@ Environment Variables:
         NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
 
 Usage:
-    # With 2 backends (default):
-    make benchmark-real
+    # 8 backends on same host with sequential ports (simplest for multi-GPU):
+    NUM_BACKENDS=8 BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 \
+    locust -f tests/integration/locustfile_real.py --headless ...
 
-    # With 4 backends for multi-GPU testing:
+    # Skip registration if backends already registered via curl:
+    SKIP_BACKEND_REGISTRATION=true NUM_RANVIER_NODES=1 RANVIER_NODE1=http://localhost:8081 \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # With 4 backends on different hosts:
     NUM_BACKENDS=4 \
     BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 \
     BACKEND3_IP=10.0.0.3 BACKEND4_IP=10.0.0.4 \
@@ -77,48 +85,71 @@ logger = logging.getLogger(__name__)
 # Environment Configuration
 # ============================================================================
 
+# Skip backend registration if backends are already registered manually
+# Use this when you've already registered backends via curl or admin API
+SKIP_BACKEND_REGISTRATION = os.environ.get("SKIP_BACKEND_REGISTRATION", "false").lower() in ("true", "1", "yes")
+
 # Support single-backend mode for single-GPU testing (legacy, prefer NUM_BACKENDS=1)
 SINGLE_BACKEND_MODE = os.environ.get("SINGLE_BACKEND_MODE", "false").lower() == "true"
 
 # Configurable backend count (1-16 backends supported)
 # Set NUM_BACKENDS to control how many backends to use
-# Each backend requires BACKEND{N}_IP and optionally BACKEND{N}_PORT environment variables
 if SINGLE_BACKEND_MODE:
     NUM_BACKENDS = 1
 else:
     NUM_BACKENDS = int(os.environ.get("NUM_BACKENDS", "2"))
 
-# Default backend IP patterns (can be overridden per-backend)
+# Simplified backend config for sequential ports on same host (common for multi-GPU)
+# If BACKEND_BASE_IP is set, all backends use that IP with sequential ports starting from BACKEND_PORT_START
+# Example: BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 NUM_BACKENDS=8
+#   -> Backend 1: 172.17.0.1:8000, Backend 2: 172.17.0.1:8001, ..., Backend 8: 172.17.0.1:8007
+BACKEND_BASE_IP = os.environ.get("BACKEND_BASE_IP")
+BACKEND_PORT_START = int(os.environ.get("BACKEND_PORT_START", "8000"))
+
+# Default backend IP patterns (used when BACKEND_BASE_IP is not set)
 DEFAULT_BACKEND_IP_PATTERN = "172.29.1.{}"  # {} is replaced with 10 + backend_index
 DEFAULT_BACKEND_PORT = 8000
 
-# Dynamically build backends list based on NUM_BACKENDS
+
 def _build_backends_list(num_backends: int) -> List[dict]:
     """Build the backends list dynamically based on environment configuration.
 
-    For each backend N (1-indexed), checks for:
-    - BACKEND{N}_IP: IP address (default: 172.29.1.{9+N})
-    - BACKEND{N}_PORT: Port number (default: 8000)
+    Configuration modes (in order of precedence):
+    1. BACKEND_BASE_IP + BACKEND_PORT_START: Sequential ports on same host
+       Example: BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 NUM_BACKENDS=8
+         -> 172.17.0.1:8000, 172.17.0.1:8001, ..., 172.17.0.1:8007
 
-    Examples:
-        NUM_BACKENDS=4 with defaults:
-          Backend 1: 172.29.1.10:8000
-          Backend 2: 172.29.1.11:8000
-          Backend 3: 172.29.1.12:8000
-          Backend 4: 172.29.1.13:8000
+    2. Per-backend overrides: BACKEND{N}_IP and BACKEND{N}_PORT
+       Example: BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 NUM_BACKENDS=2
 
-        With custom IPs:
-          BACKEND1_IP=10.0.0.1 BACKEND2_IP=10.0.0.2 NUM_BACKENDS=2
+    3. Defaults: Different IPs (172.29.1.10, .11, ...), same port (8000)
+       Example: NUM_BACKENDS=4
+         -> 172.29.1.10:8000, 172.29.1.11:8000, 172.29.1.12:8000, 172.29.1.13:8000
     """
     backends = []
+
     for i in range(1, num_backends + 1):
-        default_ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
-        backends.append({
-            "id": i,
-            "ip": os.environ.get(f"BACKEND{i}_IP", default_ip),
-            "port": int(os.environ.get(f"BACKEND{i}_PORT", str(DEFAULT_BACKEND_PORT))),
-        })
+        # Check for per-backend override first
+        backend_ip = os.environ.get(f"BACKEND{i}_IP")
+        backend_port = os.environ.get(f"BACKEND{i}_PORT")
+
+        if backend_ip is not None:
+            # Per-backend override takes precedence
+            ip = backend_ip
+            port = int(backend_port) if backend_port else DEFAULT_BACKEND_PORT
+        elif BACKEND_BASE_IP:
+            # Use simplified sequential port config
+            ip = BACKEND_BASE_IP
+            port = BACKEND_PORT_START + (i - 1)
+        else:
+            # Fall back to default pattern (different IPs, same port)
+            ip = DEFAULT_BACKEND_IP_PATTERN.format(9 + i)  # 172.29.1.10, .11, .12, etc.
+            port = DEFAULT_BACKEND_PORT
+
+        backends.append({"id": i, "ip": ip, "port": port})
+
     return backends
+
 
 BACKENDS = _build_backends_list(NUM_BACKENDS)
 
@@ -2112,7 +2143,14 @@ def register_backends_on_all_nodes():
     if _backends_registered:
         return
 
+    if SKIP_BACKEND_REGISTRATION:
+        logger.info("Skipping backend registration (SKIP_BACKEND_REGISTRATION=true)")
+        logger.info("Ensure backends are already registered via admin API or curl")
+        _backends_registered = True
+        return
+
     logger.info("Registering backends on all Ranvier nodes...")
+    logger.info(f"Backends to register: {BACKENDS}")
 
     for node_url in RANVIER_NODES:
         for backend in BACKENDS:

@@ -431,6 +431,10 @@ Use `make benchmark-single-gpu` for basic validation.
 |----------|---------|-------------|
 | `VLLM_ENDPOINT_1` | - | URL of first vLLM backend (required for external) |
 | `VLLM_ENDPOINT_2` | - | URL of second vLLM backend (required for external) |
+| `NUM_BACKENDS` | 2 | Number of vLLM backends |
+| `BACKEND_BASE_IP` | - | Base IP for sequential ports (e.g., `172.17.0.1`) |
+| `BACKEND_PORT_START` | 8000 | Starting port when using `BACKEND_BASE_IP` |
+| `SKIP_BACKEND_REGISTRATION` | false | Skip auto-registration if backends already registered |
 | `BENCHMARK_REAL_DURATION` | 5m | Test duration |
 | `BENCHMARK_REAL_USERS` | 10 | Concurrent users |
 | `BENCHMARK_REAL_SPAWN_RATE` | 2 | Users spawned per second |
