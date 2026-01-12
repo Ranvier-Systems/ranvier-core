@@ -1831,6 +1831,7 @@ docker compose -f docker-compose.benchmark-real.yml up -d ranvier1
 
 
 BENCHMARK_MODE=round_robin \
+RANVIER_ROUTING_MODE=round_robin \
 PROMPT_DISTRIBUTION=large-prefix \
 NUM_BACKENDS=8 \
 NUM_RANVIER_NODES=3 \
@@ -1865,6 +1866,7 @@ locust -f tests/integration/locustfile_real.py \
 
 # Prefix-affinity test (5 minutes)
 BENCHMARK_MODE=prefix \
+RANVIER_ROUTING_MODE=prefix \
 PROMPT_DISTRIBUTION=large-prefix \
 NUM_BACKENDS=8 \
 NUM_RANVIER_NODES=3 \
@@ -1897,6 +1899,7 @@ locust -f tests/integration/locustfile_real.py \
 
 # 1 node, round robin
 BENCHMARK_MODE=round_robin \
+RANVIER_ROUTING_MODE=round_robin \
 PROMPT_DISTRIBUTION=large-prefix \
 NUM_BACKENDS=8 \
 NUM_RANVIER_NODES=1 \
@@ -1924,6 +1927,7 @@ locust -f tests/integration/locustfile_real.py \
 
 # 1 node, prefix
 BENCHMARK_MODE=prefix \
+RANVIER_ROUTING_MODE=prefix \
 PROMPT_DISTRIBUTION=large-prefix \
 NUM_BACKENDS=8 \
 NUM_RANVIER_NODES=1 \
@@ -1988,24 +1992,25 @@ We need more prefixes than can fit in cache across all backends. Run with more p
 
 
 # Use 50 prefixes instead of 5
-BENCHMARK_MODE=round_robin \
-PROMPT_DISTRIBUTION=large-prefix \
-NUM_LARGE_PREFIXES=50 \
-NUM_BACKENDS=8 \
-NUM_RANVIER_NODES=1 \
-RANVIER_NODE1=http://localhost:8081 \
-RANVIER_METRICS1=http://localhost:9181 \
-BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
-BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
-BACKEND3_IP=172.17.0.1 BACKEND2_PORT=8002 \
-BACKEND4_IP=172.17.0.1 BACKEND3_PORT=8003 \
-BACKEND5_IP=172.17.0.1 BACKEND4_PORT=8004 \
-BACKEND6_IP=172.17.0.1 BACKEND5_PORT=8005 \
-BACKEND7_IP=172.17.0.1 BACKEND6_PORT=8006 \
-BACKEND8_IP=172.17.0.1 BACKEND7_PORT=8007 \
-VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
-LARGE_PREFIX_MIN_TOKENS=2000 \
-LARGE_PREFIX_MAX_TOKENS=8000 \
+export BENCHMARK_MODE=round_robin
+export RANVIER_ROUTING_MODE=round_robin
+export PROMPT_DISTRIBUTION=large-prefix
+export NUM_LARGE_PREFIXES=50
+export NUM_BACKENDS=8
+export NUM_RANVIER_NODES=1
+export RANVIER_NODE1=http://localhost:8081
+export RANVIER_METRICS1=http://localhost:9181
+export BACKEND1_IP=172.17.0.1 BACKEND1_PORT=8000 \
+export BACKEND2_IP=172.17.0.1 BACKEND2_PORT=8001 \
+export BACKEND3_IP=172.17.0.1 BACKEND2_PORT=8002 \
+export BACKEND4_IP=172.17.0.1 BACKEND3_PORT=8003 \
+export BACKEND5_IP=172.17.0.1 BACKEND4_PORT=8004 \
+export BACKEND6_IP=172.17.0.1 BACKEND5_PORT=8005 \
+export BACKEND7_IP=172.17.0.1 BACKEND6_PORT=8006 \
+export BACKEND8_IP=172.17.0.1 BACKEND7_PORT=8007 \
+export VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+export LARGE_PREFIX_MIN_TOKENS=2000 \
+export LARGE_PREFIX_MAX_TOKENS=8000 \
 locust -f tests/integration/locustfile_real.py \
   --headless \
   --users 3 \
@@ -2056,6 +2061,7 @@ failed to create network ranvier-benchmark-prefix-aware_ranvier-benchmark: Error
 
 # Run benchmark
 export BENCHMARK_MODE=round_robin
+export RANVIER_ROUTING_MODE=round_robin
 export PROMPT_DISTRIBUTION=large-prefix
 export NUM_LARGE_PREFIXES=50
 export BACKEND1_IP=172.17.0.1
@@ -2078,6 +2084,7 @@ done
 
 # Run round-robin benchmark
 export BENCHMARK_MODE=round_robin
+export RANVIER_ROUTING_MODE=round_robin
 export PROMPT_DISTRIBUTION=large-prefix
 export NUM_LARGE_PREFIXES=50
 export BACKEND1_IP=172.17.0.1
@@ -2099,6 +2106,7 @@ done
 
 # Run benchmark
 export BENCHMARK_MODE=round_robin
+export RANVIER_ROUTING_MODE=round_robin
 export PROMPT_DISTRIBUTION=large-prefix
 export NUM_LARGE_PREFIXES=50
 export BACKEND1_IP=172.17.0.1
@@ -2121,6 +2129,7 @@ done
 
 # Run benchmark
 export BENCHMARK_MODE=prefix
+export RANVIER_ROUTING_MODE=prefix
 export PROMPT_DISTRIBUTION=large-prefix
 export NUM_LARGE_PREFIXES=50
 export BACKEND1_IP=172.17.0.1
@@ -2166,3 +2175,60 @@ docker build -f Dockerfile.production.fast --build-arg BASE_IMAGE=ranvier-dev/ra
 # Build full + run
 docker build -f Dockerfile.production -t ranvier:latest .
 docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ranvier:latest
+
+
+
+===
+./tools/rvctl -u http://localhost:8081 inspect backends
+./tools/rvctl -u http://localhost:8081 inspect routes
+
+
+
+New Configuration Options
+Option 1: Sequential Ports (Simplest for Multi-GPU)
+NUM_BACKENDS=8 \
+BACKEND_BASE_IP=172.17.0.1 \
+BACKEND_PORT_START=8000 \
+RANVIER_ROUTING_MODE=round_robin \
+BENCHMARK_MODE=round_robin \
+NUM_RANVIER_NODES=1 \
+RANVIER_NODE1=http://localhost:8081 \
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 10 --spawn-rate 2 --run-time 5m \
+  --host http://localhost:8081
+
+This automatically generates:
+Backend 1: 172.17.0.1:8000
+Backend 2: 172.17.0.1:8001
+...
+Backend 8: 172.17.0.1:8007
+Option 2: Skip Registration (If Already Done)
+SKIP_BACKEND_REGISTRATION=true \
+RANVIER_ROUTING_MODE=round_robin \
+BENCHMARK_MODE=round_robin \
+NUM_RANVIER_NODES=1 \
+RANVIER_NODE1=http://localhost:8081 \
+locust -f tests/integration/locustfile_real.py \
+  --headless --users 10 --spawn-rate 2 --run-time 5m \
+  --host http://localhost:8081
+
+Configuration Precedence
+Per-backend overrides (BACKEND{N}_IP, BACKEND{N}_PORT) - highest
+Sequential ports (BACKEND_BASE_IP + BACKEND_PORT_START) - middle
+Default pattern (different IPs, same port) - lowest
+
+
+
+Now you can run meaningful comparisons:
+# Test 1: Baseline (no affinity)
+export RANVIER_ROUTING_MODE=random
+export BENCHMARK_MODE=random ...
+
+# Test 2: Hash-only (measure hash value)
+export RANVIER_ROUTING_MODE=hash
+export BENCHMARK_MODE=hash ...
+
+# Test 3: Full prefix-affinity (ART + hash)
+export RANVIER_ROUTING_MODE=prefix
+export BENCHMARK_MODE=prefix ...
+
