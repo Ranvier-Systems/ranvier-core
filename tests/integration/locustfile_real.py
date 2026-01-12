@@ -26,6 +26,9 @@ Environment Variables:
 
     Ranvier Node Configuration:
         NUM_RANVIER_NODES     - Number of Ranvier router nodes (default: 3)
+        RANVIER_BASE_IP       - Base IP for sequential port config (e.g., localhost)
+        RANVIER_PORT_START    - Starting port for sequential config (default: 8080)
+        RANVIER_METRICS_PORT_START - Starting metrics port for sequential config (default: 9180)
         RANVIER_NODE{N}       - Full URL for node N (e.g., http://host:8080)
         RANVIER_NODE{N}_IP    - IP address for node N (default: 172.29.2.{N})
         RANVIER_NODE{N}_PORT  - Port for node N (default: 8080)
@@ -46,6 +49,10 @@ Environment Variables:
 Usage:
     # 8 backends on same host with sequential ports (simplest for multi-GPU):
     NUM_BACKENDS=8 BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # 3 Ranvier nodes on same host with sequential ports:
+    NUM_RANVIER_NODES=3 RANVIER_BASE_IP=localhost RANVIER_PORT_START=8081 \
     locust -f tests/integration/locustfile_real.py --headless ...
 
     # Skip registration if backends already registered via curl:
@@ -157,39 +164,105 @@ BACKENDS = _build_backends_list(NUM_BACKENDS)
 # Set NUM_RANVIER_NODES to control how many router nodes to use
 NUM_RANVIER_NODES = int(os.environ.get("NUM_RANVIER_NODES", "3"))
 
-# Default Ranvier node patterns
+# Simplified Ranvier config for sequential ports on same host (common for multi-node testing)
+# If RANVIER_BASE_IP is set, all nodes use that IP with sequential ports starting from RANVIER_PORT_START
+# Example: RANVIER_BASE_IP=localhost RANVIER_PORT_START=8081 NUM_RANVIER_NODES=3
+#   -> Node 1: localhost:8081, Node 2: localhost:8082, Node 3: localhost:8083
+#   -> Metrics 1: localhost:9181, Metrics 2: localhost:9182, Metrics 3: localhost:9183
+RANVIER_BASE_IP = os.environ.get("RANVIER_BASE_IP")
+RANVIER_PORT_START = int(os.environ.get("RANVIER_PORT_START", "8080"))
+RANVIER_METRICS_PORT_START = int(os.environ.get("RANVIER_METRICS_PORT_START", "9180"))
+
+# Default Ranvier node patterns (used when RANVIER_BASE_IP is not set)
 DEFAULT_RANVIER_IP_PATTERN = "172.29.2.{}"  # {} is replaced with node_index
 DEFAULT_RANVIER_PORT = 8080
 DEFAULT_RANVIER_METRICS_PORT = 9180
 
+
 def _build_ranvier_nodes_list(num_nodes: int) -> List[str]:
-    """Build the Ranvier nodes list dynamically."""
+    """Build the Ranvier nodes list dynamically.
+
+    Configuration modes (in order of precedence):
+    1. RANVIER_NODE{N}: Full URL override (e.g., http://host:8080)
+
+    2. RANVIER_BASE_IP + RANVIER_PORT_START: Sequential ports on same host
+       Example: RANVIER_BASE_IP=localhost RANVIER_PORT_START=8081 NUM_RANVIER_NODES=3
+         -> http://localhost:8081, http://localhost:8082, http://localhost:8083
+
+    3. Per-node overrides: RANVIER_NODE{N}_IP and RANVIER_NODE{N}_PORT
+       Example: RANVIER_NODE1_IP=10.0.0.1 RANVIER_NODE2_IP=10.0.0.2
+
+    4. Defaults: Different IPs (172.29.2.1, .2, ...), same port (8080)
+    """
     nodes = []
     for i in range(1, num_nodes + 1):
-        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
-        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
-        port = os.environ.get(f"RANVIER_NODE{i}_PORT", str(DEFAULT_RANVIER_PORT))
-        # Support full URL override
+        # Check for full URL override first (highest precedence)
         full_url = os.environ.get(f"RANVIER_NODE{i}")
         if full_url:
             nodes.append(full_url)
+            continue
+
+        # Check for per-node IP override
+        node_ip = os.environ.get(f"RANVIER_NODE{i}_IP")
+        node_port = os.environ.get(f"RANVIER_NODE{i}_PORT")
+
+        if node_ip is not None:
+            # Per-node override
+            ip = node_ip
+            port = int(node_port) if node_port else DEFAULT_RANVIER_PORT
+        elif RANVIER_BASE_IP:
+            # Use simplified sequential port config
+            ip = RANVIER_BASE_IP
+            port = RANVIER_PORT_START + (i - 1)
         else:
-            nodes.append(f"http://{ip}:{port}")
+            # Fall back to default pattern (different IPs, same port)
+            ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+            port = DEFAULT_RANVIER_PORT
+
+        nodes.append(f"http://{ip}:{port}")
     return nodes
 
+
 def _build_ranvier_metrics_list(num_nodes: int) -> List[str]:
-    """Build the Ranvier metrics endpoints list dynamically."""
+    """Build the Ranvier metrics endpoints list dynamically.
+
+    Configuration modes (in order of precedence):
+    1. RANVIER_METRICS{N}: Full URL override
+
+    2. RANVIER_BASE_IP + RANVIER_METRICS_PORT_START: Sequential ports on same host
+       Example: RANVIER_BASE_IP=localhost RANVIER_METRICS_PORT_START=9181 NUM_RANVIER_NODES=3
+         -> http://localhost:9181, http://localhost:9182, http://localhost:9183
+
+    3. Per-node overrides: RANVIER_NODE{N}_IP + RANVIER_METRICS{N}_PORT
+
+    4. Defaults: Different IPs (172.29.2.1, .2, ...), same port (9180)
+    """
     metrics = []
     for i in range(1, num_nodes + 1):
-        default_ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
-        ip = os.environ.get(f"RANVIER_NODE{i}_IP", default_ip)
-        port = os.environ.get(f"RANVIER_METRICS{i}_PORT", str(DEFAULT_RANVIER_METRICS_PORT))
-        # Support full URL override
+        # Check for full URL override first (highest precedence)
         full_url = os.environ.get(f"RANVIER_METRICS{i}")
         if full_url:
             metrics.append(full_url)
+            continue
+
+        # Check for per-node IP override (from node config, reused for metrics)
+        node_ip = os.environ.get(f"RANVIER_NODE{i}_IP")
+        metrics_port = os.environ.get(f"RANVIER_METRICS{i}_PORT")
+
+        if node_ip is not None:
+            # Per-node override
+            ip = node_ip
+            port = int(metrics_port) if metrics_port else DEFAULT_RANVIER_METRICS_PORT
+        elif RANVIER_BASE_IP:
+            # Use simplified sequential port config
+            ip = RANVIER_BASE_IP
+            port = RANVIER_METRICS_PORT_START + (i - 1)
         else:
-            metrics.append(f"http://{ip}:{port}")
+            # Fall back to default pattern (different IPs, same port)
+            ip = DEFAULT_RANVIER_IP_PATTERN.format(i)
+            port = DEFAULT_RANVIER_METRICS_PORT
+
+        metrics.append(f"http://{ip}:{port}")
     return metrics
 
 RANVIER_NODES = _build_ranvier_nodes_list(NUM_RANVIER_NODES)

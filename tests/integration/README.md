@@ -435,6 +435,10 @@ Use `make benchmark-single-gpu` for basic validation.
 | `BACKEND_BASE_IP` | - | Base IP for sequential ports (e.g., `172.17.0.1`) |
 | `BACKEND_PORT_START` | 8000 | Starting port when using `BACKEND_BASE_IP` |
 | `SKIP_BACKEND_REGISTRATION` | false | Skip auto-registration if backends already registered |
+| `NUM_RANVIER_NODES` | 3 | Number of Ranvier router nodes |
+| `RANVIER_BASE_IP` | - | Base IP for sequential ports (e.g., `localhost`) |
+| `RANVIER_PORT_START` | 8080 | Starting port when using `RANVIER_BASE_IP` |
+| `RANVIER_METRICS_PORT_START` | 9180 | Starting metrics port when using `RANVIER_BASE_IP` |
 | `BENCHMARK_REAL_DURATION` | 5m | Test duration |
 | `BENCHMARK_REAL_USERS` | 10 | Concurrent users |
 | `BENCHMARK_REAL_SPAWN_RATE` | 2 | Users spawned per second |
