@@ -1,0 +1,9 @@
+{"conversations": [{"from": "human", "value": "What is the capital of France?"}]}
+{"conversations": [{"from": "system", "value": "You are a helpful assistant."}, {"from": "human", "value": "Write a haiku about programming."}]}
+{"conversations": [{"from": "human", "value": "Explain recursion in simple terms."}, {"from": "gpt", "value": "Recursion is when a function calls itself."}, {"from": "human", "value": "Can you give me an example in Python?"}]}
+{"messages": [{"role": "user", "content": "What is 2 + 2?"}]}
+{"messages": [{"role": "system", "content": "You are a math tutor."}, {"role": "user", "content": "Help me solve: 3x + 5 = 20"}]}
+{"messages": [{"role": "user", "content": "Hello!"}, {"role": "assistant", "content": "Hi there!"}, {"role": "user", "content": "How are you today?"}]}
+{"prompt": "Write a short poem about the ocean."}
+{"prompt": "List 5 benefits of regular exercise."}
+{"prompt": "Explain the difference between a list and a tuple in Python."}
