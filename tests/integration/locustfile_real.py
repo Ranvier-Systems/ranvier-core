@@ -77,17 +77,31 @@ Usage:
     # Stress test with large prefixes:
     PROMPT_DISTRIBUTION=stress NUM_BACKENDS=4 make benchmark-real
 
-    # Use prompts from ShareGPT dataset file exclusively:
-    PROMPT_FILE=sharegpt_sample.jsonl PROMPT_DISTRIBUTION=file \
+    # Use included sample prompts:
+    PROMPT_FILE=tests/integration/data/prompts/sample_prompts.jsonl PROMPT_DISTRIBUTION=file \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # Use realistic prompts for benchmarking:
+    PROMPT_FILE=tests/integration/data/prompts/realistic_prompts.jsonl PROMPT_DISTRIBUTION=file \
     locust -f tests/integration/locustfile_real.py --headless ...
 
     # Use custom production prompts with sequential sampling:
     PROMPT_FILE=/data/prod_prompts.jsonl PROMPT_DISTRIBUTION=file PROMPT_SAMPLING=sequential \
     locust -f tests/integration/locustfile_real.py --headless ...
 
-    # Mix file prompts with generated prompts (50/50 in mixed mode):
-    PROMPT_FILE=my_prompts.jsonl PROMPT_DISTRIBUTION=mixed \
-    locust -f tests/integration/locustfile_real.py --headless ...
+    # Validate prompt file before benchmarking:
+    python tests/integration/prompt_loader.py validate my_prompts.jsonl
+    python tests/integration/prompt_loader.py stats my_prompts.jsonl
+
+Official Datasets (ShareGPT format, commonly used for LLM benchmarks):
+    - ShareGPT: huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered
+    - LMSYS-Chat-1M: huggingface.co/datasets/lmsys/lmsys-chat-1m
+    - WildChat: huggingface.co/datasets/allenai/WildChat-1M
+    - OpenOrca: huggingface.co/datasets/Open-Orca/OpenOrca
+
+    Download example:
+        pip install huggingface_hub
+        huggingface-cli download lmsys/lmsys-chat-1m --include "*.jsonl" --local-dir ./data
 """
 
 import json
@@ -1838,154 +1852,13 @@ But:
 # ============================================================================
 # Custom Prompt File Loading
 # ============================================================================
+# Extracted to prompt_loader.py for reuse and standalone validation.
+# See: python tests/integration/prompt_loader.py --help
 
-@dataclass
-class LoadedPrompt:
-    """A prompt loaded from file with metadata."""
-    messages: List[dict]
-    prefix_hash: str
-    estimated_tokens: int
-    source_format: str  # "sharegpt", "openai", "simple"
-    prefix_group: Optional[str] = None  # For grouping prompts by shared prefix
+from prompt_loader import PromptLoader
 
-
-# Cached prompts loaded from file
-_file_prompts: List[LoadedPrompt] = []
-_file_prompts_by_prefix: Dict[str, List[LoadedPrompt]] = {}
-_prompt_file_loaded: bool = False
-_prompt_index: int = 0  # For sequential sampling
-_prompt_index_lock: Lock = Lock()
-
-
-def _parse_sharegpt_format(data: dict) -> Optional[List[dict]]:
-    """Parse ShareGPT conversation format.
-
-    Format: {"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}
-
-    Returns OpenAI-style messages list.
-    """
-    if "conversations" not in data:
-        return None
-
-    conversations = data["conversations"]
-    if not isinstance(conversations, list) or not conversations:
-        return None
-
-    messages = []
-    for turn in conversations:
-        if not isinstance(turn, dict):
-            continue
-
-        from_role = turn.get("from", "")
-        value = turn.get("value", "")
-
-        if not value:
-            continue
-
-        # Map ShareGPT roles to OpenAI roles
-        if from_role in ("human", "user"):
-            messages.append({"role": "user", "content": value})
-        elif from_role in ("gpt", "assistant", "model"):
-            messages.append({"role": "assistant", "content": value})
-        elif from_role == "system":
-            messages.append({"role": "system", "content": value})
-
-    return messages if messages else None
-
-
-def _parse_openai_format(data: dict) -> Optional[List[dict]]:
-    """Parse OpenAI messages format.
-
-    Format: {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
-
-    Returns OpenAI-style messages list.
-    """
-    if "messages" not in data:
-        return None
-
-    messages = data["messages"]
-    if not isinstance(messages, list) or not messages:
-        return None
-
-    # Validate and clean messages
-    cleaned = []
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        if "role" not in msg or "content" not in msg:
-            continue
-        if msg["role"] not in ("user", "assistant", "system"):
-            continue
-        cleaned.append({"role": msg["role"], "content": msg["content"]})
-
-    return cleaned if cleaned else None
-
-
-def _parse_simple_format(data: dict) -> Optional[List[dict]]:
-    """Parse simple prompt format.
-
-    Format: {"prompt": "user prompt text here"}
-
-    Returns OpenAI-style messages list with single user message.
-    """
-    prompt = data.get("prompt")
-    if not prompt or not isinstance(prompt, str):
-        return None
-
-    return [{"role": "user", "content": prompt}]
-
-
-def _parse_prompt_line(line: str) -> Optional[Tuple[List[dict], str]]:
-    """Parse a single line from the prompt file.
-
-    Tries each format in order: ShareGPT, OpenAI messages, simple.
-
-    Returns:
-        Tuple of (messages, format_name) if successful, None otherwise.
-    """
-    try:
-        data = json.loads(line)
-        if not isinstance(data, dict):
-            return None
-    except json.JSONDecodeError:
-        return None
-
-    # Try ShareGPT format first (most common for LLM benchmarks)
-    messages = _parse_sharegpt_format(data)
-    if messages:
-        return messages, "sharegpt"
-
-    # Try OpenAI messages format
-    messages = _parse_openai_format(data)
-    if messages:
-        return messages, "openai"
-
-    # Try simple format
-    messages = _parse_simple_format(data)
-    if messages:
-        return messages, "simple"
-
-    return None
-
-
-def _extract_prefix_group(messages: List[dict]) -> str:
-    """Extract a prefix group identifier from messages.
-
-    Uses the system message (if present) or the first ~400 characters
-    of the first user message as the prefix group key.
-    """
-    # Check for system message first
-    for msg in messages:
-        if msg["role"] == "system":
-            # Use first 400 chars of system message as group key
-            return msg["content"][:400]
-
-    # Fall back to first user message
-    for msg in messages:
-        if msg["role"] == "user":
-            return msg["content"][:400]
-
-    return ""
+# Module-level prompt loader instance
+_prompt_loader: Optional[PromptLoader] = None
 
 
 def load_prompts_from_file(file_path: str) -> Tuple[int, int, Dict[str, int]]:
@@ -1999,93 +1872,27 @@ def load_prompts_from_file(file_path: str) -> Tuple[int, int, Dict[str, int]]:
     Returns:
         Tuple of (total_loaded, total_failed, format_counts)
     """
-    global _file_prompts, _file_prompts_by_prefix, _prompt_file_loaded
+    global _prompt_loader
 
-    if _prompt_file_loaded:
-        return len(_file_prompts), 0, {}
+    if _prompt_loader is None:
+        _prompt_loader = PromptLoader(
+            shared_prefix_ratio=SHARED_PREFIX_RATIO,
+            sampling=PROMPT_SAMPLING
+        )
 
-    if not file_path or not os.path.exists(file_path):
-        logger.warning(f"Prompt file not found: {file_path}")
-        _prompt_file_loaded = True
-        return 0, 0, {}
+    if _prompt_loader.is_loaded:
+        stats = _prompt_loader.get_stats()
+        return stats.total_loaded, stats.total_failed, stats.format_counts
 
-    format_counts: Dict[str, int] = {"sharegpt": 0, "openai": 0, "simple": 0}
-    loaded = 0
-    failed = 0
-    prefix_groups: Dict[str, List[LoadedPrompt]] = {}
+    stats = _prompt_loader.load_file(file_path)
 
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
+    if stats.errors:
+        for error in stats.errors[:5]:
+            logger.warning(error)
+        if len(stats.errors) > 5:
+            logger.warning(f"... and {len(stats.errors) - 5} more errors")
 
-                result = _parse_prompt_line(line)
-                if result is None:
-                    failed += 1
-                    if failed <= 5:  # Only log first 5 failures
-                        logger.warning(f"Failed to parse line {line_num} in {file_path}")
-                    continue
-
-                messages, source_format = result
-                format_counts[source_format] += 1
-
-                # Calculate metadata
-                full_text = " ".join(m["content"] for m in messages)
-                est_tokens = len(full_text) // 4  # Same estimation as estimate_tokens()
-
-                # Create prefix hash for cache tracking
-                prefix_hash = _compute_prefix_hash_for_messages(messages)
-
-                # Extract prefix group for shared prefix routing
-                prefix_group = _extract_prefix_group(messages)
-
-                prompt = LoadedPrompt(
-                    messages=messages,
-                    prefix_hash=prefix_hash,
-                    estimated_tokens=est_tokens,
-                    source_format=source_format,
-                    prefix_group=prefix_group
-                )
-
-                _file_prompts.append(prompt)
-
-                # Group by prefix for SHARED_PREFIX_RATIO support
-                if prefix_group not in prefix_groups:
-                    prefix_groups[prefix_group] = []
-                prefix_groups[prefix_group].append(prompt)
-
-                loaded += 1
-
-    except Exception as e:
-        logger.error(f"Error reading prompt file {file_path}: {e}")
-
-    # Store grouped prompts
-    _file_prompts_by_prefix = prefix_groups
-    _prompt_file_loaded = True
-
-    if failed > 5:
-        logger.warning(f"... and {failed - 5} more parse failures")
-
-    return loaded, failed, format_counts
-
-
-def _compute_prefix_hash_for_messages(messages: List[dict]) -> str:
-    """Compute a prefix hash for loaded messages.
-
-    Uses the same approach as hash_prompt_prefix but for already-parsed messages.
-    """
-    # Build full text from messages
-    full_text = ""
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        full_text += f"{role}: {content}\n"
-
-    # Take first ~400 characters (approximately first 100 tokens)
-    prefix = full_text[:400]
-    return str(hash(prefix))
+    return stats.total_loaded, stats.total_failed, stats.format_counts
 
 
 def get_file_prompt() -> Optional[Tuple[List[dict], str, int]]:
@@ -2097,57 +1904,15 @@ def get_file_prompt() -> Optional[Tuple[List[dict], str, int]]:
     Returns:
         Tuple of (messages, prefix_hash, estimated_tokens) or None if no prompts loaded.
     """
-    global _prompt_index
-
-    if not _file_prompts:
+    if _prompt_loader is None or not _prompt_loader.is_loaded:
         return None
 
-    # Decide whether to use shared prefix grouping
-    use_shared_prefix = random.random() < SHARED_PREFIX_RATIO
-
-    if use_shared_prefix and _file_prompts_by_prefix:
-        # Pick a random prefix group and then a prompt from that group
-        prefix_groups = list(_file_prompts_by_prefix.keys())
-        if prefix_groups:
-            group_key = random.choice(prefix_groups)
-            prompts_in_group = _file_prompts_by_prefix[group_key]
-            if prompts_in_group:
-                prompt = random.choice(prompts_in_group)
-                return prompt.messages, prompt.prefix_hash, prompt.estimated_tokens
-
-    # Regular sampling based on strategy
-    sampling = PROMPT_SAMPLING.lower()
-
-    if sampling == "sequential":
-        with _prompt_index_lock:
-            prompt = _file_prompts[_prompt_index % len(_file_prompts)]
-            _prompt_index += 1
-        return prompt.messages, prompt.prefix_hash, prompt.estimated_tokens
-
-    elif sampling == "weighted":
-        # Weight by token count (favor longer prompts)
-        total_tokens = sum(p.estimated_tokens for p in _file_prompts)
-        if total_tokens == 0:
-            prompt = random.choice(_file_prompts)
-        else:
-            r = random.uniform(0, total_tokens)
-            cumulative = 0
-            prompt = _file_prompts[-1]  # Default to last
-            for p in _file_prompts:
-                cumulative += p.estimated_tokens
-                if r <= cumulative:
-                    prompt = p
-                    break
-        return prompt.messages, prompt.prefix_hash, prompt.estimated_tokens
-
-    else:  # random (default)
-        prompt = random.choice(_file_prompts)
-        return prompt.messages, prompt.prefix_hash, prompt.estimated_tokens
+    return _prompt_loader.get_prompt()
 
 
 def get_file_prompt_stats() -> Dict[str, any]:
     """Get statistics about loaded file prompts."""
-    if not _file_prompts:
+    if _prompt_loader is None or not _prompt_loader.is_loaded:
         return {
             "loaded": False,
             "total_prompts": 0,
@@ -2157,15 +1922,31 @@ def get_file_prompt_stats() -> Dict[str, any]:
             "max_tokens": 0
         }
 
-    tokens = [p.estimated_tokens for p in _file_prompts]
+    stats = _prompt_loader.get_stats()
     return {
         "loaded": True,
-        "total_prompts": len(_file_prompts),
-        "prefix_groups": len(_file_prompts_by_prefix),
-        "avg_tokens": sum(tokens) // len(tokens) if tokens else 0,
-        "min_tokens": min(tokens) if tokens else 0,
-        "max_tokens": max(tokens) if tokens else 0
+        "total_prompts": stats.total_loaded,
+        "prefix_groups": stats.prefix_groups,
+        "avg_tokens": stats.avg_tokens,
+        "min_tokens": stats.min_tokens,
+        "max_tokens": stats.max_tokens
     }
+
+
+def _file_prompts_loaded() -> bool:
+    """Check if file prompts are loaded (for backward compatibility)."""
+    return _prompt_loader is not None and len(_prompt_loader) > 0
+
+
+# Backward compatibility: expose as property-like check
+class _FilePromptsProxy:
+    """Proxy to check if file prompts are loaded."""
+    def __bool__(self):
+        return _file_prompts_loaded()
+    def __len__(self):
+        return len(_prompt_loader) if _prompt_loader else 0
+
+_file_prompts = _FilePromptsProxy()
 
 
 def estimate_tokens(text: str) -> int:
