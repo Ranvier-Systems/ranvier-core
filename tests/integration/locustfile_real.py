@@ -37,9 +37,18 @@ Environment Variables:
 
     Benchmark Configuration:
         BENCHMARK_MODE        - "prefix" (default), "hash", or "random"
-        PROMPT_DISTRIBUTION   - "mixed", "short", "medium", "long", "large-prefix", "stress"
+        PROMPT_DISTRIBUTION   - "mixed", "short", "medium", "long", "large-prefix", "stress", "file"
         SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
         P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
+
+    Custom Prompt File Configuration:
+        PROMPT_FILE           - Path to JSONL file containing prompts (optional)
+        PROMPT_SAMPLING       - Sampling strategy: "random" (default), "sequential", "weighted"
+
+        Supported prompt file formats:
+        - ShareGPT: {"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}
+        - OpenAI:   {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+        - Simple:   {"prompt": "user prompt text here"}
 
     Large Prefix Stress Testing:
         LARGE_PREFIX_MIN_TOKENS - Minimum prefix size (default: 2000)
@@ -67,6 +76,32 @@ Usage:
 
     # Stress test with large prefixes:
     PROMPT_DISTRIBUTION=stress NUM_BACKENDS=4 make benchmark-real
+
+    # Use included sample prompts:
+    PROMPT_FILE=tests/integration/data/prompts/sample_prompts.jsonl PROMPT_DISTRIBUTION=file \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # Use realistic prompts for benchmarking:
+    PROMPT_FILE=tests/integration/data/prompts/realistic_prompts.jsonl PROMPT_DISTRIBUTION=file \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # Use custom production prompts with sequential sampling:
+    PROMPT_FILE=/data/prod_prompts.jsonl PROMPT_DISTRIBUTION=file PROMPT_SAMPLING=sequential \
+    locust -f tests/integration/locustfile_real.py --headless ...
+
+    # Validate prompt file before benchmarking:
+    python tests/integration/prompt_loader.py validate my_prompts.jsonl
+    python tests/integration/prompt_loader.py stats my_prompts.jsonl
+
+Official Datasets (ShareGPT format, commonly used for LLM benchmarks):
+    - ShareGPT: huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered
+    - LMSYS-Chat-1M: huggingface.co/datasets/lmsys/lmsys-chat-1m
+    - WildChat: huggingface.co/datasets/allenai/WildChat-1M
+    - OpenOrca: huggingface.co/datasets/Open-Orca/OpenOrca
+
+    Download example:
+        pip install huggingface_hub
+        huggingface-cli download lmsys/lmsys-chat-1m --include "*.jsonl" --local-dir ./data
 """
 
 import json
@@ -320,8 +355,18 @@ def verify_routing_mode_matches() -> Tuple[bool, Optional[str]]:
         return True, None  # Can't verify, assume OK
 
 
-# Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress"
+# Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress", "file"
 PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "mixed")
+
+# Custom prompt file configuration
+# Path to JSONL file containing prompts (ShareGPT, OpenAI messages, or simple format)
+PROMPT_FILE = os.environ.get("PROMPT_FILE", "")
+
+# Prompt sampling strategy: "random", "sequential", "weighted"
+# - random: randomly sample from loaded prompts
+# - sequential: cycle through prompts in order
+# - weighted: sample weighted by estimated token count (favor longer prompts)
+PROMPT_SAMPLING = os.environ.get("PROMPT_SAMPLING", "random")
 
 # Large prefix configuration
 LARGE_PREFIX_MIN_TOKENS = int(os.environ.get("LARGE_PREFIX_MIN_TOKENS", "2000"))
@@ -1804,6 +1849,106 @@ But:
 ]
 
 
+# ============================================================================
+# Custom Prompt File Loading
+# ============================================================================
+# Extracted to prompt_loader.py for reuse and standalone validation.
+# See: python tests/integration/prompt_loader.py --help
+
+from prompt_loader import PromptLoader
+
+# Module-level prompt loader instance
+_prompt_loader: Optional[PromptLoader] = None
+
+
+def load_prompts_from_file(file_path: str) -> Tuple[int, int, Dict[str, int]]:
+    """Load prompts from a JSONL file.
+
+    Supports ShareGPT, OpenAI messages, and simple formats.
+
+    Args:
+        file_path: Path to the JSONL file
+
+    Returns:
+        Tuple of (total_loaded, total_failed, format_counts)
+    """
+    global _prompt_loader
+
+    if _prompt_loader is None:
+        _prompt_loader = PromptLoader(
+            shared_prefix_ratio=SHARED_PREFIX_RATIO,
+            sampling=PROMPT_SAMPLING
+        )
+
+    if _prompt_loader.is_loaded:
+        stats = _prompt_loader.get_stats()
+        return stats.total_loaded, stats.total_failed, stats.format_counts
+
+    stats = _prompt_loader.load_file(file_path)
+
+    if stats.errors:
+        for error in stats.errors[:5]:
+            logger.warning(error)
+        if len(stats.errors) > 5:
+            logger.warning(f"... and {len(stats.errors) - 5} more errors")
+
+    return stats.total_loaded, stats.total_failed, stats.format_counts
+
+
+def get_file_prompt() -> Optional[Tuple[List[dict], str, int]]:
+    """Get a prompt from the loaded file prompts.
+
+    Uses the configured sampling strategy (random, sequential, or weighted).
+    Respects SHARED_PREFIX_RATIO to group prompts by common prefix.
+
+    Returns:
+        Tuple of (messages, prefix_hash, estimated_tokens) or None if no prompts loaded.
+    """
+    if _prompt_loader is None or not _prompt_loader.is_loaded:
+        return None
+
+    return _prompt_loader.get_prompt()
+
+
+def get_file_prompt_stats() -> Dict[str, any]:
+    """Get statistics about loaded file prompts."""
+    if _prompt_loader is None or not _prompt_loader.is_loaded:
+        return {
+            "loaded": False,
+            "total_prompts": 0,
+            "prefix_groups": 0,
+            "avg_tokens": 0,
+            "min_tokens": 0,
+            "max_tokens": 0
+        }
+
+    stats = _prompt_loader.get_stats()
+    return {
+        "loaded": True,
+        "total_prompts": stats.total_loaded,
+        "prefix_groups": stats.prefix_groups,
+        "avg_tokens": stats.avg_tokens,
+        "min_tokens": stats.min_tokens,
+        "max_tokens": stats.max_tokens
+    }
+
+
+def _file_prompts_loaded() -> bool:
+    """Check if file prompts are loaded (for backward compatibility)."""
+    return _prompt_loader is not None and len(_prompt_loader) > 0
+
+
+# Backward compatibility: expose as property-like check
+class _FilePromptsProxy:
+    """Proxy to check if file prompts are loaded."""
+    def __bool__(self):
+        return _file_prompts_loaded()
+    def __len__(self):
+        return len(_prompt_loader) if _prompt_loader else 0
+
+_file_prompts = _FilePromptsProxy()
+
+
 def estimate_tokens(text: str) -> int:
     """Estimate token count from text length.
 
@@ -2342,10 +2487,23 @@ def get_backend_from_response(headers: dict) -> Optional[str]:
 def generate_prompt() -> Tuple[List[dict], str, int]:
     """Generate a prompt based on configured distribution.
 
+    When PROMPT_FILE is set and distribution is "file", prompts are loaded
+    exclusively from the file. For other distributions, file prompts are
+    used as a fallback if the file is loaded and available.
+
     Returns:
         Tuple of (messages list, prefix_hash for cache tracking, estimated_token_count)
     """
     distribution = PROMPT_DISTRIBUTION.lower().replace("-", "_")
+
+    # File mode: exclusively use prompts from file
+    if distribution == "file":
+        result = get_file_prompt()
+        if result:
+            return result
+        # Fall back to mixed distribution if no file prompts available
+        logger.warning("No file prompts available, falling back to mixed distribution")
+        distribution = "mixed"
 
     if distribution == "short":
         messages, prefix_hash = _generate_short_prompt()
@@ -2363,6 +2521,14 @@ def generate_prompt() -> Tuple[List[dict], str, int]:
         # Stress mode with mixed sizes biased toward large prefixes
         return _generate_stress_prompt()
     else:  # mixed
+        # If PROMPT_FILE is set, mix file prompts with generated ones
+        if PROMPT_FILE and _file_prompts:
+            # 50% chance to use file prompts when available
+            if random.random() < 0.5:
+                result = get_file_prompt()
+                if result:
+                    return result
+
         # Weighted distribution: 30% short, 50% medium, 20% long
         r = random.random()
         if r < 0.3:
@@ -2537,6 +2703,24 @@ def on_test_start(environment, **kwargs):
         logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
         logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
         logger.info(f"  Prefix Size Buckets: {PREFIX_SIZE_BUCKETS}")
+
+    # Load prompts from file if PROMPT_FILE is set
+    if PROMPT_FILE:
+        logger.info(f"Loading prompts from file: {PROMPT_FILE}")
+        logger.info(f"  Sampling strategy: {PROMPT_SAMPLING}")
+        loaded, failed, format_counts = load_prompts_from_file(PROMPT_FILE)
+        if loaded > 0:
+            stats = get_file_prompt_stats()
+            logger.info(f"  Loaded {loaded} prompts successfully")
+            if failed > 0:
+                logger.warning(f"  Failed to parse {failed} lines")
+            logger.info(f"  Format breakdown: {format_counts}")
+            logger.info(f"  Prefix groups: {stats['prefix_groups']}")
+            logger.info(f"  Token stats: avg={stats['avg_tokens']}, min={stats['min_tokens']}, max={stats['max_tokens']}")
+        else:
+            logger.warning(f"  No prompts loaded from file - will use fallback generation")
+            if dist == "file":
+                logger.warning(f"  PROMPT_DISTRIBUTION=file but no prompts available!")
 
     logger.info("=" * 70)
 
