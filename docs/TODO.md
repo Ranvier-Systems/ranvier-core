@@ -680,11 +680,69 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 ## 7. Security Audit Findings (Adversarial System Audit)
 
-> **Criticality Score: 0/10 (All Issues Resolved)** ✅ _(was 6/10 → 4/10 → 3/10 → 2/10 → 1/10 → 0/10)_
-> Generated: 2026-01-11 | Completed: 2026-01-11
+> **Criticality Score: 6/10** _(was 0/10 after 2026-01-11 fixes; new issues found 2026-01-14)_
+> Generated: 2026-01-11 | Updated: 2026-01-14
 > Audit Scope: `src/` directory against `docs/claude-context.md` constraints
 
 Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, Architecture Drift, and Scale & Leak.
+
+### 7.0 Adversarial Audit Findings (2026-01-14)
+
+New issues discovered during comprehensive adversarial audit. See `docs/adversarial-audit-2026-01-14.md` for full report.
+
+#### Async Integrity Violations
+
+- [ ] **Replace blocking std::ifstream with Seastar async I/O in K8s CA cert loading**
+  _Issue:_ `k8s_discovery_service.cpp:234` uses `std::ifstream ca_file(_config.ca_cert_path)` which performs blocking file I/O on the reactor thread, violating Seastar's async-only model.
+  _Fix:_ Use `seastar::open_file_dma()` + `seastar::make_file_input_stream()` as done for token loading at lines 204-207.
+  _Location:_ `src/k8s_discovery_service.cpp:234`
+  _Severity:_ **Critical**
+
+- [ ] **Add gate guard to connection pool reaper timer**
+  _Issue:_ `connection_pool.hpp:99-109` timer callback captures `this` without RAII gate protection. Destructor cancels timer but already-queued callback creates use-after-free race window.
+  _Fix:_ Add `seastar::gate _timer_gate`; callbacks acquire `_timer_gate.hold()` at entry; destructor closes gate before canceling timer.
+  _Location:_ `src/connection_pool.hpp:99-109`
+  _Severity:_ Medium
+
+#### Edge-Case Crash Scenarios
+
+- [ ] **Add null assertion in metrics() accessor**
+  _Issue:_ `metrics_service.hpp:443-445` returns `*g_metrics` without null check. If `init_metrics()` not called before first use, immediate segfault.
+  _Fix:_ Add assertion: `assert(g_metrics && "init_metrics() must be called first")` or lazy-init pattern.
+  _Location:_ `src/metrics_service.hpp:443-445`
+  _Severity:_ Medium
+
+#### Scale & Leak Vulnerabilities
+
+- [ ] **Fix memory leak in thread-local MetricsService allocation**
+  _Issue:_ `metrics_service.hpp:436-440` uses `g_metrics = new MetricsService()` with no corresponding `delete`. Thread-local raw `new` leaks on process shutdown.
+  _Fix:_ Add `destroy_metrics()` function called during shard shutdown, or use `thread_local std::unique_ptr<MetricsService>`.
+  _Location:_ `src/metrics_service.hpp:436-440`
+  _Severity:_ **High**
+
+- [ ] **Cap per-backend metrics map to prevent unbounded growth**
+  _Issue:_ `metrics_service.hpp:397` `_per_backend_metrics` map grows with each unique BackendId. Under attack with spoofed IDs, unbounded memory consumption. Entries never removed.
+  _Fix:_ Cap at `MAX_TRACKED_BACKENDS` (e.g., 1000). Implement LRU eviction or tie to backend lifecycle. Add `remove_backend_metrics(BackendId)`.
+  _Location:_ `src/metrics_service.hpp:397`
+  _Severity:_ **High**
+
+- [ ] **Add circuit cleanup when backends are removed**
+  _Issue:_ `circuit_breaker.hpp:210` `_circuits` map grows with each BackendId. While `reset(id)` exists, nothing calls it when backends are removed. Memory grows monotonically.
+  _Fix:_ Add `remove_circuit(BackendId)` called from backend removal path, or expire stale circuits periodically.
+  _Location:_ `src/circuit_breaker.hpp:210`
+  _Severity:_ **High**
+
+- [ ] **Fully erase map entries in connection pool clear_pool()**
+  _Issue:_ `connection_pool.hpp:348` `_pools` map grows per socket_address. While `clear_pool()` removes deque contents, map entries for removed backends remain as empty deques.
+  _Fix:_ In `clear_pool()`, the current code already erases the entry (`_pools.erase(it)`) at line 294, but verify this is called from all backend removal paths.
+  _Location:_ `src/connection_pool.hpp:280-300`
+  _Severity:_ Medium
+
+- [ ] **Add MAX_TRACKED_PEERS limit to gossip dedup structures**
+  _Issue:_ `gossip_service.cpp:1174-1195` `_received_seq_sets` and `_received_seq_windows` grow per peer address. While sliding window evicts old entries, peer count itself is unbounded.
+  _Fix:_ Add `MAX_TRACKED_PEERS` limit. Clean up peer state in `refresh_peers()` when peers are removed.
+  _Location:_ `src/gossip_service.cpp:1174-1195`
+  _Severity:_ Medium
 
 ### 7.1 Async Integrity Violations (No Locks/Async Only)
 
