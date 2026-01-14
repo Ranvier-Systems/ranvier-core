@@ -70,6 +70,8 @@ GossipService::GossipService(const ClusterConfig& config)
             seastar::metrics::description("Total number of duplicate route announcements suppressed")),
         seastar::metrics::make_counter("cluster_max_retries_exceeded", _max_retries_exceeded,
             seastar::metrics::description("Total number of route announcements that exceeded max retries")),
+        seastar::metrics::make_counter("cluster_dedup_peers_overflow", _dedup_peers_overflow,
+            seastar::metrics::description("Times dedup peer limit was reached, new peers not tracked (Rule #4: bounded containers)")),
         // DTLS encryption metrics
         seastar::metrics::make_counter("cluster_dtls_handshakes_started", _dtls_handshakes_started,
             seastar::metrics::description("Total number of DTLS handshakes initiated")),
@@ -1171,25 +1173,48 @@ void GossipService::handle_ack(const seastar::socket_address& peer, uint32_t seq
 // the maximum expected in-flight messages during normal operation and
 // any network partitions that might delay delivery.
 bool GossipService::is_duplicate(const seastar::socket_address& peer, uint32_t seq_num) {
+    // Check if we already track this peer
+    auto set_it = _received_seq_sets.find(peer);
+    auto window_it = _received_seq_windows.find(peer);
+
+    if (set_it != _received_seq_sets.end()) {
+        // Existing peer - check for duplicate
+        auto& seq_set = set_it->second;
+        auto& seq_window = window_it->second;
+
+        if (seq_set.count(seq_num) > 0) {
+            return true;
+        }
+
+        // Add to window
+        seq_set.insert(seq_num);
+        seq_window.push_back(seq_num);
+
+        // Slide window if too large - evict oldest sequence numbers
+        while (seq_window.size() > _config.gossip_dedup_window) {
+            uint32_t oldest = seq_window.front();
+            seq_window.pop_front();
+            seq_set.erase(oldest);
+        }
+
+        return false;
+    }
+
+    // New peer - check bounds before adding (Rule #4: bounded containers)
+    if (_received_seq_sets.size() >= MAX_DEDUP_PEERS) {
+        ++_dedup_peers_overflow;
+        // Cannot track new peer - treat as non-duplicate to allow processing
+        // This is a security/availability tradeoff: we prioritize availability
+        // over duplicate suppression when under peer flooding attack
+        return false;
+    }
+
+    // Create new entry for this peer
     auto& seq_set = _received_seq_sets[peer];
     auto& seq_window = _received_seq_windows[peer];
 
-    // Check if we've seen this sequence number (potential duplicate or replay attack)
-    if (seq_set.count(seq_num) > 0) {
-        return true;
-    }
-
-    // Add to window
     seq_set.insert(seq_num);
     seq_window.push_back(seq_num);
-
-    // Slide window if too large - evict oldest sequence numbers
-    // Note: We only evict the oldest entries, never clear the whole window
-    while (seq_window.size() > _config.gossip_dedup_window) {
-        uint32_t oldest = seq_window.front();
-        seq_window.pop_front();
-        seq_set.erase(oldest);
-    }
 
     return false;
 }

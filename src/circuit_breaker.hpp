@@ -37,6 +37,10 @@ struct BackendCircuit {
 
 // Thread-local circuit breaker (no locks needed in Seastar's shared-nothing model)
 class CircuitBreaker {
+    // Maximum number of unique circuits to track (Rule #4: bounded containers)
+    // Prevents OOM from malicious/buggy backends flooding unique IDs
+    static constexpr size_t MAX_CIRCUITS = 10000;
+
 public:
     // Configuration for circuit breaker behavior
     struct Config {
@@ -51,12 +55,25 @@ public:
 
     // Check if a request to this backend should be allowed
     // Returns true if allowed, false if circuit is open
+    // Rule #4: Bounded container - fails open (allows request) if limit reached
     bool allow_request(BackendId backend_id) {
         if (!_config.enabled) {
             return true;
         }
 
-        auto& circuit = _circuits[backend_id];
+        auto it = _circuits.find(backend_id);
+        if (it == _circuits.end()) {
+            // New circuit needed - check bounds (Rule #4)
+            if (_circuits.size() >= MAX_CIRCUITS) {
+                ++_circuits_overflow;
+                return true;  // Fail-open: allow request when limit reached
+            }
+            // Create new circuit in CLOSED state
+            _circuits.emplace(backend_id, BackendCircuit{});
+            return true;  // New circuit starts CLOSED, allow request
+        }
+
+        auto& circuit = it->second;
         auto now = std::chrono::steady_clock::now();
 
         switch (circuit.state) {
@@ -82,12 +99,20 @@ public:
     }
 
     // Record a successful request
+    // Rule #4: Bounded container - skips if circuit doesn't exist and limit reached
     void record_success(BackendId backend_id) {
         if (!_config.enabled) {
             return;
         }
 
-        auto& circuit = _circuits[backend_id];
+        auto it = _circuits.find(backend_id);
+        if (it == _circuits.end()) {
+            // Circuit doesn't exist - likely already at limit or never tracked
+            // No need to create a new circuit just for success recording
+            return;
+        }
+
+        auto& circuit = it->second;
 
         switch (circuit.state) {
             case CircuitState::CLOSED:
@@ -114,12 +139,24 @@ public:
     }
 
     // Record a failed request
+    // Rule #4: Bounded container - skips if circuit doesn't exist and limit reached
     void record_failure(BackendId backend_id) {
         if (!_config.enabled) {
             return;
         }
 
-        auto& circuit = _circuits[backend_id];
+        auto it = _circuits.find(backend_id);
+        if (it == _circuits.end()) {
+            // Circuit doesn't exist - check bounds before creating (Rule #4)
+            if (_circuits.size() >= MAX_CIRCUITS) {
+                ++_circuits_overflow;
+                return;  // Skip: cannot track new circuit when limit reached
+            }
+            // Create new circuit and record the failure
+            it = _circuits.emplace(backend_id, BackendCircuit{}).first;
+        }
+
+        auto& circuit = it->second;
         auto now = std::chrono::steady_clock::now();
 
         circuit.failure_count++;
@@ -199,6 +236,9 @@ public:
 
     const Config& config() const { return _config; }
 
+    // Get overflow count for circuit limit (for monitoring)
+    uint64_t get_circuits_overflow() const { return _circuits_overflow; }
+
     // Hot-reload: Update configuration at runtime
     void update_config(const Config& config) {
         _config = config;
@@ -208,6 +248,7 @@ public:
 private:
     Config _config;
     std::unordered_map<BackendId, BackendCircuit> _circuits;
+    uint64_t _circuits_overflow = 0;  // Times circuit limit was hit (Rule #4)
 };
 
 // Convert circuit state to string for logging

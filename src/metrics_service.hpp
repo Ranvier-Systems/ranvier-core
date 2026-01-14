@@ -103,6 +103,9 @@ inline std::vector<double> total_request_latency_buckets() {
 // Thread-local metrics for the HTTP controller
 // Each shard has its own counters/histograms (shared-nothing model)
 class MetricsService {
+    // Maximum number of unique backends to track metrics for (Rule #4: bounded containers)
+    // Prevents OOM from malicious/buggy backends flooding unique IDs
+    static constexpr size_t MAX_TRACKED_BACKENDS = 10000;
     struct MetricHistogram {
         seastar::metrics::histogram data;
 
@@ -176,6 +179,9 @@ public:
 
             seastar::metrics::make_counter("stream_parser_size_limit_rejections", _stream_parser_size_rejections,
                 seastar::metrics::description("Total number of connections rejected due to stream parser accumulator size limit (Slowloris defense)")),
+
+            seastar::metrics::make_counter("backend_metrics_overflow", _backend_metrics_overflow,
+                seastar::metrics::description("Times backend metrics limit was reached, new backends ignored (Rule #4: bounded containers)")),
 
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
@@ -286,6 +292,9 @@ public:
     // Record stream parser size limit rejections (Slowloris defense)
     void record_stream_parser_size_rejection() { _stream_parser_size_rejections++; }
 
+    // Get overflow count for backend metrics limit (for monitoring)
+    uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
+
     // Active request tracking
     void increment_active_requests() { _active_requests++; }
     void decrement_active_requests() { _active_requests--; }
@@ -362,6 +371,7 @@ private:
     uint64_t _circuit_opens = 0;
     uint64_t _fallback_attempts = 0;
     uint64_t _stream_parser_size_rejections = 0;
+    uint64_t _backend_metrics_overflow = 0;  // Times backend metrics limit was hit (Rule #4)
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance
@@ -398,10 +408,20 @@ private:
 
     // Get or create per-backend metrics and register with Seastar
     // Metrics are shard-local (lock-free) to maintain hot path efficiency
+    // Rule #4: Bounded container - rejects new backends beyond MAX_TRACKED_BACKENDS
     BackendMetrics& get_or_create_backend_metrics(BackendId backend_id) {
         auto it = _per_backend_metrics.find(backend_id);
         if (it != _per_backend_metrics.end()) {
             return it->second;
+        }
+
+        // Bounds check: reject new backends if limit reached (Rule #4)
+        if (_per_backend_metrics.size() >= MAX_TRACKED_BACKENDS) {
+            ++_backend_metrics_overflow;
+            // Return fallback metrics that are not registered with Prometheus
+            // This prevents OOM while still allowing the request to proceed
+            static thread_local BackendMetrics fallback_metrics;
+            return fallback_metrics;
         }
 
         // Create new backend metrics
