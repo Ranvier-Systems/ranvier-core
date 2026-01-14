@@ -931,7 +931,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     // Initialize ProxyContext with all state needed for streaming
     // This struct bundles request state to reduce lambda capture complexity
-    auto ctx = std::make_shared<ProxyContext>();
+    // Using unique_ptr: ownership transfers from handle_proxy to the lambda (no sharing)
+    auto ctx = std::make_unique<ProxyContext>();
     ctx->request_id = request_id;
     ctx->backend_traceparent = backend_traceparent;
     ctx->routing_mode = routing_mode_str;
@@ -951,7 +952,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
     // Move gate_holder and semaphore_units into the lambda to keep them alive during streaming.
     // This ensures the gate stays held and the semaphore slot is occupied until streaming completes.
-    rep->write_body("text/event-stream", [this, ctx, gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(*ctx);
