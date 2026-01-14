@@ -172,6 +172,10 @@ seastar::future<> K8sDiscoveryService::stop() {
     log_k8s.info("Stopping K8s discovery service");
     _running = false;
 
+    // Rule #6: Deregister metrics FIRST to prevent use-after-free from
+    // Prometheus scrapes that arrive after shutdown begins.
+    _metrics.clear();
+
     // Stop the poll timer
     _poll_timer.cancel();
 

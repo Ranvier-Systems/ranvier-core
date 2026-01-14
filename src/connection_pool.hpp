@@ -8,6 +8,7 @@
 #include <string>
 #include <system_error>
 
+#include <seastar/core/gate.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/timer.hh>
@@ -105,7 +106,24 @@ public:
     }
 
     ~ConnectionPool() {
+        // Note: stop() should be called before destruction to properly wait
+        // for in-flight timer callbacks. Destructor cancels as a safety net.
         _reaper_timer.cancel();
+    }
+
+    // Stop the connection pool gracefully.
+    // MUST be called before destruction to ensure timer callback safety.
+    // Follows Rule #5: Timer callbacks need gate guards.
+    //
+    // Order is critical:
+    //   1. Close _timer_gate (waits for in-flight callbacks to complete)
+    //   2. Cancel timer (prevents future callbacks from being scheduled)
+    //
+    // This guarantees no timer callback can access `this` after stop() returns.
+    seastar::future<> stop() {
+        return _timer_gate.close().then([this] {
+            _reaper_timer.cancel();
+        });
     }
 
     // GET: Reuse existing or create new connection
@@ -351,6 +369,14 @@ private:
     size_t _connections_reaped_max_age = 0;
     seastar::timer<> _reaper_timer;
 
+    // RAII gate for timer callback lifetime safety (Rule #5).
+    // Timer callbacks capture `this`, creating a potential use-after-free if the
+    // callback executes after destruction begins. The _timer_gate ensures:
+    //   - Timer callbacks acquire a gate::holder at entry (fails if gate is closed)
+    //   - stop() closes the gate FIRST (waits for in-flight callbacks to complete)
+    //   - Only then are timers cancelled and resources freed
+    seastar::gate _timer_gate;
+
     // Arm the reaper timer for next execution
     void arm_reaper_timer() {
         _reaper_timer.arm(_config.reaper_interval);
@@ -358,7 +384,22 @@ private:
 
     // Dead connection reaper - runs periodically to clean up stale connections
     // This catches half-open sockets that received FIN from backend and expired connections
+    //
+    // Timer Safety (Rule #5): Acquires gate holder to prevent execution during shutdown.
+    // If the gate is closed (stop() in progress), the callback safely exits without
+    // accessing any member state - preventing use-after-free on `this`.
     void reap_dead_connections() {
+        // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+        // If the gate is closed (stop() in progress), this throws gate_closed_exception
+        // and the callback safely exits without accessing any member state.
+        seastar::gate::holder timer_holder;
+        try {
+            timer_holder = _timer_gate.hold();
+        } catch (const seastar::gate_closed_exception&) {
+            // Gate closed - stop() is in progress, exit safely
+            return;
+        }
+
         size_t reaped = cleanup_expired();
         if (reaped > 0) {
             log_pool.debug("Dead connection reaper: closed {} stale connections", reaped);
