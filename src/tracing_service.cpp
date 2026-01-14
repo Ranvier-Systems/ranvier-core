@@ -42,6 +42,86 @@ namespace resource = opentelemetry::sdk::resource;
 namespace zipkin = opentelemetry::exporter::zipkin;
 
 // ============================================================================
+// W3C Trace Context Format Constants
+// Spec: https://www.w3.org/TR/trace-context/
+//
+// Format: {version}-{trace-id}-{parent-span-id}-{trace-flags}
+// Example: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+// ============================================================================
+namespace w3c {
+
+// Field lengths (in hex characters)
+constexpr size_t VERSION_HEX_LEN = 2;       // "00"
+constexpr size_t TRACE_ID_HEX_LEN = 32;     // 16 bytes = 32 hex chars
+constexpr size_t SPAN_ID_HEX_LEN = 16;      // 8 bytes = 16 hex chars
+constexpr size_t TRACE_FLAGS_HEX_LEN = 2;   // "00" or "01"
+constexpr size_t SEPARATOR_LEN = 1;         // "-"
+
+// Field lengths (in bytes, for binary representation)
+constexpr size_t TRACE_ID_BYTE_LEN = 16;
+constexpr size_t SPAN_ID_BYTE_LEN = 8;
+
+// Field offsets in traceparent string
+// Layout: VV-TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT-SSSSSSSSSSSSSSSS-FF
+//         0  3                                36               53
+constexpr size_t VERSION_OFFSET = 0;
+constexpr size_t TRACE_ID_OFFSET = VERSION_HEX_LEN + SEPARATOR_LEN;  // 3
+constexpr size_t SPAN_ID_OFFSET = TRACE_ID_OFFSET + TRACE_ID_HEX_LEN + SEPARATOR_LEN;  // 36
+constexpr size_t FLAGS_OFFSET = SPAN_ID_OFFSET + SPAN_ID_HEX_LEN + SEPARATOR_LEN;  // 53
+
+// Separator positions (indices where '-' should appear)
+constexpr size_t SEP_AFTER_VERSION = VERSION_HEX_LEN;  // 2
+constexpr size_t SEP_AFTER_TRACE_ID = TRACE_ID_OFFSET + TRACE_ID_HEX_LEN;  // 35
+constexpr size_t SEP_AFTER_SPAN_ID = SPAN_ID_OFFSET + SPAN_ID_HEX_LEN;  // 52
+
+// Minimum valid traceparent length
+constexpr size_t MIN_TRACEPARENT_LEN = FLAGS_OFFSET + TRACE_FLAGS_HEX_LEN;  // 55
+
+// Known values
+constexpr char SEPARATOR = '-';
+constexpr std::string_view SUPPORTED_VERSION = "00";
+constexpr std::string_view SAMPLED_FLAG = "01";
+constexpr std::string_view UNSAMPLED_FLAG = "00";
+
+// Buffer sizes for hex string output (includes null terminator)
+constexpr size_t TRACE_ID_BUF_SIZE = TRACE_ID_HEX_LEN + 1;  // 33
+constexpr size_t SPAN_ID_BUF_SIZE = SPAN_ID_HEX_LEN + 1;    // 17
+
+// Helper: Check if character is valid hexadecimal
+constexpr bool is_hex_char(char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+// Helper: Convert hex character pair to byte
+constexpr uint8_t hex_pair_to_byte(char hi, char lo) noexcept {
+    auto char_to_nibble = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+        return 0;
+    };
+    return static_cast<uint8_t>((char_to_nibble(hi) << 4) | char_to_nibble(lo));
+}
+
+// Helper: Validate that a string contains only hex characters
+inline bool is_valid_hex_string(std::string_view s) noexcept {
+    for (char c : s) {
+        if (!is_hex_char(c)) return false;
+    }
+    return true;
+}
+
+// Helper: Check if hex string is all zeros (invalid per W3C spec)
+inline bool is_all_zeros(std::string_view s) noexcept {
+    for (char c : s) {
+        if (c != '0') return false;
+    }
+    return true;
+}
+
+}  // namespace w3c
+
+// ============================================================================
 // Static storage (file-local to avoid header pollution)
 //
 // Thread-safety model:
@@ -66,53 +146,48 @@ static std::string g_service_name;
 TraceContext TraceContext::parse(std::string_view traceparent) {
     TraceContext ctx;
 
-    // Minimum length: "00-" + 32 + "-" + 16 + "-" + 2 = 55
-    if (traceparent.length() < 55) {
+    // Validate minimum length
+    if (traceparent.length() < w3c::MIN_TRACEPARENT_LEN) {
         return ctx;
     }
 
-    // Version check (only support version 00)
-    if (traceparent[0] != '0' || traceparent[1] != '0' || traceparent[2] != '-') {
+    // Validate version field (only support version "00")
+    std::string_view version = traceparent.substr(w3c::VERSION_OFFSET, w3c::VERSION_HEX_LEN);
+    if (version != w3c::SUPPORTED_VERSION) {
         return ctx;
     }
 
-    // Extract trace-id (32 hex chars)
-    ctx.trace_id = std::string(traceparent.substr(3, 32));
-    if (traceparent[35] != '-') {
+    // Validate all separator positions
+    if (traceparent[w3c::SEP_AFTER_VERSION] != w3c::SEPARATOR ||
+        traceparent[w3c::SEP_AFTER_TRACE_ID] != w3c::SEPARATOR ||
+        traceparent[w3c::SEP_AFTER_SPAN_ID] != w3c::SEPARATOR) {
         return ctx;
     }
 
-    // Extract parent-span-id (16 hex chars)
-    ctx.parent_span_id = std::string(traceparent.substr(36, 16));
-    if (traceparent[52] != '-') {
+    // Extract trace-id and validate
+    std::string_view trace_id_view = traceparent.substr(w3c::TRACE_ID_OFFSET, w3c::TRACE_ID_HEX_LEN);
+    if (!w3c::is_valid_hex_string(trace_id_view)) {
         return ctx;
     }
 
-    // Extract trace-flags (2 hex chars)
-    if (traceparent.length() >= 55) {
-        std::string_view flags = traceparent.substr(53, 2);
-        ctx.sampled = (flags == "01");
+    // Extract parent-span-id and validate
+    std::string_view span_id_view = traceparent.substr(w3c::SPAN_ID_OFFSET, w3c::SPAN_ID_HEX_LEN);
+    if (!w3c::is_valid_hex_string(span_id_view)) {
+        return ctx;
     }
 
-    // Validate hex characters
-    auto is_hex = [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-    };
-
-    for (char c : ctx.trace_id) {
-        if (!is_hex(c)) return ctx;
-    }
-    for (char c : ctx.parent_span_id) {
-        if (!is_hex(c)) return ctx;
+    // Trace-id must not be all zeros (per W3C spec)
+    if (w3c::is_all_zeros(trace_id_view)) {
+        return ctx;
     }
 
-    // Check for all-zeros (invalid)
-    bool all_zeros = true;
-    for (char c : ctx.trace_id) {
-        if (c != '0') { all_zeros = false; break; }
-    }
-    if (all_zeros) return ctx;
+    // Extract trace-flags
+    std::string_view flags = traceparent.substr(w3c::FLAGS_OFFSET, w3c::TRACE_FLAGS_HEX_LEN);
+    ctx.sampled = (flags == w3c::SAMPLED_FLAG);
 
+    // All validations passed - populate the context
+    ctx.trace_id = std::string(trace_id_view);
+    ctx.parent_span_id = std::string(span_id_view);
     ctx.valid = true;
     return ctx;
 }
@@ -121,7 +196,17 @@ std::string TraceContext::to_traceparent(std::string_view span_id) const {
     if (!valid || span_id.empty()) {
         return "";
     }
-    return "00-" + trace_id + "-" + std::string(span_id) + (sampled ? "-01" : "-00");
+    // Format: {version}-{trace-id}-{span-id}-{flags}
+    std::string result;
+    result.reserve(w3c::MIN_TRACEPARENT_LEN);
+    result.append(w3c::SUPPORTED_VERSION);
+    result.push_back(w3c::SEPARATOR);
+    result.append(trace_id);
+    result.push_back(w3c::SEPARATOR);
+    result.append(span_id);
+    result.push_back(w3c::SEPARATOR);
+    result.append(sampled ? w3c::SAMPLED_FLAG : w3c::UNSAMPLED_FLAG);
+    return result;
 }
 
 // ============================================================================
@@ -153,30 +238,26 @@ ScopedSpan::ScopedSpan(const std::string& name, const std::optional<TraceContext
     trace::StartSpanOptions options;
 
     if (parent && parent->valid) {
-        // Create span context from parent
-        uint8_t trace_id_bytes[16];
-        uint8_t span_id_bytes[8];
+        // Create span context from parent by converting hex strings to bytes
+        uint8_t trace_id_bytes[w3c::TRACE_ID_BYTE_LEN];
+        uint8_t span_id_bytes[w3c::SPAN_ID_BYTE_LEN];
 
-        // Parse hex strings to bytes
-        auto hex_to_byte = [](char hi, char lo) -> uint8_t {
-            auto char_to_nibble = [](char c) -> uint8_t {
-                if (c >= '0' && c <= '9') return c - '0';
-                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-                return 0;
-            };
-            return (char_to_nibble(hi) << 4) | char_to_nibble(lo);
-        };
-
-        for (size_t i = 0; i < 16; ++i) {
-            trace_id_bytes[i] = hex_to_byte(parent->trace_id[i*2], parent->trace_id[i*2+1]);
-        }
-        for (size_t i = 0; i < 8; ++i) {
-            span_id_bytes[i] = hex_to_byte(parent->parent_span_id[i*2], parent->parent_span_id[i*2+1]);
+        // Convert trace-id hex string to bytes
+        for (size_t i = 0; i < w3c::TRACE_ID_BYTE_LEN; ++i) {
+            trace_id_bytes[i] = w3c::hex_pair_to_byte(
+                parent->trace_id[i * 2], parent->trace_id[i * 2 + 1]);
         }
 
-        trace::TraceId tid(opentelemetry::nostd::span<const uint8_t, 16>(trace_id_bytes, 16));
-        trace::SpanId sid(opentelemetry::nostd::span<const uint8_t, 8>(span_id_bytes, 8));
+        // Convert span-id hex string to bytes
+        for (size_t i = 0; i < w3c::SPAN_ID_BYTE_LEN; ++i) {
+            span_id_bytes[i] = w3c::hex_pair_to_byte(
+                parent->parent_span_id[i * 2], parent->parent_span_id[i * 2 + 1]);
+        }
+
+        trace::TraceId tid(opentelemetry::nostd::span<const uint8_t, w3c::TRACE_ID_BYTE_LEN>(
+            trace_id_bytes, w3c::TRACE_ID_BYTE_LEN));
+        trace::SpanId sid(opentelemetry::nostd::span<const uint8_t, w3c::SPAN_ID_BYTE_LEN>(
+            span_id_bytes, w3c::SPAN_ID_BYTE_LEN));
         trace::TraceFlags flags(parent->sampled ? trace::TraceFlags::kIsSampled : 0);
 
         trace::SpanContext parent_ctx(tid, sid, flags, true);
@@ -245,21 +326,23 @@ void ScopedSpan::record_exception(const std::exception& e) {
 std::string ScopedSpan::span_id() const {
     if (!_impl || !_impl->span) return "";
 
-    char buf[17];
+    char buf[w3c::SPAN_ID_BUF_SIZE];
     auto span_ctx = _impl->span->GetContext();
-    span_ctx.span_id().ToLowerBase16(opentelemetry::nostd::span<char, 16>{buf, 16});
-    buf[16] = '\0';
-    return std::string(buf, 16);
+    span_ctx.span_id().ToLowerBase16(
+        opentelemetry::nostd::span<char, w3c::SPAN_ID_HEX_LEN>{buf, w3c::SPAN_ID_HEX_LEN});
+    buf[w3c::SPAN_ID_HEX_LEN] = '\0';
+    return std::string(buf, w3c::SPAN_ID_HEX_LEN);
 }
 
 std::string ScopedSpan::trace_id() const {
     if (!_impl || !_impl->span) return "";
 
-    char buf[33];
+    char buf[w3c::TRACE_ID_BUF_SIZE];
     auto span_ctx = _impl->span->GetContext();
-    span_ctx.trace_id().ToLowerBase16(opentelemetry::nostd::span<char, 32>{buf, 32});
-    buf[32] = '\0';
-    return std::string(buf, 32);
+    span_ctx.trace_id().ToLowerBase16(
+        opentelemetry::nostd::span<char, w3c::TRACE_ID_HEX_LEN>{buf, w3c::TRACE_ID_HEX_LEN});
+    buf[w3c::TRACE_ID_HEX_LEN] = '\0';
+    return std::string(buf, w3c::TRACE_ID_HEX_LEN);
 }
 
 bool ScopedSpan::is_recording() const {
