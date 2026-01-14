@@ -432,6 +432,7 @@ private:
     uint64_t _retries_sent = 0;
     uint64_t _duplicates_suppressed = 0;
     uint64_t _max_retries_exceeded = 0;
+    uint64_t _dedup_peers_overflow = 0;  // Times dedup peer limit was hit (Rule #4)
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;
@@ -539,6 +540,10 @@ private:
     static constexpr size_t CRYPTO_OFFLOAD_PEER_THRESHOLD = 10;      // Use batch mode if > N peers
     static constexpr size_t CRYPTO_OFFLOAD_BYTES_THRESHOLD = 1024;   // Offload if packet > N bytes
     static constexpr uint64_t CRYPTO_STALL_WARNING_US = 100;         // Warn if single op > 100μs
+
+    // Deduplication limits (Rule #4: bounded containers)
+    // Prevents OOM from malicious peers flooding unique source addresses
+    static constexpr size_t MAX_DEDUP_PEERS = 10000;  // Max unique peers to track for dedup
 
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();
