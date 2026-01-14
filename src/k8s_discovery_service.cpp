@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
-#include <fstream>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -218,6 +217,49 @@ seastar::future<> K8sDiscoveryService::load_service_account_token() {
     });
 }
 
+seastar::future<std::string> K8sDiscoveryService::load_ca_cert(const std::string& path) {
+    // Check if file exists first (async)
+    bool exists = co_await seastar::file_exists(path);
+    if (!exists) {
+        log_k8s.debug("CA cert file not found at {}", path);
+        co_return std::string{};
+    }
+
+    try {
+        auto file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+        auto size = co_await file.size();
+
+        if (size == 0) {
+            log_k8s.warn("CA cert file is empty: {}", path);
+            co_await file.close();
+            co_return std::string{};
+        }
+
+        // Read entire file contents
+        auto stream = seastar::make_file_input_stream(file);
+        auto buf = co_await stream.read_exactly(size);
+        co_await stream.close();
+        co_await file.close();
+
+        std::string content(buf.get(), buf.size());
+
+        // Trim trailing whitespace/newlines
+        while (!content.empty() && std::isspace(static_cast<unsigned char>(content.back()))) {
+            content.pop_back();
+        }
+
+        log_k8s.debug("Loaded CA certificate from {} ({} bytes)", path, content.size());
+        co_return content;
+
+    } catch (const std::system_error& e) {
+        log_k8s.warn("Failed to read CA cert file {}: {}", path, e.what());
+        co_return std::string{};
+    } catch (const std::exception& e) {
+        log_k8s.warn("Failed to read CA cert file {}: {}", path, e.what());
+        co_return std::string{};
+    }
+}
+
 seastar::future<> K8sDiscoveryService::init_tls() {
     if (!_config.api_server.starts_with("https://")) {
         log_k8s.debug("API server is not HTTPS, skipping TLS init");
@@ -226,31 +268,18 @@ seastar::future<> K8sDiscoveryService::init_tls() {
 
     try {
         auto builder = seastar::tls::credentials_builder();
-        bool needs_system_trust = false;
 
         if (_config.verify_tls) {
-            // Try to load CA certificate
-            try {
-                std::ifstream ca_file(_config.ca_cert_path);
-                if (ca_file.is_open()) {
-                    std::stringstream buffer;
-                    buffer << ca_file.rdbuf();
-                    builder.set_x509_trust(buffer.str(), seastar::tls::x509_crt_format::PEM);
-                    log_k8s.debug("Loaded CA certificate from {}", _config.ca_cert_path);
-                } else {
-                    needs_system_trust = true;
-                    log_k8s.debug("Using system CA certificates");
-                }
-            } catch (const std::exception& e) {
-                log_k8s.warn("Failed to load CA cert, using system trust: {}", e.what());
-                needs_system_trust = true;
-            }
+            // Load CA certificate asynchronously (non-blocking)
+            std::string ca_cert = co_await load_ca_cert(_config.ca_cert_path);
 
-            if (needs_system_trust) {
+            if (!ca_cert.empty()) {
+                builder.set_x509_trust(ca_cert, seastar::tls::x509_crt_format::PEM);
+                log_k8s.debug("Loaded CA certificate from {}", _config.ca_cert_path);
+            } else {
                 // Fall back to system CA
-                // Note: co_await is must be outside the catch block.
                 co_await builder.set_system_trust();
-                log_k8s.debug("Using system CA certificates");
+                log_k8s.debug("CA cert not available, using system CA certificates");
             }
         } else {
             // Disable verification (not recommended for production)

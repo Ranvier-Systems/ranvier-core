@@ -166,6 +166,10 @@ private:
     // Initialize TLS credentials
     seastar::future<> init_tls();
 
+    // Load CA certificate from file asynchronously
+    // Returns empty string if file doesn't exist or on read error (logs at warn level)
+    seastar::future<std::string> load_ca_cert(const std::string& path);
+
     // Perform full sync of endpoints
     seastar::future<> sync_endpoints();
 
