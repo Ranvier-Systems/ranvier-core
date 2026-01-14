@@ -278,6 +278,11 @@ seastar::future<> GossipService::stop() {
     log_gossip.info("Stopping gossip service");
     _running = false;
 
+    // Rule #6: Deregister metrics FIRST to prevent use-after-free from
+    // Prometheus scrapes that arrive after shutdown begins.
+    // CryptoOffloader's metrics are also registered in _metrics.
+    _metrics.clear();
+
     // RAII Timer Safety: Close the timer gate FIRST to ensure no timer callbacks
     // can execute during or after shutdown. This waits for any in-flight timer
     // callbacks to complete before proceeding.

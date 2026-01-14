@@ -77,7 +77,10 @@ public:
     }
 
     // Required by seastar::sharded<>
+    // Rule #6: Deregister metrics first to prevent use-after-free from
+    // Prometheus scrapes that arrive after shutdown begins.
     seastar::future<> stop() {
+        _metrics.clear();
         return seastar::make_ready_future<>();
     }
 

@@ -447,6 +447,27 @@ private:
         metrics.registered = true;
         return metrics;
     }
+
+public:
+    // Stop the metrics service - MUST be called during shutdown (Rule #6).
+    // Deregisters all metrics lambdas to prevent use-after-free when
+    // Prometheus scrapes arrive after shutdown begins.
+    //
+    // Order is critical:
+    //   1. Clear _metrics (deregisters all lambdas capturing `this`)
+    //   2. Clear _backend_metrics (deregisters per-backend lambdas)
+    //   3. Clear _per_backend_metrics (destroys BackendMetrics objects)
+    //
+    // After stop() returns, no metrics lambda can access `this`.
+    void stop() {
+        // FIRST: Deregister all metrics before any other cleanup.
+        // This removes all lambdas from Prometheus scrape path.
+        _metrics.clear();
+        _backend_metrics.clear();
+
+        // Now safe to clear internal state
+        _per_backend_metrics.clear();
+    }
 };
 
 // Global thread-local metrics instance
@@ -462,6 +483,17 @@ inline void init_metrics() {
 // Get the metrics instance for this shard
 inline MetricsService& metrics() {
     return *g_metrics;
+}
+
+// Stop and cleanup metrics for this shard (call during shutdown).
+// MUST be called before destruction to deregister metrics lambdas (Rule #6).
+// After this call, Prometheus scrapes cannot access any metrics state.
+inline void stop_metrics() {
+    if (g_metrics) {
+        g_metrics->stop();
+        delete g_metrics;
+        g_metrics = nullptr;
+    }
 }
 
 }  // namespace ranvier
