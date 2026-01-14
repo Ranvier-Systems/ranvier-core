@@ -145,7 +145,11 @@ inline void init_shard_load_metrics() {
 }
 
 // Get the shard load metrics instance for this shard
+// Rule #3: Null-guard all pointer accessors - lazy initialization ensures never null
 inline ShardLoadMetrics& shard_load_metrics() {
+    if (!g_shard_load_metrics) {
+        g_shard_load_metrics = std::make_unique<ShardLoadMetrics>();
+    }
     return *g_shard_load_metrics;
 }
 
