@@ -23,6 +23,10 @@
 
 using namespace seastar;
 
+// UTF-8 status symbols for console output
+constexpr const char* kCheckMark = "\xE2\x9C\x93";  // ✓ (U+2713)
+constexpr const char* kCrossMark = "\xE2\x9C\x97";  // ✗ (U+2717)
+
 // Dry-run validation - checks configuration, tokenizer, database, and TLS without starting services
 // Returns 0 if all checks pass, 1 if any fail
 static int run_dry_run_validation(const std::string& config_path, const ranvier::RanvierConfig& config) {
@@ -39,20 +43,20 @@ static int run_dry_run_validation(const std::string& config_path, const ranvier:
     std::ifstream config_file(config_path);
     if (config_file.is_open()) {
         config_file.close();
-        std::cout << "  \xE2\x9C\x93 Config file parsed successfully\n";
+        std::cout << "  " << kCheckMark << " Config file parsed successfully\n";
     } else {
         std::cout << "  ! Config file not found, using defaults\n";
     }
-    std::cout << "  \xE2\x9C\x93 API port: " << config.server.api_port << "\n";
-    std::cout << "  \xE2\x9C\x93 Metrics port: " << config.server.metrics_port << "\n";
+    std::cout << "  " << kCheckMark << " API port: " << config.server.api_port << "\n";
+    std::cout << "  " << kCheckMark << " Metrics port: " << config.server.metrics_port << "\n";
 
     // Run config validation
     auto validation_error = ranvier::RanvierConfig::validate(config);
     if (validation_error) {
-        std::cout << "  \xE2\x9C\x97 Validation error: " << *validation_error << "\n";
+        std::cout << "  " << kCrossMark << " Validation error: " << *validation_error << "\n";
         error_count++;
     } else {
-        std::cout << "  \xE2\x9C\x93 Configuration validation passed\n";
+        std::cout << "  " << kCheckMark << " Configuration validation passed\n";
     }
 
     // ============================================================
@@ -63,7 +67,7 @@ static int run_dry_run_validation(const std::string& config_path, const ranvier:
     // Check tokenizer file exists
     std::ifstream tokenizer_file(config.assets.tokenizer_path);
     if (!tokenizer_file.is_open()) {
-        std::cout << "  \xE2\x9C\x97 " << config.assets.tokenizer_path << " (file not found)\n";
+        std::cout << "  " << kCrossMark << " " << config.assets.tokenizer_path << " (file not found)\n";
         error_count++;
     } else {
         // Try to read and parse the JSON
@@ -77,13 +81,13 @@ static int run_dry_run_validation(const std::string& config_path, const ranvier:
             test_tokenizer.load_from_json(json_str);
 
             if (test_tokenizer.is_loaded()) {
-                std::cout << "  \xE2\x9C\x93 " << config.assets.tokenizer_path << " (valid)\n";
+                std::cout << "  " << kCheckMark << " " << config.assets.tokenizer_path << " (valid)\n";
             } else {
-                std::cout << "  \xE2\x9C\x97 " << config.assets.tokenizer_path << " (failed to parse)\n";
+                std::cout << "  " << kCrossMark << " " << config.assets.tokenizer_path << " (failed to parse)\n";
                 error_count++;
             }
         } catch (const std::exception& e) {
-            std::cout << "  \xE2\x9C\x97 " << config.assets.tokenizer_path << " (invalid: " << e.what() << ")\n";
+            std::cout << "  " << kCrossMark << " " << config.assets.tokenizer_path << " (invalid: " << e.what() << ")\n";
             error_count++;
         }
     }
@@ -100,9 +104,9 @@ static int run_dry_run_validation(const std::string& config_path, const ranvier:
     if (stat(db_path.c_str(), &db_stat) == 0) {
         // File exists, check if it's writable
         if (access(db_path.c_str(), W_OK) == 0) {
-            std::cout << "  \xE2\x9C\x93 " << db_path << " (writable)\n";
+            std::cout << "  " << kCheckMark << " " << db_path << " (writable)\n";
         } else {
-            std::cout << "  \xE2\x9C\x97 " << db_path << " (not writable)\n";
+            std::cout << "  " << kCrossMark << " " << db_path << " (not writable)\n";
             error_count++;
         }
     } else {
@@ -117,9 +121,9 @@ static int run_dry_run_validation(const std::string& config_path, const ranvier:
         }
 
         if (access(parent_dir.c_str(), W_OK) == 0) {
-            std::cout << "  \xE2\x9C\x93 " << db_path << " (can be created)\n";
+            std::cout << "  " << kCheckMark << " " << db_path << " (can be created)\n";
         } else {
-            std::cout << "  \xE2\x9C\x97 " << db_path << " (parent directory not writable: " << parent_dir << ")\n";
+            std::cout << "  " << kCrossMark << " " << db_path << " (parent directory not writable: " << parent_dir << ")\n";
             error_count++;
         }
     }
@@ -134,23 +138,23 @@ static int run_dry_run_validation(const std::string& config_path, const ranvier:
     } else {
         // Check certificate file
         if (config.tls.cert_path.empty()) {
-            std::cout << "  \xE2\x9C\x97 Certificate: (path not configured)\n";
+            std::cout << "  " << kCrossMark << " Certificate: (path not configured)\n";
             error_count++;
         } else if (access(config.tls.cert_path.c_str(), R_OK) == 0) {
-            std::cout << "  \xE2\x9C\x93 Certificate: " << config.tls.cert_path << "\n";
+            std::cout << "  " << kCheckMark << " Certificate: " << config.tls.cert_path << "\n";
         } else {
-            std::cout << "  \xE2\x9C\x97 Certificate: " << config.tls.cert_path << " (not readable)\n";
+            std::cout << "  " << kCrossMark << " Certificate: " << config.tls.cert_path << " (not readable)\n";
             error_count++;
         }
 
         // Check private key file
         if (config.tls.key_path.empty()) {
-            std::cout << "  \xE2\x9C\x97 Private key: (path not configured)\n";
+            std::cout << "  " << kCrossMark << " Private key: (path not configured)\n";
             error_count++;
         } else if (access(config.tls.key_path.c_str(), R_OK) == 0) {
-            std::cout << "  \xE2\x9C\x93 Private key: " << config.tls.key_path << "\n";
+            std::cout << "  " << kCheckMark << " Private key: " << config.tls.key_path << "\n";
         } else {
-            std::cout << "  \xE2\x9C\x97 Private key: " << config.tls.key_path << " (not readable)\n";
+            std::cout << "  " << kCrossMark << " Private key: " << config.tls.key_path << " (not readable)\n";
             error_count++;
         }
     }
