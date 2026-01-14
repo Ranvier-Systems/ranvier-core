@@ -58,6 +58,54 @@ struct LoadBalancingSettings {
     uint64_t snapshot_refresh_interval_us = 1000;     // Snapshot cache refresh interval (microseconds)
 };
 
+// Forward declaration for connection bundle
+struct ConnectionBundle;
+
+// Context struct for proxy request state - reduces parameter passing and improves readability
+// This bundles all state that flows through the proxy request lifecycle
+struct ProxyContext {
+    // Request identification
+    std::string request_id;
+    std::string backend_traceparent;
+    std::string routing_mode;
+
+    // Request body and tokens
+    std::string forwarded_body;
+    std::vector<int32_t> tokens;
+
+    // Target backend
+    BackendId target_id;
+    seastar::socket_address target_addr;
+    BackendId current_backend;            // May differ from target_id after fallback
+    seastar::socket_address current_addr;
+
+    // Timing
+    std::chrono::steady_clock::time_point request_start;
+    std::chrono::steady_clock::time_point connect_start;
+    seastar::lowres_clock::time_point request_deadline;
+
+    // Configuration (captured from HttpControllerConfig)
+    std::chrono::seconds connect_timeout;
+    std::chrono::seconds request_timeout;
+    RetrySettings retry_config;
+    bool fallback_enabled;
+
+    // State flags
+    bool shard_metrics_active = false;
+    bool timed_out = false;
+    bool connection_failed = false;
+    bool connection_error = false;
+    bool client_disconnected = false;
+    bool stream_closed = false;
+    bool response_latency_recorded = false;
+
+    // Retry tracking
+    uint32_t retry_attempt = 0;
+    std::chrono::milliseconds current_backoff;
+    uint32_t fallback_attempts = 0;
+    static constexpr uint32_t MAX_FALLBACK_ATTEMPTS = 3;
+};
+
 // HTTP controller configuration
 struct HttpControllerConfig {
     ConnectionPoolConfig pool;
@@ -229,6 +277,34 @@ private:
 
     // Try to get an alternative backend when primary fails (fallback routing)
     std::optional<BackendId> get_fallback_backend(BackendId failed_id);
+
+    // Proxy request helper methods - break down handle_proxy into manageable pieces
+    // These are called from within the streaming lambda to handle different phases
+
+    // Establish connection to backend with retry and fallback logic
+    // Returns connected bundle or sets ctx.connection_failed on failure
+    seastar::future<ConnectionBundle> establish_backend_connection(ProxyContext& ctx);
+
+    // Send HTTP request to backend
+    // Returns true on success, false on failure (sets appropriate ctx flags)
+    seastar::future<bool> send_backend_request(ProxyContext& ctx, ConnectionBundle& bundle);
+
+    // Stream response from backend to client
+    // Handles the read loop, parsing, route learning, and client writes
+    seastar::future<> stream_backend_response(
+        ProxyContext& ctx,
+        ConnectionBundle& bundle,
+        seastar::output_stream<char>& client_out);
+
+    // Write error message to client, handling disconnected clients gracefully
+    seastar::future<> write_client_error(
+        seastar::output_stream<char>& client_out,
+        std::string_view error_msg);
+
+    // Record final metrics and clean up after proxy request completes
+    void record_proxy_completion_metrics(
+        const ProxyContext& ctx,
+        const std::chrono::steady_clock::time_point& backend_end);
 };
 
 } // namespace ranvier

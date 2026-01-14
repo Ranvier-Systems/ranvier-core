@@ -298,6 +298,341 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 }
 
 // ---------------------------------------------------------
+// PROXY HELPER METHODS
+// ---------------------------------------------------------
+
+// Write error message to client, handling disconnected clients gracefully
+future<> HttpController::write_client_error(
+    output_stream<char>& client_out,
+    std::string_view error_msg) {
+    try {
+        sstring msg = sstring("data: {\"error\": \"") + sstring(error_msg) + "\"}\n\n";
+        co_await client_out.write(msg);
+        co_await client_out.flush();
+    } catch (...) {
+        // Client may have disconnected, ignore write errors
+        auto err_type = classify_connection_error(std::current_exception());
+        if (err_type == ConnectionErrorType::NONE) {
+            log_proxy.debug("Failed to send error to client: {}", error_msg);
+        }
+    }
+}
+
+// Record final metrics and clean up after proxy request completes
+void HttpController::record_proxy_completion_metrics(
+    const ProxyContext& ctx,
+    const std::chrono::steady_clock::time_point& backend_end) {
+
+    // Record backend total latency (from connection start to completion)
+    if (!ctx.connection_failed && !ctx.connection_error) {
+        auto backend_latency = MetricsService::to_seconds(backend_end - ctx.connect_start);
+        // Record in legacy histogram
+        metrics().record_backend_total_latency(backend_latency);
+        // Record in per-backend histogram for GPU model comparison (e.g., H100 vs A100)
+        metrics().record_backend_latency_by_id(ctx.current_backend, backend_latency);
+    }
+
+    // Record total request duration (end-to-end from ingress to completion)
+    auto total_latency = MetricsService::to_seconds(backend_end - ctx.request_start);
+    // Record in legacy histogram
+    metrics().record_request_latency(total_latency);
+    // Record in new advanced histogram with optimized buckets
+    metrics().record_router_total_latency(total_latency);
+}
+
+// Establish connection to backend with retry and fallback logic
+future<ConnectionBundle> HttpController::establish_backend_connection(ProxyContext& ctx) {
+    ctx.connect_start = std::chrono::steady_clock::now();
+    ctx.current_backoff = ctx.retry_config.initial_backoff;
+
+    ConnectionBundle bundle;
+
+    while (ctx.retry_attempt <= ctx.retry_config.max_retries) {
+        // Check if we've exceeded overall request deadline
+        if (lowres_clock::now() >= ctx.request_deadline) {
+            log_proxy.warn("[{}] Request deadline exceeded during connection retry", ctx.request_id);
+            ctx.connection_failed = true;
+            _circuit_breaker.record_failure(ctx.current_backend);
+            break;
+        }
+
+        auto connect_deadline = lowres_clock::now() + ctx.connect_timeout;
+        auto conn_future = with_timeout(connect_deadline, _pool.get(ctx.current_addr, ctx.request_id));
+
+        bool this_attempt_failed = false;
+        bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
+            this_attempt_failed = true;
+            return ConnectionBundle{}; // Return empty bundle
+        });
+
+        if (!this_attempt_failed) {
+            // Connection successful - record connect latency
+            auto connect_end = std::chrono::steady_clock::now();
+            metrics().record_connect_latency(
+                MetricsService::to_seconds(connect_end - ctx.connect_start));
+            ctx.connection_failed = false;
+            log_proxy.info("[{}] Connection established to backend {} at {}",
+                          ctx.request_id, ctx.current_backend, ctx.current_addr);
+            break;
+        }
+
+        // Record failure for circuit breaker
+        _circuit_breaker.record_failure(ctx.current_backend);
+
+        // Try fallback to a different backend before retrying
+        if (ctx.fallback_enabled && ctx.fallback_attempts < ProxyContext::MAX_FALLBACK_ATTEMPTS) {
+            auto fallback = get_fallback_backend(ctx.current_backend);
+            if (fallback.has_value()) {
+                auto fallback_addr = _router.get_backend_address(fallback.value());
+                if (fallback_addr.has_value()) {
+                    log_proxy.info("[{}] Falling back from backend {} to {}",
+                                  ctx.request_id, ctx.current_backend, fallback.value());
+                    ctx.current_backend = fallback.value();
+                    ctx.current_addr = fallback_addr.value();
+                    ctx.fallback_attempts++;
+                    // Don't increment retry_attempt for fallback - this is a different backend
+                    continue;
+                }
+            }
+        }
+
+        // No fallback available - check if we should retry same backend
+        if (ctx.retry_attempt < ctx.retry_config.max_retries) {
+            log_proxy.warn("[{}] Connection attempt {} failed, retrying in {}ms",
+                ctx.request_id, ctx.retry_attempt + 1, ctx.current_backoff.count());
+
+            // Wait with exponential backoff before retry
+            co_await seastar::sleep(ctx.current_backoff);
+
+            // Increase backoff for next attempt (with cap)
+            auto next_backoff = std::chrono::milliseconds(
+                static_cast<int64_t>(ctx.current_backoff.count() * ctx.retry_config.backoff_multiplier));
+            ctx.current_backoff = std::min(next_backoff, ctx.retry_config.max_backoff);
+        } else {
+            log_proxy.warn("[{}] Connection failed after {} retries and {} fallbacks",
+                ctx.request_id, ctx.retry_config.max_retries + 1, ctx.fallback_attempts);
+            ctx.connection_failed = true;
+        }
+
+        ctx.retry_attempt++;
+    }
+
+    co_return bundle;
+}
+
+// Send HTTP request to backend
+future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionBundle& bundle) {
+    // Check request timeout before sending
+    if (lowres_clock::now() >= ctx.request_deadline) {
+        log_proxy.warn("[{}] Request timeout before sending", ctx.request_id);
+        ctx.timed_out = true;
+        bundle.is_valid = false;
+        co_return false;
+    }
+
+    // Build HTTP request with tracing headers for backend
+    sstring http_req =
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + to_sstring(ctx.forwarded_body.size()) + "\r\n"
+        "X-Request-ID: " + ctx.request_id + "\r\n";
+
+    // Add traceparent header if tracing is enabled
+    if (!ctx.backend_traceparent.empty()) {
+        http_req += "traceparent: " + ctx.backend_traceparent + "\r\n";
+    }
+
+    http_req += "Connection: keep-alive\r\n\r\n" + ctx.forwarded_body;
+
+    log_proxy.info("[{}] Sending request to backend ({} bytes)",
+                  ctx.request_id, ctx.forwarded_body.size());
+
+    // Send request with broken pipe/connection reset handling
+    std::exception_ptr rethrow_exception;
+    try {
+        co_await bundle.out.write(http_req);
+        co_await bundle.out.flush();
+        co_return true;
+    } catch (...) {
+        auto err_type = classify_connection_error(std::current_exception());
+        if (err_type != ConnectionErrorType::NONE) {
+            log_proxy.warn("[{}] Backend write failed: {} - closing connection",
+                           ctx.request_id, connection_error_to_string(err_type));
+            bundle.is_valid = false;
+            _circuit_breaker.record_failure(ctx.current_backend);
+            metrics().record_connection_error();
+            ctx.connection_error = true;
+            co_return false;
+        }
+        // Non-connection error - rethrow
+        throw;
+    }
+}
+
+// Stream response from backend to client
+future<> HttpController::stream_backend_response(
+    ProxyContext& ctx,
+    ConnectionBundle& bundle,
+    output_stream<char>& client_out) {
+
+    StreamParser parser;
+    size_t chunks_received = 0;
+    std::exception_ptr rethrow_exception;
+
+    while (true) {
+        // Check request timeout before each read
+        if (lowres_clock::now() >= ctx.request_deadline) {
+            log_proxy.warn("[{}] Request timeout after {}s",
+                          ctx.request_id, ctx.request_timeout.count());
+            ctx.timed_out = true;
+            bundle.is_valid = false;
+            break;
+        }
+
+        // Read with per-chunk timeout (use remaining time, capped at 30s per read)
+        auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+            ctx.request_deadline - lowres_clock::now());
+        auto read_timeout = std::min(remaining, std::chrono::seconds(30));
+        auto read_deadline = lowres_clock::now() + read_timeout;
+
+        bool read_failed = false;
+        temporary_buffer<char> chunk;
+
+        try {
+            auto read_future = with_timeout(read_deadline, bundle.in.read());
+            chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
+                // Check for connection errors first
+                auto err_type = classify_connection_error(ep);
+                if (err_type != ConnectionErrorType::NONE) {
+                    log_proxy.warn("[{}] Backend read failed: {}",
+                                   ctx.request_id, connection_error_to_string(err_type));
+                    ctx.connection_error = true;
+                } else {
+                    log_proxy.warn("[{}] Read timeout waiting for backend response", ctx.request_id);
+                }
+                read_failed = true;
+                return temporary_buffer<char>{}; // Return empty buffer
+            });
+        } catch (...) {
+            // Catch any exceptions that weren't handled by handle_exception
+            auto err_type = classify_connection_error(std::current_exception());
+            if (err_type != ConnectionErrorType::NONE) {
+                log_proxy.warn("[{}] Backend read failed: {}",
+                               ctx.request_id, connection_error_to_string(err_type));
+                ctx.connection_error = true;
+                read_failed = true;
+                bundle.is_valid = false;
+            } else {
+                // Non-connection error - save for rethrow after cleanup
+                rethrow_exception = std::current_exception();
+            }
+        }
+
+        // Handle non-connection errors outside catch block
+        if (rethrow_exception) {
+            ctx.stream_closed = true;
+            std::rethrow_exception(rethrow_exception);
+        }
+
+        if (read_failed) {
+            if (ctx.connection_error) {
+                _circuit_breaker.record_failure(ctx.current_backend);
+            } else {
+                ctx.timed_out = true;
+                bundle.is_valid = false;
+            }
+            break;
+        }
+
+        // EOF logic
+        if (chunk.empty()) {
+            log_proxy.info("[{}] Backend response complete (EOF after {} chunks)",
+                          ctx.request_id, chunks_received);
+            bundle.is_valid = false;
+            break;
+        }
+        chunks_received++;
+        log_proxy.debug("[{}] Received chunk #{} ({} bytes)",
+                       ctx.request_id, chunks_received, chunk.size());
+
+        auto res = parser.push(std::move(chunk));
+
+        // Check for parsing errors (malformed chunked encoding, size limits, etc.)
+        if (res.has_error) {
+            log_proxy.warn("[{}] Stream parsing error: {}", ctx.request_id, res.error_message);
+            bundle.is_valid = false;
+            metrics().record_failure();
+            co_await write_client_error(client_out,
+                sstring("Backend response parsing error: ") + sstring(res.error_message));
+            break;
+        }
+
+        // Snooping Logic - record success and learn route
+        if (res.header_snoop_success) {
+            // Backend responded successfully - record for circuit breaker
+            _circuit_breaker.record_success(ctx.current_backend);
+
+            // Record response latency (time to first byte)
+            if (!ctx.response_latency_recorded) {
+                auto response_time = std::chrono::steady_clock::now();
+                auto first_byte_latency = MetricsService::to_seconds(response_time - ctx.connect_start);
+                // Record in legacy histogram
+                metrics().record_response_latency(first_byte_latency);
+                // Record in per-backend histogram for GPU model comparison
+                metrics().record_first_byte_latency_by_id(ctx.current_backend, first_byte_latency);
+                ctx.response_latency_recorded = true;
+                log_proxy.info("[{}] First byte received from backend {} (latency: {:.3f}s)",
+                                ctx.request_id, ctx.current_backend, first_byte_latency);
+            }
+
+            // Learn route in the ART for future prefix matching
+            if (_config.should_learn_routes() && ctx.tokens.size() >= _config.min_token_length) {
+                // Route learning is best-effort; don't fail the request if it fails
+                (void)_router.learn_route_global(ctx.tokens, ctx.current_backend, ctx.request_id)
+                    .handle_exception([request_id = ctx.request_id](auto) {
+                        log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
+                    });
+
+                // Queue route for async persistence (fire-and-forget, non-blocking)
+                if (_persistence) {
+                    _persistence->queue_save_route(ctx.tokens, ctx.current_backend);
+                }
+            }
+        }
+
+        // Write to client with broken pipe handling
+        if (!res.data.empty()) {
+            try {
+                co_await client_out.write(res.data);
+                co_await client_out.flush();
+            } catch (...) {
+                auto err_type = classify_connection_error(std::current_exception());
+                if (err_type != ConnectionErrorType::NONE) {
+                    log_proxy.warn("[{}] Client write failed: {} - client disconnected",
+                                   ctx.request_id, connection_error_to_string(err_type));
+                    bundle.is_valid = false;
+                    ctx.client_disconnected = true;
+                    break;
+                }
+                // Non-connection error - save for rethrow after cleanup
+                rethrow_exception = std::current_exception();
+            }
+
+            if (rethrow_exception) {
+                ctx.stream_closed = true;
+                std::rethrow_exception(rethrow_exception);
+            }
+        }
+
+        if (res.done) {
+            log_proxy.debug("[{}] Stream complete", ctx.request_id);
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------
 // PROXY HANDLER
 // ---------------------------------------------------------
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
@@ -594,485 +929,141 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
+    // Initialize ProxyContext with all state needed for streaming
+    // This struct bundles request state to reduce lambda capture complexity
+    // Using unique_ptr: ownership transfers from handle_proxy to the lambda (no sharing)
+    auto ctx = std::make_unique<ProxyContext>();
+    ctx->request_id = request_id;
+    ctx->backend_traceparent = backend_traceparent;
+    ctx->routing_mode = routing_mode_str;
+    ctx->forwarded_body = std::move(forwarded_body);
+    ctx->tokens = std::move(tokens);
+    ctx->target_id = target_id;
+    ctx->target_addr = target_addr;
+    ctx->current_backend = target_id;
+    ctx->current_addr = target_addr;
+    ctx->request_start = request_start;
+    ctx->connect_timeout = connect_timeout;
+    ctx->request_timeout = request_timeout;
+    ctx->retry_config = retry_config;
+    ctx->fallback_enabled = fallback_enabled;
+    ctx->shard_metrics_active = shard_metrics_active;
+    ctx->request_deadline = lowres_clock::now() + request_timeout;
+
     // Move gate_holder and semaphore_units into the lambda to keep them alive during streaming.
     // This ensures the gate stays held and the semaphore slot is occupied until streaming completes.
-    rep->write_body("text/event-stream", [this, target_addr, forwarded_body, tokens, target_id, connect_timeout, request_timeout, retry_config, fallback_enabled, request_start, request_id, backend_traceparent, shard_metrics_active, gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
 
-        // Calculate request deadline
-        auto request_deadline = lowres_clock::now() + request_timeout;
+        // Phase 1: Establish backend connection with retry and fallback
+        ConnectionBundle bundle = co_await establish_backend_connection(*ctx);
 
-        // Track backend operation timing
-        auto connect_start = std::chrono::steady_clock::now();
-        bool response_latency_recorded = false;
-
-        ConnectionBundle bundle;
-        bool timed_out = false;
-        bool connection_failed = false;
-        bool client_disconnected = false;  // Track if client disconnected mid-stream
-        bool stream_closed = false;        // Track if client_out was already closed
-        BackendId current_backend = target_id;
-        socket_address current_addr = target_addr;
-
-        // 1. GET CONNECTION FROM POOL (with connect timeout, retry, and fallback)
-        uint32_t retry_attempt = 0;
-        auto current_backoff = retry_config.initial_backoff;
-        uint32_t fallback_attempts = 0;
-        const uint32_t max_fallback_attempts = 3;
-
-        while (retry_attempt <= retry_config.max_retries) {
-            // Check if we've exceeded overall request deadline
-            if (lowres_clock::now() >= request_deadline) {
-                log_proxy.warn("[{}] Request deadline exceeded during connection retry", request_id);
-                connection_failed = true;
-                _circuit_breaker.record_failure(current_backend);
-                break;
-            }
-
-            auto connect_deadline = lowres_clock::now() + connect_timeout;
-            auto conn_future = with_timeout(connect_deadline, _pool.get(current_addr, request_id));
-
-            bool this_attempt_failed = false;
-            bundle = co_await std::move(conn_future).handle_exception([&](auto ep) {
-                this_attempt_failed = true;
-                return ConnectionBundle{}; // Return empty bundle
-            });
-
-            if (!this_attempt_failed) {
-                // Connection successful - record connect latency
-                auto connect_end = std::chrono::steady_clock::now();
-                metrics().record_connect_latency(
-                    MetricsService::to_seconds(connect_end - connect_start));
-                connection_failed = false;
-                log_proxy.info("[{}] Connection established to backend {} at {}", request_id, current_backend, current_addr);
-                break;
-            }
-
-            // Record failure for circuit breaker
-            _circuit_breaker.record_failure(current_backend);
-
-            // Try fallback to a different backend before retrying
-            if (fallback_enabled && fallback_attempts < max_fallback_attempts) {
-                auto fallback = get_fallback_backend(current_backend);
-                if (fallback.has_value()) {
-                    auto fallback_addr = _router.get_backend_address(fallback.value());
-                    if (fallback_addr.has_value()) {
-                        log_proxy.info("[{}] Falling back from backend {} to {}", request_id, current_backend, fallback.value());
-                        current_backend = fallback.value();
-                        current_addr = fallback_addr.value();
-                        fallback_attempts++;
-                        // Don't increment retry_attempt for fallback - this is a different backend
-                        continue;
-                    }
-                }
-            }
-
-            // No fallback available - check if we should retry same backend
-            if (retry_attempt < retry_config.max_retries) {
-                log_proxy.warn("[{}] Connection attempt {} failed, retrying in {}ms",
-                    request_id, retry_attempt + 1, current_backoff.count());
-
-                // Wait with exponential backoff before retry
-                co_await seastar::sleep(current_backoff);
-
-                // Increase backoff for next attempt (with cap)
-                auto next_backoff = std::chrono::milliseconds(
-                    static_cast<int64_t>(current_backoff.count() * retry_config.backoff_multiplier));
-                current_backoff = std::min(next_backoff, retry_config.max_backoff);
-            } else {
-                log_proxy.warn("[{}] Connection failed after {} retries and {} fallbacks",
-                    request_id, retry_config.max_retries + 1, fallback_attempts);
-                connection_failed = true;
-            }
-
-            retry_attempt++;
-        }
-
-        if (connection_failed) {
-            log_proxy.error("[{}] Backend connection failed after retries", request_id);
+        if (ctx->connection_failed) {
+            log_proxy.error("[{}] Backend connection failed after retries", ctx->request_id);
             metrics().record_failure();
             metrics().decrement_active_requests();
-            if (shard_metrics_active && shard_load_metrics_initialized()) {
+            if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
-            sstring error_msg = "data: {\"error\": \"Backend connection failed after retries\"}\n\n";
-            try {
-                co_await client_out.write(error_msg);
-                co_await client_out.flush();
-            } catch (...) {
-                // Ignore write errors - client may have disconnected
-            }
+            co_await write_client_error(client_out, "Backend connection failed after retries");
             co_await client_out.close();
             co_return;
         }
 
-        // 2. SEND REQUEST (with timeout check)
-        if (lowres_clock::now() >= request_deadline) {
-            log_proxy.warn("[{}] Request timeout before sending", request_id);
-            metrics().record_timeout();
+        // Phase 2: Send HTTP request to backend
+        bool send_success = co_await send_backend_request(*ctx, bundle);
+
+        if (!send_success) {
+            // Handle timeout or connection error during send
+            if (ctx->timed_out) {
+                metrics().record_timeout();
+            } else {
+                metrics().record_failure();
+            }
             metrics().decrement_active_requests();
-            if (shard_metrics_active && shard_load_metrics_initialized()) {
+            if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
-            bundle.is_valid = false;
             co_await bundle.close();
-            sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
-            try {
-                co_await client_out.write(error_msg);
-                co_await client_out.flush();
-            } catch (...) {
-                // Ignore write errors - client may have disconnected
-            }
+            co_await write_client_error(client_out,
+                ctx->timed_out ? "Request timed out" : "Backend connection lost during request");
             co_await client_out.close();
             co_return;
         }
 
-        // Build HTTP request with tracing headers for backend
-        // - X-Request-ID: Ranvier's internal request correlation ID
-        // - traceparent: W3C Trace Context for distributed tracing
-        // Use forwarded_body which may include prompt_token_ids if token forwarding is enabled
-        sstring http_req =
-            "POST /v1/chat/completions HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: " + to_sstring(forwarded_body.size()) + "\r\n"
-            "X-Request-ID: " + request_id + "\r\n";
-
-        // Add traceparent header if tracing is enabled
-        if (!backend_traceparent.empty()) {
-            http_req += "traceparent: " + backend_traceparent + "\r\n";
-        }
-
-        http_req += "Connection: keep-alive\r\n\r\n" + forwarded_body;
-
-        log_proxy.info("[{}] Sending request to backend ({} bytes)", request_id, forwarded_body.size());
-
-        // Send request with broken pipe/connection reset handling
-        bool write_failed = false;
-        std::exception_ptr rethrow_exception;
+        // Phase 3: Stream response from backend to client
+        std::exception_ptr streaming_exception;
         try {
-            co_await bundle.out.write(http_req);
-            co_await bundle.out.flush();
+            co_await stream_backend_response(*ctx, bundle, client_out);
         } catch (...) {
-            auto err_type = classify_connection_error(std::current_exception());
-            if (err_type != ConnectionErrorType::NONE) {
-                log_proxy.warn("[{}] Backend write failed: {} - closing connection",
-                               request_id, connection_error_to_string(err_type));
-                write_failed = true;
-                bundle.is_valid = false;
-                _circuit_breaker.record_failure(current_backend);
-                metrics().record_connection_error();
-            } else {
-                // Capture exception for re-throw after cleanup
-                // (co_await not permitted in catch handlers)
-                rethrow_exception = std::current_exception();
-            }
+            // Capture exception - co_await not allowed in catch blocks
+            streaming_exception = std::current_exception();
         }
 
-        // Handle non-connection errors: cleanup and rethrow outside catch block
-        if (rethrow_exception) {
+        // Handle streaming exception outside catch block (co_await constraint)
+        if (streaming_exception) {
             metrics().record_failure();
             metrics().decrement_active_requests();
-            if (shard_metrics_active && shard_load_metrics_initialized()) {
+            if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
-            co_await bundle.close();
-            try { co_await client_out.close(); } catch (...) {}
-            stream_closed = true;
-            std::rethrow_exception(rethrow_exception);
-        }
-
-        if (write_failed) {
-            // Clean up and send error to client
-            metrics().record_failure();
-            metrics().decrement_active_requests();
-            if (shard_metrics_active && shard_load_metrics_initialized()) {
-                shard_load_metrics().decrement_active();
-            }
-            co_await bundle.close();
-            sstring error_msg = "data: {\"error\": \"Backend connection lost during request\"}\n\n";
             try {
-                co_await client_out.write(error_msg);
-                co_await client_out.flush();
-            } catch (...) {
-                // Ignore write errors - client may have disconnected
-            }
-            co_await client_out.close();
-            co_return;
-        }
-
-        // 3. The Read Loop (with timeout and connection error handling)
-        StreamParser parser;
-        bool connection_error = false;
-        size_t chunks_received = 0;
-        while (true) {
-            // Check request timeout before each read
-            if (lowres_clock::now() >= request_deadline) {
-                log_proxy.warn("[{}] Request timeout after {}s", request_id, request_timeout.count());
-                timed_out = true;
-                bundle.is_valid = false;
-                break;
-            }
-
-            // Read with per-chunk timeout (use remaining time, capped at 30s per read)
-            auto remaining = std::chrono::duration_cast<std::chrono::seconds>(request_deadline - lowres_clock::now());
-            auto read_timeout = std::min(remaining, std::chrono::seconds(30));
-            auto read_deadline = lowres_clock::now() + read_timeout;
-
-            bool read_failed = false;
-            temporary_buffer<char> chunk;
-            try {
-                auto read_future = with_timeout(read_deadline, bundle.in.read());
-                chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
-                    // Check for connection errors first
-                    auto err_type = classify_connection_error(ep);
-                    if (err_type != ConnectionErrorType::NONE) {
-                        log_proxy.warn("[{}] Backend read failed: {}",
-                                       request_id, connection_error_to_string(err_type));
-                        connection_error = true;
-                    } else {
-                        log_proxy.warn("[{}] Read timeout waiting for backend response", request_id);
-                    }
-                    read_failed = true;
-                    return temporary_buffer<char>{}; // Return empty buffer
-                });
-            } catch (...) {
-                // Catch any exceptions that weren't handled by handle_exception
-                auto err_type = classify_connection_error(std::current_exception());
-                if (err_type != ConnectionErrorType::NONE) {
-                    log_proxy.warn("[{}] Backend read failed: {}",
-                                   request_id, connection_error_to_string(err_type));
-                    connection_error = true;
-                    read_failed = true;
-                    bundle.is_valid = false;
-                } else {
-                    // Capture exception for re-throw after cleanup
-                    // (co_await not permitted in catch handlers)
-                    rethrow_exception = std::current_exception();
-                }
-            }
-
-            // Handle non-connection errors: cleanup and rethrow outside catch block
-            if (rethrow_exception) {
-                metrics().record_failure();
-                metrics().decrement_active_requests();
-                if (shard_metrics_active && shard_load_metrics_initialized()) {
-                    shard_load_metrics().decrement_active();
-                }
-                bundle.is_valid = false;
                 co_await bundle.close();
-                try { co_await client_out.close(); } catch (...) {}
-                stream_closed = true;
-                std::rethrow_exception(rethrow_exception);
-            }
-
-            if (read_failed) {
-                if (connection_error) {
-                    // bundle.is_valid already set to false in catch block above
-                    _circuit_breaker.record_failure(current_backend);
-                } else {
-                    timed_out = true;
-                    bundle.is_valid = false;
-                }
-                break;
-            }
-
-            // EOF logic
-            if (chunk.empty()) {
-                log_proxy.info("[{}] Backend response complete (EOF after {} chunks)", request_id, chunks_received);
-                bundle.is_valid = false;
-                break;
-            }
-            chunks_received++;
-            log_proxy.debug("[{}] Received chunk #{} ({} bytes)", request_id, chunks_received, chunk.size());
-
-            auto res = parser.push(std::move(chunk));
-
-            // Check for parsing errors (malformed chunked encoding, size limits, etc.)
-            if (res.has_error) {
-                log_proxy.warn("[{}] Stream parsing error: {}", request_id, res.error_message);
-                // Parsing error is non-recoverable; close connection and report error
-                bundle.is_valid = false;
-                metrics().record_failure();
-                sstring error_msg = "data: {\"error\": \"Backend response parsing error: " +
-                                    sstring(res.error_message) + "\"}\n\n";
-                try {
-                    co_await client_out.write(error_msg);
-                    co_await client_out.flush();
-                } catch (...) {
-                    // Client may have disconnected, ignore write errors
-                }
-                break;
-            }
-
-            // Snooping Logic - record success and learn route
-            if (res.header_snoop_success) {
-                // Backend responded successfully - record for circuit breaker
-                _circuit_breaker.record_success(current_backend);
-
-                // Record response latency (time to first byte)
-                if (!response_latency_recorded) {
-                    auto response_time = std::chrono::steady_clock::now();
-                    auto first_byte_latency = MetricsService::to_seconds(response_time - connect_start);
-                    // Record in legacy histogram
-                    metrics().record_response_latency(first_byte_latency);
-                    // Record in per-backend histogram for GPU model comparison
-                    metrics().record_first_byte_latency_by_id(current_backend, first_byte_latency);
-                    response_latency_recorded = true;
-                    log_proxy.info("[{}] First byte received from backend {} (latency: {:.3f}s)",
-                                    request_id, current_backend, first_byte_latency);
-                }
-
-                // Learn route in the ART for future prefix matching
-                // Learn routes only in PREFIX mode; skip for HASH and RANDOM modes
-                // The ART insert is idempotent - existing routes just get their timestamp updated
-                if (_config.should_learn_routes() && tokens.size() >= _config.min_token_length) {
-                    // Route learning is best-effort; don't fail the request if it fails
-                    (void)_router.learn_route_global(tokens, current_backend, request_id)
-                        .handle_exception([request_id](auto) {
-                            log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
-                        });
-
-                    // Queue route for async persistence (fire-and-forget, non-blocking)
-                    if (_persistence) {
-                        _persistence->queue_save_route(tokens, current_backend);
-                    }
-                }
-            }
-
-            // Write to client with broken pipe handling
-            bool client_write_error = false;
-            if (!res.data.empty()) {
-                try {
-                    co_await client_out.write(res.data);
-                    co_await client_out.flush();
-                } catch (...) {
-                    auto err_type = classify_connection_error(std::current_exception());
-                    if (err_type != ConnectionErrorType::NONE) {
-                        log_proxy.warn("[{}] Client write failed: {} - client disconnected",
-                                       request_id, connection_error_to_string(err_type));
-                        // Client disconnected, clean up backend connection and exit
-                        bundle.is_valid = false;
-                        client_disconnected = true;
-                        break;
-                    }
-                    // Capture exception for re-throw after cleanup
-                    // (co_await not permitted in catch handlers)
-                    rethrow_exception = std::current_exception();
-                }
-
-                // Handle non-connection errors: cleanup and rethrow outside catch block
-                if (rethrow_exception) {
-                    metrics().record_failure();
-                    metrics().decrement_active_requests();
-                    if (shard_metrics_active && shard_load_metrics_initialized()) {
-                        shard_load_metrics().decrement_active();
-                    }
-                    bundle.is_valid = false;
-                    stream_closed = true;
-                    co_await bundle.close();
-                    try { co_await client_out.close(); } catch (...) {}
-                    std::rethrow_exception(rethrow_exception);
-                }
-            }
-
-            if (res.done) {
-                log_proxy.debug("[{}] Stream complete", request_id);
-                break;
-            }
+            } catch (...) {}
+            try {
+                co_await client_out.close();
+            } catch (...) {}
+            std::rethrow_exception(streaming_exception);
         }
 
-        // Send error to client if needed (skip if client already disconnected)
-        if (client_disconnected) {
-            // Client disconnected mid-stream - don't count as success or failure
-            // The request was partially served; this is a client-side abort
-            log_proxy.info("[{}] Client disconnected mid-stream", request_id);
-        } else if (timed_out) {
-            // Record failure for circuit breaker on timeout
-            log_proxy.warn("[{}] Request timed out", request_id);
-            _circuit_breaker.record_failure(current_backend);
+        // Phase 4: Handle completion status and send appropriate client response
+        if (ctx->client_disconnected) {
+            log_proxy.info("[{}] Client disconnected mid-stream", ctx->request_id);
+        } else if (ctx->timed_out) {
+            log_proxy.warn("[{}] Request timed out", ctx->request_id);
+            _circuit_breaker.record_failure(ctx->current_backend);
             metrics().record_timeout();
-            sstring error_msg = "data: {\"error\": \"Request timed out\"}\n\n";
-            try {
-                co_await client_out.write(error_msg);
-                co_await client_out.flush();
-            } catch (...) {
-                // Client may have disconnected, ignore write errors
-                auto err_type = classify_connection_error(std::current_exception());
-                if (err_type == ConnectionErrorType::NONE) {
-                    log_proxy.debug("[{}] Failed to send timeout error to client", request_id);
-                }
-            }
-        } else if (connection_error) {
-            // Backend connection was lost unexpectedly
-            log_proxy.warn("[{}] Backend connection error occurred", request_id);
+            co_await write_client_error(client_out, "Request timed out");
+        } else if (ctx->connection_error) {
+            log_proxy.warn("[{}] Backend connection error occurred", ctx->request_id);
             metrics().record_connection_error();
-            sstring error_msg = "data: {\"error\": \"Backend connection lost\"}\n\n";
-            try {
-                co_await client_out.write(error_msg);
-                co_await client_out.flush();
-            } catch (...) {
-                // Client may have disconnected, ignore write errors
-                auto err_type = classify_connection_error(std::current_exception());
-                if (err_type == ConnectionErrorType::NONE) {
-                    log_proxy.debug("[{}] Failed to send error to client", request_id);
-                }
-            }
-        } else if (!connection_failed) {
-            // Request completed successfully
-            log_proxy.info("[{}] Request completed successfully", request_id);
+            co_await write_client_error(client_out, "Backend connection lost");
+        } else if (!ctx->connection_failed) {
+            log_proxy.info("[{}] Request completed successfully", ctx->request_id);
             metrics().record_success();
         }
 
-        // Record backend total latency (from connection start to completion)
-        if (!connection_failed && !connection_error) {
-            auto backend_end = std::chrono::steady_clock::now();
-            auto backend_latency = MetricsService::to_seconds(backend_end - connect_start);
-            // Record in legacy histogram
-            metrics().record_backend_total_latency(backend_latency);
-            // Record in per-backend histogram for GPU model comparison (e.g., H100 vs A100)
-            metrics().record_backend_latency_by_id(current_backend, backend_latency);
-        }
+        // Phase 5: Record metrics and cleanup
+        auto backend_end = std::chrono::steady_clock::now();
+        record_proxy_completion_metrics(*ctx, backend_end);
 
-        // 4. CLEANUP - Always ensure proper resource recovery
-        // For failed connections, explicitly close the bundle instead of pooling
-        if (connection_failed || connection_error || timed_out || !bundle.is_valid) {
-            // Don't return broken connections to the pool
+        // Return connection to pool or close it
+        if (ctx->connection_failed || ctx->connection_error || ctx->timed_out || !bundle.is_valid) {
             bundle.is_valid = false;
             try {
                 co_await bundle.close();
             } catch (...) {
-                log_proxy.trace("[{}] Error closing backend connection", request_id);
+                log_proxy.trace("[{}] Error closing backend connection", ctx->request_id);
             }
         } else {
-            // Return healthy connection to pool
             try {
-                _pool.put(std::move(bundle), request_id);
+                _pool.put(std::move(bundle), ctx->request_id);
             } catch (...) {
-                log_proxy.trace("[{}] Error returning connection to pool", request_id);
+                log_proxy.trace("[{}] Error returning connection to pool", ctx->request_id);
             }
         }
 
-        // Close client output stream (skip if already closed in exception path)
-        if (!stream_closed) {
+        // Close client output stream
+        if (!ctx->stream_closed) {
             try {
                 co_await client_out.close();
             } catch (...) {
-                // Ignore errors closing client connection
-                log_proxy.trace("[{}] Error closing client output stream", request_id);
+                log_proxy.trace("[{}] Error closing client output stream", ctx->request_id);
             }
         }
 
-        // Record total request duration (end-to-end from ingress to completion)
-        auto request_end = std::chrono::steady_clock::now();
-        auto total_latency = MetricsService::to_seconds(request_end - request_start);
-        // Record in legacy histogram
-        metrics().record_request_latency(total_latency);
-        // Record in new advanced histogram with optimized buckets
-        metrics().record_router_total_latency(total_latency);
-
         // Decrement active request counters
         metrics().decrement_active_requests();
-        if (shard_metrics_active && shard_load_metrics_initialized()) {
+        if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
             shard_load_metrics().decrement_active();
             shard_load_metrics().record_request_completed();
         }
