@@ -318,8 +318,12 @@ public:
     }
 
     // Cleanup expired, max-age, and half-open connections (call periodically)
+    // Rule #4: Erase empty map entries to prevent unbounded map growth
     size_t cleanup_expired() {
         size_t closed = 0;
+        // Collect empty pools to erase after iteration (can't erase during range-for)
+        std::vector<seastar::socket_address> empty_pools;
+
         for (auto& [addr, pool] : _pools) {
             auto it = pool.begin();
             while (it != pool.end()) {
@@ -357,7 +361,19 @@ public:
                     ++it;
                 }
             }
+
+            // Track empty pools for removal (Rule #4: cleanup map entries)
+            if (pool.empty()) {
+                empty_pools.push_back(addr);
+            }
         }
+
+        // Erase empty map entries to prevent unbounded growth (Rule #4)
+        for (const auto& addr : empty_pools) {
+            _pools.erase(addr);
+            log_pool.trace("Removed empty pool entry for {}", addr);
+        }
+
         return closed;
     }
 

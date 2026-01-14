@@ -481,7 +481,11 @@ inline void init_metrics() {
 }
 
 // Get the metrics instance for this shard
+// Rule #3: Null-guard all pointer accessors - lazy initialization ensures never null
 inline MetricsService& metrics() {
+    if (!g_metrics) {
+        g_metrics = new MetricsService();
+    }
     return *g_metrics;
 }
 
