@@ -13,7 +13,7 @@ I have written code for: <INSERT_TASK_NAME>
 
 ## SELF-REVIEW (before commit)
 
-Run through each of the 12 Hard Rules. For each rule, provide one of:
+Run through each of the 14 Hard Rules. For each rule, provide one of:
 - `[N/A]` - Not applicable to this change
 - `[OK]` - Compliant because: [brief reason]
 - `[FIX]` - Violation found at [file:line]: [description]
@@ -36,6 +36,8 @@ Run through each of the 12 Hard Rules. For each rule, provide one of:
 | 9 | Every catch block logs at warn+ | | |
 | 10 | String-to-number uses `std::from_chars` | | |
 | 11 | Global state uses `call_once`/`atomic` | | |
+| 12 | Use Seastar file I/O (no `std::ifstream`) | | |
+| 13 | Thread-local raw new has destroy function | | |
 
 ---
 
