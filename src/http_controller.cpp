@@ -990,18 +990,28 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
 
         // Phase 3: Stream response from backend to client
+        std::exception_ptr streaming_exception;
         try {
             co_await stream_backend_response(*ctx, bundle, client_out);
         } catch (...) {
-            // Exception during streaming - cleanup already handled in helper
+            // Capture exception - co_await not allowed in catch blocks
+            streaming_exception = std::current_exception();
+        }
+
+        // Handle streaming exception outside catch block (co_await constraint)
+        if (streaming_exception) {
             metrics().record_failure();
             metrics().decrement_active_requests();
             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
-            co_await bundle.close();
-            try { co_await client_out.close(); } catch (...) {}
-            throw;
+            try {
+                co_await bundle.close();
+            } catch (...) {}
+            try {
+                co_await client_out.close();
+            } catch (...) {}
+            std::rethrow_exception(streaming_exception);
         }
 
         // Phase 4: Handle completion status and send appropriate client response
