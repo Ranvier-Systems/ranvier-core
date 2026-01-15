@@ -21,6 +21,10 @@
 
 #include <yaml-cpp/yaml.h>
 
+// Seastar headers for async file loading (hot-reload path only)
+#include <seastar/core/future.hh>
+#include <seastar/core/thread.hh>
+
 namespace ranvier {
 
 // Server configuration (HTTP API and Prometheus)
@@ -390,8 +394,13 @@ struct RanvierConfig {
     TelemetryConfig telemetry;
     LoadBalancingConfig load_balancing;
 
-    // Load configuration from YAML file
+    // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);
+
+    // Load configuration asynchronously (non-blocking - for hot-reload path)
+    // Wraps load() in seastar::async() to offload blocking I/O to thread pool.
+    // This is the ONLY safe way to reload config after the Seastar reactor starts.
+    static seastar::future<RanvierConfig> load_async(const std::string& config_path);
 
     // Load with defaults (no file)
     static RanvierConfig defaults();
@@ -799,6 +808,15 @@ inline RanvierConfig RanvierConfig::defaults() {
     RanvierConfig config;
     config.apply_env_overrides();
     return config;
+}
+
+inline seastar::future<RanvierConfig> RanvierConfig::load_async(const std::string& config_path) {
+    // Offload blocking std::ifstream I/O to Seastar's thread pool.
+    // This prevents stalling the reactor thread during hot-reload.
+    // The lambda captures config_path by value to ensure lifetime safety.
+    return seastar::async([path = config_path] {
+        return RanvierConfig::load(path);
+    });
 }
 
 inline RanvierConfig RanvierConfig::load(const std::string& config_path) {

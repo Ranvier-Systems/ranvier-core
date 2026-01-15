@@ -957,58 +957,69 @@ seastar::future<> Application::shutdown() {
 // =============================================================================
 
 seastar::future<> Application::reload_config() {
+    // Rate limiting: reject reload if last reload was < 10 seconds ago
+    static constexpr auto RELOAD_COOLDOWN = std::chrono::seconds(10);
+
+    auto now = std::chrono::steady_clock::now();
+    if (_last_reload_time.time_since_epoch().count() > 0) {
+        auto elapsed = now - _last_reload_time;
+        if (elapsed < RELOAD_COOLDOWN) {
+            auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                RELOAD_COOLDOWN - elapsed).count();
+            log_main.warn("Config reload rate-limited: {} seconds remaining before next reload allowed",
+                          remaining);
+            return seastar::make_ready_future<>();
+        }
+    }
+
     log_main.info("Reloading configuration from {}", _config_path);
 
-    // Load and validate new configuration synchronously
-    // This happens before any state is modified, so failures are safe
-    RanvierConfig new_config;
-    try {
-        new_config = RanvierConfig::load(_config_path);
-    } catch (const std::exception& e) {
-        log_main.error("Config reload failed - could not load file: {}", e.what());
-        return seastar::make_ready_future<>();
-    }
+    // Load configuration asynchronously to avoid blocking the reactor.
+    // RanvierConfig::load_async() wraps the blocking std::ifstream I/O in seastar::async(),
+    // offloading file reads to the Seastar thread pool.
+    return RanvierConfig::load_async(_config_path).then([this, now](RanvierConfig new_config) {
+        // Validate the new configuration
+        auto validation_error = RanvierConfig::validate(new_config);
+        if (validation_error) {
+            log_main.error("Config reload failed - validation error: {}", *validation_error);
+            return seastar::make_ready_future<>();
+        }
 
-    // Validate the new configuration
-    auto validation_error = RanvierConfig::validate(new_config);
-    if (validation_error) {
-        log_main.error("Config reload failed - validation error: {}", *validation_error);
-        return seastar::make_ready_future<>();
-    }
+        // Log warnings for settings that cannot be hot-reloaded
+        log_non_reloadable_changes(new_config);
 
-    // Log warnings for settings that cannot be hot-reloaded
-    log_non_reloadable_changes(new_config);
+        // Use shared_ptr to avoid copying config N times for N shards
+        auto config_ptr = std::make_shared<RanvierConfig>(std::move(new_config));
 
-    // Use shared_ptr to avoid copying config N times for N shards
-    auto config_ptr = std::make_shared<RanvierConfig>(std::move(new_config));
+        // Step 1: Update the sharded config across all cores using invoke_on_all
+        // This ensures each shard has the updated configuration for lock-free access
+        return _sharded_config.invoke_on_all([config_ptr](ShardedConfig& cfg) {
+            cfg.update(*config_ptr);
+        }).then([this, config_ptr] {
+            log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
 
-    // Step 1: Update the sharded config across all cores using invoke_on_all
-    // This ensures each shard has the updated configuration for lock-free access
-    return _sharded_config.invoke_on_all([config_ptr](ShardedConfig& cfg) {
-        cfg.update(*config_ptr);
-    }).then([this, config_ptr] {
-        log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
+            // Step 2: Build updated controller config from the new config
+            auto ctrl_config = build_controller_config_from(*config_ptr);
 
-        // Step 2: Build updated controller config from the new config
-        auto ctrl_config = build_controller_config_from(*config_ptr);
-
-        // Step 3: Update HttpController config on all shards
-        return _controller.invoke_on_all([ctrl_config](HttpController& c) {
-            c.update_config(ctrl_config);
+            // Step 3: Update HttpController config on all shards
+            return _controller.invoke_on_all([ctrl_config](HttpController& c) {
+                c.update_config(ctrl_config);
+            });
+        }).then([this, config_ptr] {
+            // Step 4: Update routing config on all shards via RouterService
+            return _router->update_routing_config(config_ptr->routing);
+        }).then([this, config_ptr, now] {
+            // Step 5: Only update master config after all shards succeeded
+            // This ensures consistency - if any step fails, master config is unchanged
+            _config = *config_ptr;
+            _last_reload_time = now;
+            log_main.info("Configuration reloaded successfully on all cores");
         });
-    }).then([this, config_ptr] {
-        // Step 4: Update routing config on all shards via RouterService
-        return _router->update_routing_config(config_ptr->routing);
-    }).then([this, config_ptr] {
-        // Step 5: Only update master config after all shards succeeded
-        // This ensures consistency - if any step fails, master config is unchanged
-        _config = *config_ptr;
-        log_main.info("Configuration reloaded successfully on all cores");
     }).handle_exception([](auto ep) {
         try {
             std::rethrow_exception(ep);
         } catch (const std::exception& e) {
-            log_main.error("Config reload failed during propagation: {}", e.what());
+            log_main.error("Config reload failed: {}", e.what());
         }
         // Don't re-throw - config reload failure shouldn't crash the server
     });
