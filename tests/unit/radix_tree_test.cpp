@@ -2285,14 +2285,15 @@ TEST_F(RadixTreeCompactionTest, CompactPreservesActiveRoutes) {
     tree.insert(tokens({4, 5, 6}), 200);
     tree.insert(tokens({7, 8, 9}), 300);
 
-    // Access one route to mark it as newer
+    // Wait, then capture cutoff BEFORE accessing the route we want to keep
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    tree.lookup(tokens({1, 2, 3}));
-
     auto middle = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    // Evict older routes
+    // Access one route to mark it as newer (timestamp now > middle)
+    tree.lookup(tokens({1, 2, 3}));
+
+    // Evict older routes (those not accessed after middle)
     tree.remove_expired(middle);
 
     // Compact
