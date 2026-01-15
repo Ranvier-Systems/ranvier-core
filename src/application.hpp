@@ -153,6 +153,9 @@ private:
     // Shutdown timing for metrics/debugging
     std::chrono::steady_clock::time_point _shutdown_start_time;
 
+    // Rate limiting for config hot-reload (prevents reload storms from rapid SIGHUPs)
+    std::chrono::steady_clock::time_point _last_reload_time;
+
     // --- Services (owned by Application) ---
 
     // Infrastructure layer

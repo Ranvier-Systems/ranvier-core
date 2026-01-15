@@ -390,7 +390,7 @@ struct RanvierConfig {
     TelemetryConfig telemetry;
     LoadBalancingConfig load_balancing;
 
-    // Load configuration from YAML file
+    // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);
 
     // Load with defaults (no file)
