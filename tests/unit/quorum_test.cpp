@@ -603,6 +603,201 @@ TEST_F(QuorumTest, SequenceWindow_ReplayAttackPrevention) {
     EXPECT_FALSE(window.is_duplicate(52));
 }
 
+// =============================================================================
+// Fail-Open Mode Tests
+// =============================================================================
+// Fail-open mode enables random routing to healthy backends during split-brain.
+// This is useful for inference workloads that prioritize availability over
+// strict routing consistency.
+
+// Simulates GossipService::is_fail_open_mode() logic
+bool is_fail_open_mode(bool quorum_enabled, bool fail_open_on_quorum_loss, QuorumState state) {
+    return quorum_enabled && fail_open_on_quorum_loss && (state == QuorumState::DEGRADED);
+}
+
+// Simulates routing decision: should we use random routing?
+// Returns: "random" for fail-open, "prefix" for normal routing
+std::string get_routing_mode(bool quorum_enabled, bool fail_open_on_quorum_loss,
+                               QuorumState state, std::string normal_mode) {
+    if (is_fail_open_mode(quorum_enabled, fail_open_on_quorum_loss, state)) {
+        return "random";
+    }
+    return normal_mode;
+}
+
+// Simulates incoming gossip acceptance logic
+// Returns: true if gossip should be accepted, false if rejected
+bool should_accept_incoming_gossip(bool quorum_enabled, bool reject_routes_on_quorum_loss,
+                                     bool accept_gossip_on_quorum_loss, QuorumState state) {
+    if (!quorum_enabled) {
+        return true;  // Quorum disabled, always accept
+    }
+    if (state == QuorumState::HEALTHY) {
+        return true;  // Healthy cluster, always accept
+    }
+    // DEGRADED state
+    if (accept_gossip_on_quorum_loss) {
+        return true;  // Fail-open: stale data > no data
+    }
+    if (reject_routes_on_quorum_loss) {
+        return false;  // Fail-closed: reject stale gossip
+    }
+    return true;  // Neither flag set, default accept
+}
+
+// Simulates outbound route broadcast logic
+// Returns: true if broadcast should proceed, false if rejected
+bool should_broadcast_route(bool quorum_enabled, bool reject_routes_on_quorum_loss,
+                              bool fail_open_on_quorum_loss, QuorumState state) {
+    if (!quorum_enabled) {
+        return true;  // Quorum disabled, always broadcast
+    }
+    if (state == QuorumState::HEALTHY) {
+        return true;  // Healthy cluster, always broadcast
+    }
+    // DEGRADED state
+    if (fail_open_on_quorum_loss) {
+        return true;  // Fail-open: allow broadcast despite quorum loss
+    }
+    if (reject_routes_on_quorum_loss) {
+        return false;  // Fail-closed: reject broadcast
+    }
+    return true;  // Neither flag set, default allow
+}
+
+TEST_F(QuorumTest, FailOpenMode_DisabledByDefault) {
+    // Default: fail_open_on_quorum_loss = false
+    // Even when degraded, fail-open mode is not active
+    EXPECT_FALSE(is_fail_open_mode(true, false, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, FailOpenMode_EnabledWhenDegraded) {
+    // fail_open_on_quorum_loss = true, state = DEGRADED
+    // Fail-open mode should be active
+    EXPECT_TRUE(is_fail_open_mode(true, true, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, FailOpenMode_NotActiveWhenHealthy) {
+    // Even with fail_open_on_quorum_loss = true, healthy cluster doesn't trigger fail-open
+    EXPECT_FALSE(is_fail_open_mode(true, true, QuorumState::HEALTHY));
+}
+
+TEST_F(QuorumTest, FailOpenMode_NotActiveWhenQuorumDisabled) {
+    // quorum_enabled = false means no fail-open check
+    EXPECT_FALSE(is_fail_open_mode(false, true, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, RoutingMode_NormalWhenHealthy) {
+    // Healthy cluster uses normal routing mode
+    EXPECT_EQ(get_routing_mode(true, true, QuorumState::HEALTHY, "prefix"), "prefix");
+    EXPECT_EQ(get_routing_mode(true, true, QuorumState::HEALTHY, "hash"), "hash");
+}
+
+TEST_F(QuorumTest, RoutingMode_RandomWhenFailOpen) {
+    // Degraded cluster with fail-open uses random routing
+    EXPECT_EQ(get_routing_mode(true, true, QuorumState::DEGRADED, "prefix"), "random");
+    EXPECT_EQ(get_routing_mode(true, true, QuorumState::DEGRADED, "hash"), "random");
+}
+
+TEST_F(QuorumTest, RoutingMode_NormalWhenFailOpenDisabled) {
+    // Degraded cluster without fail-open keeps normal routing
+    // (request handling happens elsewhere, this just shows routing decision)
+    EXPECT_EQ(get_routing_mode(true, false, QuorumState::DEGRADED, "prefix"), "prefix");
+}
+
+TEST_F(QuorumTest, IncomingGossip_AcceptedWhenHealthy) {
+    // Healthy cluster always accepts incoming gossip
+    EXPECT_TRUE(should_accept_incoming_gossip(true, true, false, QuorumState::HEALTHY));
+}
+
+TEST_F(QuorumTest, IncomingGossip_RejectedWhenDegraded_FailClosed) {
+    // Degraded + reject_routes_on_quorum_loss = true + accept_gossip_on_quorum_loss = false
+    // Should reject incoming gossip
+    EXPECT_FALSE(should_accept_incoming_gossip(true, true, false, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, IncomingGossip_AcceptedWhenDegraded_FailOpen) {
+    // Degraded + accept_gossip_on_quorum_loss = true
+    // Should accept incoming gossip (stale data > no data)
+    EXPECT_TRUE(should_accept_incoming_gossip(true, true, true, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, IncomingGossip_AcceptedWhenQuorumDisabled) {
+    // quorum_enabled = false means always accept
+    EXPECT_TRUE(should_accept_incoming_gossip(false, true, false, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, BroadcastRoute_AllowedWhenHealthy) {
+    // Healthy cluster always allows route broadcast
+    EXPECT_TRUE(should_broadcast_route(true, true, false, QuorumState::HEALTHY));
+}
+
+TEST_F(QuorumTest, BroadcastRoute_RejectedWhenDegraded_FailClosed) {
+    // Degraded + reject_routes_on_quorum_loss = true + fail_open_on_quorum_loss = false
+    // Should reject route broadcast
+    EXPECT_FALSE(should_broadcast_route(true, true, false, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, BroadcastRoute_AllowedWhenDegraded_FailOpen) {
+    // Degraded + fail_open_on_quorum_loss = true
+    // Should allow route broadcast
+    EXPECT_TRUE(should_broadcast_route(true, true, true, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, BroadcastRoute_AllowedWhenQuorumDisabled) {
+    // quorum_enabled = false means always allow
+    EXPECT_TRUE(should_broadcast_route(false, true, false, QuorumState::DEGRADED));
+}
+
+TEST_F(QuorumTest, FailOpenMode_ConfigCombinations) {
+    // Test all config flag combinations for completeness
+
+    // Matrix: quorum_enabled × fail_open_on_quorum_loss × state
+    // quorum_enabled=false always returns false (no fail-open)
+    EXPECT_FALSE(is_fail_open_mode(false, false, QuorumState::HEALTHY));
+    EXPECT_FALSE(is_fail_open_mode(false, false, QuorumState::DEGRADED));
+    EXPECT_FALSE(is_fail_open_mode(false, true, QuorumState::HEALTHY));
+    EXPECT_FALSE(is_fail_open_mode(false, true, QuorumState::DEGRADED));
+
+    // quorum_enabled=true, fail_open_on_quorum_loss=false always returns false
+    EXPECT_FALSE(is_fail_open_mode(true, false, QuorumState::HEALTHY));
+    EXPECT_FALSE(is_fail_open_mode(true, false, QuorumState::DEGRADED));
+
+    // quorum_enabled=true, fail_open_on_quorum_loss=true depends on state
+    EXPECT_FALSE(is_fail_open_mode(true, true, QuorumState::HEALTHY));  // Healthy = no fail-open
+    EXPECT_TRUE(is_fail_open_mode(true, true, QuorumState::DEGRADED));  // Degraded = fail-open
+}
+
+TEST_F(QuorumTest, FailOpen_IndependentFlags) {
+    // Verify fail_open_on_quorum_loss and accept_gossip_on_quorum_loss are independent
+
+    // Scenario 1: fail-open routing but reject gossip
+    // (serve traffic but don't accept potentially stale routes)
+    bool fail_open_routing = is_fail_open_mode(true, true, QuorumState::DEGRADED);
+    bool accept_gossip = should_accept_incoming_gossip(true, true, false, QuorumState::DEGRADED);
+    EXPECT_TRUE(fail_open_routing);
+    EXPECT_FALSE(accept_gossip);
+
+    // Scenario 2: fail-closed routing but accept gossip
+    // (don't serve traffic but keep collecting routing info for recovery)
+    fail_open_routing = is_fail_open_mode(true, false, QuorumState::DEGRADED);
+    accept_gossip = should_accept_incoming_gossip(true, false, true, QuorumState::DEGRADED);
+    EXPECT_FALSE(fail_open_routing);
+    EXPECT_TRUE(accept_gossip);
+
+    // Scenario 3: full fail-open (both enabled)
+    fail_open_routing = is_fail_open_mode(true, true, QuorumState::DEGRADED);
+    accept_gossip = should_accept_incoming_gossip(true, true, true, QuorumState::DEGRADED);
+    EXPECT_TRUE(fail_open_routing);
+    EXPECT_TRUE(accept_gossip);
+
+    // Scenario 4: full fail-closed (both disabled, default)
+    fail_open_routing = is_fail_open_mode(true, false, QuorumState::DEGRADED);
+    accept_gossip = should_accept_incoming_gossip(true, true, false, QuorumState::DEGRADED);
+    EXPECT_FALSE(fail_open_routing);
+    EXPECT_FALSE(accept_gossip);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
