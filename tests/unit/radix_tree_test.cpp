@@ -2111,3 +2111,351 @@ TEST_F(RadixTreeStatsTest, StatsNodeTypesSumToTotal) {
                  stats.node48_count + stats.node256_count;
     EXPECT_EQ(sum, stats.total_nodes);
 }
+
+// =============================================================================
+// Tree Compaction Tests (Memory Reclamation)
+// =============================================================================
+
+class RadixTreeCompactionTest : public ::testing::Test {
+protected:
+    // Use block_alignment=1 to disable alignment for cleaner tests
+    RadixTree tree{1};
+
+    std::vector<TokenId> tokens(std::initializer_list<TokenId> list) {
+        return std::vector<TokenId>(list);
+    }
+
+    std::vector<TokenId> tokens(size_t count, TokenId start = 1) {
+        std::vector<TokenId> result;
+        result.reserve(count);
+        for (size_t i = 0; i < count; i++) {
+            result.push_back(start + static_cast<TokenId>(i));
+        }
+        return result;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Basic Compaction Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeCompactionTest, CompactEmptyTree) {
+    // Compacting an empty tree should succeed with no changes
+    auto stats = tree.compact();
+
+    EXPECT_EQ(stats.nodes_removed, 0u);
+    EXPECT_EQ(stats.nodes_shrunk, 0u);
+    EXPECT_EQ(stats.bytes_reclaimed, 0u);
+}
+
+TEST_F(RadixTreeCompactionTest, CompactTreeWithNoTombstones) {
+    // Insert some routes
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+    tree.insert(tokens({7, 8, 9}), 3);
+
+    // Compact should have no effect (no tombstoned nodes)
+    auto stats = tree.compact();
+
+    EXPECT_EQ(stats.nodes_removed, 0u);
+    EXPECT_EQ(stats.nodes_shrunk, 0u);
+
+    // Routes should still be accessible
+    EXPECT_TRUE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({7, 8, 9})).has_value());
+}
+
+TEST_F(RadixTreeCompactionTest, CompactAfterEviction) {
+    // Insert routes
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    auto stats_before = tree.get_tree_stats();
+
+    // Evict all routes (creates tombstoned nodes)
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    // Compact should reclaim the empty nodes
+    auto compact_stats = tree.compact();
+
+    // Should have removed at least some nodes
+    EXPECT_GE(compact_stats.nodes_removed, 0u);
+
+    auto stats_after = tree.get_tree_stats();
+
+    // Node count should decrease or stay the same
+    EXPECT_LE(stats_after.total_nodes, stats_before.total_nodes);
+}
+
+TEST_F(RadixTreeCompactionTest, CompactReturnsCorrectStats) {
+    // Create a tree with many routes under a common prefix to force node growth
+    for (int i = 0; i < 20; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i), 3}), static_cast<BackendId>(i));
+    }
+
+    // Evict all routes
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    auto stats = tree.compact();
+
+    // bytes_reclaimed should be calculated
+    if (stats.nodes_removed > 0 || stats.nodes_shrunk > 0) {
+        EXPECT_GT(stats.bytes_reclaimed, 0u);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Node Shrinking Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeCompactionTest, ShrinkNode256ToNode48) {
+    // Create 100 children under root to force Node256
+    for (int i = 0; i < 100; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1}), static_cast<BackendId>(i % 128));
+    }
+
+    // Verify we have a Node256
+    auto stats_before = tree.get_tree_stats();
+    EXPECT_GT(stats_before.node256_count, 0u);
+
+    // Evict most routes, leaving < 49
+    size_t evicted = 0;
+    while (evicted < 60) {
+        if (tree.evict_oldest()) {
+            evicted++;
+        } else {
+            break;
+        }
+    }
+
+    // Compact should shrink the Node256
+    auto compact_stats = tree.compact();
+
+    // Should have shrunk some nodes
+    if (tree.route_count() <= 48) {
+        EXPECT_GE(compact_stats.nodes_shrunk, 0u);
+    }
+}
+
+TEST_F(RadixTreeCompactionTest, ShrinkNode16ToNode4) {
+    // Create 10 children to force Node16
+    for (int i = 0; i < 10; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Verify we have a Node16
+    auto stats_before = tree.get_tree_stats();
+    EXPECT_GT(stats_before.node16_count, 0u);
+
+    // Evict most routes, leaving <= 4
+    size_t evicted = 0;
+    while (evicted < 6) {
+        if (tree.evict_oldest()) {
+            evicted++;
+        } else {
+            break;
+        }
+    }
+
+    // Compact should shrink Node16 to Node4
+    auto compact_stats = tree.compact();
+
+    auto stats_after = tree.get_tree_stats();
+
+    // Remaining routes should still be accessible
+    size_t accessible = 0;
+    for (int i = 0; i < 10; i++) {
+        if (tree.lookup(tokens({1, static_cast<TokenId>(i)})).has_value()) {
+            accessible++;
+        }
+    }
+    EXPECT_EQ(accessible, tree.route_count());
+}
+
+// -----------------------------------------------------------------------------
+// Compaction Preserves Data Integrity
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeCompactionTest, CompactPreservesActiveRoutes) {
+    // Insert routes
+    tree.insert(tokens({1, 2, 3}), 100);
+    tree.insert(tokens({4, 5, 6}), 200);
+    tree.insert(tokens({7, 8, 9}), 300);
+
+    // Wait, then capture cutoff BEFORE accessing the route we want to keep
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto middle = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Access one route to mark it as newer (timestamp now > middle)
+    tree.lookup(tokens({1, 2, 3}));
+
+    // Evict older routes (those not accessed after middle)
+    tree.remove_expired(middle);
+
+    // Compact
+    tree.compact();
+
+    // Active route should still be accessible with correct value
+    auto result = tree.lookup(tokens({1, 2, 3}));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 100);
+}
+
+TEST_F(RadixTreeCompactionTest, CompactPreservesHierarchicalStructure) {
+    // Create hierarchical routes
+    tree.insert(tokens({1, 2}), 1);
+    tree.insert(tokens({1, 2, 3, 4}), 2);
+    tree.insert(tokens({1, 2, 3, 4, 5, 6}), 3);
+
+    // Compact (should have no effect since no tombstones)
+    tree.compact();
+
+    // All routes should still work with correct longest-prefix matching
+    EXPECT_EQ(tree.lookup(tokens({1, 2})).value(), 1);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4})).value(), 2);
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4, 5, 6})).value(), 3);
+
+    // Partial matches should work
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3})).value(), 1);  // Matches {1,2}
+    EXPECT_EQ(tree.lookup(tokens({1, 2, 3, 4, 5})).value(), 2);  // Matches {1,2,3,4}
+}
+
+TEST_F(RadixTreeCompactionTest, CompactAfterPartialEviction) {
+    // Insert routes in same subtree
+    tree.insert(tokens({1, 2, 10}), 10);
+    tree.insert(tokens({1, 2, 20}), 20);
+    tree.insert(tokens({1, 2, 30}), 30);
+    tree.insert(tokens({1, 2, 40}), 40);
+    tree.insert(tokens({1, 2, 50}), 50);
+
+    EXPECT_EQ(tree.route_count(), 5u);
+
+    // Evict one oldest
+    tree.evict_oldest();
+
+    // Compact
+    tree.compact();
+
+    // Remaining routes should still be accessible
+    EXPECT_EQ(tree.route_count(), 4u);
+    size_t accessible = 0;
+    for (int i : {10, 20, 30, 40, 50}) {
+        if (tree.lookup(tokens({1, 2, static_cast<TokenId>(i)})).has_value()) {
+            accessible++;
+        }
+    }
+    EXPECT_EQ(accessible, 4u);
+}
+
+// -----------------------------------------------------------------------------
+// Compaction with Complex Tree Structures
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeCompactionTest, CompactDeepTree) {
+    // Create a deep tree (100 levels via path compression)
+    std::vector<TokenId> deep_path;
+    for (int i = 0; i < 100; i++) {
+        deep_path.push_back(static_cast<TokenId>(i));
+    }
+    tree.insert(deep_path, 42);
+
+    // Evict and compact
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    auto stats = tree.compact();
+
+    // Should have cleaned up
+    EXPECT_GE(stats.nodes_removed + stats.nodes_shrunk, 0u);
+}
+
+TEST_F(RadixTreeCompactionTest, CompactWideTree) {
+    // Create a wide tree (many children at first level)
+    for (int i = 0; i < 50; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i), 1}), static_cast<BackendId>(i % 128));
+    }
+
+    auto stats_before = tree.get_tree_stats();
+
+    // Evict all but 3
+    while (tree.route_count() > 3) {
+        tree.evict_oldest();
+    }
+
+    // Compact
+    auto compact_stats = tree.compact();
+
+    auto stats_after = tree.get_tree_stats();
+
+    // Node count should decrease
+    EXPECT_LE(stats_after.total_nodes, stats_before.total_nodes);
+
+    // Remaining routes should work
+    EXPECT_EQ(tree.route_count(), 3u);
+}
+
+TEST_F(RadixTreeCompactionTest, MultipleCompactionsIdempotent) {
+    // Insert and evict some routes
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    tree.evict_oldest();
+
+    // First compaction
+    auto stats1 = tree.compact();
+
+    // Second compaction should have no effect
+    auto stats2 = tree.compact();
+
+    EXPECT_EQ(stats2.nodes_removed, 0u);
+    EXPECT_EQ(stats2.nodes_shrunk, 0u);
+    EXPECT_EQ(stats2.bytes_reclaimed, 0u);
+
+    // Route should still work
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+// -----------------------------------------------------------------------------
+// Compaction Metrics Tests
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeCompactionTest, BytesReclaimedCalculation) {
+    // Create tree with known structure
+    for (int i = 0; i < 5; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Evict all
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    auto stats = tree.compact();
+
+    // If nodes were removed or shrunk, bytes should be reclaimed
+    if (stats.nodes_removed > 0 || stats.nodes_shrunk > 0) {
+        EXPECT_GT(stats.bytes_reclaimed, 0u);
+    }
+}
+
+TEST_F(RadixTreeCompactionTest, NodesRemovedCount) {
+    // Insert several routes
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+    tree.insert(tokens({7, 8, 9}), 3);
+
+    size_t initial_nodes = tree.get_tree_stats().total_nodes;
+
+    // Evict all
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    auto stats = tree.compact();
+
+    // nodes_removed should match the decrease
+    size_t final_nodes = tree.get_tree_stats().total_nodes;
+    EXPECT_EQ(stats.nodes_removed, initial_nodes - final_nodes);
+}

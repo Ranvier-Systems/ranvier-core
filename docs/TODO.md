@@ -99,6 +99,12 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/node_slab.hpp`, `src/node_slab.cpp`, `src/router_service.cpp`
   _Complexity:_ High
 
+- [x] **Implement tree compaction to reclaim memory from tombstoned nodes** ✓
+  _Justification:_ Route eviction clears `leaf_value` but leaves tree structure intact, creating "tombstoned" nodes that waste slab allocator slots and fragment memory. Without compaction, memory usage grows monotonically even after route removal.
+  _Approach:_ Added `compact()` method to RadixTree with post-order traversal. Removes empty nodes (no leaf, no children) and shrinks oversized nodes (Node256→Node48 when children ≤48, etc.). Returns `CompactionStats` with nodes_removed, nodes_shrunk, and bytes_reclaimed. Uses bounded `keys_to_remove` vector per Rule #4. Documented in `docs/internals/radix-tree.md`.
+  _Location:_ `src/radix_tree.hpp:336-452`
+  _Complexity:_ Medium
+
 - [x] **Add memory usage metrics per Radix Tree** ✓
   _Justification:_ No visibility into per-shard memory consumption. Required for capacity planning and debugging memory leaks.
   _Approach:_ Added comprehensive radix tree performance metrics:
@@ -893,7 +899,8 @@ All issues discovered during comprehensive adversarial audit have been resolved.
 | **P2 - Medium** | Performance | Zero-copy StreamParser optimization | Medium | ✅ Done |
 | **P2 - Medium** | Reliability | CrossShardRequest size validation | Low | ✅ Done |
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
-| **P2 - Medium** | Performance | Node pooling for Radix Tree | High | |
+| **P2 - Medium** | Performance | Node pooling for Radix Tree | High | ✅ Done |
+| **P2 - Medium** | Performance | Tree compaction for memory reclamation | Medium | ✅ Done |
 | **P2 - Medium** | DX | Benchmark regression CI | Medium | |
 | **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
 | **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
@@ -917,6 +924,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-15 | **[Feature]** Implement tree compaction for NodeSlab memory reclamation (removes empty nodes, shrinks oversized nodes) | #155 |
 | 2026-01-15 | **[Feature]** Add fail-open mode for split-brain handling (random routing during quorum loss) | #156 |
 | 2026-01-14 | **[Security Audit 7.0.1]** Replace blocking std::ifstream with async Seastar I/O in K8s CA cert loading | #149 |
 | 2026-01-14 | **[Security Audit 7.0.2]** Add bounds checking to prevent OOM from unbounded containers (_per_backend_metrics, _circuits, _received_seq_sets) | #150 |
