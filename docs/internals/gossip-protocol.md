@@ -442,6 +442,63 @@ When quorum is restored:
 3. **Metric updated**: Gauge set to 1
 4. **Log emitted**: `INFO: QUORUM RESTORED: Cluster returning to HEALTHY mode`
 
+### Fail-Open Mode (Optional)
+
+By default, degraded clusters reject route operations (fail-closed). However, for scenarios where **availability is prioritized over consistency**, you can enable **fail-open mode** via `fail_open_on_quorum_loss: true`.
+
+```yaml
+cluster:
+  fail_open_on_quorum_loss: true  # Enable fail-open during split-brain
+```
+
+**Behavior with fail-open enabled:**
+
+| Operation | Default (fail-closed) | With fail_open_on_quorum_loss=true |
+|-----------|----------------------|-----------------------------------|
+| Outbound route writes | Rejected | Allowed (random routing to healthy backends) |
+| Incoming gossip routes | Rejected (ACKed but not applied) | Accepted |
+| Routing mode | Prefix-affinity | Random (load-balanced across healthy backends) |
+
+**When to use fail-open:**
+
+- **Availability-critical deployments**: Where serving some requests incorrectly is better than serving none
+- **Single-node testing**: When running development clusters where quorum loss is expected
+- **Edge deployments**: Where network partitions are common but service must continue
+
+**Trade-offs:**
+
+| Mode | Advantage | Risk |
+|------|-----------|------|
+| Fail-closed (default) | Prevents divergent state, no stale routes | Complete unavailability during split-brain |
+| Fail-open | Continues serving during partitions | May route requests to suboptimal backends, possible stale data |
+
+**Metrics for monitoring fail-open:**
+
+| Metric | Description |
+|--------|-------------|
+| `ranvier_cluster_routes_allowed_fail_open` | Route broadcasts allowed due to fail-open mode |
+| `ranvier_cluster_gossip_accepted_fail_open` | Incoming gossip accepted due to fail-open mode |
+
+**Routing behavior during fail-open:**
+
+When `fail_open_on_quorum_loss=true` and the cluster enters DEGRADED mode:
+
+1. `RouterService::route_request()` detects fail-open mode via `GossipService::is_fail_open_mode()`
+2. Instead of prefix-affinity routing, routes to a **random healthy backend**
+3. This load-balances requests across available backends without relying on potentially stale routing data
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Request arrives during split-brain with fail-open enabled       │
+├─────────────────────────────────────────────────────────────────┤
+│ 1. Check quorum state → DEGRADED                                │
+│ 2. Check fail_open_on_quorum_loss → true                        │
+│ 3. Skip RadixTree lookup (may have stale data)                  │
+│ 4. Select random healthy backend from available pool            │
+│ 5. Forward request → may miss KV-cache but service continues    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### Partition Scenarios
 
 **Scenario 1: 3-node cluster, 1 node isolated**
@@ -494,6 +551,7 @@ cluster:
   quorum_enabled: true                    # Enable quorum checks
   quorum_threshold: 0.5                   # Fraction for quorum (0.5 = majority)
   reject_routes_on_quorum_loss: true      # Reject writes when degraded
+  fail_open_on_quorum_loss: false         # true = random routing during split-brain
   quorum_warning_threshold: 1             # Warn when margin <= this (0 disables)
   quorum_check_window_seconds: 30         # Window for recently-seen check
 
@@ -518,6 +576,7 @@ RANVIER_CLUSTER_GOSSIP_DEDUP_WINDOW=1000
 RANVIER_CLUSTER_QUORUM_ENABLED=true
 RANVIER_CLUSTER_QUORUM_THRESHOLD=0.5
 RANVIER_CLUSTER_REJECT_ROUTES_ON_QUORUM_LOSS=true
+RANVIER_CLUSTER_FAIL_OPEN_ON_QUORUM_LOSS=false
 RANVIER_CLUSTER_QUORUM_WARNING_THRESHOLD=1
 RANVIER_CLUSTER_QUORUM_CHECK_WINDOW=30
 
@@ -565,6 +624,8 @@ All metrics are exposed via Prometheus on port 9180.
 | `ranvier_cluster_routes_rejected_degraded` | Counter | Outbound routes rejected due to degraded state |
 | `ranvier_cluster_routes_rejected_incoming_degraded` | Counter | Incoming routes rejected due to degraded state |
 | `ranvier_cluster_peers_recently_seen` | Gauge | Peers seen within quorum check window |
+| `ranvier_cluster_routes_allowed_fail_open` | Counter | Route broadcasts allowed due to fail-open mode |
+| `ranvier_cluster_gossip_accepted_fail_open` | Counter | Incoming gossip accepted due to fail-open mode |
 
 ### DTLS Encryption
 
