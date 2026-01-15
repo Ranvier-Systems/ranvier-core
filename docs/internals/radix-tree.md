@@ -13,8 +13,9 @@ This document describes the Adaptive Radix Tree implementation used by Ranvier C
 4. [Path Compression & Lazy Expansion](#path-compression--lazy-expansion)
 5. [SIMD Key Search (Roadmap)](#simd-key-search-roadmap)
 6. [Concurrency Model](#concurrency-model)
-7. [Persistence Interface](#persistence-interface)
-8. [Performance Characteristics](#performance-characteristics)
+7. [Tree Compaction (Memory Reclamation)](#tree-compaction-memory-reclamation)
+8. [Persistence Interface](#persistence-interface)
+9. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -896,6 +897,179 @@ enum class RouteOrigin : uint8_t {
 ```
 
 REMOTE routes can be evicted more aggressively than LOCAL routes via `evict_oldest_remote()`.
+
+---
+
+## Tree Compaction (Memory Reclamation)
+
+> **Added in:** v1.0 (PR #155)
+
+Route eviction and TTL expiration clear `leaf_value` fields but leave the tree structure intact. Over time, this creates "tombstoned" nodes that waste memory and fragment the slab allocator's free lists. The `compact()` method reclaims this memory.
+
+### The Problem: Memory Leaks from Tombstones
+
+When routes are evicted, the tree structure remains:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Before Eviction                 │ After Eviction                │
+├─────────────────────────────────┼───────────────────────────────┤
+│ Node[prefix=A,B]                │ Node[prefix=A,B]              │
+│   └─ leaf=Backend1              │   └─ leaf=∅ (tombstoned)      │
+│   └─ child C → Node             │   └─ child C → Node           │
+│        └─ leaf=Backend2         │        └─ leaf=∅              │
+└─────────────────────────────────┴───────────────────────────────┘
+```
+
+Tombstoned nodes:
+- Consume slab allocator slots (not returned to free list)
+- Increase traversal time for remaining routes
+- Prevent node shrinking (Node256 with 2 children stays Node256)
+
+### The Solution: Periodic Compaction
+
+Call `compact()` periodically (e.g., every 60 seconds via timer) to:
+
+1. **Remove empty nodes**: Nodes with no `leaf_value` and no children are deleted
+2. **Shrink oversized nodes**: Node256 with ≤48 children shrinks to Node48, etc.
+3. **Return memory to slab**: Deleted nodes go back to the intrusive free list
+
+```cpp
+// In RouterService timer callback (runs on each shard)
+void RouterService::on_compaction_timer() {
+    if (local_tree) {
+        auto stats = local_tree->compact();
+        if (stats.nodes_removed > 0 || stats.nodes_shrunk > 0) {
+            log_info("Compaction: removed={} shrunk={} reclaimed={}B",
+                     stats.nodes_removed, stats.nodes_shrunk, stats.bytes_reclaimed);
+        }
+    }
+}
+```
+
+### Compaction Algorithm
+
+The algorithm uses post-order traversal to process children before parents:
+
+```mermaid
+flowchart TB
+    subgraph "Compaction Flow"
+        START[compact()] --> CHILDREN[compact_children(root)]
+        CHILDREN --> RECURSE[For each child: recurse]
+        RECURSE --> CHECK_SHRINK{Should shrink?}
+        CHECK_SHRINK -->|Yes| SHRINK[shrink_node()]
+        CHECK_SHRINK -->|No| CHECK_EMPTY
+        SHRINK --> CHECK_EMPTY{Is empty?}
+        CHECK_EMPTY -->|Yes| REMOVE[Remove child]
+        CHECK_EMPTY -->|No| NEXT[Next child]
+        REMOVE --> NEXT
+        NEXT --> DONE{More children?}
+        DONE -->|Yes| RECURSE
+        DONE -->|No| ROOT_CHECK[Check if root should shrink]
+        ROOT_CHECK --> END[Return CompactionStats]
+    end
+```
+
+**Key Implementation Details:**
+
+1. **Post-order traversal**: Children are compacted before parents to ensure accurate emptiness checks
+2. **Shrinking thresholds**: Match growth thresholds in reverse:
+   - Node256 → Node48 when children ≤ 48
+   - Node48 → Node16 when children ≤ 16
+   - Node16 → Node4 when children ≤ 4
+3. **Root protection**: Root node is never deleted (only shrunk if oversized)
+4. **Bounded allocation**: `keys_to_remove` vector uses `reserve(8)` per Rule #4
+
+### CompactionStats Structure
+
+```cpp
+struct CompactionStats {
+    size_t nodes_removed = 0;     // Empty nodes deleted
+    size_t nodes_shrunk = 0;      // Nodes downsized (e.g., Node256 → Node48)
+    size_t bytes_reclaimed = 0;   // Estimated bytes returned to free list
+};
+```
+
+**Bytes Reclaimed Calculation:**
+
+```cpp
+// Estimated byte sizes per node type
+static constexpr size_t NODE4_SIZE = 192;
+static constexpr size_t NODE16_SIZE = 384;
+static constexpr size_t NODE48_SIZE = 640;
+static constexpr size_t NODE256_SIZE = 2240;
+
+// On removal: add full node size
+stats.bytes_reclaimed += node_byte_size(removed_type);
+
+// On shrink: add size difference
+stats.bytes_reclaimed += NODE256_SIZE - NODE48_SIZE;  // Example
+```
+
+### Usage Patterns
+
+**Periodic Background Compaction:**
+
+```cpp
+// Recommended: Every 60 seconds
+seastar::timer<> _compaction_timer;
+
+void start_compaction_timer() {
+    _compaction_timer.set_callback([this] {
+        return seastar::smp::invoke_on_all([this] {
+            if (local_tree) {
+                local_tree->compact();
+            }
+        });
+    });
+    _compaction_timer.arm_periodic(std::chrono::seconds(60));
+}
+```
+
+**After Bulk Eviction:**
+
+```cpp
+// After removing all routes for a backend
+void on_backend_removed(BackendId id) {
+    auto removed = local_tree->remove_routes_by_backend(id, RouteOrigin::LOCAL);
+    if (removed > 100) {  // Threshold for immediate compaction
+        local_tree->compact();
+    }
+}
+```
+
+### Performance Characteristics
+
+| Metric | Value |
+|--------|-------|
+| Time Complexity | O(n) where n = total nodes |
+| Space Complexity | O(d) where d = tree depth (stack) |
+| Memory Impact | Returns nodes to slab free list |
+| Blocking | Yes (synchronous within shard) |
+
+**Compaction is synchronous** because:
+1. It operates on thread-local state only (no cross-shard coordination)
+2. Slab allocator operations are O(1)
+3. Typical compaction completes in microseconds for trees with <100K nodes
+
+### Metrics Integration
+
+Expose compaction metrics via Prometheus:
+
+```cpp
+// Register metrics
+_metrics.add_group("radix_tree", {
+    sm::make_counter("compaction_nodes_removed_total",
+        [this] { return _compaction_nodes_removed; },
+        sm::description("Total nodes removed by compaction")),
+    sm::make_counter("compaction_nodes_shrunk_total",
+        [this] { return _compaction_nodes_shrunk; },
+        sm::description("Total nodes shrunk by compaction")),
+    sm::make_counter("compaction_bytes_reclaimed_total",
+        [this] { return _compaction_bytes_reclaimed; },
+        sm::description("Total bytes reclaimed by compaction")),
+});
+```
 
 ---
 
