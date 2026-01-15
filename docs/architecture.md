@@ -245,6 +245,46 @@ The `GossipService` uses `seastar::gate` to track in-flight gossip tasks:
 - `start_resync()` / `end_resync()`: Coordinates cluster resynchronization
 - Gates ensure graceful completion of in-flight operations before node shutdown
 
+### Fail-Open Mode for Split-Brain
+
+For inference workloads that prioritize availability over strict routing consistency, Ranvier supports **fail-open mode** during split-brain (quorum loss):
+
+```yaml
+cluster:
+  quorum_enabled: true
+  reject_routes_on_quorum_loss: true  # Default: fail-closed
+
+  # Fail-open mode (inference workloads)
+  fail_open_on_quorum_loss: false     # true = random routing during split-brain
+  accept_gossip_on_quorum_loss: false # true = accept incoming gossip (stale > none)
+```
+
+**Behavior during quorum loss:**
+
+| Mode | `fail_open_on_quorum_loss` | Routing Behavior |
+|------|---------------------------|------------------|
+| Fail-Closed (default) | `false` | Requests use normal routing; route broadcasts rejected |
+| Fail-Open | `true` | Requests routed randomly to healthy backends |
+
+| Mode | `accept_gossip_on_quorum_loss` | Gossip Behavior |
+|------|-------------------------------|-----------------|
+| Reject Stale (default) | `false` | Incoming gossip rejected during split-brain |
+| Accept Stale | `true` | Incoming gossip accepted (stale data > no data) |
+
+The two flags are independent, enabling four operational modes:
+
+1. **Full fail-closed** (default): Reject routes and gossip during split-brain
+2. **Fail-open routing only**: Serve traffic randomly, reject stale gossip
+3. **Accept gossip only**: Reject traffic, but collect routing data for recovery
+4. **Full fail-open**: Maximum availability mode
+
+**Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `cluster_routes_allowed_fail_open` | Routes broadcast allowed due to fail-open |
+| `cluster_gossip_accepted_fail_open` | Incoming gossip accepted due to fail-open |
+
 ### Monitoring
 
 The following Prometheus metrics track backpressure events:

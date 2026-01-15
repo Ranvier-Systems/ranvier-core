@@ -107,6 +107,11 @@ GossipService::GossipService(const ClusterConfig& config)
             seastar::metrics::description("Total number of incoming routes rejected due to degraded quorum state")),
         seastar::metrics::make_gauge("cluster_peers_recently_seen", _stats_peers_recently_seen,
             seastar::metrics::description("Number of peers seen within quorum check window")),
+        // Fail-open mode metrics
+        seastar::metrics::make_counter("cluster_routes_allowed_fail_open", _routes_allowed_fail_open,
+            seastar::metrics::description("Total number of route broadcasts allowed due to fail-open mode during split-brain")),
+        seastar::metrics::make_counter("cluster_gossip_accepted_fail_open", _gossip_accepted_fail_open,
+            seastar::metrics::description("Total number of incoming gossip routes accepted due to fail-open mode during split-brain")),
         // DTLS lockdown metrics
         seastar::metrics::make_counter("cluster_dtls_lockdown_drops", _dtls_lockdown_drops,
             seastar::metrics::description("Total number of packets dropped due to mTLS lockdown enforcement")),
@@ -453,11 +458,21 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
     }
 
     // Split-brain protection: reject new route writes when quorum is lost
-    if (_config.quorum_enabled && _config.reject_routes_on_quorum_loss && is_degraded()) {
-        ++_routes_rejected_degraded;
-        log_gossip.debug("Route broadcast rejected: cluster in DEGRADED mode (no quorum). "
-                        "tokens={}, backend={}", tokens.size(), backend);
-        return seastar::make_ready_future<>();
+    // Unless fail-open mode is enabled, which prioritizes availability over consistency
+    if (_config.quorum_enabled && is_degraded()) {
+        if (_config.fail_open_on_quorum_loss) {
+            // Fail-open: allow route broadcast despite quorum loss
+            ++_routes_allowed_fail_open;
+            log_gossip.debug("Route broadcast allowed (fail-open mode): cluster DEGRADED but "
+                            "fail_open_on_quorum_loss=true. tokens={}, backend={}",
+                            tokens.size(), backend);
+        } else if (_config.reject_routes_on_quorum_loss) {
+            // Fail-closed: reject route broadcast
+            ++_routes_rejected_degraded;
+            log_gossip.debug("Route broadcast rejected: cluster in DEGRADED mode (no quorum). "
+                            "tokens={}, backend={}", tokens.size(), backend);
+            return seastar::make_ready_future<>();
+        }
     }
 
     log_gossip.debug("Broadcasting route: {} tokens -> backend {} to {} peers",
@@ -646,16 +661,25 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     }
 
     // Split-brain protection: reject incoming route propagation when quorum is lost
-    // This prevents a partitioned node from accepting potentially stale routes
-    if (_config.quorum_enabled && _config.reject_routes_on_quorum_loss && is_degraded()) {
-        ++_routes_rejected_incoming_degraded;
-        log_gossip.debug("Incoming route rejected: cluster in DEGRADED mode (no quorum). "
-                        "peer={}, tokens={}, backend={}", src_addr, pkt->tokens.size(), pkt->backend_id);
-        // Still send ACK to avoid sender retries (we're explicitly rejecting, not failing)
-        if (_config.gossip_reliable_delivery) {
-            return send_ack(src_addr, pkt->seq_num);
+    // Unless accept_gossip_on_quorum_loss is enabled (stale data > no data)
+    if (_config.quorum_enabled && is_degraded()) {
+        if (_config.accept_gossip_on_quorum_loss) {
+            // Fail-open: accept incoming route despite quorum loss
+            ++_gossip_accepted_fail_open;
+            log_gossip.debug("Incoming route accepted (fail-open mode): cluster DEGRADED but "
+                            "accept_gossip_on_quorum_loss=true. peer={}, tokens={}, backend={}",
+                            src_addr, pkt->tokens.size(), pkt->backend_id);
+        } else if (_config.reject_routes_on_quorum_loss) {
+            // Fail-closed: reject incoming route
+            ++_routes_rejected_incoming_degraded;
+            log_gossip.debug("Incoming route rejected: cluster in DEGRADED mode (no quorum). "
+                            "peer={}, tokens={}, backend={}", src_addr, pkt->tokens.size(), pkt->backend_id);
+            // Still send ACK to avoid sender retries (we're explicitly rejecting, not failing)
+            if (_config.gossip_reliable_delivery) {
+                return send_ack(src_addr, pkt->seq_num);
+            }
+            return seastar::make_ready_future<>();
         }
-        return seastar::make_ready_future<>();
     }
 
     // Map this peer address to the backend ID it just announced

@@ -325,6 +325,15 @@ public:
     bool has_quorum() const { return _quorum_state == QuorumState::HEALTHY; }
     bool is_degraded() const { return _quorum_state == QuorumState::DEGRADED; }
 
+    // Fail-open mode: when enabled and quorum is lost, requests should be
+    // routed randomly to healthy backends instead of being rejected.
+    // RouterService queries this to decide routing behavior during split-brain.
+    bool is_fail_open_mode() const {
+        return _config.quorum_enabled &&
+               _config.fail_open_on_quorum_loss &&
+               is_degraded();
+    }
+
     // Get quorum status for external queries (e.g., health checks, metrics)
     // NOTE: Only valid on shard 0 where peer table is maintained.
     size_t quorum_required() const;  // N/2+1
@@ -418,6 +427,10 @@ private:
     uint64_t _routes_rejected_incoming_degraded = 0;  // Incoming routes rejected due to degraded state
     uint64_t _stats_peers_recently_seen = 0;  // Count of peers seen within quorum check window
     bool _quorum_warning_active = false;  // Track if we've already logged a warning (rate limiting)
+
+    // Fail-open mode metrics
+    uint64_t _routes_allowed_fail_open = 0;  // Routes broadcast allowed due to fail-open mode
+    uint64_t _gossip_accepted_fail_open = 0;  // Incoming gossip accepted due to fail-open mode
 
     // DTLS lockdown metrics
     uint64_t _dtls_lockdown_drops = 0;  // Packets dropped due to mTLS lockdown (non-DTLS when mTLS required)
