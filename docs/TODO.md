@@ -692,9 +692,31 @@ All tests must follow the **No Locks/Async Only** constraints from `docs/claude-
 
 Structural issues identified across 4 lenses: Async Integrity, Edge-Case Crash, Architecture Drift, and Scale & Leak.
 
-### 7.0 Adversarial Audit Findings (2026-01-14)
+### 7.0 Adversarial Audit Findings (2026-01-15)
 
-All issues discovered during comprehensive adversarial audit have been resolved. See `docs/adversarial-audit-2026-01-14.md` for full report.
+All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future hardening.
+
+#### Remaining Issues (Future Hardening)
+
+- [ ] **[MEDIUM] Add stale circuit entry cleanup when backends removed**
+  _Issue:_ `circuit_breaker.hpp:250` `_circuits` map has MAX_CIRCUITS=10K bound (good), but entries are never cleaned up when backends are deregistered. Dead backend entries persist forever, consuming memory until MAX_CIRCUITS limit.
+  _Fix:_ Add `remove_circuit(BackendId)` method called from backend removal path in RouterService. Alternatively, add periodic sweep to remove entries for backends not in active registry.
+  _Location:_ `src/circuit_breaker.hpp`, `src/router_service.cpp`
+  _Severity:_ Medium
+
+- [ ] **[MEDIUM] Consider lock-free queue for AsyncPersistenceManager**
+  _Issue:_ `async_persistence.cpp:192,203,216,234` uses `std::lock_guard<std::mutex>` in `try_enqueue()` which briefly blocks reactor thread during write batching. Documented as acceptable tradeoff but still a theoretical stall point under high persistence load.
+  _Fix:_ Consider lock-free SPSC queue or `seastar::submit_to` pattern for cross-shard enqueue. Current design is acceptable for typical workloads.
+  _Location:_ `src/async_persistence.cpp`
+  _Severity:_ Medium (acceptable tradeoff)
+
+- [ ] **[LOW] Audit _pending_acks cleanup in GossipService**
+  _Issue:_ `gossip_service.cpp` `_pending_acks` map tracks pending reliable delivery ACKs. Entries have retry limits, but if peers become permanently unresponsive, entries may accumulate until retry exhaustion. Need to verify cleanup occurs when peers are removed from cluster.
+  _Fix:_ Review cleanup logic in `refresh_peers()` and peer removal paths. Add periodic sweep if needed.
+  _Location:_ `src/gossip_service.cpp`
+  _Severity:_ Low
+
+#### Completed Issues (2026-01-14)
 
 #### Async Integrity Violations
 
