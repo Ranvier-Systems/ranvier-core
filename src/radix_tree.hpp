@@ -130,6 +130,13 @@ struct TreeStats {
     double average_prefix_length = 0; // Average prefix length (path compression effectiveness)
 };
 
+// Statistics from tree compaction operation
+struct CompactionStats {
+    size_t nodes_removed = 0;         // Empty nodes deleted and returned to slab
+    size_t nodes_shrunk = 0;          // Nodes downsized (e.g., Node256 → Node48)
+    size_t bytes_reclaimed = 0;       // Estimated bytes returned to free list
+};
+
 // Result from lookup with instrumentation data
 struct LookupResult {
     std::optional<BackendId> backend;
@@ -324,6 +331,24 @@ public:
         remove_by_backend_recursive(root_.get(), backend, origin, removed);
         route_count_ = (route_count_ > removed) ? route_count_ - removed : 0;
         return removed;
+    }
+
+    // =========================================================================
+    // Tree Compaction - Reclaims memory from tombstoned nodes
+    // =========================================================================
+
+    // Compact the tree by removing empty nodes and optionally shrinking oversized nodes.
+    // Call periodically (e.g., every 60s) to reclaim memory after route deletions.
+    // Returns statistics about the compaction operation.
+    CompactionStats compact() {
+        CompactionStats stats;
+        // Compact children of root (root itself is never deleted)
+        compact_children(root_.get(), stats);
+        // Optionally shrink the root if it's oversized
+        if (should_shrink(root_.get())) {
+            root_ = shrink_node(std::move(root_), stats);
+        }
+        return stats;
     }
 
 private:
@@ -1103,6 +1128,327 @@ private:
         visit_children(node, [&](TokenId, Node* child) {
             remove_by_backend_recursive(child, backend, origin, removed);
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // Compaction Implementation
+    // -------------------------------------------------------------------------
+
+    // Estimated byte sizes for each node type (for metrics)
+    static constexpr size_t NODE4_SIZE = 192;
+    static constexpr size_t NODE16_SIZE = 384;
+    static constexpr size_t NODE48_SIZE = 640;
+    static constexpr size_t NODE256_SIZE = 2240;
+
+    static size_t node_byte_size(NodeType type) {
+        switch (type) {
+            case NodeType::Node4: return NODE4_SIZE;
+            case NodeType::Node16: return NODE16_SIZE;
+            case NodeType::Node48: return NODE48_SIZE;
+            case NodeType::Node256: return NODE256_SIZE;
+        }
+        return 0;
+    }
+
+    // Check if a node is empty (no leaf value, no children)
+    static bool is_node_empty(Node* node) {
+        return !node->leaf_value.has_value() && child_count(node) == 0;
+    }
+
+    // Check if a node should be shrunk to a smaller type
+    static bool should_shrink(Node* node) {
+        size_t count = child_count(node);
+        switch (node->type) {
+            case NodeType::Node256: return count <= 48;
+            case NodeType::Node48: return count <= 16;
+            case NodeType::Node16: return count <= 4;
+            case NodeType::Node4: return false; // Already smallest
+        }
+        return false;
+    }
+
+    // Recursively compact children of a node, removing empty ones
+    void compact_children(Node* node, CompactionStats& stats) {
+        if (!node) return;
+
+        // Collect keys of children to remove (can't modify during iteration)
+        std::vector<TokenId> keys_to_remove;
+        keys_to_remove.reserve(8); // Bounded allocation (Rule #4)
+
+        switch (node->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(node);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    Node* child = n->children[i].get();
+                    // Recurse first (post-order traversal)
+                    compact_children(child, stats);
+                    // Check if child should be shrunk
+                    if (should_shrink(child)) {
+                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
+                    }
+                    // Mark for removal if empty
+                    if (is_node_empty(n->children[i].get())) {
+                        keys_to_remove.push_back(n->keys[i]);
+                    }
+                }
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(node);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    Node* child = n->children[i].get();
+                    compact_children(child, stats);
+                    if (should_shrink(child)) {
+                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
+                    }
+                    if (is_node_empty(n->children[i].get())) {
+                        keys_to_remove.push_back(n->keys[i]);
+                    }
+                }
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(node);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    Node* child = n->children[i].get();
+                    compact_children(child, stats);
+                    if (should_shrink(child)) {
+                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
+                    }
+                    if (is_node_empty(n->children[i].get())) {
+                        keys_to_remove.push_back(n->keys[i]);
+                    }
+                }
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(node);
+                for (int i = 0; i < 256; i++) {
+                    if (n->children[i]) {
+                        Node* child = n->children[i].get();
+                        compact_children(child, stats);
+                        if (should_shrink(child)) {
+                            n->children[i] = shrink_node(std::move(n->children[i]), stats);
+                        }
+                        if (is_node_empty(n->children[i].get())) {
+                            keys_to_remove.push_back(static_cast<TokenId>(i));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // Remove empty children (triggers SlabNodeDeleter, returns memory to free list)
+        for (TokenId key : keys_to_remove) {
+            NodeType removed_type = remove_child(node, key);
+            stats.nodes_removed++;
+            stats.bytes_reclaimed += node_byte_size(removed_type);
+        }
+    }
+
+    // Remove a child by key, returns the type of the removed node
+    NodeType remove_child(Node* parent, TokenId key) {
+        switch (parent->type) {
+            case NodeType::Node4: {
+                auto* n = static_cast<Node4*>(parent);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        NodeType removed_type = n->children[i]->type;
+                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
+                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
+                        return removed_type;
+                    }
+                }
+                break;
+            }
+            case NodeType::Node16: {
+                auto* n = static_cast<Node16*>(parent);
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        NodeType removed_type = n->children[i]->type;
+                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
+                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
+                        return removed_type;
+                    }
+                }
+                break;
+            }
+            case NodeType::Node48: {
+                auto* n = static_cast<Node48*>(parent);
+                uint8_t idx = n->index[key_byte(key)];
+                if (idx != Node48::EMPTY_MARKER) {
+                    NodeType removed_type = n->children[idx]->type;
+                    // Remove from children and keys vectors
+                    n->children.erase(n->children.begin() + idx);
+                    n->keys.erase(n->keys.begin() + idx);
+                    // Reset index entry
+                    n->index[key_byte(key)] = Node48::EMPTY_MARKER;
+                    // Reindex: entries pointing to indices > idx need to be decremented
+                    for (size_t i = 0; i < 256; i++) {
+                        if (n->index[i] != Node48::EMPTY_MARKER && n->index[i] > idx) {
+                            n->index[i]--;
+                        }
+                    }
+                    return removed_type;
+                }
+                break;
+            }
+            case NodeType::Node256: {
+                auto* n = static_cast<Node256*>(parent);
+                uint8_t idx = key_byte(key);
+                if (n->children[idx]) {
+                    NodeType removed_type = n->children[idx]->type;
+                    n->children[idx].reset(); // Triggers SlabNodeDeleter
+                    return removed_type;
+                }
+                break;
+            }
+        }
+        return NodeType::Node4; // Fallback (shouldn't happen)
+    }
+
+    // Shrink a node to the appropriate smaller type
+    NodePtr shrink_node(NodePtr node, CompactionStats& stats) {
+        size_t count = child_count(node.get());
+
+        switch (node->type) {
+            case NodeType::Node256:
+                if (count <= 4) {
+                    stats.nodes_shrunk++;
+                    stats.bytes_reclaimed += NODE256_SIZE - NODE4_SIZE;
+                    return shrink_to_node4(std::move(node));
+                } else if (count <= 16) {
+                    stats.nodes_shrunk++;
+                    stats.bytes_reclaimed += NODE256_SIZE - NODE16_SIZE;
+                    return shrink_to_node16(std::move(node));
+                } else if (count <= 48) {
+                    stats.nodes_shrunk++;
+                    stats.bytes_reclaimed += NODE256_SIZE - NODE48_SIZE;
+                    return shrink_to_node48(std::move(node));
+                }
+                break;
+            case NodeType::Node48:
+                if (count <= 4) {
+                    stats.nodes_shrunk++;
+                    stats.bytes_reclaimed += NODE48_SIZE - NODE4_SIZE;
+                    return shrink_to_node4(std::move(node));
+                } else if (count <= 16) {
+                    stats.nodes_shrunk++;
+                    stats.bytes_reclaimed += NODE48_SIZE - NODE16_SIZE;
+                    return shrink_to_node16(std::move(node));
+                }
+                break;
+            case NodeType::Node16:
+                if (count <= 4) {
+                    stats.nodes_shrunk++;
+                    stats.bytes_reclaimed += NODE16_SIZE - NODE4_SIZE;
+                    return shrink_to_node4(std::move(node));
+                }
+                break;
+            case NodeType::Node4:
+                break; // Already smallest
+        }
+        return node;
+    }
+
+    // -------------------------------------------------------------------------
+    // Shrink Operations (reverse of grow_to_*)
+    // -------------------------------------------------------------------------
+
+    NodePtr shrink_to_node4(NodePtr node) {
+        auto n4_ptr = make_node<Node4>();
+        auto* n4 = static_cast<Node4*>(n4_ptr.get());
+        copy_node_metadata(n4, node.get());
+
+        // Move up to 4 children
+        size_t count = 0;
+        switch (node->type) {
+            case NodeType::Node16: {
+                auto* src = static_cast<Node16*>(node.get());
+                for (size_t i = 0; i < src->keys.size() && count < 4; i++, count++) {
+                    n4->keys.push_back(src->keys[i]);
+                    n4->children.push_back(std::move(src->children[i]));
+                }
+                break;
+            }
+            case NodeType::Node48: {
+                auto* src = static_cast<Node48*>(node.get());
+                for (size_t i = 0; i < src->keys.size() && count < 4; i++, count++) {
+                    n4->keys.push_back(src->keys[i]);
+                    n4->children.push_back(std::move(src->children[i]));
+                }
+                break;
+            }
+            case NodeType::Node256: {
+                auto* src = static_cast<Node256*>(node.get());
+                for (int i = 0; i < 256 && count < 4; i++) {
+                    if (src->children[i]) {
+                        n4->keys.push_back(static_cast<TokenId>(i));
+                        n4->children.push_back(std::move(src->children[i]));
+                        count++;
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return n4_ptr;
+    }
+
+    NodePtr shrink_to_node16(NodePtr node) {
+        auto n16_ptr = make_node<Node16>();
+        auto* n16 = static_cast<Node16*>(n16_ptr.get());
+        copy_node_metadata(n16, node.get());
+
+        // Move up to 16 children
+        size_t count = 0;
+        switch (node->type) {
+            case NodeType::Node48: {
+                auto* src = static_cast<Node48*>(node.get());
+                for (size_t i = 0; i < src->keys.size() && count < 16; i++, count++) {
+                    n16->keys.push_back(src->keys[i]);
+                    n16->children.push_back(std::move(src->children[i]));
+                }
+                break;
+            }
+            case NodeType::Node256: {
+                auto* src = static_cast<Node256*>(node.get());
+                for (int i = 0; i < 256 && count < 16; i++) {
+                    if (src->children[i]) {
+                        n16->keys.push_back(static_cast<TokenId>(i));
+                        n16->children.push_back(std::move(src->children[i]));
+                        count++;
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return n16_ptr;
+    }
+
+    NodePtr shrink_to_node48(NodePtr node) {
+        auto n48_ptr = make_node<Node48>();
+        auto* n48 = static_cast<Node48*>(n48_ptr.get());
+        copy_node_metadata(n48, node.get());
+
+        // Only Node256 can shrink to Node48
+        if (node->type == NodeType::Node256) {
+            auto* src = static_cast<Node256*>(node.get());
+            size_t count = 0;
+            for (int i = 0; i < 256 && count < 48; i++) {
+                if (src->children[i]) {
+                    n48->index[i] = static_cast<uint8_t>(count);
+                    n48->keys.push_back(static_cast<TokenId>(i));
+                    n48->children.push_back(std::move(src->children[i]));
+                    count++;
+                }
+            }
+        }
+        return n48_ptr;
     }
 };
 

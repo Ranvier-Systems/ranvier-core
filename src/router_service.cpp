@@ -68,6 +68,11 @@ struct ShardLocalState {
         uint64_t radix_tree_lookup_hits = 0;
         uint64_t radix_tree_lookup_misses = 0;
         uint64_t prefix_affinity_routes = 0;
+        // Compaction stats (cumulative since process start)
+        uint64_t compaction_nodes_removed = 0;
+        uint64_t compaction_nodes_shrunk = 0;
+        uint64_t compaction_bytes_reclaimed = 0;
+        uint64_t compaction_runs = 0;
 
         void reset() {
             cache_hits = 0;
@@ -78,6 +83,10 @@ struct ShardLocalState {
             radix_tree_lookup_hits = 0;
             radix_tree_lookup_misses = 0;
             prefix_affinity_routes = 0;
+            compaction_nodes_removed = 0;
+            compaction_nodes_shrunk = 0;
+            compaction_bytes_reclaimed = 0;
+            compaction_runs = 0;
         }
     } stats;
 
@@ -400,7 +409,20 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                 }
                 if (total_capacity == 0) return 0.0;
                 return static_cast<double>(total_allocated) / static_cast<double>(total_capacity);
-            })
+            }),
+        // Compaction metrics - track memory reclamation from tombstoned nodes
+        seastar::metrics::make_counter("radix_tree_compaction_nodes_removed_total",
+            [] { return g_shard_state ? g_shard_state->stats.compaction_nodes_removed : 0UL; },
+            seastar::metrics::description("Total empty nodes removed and returned to slab free list")),
+        seastar::metrics::make_counter("radix_tree_compaction_nodes_shrunk_total",
+            [] { return g_shard_state ? g_shard_state->stats.compaction_nodes_shrunk : 0UL; },
+            seastar::metrics::description("Total nodes downsized (e.g., Node256 to Node48)")),
+        seastar::metrics::make_counter("radix_tree_compaction_bytes_reclaimed_total",
+            [] { return g_shard_state ? g_shard_state->stats.compaction_bytes_reclaimed : 0UL; },
+            seastar::metrics::description("Total bytes reclaimed by compaction")),
+        seastar::metrics::make_counter("radix_tree_compaction_runs_total",
+            [] { return g_shard_state ? g_shard_state->stats.compaction_runs : 0UL; },
+            seastar::metrics::description("Total number of compaction cycles executed"))
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
     });
@@ -469,17 +491,32 @@ seastar::future<> RouterService::stop() {
 void RouterService::run_ttl_cleanup() {
     auto cutoff = std::chrono::steady_clock::now() - shard_state().config.ttl_seconds;
 
-    // Run cleanup on all shards
+    // Run cleanup and compaction on all shards
     (void)seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
         return seastar::smp::submit_to(shard_id, [cutoff] {
             if (!g_shard_state) return seastar::make_ready_future<>();
             auto& state = shard_state();
             RadixTree* tree = state.tree.get();
             if (tree) {
+                // Phase 1: Expire old routes (marks leaves as empty)
                 size_t removed = tree->remove_expired(cutoff);
                 if (removed > 0) {
                     state.stats.routes_expired += removed;
                     log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
+                }
+
+                // Phase 2: Compact tree (reclaims empty nodes, shrinks oversized nodes)
+                auto compact_stats = tree->compact();
+                state.stats.compaction_runs++;
+                state.stats.compaction_nodes_removed += compact_stats.nodes_removed;
+                state.stats.compaction_nodes_shrunk += compact_stats.nodes_shrunk;
+                state.stats.compaction_bytes_reclaimed += compact_stats.bytes_reclaimed;
+                if (compact_stats.nodes_removed > 0 || compact_stats.nodes_shrunk > 0) {
+                    log_main.debug("Shard {}: Compaction removed {} nodes, shrunk {} nodes, reclaimed {} bytes",
+                                   seastar::this_shard_id(),
+                                   compact_stats.nodes_removed,
+                                   compact_stats.nodes_shrunk,
+                                   compact_stats.bytes_reclaimed);
                 }
             }
             return seastar::make_ready_future<>();
