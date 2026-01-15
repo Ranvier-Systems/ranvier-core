@@ -595,6 +595,33 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
                                          const std::string& request_id) {
     RouteResult result;
 
+    // ==========================================================================
+    // Fail-Open Mode Check
+    // ==========================================================================
+    // When fail-open mode is active (quorum lost + fail_open_on_quorum_loss=true),
+    // bypass normal routing and use random selection to known-healthy backends.
+    // This prioritizes availability over cache affinity during split-brain.
+    //
+    // Note: _gossip is only valid on shard 0. For other shards, we check if
+    // gossip exists and defer to its is_fail_open_mode() which returns false
+    // on non-shard-0 (as quorum state is only maintained on shard 0).
+    if (_gossip && _gossip->is_fail_open_mode()) {
+        result.routing_mode = "random";
+        result.cache_hit = false;
+        auto random_id = get_random_backend();
+
+        if (random_id.has_value()) {
+            result.backend_id = random_id.value();
+            if (!request_id.empty()) {
+                log_router.debug("[{}] Fail-open routing: {} tokens -> backend {} (split-brain active)",
+                                 request_id, tokens.size(), random_id.value());
+            }
+        } else {
+            result.error_message = "No backends registered (fail-open mode)";
+        }
+        return result;
+    }
+
     // Use shard-local routing mode (hot-reloadable via update_routing_config)
     auto routing_mode = g_shard_state ? shard_state().config.routing_mode
                                       : RoutingConfig::RoutingMode::PREFIX;

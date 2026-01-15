@@ -302,6 +302,12 @@ struct ClusterConfig {
     uint32_t quorum_warning_threshold = 1;                 // Warn when alive peers <= required + this threshold
     std::chrono::seconds quorum_check_window{30};          // Window to count recently seen peers (check_quorum)
 
+    // Fail-open mode for split-brain handling (inference workloads)
+    // When enabled during quorum loss, requests are routed randomly to healthy backends
+    // instead of being rejected. This prioritizes availability over consistency.
+    bool fail_open_on_quorum_loss = false;                 // true = random routing during split-brain, false = reject (default)
+    bool accept_gossip_on_quorum_loss = false;             // true = accept incoming gossip during split-brain (stale > none)
+
     // DTLS Security Lockdown
     bool mtls_enabled = false;                             // Enforce mTLS: drop non-DTLS packets when TLS enabled
 
@@ -701,6 +707,12 @@ inline void RanvierConfig::apply_env_overrides() {
     }
     if (auto v = get_env("RANVIER_CLUSTER_MTLS_ENABLED")) {
         cluster.mtls_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_FAIL_OPEN_ON_QUORUM_LOSS")) {
+        cluster.fail_open_on_quorum_loss = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_CLUSTER_ACCEPT_GOSSIP_ON_QUORUM_LOSS")) {
+        cluster.accept_gossip_on_quorum_loss = (*v == "1" || *v == "true" || *v == "yes");
     }
 
     // K8s discovery overrides
@@ -1114,6 +1126,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (c["mtls_enabled"]) {
                 config.cluster.mtls_enabled = c["mtls_enabled"].as<bool>();
+            }
+            if (c["fail_open_on_quorum_loss"]) {
+                config.cluster.fail_open_on_quorum_loss = c["fail_open_on_quorum_loss"].as<bool>();
+            }
+            if (c["accept_gossip_on_quorum_loss"]) {
+                config.cluster.accept_gossip_on_quorum_loss = c["accept_gossip_on_quorum_loss"].as<bool>();
             }
             if (c["self_backend_id"]) {
                 config.cluster.self_backend_id = c["self_backend_id"].as<int32_t>();
