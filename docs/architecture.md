@@ -106,6 +106,12 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 
    Signal handlers integrate with the Seastar reactor, enabling async operations within handlers. A `seastar::promise<>` bridges signal reception to the main application loop.
 
+   **SIGHUP Hot-Reload Details**:
+   - **Async I/O**: File loading uses `seastar::async()` to offload blocking `std::ifstream` to the thread pool, preventing reactor stalls on slow storage (Hard Rule #12)
+   - **Rate Limiting**: Reloads are rate-limited to once per 10 seconds to prevent reload storms from rapid SIGHUP signals
+   - **Validation**: New configuration is validated before applying; invalid configs are rejected with error logging
+   - **Atomic Propagation**: All shards are updated via `invoke_on_all()` before updating the master config (exception-safe)
+
 6. **Sharded Configuration**: Uses `seastar::sharded<ShardedConfig>` for per-core configuration distribution:
    - Each CPU core has its own config copy for lock-free access
    - Hot-reload updates all shards atomically via `invoke_on_all()`

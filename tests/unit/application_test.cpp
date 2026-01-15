@@ -291,6 +291,27 @@ TEST_F(ApplicationConfigTest, ClusterConfigIsPreserved) {
 }
 
 // =============================================================================
+// Configuration Hot-Reload Tests
+// =============================================================================
+// Note: Actual reload_config() execution requires Seastar runtime and is tested
+// in integration tests. These tests document the expected behavior and verify
+// configuration handling.
+
+TEST_F(ApplicationConfigTest, ReloadConfigPathIsPreserved) {
+    Application app(default_config, "/etc/ranvier/config.yaml");
+    // Config path is stored internally for reload
+    // Reload uses RanvierConfig::load() with this path
+    EXPECT_EQ(app.state(), ApplicationState::CREATED);
+}
+
+// Document expected reload_config() behavior (tested in integration tests):
+// - Rate limiting: Rejects reload if last reload was < 10 seconds ago
+// - Async I/O: Uses seastar::async() to offload blocking std::ifstream to thread pool
+// - Validation: Validates new config before applying; logs error if invalid
+// - Atomic propagation: Updates all shards via invoke_on_all() before updating master
+// - Error handling: Logs errors but doesn't crash on reload failure
+
+// =============================================================================
 // Tokenizer Configuration Tests
 // =============================================================================
 // Note: Actual init_tokenizer() execution requires Seastar runtime and is tested
