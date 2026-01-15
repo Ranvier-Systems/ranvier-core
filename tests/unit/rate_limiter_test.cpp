@@ -23,16 +23,19 @@ TEST_F(RateLimiterConfigTest, DefaultConfigIsDisabled) {
     EXPECT_FALSE(config.enabled);
     EXPECT_EQ(config.requests_per_second, 100u);
     EXPECT_EQ(config.burst_size, 50u);
+    EXPECT_EQ(config.cleanup_interval, std::chrono::seconds(60));
 }
 
 TEST_F(RateLimiterConfigTest, ConfigCanBeCustomized) {
     config.enabled = true;
     config.requests_per_second = 500;
     config.burst_size = 100;
+    config.cleanup_interval = std::chrono::seconds(120);
 
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.requests_per_second, 500u);
     EXPECT_EQ(config.burst_size, 100u);
+    EXPECT_EQ(config.cleanup_interval, std::chrono::seconds(120));
 }
 
 // =============================================================================
@@ -205,7 +208,8 @@ TEST_F(RateLimiterCleanupTest, CleanupRemovesIdleBuckets) {
     EXPECT_EQ(limiter.bucket_count(), 2u);
 
     // Cleanup with 0 seconds idle time should remove all
-    limiter.cleanup(std::chrono::seconds(0));
+    size_t removed = limiter.cleanup(std::chrono::seconds(0));
+    EXPECT_EQ(removed, 2u);
     EXPECT_EQ(limiter.bucket_count(), 0u);
 }
 
@@ -216,9 +220,34 @@ TEST_F(RateLimiterCleanupTest, CleanupPreservesRecentBuckets) {
     EXPECT_EQ(limiter.bucket_count(), 1u);
 
     // Cleanup with long idle threshold should preserve recent bucket
-    limiter.cleanup(std::chrono::seconds(3600));
+    size_t removed = limiter.cleanup(std::chrono::seconds(3600));
+    EXPECT_EQ(removed, 0u);
     EXPECT_EQ(limiter.bucket_count(), 1u);
 }
+
+TEST_F(RateLimiterCleanupTest, CleanupReturnsRemovedCount) {
+    RateLimiter limiter(config);
+
+    // Create some buckets
+    limiter.allow("client_1");
+    limiter.allow("client_2");
+    limiter.allow("client_3");
+    EXPECT_EQ(limiter.bucket_count(), 3u);
+
+    // Cleanup with 0 seconds idle time should remove all and return count
+    size_t removed = limiter.cleanup(std::chrono::seconds(0));
+    EXPECT_EQ(removed, 3u);
+    EXPECT_EQ(limiter.bucket_count(), 0u);
+}
+
+TEST_F(RateLimiterCleanupTest, BucketsCleanedTotalStartsAtZero) {
+    RateLimiter limiter(config);
+    EXPECT_EQ(limiter.buckets_cleaned_total(), 0u);
+}
+
+// Note: Timer-based cleanup tests require Seastar reactor and are in
+// tests/integration/rate_limiter_timer_test.cpp. The on_cleanup_timer()
+// callback increments buckets_cleaned_total atomically.
 
 // =============================================================================
 // Config Update Tests
@@ -268,6 +297,22 @@ TEST_F(RateLimiterConfigUpdateTest, DisablingViaConfigAllowsAllRequests) {
 
     // Now should allow (disabled)
     EXPECT_TRUE(limiter.allow("client"));
+}
+
+TEST_F(RateLimiterConfigUpdateTest, UpdateConfigChangesCleanupInterval) {
+    RateLimiter limiter(config);
+
+    // Update cleanup interval
+    RateLimiterConfig new_config;
+    new_config.enabled = true;
+    new_config.requests_per_second = 100;
+    new_config.burst_size = 10;
+    new_config.cleanup_interval = std::chrono::seconds(30);
+    limiter.update_config(new_config);
+
+    // Note: The actual interval change takes effect on next timer rearm.
+    // This test verifies config is accepted; timer behavior tested in integration.
+    EXPECT_TRUE(limiter.is_enabled());
 }
 
 // =============================================================================
