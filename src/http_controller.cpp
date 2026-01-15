@@ -295,6 +295,9 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     r.add(operation_type::POST, url("/admin/drain"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_drain_backend(std::move(req), std::move(rep));
     }));
+
+    // Start rate limiter cleanup timer (Hard Rule #5: timer with gate guard)
+    _rate_limiter.start();
 }
 
 // ---------------------------------------------------------
@@ -1390,19 +1393,23 @@ future<> HttpController::wait_for_drain() {
     auto drain_timeout = _config.drain_timeout;
     log_proxy.info("Waiting for in-flight requests to complete (timeout: {}s)", drain_timeout.count());
 
-    // Close the gate and wait for all holders to be released
-    auto gate_close_future = _request_gate.close();
+    // Stop rate limiter cleanup timer first (Hard Rule #5: close gate before destruction)
+    // This ensures no timer callbacks are in-flight when we proceed with shutdown
+    return _rate_limiter.stop().then([this, drain_timeout] {
+        // Close the gate and wait for all holders to be released
+        auto gate_close_future = _request_gate.close();
 
-    // Race between gate closing and timeout
-    auto deadline = lowres_clock::now() + drain_timeout;
+        // Race between gate closing and timeout
+        auto deadline = lowres_clock::now() + drain_timeout;
 
-    return with_timeout(deadline, std::move(gate_close_future))
-        .then([] {
-            log_proxy.info("All in-flight requests completed");
-        })
-        .handle_exception_type([](const seastar::timed_out_error&) {
-            log_proxy.warn("Drain timeout reached - some requests may be interrupted");
-        });
+        return with_timeout(deadline, std::move(gate_close_future))
+            .then([] {
+                log_proxy.info("All in-flight requests completed");
+            })
+            .handle_exception_type([](const seastar::timed_out_error&) {
+                log_proxy.warn("Drain timeout reached - some requests may be interrupted");
+            });
+    });
 }
 
 bool HttpController::is_draining() const {
