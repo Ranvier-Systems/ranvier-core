@@ -2,14 +2,26 @@
 //
 // Token bucket rate limiter for controlling request rates per client IP.
 // Each client gets a bucket that refills at a configured rate.
+//
+// Hard Rule #4 compliance: MAX_BUCKETS bounds the _buckets map to prevent
+// memory exhaustion from attackers generating requests from unique source IPs.
+// When at capacity, fail-open (allow request) to maintain availability.
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <mutex>  // for std::call_once / std::once_flag only
 #include <string>
 #include <unordered_map>
 
+#include <seastar/core/metrics_registration.hh>
+#include <seastar/util/log.hh>
+
 namespace ranvier {
+
+// Logger for rate limiter warnings
+inline seastar::logger log_rate_limiter("ranvier.rate_limiter");
 
 struct RateLimiterConfig {
     bool enabled = false;
@@ -30,8 +42,13 @@ struct TokenBucket {
 // Per-shard rate limiter (no locks needed in Seastar's shared-nothing model)
 class RateLimiter {
 public:
+    // Hard Rule #4: Every growing container must have an explicit MAX_SIZE
+    // 100k buckets * ~56 bytes/bucket ≈ 5.6 MB max memory per shard
+    static constexpr size_t MAX_BUCKETS = 100'000;
+
     explicit RateLimiter(RateLimiterConfig config)
-        : _config(config) {}
+        : _config(config)
+        , _overflow_count(0) {}
 
     // Check if request is allowed and consume a token if so
     // Returns true if allowed, false if rate limited
@@ -44,6 +61,22 @@ public:
         auto it = _buckets.find(client_ip);
 
         if (it == _buckets.end()) {
+            // Hard Rule #4: Check MAX_BUCKETS before inserting
+            if (_buckets.size() >= MAX_BUCKETS) {
+                // Fail-open: allow request without creating bucket
+                _overflow_count.fetch_add(1, std::memory_order_relaxed);
+
+                // Log warning once per process lifetime
+                std::call_once(_overflow_logged, [] {
+                    log_rate_limiter.warn(
+                        "Rate limiter bucket overflow: MAX_BUCKETS ({}) reached. "
+                        "Failing open for new clients. This may indicate an attack "
+                        "or misconfiguration.", MAX_BUCKETS);
+                });
+
+                return true;
+            }
+
             // New client - create bucket with burst_size tokens
             _buckets.emplace(client_ip, TokenBucket(_config.burst_size));
 
@@ -92,6 +125,32 @@ public:
 
     bool is_enabled() const { return _config.enabled; }
 
+    // Lock-free overflow counter accessor (Rule #1: metrics must be lock-free)
+    size_t overflow_count() const {
+        return _overflow_count.load(std::memory_order_relaxed);
+    }
+
+    // Register Prometheus metrics
+    void register_metrics() {
+        namespace sm = seastar::metrics;
+        _metrics.add_group("ranvier_rate_limiter", {
+            sm::make_counter("overflow_total",
+                [this] { return _overflow_count.load(std::memory_order_relaxed); },
+                sm::description("Number of requests that bypassed rate limiting due to bucket overflow (fail-open)")),
+            sm::make_gauge("bucket_count",
+                [this] { return static_cast<double>(_buckets.size()); },
+                sm::description("Current number of active rate limit buckets")),
+            sm::make_gauge("bucket_capacity",
+                [] { return static_cast<double>(MAX_BUCKETS); },
+                sm::description("Maximum number of rate limit buckets allowed")),
+        });
+    }
+
+    // Rule #6: Deregister metrics before destruction to prevent use-after-free
+    void clear_metrics() {
+        _metrics.clear();
+    }
+
     // Hot-reload: Update configuration at runtime
     void update_config(const RateLimiterConfig& config) {
         _config = config;
@@ -101,6 +160,13 @@ public:
 private:
     RateLimiterConfig _config;
     std::unordered_map<std::string, TokenBucket> _buckets;
+
+    // Overflow tracking (Rule #4: bounded container overflow detection)
+    std::atomic<size_t> _overflow_count;
+    inline static std::once_flag _overflow_logged;  // Log once per process
+
+    // Prometheus metrics (Rule #6: clear in owning service's stop())
+    seastar::metrics::metric_groups _metrics;
 };
 
 }  // namespace ranvier
