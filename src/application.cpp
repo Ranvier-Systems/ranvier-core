@@ -16,6 +16,7 @@
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/net/inet_address.hh>
@@ -975,9 +976,11 @@ seastar::future<> Application::reload_config() {
     log_main.info("Reloading configuration from {}", _config_path);
 
     // Load configuration asynchronously to avoid blocking the reactor.
-    // RanvierConfig::load_async() wraps the blocking std::ifstream I/O in seastar::async(),
-    // offloading file reads to the Seastar thread pool.
-    return RanvierConfig::load_async(_config_path).then([this, now](RanvierConfig new_config) {
+    // seastar::async() offloads the blocking std::ifstream I/O to the thread pool.
+    // This is the ONLY safe way to reload config after the Seastar reactor starts.
+    return seastar::async([path = _config_path] {
+        return RanvierConfig::load(path);
+    }).then([this, now](RanvierConfig new_config) {
         // Validate the new configuration
         auto validation_error = RanvierConfig::validate(new_config);
         if (validation_error) {
