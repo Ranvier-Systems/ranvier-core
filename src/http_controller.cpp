@@ -18,6 +18,8 @@
 #include <seastar/http/handlers.hh>
 #include <seastar/http/function_handlers.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/dns.hh>
+#include <seastar/net/inet_address.hh>
 
 using namespace seastar;
 
@@ -1145,6 +1147,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
 future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
     // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0
+    // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
     sstring port_str = req->get_query_param("port");
@@ -1159,7 +1162,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
             port_str.empty() ? "<missing>" : port_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id, ip, or port\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
 
     int id, port;
@@ -1183,33 +1186,68 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
             id_str, port_str, weight_str, priority_str, e.what());
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid parameter: id, port, weight, and priority must be valid integers\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
 
-    // Parse and validate IP address
+    // Resolve address: supports both direct IP addresses and hostnames
     socket_address addr;
+    std::string resolved_ip;
+    bool needs_dns_resolution = false;
+
+    // Fast path: Try parsing as direct IP address (most common case)
     try {
-        addr = socket_address(ipv4_addr(std::string(ip_str), port));
-    } catch (const std::exception& e) {
-        log_control.warn("POST /admin/backends: invalid IP address '{}': {}", ip_str, e.what());
-        rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->write_body("json", "{\"error\": \"Invalid IP address format\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        auto ip_string = std::string(ip_str);
+        seastar::net::inet_address parsed_addr{ip_string};
+        addr = seastar::socket_address(parsed_addr, static_cast<uint16_t>(port));
+        resolved_ip = ip_string;
+    } catch (...) {
+        // Not a valid IP address, will need DNS resolution
+        needs_dns_resolution = true;
+    }
+
+    // Slow path: DNS resolution for hostname (co_await not allowed in catch blocks)
+    if (needs_dns_resolution) {
+        log_control.debug("POST /admin/backends: '{}' is not a direct IP, attempting DNS resolution", ip_str);
+
+        try {
+            auto hostent = co_await seastar::net::dns::get_host_by_name(std::string(ip_str));
+
+            if (hostent.addr_list.empty()) {
+                log_control.warn("POST /admin/backends: DNS resolution returned no addresses for '{}'", ip_str);
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->write_body("json", "{\"error\": \"DNS resolution returned no addresses for hostname\"}");
+                co_return std::move(rep);
+            }
+
+            addr = seastar::socket_address(hostent.addr_list[0], static_cast<uint16_t>(port));
+            // Convert resolved address back to string for logging/persistence
+            std::ostringstream oss;
+            oss << hostent.addr_list[0];
+            resolved_ip = oss.str();
+
+            log_control.info("POST /admin/backends: resolved hostname '{}' to IP '{}'", ip_str, resolved_ip);
+
+        } catch (const std::exception& e) {
+            log_control.warn("POST /admin/backends: failed to resolve '{}': {}", ip_str, e.what());
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid IP address or hostname could not be resolved\"}");
+            co_return std::move(rep);
+        }
     }
 
     // Queue backend for async persistence (fire-and-forget, non-blocking)
+    // Store the resolved IP, not the hostname, for persistence
     if (_persistence) {
-        _persistence->queue_save_backend(id, std::string(ip_str), static_cast<uint16_t>(port), weight, priority);
+        _persistence->queue_save_backend(id, resolved_ip, static_cast<uint16_t>(port), weight, priority);
     }
 
-    return _router.register_backend_global(id, addr, weight, priority).then(
-        [id, ip_str, port, weight, priority, rep = std::move(rep)]() mutable {
-        log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={})",
-            id, ip_str, port, weight, priority);
-        rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
-            ", \"priority\": " + std::to_string(priority) + "}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
-    });
+    co_await _router.register_backend_global(id, addr, weight, priority);
+
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={})",
+        id, ip_str, port, weight, priority);
+    rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
+        ", \"priority\": " + std::to_string(priority) + "}");
+    co_return std::move(rep);
 }
 
 // ---------------------------------------------------------

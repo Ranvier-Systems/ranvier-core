@@ -258,11 +258,13 @@ paths:
             example: 1
         - name: ip
           in: query
-          description: Backend server IPv4 address
+          description: |
+            Backend server address. Accepts either:
+            - IPv4 address (e.g., "192.168.1.100")
+            - Hostname that will be resolved via DNS (e.g., "host.docker.internal")
           required: true
           schema:
             type: string
-            format: ipv4
             example: "192.168.1.100"
         - name: port
           in: query
@@ -317,9 +319,13 @@ paths:
                   value:
                     error: "Invalid parameter: id, port, weight, and priority must be valid integers"
                 invalidIP:
-                  summary: Invalid IP address
+                  summary: Invalid IP address or hostname
                   value:
-                    error: "Invalid IP address format"
+                    error: "Invalid IP address or hostname could not be resolved"
+                dnsNoAddresses:
+                  summary: DNS resolution returned no addresses
+                  value:
+                    error: "DNS resolution returned no addresses for hostname"
         '401':
           $ref: '#/components/responses/Unauthorized'
 
