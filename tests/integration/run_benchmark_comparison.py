@@ -319,8 +319,8 @@ def format_stress_test_report(
     lines.append("OVERALL RESULTS")
     lines.append("-" * 100)
 
-    pa_hit_rate = prefix_results.get("cache_hit_rate_pct", 0)
-    rr_hit_rate = random_results.get("cache_hit_rate_pct", 0)
+    pa_hit_rate = prefix_results.get("cache_hit_rate_pct") or 0
+    rr_hit_rate = random_results.get("cache_hit_rate_pct") or 0
     lines.append(f"  Cache Hit Rate: {rr_hit_rate:.1f}% (random) -> {pa_hit_rate:.1f}% (prefix-affinity)")
 
     pa_improvement = prefix_results.get("ttft_improvement_pct")
