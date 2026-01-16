@@ -446,6 +446,8 @@ private:
     uint64_t _duplicates_suppressed = 0;
     uint64_t _max_retries_exceeded = 0;
     uint64_t _dedup_peers_overflow = 0;  // Times dedup peer limit was hit (Rule #4)
+    uint64_t _pending_acks_overflow = 0;  // Times pending acks limit was hit (Rule #4)
+    uint64_t _stats_pending_acks_count = 0;  // Current count of pending acks (gauge)
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;
@@ -557,6 +559,11 @@ private:
     // Deduplication limits (Rule #4: bounded containers)
     // Prevents OOM from malicious peers flooding unique source addresses
     static constexpr size_t MAX_DEDUP_PEERS = 10000;  // Max unique peers to track for dedup
+
+    // Pending ACKs limits (Rule #4: bounded containers)
+    // Prevents OOM if peers become unresponsive faster than retries expire
+    // 1000 allows ~100 peers * 10 in-flight messages each
+    static constexpr size_t MAX_PENDING_ACKS = 1000;
 
     void update_peer_liveness(const seastar::socket_address& addr);
     void check_liveness();

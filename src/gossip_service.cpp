@@ -72,6 +72,10 @@ GossipService::GossipService(const ClusterConfig& config)
             seastar::metrics::description("Total number of route announcements that exceeded max retries")),
         seastar::metrics::make_counter("cluster_dedup_peers_overflow", _dedup_peers_overflow,
             seastar::metrics::description("Times dedup peer limit was reached, new peers not tracked (Rule #4: bounded containers)")),
+        seastar::metrics::make_counter("cluster_pending_acks_overflow", _pending_acks_overflow,
+            seastar::metrics::description("Times pending acks limit was reached, new acks not tracked (Rule #4: bounded containers)")),
+        seastar::metrics::make_gauge("cluster_pending_acks_count", _stats_pending_acks_count,
+            seastar::metrics::description("Current number of pending ACKs awaiting response")),
         // DTLS encryption metrics
         seastar::metrics::make_counter("cluster_dtls_handshakes_started", _dtls_handshakes_started,
             seastar::metrics::description("Total number of DTLS handshakes initiated")),
@@ -335,6 +339,7 @@ seastar::future<> GossipService::stop() {
 
     // Clear pending ACKs (no point in retrying during shutdown)
     _pending_acks.clear();
+    _stats_pending_acks_count = 0;
 
     // Stop DNS discovery
     _discovery_enabled = false;
@@ -498,13 +503,22 @@ seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tok
 
         // Track pending ACK if reliable delivery is enabled
         if (_config.gossip_reliable_delivery) {
-            PendingAck pending;
-            pending.seq_num = pkt.seq_num;
-            pending.serialized_packet = serialized;
-            pending.next_retry = seastar::lowres_clock::now() + _config.gossip_ack_timeout;
-            pending.retry_count = 0;
-            _pending_acks[peer][pkt.seq_num] = std::move(pending);
-            log_gossip.trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
+            // Rule #4: Check bounds before adding to _pending_acks
+            if (_stats_pending_acks_count >= MAX_PENDING_ACKS) {
+                ++_pending_acks_overflow;
+                log_gossip.warn("Pending acks limit reached ({}), not tracking ACK for peer={}, seq_num={}",
+                               MAX_PENDING_ACKS, peer, pkt.seq_num);
+                // Still send the packet, just don't track for retries
+            } else {
+                PendingAck pending;
+                pending.seq_num = pkt.seq_num;
+                pending.serialized_packet = serialized;
+                pending.next_retry = seastar::lowres_clock::now() + _config.gossip_ack_timeout;
+                pending.retry_count = 0;
+                _pending_acks[peer][pkt.seq_num] = std::move(pending);
+                ++_stats_pending_acks_count;
+                log_gossip.trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
+            }
         }
 
         // Use DTLS encryption if enabled
@@ -1065,7 +1079,11 @@ seastar::future<> GossipService::refresh_peers() {
                 log_gossip.info("DNS discovery: peer removed: {}", addr);
 
                 // Clean up reliable delivery state for removed peer
-                _pending_acks.erase(addr);
+                auto pa_it = _pending_acks.find(addr);
+                if (pa_it != _pending_acks.end()) {
+                    _stats_pending_acks_count -= pa_it->second.size();
+                    _pending_acks.erase(pa_it);
+                }
                 _peer_seq_counters.erase(addr);
                 _received_seq_windows.erase(addr);
                 _received_seq_sets.erase(addr);
@@ -1180,6 +1198,7 @@ void GossipService::handle_ack(const seastar::socket_address& peer, uint32_t seq
     log_gossip.trace("Received ACK: peer={}, seq_num={}", peer, seq_num);
     pending_map.erase(ack_it);
     ++_acks_received;
+    --_stats_pending_acks_count;
 
     // Clean up empty peer entry
     if (pending_map.empty()) {
@@ -1326,6 +1345,7 @@ void GossipService::process_retries() {
         // Remove entries that exceeded max retries
         for (uint32_t seq_num : to_remove) {
             pending_map.erase(seq_num);
+            --_stats_pending_acks_count;
         }
     }
 
@@ -1757,6 +1777,7 @@ void GossipService::start_resync() {
 
     // Clear pending ACKs to avoid stale retries during re-sync
     _pending_acks.clear();
+    _stats_pending_acks_count = 0;
 
     // SECURITY: DO NOT clear _received_seq_windows and _received_seq_sets!
     // These sliding windows MUST persist across resync events to prevent
