@@ -1192,14 +1192,20 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     // Resolve address: supports both direct IP addresses and hostnames
     socket_address addr;
     std::string resolved_ip;
+    bool needs_dns_resolution = false;
 
     // Fast path: Try parsing as direct IP address (most common case)
     try {
-        seastar::net::inet_address inet_addr(std::string(ip_str));
-        addr = seastar::socket_address(inet_addr, static_cast<uint16_t>(port));
+        seastar::net::inet_address parsed_addr(std::string(ip_str));
+        addr = seastar::socket_address(parsed_addr, static_cast<uint16_t>(port));
         resolved_ip = std::string(ip_str);
     } catch (...) {
-        // Not a valid IP address, try DNS resolution for hostname
+        // Not a valid IP address, will need DNS resolution
+        needs_dns_resolution = true;
+    }
+
+    // Slow path: DNS resolution for hostname (co_await not allowed in catch blocks)
+    if (needs_dns_resolution) {
         log_control.debug("POST /admin/backends: '{}' is not a direct IP, attempting DNS resolution", ip_str);
 
         try {
