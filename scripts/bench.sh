@@ -125,6 +125,7 @@ OPTIONS:
     --skip-setup        Skip system configuration (for repeated runs)
     --skip-vllm         Don't start vLLM (use existing endpoints)
     --vllm-host HOST    vLLM host IP (default: localhost, for --skip-vllm)
+    --install-deps      Install vLLM and dependencies before running
     --dry-run           Show what would be done without executing
     -h, --help          Show this help message
 
@@ -163,6 +164,7 @@ COMPARE=false
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
+INSTALL_DEPS=false
 DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
@@ -178,6 +180,7 @@ while [[ $# -gt 0 ]]; do
         --skip-setup)   SKIP_SETUP=true; shift ;;
         --skip-vllm)    SKIP_VLLM=true; shift ;;
         --vllm-host)    VLLM_HOST="$2"; shift 2 ;;
+        --install-deps) INSTALL_DEPS=true; shift ;;
         --dry-run)      DRY_RUN=true; shift ;;
         -h|--help)      print_help; exit 0 ;;
         *)              log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -226,6 +229,14 @@ fi
 # Check Docker
 if ! command -v docker &> /dev/null; then
     log_error "Docker not found. Please install Docker first."
+    exit 1
+fi
+
+# Check if user can run docker
+if ! docker ps &> /dev/null; then
+    log_error "Cannot run docker commands. You may need to add yourself to the docker group:"
+    log_info "  sudo usermod -aG docker \$USER"
+    log_info "  newgrp docker  # or log out and back in"
     exit 1
 fi
 log_ok "Docker available"
@@ -280,6 +291,32 @@ if [[ "$SKIP_SETUP" = false ]]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Install dependencies (optional)
+# -----------------------------------------------------------------------------
+
+if [[ "$INSTALL_DEPS" = true ]]; then
+    log_header "Installing Dependencies"
+
+    if command -v pip3 &> /dev/null; then
+        PIP="pip3"
+    elif command -v pip &> /dev/null; then
+        PIP="pip"
+    else
+        log_error "pip not found. Please install Python pip first."
+        exit 1
+    fi
+
+    log_info "Installing vLLM (this may take a few minutes)..."
+    $PIP install vllm 2>&1 | tail -5
+    log_ok "vLLM installed"
+
+    # numpy<2 compatibility fix for vLLM
+    log_info "Installing numpy<2 (vLLM compatibility fix)..."
+    $PIP install "numpy<2" 2>&1 | tail -2
+    log_ok "numpy<2 installed"
+fi
+
+# -----------------------------------------------------------------------------
 # Dry run output
 # -----------------------------------------------------------------------------
 
@@ -311,7 +348,13 @@ if [[ "$SKIP_VLLM" = false ]]; then
 
     # Check if vLLM is available
     if ! python3 -c "import vllm" 2>/dev/null; then
-        log_error "vLLM not installed. Install with: pip install vllm"
+        log_error "vLLM not installed."
+        log_info "Install manually:"
+        log_info "  pip install vllm"
+        log_info "  pip install 'numpy<2'  # compatibility fix"
+        log_info ""
+        log_info "Or re-run with --install-deps:"
+        log_info "  $0 --install-deps"
         exit 1
     fi
 
