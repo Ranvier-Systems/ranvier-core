@@ -267,7 +267,7 @@ def format_comparison_table(prefix_results: Dict, random_results: Dict) -> str:
     # Overall assessment
     lines.append("")
     p99_prefix = prefix_results.get("p99_ttft_ms")
-    p99_rr = roundrobin_results.get("p99_ttft_ms")
+    p99_rr = random_results.get("p99_ttft_ms")
 
     if p99_prefix and p99_rr:
         if p99_prefix < p99_rr:
