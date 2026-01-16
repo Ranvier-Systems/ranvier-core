@@ -1196,9 +1196,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 
     // Fast path: Try parsing as direct IP address (most common case)
     try {
-        seastar::net::inet_address parsed_addr(std::string(ip_str));
+        auto ip_string = std::string(ip_str);
+        seastar::net::inet_address parsed_addr{ip_string};
         addr = seastar::socket_address(parsed_addr, static_cast<uint16_t>(port));
-        resolved_ip = std::string(ip_str);
+        resolved_ip = ip_string;
     } catch (...) {
         // Not a valid IP address, will need DNS resolution
         needs_dns_resolution = true;
