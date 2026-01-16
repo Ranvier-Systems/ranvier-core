@@ -212,6 +212,15 @@ public:
     // Check if currently draining
     bool is_draining() const;
 
+    // Remove circuit breaker entry for a deregistered backend (Rule #4: bounded container cleanup)
+    // Called via RouterService callback when a backend is unregistered from all shards
+    void remove_circuit(BackendId backend_id) {
+        _circuit_breaker.remove_circuit(backend_id);
+    }
+
+    // Get circuit breaker metrics for Prometheus
+    uint64_t get_circuits_removed() const { return _circuit_breaker.get_circuits_removed(); }
+
 private:
     TokenizerService& _tokenizer;
     RouterService& _router;

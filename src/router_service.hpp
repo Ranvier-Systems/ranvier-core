@@ -197,6 +197,14 @@ public:
     // Set callback to be invoked when a backend is fully removed (for pool cleanup)
     void set_pool_cleanup_callback(PoolCleanupCallback callback);
 
+    // Callback type for circuit breaker cleanup when a backend is unregistered
+    // Called on each shard during unregister_backend_global() to clean up circuit entries
+    using CircuitCleanupCallback = std::function<void(BackendId)>;
+
+    // Set shard-local callback for circuit cleanup (must be called on each shard)
+    // The callback is stored in thread-local state and invoked during backend unregistration
+    static void set_circuit_cleanup_callback(CircuitCleanupCallback callback);
+
     // Start the draining reaper timer (call after Seastar is initialized)
     void start_draining_reaper();
 
