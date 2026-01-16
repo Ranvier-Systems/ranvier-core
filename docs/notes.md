@@ -2232,3 +2232,152 @@ export BENCHMARK_MODE=hash ...
 export RANVIER_ROUTING_MODE=prefix
 export BENCHMARK_MODE=prefix ...
 
+
+##### ---- Benchmark Setup
+
+
+### Host setup
+host=150.136.208.179
+scp ~/.ssh/id_rsa ~/.ssh/id_rsa.pub ubuntu@${host}:~/.ssh/
+
+
+### VLLM Setup
+
+# Install vLLM
+pip install vllm
+pip install "numpy<2"
+
+export HF_TOKEN=<your_token>
+export VLLM_MODEL=meta-llama/Llama-3.1-8B-Instruct
+
+# Model meta-llama/Llama-3.2-1B-Instruct
+python -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-3.2-1B-Instruct --host 0.0.0.0 --port 8000 --enable-prefix-caching
+
+# Model meta-llama/Llama-3.1-8B-Instruct
+vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-prefix-caching --max-model-len 8192 --port 8000
+
+# Start 8 instances (one per GPU)
+for i in {0..7}; do
+  CUDA_VISIBLE_DEVICES=$i HF_TOKEN=$HF_TOKEN \
+  vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --enable-prefix-caching \
+    --max-model-len 8192 \
+    --port $((8000 + i)) \
+    > /tmp/vllm-$i.log 2>&1 &
+  echo "Started vLLM on GPU $i, port $((8000 + i))"
+done
+
+for i in {0..7}; do
+  curl -s http://localhost:$((8000 + i))/health && echo " - GPU $i ready"
+done
+
+
+### Ranvier Setup
+
+git clone git@github.com:Ranvier-Systems/ranvier-core.git
+
+sudo usermod -aG docker $USER
+newgrp docker
+
+set -o vi
+alias h=history
+alias today='/bin/date +%Y%m%d'
+
+docker compose -f docker-compose.benchmark-real.yml up -d ranvier1 ranvier2 ranvier3
+
+export RANVIER_ROUTING_MODE=prefix
+export BENCHMARK_MODE=prefix 
+
+export NUM_BACKENDS=8
+export BACKEND_BASE_IP=172.17.0.1
+export BACKEND_PORT_START=8000
+
+export NUM_RANVIER_NODES=3
+export RANVIER_BASE_IP=localhost
+export RANVIER_PORT_START=8081
+
+pip install locust requests
+locust -f tests/integration/locustfile_real.py --headless --users 10 --spawn-rate 2 --run-time 5m --host http://localhost:8081 2>&1 |tee ${BENCHMARK_MODE}-`today`.stdout
+
+
+### Monitor
+ubuntu@150-136-208-179:~$ ./ranvier-core/tools/rvctl --url http://localhost:8081 cluster status
+Fetching cluster status from http://localhost:8081...
+
+Cluster Status
+============================================================
+  Quorum State:       HEALTHY
+  Quorum Required:    2 peers
+  Peers Alive:        2 / 2
+  Peers Recently Seen: 2
+  Local Backend ID:   0
+  Node Status:        ACTIVE
+
+Peer Table
+────────────────────────────────────────────────────────────
+           Address          │   Status   │    Last Seen   
+  ──────────────────────────┼────────────┼────────────────
+       172.29.2.3:9190      │ ALIVE │   20469d ago   
+       172.29.2.2:9190      │ ALIVE │   20469d ago   
+
+ubuntu@150-136-208-179:~$ ./ranvier-core/tools/rvctl --url http://localhost:8081 inspect backends
+
+
+
+===
+ubuntu@150-136-208-179:~/ranvier-core$ docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real down
+[+] Running 4/4
+ ✔ Container ranvier-bench2                          Removed                                                                                                                                           2.0s 
+ ✔ Container ranvier-bench3                          Removed                                                                                                                                           1.8s 
+ ✔ Container ranvier-bench1                          Removed                                                                                                                                           2.1s 
+ ✔ Network ranvier-benchmark-real_ranvier-benchmark  Removed                                                                                                                                           0.2s 
+
+
+
+# Stop and remove the running containers
+docker rm -f ranvier-bench1 ranvier-bench2 ranvier-bench3
+
+# Clean up orphan networks
+docker network prune -f
+
+# Now rebuild and start fresh
+docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real up -d ranvier1 ranvier2 ranvier3
+
+
+
+
+# Add routes
+ubuntu@150-136-208-179:~/ranvier-core$ for i in {0..7}; do   curl -X POST "http://localhost:8081/admin/backends?id=$((i+1))&ip=172.17.0.1&port=$((8000+i))";   echo ""; done
+
+
+### View logs
+# Single node
+docker logs ranvier-bench1
+
+# Follow logs in real-time
+docker logs -f ranvier-bench1
+
+# All 3 nodes combined
+docker logs ranvier-bench1 & docker logs ranvier-bench2 & docker logs ranvier-bench3
+
+# Or with docker compose (shows all services)
+docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real logs
+
+# Follow all with compose
+docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real logs -f
+
+# Just Ranvier nodes (not vLLM/locust)
+docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real logs ranvier1 ranvier2 ranvier3
+
+
+
+
+# Use host.docker.internal instead of 172.17.0.1
+export BACKEND_BASE_IP=host.docker.internal
+export BACKEND_PORT_START=8000
+export NUM_BACKENDS=8
+export VLLM_MODEL="meta-llama/Llama-3.1-8B-Instruct"
+
+# Now run the benchmark
+python3 tests/integration/run_benchmark_comparison.py --stress --num-backends 8 --duration 2m
+
