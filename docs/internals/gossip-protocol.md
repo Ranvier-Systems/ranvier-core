@@ -599,13 +599,16 @@ All metrics are exposed via Prometheus on port 9180.
 
 ### Reliable Delivery Counters
 
-| Metric | Description |
-|--------|-------------|
-| `ranvier_cluster_acks_sent` | ACKs sent |
-| `ranvier_cluster_acks_received` | ACKs received |
-| `ranvier_cluster_retries_sent` | Retry transmissions |
-| `ranvier_cluster_duplicates_suppressed` | Duplicate announcements filtered |
-| `ranvier_cluster_max_retries_exceeded` | Announcements dropped after max retries |
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ranvier_cluster_acks_sent` | Counter | ACKs sent |
+| `ranvier_cluster_acks_received` | Counter | ACKs received |
+| `ranvier_cluster_retries_sent` | Counter | Retry transmissions |
+| `ranvier_cluster_duplicates_suppressed` | Counter | Duplicate announcements filtered |
+| `ranvier_cluster_max_retries_exceeded` | Counter | Announcements dropped after max retries |
+| `ranvier_cluster_dedup_peers_overflow` | Counter | Times dedup peer limit (10000) was reached |
+| `ranvier_cluster_pending_acks_overflow` | Counter | Times pending ACKs limit (1000) was reached |
+| `ranvier_cluster_pending_acks_count` | Gauge | Current number of pending ACKs awaiting response |
 
 ### Peer Health
 

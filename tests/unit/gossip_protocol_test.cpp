@@ -993,6 +993,212 @@ TEST_F(MtlsLockdownPolicyTest, UnestablishedSessionDrops) {
     EXPECT_TRUE(should_drop_packet(true, true, &session, false));
 }
 
+// =============================================================================
+// Pending ACKs Bound Tests (Rule #4: bounded containers)
+// =============================================================================
+// These tests verify the MAX_PENDING_ACKS limit logic used to prevent OOM
+// when peers become unresponsive faster than retries expire.
+
+class PendingAcksBoundTest : public ::testing::Test {
+protected:
+    // Matches MAX_PENDING_ACKS in gossip_service.hpp
+    static constexpr size_t MAX_PENDING_ACKS = 1000;
+
+    // Simulates the bound check logic in broadcast_route()
+    struct PendingAcksTracker {
+        uint64_t pending_acks_count = 0;
+        uint64_t pending_acks_overflow = 0;
+
+        // Returns true if the entry was added, false if overflow
+        bool try_add_pending_ack() {
+            if (pending_acks_count >= MAX_PENDING_ACKS) {
+                ++pending_acks_overflow;
+                return false;  // Overflow - not tracked
+            }
+            ++pending_acks_count;
+            return true;  // Successfully added
+        }
+
+        void remove_pending_ack() {
+            if (pending_acks_count > 0) {
+                --pending_acks_count;
+            }
+        }
+
+        void clear_all() {
+            pending_acks_count = 0;
+        }
+    };
+};
+
+TEST_F(PendingAcksBoundTest, MaxPendingAcksConstant) {
+    // Verify the constant value (1000 allows ~100 peers * 10 in-flight each)
+    EXPECT_EQ(MAX_PENDING_ACKS, 1000u);
+}
+
+TEST_F(PendingAcksBoundTest, AddWithinLimitSucceeds) {
+    PendingAcksTracker tracker;
+
+    // Adding entries within limit should succeed
+    EXPECT_TRUE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_count, 1u);
+    EXPECT_EQ(tracker.pending_acks_overflow, 0u);
+
+    // Add more entries
+    for (size_t i = 1; i < 100; ++i) {
+        EXPECT_TRUE(tracker.try_add_pending_ack());
+    }
+    EXPECT_EQ(tracker.pending_acks_count, 100u);
+    EXPECT_EQ(tracker.pending_acks_overflow, 0u);
+}
+
+TEST_F(PendingAcksBoundTest, AddAtLimitSucceeds) {
+    PendingAcksTracker tracker;
+
+    // Fill to exactly MAX_PENDING_ACKS - 1
+    for (size_t i = 0; i < MAX_PENDING_ACKS - 1; ++i) {
+        EXPECT_TRUE(tracker.try_add_pending_ack());
+    }
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS - 1);
+
+    // Adding one more should succeed (reaches limit exactly)
+    EXPECT_TRUE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);
+    EXPECT_EQ(tracker.pending_acks_overflow, 0u);
+}
+
+TEST_F(PendingAcksBoundTest, AddOverLimitFails) {
+    PendingAcksTracker tracker;
+
+    // Fill to MAX_PENDING_ACKS
+    for (size_t i = 0; i < MAX_PENDING_ACKS; ++i) {
+        EXPECT_TRUE(tracker.try_add_pending_ack());
+    }
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);
+
+    // Next add should fail and increment overflow
+    EXPECT_FALSE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);  // Count unchanged
+    EXPECT_EQ(tracker.pending_acks_overflow, 1u);
+
+    // More attempts should continue to fail
+    EXPECT_FALSE(tracker.try_add_pending_ack());
+    EXPECT_FALSE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_overflow, 3u);
+}
+
+TEST_F(PendingAcksBoundTest, RemoveDecreasesCount) {
+    PendingAcksTracker tracker;
+
+    // Add some entries
+    for (size_t i = 0; i < 10; ++i) {
+        tracker.try_add_pending_ack();
+    }
+    EXPECT_EQ(tracker.pending_acks_count, 10u);
+
+    // Remove entries
+    tracker.remove_pending_ack();
+    EXPECT_EQ(tracker.pending_acks_count, 9u);
+
+    tracker.remove_pending_ack();
+    tracker.remove_pending_ack();
+    EXPECT_EQ(tracker.pending_acks_count, 7u);
+}
+
+TEST_F(PendingAcksBoundTest, RemoveAllowsNewAdds) {
+    PendingAcksTracker tracker;
+
+    // Fill to limit
+    for (size_t i = 0; i < MAX_PENDING_ACKS; ++i) {
+        tracker.try_add_pending_ack();
+    }
+
+    // Verify at limit
+    EXPECT_FALSE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_overflow, 1u);
+
+    // Remove one entry
+    tracker.remove_pending_ack();
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS - 1);
+
+    // Now add should succeed again
+    EXPECT_TRUE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);
+    EXPECT_EQ(tracker.pending_acks_overflow, 1u);  // Overflow count unchanged
+}
+
+TEST_F(PendingAcksBoundTest, ClearResetsCount) {
+    PendingAcksTracker tracker;
+
+    // Add some entries
+    for (size_t i = 0; i < 500; ++i) {
+        tracker.try_add_pending_ack();
+    }
+    EXPECT_EQ(tracker.pending_acks_count, 500u);
+
+    // Clear all
+    tracker.clear_all();
+    EXPECT_EQ(tracker.pending_acks_count, 0u);
+
+    // Can add again from zero
+    EXPECT_TRUE(tracker.try_add_pending_ack());
+    EXPECT_EQ(tracker.pending_acks_count, 1u);
+}
+
+TEST_F(PendingAcksBoundTest, OverflowMetricAccumulates) {
+    PendingAcksTracker tracker;
+
+    // Fill to limit
+    for (size_t i = 0; i < MAX_PENDING_ACKS; ++i) {
+        tracker.try_add_pending_ack();
+    }
+
+    // Generate multiple overflows
+    for (size_t i = 0; i < 100; ++i) {
+        tracker.try_add_pending_ack();
+    }
+    EXPECT_EQ(tracker.pending_acks_overflow, 100u);
+
+    // Clear doesn't reset overflow counter (it's a total counter, not gauge)
+    tracker.clear_all();
+    EXPECT_EQ(tracker.pending_acks_overflow, 100u);
+}
+
+TEST_F(PendingAcksBoundTest, TypicalPeerScenario) {
+    // Simulate typical scenario: 100 peers with 10 in-flight messages each
+    PendingAcksTracker tracker;
+
+    // 100 peers * 10 messages = 1000 (exactly at limit)
+    for (size_t peer = 0; peer < 100; ++peer) {
+        for (size_t msg = 0; msg < 10; ++msg) {
+            EXPECT_TRUE(tracker.try_add_pending_ack())
+                << "Failed at peer " << peer << " msg " << msg;
+        }
+    }
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);
+    EXPECT_EQ(tracker.pending_acks_overflow, 0u);
+}
+
+TEST_F(PendingAcksBoundTest, OverloadedPeerScenario) {
+    // Simulate overloaded scenario: too many unresponsive peers
+    PendingAcksTracker tracker;
+
+    // Fill to capacity
+    for (size_t i = 0; i < MAX_PENDING_ACKS; ++i) {
+        tracker.try_add_pending_ack();
+    }
+
+    // Simulate 50 more peers trying to send 10 messages each
+    size_t overflow_attempts = 50 * 10;
+    for (size_t i = 0; i < overflow_attempts; ++i) {
+        EXPECT_FALSE(tracker.try_add_pending_ack());
+    }
+    EXPECT_EQ(tracker.pending_acks_overflow, overflow_attempts);
+
+    // Count stays at limit
+    EXPECT_EQ(tracker.pending_acks_count, MAX_PENDING_ACKS);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

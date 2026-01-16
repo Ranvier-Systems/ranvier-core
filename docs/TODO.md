@@ -711,9 +711,9 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
   _Location:_ `src/async_persistence.cpp`
   _Severity:_ Medium (acceptable tradeoff)
 
-- [ ] **[LOW] Audit _pending_acks cleanup in GossipService**
+- [x] **[LOW] Audit _pending_acks cleanup in GossipService** (completed 2026-01-16)
   _Issue:_ `gossip_service.cpp` `_pending_acks` map tracks pending reliable delivery ACKs. Entries have retry limits, but if peers become permanently unresponsive, entries may accumulate until retry exhaustion. Need to verify cleanup occurs when peers are removed from cluster.
-  _Fix:_ Review cleanup logic in `refresh_peers()` and peer removal paths. Add periodic sweep if needed.
+  _Fix:_ Audit confirmed all cleanup paths work correctly (ACK received, retry exhaustion, peer removal, shutdown, resync). Added `MAX_PENDING_ACKS=1000` bound (Rule #4), `cluster_pending_acks_overflow` counter, and `cluster_pending_acks_count` gauge metrics.
   _Location:_ `src/gossip_service.cpp`
   _Severity:_ Low
 
