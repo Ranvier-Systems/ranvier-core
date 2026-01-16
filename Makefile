@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
+.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
 
 # Default target
 all: build
@@ -205,6 +205,31 @@ benchmark-down:
 	@echo "Stopping benchmark cluster..."
 	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans
 	@echo "Cleanup complete"
+
+# ============================================================================
+# Simplified Lambda Labs Benchmark (One Command)
+# ============================================================================
+# Use this for quick benchmarking on Lambda Labs GPU instances.
+# Auto-detects GPUs, starts vLLM, runs benchmark, cleans up.
+#
+# Usage:
+#   make bench                              # Simple defaults
+#   make bench MODEL=meta-llama/Llama-3.1-8B-Instruct
+#   make bench GPUS=4 DURATION=10m
+#   make bench COMPARE=1                    # A/B comparison
+
+.PHONY: bench
+
+bench:
+	@./scripts/bench.sh \
+		$(if $(MODEL),--model $(MODEL)) \
+		$(if $(GPUS),--gpus $(GPUS)) \
+		$(if $(DURATION),--duration $(DURATION)) \
+		$(if $(USERS),--users $(USERS)) \
+		$(if $(filter 1 true yes,$(COMPARE)),--compare) \
+		$(if $(filter 1 true yes,$(SKIP_SETUP)),--skip-setup) \
+		$(if $(filter 1 true yes,$(SKIP_VLLM)),--skip-vllm) \
+		$(if $(VLLM_HOST),--vllm-host $(VLLM_HOST))
 
 # ============================================================================
 # Real vLLM Backend Benchmarking
@@ -596,6 +621,13 @@ help:
 	@echo "  make benchmark      - Run Locust load test with mock backends"
 	@echo "  make benchmark-up   - Start cluster with Locust web UI (port 8089)"
 	@echo "  make benchmark-down - Stop benchmark cluster"
+	@echo ""
+	@echo "Lambda Labs Benchmark (RECOMMENDED - one command, auto-detects GPUs):"
+	@echo "  make bench          - Auto-detect GPUs, start vLLM, run benchmark"
+	@echo "  make bench MODEL=meta-llama/Llama-3.1-8B-Instruct"
+	@echo "  make bench GPUS=4 DURATION=10m USERS=20"
+	@echo "  make bench COMPARE=1              - A/B: prefix vs round-robin"
+	@echo "  ./scripts/bench.sh --help         - Full options"
 	@echo ""
 	@echo "Real vLLM Backend Benchmark (validates prefix-aware routing value):"
 	@echo "  make benchmark-real       - Run with external vLLM endpoints"

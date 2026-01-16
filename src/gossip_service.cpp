@@ -2120,8 +2120,11 @@ GossipService::ClusterState GossipService::get_cluster_state() const {
         }
 
         info.is_alive = peer_state.is_alive;
+        // Calculate relative time (ms since last seen) rather than absolute epoch
+        // lowres_clock uses system boot as epoch, not Unix time, so we need relative
+        auto now = seastar::lowres_clock::now();
         info.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            peer_state.last_seen.time_since_epoch()).count();
+            now - peer_state.last_seen).count();
         info.associated_backend = peer_state.associated_backend;
 
         state.peers.push_back(std::move(info));

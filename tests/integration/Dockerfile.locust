@@ -3,9 +3,10 @@
 
 FROM locustio/locust:2.24.0
 
-# Copy all locustfiles into the container (mock and real benchmarks)
+# Copy all locustfiles and dependencies into the container (mock and real benchmarks)
 COPY locustfile.py /mnt/locust/locustfile.py
 COPY locustfile_real.py /mnt/locust/locustfile_real.py
+COPY prompt_loader.py /mnt/locust/prompt_loader.py
 
 # Set working directory
 WORKDIR /mnt/locust

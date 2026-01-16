@@ -252,11 +252,28 @@ services:
       # Backend configuration - use env vars or default to local vLLM
       - VLLM_ENDPOINT_1=${VLLM_ENDPOINT_1:-http://172.29.1.10:8000}
       - VLLM_ENDPOINT_2=${VLLM_ENDPOINT_2:-http://172.29.1.11:8000}
-      # For backend registration
+      # For backend registration - supports multiple config patterns:
+      # Pattern 1: Sequential (BACKEND_BASE_IP + BACKEND_PORT_START + NUM_BACKENDS)
+      - NUM_BACKENDS=${NUM_BACKENDS:-2}
+      - BACKEND_BASE_IP=${BACKEND_BASE_IP:-}
+      - BACKEND_PORT_START=${BACKEND_PORT_START:-8000}
+      # Pattern 2: Per-backend (BACKEND1_IP, BACKEND2_IP, etc.)
       - BACKEND1_IP=${BACKEND1_IP:-172.29.1.10}
       - BACKEND1_PORT=${BACKEND1_PORT:-8000}
       - BACKEND2_IP=${BACKEND2_IP:-172.29.1.11}
       - BACKEND2_PORT=${BACKEND2_PORT:-8000}
+      - BACKEND3_IP=${BACKEND3_IP:-}
+      - BACKEND3_PORT=${BACKEND3_PORT:-8000}
+      - BACKEND4_IP=${BACKEND4_IP:-}
+      - BACKEND4_PORT=${BACKEND4_PORT:-8000}
+      - BACKEND5_IP=${BACKEND5_IP:-}
+      - BACKEND5_PORT=${BACKEND5_PORT:-8000}
+      - BACKEND6_IP=${BACKEND6_IP:-}
+      - BACKEND6_PORT=${BACKEND6_PORT:-8000}
+      - BACKEND7_IP=${BACKEND7_IP:-}
+      - BACKEND7_PORT=${BACKEND7_PORT:-8000}
+      - BACKEND8_IP=${BACKEND8_IP:-}
+      - BACKEND8_PORT=${BACKEND8_PORT:-8000}
       # Model name must match vLLM's loaded model
       - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
       # Benchmark settings
