@@ -127,27 +127,25 @@ def format_timestamp(ms: int) -> str:
 
 
 def format_time_ago(ms: int) -> str:
-    """Format a millisecond timestamp as 'X ago' relative time."""
-    if ms == 0:
-        return "never"
-    try:
-        dt = datetime.fromtimestamp(ms / 1000)
-        now = datetime.now()
-        delta = now - dt
-        seconds = int(delta.total_seconds())
+    """Format milliseconds-ago value as 'X ago' relative time.
 
-        if seconds < 0:
-            return "in the future"
-        elif seconds < 60:
-            return f"{seconds}s ago"
-        elif seconds < 3600:
-            return f"{seconds // 60}m ago"
-        elif seconds < 86400:
-            return f"{seconds // 3600}h ago"
-        else:
-            return f"{seconds // 86400}d ago"
-    except (ValueError, OSError):
-        return f"{ms}ms"
+    Note: The input is milliseconds SINCE last seen (relative), not an absolute timestamp.
+    """
+    if ms == 0:
+        return "just now"
+    if ms < 0:
+        return "in the future"
+
+    seconds = ms // 1000
+
+    if seconds < 60:
+        return f"{seconds}s ago"
+    elif seconds < 3600:
+        return f"{seconds // 60}m ago"
+    elif seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    else:
+        return f"{seconds // 86400}d ago"
 
 
 class TreePrinter:
