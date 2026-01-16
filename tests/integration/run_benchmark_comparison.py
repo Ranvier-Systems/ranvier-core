@@ -111,11 +111,34 @@ def detect_docker_compose() -> str:
 
 def check_vllm_endpoints() -> Tuple[bool, str]:
     """Check if vLLM endpoints are configured or available."""
+    # Check for explicit endpoint variables
     endpoint1 = os.environ.get("VLLM_ENDPOINT_1")
     endpoint2 = os.environ.get("VLLM_ENDPOINT_2")
 
     if endpoint1 and endpoint2:
         return True, f"Using external endpoints: {endpoint1}, {endpoint2}"
+
+    # Check for sequential config pattern (BACKEND_BASE_IP + BACKEND_PORT_START)
+    base_ip = os.environ.get("BACKEND_BASE_IP")
+    port_start = os.environ.get("BACKEND_PORT_START")
+    num_backends = os.environ.get("NUM_BACKENDS")
+
+    if base_ip and port_start:
+        n = int(num_backends) if num_backends else 2
+        endpoints = [f"{base_ip}:{int(port_start) + i}" for i in range(n)]
+        return True, f"Using sequential endpoints: {', '.join(endpoints)}"
+
+    # Check for per-backend config (BACKEND1_IP, BACKEND2_IP, etc.)
+    backend1_ip = os.environ.get("BACKEND1_IP")
+    backend1_port = os.environ.get("BACKEND1_PORT", "8000")
+    if backend1_ip:
+        endpoints = [f"{backend1_ip}:{backend1_port}"]
+        for i in range(2, 9):
+            ip = os.environ.get(f"BACKEND{i}_IP")
+            if ip:
+                port = os.environ.get(f"BACKEND{i}_PORT", "8000")
+                endpoints.append(f"{ip}:{port}")
+        return True, f"Using per-backend endpoints: {', '.join(endpoints)}"
 
     return False, "No VLLM_ENDPOINT_* environment variables set"
 
@@ -643,7 +666,11 @@ def main():
         endpoints_ok, msg = check_vllm_endpoints()
         if not endpoints_ok:
             print(f"Warning: {msg}")
-            print("Tip: Set VLLM_ENDPOINT_1 and VLLM_ENDPOINT_2 or use --local-vllm")
+            print("Tip: Configure endpoints using one of these methods:")
+            print("  - VLLM_ENDPOINT_1=http://host:8000 VLLM_ENDPOINT_2=http://host:8001")
+            print("  - BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 NUM_BACKENDS=8")
+            print("  - BACKEND1_IP=host1 BACKEND2_IP=host2 ...")
+            print("  - Use --local-vllm to start vLLM containers automatically")
             response = input("Continue anyway? (y/N): ")
             if response.lower() != "y":
                 sys.exit(1)
