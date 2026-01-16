@@ -216,6 +216,17 @@ public:
         _circuits.erase(backend_id);
     }
 
+    // Remove circuit entry when backend is deregistered (Rule #4: cleanup for bounded container)
+    // This prevents dead backend circuits from consuming slots until MAX_CIRCUITS is reached.
+    // Must be called from the shard that owns this CircuitBreaker instance.
+    void remove_circuit(BackendId backend_id) {
+        auto it = _circuits.find(backend_id);
+        if (it != _circuits.end()) {
+            _circuits.erase(it);
+            ++_circuits_removed;
+        }
+    }
+
     // Reset all circuits
     void reset_all() {
         _circuits.clear();
@@ -239,6 +250,9 @@ public:
     // Get overflow count for circuit limit (for monitoring)
     uint64_t get_circuits_overflow() const { return _circuits_overflow; }
 
+    // Get count of circuits removed when backends were deregistered (for monitoring)
+    uint64_t get_circuits_removed() const { return _circuits_removed; }
+
     // Hot-reload: Update configuration at runtime
     void update_config(const Config& config) {
         _config = config;
@@ -249,6 +263,7 @@ private:
     Config _config;
     std::unordered_map<BackendId, BackendCircuit> _circuits;
     uint64_t _circuits_overflow = 0;  // Times circuit limit was hit (Rule #4)
+    uint64_t _circuits_removed = 0;   // Circuits cleaned up when backends deregistered (Rule #4)
 };
 
 // Convert circuit state to string for logging

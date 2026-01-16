@@ -430,6 +430,19 @@ seastar::future<> Application::startup() {
         }).then([this] {
             _controller_started = true;
         }).then([this] {
+            // 7b. Register circuit cleanup callback on all shards
+            // This enables RouterService to clean up CircuitBreaker entries when backends
+            // are unregistered (Rule #4: bounded container cleanup)
+            return _controller.invoke_on_all([](HttpController& c) {
+                RouterService::set_circuit_cleanup_callback([&c](BackendId id) {
+                    c.remove_circuit(id);
+                    // Record metric for Prometheus (circuit_breaker_circuits_removed_total)
+                    if (g_metrics) {
+                        metrics().record_circuit_removed();
+                    }
+                });
+            });
+        }).then([this] {
             // 8. Initialize metrics and shard load metrics on ALL shards
             return seastar::smp::invoke_on_all([] {
                 init_metrics();

@@ -109,6 +109,11 @@ struct ShardLocalState {
     std::mt19937 rng;
 
     // ========================================================================
+    // Callbacks (shard-local, set by owning service)
+    // ========================================================================
+    std::function<void(BackendId)> circuit_cleanup_callback;
+
+    // ========================================================================
     // Lifecycle Methods
     // ========================================================================
 
@@ -1141,6 +1146,13 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
             // Also remove from dead backends set if present
             state.dead_backends.erase(id);
 
+            // Clean up circuit breaker entry (Rule #4: bounded container cleanup)
+            if (state.circuit_cleanup_callback) {
+                state.circuit_cleanup_callback(id);
+                log_router.debug("Shard {}: Cleaned up circuit for deregistered backend {}",
+                                 seastar::this_shard_id(), id);
+            }
+
             return seastar::make_ready_future<>();
         });
     });
@@ -1448,6 +1460,12 @@ void RouterService::reset_shard_state_for_testing(const RoutingConfig* cfg) {
         // If no state exists but config provided, create new state
         g_shard_state = std::make_unique<ShardLocalState>();
         g_shard_state->init(*cfg);
+    }
+}
+
+void RouterService::set_circuit_cleanup_callback(CircuitCleanupCallback callback) {
+    if (g_shard_state) {
+        g_shard_state->circuit_cleanup_callback = std::move(callback);
     }
 }
 

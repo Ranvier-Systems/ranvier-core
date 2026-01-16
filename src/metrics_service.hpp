@@ -171,6 +171,9 @@ public:
             seastar::metrics::make_counter("circuit_breaker_opens", _circuit_opens,
                 seastar::metrics::description("Total number of circuit breaker opens")),
 
+            seastar::metrics::make_counter("circuit_breaker_circuits_removed_total", _circuits_removed,
+                seastar::metrics::description("Total number of circuit breaker entries removed when backends were deregistered (Rule #4: bounded container cleanup)")),
+
             seastar::metrics::make_counter("fallback_attempts", _fallback_attempts,
                 seastar::metrics::description("Total number of fallback routing attempts")),
 
@@ -284,6 +287,7 @@ public:
 
     // Record circuit breaker events
     void record_circuit_open() { _circuit_opens++; }
+    void record_circuit_removed() { _circuits_removed++; }
     void record_fallback() { _fallback_attempts++; }
 
     // Record backpressure rejections (503 due to concurrency or persistence limits)
@@ -369,6 +373,7 @@ private:
     uint64_t _requests_connection_error = 0;
     uint64_t _requests_backpressure = 0;
     uint64_t _circuit_opens = 0;
+    uint64_t _circuits_removed = 0;
     uint64_t _fallback_attempts = 0;
     uint64_t _stream_parser_size_rejections = 0;
     uint64_t _backend_metrics_overflow = 0;  // Times backend metrics limit was hit (Rule #4)
