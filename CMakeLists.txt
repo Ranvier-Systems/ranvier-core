@@ -310,6 +310,18 @@ target_link_libraries(quorum_test
 )
 gtest_discover_tests(quorum_test)
 
+# Circuit Breaker Unit Tests (Pure C++, no Seastar dependency)
+# Tests for circuit breaker pattern and remove_circuit cleanup (Rule #4)
+add_executable(circuit_breaker_test
+  tests/unit/circuit_breaker_test.cpp
+)
+target_include_directories(circuit_breaker_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(circuit_breaker_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(circuit_breaker_test)
+
 # ShardedConfig Unit Tests (Requires Seastar types for header includes)
 # Tests ShardedConfig wrapper class for per-core config distribution
 if(Seastar_FOUND)
