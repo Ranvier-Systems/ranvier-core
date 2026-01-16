@@ -251,6 +251,45 @@ The `GossipService` uses `seastar::gate` to track in-flight gossip tasks:
 - `start_resync()` / `end_resync()`: Coordinates cluster resynchronization
 - Gates ensure graceful completion of in-flight operations before node shutdown
 
+### Rate Limiting
+
+Per-IP token bucket rate limiting protects against request floods:
+
+```yaml
+rate_limit:
+  enabled: true
+  requests_per_second: 100    # Refill rate per client
+  burst_size: 50              # Maximum burst capacity
+  cleanup_interval: 60        # Stale bucket cleanup (seconds)
+```
+
+**Memory Safety (Hard Rule #4):**
+
+The rate limiter enforces `MAX_BUCKETS = 100,000` to prevent memory exhaustion from attackers generating requests from unique source IPs. At capacity (~5.6MB per shard), the limiter uses **fail-open** behavior: new clients are allowed without creating buckets. This prevents memory DoS while maintaining availability.
+
+```cpp
+// In rate_limiter.hpp
+static constexpr size_t MAX_BUCKETS = 100'000;
+```
+
+**Automatic Cleanup (Hard Rule #5):**
+
+A background timer removes stale buckets to reclaim memory. The timer uses the gate guard pattern for safe shutdown:
+
+- Cleanup interval configurable (default 60 seconds)
+- Buckets removed after 2× their refill period of inactivity
+- Timer callback acquires `seastar::gate::holder` before accessing state
+- `stop()` closes gate before canceling timer, ensuring no use-after-free
+
+**Prometheus Metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `ranvier_rate_limiter_overflow_total` | Requests bypassing rate limit due to bucket overflow |
+| `ranvier_rate_limiter_buckets_cleaned_total` | Stale buckets removed by automatic cleanup |
+| `ranvier_rate_limiter_bucket_count` | Current number of active rate limit buckets |
+| `ranvier_rate_limiter_bucket_capacity` | Maximum allowed buckets (MAX_BUCKETS constant) |
+
 ### Fail-Open Mode for Split-Brain
 
 For inference workloads that prioritize availability over strict routing consistency, Ranvier supports **fail-open mode** during split-brain (quorum loss):
