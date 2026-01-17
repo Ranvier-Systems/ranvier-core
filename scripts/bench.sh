@@ -85,6 +85,19 @@ log_warn()   { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error()  { echo -e "${RED}✗${NC} $1"; }
 log_step()   { echo -e "  ${BLUE}[$1/$2]${NC} $3"; }
 
+# Parse duration string (e.g., "10m", "1h", "30s") to seconds
+parse_duration() {
+    local duration="$1"
+    local num="${duration%[smhSMH]}"
+    local unit="${duration##*[0-9]}"
+    case "$unit" in
+        s|S) echo "$num" ;;
+        m|M) echo $((num * 60)) ;;
+        h|H) echo $((num * 3600)) ;;
+        *)   echo "$num" ;;  # Assume seconds if no unit
+    esac
+}
+
 # -----------------------------------------------------------------------------
 # Cleanup handler
 # -----------------------------------------------------------------------------
@@ -827,6 +840,14 @@ run_benchmark() {
     local LABEL="$2"
     local STEP="${3:-}"  # Optional step indicator like "[1/2]"
 
+    # Calculate expected end time
+    local DURATION_SECS
+    DURATION_SECS=$(parse_duration "$DURATION")
+    local START_TIME
+    START_TIME=$(date +%H:%M)
+    local END_TIME
+    END_TIME=$(date -d "+${DURATION_SECS} seconds" +%H:%M 2>/dev/null || date -v+${DURATION_SECS}S +%H:%M 2>/dev/null || echo "")
+
     # Prominent banner for visibility
     echo ""
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
@@ -838,7 +859,11 @@ run_benchmark() {
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
     echo "  Model:        $MODEL"
     echo "  Backends:     $GPUS"
-    echo "  Duration:     $DURATION"
+    if [[ -n "$END_TIME" ]]; then
+        echo "  Duration:     $DURATION (${START_TIME} -> ~${END_TIME})"
+    else
+        echo "  Duration:     $DURATION"
+    fi
     echo "  Users:        $USERS"
     echo "  Routing:      $ROUTING_MODE"
     echo "  Prompt Dist:  $PROMPT_DIST"
