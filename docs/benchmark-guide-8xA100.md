@@ -42,6 +42,37 @@ export HF_TOKEN="hf_your_token_here"
 
 ---
 
+## Warm-up Mode
+
+The `--warmup` flag runs a short preliminary benchmark before the main test:
+
+| Parameter | Value |
+|-----------|-------|
+| Duration | 1 minute |
+| Users | 2 concurrent |
+| Pause after | 10 seconds |
+
+**What it primes:**
+1. **vLLM's KV cache** - Populates prefix patterns so subsequent requests benefit from cached key-value computations
+2. **Ranvier's ART** - Learns routes in the Adaptive Radix Tree so prefix-aware routing can direct traffic to backends that already have the prefix cached
+
+**When to use:**
+- Always recommended for consistent, reproducible results
+- Essential on cold starts (fresh vLLM instances)
+- Required for accurate A/B comparisons
+
+**Without warm-up:** First requests will all be cache misses, skewing early results and reducing measured improvement percentages.
+
+```bash
+# With warm-up (recommended)
+./scripts/bench.sh --warmup --duration 10m --users 30
+
+# Without warm-up (faster, but less consistent)
+./scripts/bench.sh --duration 10m --users 30
+```
+
+---
+
 ## Test Scenarios
 
 ### Scenario 1: Baseline Validation (Quick)
