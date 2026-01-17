@@ -490,6 +490,13 @@ if [[ "$INSTALL_DEPS" = true ]]; then
     log_info "Installing numpy<2 (vLLM compatibility fix)..."
     $PIP install "numpy<2" 2>&1 | tail -2
     log_ok "numpy<2 installed"
+
+    log_header "Dependencies Installed"
+    echo ""
+    echo "Now run your benchmark:"
+    echo "  ./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct --duration 10m"
+    echo ""
+    exit 0
 fi
 
 # -----------------------------------------------------------------------------
