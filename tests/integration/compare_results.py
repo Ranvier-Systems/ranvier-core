@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 """
-Compare two benchmark result CSV files and show improvement summary.
+DEPRECATED: Use results_parser.py instead.
+
+This script's functionality has been consolidated into results_parser.py.
+
+Instead of:
+    python3 compare_results.py <baseline_csv> <new_csv>
+
+Use:
+    python3 results_parser.py compare <baseline_csv> <new_csv>
+
+The new parser can also compare log files directly (not just CSV).
+
+This script will be removed in a future release.
+================================================================================
+
+Compare two benchmark result CSV files and show improvement summary (LEGACY).
 
 Usage:
     python3 compare_results.py <baseline_csv> <new_csv>
@@ -15,7 +30,17 @@ Output:
 
 import csv
 import sys
+import warnings
 from typing import Optional
+
+# Deprecation warning
+warnings.warn(
+    "\n[DEPRECATED] compare_results.py is deprecated.\n"
+    "Use: python3 results_parser.py compare <baseline> <new>\n",
+    DeprecationWarning,
+    stacklevel=2,
+)
+print("\033[1;33m[DEPRECATED]\033[0m Use: results_parser.py compare <baseline> <new>", file=sys.stderr)
 
 
 def load_csv(filepath: str) -> dict:
