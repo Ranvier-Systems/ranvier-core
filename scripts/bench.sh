@@ -40,7 +40,7 @@ DEFAULT_DURATION="5m"
 DEFAULT_USERS="10"
 DEFAULT_SPAWN_RATE="2"
 DEFAULT_VLLM_PORT_START=8000
-DEFAULT_PROMPT_DIST="long"
+DEFAULT_PROMPT_DIST="stress"
 DEFAULT_PREFIX_RATIO="0.9"
 DEFAULT_OUTPUT_DIR="benchmark-reports"
 DEFAULT_WARMUP_DURATION="1m"
@@ -144,7 +144,7 @@ BENCHMARK OPTIONS:
     --duration TIME     Benchmark duration (default: 5m)
     --users N           Concurrent users (default: 10)
     --spawn-rate N      Users spawned per second (default: 2)
-    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: long)
+    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: stress)
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --compare           Run A/B comparison (prefix vs round-robin)
     --warmup            Run a short warm-up before the main benchmark
