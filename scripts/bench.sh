@@ -825,14 +825,24 @@ fi
 run_benchmark() {
     local ROUTING_MODE="$1"
     local LABEL="$2"
+    local STEP="${3:-}"  # Optional step indicator like "[1/2]"
 
-    log_header "Running Benchmark: $LABEL"
+    # Prominent banner for visibility
+    echo ""
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
+    if [[ -n "$STEP" ]]; then
+        echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}    ${STEP}${NC}"
+    else
+        echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}${NC}"
+    fi
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
     echo "  Model:        $MODEL"
     echo "  Backends:     $GPUS"
     echo "  Duration:     $DURATION"
     echo "  Users:        $USERS"
     echo "  Routing:      $ROUTING_MODE"
     echo "  Prompt Dist:  $PROMPT_DIST"
+    echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
     echo ""
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -980,13 +990,13 @@ if [[ "$COMPARE" = true ]]; then
     log_header "A/B Comparison Mode"
     log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
 
-    REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)")
+    REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[1/2]")
 
     # Brief pause between tests
     log_info "Pausing 30s between tests to clear caches..."
     sleep 30
 
-    REPORT_PREFIX=$(run_benchmark "prefix" "Prefix-Aware (Optimized)")
+    REPORT_PREFIX=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[2/2]")
 
     log_header "A/B Comparison Complete"
     echo ""
