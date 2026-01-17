@@ -1,5 +1,26 @@
 #!/bin/bash
-# Lambda Labs Ranvier Benchmark Setup Script
+# =============================================================================
+# DEPRECATED: Use ./scripts/bench.sh --setup instead
+# =============================================================================
+#
+# This script's functionality has been consolidated into bench.sh.
+#
+# Instead of:
+#   ./scripts/setup-lambda-benchmark.sh
+#
+# Use:
+#   ./scripts/bench.sh --setup
+#
+# The new consolidated script provides:
+#   - One-time setup:     ./scripts/bench.sh --setup
+#   - Full benchmark:     ./scripts/bench.sh --model <model> --duration 10m
+#   - A/B comparison:     ./scripts/bench.sh --compare
+#   - External vLLM:      ./scripts/bench.sh --skip-vllm --vllm-endpoints <list>
+#
+# This script will be removed in a future release.
+# =============================================================================
+#
+# Lambda Labs Ranvier Benchmark Setup Script (LEGACY)
 #
 # Run this script ON a Lambda Labs instance to set up Ranvier and run benchmarks
 # against vLLM backends with minimal network latency.
@@ -17,6 +38,11 @@
 #   - vLLM running on one or more endpoints
 
 set -e
+
+echo ""
+echo -e "\033[1;33m[DEPRECATED]\033[0m This script is deprecated. Use: ./scripts/bench.sh --setup"
+echo ""
+sleep 2
 
 # Colors
 RED='\033[0;31m'
