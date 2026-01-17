@@ -278,16 +278,18 @@ else
     log_ok "Repository ready at $REPO_DIR"
 fi
 
-# Check HF_TOKEN
-if [[ -z "${HF_TOKEN:-}" ]]; then
-    log_warn "HF_TOKEN not set - required for gated models like Llama"
-    log_info "Set with: export HF_TOKEN=your_token"
-    if [[ "$MODEL" == *"llama"* ]] || [[ "$MODEL" == *"Llama"* ]]; then
-        log_error "Llama models require HF_TOKEN. Exiting."
-        exit 1
+# Check HF_TOKEN (not required for --setup mode)
+if [[ "$SETUP_ONLY" != true ]]; then
+    if [[ -z "${HF_TOKEN:-}" ]]; then
+        log_warn "HF_TOKEN not set - required for gated models like Llama"
+        log_info "Set with: export HF_TOKEN=your_token"
+        if [[ "$MODEL" == *"llama"* ]] || [[ "$MODEL" == *"Llama"* ]]; then
+            log_error "Llama models require HF_TOKEN. Exiting."
+            exit 1
+        fi
+    else
+        log_ok "HF_TOKEN found"
     fi
-else
-    log_ok "HF_TOKEN found"
 fi
 
 # Check Docker
@@ -351,13 +353,21 @@ if [[ "$SETUP_ONLY" = true ]]; then
             curl -fsSL https://get.docker.com | sh
             sudo usermod -aG docker "$USER" 2>/dev/null || true
             log_ok "Docker installed"
-            log_warn "You may need to log out and back in for Docker group membership"
+            log_warn "Run 'newgrp docker' or log out/in for Docker group membership"
         else
             log_error "curl not available. Please install Docker manually."
             exit 1
         fi
     else
         log_ok "Docker already installed"
+    fi
+
+    # Ensure user is in docker group (even if Docker was pre-installed)
+    if ! docker ps &> /dev/null 2>&1; then
+        log_info "Adding user to docker group..."
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        log_warn "Run 'newgrp docker' or log out/in to apply docker group membership"
+        log_info "Then re-run: ./scripts/bench.sh --setup"
     fi
 
     # Check docker compose

@@ -23,7 +23,11 @@ git clone https://github.com/Ranvier-Systems/ranvier-core.git
 cd ranvier-core
 ./scripts/bench.sh --setup
 
-# 3. Set HuggingFace token
+# 2b. If prompted about docker group, run this then re-run setup:
+newgrp docker
+./scripts/bench.sh --setup
+
+# 3. Set HuggingFace token (required for Llama models)
 export HF_TOKEN="hf_your_token_here"
 
 # 4. Run benchmark with warm-up
