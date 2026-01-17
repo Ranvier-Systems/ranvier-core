@@ -403,14 +403,47 @@ curl -s http://localhost:9181/metrics | grep -E "ranvier_active_requests"
 
 ## Troubleshooting
 
+### Problem: Routing Mode Mismatch
+
+**Symptoms:** Locust logs show:
+```
+ROUTING MODE MISMATCH DETECTED!
+  BENCHMARK_MODE (client label): random
+  X-Routing-Mode (server actual): prefix
+```
+
+**Why this happens:** The `BENCHMARK_MODE` environment variable controls how the locustfile **labels** results, but `RANVIER_ROUTING_MODE` controls how the **server** actually routes requests. If they don't match, your benchmark results will be mislabeled.
+
+**Solution:** Set BOTH variables consistently:
+```bash
+# For prefix routing benchmark:
+export BENCHMARK_MODE=prefix
+export RANVIER_ROUTING_MODE=prefix
+
+# For random/round-robin baseline:
+export BENCHMARK_MODE=random
+export RANVIER_ROUTING_MODE=random
+```
+
+Or use `bench.sh --compare` which handles this automatically.
+
+---
+
 ### Problem: `inspect routes` Shows 0 Routes
 
-**Symptoms:** Running `./tools/rvctl inspect routes` shows "(empty tree)" even with `RANVIER_ROUTING_MODE=prefix`.
+**Symptoms:** Running `./tools/rvctl inspect routes` shows "(empty tree)" even with `RANVIER_ROUTING_MODE=prefix`, and Prometheus shows:
+```
+router_cache_hits{shard="0"} 0
+router_cache_misses{shard="0"} 1756
+router_prefix_affinity_routes{shard="0"} 1756
+```
 
 **Why this happens:** Routes are learned **after successful responses**, not on routing decision. The flow is:
 1. Request arrives → Ranvier tokenizes and routes (via hash or existing ART entry)
-2. Backend responds successfully (HTTP 200)
+2. Backend responds successfully (HTTP 200 detected via header snoop)
 3. Route is learned and added to radix tree
+
+If cache_misses equals prefix_affinity_routes and cache_hits is 0, routing IS working (via hash fallback) but routes aren't being learned.
 
 **Causes & Solutions:**
 
@@ -431,9 +464,13 @@ curl -s http://localhost:9181/metrics | grep -E "ranvier_active_requests"
    # Should show: RANVIER_ROUTING_MODE=prefix
    ```
 
-4. **Requests failing:** Check for backend errors
+4. **Requests failing or not returning HTTP 200:** Route learning requires `header_snoop_success`
    ```bash
-   docker logs ranvier-bench1 2>&1 | grep -i "error\|fail"
+   # Look for "First byte received" which indicates successful response
+   docker logs ranvier-bench1 2>&1 | grep "First byte" | head -5
+
+   # Look for "Learning route" messages
+   docker logs ranvier-bench1 2>&1 | grep -i "learning route" | head -5
    ```
 
 5. **min_token_length too high:** Routes only learned when token count >= min_token_length
@@ -442,11 +479,24 @@ curl -s http://localhost:9181/metrics | grep -E "ranvier_active_requests"
    docker exec ranvier-bench1 env | grep MIN_TOKEN
    ```
 
+6. **Tokens not being generated:** Check if tokenization is working
+   ```bash
+   # Look for token-related debug messages
+   docker logs ranvier-bench1 2>&1 | grep -i "token" | head -20
+   ```
+
 **Verify routing is working:**
 ```bash
 # Check Prometheus metrics for route learning
 curl -s http://localhost:9181/metrics | grep -E "router_prefix_affinity_routes|router_cache"
+
+# Interpretation:
+# - prefix_affinity_routes > 0: Prefix routing is active
+# - cache_hits > 0: ART is being used (routes were learned)
+# - cache_hits = 0, cache_misses > 0: Hash fallback only (routes not learned)
 ```
+
+**Note on client-side "cache hit rate":** The locustfile tracks hits based on whether the same prefix_hash goes to the same backend. With hash-based prefix routing, this will show high hit rates (~70-90%) even when the ART has 0 routes, because the hash is deterministic. This is different from Ranvier's `router_cache_hits` metric which tracks actual ART lookups.
 
 ### Problem: Low Cache Hit Rate
 
