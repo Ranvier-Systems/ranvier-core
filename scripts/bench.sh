@@ -395,6 +395,27 @@ if [[ "$SETUP_ONLY" = true ]]; then
     mkdir -p "$OUTPUT_DIR"
     log_ok "Created $OUTPUT_DIR directory"
 
+    # Install vLLM (for running LLM backends)
+    if ! command -v vllm &> /dev/null && ! python3 -c "import vllm" 2>/dev/null; then
+        log_info "Installing vLLM (this may take a few minutes)..."
+        if command -v pip3 &> /dev/null; then
+            PIP="pip3"
+        elif command -v pip &> /dev/null; then
+            PIP="pip"
+        else
+            log_warn "pip not found - skipping vLLM installation"
+            log_info "Install manually: pip install vllm 'numpy<2'"
+            PIP=""
+        fi
+        if [[ -n "$PIP" ]]; then
+            $PIP install vllm 2>&1 | tail -5
+            $PIP install "numpy<2" 2>&1 | tail -2  # vLLM compatibility fix
+            log_ok "vLLM installed"
+        fi
+    else
+        log_ok "vLLM already installed"
+    fi
+
     # Pre-build Docker images
     if [[ -f "Dockerfile.production" ]]; then
         log_info "Pre-building Ranvier Docker image..."
