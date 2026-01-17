@@ -562,6 +562,27 @@ docker compose -f docker-compose.benchmark-real.yml down -v
 cat /tmp/vllm_gpu0.log | head -50
 ```
 
+### Debugging: Capturing Full Output
+
+For debugging setups or sharing logs with others, use `--log-all` to capture everything:
+
+```bash
+# Run with full logging
+./scripts/bench.sh --log-all --duration 10m --users 30
+
+# This creates: benchmark-reports/run_YYYYMMDD_HHMMSS.log
+# Contains: all script output, system info, timestamps, and errors
+```
+
+The run.log includes:
+- System information (host, user, pwd)
+- Full script status messages
+- vLLM startup progress
+- Ranvier cluster health checks
+- Complete benchmark output
+
+When troubleshooting, share both `run.log` and the per-benchmark `benchmark.log`.
+
 ---
 
 ## Recommended Test Sequence

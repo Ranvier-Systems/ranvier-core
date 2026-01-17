@@ -159,6 +159,7 @@ EXTERNAL VLLM OPTIONS:
 OTHER OPTIONS:
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
+    --log-all           Save full shell output to run.log (useful for debugging)
     -h, --help          Show this help message
 
 EXAMPLES:
@@ -186,6 +187,9 @@ EXAMPLES:
 
     # Use external vLLM on single host with sequential ports
     ./scripts/bench.sh --skip-vllm --vllm-host 10.0.0.1 --gpus 8
+
+    # Save full shell output to run.log (for debugging)
+    ./scripts/bench.sh --log-all --duration 10m
 
 EOF
 }
@@ -220,6 +224,7 @@ INSTALL_DEPS=false
 DRY_RUN=false
 SETUP_ONLY=false
 WARMUP=false
+LOG_ALL=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -240,6 +245,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=true; shift ;;
         --setup)          SETUP_ONLY=true; shift ;;
         --warmup)         WARMUP=true; shift ;;
+        --log-all)        LOG_ALL=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
     esac
@@ -337,6 +343,30 @@ fi
 if [[ "$GPUS" -gt 8 ]]; then
     log_warn "Capping at 8 GPUs (detected $GPUS)"
     GPUS=8
+fi
+
+# -----------------------------------------------------------------------------
+# Full output logging (--log-all)
+# -----------------------------------------------------------------------------
+
+if [[ "$LOG_ALL" = true ]]; then
+    # Create output directory early for logging
+    mkdir -p "$OUTPUT_DIR"
+    RUN_LOG="${OUTPUT_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Logging all output to: $RUN_LOG"
+
+    # Redirect stdout and stderr to both terminal and log file
+    exec > >(tee -a "$RUN_LOG") 2>&1
+
+    # Log system info at the start
+    echo "============================================="
+    echo "Ranvier Benchmark Run Log"
+    echo "Started: $(date)"
+    echo "Host: $(hostname)"
+    echo "User: $(whoami)"
+    echo "PWD: $(pwd)"
+    echo "============================================="
+    echo ""
 fi
 
 # -----------------------------------------------------------------------------
@@ -515,6 +545,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Output Dir:      $OUTPUT_DIR"
     echo "  Compare Mode:    $COMPARE"
     echo "  Warmup:          $WARMUP"
+    echo "  Log All:         $LOG_ALL"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -959,6 +990,9 @@ if [[ -n "$LATEST_REPORT" && -f "${LATEST_REPORT}/benchmark.log" ]]; then
     echo "  Log:    ${LATEST_REPORT}/benchmark.log"
     echo "  Stats:  ${LATEST_REPORT}/results_stats.csv"
     echo "  Report: ${LATEST_REPORT}/report.html"
+    if [[ "$LOG_ALL" = true && -n "${RUN_LOG:-}" ]]; then
+        echo "  Run:    $RUN_LOG"
+    fi
 fi
 
 echo ""
