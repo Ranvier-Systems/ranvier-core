@@ -69,6 +69,11 @@ for arg in "$@"; do
     fi
 done
 
+# Check for no arguments (before trap is set)
+if [[ $# -eq 0 ]]; then
+    NO_ARGS=true
+fi
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -194,13 +199,35 @@ EXAMPLES:
 EOF
 }
 
+print_usage() {
+    echo -e "${BOLD}Ranvier Benchmark${NC}"
+    echo ""
+    echo "Usage: ./scripts/bench.sh [OPTIONS]"
+    echo ""
+    echo -e "${CYAN}Quick start:${NC}"
+    echo "  ./scripts/bench.sh --setup                    # First-time setup"
+    echo "  ./scripts/bench.sh --duration 5m              # Quick sanity check"
+    echo "  ./scripts/bench.sh --compare --duration 10m   # A/B comparison"
+    echo ""
+    echo -e "${CYAN}Preview what will run:${NC}"
+    echo "  ./scripts/bench.sh --dry-run --duration 10m"
+    echo ""
+    echo "Run './scripts/bench.sh --help' for all options."
+}
+
 # Handle early --help (before trap is set)
 if [[ "${SHOW_HELP:-}" == "true" ]]; then
     print_help
     exit 0
 fi
 
-# Now set the trap (after help check, so cleanup doesn't run on --help)
+# Handle no arguments (before trap is set)
+if [[ "${NO_ARGS:-}" == "true" ]]; then
+    print_usage
+    exit 0
+fi
+
+# Now set the trap (after help/usage check, so cleanup doesn't run)
 trap cleanup EXIT INT TERM
 
 # -----------------------------------------------------------------------------
