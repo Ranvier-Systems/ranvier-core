@@ -826,8 +826,10 @@ run_benchmark() {
     done
 
     # Run locust via docker compose
+    # Mount report dir as volume so files persist after container exits
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
+        -v "$PWD/$REPORT_DIR:/mnt/locust/output" \
         -e NUM_BACKENDS="$GPUS" \
         -e VLLM_MODEL="$MODEL" \
         -e RANVIER_ROUTING_MODE="$ROUTING_MODE" \
@@ -839,13 +841,9 @@ run_benchmark() {
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
         --run-time "$DURATION" \
-        --csv "/mnt/locust/results" \
-        --html "/mnt/locust/report.html" \
+        --csv "/mnt/locust/output/results" \
+        --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log"
-
-    # Copy results
-    docker cp locust-real:/mnt/locust/results_stats.csv "$REPORT_DIR/" 2>/dev/null || true
-    docker cp locust-real:/mnt/locust/report.html "$REPORT_DIR/" 2>/dev/null || true
 
     log_ok "Results saved to: $REPORT_DIR/"
 
