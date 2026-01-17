@@ -313,7 +313,140 @@ grep "Cache" benchmark-reports/*/benchmark.log
 
 ---
 
+## Cleanup & Restarts
+
+### Running Multiple Benchmarks
+
+You can run benchmarks multiple times without manual cleanup. The script handles this automatically:
+
+1. **Automatic cleanup** — `cleanup()` runs on EXIT, Ctrl+C (INT), or TERM signals
+2. **vLLM processes** — Gracefully killed, then force-killed if needed
+3. **Docker containers** — Stopped with `docker compose down -v --remove-orphans`
+4. **Output directories** — Timestamped (`benchmark-reports/20260117_143052_*/`), no conflicts
+
+### Manual Cleanup (if needed)
+
+If a previous run crashed badly:
+
+```bash
+# Kill any leftover vLLM processes
+pkill -f "vllm.entrypoints" || true
+
+# Remove any leftover containers
+docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real down -v --remove-orphans
+
+# Clean old benchmark reports (optional)
+rm -rf benchmark-reports/
+```
+
+---
+
+## Live Monitoring
+
+While a benchmark runs, you can monitor the system from a separate terminal.
+
+### rvctl Commands
+
+```bash
+# Check backend health and registration
+./tools/rvctl -u http://localhost:8081 inspect backends
+
+# View learned routes in the radix tree
+./tools/rvctl -u http://localhost:8081 inspect routes
+
+# Check cluster quorum status
+./tools/rvctl -u http://localhost:8081 cluster status
+```
+
+### Docker Logs
+
+```bash
+# Watch Ranvier logs in real-time
+docker logs -f ranvier-bench1
+
+# Check for errors
+docker logs ranvier-bench1 2>&1 | grep -i error
+
+# View all Ranvier container logs
+for i in 1 2 3; do echo "=== ranvier-bench$i ===" && docker logs ranvier-bench$i 2>&1 | tail -20; done
+```
+
+### GPU and System Monitoring
+
+```bash
+# Watch GPU utilization (all 8 should be active)
+watch -n 2 'nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv'
+
+# Check vLLM process logs
+tail -f /tmp/vllm_gpu*.log
+
+# Check vLLM health endpoints
+for port in 8000 8001 8002 8003 8004 8005 8006 8007; do
+  curl -s http://localhost:$port/health && echo " :$port OK" || echo " :$port FAIL"
+done
+```
+
+### Prometheus Metrics
+
+```bash
+# Cache hit/miss rates
+curl -s http://localhost:9181/metrics | grep -E "ranvier_(cache|route)"
+
+# Request latency
+curl -s http://localhost:9181/metrics | grep -E "ranvier_response_latency"
+
+# Active requests
+curl -s http://localhost:9181/metrics | grep -E "ranvier_active_requests"
+```
+
+---
+
 ## Troubleshooting
+
+### Problem: `inspect routes` Shows 0 Routes
+
+**Symptoms:** Running `./tools/rvctl inspect routes` shows "(empty tree)" even with `RANVIER_ROUTING_MODE=prefix`.
+
+**Why this happens:** Routes are learned **after successful responses**, not on routing decision. The flow is:
+1. Request arrives → Ranvier tokenizes and routes (via hash or existing ART entry)
+2. Backend responds successfully (HTTP 200)
+3. Route is learned and added to radix tree
+
+**Causes & Solutions:**
+
+1. **Check too early:** Wait for some requests to complete first
+   ```bash
+   # Wait until you see requests completing in Locust output, then check
+   ./tools/rvctl -u http://localhost:8081 inspect routes
+   ```
+
+2. **Tokenizer not loaded:** Check Ranvier logs for tokenizer errors
+   ```bash
+   docker logs ranvier-bench1 2>&1 | grep -i tokenizer
+   ```
+
+3. **Routing mode not prefix:** Verify environment variable
+   ```bash
+   docker exec ranvier-bench1 env | grep ROUTING_MODE
+   # Should show: RANVIER_ROUTING_MODE=prefix
+   ```
+
+4. **Requests failing:** Check for backend errors
+   ```bash
+   docker logs ranvier-bench1 2>&1 | grep -i "error\|fail"
+   ```
+
+5. **min_token_length too high:** Routes only learned when token count >= min_token_length
+   ```bash
+   # Check current setting (default: 10)
+   docker exec ranvier-bench1 env | grep MIN_TOKEN
+   ```
+
+**Verify routing is working:**
+```bash
+# Check Prometheus metrics for route learning
+curl -s http://localhost:9181/metrics | grep -E "router_prefix_affinity_routes|router_cache"
+```
 
 ### Problem: Low Cache Hit Rate
 
