@@ -141,6 +141,39 @@ This header is invaluable for debugging configuration mismatches between client 
 
 ## Reproducing This Benchmark
 
+### Quick Method (Recommended)
+
+Use the consolidated benchmark script which handles vLLM startup, Ranvier cluster, and Locust automatically:
+
+```bash
+# First-time setup
+./scripts/bench.sh --setup
+
+# Set HuggingFace token
+export HF_TOKEN="hf_your_token_here"
+
+# Run A/B comparison (prefix vs round-robin)
+./scripts/bench.sh \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --compare \
+  --warmup \
+  --duration 5m \
+  --users 10 \
+  --prompt-dist stress \
+  --prefix-ratio 0.9
+
+# Parse and compare results
+./tests/integration/results_parser.py compare \
+  benchmark-reports/*round_robin*/benchmark.log \
+  benchmark-reports/*prefix*/benchmark.log
+```
+
+For detailed scenarios and expected results, see: [Benchmark Guide for 8x A100](../benchmark-guide-8xA100.md)
+
+### Manual Method (Advanced)
+
+For more control over individual components:
+
 ```bash
 # Start 8 vLLM backends with prefix caching
 for i in {0..7}; do
@@ -160,7 +193,7 @@ for i in {1..8}; do
 done
 
 # Run benchmark
-BENCHMARK_MODE=prefix PROMPT_DISTRIBUTION=large-prefix NUM_LARGE_PREFIXES=50 \
+BENCHMARK_MODE=prefix PROMPT_DISTRIBUTION=stress NUM_LARGE_PREFIXES=50 \
 BACKEND1_IP=172.17.0.1 NUM_BACKENDS=8 \
 locust -f tests/integration/locustfile_real.py \
   --headless --users 10 --spawn-rate 2 --run-time 5m \
@@ -174,76 +207,84 @@ For more statistical confidence, run a 15-30 minute test:
 
 ```bash
 # 15-minute test for more data points
-locust -f tests/integration/locustfile_real.py \
-  --headless --users 10 --spawn-rate 2 --run-time 15m \
-  --host http://localhost:8081
-```
-
-### More Prefixes
-Test with 100+ unique prefixes to stress the routing and cache systems:
-
-```bash
-# 100 unique prefixes
-NUM_LARGE_PREFIXES=100 \
-locust -f tests/integration/locustfile_real.py \
-  --headless --users 10 --spawn-rate 2 --run-time 5m \
-  --host http://localhost:8081
+./scripts/bench.sh --duration 15m --users 10 --prompt-dist stress
 ```
 
 ### Higher Concurrency
 Test with more concurrent users to measure throughput under load:
 
 ```bash
-# 50 concurrent users
-locust -f tests/integration/locustfile_real.py \
-  --headless --users 50 --spawn-rate 5 --run-time 5m \
-  --host http://localhost:8081
+# 50 concurrent users (high concurrency stress test)
+./scripts/bench.sh --duration 10m --users 50 --spawn-rate 5 --prompt-dist stress
 ```
 
-### Different Prefix Sizes
-Adjust the prefix token range to test smaller or larger prefixes:
+### Different Prefix Ratios
+Test how cache hit rate varies with prefix sharing:
 
 ```bash
-# Smaller prefixes (500-2000 tokens)
-LARGE_PREFIX_MIN_TOKENS=500 LARGE_PREFIX_MAX_TOKENS=2000 \
-locust -f tests/integration/locustfile_real.py \
-  --headless --users 10 --spawn-rate 2 --run-time 5m \
-  --host http://localhost:8081
+# Low prefix sharing (50%)
+./scripts/bench.sh --duration 5m --users 10 --prefix-ratio 0.5
 
-# Larger prefixes (8000-16000 tokens) - requires sufficient GPU memory
-LARGE_PREFIX_MIN_TOKENS=8000 LARGE_PREFIX_MAX_TOKENS=16000 \
-locust -f tests/integration/locustfile_real.py \
-  --headless --users 10 --spawn-rate 2 --run-time 5m \
-  --host http://localhost:8081
+# High prefix sharing (95%)
+./scripts/bench.sh --duration 5m --users 10 --prefix-ratio 0.95
 ```
 
-### Compare All Three Routing Modes
-Run the same test with each routing mode:
+### Different Prompt Distributions
 
 ```bash
-for mode in prefix radix round_robin; do
+# Short prompts (< 100 tokens)
+./scripts/bench.sh --duration 5m --users 20 --prompt-dist short
+
+# Mixed workload (production-like)
+./scripts/bench.sh --duration 10m --users 30 --prompt-dist mixed
+
+# Stress test with large prefixes (2000-8000 tokens)
+./scripts/bench.sh --duration 10m --users 10 --prompt-dist stress
+```
+
+### Compare All Routing Modes (A/B Test)
+
+The `--compare` flag automatically runs both round-robin and prefix-aware routing:
+
+```bash
+# Automatic A/B comparison
+./scripts/bench.sh --compare --duration 10m --users 20 --prompt-dist stress
+
+# View comparison
+./tests/integration/results_parser.py compare \
+  benchmark-reports/*round_robin*/benchmark.log \
+  benchmark-reports/*prefix*/benchmark.log
+```
+
+### Manual Multi-Mode Comparison
+
+For testing all three routing modes individually:
+
+```bash
+for mode in prefix hash random; do
   echo "Testing routing mode: $mode"
-  docker compose -f docker-compose.benchmark-real.yml down
-  export RANVIER_ROUTING_MODE=$mode
-  docker compose -f docker-compose.benchmark-real.yml up -d
-  sleep 10
 
-  # Register backends
-  for i in {1..8}; do
-    curl -s -X POST "http://localhost:8081/admin/backends?id=$i&ip=172.17.0.1&port=$((7999+i))&weight=100"
-  done
-
-  # Run benchmark
-  BENCHMARK_MODE=$mode PROMPT_DISTRIBUTION=large-prefix NUM_LARGE_PREFIXES=50 \
-  BACKEND1_IP=172.17.0.1 NUM_BACKENDS=8 \
-  locust -f tests/integration/locustfile_real.py \
-    --headless --users 10 --spawn-rate 2 --run-time 5m \
-    --host http://localhost:8081 2>&1 | tee ${mode}_results.txt
+  # Set routing mode and run benchmark
+  RANVIER_ROUTING_MODE=$mode ./scripts/bench.sh \
+    --duration 5m \
+    --users 10 \
+    --prompt-dist stress \
+    --output-dir "benchmark-reports/${mode}_test"
 done
+
+# Compare results
+./tests/integration/results_parser.py summary benchmark-reports/*/benchmark.log
 ```
 
 ## Related Files
 
-- `tests/integration/locustfile_real.py` - Benchmark script
-- `src/router_service.cpp` - Routing implementation
+### Benchmark Tools
+- `scripts/bench.sh` - Consolidated benchmark script (setup, run, compare)
+- `tests/integration/results_parser.py` - Parse, summarize, and compare results
+- `tests/integration/locustfile_real.py` - Locust load test for real vLLM
+- `docs/benchmark-guide-8xA100.md` - Detailed test scenarios for 8x A100
+
+### Implementation
+- `src/router_service.cpp` - Routing implementation (ART + consistent hashing)
 - `src/http_controller.cpp` - Request handling with routing mode selection
+- `src/radix_tree.cpp` - Adaptive Radix Tree for prefix matching
