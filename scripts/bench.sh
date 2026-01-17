@@ -933,7 +933,7 @@ run_benchmark() {
         --headless \
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
-        --run-time "$DURATION" \
+        --run-time "$(parse_duration "$DURATION")s" \
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log"
@@ -995,7 +995,7 @@ if [[ "$WARMUP" = true ]]; then
         --headless \
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
-        --run-time "$DURATION" \
+        --run-time "$(parse_duration "$DURATION")s" \
         2>&1 | tee "$WARMUP_DIR/warmup.log"
 
     log_ok "Warm-up complete"
