@@ -244,6 +244,53 @@ fi
 trap cleanup EXIT INT TERM
 
 # -----------------------------------------------------------------------------
+# Pre-flight check for stale processes
+# -----------------------------------------------------------------------------
+
+preflight_check() {
+    local stale_found=false
+
+    # Check for existing ranvier benchmark containers
+    local existing_containers
+    existing_containers=$(docker ps --filter "name=ranvier-benchmark" --format "{{.Names}}" 2>/dev/null | head -5)
+    if [ -n "$existing_containers" ]; then
+        log_warn "Found existing Ranvier benchmark containers:"
+        echo "$existing_containers" | sed 's/^/    /'
+        stale_found=true
+    fi
+
+    # Check for existing vLLM processes
+    local vllm_procs
+    vllm_procs=$(pgrep -f "vllm.entrypoints" 2>/dev/null | head -5)
+    if [ -n "$vllm_procs" ]; then
+        log_warn "Found existing vLLM processes: $(echo $vllm_procs | tr '\n' ' ')"
+        stale_found=true
+    fi
+
+    if [ "$stale_found" = true ]; then
+        echo ""
+        log_info "Cleaning up stale processes from previous run..."
+
+        # Kill vLLM processes
+        pkill -f "vllm.entrypoints" 2>/dev/null || true
+        sleep 1
+        pkill -9 -f "vllm.entrypoints" 2>/dev/null || true
+
+        # Stop containers
+        docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+            --profile benchmark down -v --remove-orphans 2>/dev/null || true
+
+        log_ok "Cleanup complete"
+        echo ""
+    fi
+}
+
+# Run preflight check (unless --help or --setup-only)
+if [[ ! " $* " =~ " --help " ]] && [[ ! " $* " =~ " -h " ]] && [[ ! " $* " =~ " --setup " ]]; then
+    preflight_check
+fi
+
+# -----------------------------------------------------------------------------
 # Argument parsing
 # -----------------------------------------------------------------------------
 
@@ -1059,4 +1106,4 @@ fi
 
 echo ""
 log_info "To compare results, use:"
-echo "  python3 tests/integration/compare_results.py <baseline.csv> <optimized.csv>"
+echo "  python3 tests/integration/results_parser.py compare <baseline/benchmark.log> <new/benchmark.log>"

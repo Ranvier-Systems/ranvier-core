@@ -73,6 +73,71 @@ The `--warmup` flag runs a short preliminary benchmark before the main test:
 
 ---
 
+## Benchmark Parameters Reference
+
+### Command-Line Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--duration` | 5m | Test duration (e.g., `5m`, `10m`, `1h`) |
+| `--users` | 10 | Concurrent simulated clients |
+| `--spawn-rate` | 2 | Users to spawn per second at start |
+| `--warmup` | off | Run 1-minute warmup before main test |
+| `--compare` | off | Run both round-robin and prefix modes for A/B comparison |
+| `--prompt-dist` | stress | Prompt size distribution (see below) |
+| `--prefix-ratio` | 0.9 | Ratio of requests sharing prefixes (0.0-1.0) |
+| `--model` | Llama-3.1-8B | Model to benchmark |
+
+### Prompt Distribution (`--prompt-dist`)
+
+Controls the **size distribution** of generated prompts:
+
+| Value | Distribution | Use Case |
+|-------|-------------|----------|
+| `short` | 100% tiny (<100 tokens) | Fast iteration, minimal GPU load |
+| `medium` | 100% small (100-500 tokens) | Moderate workload |
+| `long` | 100% small (100-500 tokens) | Similar to medium |
+| `mixed` | 30% short, 50% medium, 20% long | Production-like variety |
+| `large_prefix` | 100% large/xlarge (2000-8000 tokens) | Maximum cache benefit |
+| **`stress`** | 10% small, 20% medium, 30% large, 40% xlarge | **Recommended for benchmarking** |
+
+**Why `stress` is the default:** Large prefixes (2000-8000 tokens) benefit most from KV cache hits. The `stress` distribution biases toward these sizes (70% are 2000+ tokens) to maximize measurable improvement from prefix-aware routing.
+
+### Prefix Ratio (`--prefix-ratio`)
+
+Controls what **percentage of requests share a common system prompt**:
+
+| Value | Meaning | Cache Hit Potential |
+|-------|---------|---------------------|
+| 0.1 | 10% share prefixes | Low (mostly unique requests) |
+| 0.5 | 50% share prefixes | Medium |
+| 0.7 | 70% share prefixes | Good |
+| **0.9** | 90% share prefixes | **High (recommended)** |
+| 1.0 | 100% share prefixes | Maximum (unrealistic) |
+
+**How it works:** When generating a prompt, there's a 90% chance (at 0.9) it picks from a pool of shared system prompts. This simulates real-world patterns where many users share the same system prompt (e.g., "You are a helpful assistant...") but have different user queries.
+
+**Expected cache hit rates with prefix-aware routing:**
+- `--prefix-ratio 0.5` → ~50% cache hit rate
+- `--prefix-ratio 0.9` → ~90%+ cache hit rate
+- Round-robin baseline → ~12.5% (1/8 chance with 8 backends)
+
+### Token Size Buckets
+
+The benchmark categorizes prompts into size buckets for analysis:
+
+| Bucket | Token Range | Typical Content |
+|--------|-------------|-----------------|
+| tiny | 0-100 | Simple queries |
+| small | 100-500 | Short conversations |
+| medium | 500-2000 | Moderate context |
+| large | 2000-4000 | RAG documents, long system prompts |
+| xlarge | 4000-8000 | Large context windows |
+
+**Key insight:** XLarge prefixes show the most dramatic improvement (25-40% TTFT reduction) because they save the most KV cache computation.
+
+---
+
 ## Test Scenarios
 
 ### Scenario 1: Baseline Validation (Quick)
@@ -647,7 +712,7 @@ For a complete benchmark session, run tests in this order:
 
 ```bash
 ./tests/integration/results_parser.py export \
-  benchmark-reports/*/results_stats.csv \
+  benchmark-reports/*/benchmark.log \
   --format markdown > results-summary.md
 ```
 
@@ -655,7 +720,7 @@ For a complete benchmark session, run tests in this order:
 
 ```bash
 ./tests/integration/results_parser.py export \
-  benchmark-reports/*/results_stats.csv \
+  benchmark-reports/*/benchmark.log \
   --format json > results.json
 ```
 

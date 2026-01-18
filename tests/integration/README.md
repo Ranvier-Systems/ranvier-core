@@ -196,8 +196,7 @@ tests/integration/
 ├── Dockerfile.mock-backend      # Dockerfile for mock backend
 ├── locustfile.py                # Locust load testing scenarios
 ├── Dockerfile.locust            # Dockerfile for Locust service
-├── parse_locust_output.py       # Parser for extracting stats from Locust output
-├── compare_results.py           # Tool for comparing benchmark results
+├── results_parser.py            # Unified parser for benchmark results and comparison
 └── configs/
     ├── node1.yaml               # Node 1 configuration
     ├── node2.yaml               # Node 2 configuration
@@ -266,9 +265,9 @@ benchmark-reports/
 Use the comparison script to analyze A/B test results:
 
 ```bash
-python3 tests/integration/compare_results.py \
-  benchmark-reports/token_off_20251227_123456_stats.csv \
-  benchmark-reports/token_on_20251227_124500_stats.csv
+python3 tests/integration/results_parser.py compare \
+  benchmark-reports/token_off_20251227_123456/benchmark.log \
+  benchmark-reports/token_on_20251227_124500/benchmark.log
 ```
 
 Example output:
@@ -666,7 +665,7 @@ VLLM_MAX_MODEL_LEN=2048 make benchmark-real-local
 tests/integration/
 ├── locustfile_real.py           # Real vLLM benchmark Locust file
 ├── run_benchmark_comparison.py  # A/B comparison script
-├── parse_real_benchmark.py      # Results parser for real benchmarks
+├── results_parser.py            # Unified results parser (parse, compare, export)
 ├── prometheus-benchmark.yml     # Prometheus config for metrics collection
 └── ...
 

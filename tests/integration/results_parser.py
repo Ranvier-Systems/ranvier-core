@@ -2,11 +2,6 @@
 """
 Unified Benchmark Results Parser for Ranvier
 
-This script consolidates functionality from:
-  - parse_locust_output.py (use: parse --type mock)
-  - parse_real_benchmark.py (use: parse --type real)
-  - compare_results.py (use: compare)
-
 Commands:
   parse      Parse a benchmark log file to CSV/JSON
   summary    Show human-readable summary of results
@@ -33,7 +28,7 @@ Examples:
     ./results_parser.py parse benchmark-reports/20250117_prefix/benchmark.log
 
     # Quick comparison of A/B test results
-    ./results_parser.py compare round_robin_stats.csv prefix_stats.csv
+    ./results_parser.py compare baseline/benchmark.log optimized/benchmark.log
 
     # Generate markdown table for documentation
     ./results_parser.py export stats.csv --format markdown > results.md
@@ -394,13 +389,15 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
         results["avg_response_time_ms"] = float(match.group(4))
 
     # Parse requests per second from aggregated line
+    # Use last occurrence (final stats, not intermediate)
     for line in content.split("\n"):
+        line = line.rstrip()  # Remove trailing \r and whitespace
         if "Aggregated" in line:
             # Try to find RPS at end of line after the last pipe
-            rps_match = re.search(r"\|\s+([0-9.]+)\s+[0-9.]+\s*$", line)
+            rps_match = re.search(r"\|\s+([0-9.]+)\s+[0-9.]+$", line)
             if rps_match:
                 results["requests_per_sec"] = float(rps_match.group(1))
-            break
+            # Don't break - use last Aggregated line (final stats)
 
     # If we didn't find aggregated stats, try alternative formats
     if results["total_requests"] == 0:
@@ -501,6 +498,10 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
             results.total_requests = json_stats["total_requests"]
         if json_stats.get("failed_requests") is not None and results.failed_requests == 0:
             results.failed_requests = json_stats["failed_requests"]
+
+        # Recalculate failure rate if we have valid counts but rate is 0
+        if results.total_requests > 0 and results.failure_rate_pct == 0.0 and results.failed_requests > 0:
+            results.failure_rate_pct = (results.failed_requests / results.total_requests) * 100
 
         # Per-bucket stats from JSON (priority source)
         if json_stats.get("ttft_large_hit_p50_ms"):
@@ -721,17 +722,49 @@ def print_summary(results: BenchmarkResults):
 # Comparison Functions
 # =============================================================================
 
-def format_change(baseline: Optional[float], new: Optional[float], lower_is_better: bool = True) -> str:
-    """Format the change between two values with percentage and direction."""
+def format_change(
+    baseline: Optional[float],
+    new: Optional[float],
+    lower_is_better: bool = True,
+    is_improvement_pct: bool = False
+) -> str:
+    """Format the change between two values with percentage and direction.
+
+    Args:
+        baseline: The baseline value
+        new: The new value to compare
+        lower_is_better: If True, decreases are BETTER. If False, increases are BETTER.
+        is_improvement_pct: If True, this metric is itself an improvement percentage,
+            so going from negative to positive is always BETTER.
+    """
     if baseline is None or new is None:
         return "N/A"
+
+    diff = new - baseline
+
+    # Special handling for improvement percentages (e.g., TTFT improvement)
+    # Going from negative to positive improvement is always BETTER
+    if is_improvement_pct:
+        if baseline < 0 and new > 0:
+            # Went from negative improvement to positive - definitely better
+            return f"+{diff:.2f} (BETTER)"
+        elif baseline > 0 and new < 0:
+            # Went from positive improvement to negative - definitely worse
+            return f"{diff:.2f} (WORSE)"
+        elif abs(baseline) < 0.1:
+            # Baseline near zero - avoid division, just show absolute change
+            if new > baseline + 1:
+                return f"+{diff:.2f} (BETTER)"
+            elif new < baseline - 1:
+                return f"{diff:.2f} (WORSE)"
+            else:
+                return f"{diff:+.2f} (SAME)"
 
     if baseline == 0:
         if new == 0:
             return "0 (--)"
         return f"{new:.2f} (NEW)"
 
-    diff = new - baseline
     pct = (diff / baseline) * 100
 
     if lower_is_better:
@@ -797,18 +830,19 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     lines.append("  (Prefix-aware routing benefits large prefixes most)")
     lines.append("")
 
+    # (key, display_name, lower_is_better, is_improvement_pct)
     bucket_metrics = [
-        ("ttft_large_hit_p50_ms", "Large Hit P50 (ms)", True),
-        ("ttft_large_miss_p50_ms", "Large Miss P50 (ms)", True),
-        ("ttft_large_improvement_pct", "Large Improvement (%)", False),
-        ("ttft_xlarge_hit_p50_ms", "XLarge Hit P50 (ms)", True),
-        ("ttft_xlarge_miss_p50_ms", "XLarge Miss P50 (ms)", True),
-        ("ttft_xlarge_improvement_pct", "XLarge Improvement (%)", False),
+        ("ttft_large_hit_p50_ms", "Large Hit P50 (ms)", True, False),
+        ("ttft_large_miss_p50_ms", "Large Miss P50 (ms)", True, False),
+        ("ttft_large_improvement_pct", "Large Improvement (%)", False, True),
+        ("ttft_xlarge_hit_p50_ms", "XLarge Hit P50 (ms)", True, False),
+        ("ttft_xlarge_miss_p50_ms", "XLarge Miss P50 (ms)", True, False),
+        ("ttft_xlarge_improvement_pct", "XLarge Improvement (%)", False, True),
     ]
 
     lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
     has_bucket_data = False
-    for key, name, lower_is_better in bucket_metrics:
+    for key, name, lower_is_better, is_improvement_pct in bucket_metrics:
         baseline_val = getattr(baseline, key, None)
         new_val = getattr(new, key, None)
         if baseline_val is None and new_val is None:
@@ -816,7 +850,7 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         has_bucket_data = True
         baseline_str = f"{baseline_val:.1f}" if baseline_val is not None else "N/A"
         new_str = f"{new_val:.1f}" if new_val is not None else "N/A"
-        change_str = format_change(baseline_val, new_val, lower_is_better)
+        change_str = format_change(baseline_val, new_val, lower_is_better, is_improvement_pct)
         lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
 
     if not has_bucket_data:
