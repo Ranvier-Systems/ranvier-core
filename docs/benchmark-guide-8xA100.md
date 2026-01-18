@@ -19,7 +19,7 @@ This guide provides specific test scenarios, expected results, and validation cr
 ssh ubuntu@<instance-ip>
 
 # 2. Clone and setup
-git clone https://github.com/Ranvier-Systems/ranvier-core.git
+git clone git@github.com:Ranvier-Systems/ranvier-core.git
 cd ranvier-core
 ./scripts/bench.sh --setup
 

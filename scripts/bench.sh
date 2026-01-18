@@ -318,7 +318,7 @@ else
         cd "$REPO_DIR"
         git pull origin main 2>/dev/null || true
     else
-        git clone https://github.com/Ranvier-Systems/ranvier-core.git "$REPO_DIR"
+        git clone git@github.com:Ranvier-Systems/ranvier-core.git "$REPO_DIR"
         cd "$REPO_DIR"
     fi
     log_ok "Repository ready at $REPO_DIR"

@@ -99,7 +99,7 @@ if [[ -d "$REPO_DIR" ]]; then
     git pull origin main || git pull origin master || true
 else
     log_info "Cloning Ranvier Core..."
-    git clone https://github.com/Ranvier-Systems/ranvier-core.git "$REPO_DIR"
+    git clone git@github.com:Ranvier-Systems/ranvier-core.git "$REPO_DIR"
     cd "$REPO_DIR"
 fi
 
