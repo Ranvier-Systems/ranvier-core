@@ -2,6 +2,7 @@
 #include "logging.hpp"
 #include "request_rewriter.hpp"
 #include "shard_load_metrics.hpp"
+#include "text_validator.hpp"
 #include "tracing_service.hpp"
 
 #include "stream_parser.hpp"
@@ -801,29 +802,38 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             // This ensures we tokenize exactly what we use for routing, not metadata
             // Uses string_view for zero-copy extraction
             auto extracted_text = RequestRewriter::extract_text(body_view);
-            try {
-                if (extracted_text.has_value()) {
-                    // TokenizerService now accepts string_view
-                    tokens = _tokenizer.encode(extracted_text.value());
-                } else {
-                    // Fallback: tokenize the entire body (legacy behavior)
-                    // Use string_view for zero-copy tokenization
-                    tokens = _tokenizer.encode(body_view);
+            std::string_view text_to_tokenize = extracted_text.has_value()
+                ? extracted_text.value()
+                : body_view;
+
+            // Validate input before passing to tokenizer to prevent crashes
+            // The tokenizer (Rust FFI) can segfault on malformed input
+            constexpr size_t MAX_TOKENIZE_LENGTH = 512 * 1024;  // 512KB limit
+            auto validation = TextValidator::validate_for_tokenizer(text_to_tokenize, MAX_TOKENIZE_LENGTH);
+
+            if (!validation.valid) {
+                log_proxy.warn("[{}] Input validation failed, falling back to round-robin routing: {}",
+                               request_id, validation.error);
+                tokenize_span.set_error(std::string("validation_failed: ") + validation.error);
+                tokens.clear();
+            } else {
+                try {
+                    tokens = _tokenizer.encode(text_to_tokenize);
+                    tokenize_span.set_attribute("ranvier.token_source", "local");
+                    tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
+                } catch (const std::exception& e) {
+                    // Tokenizer failed - log and continue without tokens (fall back to round-robin)
+                    log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
+                                   request_id, e.what());
+                    tokenize_span.set_error(std::string("tokenization_failed: ") + e.what());
+                    tokens.clear();
+                } catch (...) {
+                    // Catch any other exceptions (including potential Rust panics via FFI)
+                    log_proxy.error("[{}] Tokenization failed with unknown exception, falling back to round-robin routing",
+                                    request_id);
+                    tokenize_span.set_error("tokenization_failed: unknown exception");
+                    tokens.clear();
                 }
-                tokenize_span.set_attribute("ranvier.token_source", "local");
-                tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
-            } catch (const std::exception& e) {
-                // Tokenizer failed - log and continue without tokens (fall back to round-robin)
-                log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
-                               request_id, e.what());
-                tokenize_span.set_error(std::string("tokenization_failed: ") + e.what());
-                tokens.clear();
-            } catch (...) {
-                // Catch any other exceptions (including potential Rust panics via FFI)
-                log_proxy.error("[{}] Tokenization failed with unknown exception, falling back to round-robin routing",
-                                request_id);
-                tokenize_span.set_error("tokenization_failed: unknown exception");
-                tokens.clear();
             }
         }
     } // tokenize_span ends here
@@ -1115,9 +1125,20 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     }
 
     std::vector<int32_t> tokens;
+    // Use string_view for zero-copy tokenization
+    std::string_view content_view(req->content.data(), req->content.size());
+
+    // Validate input before passing to tokenizer
+    constexpr size_t MAX_TOKENIZE_LENGTH = 512 * 1024;  // 512KB limit
+    auto validation = TextValidator::validate_for_tokenizer(content_view, MAX_TOKENIZE_LENGTH);
+    if (!validation.valid) {
+        log_control.warn("POST /admin/routes: input validation failed for backend {}: {}", backend_id, validation.error);
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Input validation failed: " + validation.error + "\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
     try {
-        // Use string_view for zero-copy tokenization
-        std::string_view content_view(req->content.data(), req->content.size());
         tokens = _tokenizer.encode(content_view);
     } catch (const std::exception& e) {
         log_control.warn("POST /admin/routes: failed to tokenize content for backend {}: {}", backend_id, e.what());
