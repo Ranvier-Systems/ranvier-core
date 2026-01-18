@@ -86,6 +86,14 @@ class BenchmarkResults:
     tokens_per_second: Optional[float] = None
     unique_prefixes: Optional[int] = None
 
+    # Per-bucket TTFT (real benchmarks only)
+    ttft_large_hit_p50_ms: Optional[float] = None
+    ttft_large_miss_p50_ms: Optional[float] = None
+    ttft_large_improvement_pct: Optional[float] = None
+    ttft_xlarge_hit_p50_ms: Optional[float] = None
+    ttft_xlarge_miss_p50_ms: Optional[float] = None
+    ttft_xlarge_improvement_pct: Optional[float] = None
+
     # Standard Locust metrics
     total_requests: int = 0
     failed_requests: int = 0
@@ -205,6 +213,93 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
     return results
 
 
+def parse_cache_stats_text(content: str) -> Dict[str, Any]:
+    """Parse cache statistics from human-readable text output."""
+    results = {}
+
+    # Cache Hits: 5393
+    hits_match = re.search(r"Cache Hits:\s*(\d+)", content)
+    if hits_match:
+        results["cache_hits"] = int(hits_match.group(1))
+
+    # Cache Misses: 117
+    misses_match = re.search(r"Cache Misses:\s*(\d+)", content)
+    if misses_match:
+        results["cache_misses"] = int(misses_match.group(1))
+
+    # Cache Hit Rate: 97.9%
+    rate_match = re.search(r"Cache Hit Rate:\s*([0-9.]+)%", content)
+    if rate_match:
+        results["cache_hit_rate_pct"] = float(rate_match.group(1))
+
+    # Unique Prefixes: 117
+    prefixes_match = re.search(r"Unique Prefixes:\s*(\d+)", content)
+    if prefixes_match:
+        results["unique_prefixes"] = int(prefixes_match.group(1))
+
+    # TTFT Improvement: -13.2% (from TTFT Comparison section)
+    improvement_match = re.search(r"TTFT Improvement:\s*(-?[0-9.]+)%", content)
+    if improvement_match:
+        results["ttft_improvement_pct"] = float(improvement_match.group(1))
+
+    # Cache Hit P50: 459.9ms
+    hit_p50_match = re.search(r"Cache Hit P50:\s*([0-9.]+)ms", content)
+    if hit_p50_match:
+        results["ttft_cache_hit_p50_ms"] = float(hit_p50_match.group(1))
+
+    # Cache Hit P99: 607.4ms
+    hit_p99_match = re.search(r"Cache Hit P99:\s*([0-9.]+)ms", content)
+    if hit_p99_match:
+        results["ttft_cache_hit_p99_ms"] = float(hit_p99_match.group(1))
+
+    # Cache Miss P50: 406.3ms
+    miss_p50_match = re.search(r"Cache Miss P50:\s*([0-9.]+)ms", content)
+    if miss_p50_match:
+        results["ttft_cache_miss_p50_ms"] = float(miss_p50_match.group(1))
+
+    # Cache Miss P99: 1040.7ms
+    miss_p99_match = re.search(r"Cache Miss P99:\s*([0-9.]+)ms", content)
+    if miss_p99_match:
+        results["ttft_cache_miss_p99_ms"] = float(miss_p99_match.group(1))
+
+    return results
+
+
+def parse_bucket_ttft(content: str) -> Dict[str, Any]:
+    """Parse per-bucket TTFT from the benchmark summary table.
+
+    Example table:
+      Bucket         Reqs        P50        P99    Hit P50   Miss P50    Improv%
+      --------------------------------------------------------------------
+      large          1818    460.1ms    509.0ms    460.1ms    562.1ms      18.2%
+      xlarge         2210    514.8ms    623.7ms    514.7ms    691.2ms      25.5%
+    """
+    results = {}
+
+    # Pattern for bucket row: bucket_name  reqs  p50  p99  hit_p50  miss_p50  improvement
+    # Example: large          1818    460.1ms    509.0ms    460.1ms    562.1ms      18.2%
+    bucket_pattern = r"^\s*(large|xlarge)\s+\d+\s+[0-9.]+ms\s+[0-9.]+ms\s+([0-9.]+)ms\s+([0-9.]+)ms\s+(-?[0-9.]+)%"
+
+    for line in content.split("\n"):
+        match = re.search(bucket_pattern, line)
+        if match:
+            bucket = match.group(1)
+            hit_p50 = float(match.group(2))
+            miss_p50 = float(match.group(3))
+            improvement = float(match.group(4))
+
+            if bucket == "large":
+                results["ttft_large_hit_p50_ms"] = hit_p50
+                results["ttft_large_miss_p50_ms"] = miss_p50
+                results["ttft_large_improvement_pct"] = improvement
+            elif bucket == "xlarge":
+                results["ttft_xlarge_hit_p50_ms"] = hit_p50
+                results["ttft_xlarge_miss_p50_ms"] = miss_p50
+                results["ttft_xlarge_improvement_pct"] = improvement
+
+    return results
+
+
 def parse_aggregated_stats(content: str) -> Dict[str, Any]:
     """Parse Locust aggregated statistics."""
     results = {
@@ -295,6 +390,39 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
             results.ttft_cache_miss_p50_ms = json_stats["ttft_cache_miss_p50_ms"]
         if json_stats.get("ttft_cache_miss_p99_ms"):
             results.ttft_cache_miss_p99_ms = json_stats["ttft_cache_miss_p99_ms"]
+
+        # Parse text-based cache stats (fallback/override for JSON)
+        text_stats = parse_cache_stats_text(content)
+        if text_stats.get("cache_hits") and not results.cache_hits:
+            results.cache_hits = text_stats["cache_hits"]
+        if text_stats.get("cache_misses") and not results.cache_misses:
+            results.cache_misses = text_stats["cache_misses"]
+        if text_stats.get("cache_hit_rate_pct") and not results.cache_hit_rate_pct:
+            results.cache_hit_rate_pct = text_stats["cache_hit_rate_pct"]
+        if text_stats.get("unique_prefixes") and not results.unique_prefixes:
+            results.unique_prefixes = text_stats["unique_prefixes"]
+        if text_stats.get("ttft_improvement_pct") and not results.ttft_improvement_pct:
+            results.ttft_improvement_pct = text_stats["ttft_improvement_pct"]
+        # Override cache TTFT from text if not set
+        if text_stats.get("ttft_cache_hit_p50_ms") and not results.ttft_cache_hit_p50_ms:
+            results.ttft_cache_hit_p50_ms = text_stats["ttft_cache_hit_p50_ms"]
+        if text_stats.get("ttft_cache_hit_p99_ms") and not results.ttft_cache_hit_p99_ms:
+            results.ttft_cache_hit_p99_ms = text_stats["ttft_cache_hit_p99_ms"]
+        if text_stats.get("ttft_cache_miss_p50_ms") and not results.ttft_cache_miss_p50_ms:
+            results.ttft_cache_miss_p50_ms = text_stats["ttft_cache_miss_p50_ms"]
+        if text_stats.get("ttft_cache_miss_p99_ms") and not results.ttft_cache_miss_p99_ms:
+            results.ttft_cache_miss_p99_ms = text_stats["ttft_cache_miss_p99_ms"]
+
+        # Parse per-bucket TTFT
+        bucket_stats = parse_bucket_ttft(content)
+        if bucket_stats.get("ttft_large_hit_p50_ms"):
+            results.ttft_large_hit_p50_ms = bucket_stats["ttft_large_hit_p50_ms"]
+            results.ttft_large_miss_p50_ms = bucket_stats.get("ttft_large_miss_p50_ms")
+            results.ttft_large_improvement_pct = bucket_stats.get("ttft_large_improvement_pct")
+        if bucket_stats.get("ttft_xlarge_hit_p50_ms"):
+            results.ttft_xlarge_hit_p50_ms = bucket_stats["ttft_xlarge_hit_p50_ms"]
+            results.ttft_xlarge_miss_p50_ms = bucket_stats.get("ttft_xlarge_miss_p50_ms")
+            results.ttft_xlarge_improvement_pct = bucket_stats.get("ttft_xlarge_improvement_pct")
 
         # Benchmark mode
         mode_match = re.search(r"Benchmark Mode: (\w+)", content)
@@ -504,64 +632,140 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     """Compare two benchmark results and return formatted comparison."""
     lines = []
     lines.append("=" * 80)
-    lines.append("BENCHMARK COMPARISON")
+    lines.append("BENCHMARK COMPARISON: Round-Robin vs Prefix-Aware")
     lines.append("=" * 80)
-    lines.append(f"Baseline: {baseline.source_file}")
-    lines.append(f"New:      {new.source_file}")
+    lines.append(f"Baseline (Round-Robin): {baseline.source_file}")
+    lines.append(f"New (Prefix-Aware):     {new.source_file}")
     lines.append("")
 
-    # Metrics to compare: (key, display_name, lower_is_better)
-    metrics = [
+    # KEY METRICS - Cache hit rate is the most important comparison
+    lines.append("-" * 80)
+    lines.append("KEY METRICS (Cache Efficiency)")
+    lines.append("-" * 80)
+
+    cache_metrics = [
+        ("cache_hit_rate_pct", "Cache Hit Rate (%)", False),
+        ("cache_hits", "Cache Hits", False),
+        ("cache_misses", "Cache Misses", True),
+        ("unique_prefixes", "Unique Prefixes", None),
+    ]
+
+    lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
+    for key, name, lower_is_better in cache_metrics:
+        baseline_val = getattr(baseline, key, None)
+        new_val = getattr(new, key, None)
+        if baseline_val is None and new_val is None:
+            continue
+        baseline_str = f"{baseline_val:.1f}" if baseline_val is not None else "N/A"
+        new_str = f"{new_val:.1f}" if new_val is not None else "N/A"
+        if lower_is_better is not None:
+            change_str = format_change(baseline_val, new_val, lower_is_better)
+        else:
+            change_str = ""
+        lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
+
+    # PER-BUCKET TTFT - This is where the real improvement shows
+    lines.append("")
+    lines.append("-" * 80)
+    lines.append("PER-BUCKET TTFT IMPROVEMENT (Large Prefixes)")
+    lines.append("-" * 80)
+    lines.append("  (Prefix-aware routing benefits large prefixes most)")
+    lines.append("")
+
+    bucket_metrics = [
+        ("ttft_large_hit_p50_ms", "Large Hit P50 (ms)", True),
+        ("ttft_large_miss_p50_ms", "Large Miss P50 (ms)", True),
+        ("ttft_large_improvement_pct", "Large Improvement (%)", False),
+        ("ttft_xlarge_hit_p50_ms", "XLarge Hit P50 (ms)", True),
+        ("ttft_xlarge_miss_p50_ms", "XLarge Miss P50 (ms)", True),
+        ("ttft_xlarge_improvement_pct", "XLarge Improvement (%)", False),
+    ]
+
+    lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
+    has_bucket_data = False
+    for key, name, lower_is_better in bucket_metrics:
+        baseline_val = getattr(baseline, key, None)
+        new_val = getattr(new, key, None)
+        if baseline_val is None and new_val is None:
+            continue
+        has_bucket_data = True
+        baseline_str = f"{baseline_val:.1f}" if baseline_val is not None else "N/A"
+        new_str = f"{new_val:.1f}" if new_val is not None else "N/A"
+        change_str = format_change(baseline_val, new_val, lower_is_better)
+        lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
+
+    if not has_bucket_data:
+        lines.append("  (No per-bucket data available)")
+
+    # OVERALL TTFT
+    lines.append("")
+    lines.append("-" * 80)
+    lines.append("OVERALL TTFT (All Request Sizes)")
+    lines.append("-" * 80)
+    lines.append("  (Aggregate may be misleading - see per-bucket for real impact)")
+    lines.append("")
+
+    ttft_metrics = [
         ("p50_ttft_ms", "P50 TTFT (ms)", True),
-        ("p75_ttft_ms", "P75 TTFT (ms)", True),
-        ("p90_ttft_ms", "P90 TTFT (ms)", True),
-        ("p95_ttft_ms", "P95 TTFT (ms)", True),
         ("p99_ttft_ms", "P99 TTFT (ms)", True),
         ("ttft_cache_hit_p50_ms", "Cache Hit P50 (ms)", True),
         ("ttft_cache_hit_p99_ms", "Cache Hit P99 (ms)", True),
         ("ttft_cache_miss_p50_ms", "Cache Miss P50 (ms)", True),
         ("ttft_cache_miss_p99_ms", "Cache Miss P99 (ms)", True),
-        ("cache_hit_rate_pct", "Cache Hit Rate (%)", False),
-        ("avg_response_time_ms", "Avg Response (ms)", True),
+    ]
+
+    lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
+    for key, name, lower_is_better in ttft_metrics:
+        baseline_val = getattr(baseline, key, None)
+        new_val = getattr(new, key, None)
+        if baseline_val is None and new_val is None:
+            continue
+        baseline_str = f"{baseline_val:.1f}" if baseline_val is not None else "N/A"
+        new_str = f"{new_val:.1f}" if new_val is not None else "N/A"
+        change_str = format_change(baseline_val, new_val, lower_is_better)
+        lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
+
+    # REQUEST STATS
+    lines.append("")
+    lines.append("-" * 80)
+    lines.append("REQUEST STATISTICS")
+    lines.append("-" * 80)
+
+    request_metrics = [
         ("total_requests", "Total Requests", False),
         ("failed_requests", "Failed Requests", True),
         ("failure_rate_pct", "Failure Rate (%)", True),
         ("requests_per_sec", "Requests/sec", False),
-        ("tokens_per_second", "Tokens/sec", False),
         ("sync_errors", "Sync Errors", True),
     ]
 
     lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
-    lines.append("-" * 80)
-
-    for key, name, lower_is_better in metrics:
+    for key, name, lower_is_better in request_metrics:
         baseline_val = getattr(baseline, key, None)
         new_val = getattr(new, key, None)
-
-        # Skip if both are None
         if baseline_val is None and new_val is None:
             continue
-
-        baseline_str = f"{baseline_val:.2f}" if baseline_val is not None else "N/A"
-        new_str = f"{new_val:.2f}" if new_val is not None else "N/A"
+        baseline_str = f"{baseline_val:.1f}" if baseline_val is not None else "N/A"
+        new_str = f"{new_val:.1f}" if new_val is not None else "N/A"
         change_str = format_change(baseline_val, new_val, lower_is_better)
-
         lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
 
+    lines.append("")
     lines.append("-" * 80)
 
     # Validation status
-    lines.append(f"\nValidation: {'PASSED' if baseline.validation_passed else 'FAILED'} -> {'PASSED' if new.validation_passed else 'FAILED'}")
+    lines.append(f"Validation: {'PASSED' if baseline.validation_passed else 'FAILED'} -> {'PASSED' if new.validation_passed else 'FAILED'}")
 
-    # P99 summary
-    if baseline.p99_ttft_ms and new.p99_ttft_ms and baseline.p99_ttft_ms > 0:
-        p99_improvement = ((baseline.p99_ttft_ms - new.p99_ttft_ms) / baseline.p99_ttft_ms) * 100
-        if p99_improvement > 0:
-            lines.append(f"\nP99 TTFT improved by {p99_improvement:.1f}%")
-        elif p99_improvement < 0:
-            lines.append(f"\nP99 TTFT regressed by {abs(p99_improvement):.1f}%")
-        else:
-            lines.append(f"\nP99 TTFT unchanged")
+    # Summary
+    lines.append("")
+    lines.append("SUMMARY:")
+    if new.cache_hit_rate_pct and baseline.cache_hit_rate_pct:
+        improvement = new.cache_hit_rate_pct - baseline.cache_hit_rate_pct
+        lines.append(f"  Cache Hit Rate: {baseline.cache_hit_rate_pct:.1f}% -> {new.cache_hit_rate_pct:.1f}% (+{improvement:.1f}%)")
+    if new.ttft_large_improvement_pct:
+        lines.append(f"  Large Prefix TTFT Improvement: {new.ttft_large_improvement_pct:.1f}%")
+    if new.ttft_xlarge_improvement_pct:
+        lines.append(f"  XLarge Prefix TTFT Improvement: {new.ttft_xlarge_improvement_pct:.1f}%")
 
     lines.append("=" * 80)
 
