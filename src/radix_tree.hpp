@@ -490,6 +490,15 @@ private:
                 if (n->keys[idx] == key) [[likely]] {
                     return n->children[idx].get();
                 }
+                // Collision case: key_byte matches but full key differs
+                // Fall back to linear search for the correct entry
+                if (n->keys[idx] != Node256::EMPTY_KEY) {
+                    for (int i = 0; i < 256; i++) {
+                        if (n->keys[i] == key) {
+                            return n->children[i].get();
+                        }
+                    }
+                }
                 return nullptr;
             }
         }
@@ -524,8 +533,17 @@ private:
                 auto* n = static_cast<Node256*>(node);
                 uint8_t idx = key_byte(key);
                 if (n->keys[idx] == key) {
-                    n->keys[idx] = Node256::EMPTY_KEY;  // Clear key when extracting
+                    n->keys[idx] = Node256::EMPTY_KEY;
                     return std::move(n->children[idx]);
+                }
+                // Collision case: linear search
+                if (n->keys[idx] != Node256::EMPTY_KEY) {
+                    for (int i = 0; i < 256; i++) {
+                        if (n->keys[i] == key) {
+                            n->keys[i] = Node256::EMPTY_KEY;
+                            return std::move(n->children[i]);
+                        }
+                    }
                 }
                 break;
             }
@@ -566,8 +584,18 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 uint8_t idx = key_byte(key);
-                n->children[idx] = std::move(child);
-                n->keys[idx] = key;  // Store full key for verification
+                // Check if this is the right slot or we need to search
+                if (n->keys[idx] == key) {
+                    n->children[idx] = std::move(child);
+                    return;
+                }
+                // Collision case: find the actual entry
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        n->children[i] = std::move(child);
+                        return;
+                    }
+                }
                 break;
             }
         }
@@ -618,8 +646,21 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(parent.get());
                 uint8_t idx = key_byte(key);
-                n->children[idx] = std::move(child);
-                n->keys[idx] = key;  // Store full key for verification
+                // Use preferred slot if empty or same key (update case)
+                if (n->keys[idx] == Node256::EMPTY_KEY || n->keys[idx] == key) {
+                    n->children[idx] = std::move(child);
+                    n->keys[idx] = key;
+                    return parent;
+                }
+                // Collision: find an empty slot
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == Node256::EMPTY_KEY) {
+                        n->children[i] = std::move(child);
+                        n->keys[i] = key;
+                        return parent;
+                    }
+                }
+                // Node256 is full (shouldn't happen in practice)
                 return parent;
             }
         }
@@ -666,14 +707,40 @@ private:
         auto* n256 = static_cast<Node256*>(n256_ptr.get());
 
         copy_node_metadata(n256, n48);
+
+        // Copy existing children, handling potential collisions
         for (size_t i = 0; i < n48->keys.size(); i++) {
             uint8_t idx = key_byte(n48->keys[i]);
-            n256->children[idx] = std::move(n48->children[i]);
-            n256->keys[idx] = n48->keys[i];  // Copy full key for verification
+            if (n256->keys[idx] == Node256::EMPTY_KEY) {
+                n256->children[idx] = std::move(n48->children[i]);
+                n256->keys[idx] = n48->keys[i];
+            } else {
+                // Collision: find an empty slot
+                for (int j = 0; j < 256; j++) {
+                    if (n256->keys[j] == Node256::EMPTY_KEY) {
+                        n256->children[j] = std::move(n48->children[i]);
+                        n256->keys[j] = n48->keys[i];
+                        break;
+                    }
+                }
+            }
         }
+
+        // Add the new child
         uint8_t new_idx = key_byte(key);
-        n256->children[new_idx] = std::move(child);
-        n256->keys[new_idx] = key;  // Store full key for verification
+        if (n256->keys[new_idx] == Node256::EMPTY_KEY) {
+            n256->children[new_idx] = std::move(child);
+            n256->keys[new_idx] = key;
+        } else {
+            // Collision: find an empty slot
+            for (int j = 0; j < 256; j++) {
+                if (n256->keys[j] == Node256::EMPTY_KEY) {
+                    n256->children[j] = std::move(child);
+                    n256->keys[j] = key;
+                    break;
+                }
+            }
+        }
 
         return n256_ptr;
     }
@@ -859,8 +926,20 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 uint8_t idx = key_byte(key);
-                n->children[idx] = std::move(child);
-                n->keys[idx] = key;  // Store full key for verification
+                // Use preferred slot if empty (normal case after split)
+                if (n->keys[idx] == Node256::EMPTY_KEY) {
+                    n->children[idx] = std::move(child);
+                    n->keys[idx] = key;
+                } else {
+                    // Collision: find an empty slot
+                    for (int i = 0; i < 256; i++) {
+                        if (n->keys[i] == Node256::EMPTY_KEY) {
+                            n->children[i] = std::move(child);
+                            n->keys[i] = key;
+                            break;
+                        }
+                    }
+                }
                 break;
             }
         }
@@ -1330,12 +1409,21 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(parent);
                 uint8_t idx = key_byte(key);
-                // Verify key matches before removing (handles hash collisions)
+                // Check preferred slot first
                 if (n->children[idx] && n->keys[idx] == key) {
                     NodeType removed_type = n->children[idx]->type;
-                    n->children[idx].reset(); // Triggers SlabNodeDeleter
-                    n->keys[idx] = Node256::EMPTY_KEY;  // Clear key
+                    n->children[idx].reset();
+                    n->keys[idx] = Node256::EMPTY_KEY;
                     return removed_type;
+                }
+                // Collision case: linear search
+                for (int i = 0; i < 256; i++) {
+                    if (n->children[i] && n->keys[i] == key) {
+                        NodeType removed_type = n->children[i]->type;
+                        n->children[i].reset();
+                        n->keys[i] = Node256::EMPTY_KEY;
+                        return removed_type;
+                    }
                 }
                 break;
             }

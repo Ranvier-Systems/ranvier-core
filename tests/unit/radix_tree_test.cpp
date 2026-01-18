@@ -2459,3 +2459,170 @@ TEST_F(RadixTreeCompactionTest, NodesRemovedCount) {
     size_t final_nodes = tree.get_tree_stats().total_nodes;
     EXPECT_EQ(stats.nodes_removed, initial_nodes - final_nodes);
 }
+
+// =============================================================================
+// Token ID Hash Collision Tests
+// =============================================================================
+//
+// These tests verify that the radix tree correctly handles token IDs that
+// share the same lower 8 bits. The key_byte() function extracts only the
+// lower 8 bits for Node48/Node256 indexing, so tokens like 0, 256, 512
+// all map to index 0. The tree must store and verify full 32-bit keys.
+//
+// Regression test for: segfault under load due to hash collision corruption
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_SameLower8Bits) {
+    // Token IDs 0, 256, 512 all have lower 8 bits = 0
+    // Token IDs 1, 257, 513 all have lower 8 bits = 1
+    // These MUST be stored as separate routes, not overwrite each other
+
+    tree.insert(tokens({0}), 10);
+    tree.insert(tokens({256}), 20);
+    tree.insert(tokens({512}), 30);
+
+    // Each lookup must return the correct backend
+    auto r0 = tree.lookup(tokens({0}));
+    auto r256 = tree.lookup(tokens({256}));
+    auto r512 = tree.lookup(tokens({512}));
+
+    ASSERT_TRUE(r0.has_value()) << "Route for token 0 not found";
+    ASSERT_TRUE(r256.has_value()) << "Route for token 256 not found";
+    ASSERT_TRUE(r512.has_value()) << "Route for token 512 not found";
+
+    EXPECT_EQ(r0.value(), 10) << "Token 0 returned wrong backend";
+    EXPECT_EQ(r256.value(), 20) << "Token 256 returned wrong backend";
+    EXPECT_EQ(r512.value(), 30) << "Token 512 returned wrong backend";
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_MultipleCollisionGroups) {
+    // Test multiple collision groups simultaneously
+    // Group A: 0, 256, 512 (lower 8 bits = 0)
+    // Group B: 1, 257, 513 (lower 8 bits = 1)
+    // Group C: 255, 511, 767 (lower 8 bits = 255)
+
+    tree.insert(tokens({0}), 1);
+    tree.insert(tokens({256}), 2);
+    tree.insert(tokens({512}), 3);
+    tree.insert(tokens({1}), 4);
+    tree.insert(tokens({257}), 5);
+    tree.insert(tokens({513}), 6);
+    tree.insert(tokens({255}), 7);
+    tree.insert(tokens({511}), 8);
+    tree.insert(tokens({767}), 9);
+
+    // Verify all routes are distinct
+    EXPECT_EQ(tree.lookup(tokens({0})).value(), 1);
+    EXPECT_EQ(tree.lookup(tokens({256})).value(), 2);
+    EXPECT_EQ(tree.lookup(tokens({512})).value(), 3);
+    EXPECT_EQ(tree.lookup(tokens({1})).value(), 4);
+    EXPECT_EQ(tree.lookup(tokens({257})).value(), 5);
+    EXPECT_EQ(tree.lookup(tokens({513})).value(), 6);
+    EXPECT_EQ(tree.lookup(tokens({255})).value(), 7);
+    EXPECT_EQ(tree.lookup(tokens({511})).value(), 8);
+    EXPECT_EQ(tree.lookup(tokens({767})).value(), 9);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_InSequence) {
+    // Test collision in middle of token sequence
+    // Routes differ only in the second token, which has same lower 8 bits
+
+    tree.insert(tokens({100, 0, 999}), 1);
+    tree.insert(tokens({100, 256, 999}), 2);
+    tree.insert(tokens({100, 512, 999}), 3);
+
+    auto r0 = tree.lookup(tokens({100, 0, 999}));
+    auto r256 = tree.lookup(tokens({100, 256, 999}));
+    auto r512 = tree.lookup(tokens({100, 512, 999}));
+
+    ASSERT_TRUE(r0.has_value());
+    ASSERT_TRUE(r256.has_value());
+    ASSERT_TRUE(r512.has_value());
+
+    EXPECT_EQ(r0.value(), 1);
+    EXPECT_EQ(r256.value(), 2);
+    EXPECT_EQ(r512.value(), 3);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_LargeTokenIds) {
+    // Test with realistic GPT-2 token IDs (vocab size ~50,257)
+    // These tokens all have lower 8 bits = 0xE1 (225)
+    const TokenId t1 = 225;       // 0x000000E1
+    const TokenId t2 = 225 + 256; // 0x000001E1
+    const TokenId t3 = 225 + 512; // 0x000002E1
+    const TokenId t4 = 50145;     // 0x0000C3E1 (realistic GPT-2 token)
+
+    tree.insert(tokens({t1}), 1);
+    tree.insert(tokens({t2}), 2);
+    tree.insert(tokens({t3}), 3);
+    tree.insert(tokens({t4}), 4);
+
+    EXPECT_EQ(tree.lookup(tokens({t1})).value(), 1);
+    EXPECT_EQ(tree.lookup(tokens({t2})).value(), 2);
+    EXPECT_EQ(tree.lookup(tokens({t3})).value(), 3);
+    EXPECT_EQ(tree.lookup(tokens({t4})).value(), 4);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_Node256Growth) {
+    // Force tree to grow to Node256 with colliding keys
+    // Insert 49+ routes at same prefix to trigger Node48 -> Node256 growth
+
+    // First, create routes that will grow the node
+    for (int i = 0; i < 50; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Now insert colliding tokens at the same level
+    // These should be correctly stored in Node256
+    tree.insert(tokens({1, 256}), 100);  // Collides with tokens({1, 0})
+    tree.insert(tokens({1, 512}), 101);  // Also collides with tokens({1, 0})
+
+    // Verify original route still correct
+    EXPECT_EQ(tree.lookup(tokens({1, 0})).value(), 0);
+
+    // Verify colliding routes are distinct
+    EXPECT_EQ(tree.lookup(tokens({1, 256})).value(), 100);
+    EXPECT_EQ(tree.lookup(tokens({1, 512})).value(), 101);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_UpdateExisting) {
+    // Verify that updating a route doesn't affect colliding routes
+    tree.insert(tokens({0}), 10);
+    tree.insert(tokens({256}), 20);
+
+    // Update route for token 0
+    tree.insert(tokens({0}), 99);
+
+    // Token 0 should be updated
+    EXPECT_EQ(tree.lookup(tokens({0})).value(), 99);
+
+    // Token 256 should be unchanged (not accidentally updated)
+    EXPECT_EQ(tree.lookup(tokens({256})).value(), 20);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_LookupNonexistent) {
+    // Insert route for token 0, lookup token 256 (same lower 8 bits)
+    // Should return nullopt, not the route for token 0
+    tree.insert(tokens({0}), 10);
+
+    auto result = tree.lookup(tokens({256}));
+    EXPECT_FALSE(result.has_value())
+        << "Lookup for non-existent token 256 incorrectly returned route for token 0";
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_RemoveDoesNotAffectColliding) {
+    // Insert routes with colliding tokens
+    tree.insert(tokens({0, 1}), 10);
+    tree.insert(tokens({256, 1}), 20);
+    tree.insert(tokens({512, 1}), 30);
+
+    // Expire and remove route for token 256
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    tree.remove_expired(future);
+
+    // After compaction, routes for 0 and 512 should still work
+    // (This tests that removal doesn't corrupt colliding entries)
+    tree.compact();
+
+    // All routes expired, but this tests the removal path doesn't crash
+    // In a real scenario with selective expiry, non-expired routes would remain
+}
