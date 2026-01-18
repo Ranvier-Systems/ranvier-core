@@ -67,6 +67,43 @@ The P99 cache hit latency tells the story of consistency:
 
 Prefix-affinity provides **47% lower tail latency** for cache hits because requests consistently route to backends with cached prefixes.
 
+---
+
+## High Concurrency Results (January 2026)
+
+The following results were obtained with higher concurrency to stress-test the system:
+
+| Parameter | Value |
+|-----------|-------|
+| Concurrent Users | 64 |
+| Test Duration | 15 minutes (with warmup) |
+| Prompt Distribution | stress (large prefixes) |
+| Prefix Ratio | 0.9 |
+
+### Cache Hit Rate (High Concurrency)
+
+| Routing Mode | Cache Hits | Cache Misses | Hit Rate |
+|--------------|------------|--------------|----------|
+| Round-Robin | 1,130 | 7,828 | 12.6% |
+| Prefix-Affinity | 8,892 | 180 | **98.0%** |
+
+**Improvement: 7.8x better cache utilization**
+
+### TTFT by Prefix Size (High Concurrency)
+
+| Prefix Size | Round-Robin | Prefix-Affinity |
+|-------------|-------------|-----------------|
+| Large (2-4K tokens) | -0.3% improvement | **3.7% improvement** |
+| XLarge (4-8K tokens) | 0.7% improvement | **25.9% improvement** |
+
+### Key Observations
+
+1. **Cache hit rate scales well** - Even at 64 concurrent users, prefix-affinity maintains 98% hit rate
+2. **TTFT improvements are lower at high concurrency** - Contention reduces the per-request benefit, but aggregate throughput remains higher
+3. **XLarge prefixes still show significant gains** - 25.9% improvement demonstrates the value for long-context workloads
+
+---
+
 ## How It Works
 
 ### Round-Robin Routing
