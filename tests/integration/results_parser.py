@@ -185,31 +185,73 @@ def parse_cache_ttft(content: str) -> Dict[str, Optional[float]]:
 def parse_json_stats(content: str) -> Dict[str, Any]:
     """Parse JSON stats block from locustfile_real.py output."""
     results = {}
-    json_pattern = r"BENCHMARK_STATS_JSON:(\{[^}]+\})"
-    match = re.search(json_pattern, content)
-    if match:
-        try:
-            stats = json.loads(match.group(1))
-            results["cache_hits"] = stats.get("cache_hits")
-            results["cache_misses"] = stats.get("cache_misses")
-            results["cache_hit_rate_pct"] = stats.get("cache_hit_rate_pct")
-            results["ttft_improvement_pct"] = stats.get("ttft_improvement_pct")
-            results["total_prompt_tokens"] = stats.get("total_prompt_tokens")
-            results["total_completion_tokens"] = stats.get("total_completion_tokens")
-            results["tokens_per_second"] = stats.get("tokens_per_second")
-            results["unique_prefixes"] = stats.get("unique_prefixes")
 
-            # Override TTFT stats from JSON if available (more accurate)
-            if stats.get("ttft_cache_hit_p50_ms"):
-                results["ttft_cache_hit_p50_ms"] = stats["ttft_cache_hit_p50_ms"]
-            if stats.get("ttft_cache_hit_p99_ms"):
-                results["ttft_cache_hit_p99_ms"] = stats["ttft_cache_hit_p99_ms"]
-            if stats.get("ttft_cache_miss_p50_ms"):
-                results["ttft_cache_miss_p50_ms"] = stats["ttft_cache_miss_p50_ms"]
-            if stats.get("ttft_cache_miss_p99_ms"):
-                results["ttft_cache_miss_p99_ms"] = stats["ttft_cache_miss_p99_ms"]
-        except json.JSONDecodeError:
-            pass
+    # Find the JSON object after BENCHMARK_STATS_JSON:
+    # Handle nested objects by finding balanced braces
+    json_start = content.find("BENCHMARK_STATS_JSON:")
+    if json_start == -1:
+        return results
+
+    json_start = content.find("{", json_start)
+    if json_start == -1:
+        return results
+
+    # Find matching closing brace
+    depth = 0
+    json_end = json_start
+    for i, char in enumerate(content[json_start:]):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                json_end = json_start + i + 1
+                break
+
+    try:
+        stats = json.loads(content[json_start:json_end])
+
+        # Core metrics
+        results["cache_hits"] = stats.get("cache_hits")
+        results["cache_misses"] = stats.get("cache_misses")
+        results["cache_hit_rate_pct"] = stats.get("cache_hit_rate_pct")
+        results["ttft_improvement_pct"] = stats.get("ttft_improvement_pct")
+        results["total_prompt_tokens"] = stats.get("total_prompt_tokens")
+        results["total_completion_tokens"] = stats.get("total_completion_tokens")
+        results["tokens_per_second"] = stats.get("tokens_per_second")
+        results["unique_prefixes"] = stats.get("unique_prefixes")
+
+        # Request counts
+        results["total_requests"] = stats.get("total_requests")
+        results["failed_requests"] = stats.get("failed_requests")
+
+        # TTFT stats from JSON (more accurate)
+        if stats.get("ttft_cache_hit_p50_ms"):
+            results["ttft_cache_hit_p50_ms"] = stats["ttft_cache_hit_p50_ms"]
+        if stats.get("ttft_cache_hit_p99_ms"):
+            results["ttft_cache_hit_p99_ms"] = stats["ttft_cache_hit_p99_ms"]
+        if stats.get("ttft_cache_miss_p50_ms"):
+            results["ttft_cache_miss_p50_ms"] = stats["ttft_cache_miss_p50_ms"]
+        if stats.get("ttft_cache_miss_p99_ms"):
+            results["ttft_cache_miss_p99_ms"] = stats["ttft_cache_miss_p99_ms"]
+
+        # Per-bucket stats
+        bucket_stats = stats.get("bucket_stats", {})
+        for bucket_name in ["large", "xlarge"]:
+            if bucket_name in bucket_stats:
+                b = bucket_stats[bucket_name]
+                if bucket_name == "large":
+                    results["ttft_large_hit_p50_ms"] = b.get("cache_hit_ttft_p50_ms")
+                    results["ttft_large_miss_p50_ms"] = b.get("cache_miss_ttft_p50_ms")
+                    results["ttft_large_improvement_pct"] = b.get("ttft_improvement_pct")
+                elif bucket_name == "xlarge":
+                    results["ttft_xlarge_hit_p50_ms"] = b.get("cache_hit_ttft_p50_ms")
+                    results["ttft_xlarge_miss_p50_ms"] = b.get("cache_miss_ttft_p50_ms")
+                    results["ttft_xlarge_improvement_pct"] = b.get("ttft_improvement_pct")
+
+    except json.JSONDecodeError:
+        pass
+
     return results
 
 
@@ -268,25 +310,40 @@ def parse_cache_stats_text(content: str) -> Dict[str, Any]:
 def parse_bucket_ttft(content: str) -> Dict[str, Any]:
     """Parse per-bucket TTFT from the benchmark summary table.
 
-    Example table:
+    Example table (raw output):
       Bucket         Reqs        P50        P99    Hit P50   Miss P50    Improv%
       --------------------------------------------------------------------
       large          1818    460.1ms    509.0ms    460.1ms    562.1ms      18.2%
       xlarge         2210    514.8ms    623.7ms    514.7ms    691.2ms      25.5%
+
+    Example with logger prefix:
+      [2026-01-18 02:16:06,560] 5b62eb0e5595/INFO/locustfile_real:   large          1818    460.1ms    509.0ms    460.1ms    562.1ms      18.2%
     """
     results = {}
 
     # Pattern for bucket row: bucket_name  reqs  p50  p99  hit_p50  miss_p50  improvement
-    # Example: large          1818    460.1ms    509.0ms    460.1ms    562.1ms      18.2%
-    bucket_pattern = r"^\s*(large|xlarge)\s+\d+\s+[0-9.]+ms\s+[0-9.]+ms\s+([0-9.]+)ms\s+([0-9.]+)ms\s+(-?[0-9.]+)%"
+    # Don't anchor to start of line - log lines may have logger prefix
+    # Match: (large|xlarge) followed by digits (reqs), then ms values, then percentage
+    # Values may be actual numbers or "N/A"
+    bucket_pattern = r"\b(large|xlarge)\s+(\d+)\s+([0-9.]+ms|N/A)\s+([0-9.]+ms|N/A)\s+([0-9.]+ms|N/A)\s+([0-9.]+ms|N/A)\s+(-?[0-9.]+%|N/A)"
 
     for line in content.split("\n"):
         match = re.search(bucket_pattern, line)
         if match:
             bucket = match.group(1)
-            hit_p50 = float(match.group(2))
-            miss_p50 = float(match.group(3))
-            improvement = float(match.group(4))
+            # Groups: 1=bucket, 2=reqs, 3=p50, 4=p99, 5=hit_p50, 6=miss_p50, 7=improvement
+
+            # Parse hit_p50 (group 5)
+            hit_p50_str = match.group(5)
+            hit_p50 = float(hit_p50_str.replace("ms", "")) if hit_p50_str != "N/A" else None
+
+            # Parse miss_p50 (group 6)
+            miss_p50_str = match.group(6)
+            miss_p50 = float(miss_p50_str.replace("ms", "")) if miss_p50_str != "N/A" else None
+
+            # Parse improvement (group 7)
+            improv_str = match.group(7)
+            improvement = float(improv_str.replace("%", "")) if improv_str != "N/A" else None
 
             if bucket == "large":
                 results["ttft_large_hit_p50_ms"] = hit_p50
@@ -297,11 +354,27 @@ def parse_bucket_ttft(content: str) -> Dict[str, Any]:
                 results["ttft_xlarge_miss_p50_ms"] = miss_p50
                 results["ttft_xlarge_improvement_pct"] = improvement
 
+    # Also parse the highlighted summary lines for large/xlarge improvements
+    # Example: "Large Prefix (2000-4000 tokens) TTFT Improvement: 18.2%"
+    large_improv_match = re.search(r"Large Prefix.*TTFT Improvement:\s*(-?[0-9.]+)%", content)
+    if large_improv_match and not results.get("ttft_large_improvement_pct"):
+        results["ttft_large_improvement_pct"] = float(large_improv_match.group(1))
+
+    xlarge_improv_match = re.search(r"XLarge Prefix.*TTFT Improvement:\s*(-?[0-9.]+)%", content)
+    if xlarge_improv_match and not results.get("ttft_xlarge_improvement_pct"):
+        results["ttft_xlarge_improvement_pct"] = float(xlarge_improv_match.group(1))
+
     return results
 
 
 def parse_aggregated_stats(content: str) -> Dict[str, Any]:
-    """Parse Locust aggregated statistics."""
+    """Parse Locust aggregated statistics.
+
+    Example formats:
+      Standard:   Aggregated    1263  282(22.33%) |     38       0      72     53 |    3.09        0.69
+      With 0%:    Aggregated    5510    0(0.00%)  |     58      31     124    148 |    9.18        3.71
+      Logger:     [timestamp] .../INFO/...: Aggregated    5510    0(0.00%) ...
+    """
     results = {
         "total_requests": 0,
         "failed_requests": 0,
@@ -311,6 +384,7 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
     }
 
     # Pattern: Aggregated    1263  282(22.33%) |     38       0      72     53 |    3.09        0.69
+    # Don't anchor - may have logger prefix
     agg_pattern = r"Aggregated\s+(\d+)\s+(\d+)\(([0-9.]+)%\)\s+\|\s+(\d+)"
     match = re.search(agg_pattern, content)
     if match:
@@ -322,10 +396,41 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
     # Parse requests per second from aggregated line
     for line in content.split("\n"):
         if "Aggregated" in line:
+            # Try to find RPS at end of line after the last pipe
             rps_match = re.search(r"\|\s+([0-9.]+)\s+[0-9.]+\s*$", line)
             if rps_match:
                 results["requests_per_sec"] = float(rps_match.group(1))
             break
+
+    # If we didn't find aggregated stats, try alternative formats
+    if results["total_requests"] == 0:
+        # Try parsing from custom summary output
+        # Total Requests: 5510
+        total_match = re.search(r"Total Requests:\s*(\d+)", content)
+        if total_match:
+            results["total_requests"] = int(total_match.group(1))
+
+        # Failed Requests: 0
+        failed_match = re.search(r"Failed Requests:\s*(\d+)", content)
+        if failed_match:
+            results["failed_requests"] = int(failed_match.group(1))
+
+        # Calculate failure rate
+        if results["total_requests"] > 0:
+            results["failure_rate_pct"] = (results["failed_requests"] / results["total_requests"]) * 100
+
+        # Requests/Second: 9.18
+        rps_match = re.search(r"Requests/Second:\s*([0-9.]+)", content)
+        if rps_match:
+            results["requests_per_sec"] = float(rps_match.group(1))
+
+    # Also try to get total from benchmark stats
+    if results["total_requests"] == 0:
+        # From BENCHMARK_STATS_JSON or similar
+        json_pattern = r'"total_requests":\s*(\d+)'
+        json_match = re.search(json_pattern, content)
+        if json_match:
+            results["total_requests"] = int(json_match.group(1))
 
     return results
 
@@ -391,6 +496,22 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         if json_stats.get("ttft_cache_miss_p99_ms"):
             results.ttft_cache_miss_p99_ms = json_stats["ttft_cache_miss_p99_ms"]
 
+        # Override total_requests from JSON if aggregated stats returned 0
+        if json_stats.get("total_requests") and results.total_requests == 0:
+            results.total_requests = json_stats["total_requests"]
+        if json_stats.get("failed_requests") is not None and results.failed_requests == 0:
+            results.failed_requests = json_stats["failed_requests"]
+
+        # Per-bucket stats from JSON (priority source)
+        if json_stats.get("ttft_large_hit_p50_ms"):
+            results.ttft_large_hit_p50_ms = json_stats["ttft_large_hit_p50_ms"]
+            results.ttft_large_miss_p50_ms = json_stats.get("ttft_large_miss_p50_ms")
+            results.ttft_large_improvement_pct = json_stats.get("ttft_large_improvement_pct")
+        if json_stats.get("ttft_xlarge_hit_p50_ms"):
+            results.ttft_xlarge_hit_p50_ms = json_stats["ttft_xlarge_hit_p50_ms"]
+            results.ttft_xlarge_miss_p50_ms = json_stats.get("ttft_xlarge_miss_p50_ms")
+            results.ttft_xlarge_improvement_pct = json_stats.get("ttft_xlarge_improvement_pct")
+
         # Parse text-based cache stats (fallback/override for JSON)
         text_stats = parse_cache_stats_text(content)
         if text_stats.get("cache_hits") and not results.cache_hits:
@@ -413,16 +534,20 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         if text_stats.get("ttft_cache_miss_p99_ms") and not results.ttft_cache_miss_p99_ms:
             results.ttft_cache_miss_p99_ms = text_stats["ttft_cache_miss_p99_ms"]
 
-        # Parse per-bucket TTFT
+        # Parse per-bucket TTFT from text (fallback if JSON didn't have it)
         bucket_stats = parse_bucket_ttft(content)
-        if bucket_stats.get("ttft_large_hit_p50_ms"):
+        if bucket_stats.get("ttft_large_hit_p50_ms") and not results.ttft_large_hit_p50_ms:
             results.ttft_large_hit_p50_ms = bucket_stats["ttft_large_hit_p50_ms"]
-            results.ttft_large_miss_p50_ms = bucket_stats.get("ttft_large_miss_p50_ms")
-            results.ttft_large_improvement_pct = bucket_stats.get("ttft_large_improvement_pct")
-        if bucket_stats.get("ttft_xlarge_hit_p50_ms"):
+        if bucket_stats.get("ttft_large_miss_p50_ms") and not results.ttft_large_miss_p50_ms:
+            results.ttft_large_miss_p50_ms = bucket_stats["ttft_large_miss_p50_ms"]
+        if bucket_stats.get("ttft_large_improvement_pct") and not results.ttft_large_improvement_pct:
+            results.ttft_large_improvement_pct = bucket_stats["ttft_large_improvement_pct"]
+        if bucket_stats.get("ttft_xlarge_hit_p50_ms") and not results.ttft_xlarge_hit_p50_ms:
             results.ttft_xlarge_hit_p50_ms = bucket_stats["ttft_xlarge_hit_p50_ms"]
-            results.ttft_xlarge_miss_p50_ms = bucket_stats.get("ttft_xlarge_miss_p50_ms")
-            results.ttft_xlarge_improvement_pct = bucket_stats.get("ttft_xlarge_improvement_pct")
+        if bucket_stats.get("ttft_xlarge_miss_p50_ms") and not results.ttft_xlarge_miss_p50_ms:
+            results.ttft_xlarge_miss_p50_ms = bucket_stats["ttft_xlarge_miss_p50_ms"]
+        if bucket_stats.get("ttft_xlarge_improvement_pct") and not results.ttft_xlarge_improvement_pct:
+            results.ttft_xlarge_improvement_pct = bucket_stats["ttft_xlarge_improvement_pct"]
 
         # Benchmark mode
         mode_match = re.search(r"Benchmark Mode: (\w+)", content)
