@@ -158,9 +158,9 @@ benchmark:
 	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
 	echo ""; \
 	echo "Parsing results..."; \
-	python3 tests/integration/parse_locust_output.py \
+	python3 tests/integration/results_parser.py parse \
 		$(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_output.log \
-		$(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv \
+		-o $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv \
 		2>/dev/null || echo "  (parser not available, raw log saved)"; \
 	echo "Stopping test cluster..."; \
 	$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile benchmark down -v --remove-orphans; \
@@ -178,7 +178,7 @@ benchmark:
 		echo "Results saved to: $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_*"; \
 		echo ""; \
 		echo "Compare with previous runs:"; \
-		echo "  python3 tests/integration/compare_results.py $(BENCHMARK_REPORT_DIR)/<old>_stats.csv $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_stats.csv"; \
+		echo "  python3 tests/integration/results_parser.py compare $(BENCHMARK_REPORT_DIR)/<baseline>.log $(BENCHMARK_REPORT_DIR)/$(BENCHMARK_RUN_NAME)_output.log"; \
 	fi
 
 # Start benchmark cluster for interactive testing via web UI
@@ -292,9 +292,9 @@ benchmark-real:
 	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
 	echo ""; \
 	echo "Parsing results..."; \
-	python3 tests/integration/parse_real_benchmark.py \
+	python3 tests/integration/results_parser.py parse \
 		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
-		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		-o $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
 		2>/dev/null || echo "  (parser output above)"; \
 	echo "Stopping cluster..."; \
 	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile benchmark down -v --remove-orphans; \
@@ -363,9 +363,9 @@ benchmark-real-local:
 	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
 	echo ""; \
 	echo "Parsing results..."; \
-	python3 tests/integration/parse_real_benchmark.py \
+	python3 tests/integration/results_parser.py parse \
 		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
-		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		-o $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
 		2>/dev/null || echo "  (parser output above)"; \
 	echo "Stopping cluster..."; \
 	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile local-vllm --profile benchmark down -v --remove-orphans; \
@@ -440,9 +440,9 @@ benchmark-single-gpu:
 	; LOCUST_EXIT=$${PIPESTATUS[0]}; \
 	echo ""; \
 	echo "Parsing results..."; \
-	python3 tests/integration/parse_real_benchmark.py \
+	python3 tests/integration/results_parser.py parse \
 		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_output.log \
-		$(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
+		-o $(BENCHMARK_REAL_REPORT_DIR)/$${BENCHMARK_RUN_NAME}_stats.csv \
 		2>/dev/null || echo "  (parser output above)"; \
 	echo "Stopping cluster..."; \
 	$(DOCKER_COMPOSE) $(COMPOSE_REAL_ARGS) --profile single-gpu down -v --remove-orphans; \
@@ -655,7 +655,7 @@ help:
 	@echo "    SHARED_PREFIX_RATIO=0.7     - Ratio of requests with shared prefix"
 	@echo ""
 	@echo "  Compare benchmark results:"
-	@echo "    python3 tests/integration/compare_results.py <baseline.csv> <new.csv>"
+	@echo "    python3 tests/integration/results_parser.py compare <baseline.log> <new.log>"
 	@echo ""
 	@echo "Integration test helpers:"
 	@echo "  make integration-up   - Start test cluster for debugging"

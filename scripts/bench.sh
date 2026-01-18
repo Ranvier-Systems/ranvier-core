@@ -1059,4 +1059,4 @@ fi
 
 echo ""
 log_info "To compare results, use:"
-echo "  python3 tests/integration/compare_results.py <baseline.csv> <optimized.csv>"
+echo "  python3 tests/integration/results_parser.py compare <baseline.log> <new.log>"

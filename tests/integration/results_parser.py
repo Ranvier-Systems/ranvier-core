@@ -2,11 +2,6 @@
 """
 Unified Benchmark Results Parser for Ranvier
 
-This script consolidates functionality from:
-  - parse_locust_output.py (use: parse --type mock)
-  - parse_real_benchmark.py (use: parse --type real)
-  - compare_results.py (use: compare)
-
 Commands:
   parse      Parse a benchmark log file to CSV/JSON
   summary    Show human-readable summary of results
@@ -33,7 +28,7 @@ Examples:
     ./results_parser.py parse benchmark-reports/20250117_prefix/benchmark.log
 
     # Quick comparison of A/B test results
-    ./results_parser.py compare round_robin_stats.csv prefix_stats.csv
+    ./results_parser.py compare baseline/benchmark.log optimized/benchmark.log
 
     # Generate markdown table for documentation
     ./results_parser.py export stats.csv --format markdown > results.md
