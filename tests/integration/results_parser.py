@@ -394,13 +394,15 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
         results["avg_response_time_ms"] = float(match.group(4))
 
     # Parse requests per second from aggregated line
+    # Use last occurrence (final stats, not intermediate)
     for line in content.split("\n"):
+        line = line.rstrip()  # Remove trailing \r and whitespace
         if "Aggregated" in line:
             # Try to find RPS at end of line after the last pipe
-            rps_match = re.search(r"\|\s+([0-9.]+)\s+[0-9.]+\s*$", line)
+            rps_match = re.search(r"\|\s+([0-9.]+)\s+[0-9.]+$", line)
             if rps_match:
                 results["requests_per_sec"] = float(rps_match.group(1))
-            break
+            # Don't break - use last Aggregated line (final stats)
 
     # If we didn't find aggregated stats, try alternative formats
     if results["total_requests"] == 0:
