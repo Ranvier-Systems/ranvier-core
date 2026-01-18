@@ -801,16 +801,30 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
             // This ensures we tokenize exactly what we use for routing, not metadata
             // Uses string_view for zero-copy extraction
             auto extracted_text = RequestRewriter::extract_text(body_view);
-            if (extracted_text.has_value()) {
-                // TokenizerService now accepts string_view
-                tokens = _tokenizer.encode(extracted_text.value());
-            } else {
-                // Fallback: tokenize the entire body (legacy behavior)
-                // Use string_view for zero-copy tokenization
-                tokens = _tokenizer.encode(body_view);
+            try {
+                if (extracted_text.has_value()) {
+                    // TokenizerService now accepts string_view
+                    tokens = _tokenizer.encode(extracted_text.value());
+                } else {
+                    // Fallback: tokenize the entire body (legacy behavior)
+                    // Use string_view for zero-copy tokenization
+                    tokens = _tokenizer.encode(body_view);
+                }
+                tokenize_span.set_attribute("ranvier.token_source", "local");
+                tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
+            } catch (const std::exception& e) {
+                // Tokenizer failed - log and continue without tokens (fall back to round-robin)
+                log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
+                               request_id, e.what());
+                tokenize_span.set_error(std::string("tokenization_failed: ") + e.what());
+                tokens.clear();
+            } catch (...) {
+                // Catch any other exceptions (including potential Rust panics via FFI)
+                log_proxy.error("[{}] Tokenization failed with unknown exception, falling back to round-robin routing",
+                                request_id);
+                tokenize_span.set_error("tokenization_failed: unknown exception");
+                tokens.clear();
             }
-            tokenize_span.set_attribute("ranvier.token_source", "local");
-            tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
         }
     } // tokenize_span ends here
 
