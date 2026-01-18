@@ -479,6 +479,13 @@ private:
                 if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) [[likely]] {
                     return n->children[idx].get();
                 }
+                // Collision case: index points to different key, or was overwritten
+                // Fall back to linear search through keys
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        return n->children[i].get();
+                    }
+                }
                 return nullptr;
             }
             case NodeType::Node256: {
@@ -526,6 +533,12 @@ private:
                 uint8_t idx = n->index[key_byte(key)];
                 if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
                     return std::move(n->children[idx]);
+                }
+                // Collision case: linear search
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        return std::move(n->children[i]);
+                    }
                 }
                 break;
             }
@@ -576,8 +589,16 @@ private:
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER) {
+                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
                     n->children[idx] = std::move(child);
+                    return;
+                }
+                // Collision case: linear search
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        n->children[i] = std::move(child);
+                        return;
+                    }
                 }
                 break;
             }
@@ -636,7 +657,12 @@ private:
                 auto* n = static_cast<Node48*>(parent.get());
                 if (n->children.size() < 48) {
                     uint8_t pos = static_cast<uint8_t>(n->children.size());
-                    n->index[key_byte(key)] = pos;
+                    uint8_t key_idx = key_byte(key);
+                    // Only set index if slot is empty (avoid overwriting colliding keys)
+                    if (n->index[key_idx] == Node48::EMPTY_MARKER) {
+                        n->index[key_idx] = pos;
+                    }
+                    // Child is added regardless - may need linear search to find
                     n->children.push_back(std::move(child));
                     n->keys.push_back(key);
                     return parent;
@@ -688,13 +714,20 @@ private:
 
         copy_node_metadata(n48, n16);
         for (size_t i = 0; i < n16->keys.size(); i++) {
-            n48->index[key_byte(n16->keys[i])] = static_cast<uint8_t>(i);
+            uint8_t key_idx = key_byte(n16->keys[i]);
+            // Only set index if slot is empty (first key with this key_byte wins)
+            if (n48->index[key_idx] == Node48::EMPTY_MARKER) {
+                n48->index[key_idx] = static_cast<uint8_t>(i);
+            }
             n48->children.push_back(std::move(n16->children[i]));
             n48->keys.push_back(n16->keys[i]);
         }
 
         uint8_t pos = static_cast<uint8_t>(n48->children.size());
-        n48->index[key_byte(key)] = pos;
+        uint8_t new_key_idx = key_byte(key);
+        if (n48->index[new_key_idx] == Node48::EMPTY_MARKER) {
+            n48->index[new_key_idx] = pos;
+        }
         n48->children.push_back(std::move(child));
         n48->keys.push_back(key);
 
@@ -884,8 +917,12 @@ private:
                 for (int i = 0; i < 256; i++) {
                     if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
                         uint8_t pos = static_cast<uint8_t>(d->children.size());
-                        d->index[static_cast<uint8_t>(i)] = pos;
-                        d->keys.push_back(src->keys[i]);  // Use stored full key
+                        uint8_t key_idx = key_byte(src->keys[i]);
+                        // Only set index if slot is empty (collision handling)
+                        if (d->index[key_idx] == Node48::EMPTY_MARKER) {
+                            d->index[key_idx] = pos;
+                        }
+                        d->keys.push_back(src->keys[i]);
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -1387,22 +1424,37 @@ private:
             }
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(parent);
-                uint8_t idx = n->index[key_byte(key)];
-                // Verify key matches before removing (handles hash collisions)
-                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
-                    NodeType removed_type = n->children[idx]->type;
-                    // Remove from children and keys vectors
-                    n->children.erase(n->children.begin() + idx);
-                    n->keys.erase(n->keys.begin() + idx);
-                    // Reset index entry
+                uint8_t indexed_pos = n->index[key_byte(key)];
+
+                // Try indexed lookup first
+                if (indexed_pos != Node48::EMPTY_MARKER && n->keys[indexed_pos] == key) {
+                    NodeType removed_type = n->children[indexed_pos]->type;
+                    n->children.erase(n->children.begin() + indexed_pos);
+                    n->keys.erase(n->keys.begin() + indexed_pos);
                     n->index[key_byte(key)] = Node48::EMPTY_MARKER;
-                    // Reindex: entries pointing to indices > idx need to be decremented
+                    // Reindex
                     for (size_t i = 0; i < 256; i++) {
-                        if (n->index[i] != Node48::EMPTY_MARKER && n->index[i] > idx) {
+                        if (n->index[i] != Node48::EMPTY_MARKER && n->index[i] > indexed_pos) {
                             n->index[i]--;
                         }
                     }
                     return removed_type;
+                }
+
+                // Collision case: linear search
+                for (size_t i = 0; i < n->keys.size(); i++) {
+                    if (n->keys[i] == key) {
+                        NodeType removed_type = n->children[i]->type;
+                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
+                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
+                        // Reindex
+                        for (size_t j = 0; j < 256; j++) {
+                            if (n->index[j] != Node48::EMPTY_MARKER && n->index[j] > i) {
+                                n->index[j]--;
+                            }
+                        }
+                        return removed_type;
+                    }
                 }
                 break;
             }
@@ -1564,9 +1616,12 @@ private:
             size_t count = 0;
             for (int i = 0; i < 256 && count < 48; i++) {
                 if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
-                    // Use key_byte of the stored full key for index array
-                    n48->index[key_byte(src->keys[i])] = static_cast<uint8_t>(count);
-                    n48->keys.push_back(src->keys[i]);  // Store full key
+                    uint8_t key_idx = key_byte(src->keys[i]);
+                    // Only set index if slot is empty (collision handling)
+                    if (n48->index[key_idx] == Node48::EMPTY_MARKER) {
+                        n48->index[key_idx] = static_cast<uint8_t>(count);
+                    }
+                    n48->keys.push_back(src->keys[i]);
                     n48->children.push_back(std::move(src->children[i]));
                     count++;
                 }

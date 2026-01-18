@@ -2626,3 +2626,102 @@ TEST_F(RadixTreeTest, TokenIdHashCollision_RemoveDoesNotAffectColliding) {
     // All routes expired, but this tests the removal path doesn't crash
     // In a real scenario with selective expiry, non-expired routes would remain
 }
+
+// =============================================================================
+// Node48-specific Hash Collision Tests
+// =============================================================================
+// Node48 uses index[key_byte(key)] to map 8-bit index -> child position.
+// This has the same collision issue as Node256: tokens with same lower 8 bits
+// would incorrectly share index entries.
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_Node48Range) {
+    // Force tree into Node48 range (5-48 children at same prefix)
+    // Insert 10 routes at same prefix, then add colliding tokens
+
+    for (int i = 0; i < 10; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Now insert tokens that collide in lower 8 bits
+    // 0 and 256 both have key_byte() = 0, but 0 is already inserted
+    tree.insert(tokens({1, 256}), 100);  // Collides with tokens({1, 0})
+    tree.insert(tokens({1, 512}), 101);  // Also collides with tokens({1, 0})
+
+    // Original route for token 0 should still work
+    auto r0 = tree.lookup(tokens({1, 0}));
+    ASSERT_TRUE(r0.has_value());
+    EXPECT_EQ(r0.value(), 0);
+
+    // Colliding tokens should have distinct routes
+    auto r256 = tree.lookup(tokens({1, 256}));
+    ASSERT_TRUE(r256.has_value());
+    EXPECT_EQ(r256.value(), 100);
+
+    auto r512 = tree.lookup(tokens({1, 512}));
+    ASSERT_TRUE(r512.has_value());
+    EXPECT_EQ(r512.value(), 101);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_Node48ToNode256Transition) {
+    // Test collision handling during Node48 -> Node256 growth
+    // Fill Node48 to capacity (48 children), then add colliding token
+
+    for (int i = 0; i < 48; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // This should trigger growth to Node256
+    tree.insert(tokens({1, 48}), 48);
+
+    // Now add a token that collides with an existing one
+    tree.insert(tokens({1, 256}), 100);  // Collides with tokens({1, 0})
+
+    // All routes should still work correctly
+    EXPECT_EQ(tree.lookup(tokens({1, 0})).value(), 0);
+    EXPECT_EQ(tree.lookup(tokens({1, 48})).value(), 48);
+    EXPECT_EQ(tree.lookup(tokens({1, 256})).value(), 100);
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_Node48ManyCollisions) {
+    // Test multiple collisions within Node48's capacity
+    // All these tokens have same lower 8 bits: 0, 256, 512, 768, 1024
+
+    tree.insert(tokens({1, 0}), 0);
+    tree.insert(tokens({1, 256}), 1);
+    tree.insert(tokens({1, 512}), 2);
+    tree.insert(tokens({1, 768}), 3);
+    tree.insert(tokens({1, 1024}), 4);
+
+    // All should be distinct
+    EXPECT_EQ(tree.lookup(tokens({1, 0})).value(), 0);
+    EXPECT_EQ(tree.lookup(tokens({1, 256})).value(), 1);
+    EXPECT_EQ(tree.lookup(tokens({1, 512})).value(), 2);
+    EXPECT_EQ(tree.lookup(tokens({1, 768})).value(), 3);
+    EXPECT_EQ(tree.lookup(tokens({1, 1024})).value(), 4);
+
+    // Lookup of non-existent colliding token should return nullopt
+    auto result = tree.lookup(tokens({1, 1280}));  // Same lower 8 bits
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeTest, TokenIdHashCollision_Node48UpdateColliding) {
+    // Test that updating one colliding key doesn't affect others in Node48 range
+
+    // Create 10 children to be in Node48 range
+    for (int i = 2; i < 12; i++) {
+        tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Add colliding tokens
+    tree.insert(tokens({1, 0}), 10);
+    tree.insert(tokens({1, 256}), 20);
+
+    // Update one of the colliding tokens
+    tree.insert(tokens({1, 0}), 99);
+
+    // Check updated value
+    EXPECT_EQ(tree.lookup(tokens({1, 0})).value(), 99);
+
+    // Other colliding token should be unchanged
+    EXPECT_EQ(tree.lookup(tokens({1, 256})).value(), 20);
+}
