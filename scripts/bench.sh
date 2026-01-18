@@ -1059,4 +1059,4 @@ fi
 
 echo ""
 log_info "To compare results, use:"
-echo "  python3 tests/integration/results_parser.py compare <baseline.log> <new.log>"
+echo "  python3 tests/integration/results_parser.py compare <baseline/benchmark.log> <new/benchmark.log>"

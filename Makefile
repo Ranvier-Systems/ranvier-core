@@ -655,7 +655,7 @@ help:
 	@echo "    SHARED_PREFIX_RATIO=0.7     - Ratio of requests with shared prefix"
 	@echo ""
 	@echo "  Compare benchmark results:"
-	@echo "    python3 tests/integration/results_parser.py compare <baseline.log> <new.log>"
+	@echo "    python3 tests/integration/results_parser.py compare <baseline/benchmark.log> <new/benchmark.log>"
 	@echo ""
 	@echo "Integration test helpers:"
 	@echo "  make integration-up   - Start test cluster for debugging"
