@@ -41,8 +41,10 @@ COPY assets/ ./assets/
 
 # Layer 6: Build Ranvier (only this rebuilds on code changes)
 # OpenTelemetry uses PIMPL pattern to defer initialization until after main() starts
+# Use --build-arg BUILD_TYPE=Debug for debug builds with symbols
+ARG BUILD_TYPE=Release
 RUN mkdir -p build && cd build && \
-    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release && \
+    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} && \
     ninja
 
 # Collect all shared libraries needed at runtime (including symlinks)
