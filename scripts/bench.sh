@@ -178,6 +178,7 @@ OTHER OPTIONS:
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
     --log-all           Save full shell output to run.log (useful for debugging)
+    --debug             Build with debug symbols (CMAKE_BUILD_TYPE=Debug)
     -h, --help          Show this help message
 
 EXAMPLES:
@@ -333,6 +334,7 @@ while [[ $# -gt 0 ]]; do
         --setup)          SETUP_ONLY=true; shift ;;
         --warmup)         WARMUP=true; shift ;;
         --log-all)        LOG_ALL=true; shift ;;
+        --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
     esac
@@ -535,8 +537,10 @@ if [[ "$SETUP_ONLY" = true ]]; then
 
     # Pre-build Docker images
     if [[ -f "Dockerfile.production" ]]; then
-        log_info "Pre-building Ranvier Docker image..."
-        docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
+        BUILD_TYPE_ARG=""
+        [[ "${DEBUG_BUILD:-}" == "true" ]] && BUILD_TYPE_ARG="--build-arg BUILD_TYPE=Debug"
+        log_info "Pre-building Ranvier Docker image${DEBUG_BUILD:+ (Debug mode)}..."
+        docker build $BUILD_TYPE_ARG -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
             log_ok "Ranvier image built" || log_warn "Could not build Ranvier image"
     fi
 
@@ -833,9 +837,15 @@ done
 log_header "Starting Ranvier Cluster"
 
 # Build Ranvier image if needed
-if ! docker image inspect ranvier:latest &> /dev/null; then
-    log_info "Building Ranvier image (first run)..."
-    docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+BUILD_TYPE_ARG=""
+if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
+    BUILD_TYPE_ARG="--build-arg BUILD_TYPE=Debug"
+    log_info "Debug build requested - will include debug symbols"
+fi
+
+if ! docker image inspect ranvier:latest &> /dev/null || [[ "${DEBUG_BUILD:-}" == "true" ]]; then
+    log_info "Building Ranvier image${DEBUG_BUILD:+ (Debug mode)}..."
+    docker build $BUILD_TYPE_ARG -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
     log_ok "Ranvier image built"
 fi
 
