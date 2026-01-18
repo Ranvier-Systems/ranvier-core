@@ -1,10 +1,14 @@
 #!/bin/bash
 # =============================================================================
-# Ranvier Benchmark - Simplified Lambda Labs Edition
+# Ranvier Benchmark - Consolidated Edition
 # =============================================================================
 #
 # One-command benchmarking for Lambda Labs multi-GPU instances.
 # Auto-detects GPUs, starts vLLM, runs Ranvier benchmark, cleans up.
+#
+# This script consolidates functionality from:
+#   - setup-lambda-benchmark.sh (use --setup)
+#   - run-multi-gpu-benchmark.sh (use --skip-vllm --vllm-endpoints)
 #
 # Usage:
 #   export HF_TOKEN=your_huggingface_token
@@ -12,6 +16,12 @@
 #   ./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct
 #   ./scripts/bench.sh --gpus 4 --duration 10m --users 20
 #   ./scripts/bench.sh --compare                          # A/B test
+#
+# First-time setup on fresh instance:
+#   ./scripts/bench.sh --setup
+#
+# Using external vLLM endpoints:
+#   ./scripts/bench.sh --skip-vllm --vllm-endpoints 10.0.0.1:8000,10.0.0.2:8000
 #
 # From a fresh Lambda instance:
 #   curl -fsSL https://raw.githubusercontent.com/Ranvier-Systems/ranvier-core/main/scripts/bench.sh | bash
@@ -30,8 +40,11 @@ DEFAULT_DURATION="5m"
 DEFAULT_USERS="10"
 DEFAULT_SPAWN_RATE="2"
 DEFAULT_VLLM_PORT_START=8000
-DEFAULT_PROMPT_DIST="long"
+DEFAULT_PROMPT_DIST="stress"
 DEFAULT_PREFIX_RATIO="0.9"
+DEFAULT_OUTPUT_DIR="benchmark-reports"
+DEFAULT_WARMUP_DURATION="1m"
+DEFAULT_WARMUP_USERS="2"
 
 # Colors
 RED='\033[0;31m'
@@ -45,6 +58,21 @@ NC='\033[0m'
 # State
 VLLM_PIDS=()
 CLEANUP_DONE=false
+VLLM_ENDPOINTS=()  # Array of host:port pairs for external vLLM
+
+# Early exit for --help (before trap is set)
+for arg in "$@"; do
+    if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+        # Help is printed later after print_help is defined
+        SHOW_HELP=true
+        break
+    fi
+done
+
+# Check for no arguments (before trap is set)
+if [[ $# -eq 0 ]]; then
+    NO_ARGS=true
+fi
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -56,6 +84,19 @@ log_ok()     { echo -e "${GREEN}✓${NC} $1"; }
 log_warn()   { echo -e "${YELLOW}⚠${NC} $1"; }
 log_error()  { echo -e "${RED}✗${NC} $1"; }
 log_step()   { echo -e "  ${BLUE}[$1/$2]${NC} $3"; }
+
+# Parse duration string (e.g., "10m", "1h", "30s") to seconds
+parse_duration() {
+    local duration="$1"
+    local num="${duration%[smhSMH]}"
+    local unit="${duration##*[0-9]}"
+    case "$unit" in
+        s|S) echo "$num" ;;
+        m|M) echo $((num * 60)) ;;
+        h|H) echo $((num * 3600)) ;;
+        *)   echo "$num" ;;  # Assume seconds if no unit
+    esac
+}
 
 # -----------------------------------------------------------------------------
 # Cleanup handler
@@ -97,15 +138,13 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT INT TERM
-
 # -----------------------------------------------------------------------------
-# Help
+# Help (check early, before trap is set)
 # -----------------------------------------------------------------------------
 
 print_help() {
     cat << 'EOF'
-Ranvier Benchmark - Lambda Labs Edition
+Ranvier Benchmark - Consolidated Edition
 
 USAGE:
     ./scripts/bench.sh [OPTIONS]
@@ -113,41 +152,96 @@ USAGE:
 REQUIRED:
     HF_TOKEN        Hugging Face token (env var) for gated models
 
-OPTIONS:
+SETUP OPTIONS:
+    --setup             One-time system setup (Docker, limits, dependencies)
+    --install-deps      Install vLLM and dependencies before running
+
+BENCHMARK OPTIONS:
     --model MODEL       Model to benchmark (default: meta-llama/Llama-3.2-1B-Instruct)
     --gpus N            Number of GPUs to use (default: auto-detect)
     --duration TIME     Benchmark duration (default: 5m)
     --users N           Concurrent users (default: 10)
     --spawn-rate N      Users spawned per second (default: 2)
-    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed (default: long)
+    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: stress)
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --compare           Run A/B comparison (prefix vs round-robin)
+    --warmup            Run a short warm-up before the main benchmark
+    --output-dir DIR    Custom output directory (default: benchmark-reports)
+
+EXTERNAL VLLM OPTIONS:
+    --skip-vllm             Don't start vLLM (use existing endpoints)
+    --vllm-host HOST        vLLM host IP (default: localhost, assumes sequential ports)
+    --vllm-endpoints LIST   Comma-separated host:port pairs (alternative to --vllm-host)
+                            Example: --vllm-endpoints 10.0.0.1:8000,10.0.0.2:8000
+
+OTHER OPTIONS:
     --skip-setup        Skip system configuration (for repeated runs)
-    --skip-vllm         Don't start vLLM (use existing endpoints)
-    --vllm-host HOST    vLLM host IP (default: localhost, for --skip-vllm)
-    --install-deps      Install vLLM and dependencies before running
     --dry-run           Show what would be done without executing
+    --log-all           Save full shell output to run.log (useful for debugging)
     -h, --help          Show this help message
 
 EXAMPLES:
-    # Simple run with defaults
+    # First-time setup on fresh Lambda instance
+    ./scripts/bench.sh --setup
+
+    # Simple run with defaults (auto-detects GPUs, starts vLLM)
     export HF_TOKEN=hf_xxx
     ./scripts/bench.sh
 
-    # Larger model, longer duration
-    ./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct --duration 10m
+    # 8x A100 with larger model
+    ./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct --duration 10m --users 30
 
     # Use only 4 of 8 GPUs
     ./scripts/bench.sh --gpus 4
 
-    # A/B comparison test
-    ./scripts/bench.sh --compare
+    # A/B comparison test (prefix vs round-robin)
+    ./scripts/bench.sh --compare --duration 10m
 
-    # Use existing vLLM endpoints (manual setup)
-    ./scripts/bench.sh --skip-vllm --vllm-host 10.0.0.1 --gpus 2
+    # With warm-up run before main benchmark
+    ./scripts/bench.sh --warmup --duration 10m
+
+    # Use external vLLM endpoints (explicit list)
+    ./scripts/bench.sh --skip-vllm --vllm-endpoints 10.0.0.1:8000,10.0.0.2:8000,10.0.0.3:8000
+
+    # Use external vLLM on single host with sequential ports
+    ./scripts/bench.sh --skip-vllm --vllm-host 10.0.0.1 --gpus 8
+
+    # Save full shell output to run.log (for debugging)
+    ./scripts/bench.sh --log-all --duration 10m
 
 EOF
 }
+
+print_usage() {
+    echo -e "${BOLD}Ranvier Benchmark${NC}"
+    echo ""
+    echo "Usage: ./scripts/bench.sh [OPTIONS]"
+    echo ""
+    echo -e "${CYAN}Quick start:${NC}"
+    echo "  ./scripts/bench.sh --setup                    # First-time setup"
+    echo "  ./scripts/bench.sh --duration 5m              # Quick sanity check"
+    echo "  ./scripts/bench.sh --compare --duration 10m   # A/B comparison"
+    echo ""
+    echo -e "${CYAN}Preview what will run:${NC}"
+    echo "  ./scripts/bench.sh --dry-run --duration 10m"
+    echo ""
+    echo "Run './scripts/bench.sh --help' for all options."
+}
+
+# Handle early --help (before trap is set)
+if [[ "${SHOW_HELP:-}" == "true" ]]; then
+    print_help
+    exit 0
+fi
+
+# Handle no arguments (before trap is set)
+if [[ "${NO_ARGS:-}" == "true" ]]; then
+    print_usage
+    exit 0
+fi
+
+# Now set the trap (after help/usage check, so cleanup doesn't run)
+trap cleanup EXIT INT TERM
 
 # -----------------------------------------------------------------------------
 # Argument parsing
@@ -160,32 +254,48 @@ USERS="$DEFAULT_USERS"
 SPAWN_RATE="$DEFAULT_SPAWN_RATE"
 PROMPT_DIST="$DEFAULT_PROMPT_DIST"
 PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
+OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
 SKIP_SETUP=false
 SKIP_VLLM=false
 VLLM_HOST="localhost"
+VLLM_ENDPOINTS_RAW=""
 INSTALL_DEPS=false
 DRY_RUN=false
+SETUP_ONLY=false
+WARMUP=false
+LOG_ALL=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --model)        MODEL="$2"; shift 2 ;;
-        --gpus)         GPUS="$2"; shift 2 ;;
-        --duration)     DURATION="$2"; shift 2 ;;
-        --users)        USERS="$2"; shift 2 ;;
-        --spawn-rate)   SPAWN_RATE="$2"; shift 2 ;;
-        --prompt-dist)  PROMPT_DIST="$2"; shift 2 ;;
-        --prefix-ratio) PREFIX_RATIO="$2"; shift 2 ;;
-        --compare)      COMPARE=true; shift ;;
-        --skip-setup)   SKIP_SETUP=true; shift ;;
-        --skip-vllm)    SKIP_VLLM=true; shift ;;
-        --vllm-host)    VLLM_HOST="$2"; shift 2 ;;
-        --install-deps) INSTALL_DEPS=true; shift ;;
-        --dry-run)      DRY_RUN=true; shift ;;
-        -h|--help)      print_help; exit 0 ;;
-        *)              log_error "Unknown option: $1"; print_help; exit 1 ;;
+        --model)          MODEL="$2"; shift 2 ;;
+        --gpus)           GPUS="$2"; shift 2 ;;
+        --duration)       DURATION="$2"; shift 2 ;;
+        --users)          USERS="$2"; shift 2 ;;
+        --spawn-rate)     SPAWN_RATE="$2"; shift 2 ;;
+        --prompt-dist)    PROMPT_DIST="$2"; shift 2 ;;
+        --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
+        --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
+        --compare)        COMPARE=true; shift ;;
+        --skip-setup)     SKIP_SETUP=true; shift ;;
+        --skip-vllm)      SKIP_VLLM=true; shift ;;
+        --vllm-host)      VLLM_HOST="$2"; shift 2 ;;
+        --vllm-endpoints) VLLM_ENDPOINTS_RAW="$2"; shift 2 ;;
+        --install-deps)   INSTALL_DEPS=true; shift ;;
+        --dry-run)        DRY_RUN=true; shift ;;
+        --setup)          SETUP_ONLY=true; shift ;;
+        --warmup)         WARMUP=true; shift ;;
+        --log-all)        LOG_ALL=true; shift ;;
+        -h|--help)        print_help; exit 0 ;;
+        *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
     esac
 done
+
+# Parse --vllm-endpoints into array if provided
+if [[ -n "$VLLM_ENDPOINTS_RAW" ]]; then
+    IFS=',' read -ra VLLM_ENDPOINTS <<< "$VLLM_ENDPOINTS_RAW"
+    SKIP_VLLM=true  # Implicit --skip-vllm when endpoints are provided
+fi
 
 # -----------------------------------------------------------------------------
 # Preflight checks
@@ -208,22 +318,24 @@ else
         cd "$REPO_DIR"
         git pull origin main 2>/dev/null || true
     else
-        git clone https://github.com/Ranvier-Systems/ranvier-core.git "$REPO_DIR"
+        git clone git@github.com:Ranvier-Systems/ranvier-core.git "$REPO_DIR"
         cd "$REPO_DIR"
     fi
     log_ok "Repository ready at $REPO_DIR"
 fi
 
-# Check HF_TOKEN
-if [[ -z "${HF_TOKEN:-}" ]]; then
-    log_warn "HF_TOKEN not set - required for gated models like Llama"
-    log_info "Set with: export HF_TOKEN=your_token"
-    if [[ "$MODEL" == *"llama"* ]] || [[ "$MODEL" == *"Llama"* ]]; then
-        log_error "Llama models require HF_TOKEN. Exiting."
-        exit 1
+# Check HF_TOKEN (not required for --setup mode)
+if [[ "$SETUP_ONLY" != true ]]; then
+    if [[ -z "${HF_TOKEN:-}" ]]; then
+        log_warn "HF_TOKEN not set - required for gated models like Llama"
+        log_info "Set with: export HF_TOKEN=your_token"
+        if [[ "$MODEL" == *"llama"* ]] || [[ "$MODEL" == *"Llama"* ]]; then
+            log_error "Llama models require HF_TOKEN. Exiting."
+            exit 1
+        fi
+    else
+        log_ok "HF_TOKEN found"
     fi
-else
-    log_ok "HF_TOKEN found"
 fi
 
 # Check Docker
@@ -274,6 +386,140 @@ if [[ "$GPUS" -gt 8 ]]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Full output logging (--log-all)
+# -----------------------------------------------------------------------------
+
+if [[ "$LOG_ALL" = true ]]; then
+    # Create output directory early for logging
+    mkdir -p "$OUTPUT_DIR"
+    RUN_LOG="${OUTPUT_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+    log_ok "Logging all output to: $RUN_LOG"
+
+    # Redirect stdout and stderr to both terminal and log file
+    exec > >(tee -a "$RUN_LOG") 2>&1
+
+    # Log system info at the start
+    echo "============================================="
+    echo "Ranvier Benchmark Run Log"
+    echo "Started: $(date)"
+    echo "Host: $(hostname)"
+    echo "User: $(whoami)"
+    echo "PWD: $(pwd)"
+    echo "============================================="
+    echo ""
+fi
+
+# -----------------------------------------------------------------------------
+# Setup-only mode (--setup flag)
+# -----------------------------------------------------------------------------
+
+if [[ "$SETUP_ONLY" = true ]]; then
+    log_header "One-Time System Setup"
+
+    # Check/install Docker
+    if ! command -v docker &> /dev/null; then
+        log_info "Docker not found. Installing..."
+        if command -v curl &> /dev/null; then
+            curl -fsSL https://get.docker.com | sh
+            sudo usermod -aG docker "$USER" 2>/dev/null || true
+            log_ok "Docker installed"
+            log_warn "Run 'newgrp docker' or log out/in for Docker group membership"
+        else
+            log_error "curl not available. Please install Docker manually."
+            exit 1
+        fi
+    else
+        log_ok "Docker already installed"
+    fi
+
+    # Ensure user is in docker group (even if Docker was pre-installed)
+    if ! docker ps &> /dev/null 2>&1; then
+        log_info "Adding user to docker group..."
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        log_warn "Run 'newgrp docker' or log out/in to apply docker group membership"
+        log_info "Then re-run: ./scripts/bench.sh --setup"
+    fi
+
+    # Check docker compose
+    if docker compose version &> /dev/null; then
+        log_ok "Docker Compose available"
+    else
+        log_warn "Docker Compose not available - may need to install docker-compose-plugin"
+    fi
+
+    # System limits for Seastar
+    log_info "Configuring system limits..."
+    if [[ -w /proc/sys/fs/aio-max-nr ]] || command -v sudo &> /dev/null; then
+        sudo sysctl -w fs.aio-max-nr=1048576 2>/dev/null && log_ok "Set fs.aio-max-nr=1048576" || log_warn "Could not set aio-max-nr"
+    fi
+
+    # Persist the setting
+    if [[ -w /etc/sysctl.conf ]] || command -v sudo &> /dev/null; then
+        if ! grep -q "fs.aio-max-nr" /etc/sysctl.conf 2>/dev/null; then
+            echo "fs.aio-max-nr=1048576" | sudo tee -a /etc/sysctl.conf > /dev/null 2>&1 && \
+                log_ok "Persisted aio-max-nr setting" || log_warn "Could not persist setting"
+        fi
+    fi
+
+    # Create directories
+    mkdir -p "$OUTPUT_DIR"
+    log_ok "Created $OUTPUT_DIR directory"
+
+    # Install vLLM (for running LLM backends)
+    if ! command -v vllm &> /dev/null && ! python3 -c "import vllm" 2>/dev/null; then
+        log_info "Installing vLLM (this may take a few minutes)..."
+        if command -v pip3 &> /dev/null; then
+            PIP="pip3"
+        elif command -v pip &> /dev/null; then
+            PIP="pip"
+        else
+            log_warn "pip not found - skipping vLLM installation"
+            log_info "Install manually: pip install vllm 'numpy<2'"
+            PIP=""
+        fi
+        if [[ -n "$PIP" ]]; then
+            $PIP install vllm 2>&1 | tail -5
+            $PIP install "numpy<2" 2>&1 | tail -2  # vLLM compatibility fix
+            log_ok "vLLM installed"
+        fi
+    else
+        log_ok "vLLM already installed"
+    fi
+
+    # Pre-build Docker images
+    if [[ -f "Dockerfile.production" ]]; then
+        log_info "Pre-building Ranvier Docker image..."
+        docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
+            log_ok "Ranvier image built" || log_warn "Could not build Ranvier image"
+    fi
+
+    if [[ -f "tests/integration/Dockerfile.locust" ]]; then
+        log_info "Pre-building Locust Docker image..."
+        docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1 && \
+            log_ok "Locust image built" || log_warn "Could not build Locust image"
+    fi
+
+    # Summary
+    log_header "Setup Complete"
+    echo ""
+    echo "Next steps:"
+    echo ""
+    echo "  1. Set HuggingFace token (for gated models):"
+    echo "     export HF_TOKEN=hf_your_token_here"
+    echo ""
+    echo "  2. Run benchmark:"
+    echo "     ./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct --duration 10m"
+    echo ""
+    echo "  3. Or run with warm-up:"
+    echo "     ./scripts/bench.sh --warmup --duration 10m --users 30"
+    echo ""
+    echo "  4. For A/B comparison (prefix vs round-robin):"
+    echo "     ./scripts/bench.sh --compare --duration 10m"
+    echo ""
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
 # System setup (one-time)
 # -----------------------------------------------------------------------------
 
@@ -286,8 +532,8 @@ if [[ "$SKIP_SETUP" = false ]]; then
     fi
 
     # Create reports directory
-    mkdir -p benchmark-reports
-    log_ok "Created benchmark-reports directory"
+    mkdir -p "$OUTPUT_DIR"
+    log_ok "Created $OUTPUT_DIR directory"
 fi
 
 # -----------------------------------------------------------------------------
@@ -314,6 +560,13 @@ if [[ "$INSTALL_DEPS" = true ]]; then
     log_info "Installing numpy<2 (vLLM compatibility fix)..."
     $PIP install "numpy<2" 2>&1 | tail -2
     log_ok "numpy<2 installed"
+
+    log_header "Dependencies Installed"
+    echo ""
+    echo "Now run your benchmark:"
+    echo "  ./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct --duration 10m"
+    echo ""
+    exit 0
 fi
 
 # -----------------------------------------------------------------------------
@@ -329,13 +582,31 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Spawn Rate:      $SPAWN_RATE/s"
     echo "  Prompt Dist:     $PROMPT_DIST"
     echo "  Prefix Ratio:    $PREFIX_RATIO"
+    echo "  Output Dir:      $OUTPUT_DIR"
     echo "  Compare Mode:    $COMPARE"
+    echo "  Warmup:          $WARMUP"
+    echo "  Log All:         $LOG_ALL"
     echo "  Skip vLLM:       $SKIP_VLLM"
-    echo "  vLLM Host:       $VLLM_HOST"
+    if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+        echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
+    else
+        echo "  vLLM Host:       $VLLM_HOST"
+    fi
     echo ""
-    log_info "Would start $GPUS vLLM instances on ports $DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+    if [[ "$SKIP_VLLM" = false ]]; then
+        log_info "Would start $GPUS vLLM instances on ports $DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+    else
+        if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+            log_info "Would use ${#VLLM_ENDPOINTS[@]} external vLLM endpoints"
+        else
+            log_info "Would use $GPUS external vLLM endpoints at $VLLM_HOST:$DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+        fi
+    fi
     log_info "Would start Ranvier cluster (3 nodes)"
-    log_info "Would run Locust benchmark"
+    if [[ "$WARMUP" = true ]]; then
+        log_info "Would run warm-up ($DEFAULT_WARMUP_DURATION, $DEFAULT_WARMUP_USERS users)"
+    fi
+    log_info "Would run Locust benchmark ($DURATION, $USERS users)"
     exit 0
 fi
 
@@ -425,19 +696,63 @@ if [[ "$SKIP_VLLM" = false ]]; then
     fi
 else
     log_header "Using External vLLM"
-    log_info "Host: $VLLM_HOST"
-    log_info "Ports: $DEFAULT_VLLM_PORT_START - $((DEFAULT_VLLM_PORT_START + GPUS - 1))"
 
-    # Health check external endpoints
-    for ((i=0; i<GPUS; i++)); do
-        PORT=$((DEFAULT_VLLM_PORT_START + i))
-        if curl -sf --connect-timeout 5 "http://${VLLM_HOST}:$PORT/health" > /dev/null 2>&1; then
-            log_ok "GPU $i: $VLLM_HOST:$PORT healthy"
-        else
-            log_error "GPU $i: $VLLM_HOST:$PORT unreachable"
-            exit 1
+    # Handle explicit endpoints vs host+port pattern
+    if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+        log_info "Using ${#VLLM_ENDPOINTS[@]} explicit endpoints"
+        GPUS=${#VLLM_ENDPOINTS[@]}
+
+        # Health check each endpoint
+        FAILED=0
+        for ((i=0; i<${#VLLM_ENDPOINTS[@]}; i++)); do
+            ENDPOINT="${VLLM_ENDPOINTS[$i]}"
+            HOST="${ENDPOINT%:*}"
+            PORT="${ENDPOINT#*:}"
+            if curl -sf --connect-timeout 5 "http://${HOST}:${PORT}/health" > /dev/null 2>&1; then
+                log_ok "Backend $((i+1)): $HOST:$PORT healthy"
+            else
+                log_warn "Backend $((i+1)): $HOST:$PORT unreachable"
+                FAILED=$((FAILED + 1))
+            fi
+        done
+
+        if [[ $FAILED -gt 0 ]]; then
+            log_warn "$FAILED endpoint(s) unreachable from this host"
+            log_info "Docker containers may still be able to reach them"
+            read -p "Continue anyway? [y/N] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                log_info "Aborted."
+                exit 0
+            fi
         fi
-    done
+    else
+        log_info "Host: $VLLM_HOST"
+        log_info "Ports: $DEFAULT_VLLM_PORT_START - $((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+
+        # Health check external endpoints (sequential ports)
+        FAILED=0
+        for ((i=0; i<GPUS; i++)); do
+            PORT=$((DEFAULT_VLLM_PORT_START + i))
+            if curl -sf --connect-timeout 5 "http://${VLLM_HOST}:$PORT/health" > /dev/null 2>&1; then
+                log_ok "GPU $i: $VLLM_HOST:$PORT healthy"
+            else
+                log_warn "GPU $i: $VLLM_HOST:$PORT unreachable"
+                FAILED=$((FAILED + 1))
+            fi
+        done
+
+        if [[ $FAILED -gt 0 ]]; then
+            log_warn "$FAILED endpoint(s) unreachable from this host"
+            log_info "Docker containers may still be able to reach them"
+            read -p "Continue anyway? [y/N] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                log_info "Aborted."
+                exit 0
+            fi
+        fi
+    fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -447,11 +762,19 @@ fi
 # Build BACKEND{N}_IP and BACKEND{N}_PORT env vars
 BACKEND_ENV=""
 for ((i=1; i<=GPUS; i++)); do
-    PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
-    if [[ "$SKIP_VLLM" = true ]]; then
+    if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+        # Use explicit endpoints
+        ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
+        HOST="${ENDPOINT%:*}"
+        PORT="${ENDPOINT#*:}"
+    elif [[ "$SKIP_VLLM" = true ]]; then
+        # Use host + sequential ports
         HOST="$VLLM_HOST"
+        PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
     else
+        # Local vLLM via Docker network
         HOST="host.docker.internal"
+        PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
     fi
     BACKEND_ENV+="BACKEND${i}_IP=$HOST BACKEND${i}_PORT=$PORT "
 done
@@ -515,18 +838,40 @@ fi
 run_benchmark() {
     local ROUTING_MODE="$1"
     local LABEL="$2"
+    local STEP="${3:-}"  # Optional step indicator like "[1/2]"
 
-    log_header "Running Benchmark: $LABEL"
+    # Calculate expected end time
+    local DURATION_SECS
+    DURATION_SECS=$(parse_duration "$DURATION")
+    local START_TIME
+    START_TIME=$(date +%H:%M)
+    local END_TIME
+    END_TIME=$(date -d "+${DURATION_SECS} seconds" +%H:%M 2>/dev/null || date -v+${DURATION_SECS}S +%H:%M 2>/dev/null || echo "")
+
+    # Prominent banner for visibility
+    echo ""
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
+    if [[ -n "$STEP" ]]; then
+        echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}    ${STEP}${NC}"
+    else
+        echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}${NC}"
+    fi
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
     echo "  Model:        $MODEL"
     echo "  Backends:     $GPUS"
-    echo "  Duration:     $DURATION"
+    if [[ -n "$END_TIME" ]]; then
+        echo "  Duration:     $DURATION (${START_TIME} -> ~${END_TIME})"
+    else
+        echo "  Duration:     $DURATION"
+    fi
     echo "  Users:        $USERS"
     echo "  Routing:      $ROUTING_MODE"
     echo "  Prompt Dist:  $PROMPT_DIST"
+    echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
     echo ""
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    REPORT_DIR="benchmark-reports/${TIMESTAMP}_${GPUS}gpu_${ROUTING_MODE}"
+    REPORT_DIR="${OUTPUT_DIR}/${TIMESTAMP}_${GPUS}gpu_${ROUTING_MODE}"
     mkdir -p "$REPORT_DIR"
 
     # Set environment for locust
@@ -538,50 +883,129 @@ run_benchmark() {
 
     # Export backend configuration
     for ((i=1; i<=GPUS; i++)); do
-        PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
-        if [[ "$SKIP_VLLM" = true ]]; then
+        if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+            # Use explicit endpoints
+            ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
+            HOST="${ENDPOINT%:*}"
+            PORT="${ENDPOINT#*:}"
+        elif [[ "$SKIP_VLLM" = true ]]; then
+            # Use host + sequential ports
             HOST="$VLLM_HOST"
+            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
         else
+            # Local vLLM via Docker network
             HOST="host.docker.internal"
+            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
         fi
         export "BACKEND${i}_IP=$HOST"
         export "BACKEND${i}_PORT=$PORT"
     done
 
+    # Build backend env args for docker compose
+    BACKEND_ARGS=""
+    for ((i=1; i<=GPUS; i++)); do
+        if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+            ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
+            HOST="${ENDPOINT%:*}"
+            PORT="${ENDPOINT#*:}"
+        elif [[ "$SKIP_VLLM" = true ]]; then
+            HOST="$VLLM_HOST"
+            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
+        else
+            HOST="host.docker.internal"
+            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
+        fi
+        BACKEND_ARGS+=" -e BACKEND${i}_IP=$HOST -e BACKEND${i}_PORT=$PORT"
+    done
+
     # Run locust via docker compose
+    # Mount report dir as volume so files persist after container exits
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
+        -v "$PWD/$REPORT_DIR:/mnt/locust/output" \
         -e NUM_BACKENDS="$GPUS" \
         -e VLLM_MODEL="$MODEL" \
         -e RANVIER_ROUTING_MODE="$ROUTING_MODE" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
-        $(for ((i=1; i<=GPUS; i++)); do
-            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
-            if [[ "$SKIP_VLLM" = true ]]; then
-                HOST="$VLLM_HOST"
-            else
-                HOST="host.docker.internal"
-            fi
-            echo "-e BACKEND${i}_IP=$HOST -e BACKEND${i}_PORT=$PORT"
-        done) \
+        $BACKEND_ARGS \
         locust \
         --headless \
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
-        --run-time "$DURATION" \
-        --csv "/mnt/locust/results" \
-        --html "/mnt/locust/report.html" \
+        --run-time "$(parse_duration "$DURATION")s" \
+        --csv "/mnt/locust/output/results" \
+        --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log"
-
-    # Copy results
-    docker cp locust-real:/mnt/locust/results_stats.csv "$REPORT_DIR/" 2>/dev/null || true
-    docker cp locust-real:/mnt/locust/report.html "$REPORT_DIR/" 2>/dev/null || true
 
     log_ok "Results saved to: $REPORT_DIR/"
 
     echo "$REPORT_DIR"
 }
+
+# -----------------------------------------------------------------------------
+# Warm-up run (optional)
+# -----------------------------------------------------------------------------
+
+if [[ "$WARMUP" = true ]]; then
+    log_header "Warm-up Run"
+    log_info "Running short warm-up to prime KV caches and model weights..."
+    log_info "Duration: $DEFAULT_WARMUP_DURATION, Users: $DEFAULT_WARMUP_USERS"
+    echo ""
+
+    # Save original values
+    ORIG_DURATION="$DURATION"
+    ORIG_USERS="$USERS"
+
+    # Run warm-up with reduced params
+    DURATION="$DEFAULT_WARMUP_DURATION"
+    USERS="$DEFAULT_WARMUP_USERS"
+
+    # Create warmup directory
+    WARMUP_DIR="${OUTPUT_DIR}/warmup_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$WARMUP_DIR"
+
+    # Build backend env args
+    BACKEND_ARGS=""
+    for ((i=1; i<=GPUS; i++)); do
+        if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
+            ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
+            HOST="${ENDPOINT%:*}"
+            PORT="${ENDPOINT#*:}"
+        elif [[ "$SKIP_VLLM" = true ]]; then
+            HOST="$VLLM_HOST"
+            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
+        else
+            HOST="host.docker.internal"
+            PORT=$((DEFAULT_VLLM_PORT_START + i - 1))
+        fi
+        BACKEND_ARGS+=" -e BACKEND${i}_IP=$HOST -e BACKEND${i}_PORT=$PORT"
+    done
+
+    # Run warm-up benchmark
+    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+        --profile benchmark run --rm \
+        -e NUM_BACKENDS="$GPUS" \
+        -e VLLM_MODEL="$MODEL" \
+        -e RANVIER_ROUTING_MODE="prefix" \
+        -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
+        -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
+        $BACKEND_ARGS \
+        locust \
+        --headless \
+        --users "$USERS" \
+        --spawn-rate "$SPAWN_RATE" \
+        --run-time "$(parse_duration "$DURATION")s" \
+        2>&1 | tee "$WARMUP_DIR/warmup.log"
+
+    log_ok "Warm-up complete"
+    log_info "Pausing 10s before main benchmark..."
+    sleep 10
+
+    # Restore original values
+    DURATION="$ORIG_DURATION"
+    USERS="$ORIG_USERS"
+fi
 
 # -----------------------------------------------------------------------------
 # Execute benchmarks
@@ -591,13 +1015,13 @@ if [[ "$COMPARE" = true ]]; then
     log_header "A/B Comparison Mode"
     log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
 
-    REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)")
+    REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[1/2]")
 
     # Brief pause between tests
     log_info "Pausing 30s between tests to clear caches..."
     sleep 30
 
-    REPORT_PREFIX=$(run_benchmark "prefix" "Prefix-Aware (Optimized)")
+    REPORT_PREFIX=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[2/2]")
 
     log_header "A/B Comparison Complete"
     echo ""
@@ -611,4 +1035,28 @@ else
 fi
 
 log_header "Benchmark Complete"
-log_ok "All results saved to benchmark-reports/"
+log_ok "All results saved to $OUTPUT_DIR/"
+echo ""
+
+# Display quick summary if results exist
+LATEST_REPORT=$(ls -td ${OUTPUT_DIR}/*/ 2>/dev/null | head -1)
+if [[ -n "$LATEST_REPORT" && -f "${LATEST_REPORT}/benchmark.log" ]]; then
+    log_info "Quick Summary (from ${LATEST_REPORT}):"
+    echo ""
+    # Extract key metrics from log if available
+    if grep -q "TTFT" "${LATEST_REPORT}/benchmark.log" 2>/dev/null; then
+        grep -E "(P50|P99|Cache hit|Requests/s|Error)" "${LATEST_REPORT}/benchmark.log" | head -10 || true
+    fi
+    echo ""
+    log_info "Full results:"
+    echo "  Log:    ${LATEST_REPORT}/benchmark.log"
+    echo "  Stats:  ${LATEST_REPORT}/results_stats.csv"
+    echo "  Report: ${LATEST_REPORT}/report.html"
+    if [[ "$LOG_ALL" = true && -n "${RUN_LOG:-}" ]]; then
+        echo "  Run:    $RUN_LOG"
+    fi
+fi
+
+echo ""
+log_info "To compare results, use:"
+echo "  python3 tests/integration/compare_results.py <baseline.csv> <optimized.csv>"

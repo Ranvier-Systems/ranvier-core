@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """
-Parse Locust output log and extract statistics to CSV.
+DEPRECATED: Use results_parser.py instead.
+
+This script's functionality has been consolidated into results_parser.py.
+
+Instead of:
+    python3 parse_locust_output.py <input_log> <output_csv>
+
+Use:
+    python3 results_parser.py parse <input_log> -o <output_csv>
+
+Or with summary:
+    python3 results_parser.py parse <input_log> -o <output_csv> --summary
+
+This script will be removed in a future release.
+================================================================================
+
+Parse Locust output log and extract statistics to CSV (LEGACY).
 
 Usage:
     python3 parse_locust_output.py <input_log> <output_csv>
@@ -12,7 +28,17 @@ Example:
 import csv
 import re
 import sys
+import warnings
 from datetime import datetime
+
+# Deprecation warning
+warnings.warn(
+    "\n[DEPRECATED] parse_locust_output.py is deprecated.\n"
+    "Use: python3 results_parser.py parse <input_log> -o <output_csv>\n",
+    DeprecationWarning,
+    stacklevel=2,
+)
+print("\033[1;33m[DEPRECATED]\033[0m Use: results_parser.py parse <log> -o <csv>", file=sys.stderr)
 
 
 def parse_locust_output(log_file: str) -> dict:

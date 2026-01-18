@@ -1,5 +1,29 @@
 #!/bin/bash
-# Multi-GPU Benchmark Runner for Ranvier Core
+# =============================================================================
+# DEPRECATED: Use ./scripts/bench.sh --skip-vllm --vllm-endpoints instead
+# =============================================================================
+#
+# This script's functionality has been consolidated into bench.sh.
+#
+# Instead of:
+#   ./scripts/run-multi-gpu-benchmark.sh 10.0.0.1 10.0.0.2
+#
+# Use:
+#   ./scripts/bench.sh --skip-vllm --vllm-endpoints 10.0.0.1:8000,10.0.0.2:8000
+#
+# Or for sequential ports on same host:
+#   ./scripts/bench.sh --skip-vllm --vllm-host 10.0.0.1 --gpus 8
+#
+# The new consolidated script provides:
+#   - One-time setup:     ./scripts/bench.sh --setup
+#   - Full benchmark:     ./scripts/bench.sh --model <model> --duration 10m
+#   - A/B comparison:     ./scripts/bench.sh --compare
+#   - External vLLM:      ./scripts/bench.sh --skip-vllm --vllm-endpoints <list>
+#
+# This script will be removed in a future release.
+# =============================================================================
+#
+# Multi-GPU Benchmark Runner for Ranvier Core (LEGACY)
 #
 # This script simplifies running multi-GPU benchmarks against real vLLM backends.
 # It handles endpoint validation, environment variable setup, and provides clear
@@ -19,6 +43,12 @@
 #   ./scripts/run-multi-gpu-benchmark.sh 129.213.118.109 123.45.67.89 --skip-health-check
 
 set -e
+
+echo ""
+echo -e "\033[1;33m[DEPRECATED]\033[0m This script is deprecated."
+echo "Use: ./scripts/bench.sh --skip-vllm --vllm-endpoints $1:8000,$2:8000"
+echo ""
+sleep 2
 
 # Colors for output
 RED='\033[0;31m'

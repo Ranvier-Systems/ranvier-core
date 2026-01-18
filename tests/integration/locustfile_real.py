@@ -356,7 +356,7 @@ def verify_routing_mode_matches() -> Tuple[bool, Optional[str]]:
 
 
 # Prompt distribution: "mixed", "short", "medium", "long", "large-prefix", "stress", "file"
-PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "mixed")
+PROMPT_DISTRIBUTION = os.environ.get("PROMPT_DISTRIBUTION", "stress")
 
 # Custom prompt file configuration
 # Path to JSONL file containing prompts (ShareGPT, OpenAI messages, or simple format)
@@ -2695,14 +2695,28 @@ def on_test_start(environment, **kwargs):
     logger.info(f"Number of Ranvier Nodes: {NUM_RANVIER_NODES}")
     logger.info(f"Ranvier Nodes: {RANVIER_NODES}")
 
-    # Log large prefix configuration if using stress modes
+    # Log prefix size buckets (always useful for understanding results)
+    logger.info(f"Prefix Size Buckets (tokens): tiny=0-100, small=100-500, medium=500-2000, large=2000-4000, xlarge=4000-8000")
+
+    # Log distribution explanation
     dist = PROMPT_DISTRIBUTION.lower().replace("-", "_")
+    dist_explanations = {
+        "short": "100% short prompts -> mostly 'tiny' bucket (<100 tokens)",
+        "medium": "100% medium prompts -> mostly 'small' bucket (100-500 tokens)",
+        "long": "100% long prompts -> mostly 'small' bucket (100-500 tokens)",
+        "mixed": "30% short, 50% medium, 20% long -> 'tiny' and 'small' buckets only",
+        "large_prefix": "100% large prefixes -> 'large' and 'xlarge' buckets (2000-8000 tokens)",
+        "stress": "10% small, 20% medium, 30% large, 40% xlarge -> biased toward large prefixes",
+    }
+    if dist in dist_explanations:
+        logger.info(f"Distribution '{dist}': {dist_explanations[dist]}")
+
+    # Log large prefix configuration if using stress modes
     if dist in ["large_prefix", "stress"]:
-        logger.info(f"Large Prefix Mode:")
+        logger.info(f"Large Prefix Config:")
         logger.info(f"  Min Tokens: {LARGE_PREFIX_MIN_TOKENS}")
         logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
         logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
-        logger.info(f"  Prefix Size Buckets: {PREFIX_SIZE_BUCKETS}")
 
     # Load prompts from file if PROMPT_FILE is set
     if PROMPT_FILE:
