@@ -75,8 +75,8 @@ The following results were obtained with higher concurrency to stress-test the s
 
 | Parameter | Value |
 |-----------|-------|
-| Concurrent Users | 64 |
-| Test Duration | 15 minutes (with warmup) |
+| Concurrent Users | 30 |
+| Test Duration | 10 minutes (with warmup) |
 | Prompt Distribution | stress (large prefixes) |
 | Prefix Ratio | 0.9 |
 
