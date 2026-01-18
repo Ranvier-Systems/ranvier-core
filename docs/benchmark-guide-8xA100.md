@@ -87,6 +87,7 @@ The `--warmup` flag runs a short preliminary benchmark before the main test:
 | `--prompt-dist` | stress | Prompt size distribution (see below) |
 | `--prefix-ratio` | 0.9 | Ratio of requests sharing prefixes (0.0-1.0) |
 | `--model` | Llama-3.1-8B | Model to benchmark |
+| `--debug` | off | Build with debug symbols for crash investigation |
 
 ### Prompt Distribution (`--prompt-dist`)
 
@@ -678,6 +679,40 @@ The run.log includes:
 - Complete benchmark output
 
 When troubleshooting, share both `run.log` and the per-benchmark `benchmark.log`.
+
+### Problem: Ranvier Crashes (Segfault)
+
+**Symptoms:** Ranvier container exits with segmentation fault, especially under high concurrency.
+
+**Solution:** Run with debug build to get readable stack traces:
+
+```bash
+# Force rebuild with debug symbols
+docker rmi ranvier:latest 2>/dev/null
+
+# Run benchmark with debug build
+./scripts/bench.sh --debug --log-all --duration 15m --users 64 --prompt-dist stress
+```
+
+**What `--debug` does:**
+- Passes `--build-arg BUILD_TYPE=Debug` to docker build
+- Includes debug symbols in the binary for readable backtraces
+- Forces image rebuild (even if ranvier:latest exists)
+
+**Collecting crash info:**
+```bash
+# Check container exit logs
+docker logs ranvier-bench1 2>&1 | tail -100
+
+# If you have coredumps enabled
+coredumpctl list
+coredumpctl debug <pid>  # Opens in gdb
+```
+
+**Common crash causes:**
+1. **High concurrency + large requests:** Radix tree hash collisions (fixed in recent versions)
+2. **Memory exhaustion:** Reduce `--users` or use smaller model
+3. **Tokenizer issues:** Check HF_TOKEN is valid and model is accessible
 
 ---
 
