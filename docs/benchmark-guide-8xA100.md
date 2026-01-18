@@ -647,7 +647,7 @@ For a complete benchmark session, run tests in this order:
 
 ```bash
 ./tests/integration/results_parser.py export \
-  benchmark-reports/*/results_stats.csv \
+  benchmark-reports/*/benchmark.log \
   --format markdown > results-summary.md
 ```
 
@@ -655,7 +655,7 @@ For a complete benchmark session, run tests in this order:
 
 ```bash
 ./tests/integration/results_parser.py export \
-  benchmark-reports/*/results_stats.csv \
+  benchmark-reports/*/benchmark.log \
   --format json > results.json
 ```
 
