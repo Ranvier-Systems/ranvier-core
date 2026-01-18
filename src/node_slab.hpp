@@ -100,12 +100,13 @@ struct SlabPoolConfig {
     // Node4:   ~112 bytes object -> 128 byte slot + 8 header = 136, round to 192
     // Node16:  ~112 bytes object -> 128 byte slot + 8 header = 136, round to 192
     // Node48:  ~368 bytes object -> 384 byte slot + 8 header = 392, round to 448
-    // Node256: ~2112 bytes object -> 2176 byte slot + 8 header = 2184, round to 2240
+    // Node256: ~3136 bytes object (includes 256-entry keys array for hash collision fix)
+    //          -> 3136 + 8 header = 3144, round to 3200
 
     static constexpr size_t NODE4_SLOT_SIZE = 192;
     static constexpr size_t NODE16_SLOT_SIZE = 192;
     static constexpr size_t NODE48_SLOT_SIZE = 448;
-    static constexpr size_t NODE256_SLOT_SIZE = 2240;
+    static constexpr size_t NODE256_SLOT_SIZE = 3200;
 
     // Slots per 2MB chunk for each type
     static constexpr size_t NODE4_SLOTS_PER_CHUNK = SLAB_CHUNK_SIZE / NODE4_SLOT_SIZE;
