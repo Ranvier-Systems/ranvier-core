@@ -2148,6 +2148,9 @@ docker exec ranvier-bench1 printenv | grep ROUTING
 ~/dev/ranvier-core % docker build -f Dockerfile.production -t ranvier:latest .
 View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/rvweyagifflm6vzmk5a4smatr
 
+# Restart
+docker compose -f docker-compose.benchmark-real.yml up -d --force-recreate ranvier1 ranvier2 ranvier3
+
 # Then run with the capability
 ~/dev/ranvier-core % docker run --cap-add=IPC_LOCK ranvier:latest
 
@@ -2380,4 +2383,88 @@ export VLLM_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 
 # Now run the benchmark
 python3 tests/integration/run_benchmark_comparison.py --stress --num-backends 8 --duration 2m
+
+=====
+ubuntu@129-213-22-220:~/ranvier-core$ ./tools/rvctl --url http://localhost:8081 cluster status
+Fetching cluster status from http://localhost:8081...
+
+Cluster Status
+============================================================
+  Quorum State:       HEALTHY
+  Quorum Required:    2 peers
+  Peers Alive:        2 / 2
+  Peers Recently Seen: 2
+  Local Backend ID:   0
+  Node Status:        ACTIVE
+
+Peer Table
+────────────────────────────────────────────────────────────
+           Address          │   Status   │    Last Seen   
+  ──────────────────────────┼────────────┼────────────────
+       172.29.2.3:9190      │ ALIVE │     0s ago      (backend 6)
+       172.29.2.2:9190      │ ALIVE │     0s ago      (backend 8)
+ubuntu@129-213-22-220:~/ranvier-core$ ./tools/rvctl --url http://localhost:8081 inspect backends
+Fetching backends from http://localhost:8081...
+
+Backend Status (Shard 1)
+================================================================================
+  ID │        Address        │ Weight │ Priority │     Status     
+─────┼───────────────────────┼────────┼──────────┼────────────────
+   4 │    172.17.0.1:8003    │    100 │        0 │ HEALTHY
+   6 │    172.17.0.1:8005    │    100 │        0 │ HEALTHY
+   5 │    172.17.0.1:8004    │    100 │        0 │ HEALTHY
+   2 │    172.17.0.1:8001    │    100 │        0 │ HEALTHY
+   7 │    172.17.0.1:8006    │    100 │        0 │ HEALTHY
+   3 │    172.17.0.1:8002    │    100 │        0 │ HEALTHY
+   1 │    172.17.0.1:8000    │    100 │        0 │ HEALTHY
+   8 │    172.17.0.1:8007    │    100 │        0 │ HEALTHY
+
+Total Backends: 8
+  Healthy: 8  Draining: 0  Dead: 0
+ubuntu@129-213-22-220:~/ranvier-core$ ./tools/rvctl --url http://localhost:8081 inspect routes
+Fetching routes from http://localhost:8081...
+
+Radix Tree State (Shard 0)
+==================================================
+└── Node4 [root]
+    ├─▶ edge=58
+    │   └── Node16 [21947,4522,25]
+    │       ├─▶ edge=604
+    │       │   └── Node4 [60,198,198,2235,7824...] → Backend:3 (LOCAL)
+    │       ├─▶ edge=362
+    │       │   └── Node4 [60,198,198,1639,389...] → Backend:4 (LOCAL)
+    │       ├─▶ edge=352
+    │       │   └── Node4 [60,198,198,4342,389...] → Backend:1 (LOCAL)
+    │       ├─▶ edge=657
+    │       │   └── Node4 [60,198,198,2235,10850...] → Backend:1 (REMOTE)
+    │       └─▶ edge=513
+    │           └── Node4 [60,198,198,2235]
+    │               ├─▶ edge=12554
+    │               │   └── Node4 [527,3262,274,34706,434...] → Backend:3 (LOCAL)
+    │               └─▶ edge=7824
+    │                   └── Node4 [20984,25,48191,19937,198...] → Backend:8 (REMOTE)
+    ├─▶ edge=1639
+    │   └── Node4 [389]
+    │       ├─▶ edge=257
+    │       │   └── Node4 [1366,12499,5887,13,921...]
+    │       │       ├─▶ edge=4886
+    │       │       │   └── Node4 [24627,8945,13] → Backend:6 (REMOTE)
+    │       │       ├─▶ edge=5911
+    │       │       │   └── Node4 [4297,508,389] → Backend:6 (REMOTE)
+    │       │       └─▶ edge=10618
+    │       │           └── Node4 [4297,656,2628] → Backend:4 (LOCAL)
+    │       └─▶ edge=281
+    │           └── Node4 [5887,3788,11949,13,921...]
+    │               ├─▶ edge=3494
+    │               │   └── Node4 [2836,18239,351,449,39386...] → Backend:6 (LOCAL)
+    │               ├─▶ edge=751
+    │               │   └── Node4 [2494,15637,284,2948,5076...] → Backend:6 (REMOTE)
+    │               └─▶ edge=900
+    │                   └── Node4 [510,6831,8787,351,16363...] → Backend:8 (LOCAL)
+    ├─▶ edge=22743
+    │   └── Node4 [428,2438,25,825,751...] → Backend:5 (REMOTE)
+    └─▶ edge=2061
+        └── Node4 [318,262,4403,440,13357...] → Backend:4 (REMOTE)
+
+Total Routes: 14
 
