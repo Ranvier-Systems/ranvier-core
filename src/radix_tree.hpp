@@ -103,9 +103,16 @@ struct Node48 : public Node {
 };
 
 struct Node256 : public Node {
-    std::array<NodePtr, 256> children;
+    // CRITICAL: Must store full token IDs because key_byte() only uses lower 8 bits.
+    // Token IDs like 0, 256, 512 all map to index 0 - we need to verify the actual key.
+    static constexpr TokenId EMPTY_KEY = -1;  // Sentinel value for empty slots
 
-    Node256() : Node(NodeType::Node256) {}
+    std::array<NodePtr, 256> children;
+    std::array<TokenId, 256> keys;  // Full token IDs at each slot
+
+    Node256() : Node(NodeType::Node256) {
+        keys.fill(EMPTY_KEY);
+    }
 };
 
 // =============================================================================
@@ -405,8 +412,8 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
-                    if (n->children[i]) {
-                        callback(static_cast<TokenId>(i), n->children[i].get());
+                    if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) {
+                        callback(n->keys[i], n->children[i].get());  // Use stored full key
                     }
                 }
                 break;
@@ -427,7 +434,7 @@ private:
                 size_t count = 0;
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
-                    if (n->children[i]) count++;
+                    if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) count++;
                 }
                 return count;
             }
@@ -465,16 +472,25 @@ private:
             }
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
-                // O(1) index lookup
+                // O(1) index lookup with full key verification
+                // CRITICAL: key_byte() only uses lower 8 bits, so we must verify
+                // the actual key matches to handle token ID collisions (e.g., 0 vs 256)
                 uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER) [[likely]] {
+                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) [[likely]] {
                     return n->children[idx].get();
                 }
                 return nullptr;
             }
             case NodeType::Node256: {
-                // O(1) direct array access - most common for dense nodes
-                return static_cast<Node256*>(node)->children[key_byte(key)].get();
+                // O(1) lookup with full key verification
+                // CRITICAL: key_byte() only uses lower 8 bits, so we must verify
+                // the actual key matches to handle token ID collisions
+                auto* n = static_cast<Node256*>(node);
+                uint8_t idx = key_byte(key);
+                if (n->keys[idx] == key) [[likely]] {
+                    return n->children[idx].get();
+                }
+                return nullptr;
             }
         }
         return nullptr;
@@ -499,14 +515,19 @@ private:
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER) {
+                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
                     return std::move(n->children[idx]);
                 }
                 break;
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
-                return std::move(n->children[key_byte(key)]);
+                uint8_t idx = key_byte(key);
+                if (n->keys[idx] == key) {
+                    n->keys[idx] = Node256::EMPTY_KEY;  // Clear key when extracting
+                    return std::move(n->children[idx]);
+                }
+                break;
             }
         }
         return nullptr;
@@ -544,7 +565,9 @@ private:
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
-                n->children[key_byte(key)] = std::move(child);
+                uint8_t idx = key_byte(key);
+                n->children[idx] = std::move(child);
+                n->keys[idx] = key;  // Store full key for verification
                 break;
             }
         }
@@ -594,7 +617,9 @@ private:
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(parent.get());
-                n->children[key_byte(key)] = std::move(child);
+                uint8_t idx = key_byte(key);
+                n->children[idx] = std::move(child);
+                n->keys[idx] = key;  // Store full key for verification
                 return parent;
             }
         }
@@ -642,9 +667,13 @@ private:
 
         copy_node_metadata(n256, n48);
         for (size_t i = 0; i < n48->keys.size(); i++) {
-            n256->children[key_byte(n48->keys[i])] = std::move(n48->children[i]);
+            uint8_t idx = key_byte(n48->keys[i]);
+            n256->children[idx] = std::move(n48->children[i]);
+            n256->keys[idx] = n48->keys[i];  // Copy full key for verification
         }
-        n256->children[key_byte(key)] = std::move(child);
+        uint8_t new_idx = key_byte(key);
+        n256->children[new_idx] = std::move(child);
+        n256->keys[new_idx] = key;  // Store full key for verification
 
         return n256_ptr;
     }
@@ -766,8 +795,8 @@ private:
             case NodeType::Node4: {
                 auto* d = static_cast<Node4*>(dest);
                 for (int i = 0; i < 256; i++) {
-                    if (src->children[i]) {
-                        d->keys.push_back(static_cast<TokenId>(i));
+                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
+                        d->keys.push_back(src->keys[i]);  // Use stored full key
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -776,8 +805,8 @@ private:
             case NodeType::Node16: {
                 auto* d = static_cast<Node16*>(dest);
                 for (int i = 0; i < 256; i++) {
-                    if (src->children[i]) {
-                        d->keys.push_back(static_cast<TokenId>(i));
+                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
+                        d->keys.push_back(src->keys[i]);  // Use stored full key
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -786,10 +815,10 @@ private:
             case NodeType::Node48: {
                 auto* d = static_cast<Node48*>(dest);
                 for (int i = 0; i < 256; i++) {
-                    if (src->children[i]) {
+                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
                         uint8_t pos = static_cast<uint8_t>(d->children.size());
                         d->index[static_cast<uint8_t>(i)] = pos;
-                        d->keys.push_back(static_cast<TokenId>(i));
+                        d->keys.push_back(src->keys[i]);  // Use stored full key
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -799,6 +828,7 @@ private:
                 auto* d = static_cast<Node256*>(dest);
                 for (int i = 0; i < 256; i++) {
                     d->children[i] = std::move(src->children[i]);
+                    d->keys[i] = src->keys[i];  // Copy stored full keys
                 }
                 break;
             }
@@ -828,7 +858,9 @@ private:
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
-                n->children[key_byte(key)] = std::move(child);
+                uint8_t idx = key_byte(key);
+                n->children[idx] = std::move(child);
+                n->keys[idx] = key;  // Store full key for verification
                 break;
             }
         }
@@ -1277,7 +1309,8 @@ private:
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(parent);
                 uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER) {
+                // Verify key matches before removing (handles hash collisions)
+                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
                     NodeType removed_type = n->children[idx]->type;
                     // Remove from children and keys vectors
                     n->children.erase(n->children.begin() + idx);
@@ -1297,9 +1330,11 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(parent);
                 uint8_t idx = key_byte(key);
-                if (n->children[idx]) {
+                // Verify key matches before removing (handles hash collisions)
+                if (n->children[idx] && n->keys[idx] == key) {
                     NodeType removed_type = n->children[idx]->type;
                     n->children[idx].reset(); // Triggers SlabNodeDeleter
+                    n->keys[idx] = Node256::EMPTY_KEY;  // Clear key
                     return removed_type;
                 }
                 break;
@@ -1383,8 +1418,8 @@ private:
             case NodeType::Node256: {
                 auto* src = static_cast<Node256*>(node.get());
                 for (int i = 0; i < 256 && count < 4; i++) {
-                    if (src->children[i]) {
-                        n4->keys.push_back(static_cast<TokenId>(i));
+                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
+                        n4->keys.push_back(src->keys[i]);  // Use stored full key
                         n4->children.push_back(std::move(src->children[i]));
                         count++;
                     }
@@ -1416,8 +1451,8 @@ private:
             case NodeType::Node256: {
                 auto* src = static_cast<Node256*>(node.get());
                 for (int i = 0; i < 256 && count < 16; i++) {
-                    if (src->children[i]) {
-                        n16->keys.push_back(static_cast<TokenId>(i));
+                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
+                        n16->keys.push_back(src->keys[i]);  // Use stored full key
                         n16->children.push_back(std::move(src->children[i]));
                         count++;
                     }
@@ -1440,9 +1475,10 @@ private:
             auto* src = static_cast<Node256*>(node.get());
             size_t count = 0;
             for (int i = 0; i < 256 && count < 48; i++) {
-                if (src->children[i]) {
-                    n48->index[i] = static_cast<uint8_t>(count);
-                    n48->keys.push_back(static_cast<TokenId>(i));
+                if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
+                    // Use key_byte of the stored full key for index array
+                    n48->index[key_byte(src->keys[i])] = static_cast<uint8_t>(count);
+                    n48->keys.push_back(src->keys[i]);  // Store full key
                     n48->children.push_back(std::move(src->children[i]));
                     count++;
                 }
