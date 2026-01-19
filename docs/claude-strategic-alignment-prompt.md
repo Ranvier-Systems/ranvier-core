@@ -2,6 +2,11 @@
 2. DO NOT read /assets or /docs (except for TODO.md and claude-context.md).
 3. Run /compact if the conversation exceeds 4 turns.
 
+Build Constraints:
+1. **Static Analysis Only:** Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
+2. **API Verification:** Verify syntax against Seastar documentation logic.
+3. **Manual Verification:** I will build in my Docker container and provide logs if it fails.
+
 ---
 
 I am requesting a STRATEGIC PROJECT ASSESSMENT. 
