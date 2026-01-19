@@ -194,7 +194,46 @@ The following patterns were identified during an adversarial security audit. Eac
 
 ---
 
-### Quick Reference: The 14 Hard Rules
+#### 14. The Cross-Shard Heap Memory Anti-Pattern
+
+**THE PATTERN:** Moving `std::vector`, `std::string`, or any heap-owning type across shards via `smp::submit_to`:
+```cpp
+auto tokens = get_tokens();  // Heap allocated on shard 0
+smp::submit_to(shard_1, [tokens = std::move(tokens)] {
+    store(std::move(tokens));  // tokens' heap still on shard 0!
+});
+```
+
+**THE CONSEQUENCE:** `std::move` only transfers the pointer/metadata—the actual heap memory stays on the source shard. When the destination shard eventually frees the memory, Seastar's per-shard allocator rejects it with `free(): invalid pointer` or `SIGSEGV`. This can manifest long after the cross-shard transfer, making debugging difficult.
+
+**THE LESSON:** *Hard Rule: Heap-owning types cannot be moved across shards.* The heap data stays where it was allocated. Either:
+1. Force a fresh allocation on the destination: `std::vector<T>(source.begin(), source.end())`
+2. Use POD types only for cross-shard transfer
+3. Serialize/deserialize across the boundary
+4. Redesign to avoid cross-shard data transfer
+
+**RED FLAGS TO AUDIT:**
+- `submit_to` lambdas capturing `vector`, `string`, `unique_ptr`, `shared_ptr`
+- `parallel_for_each` broadcasting heap-owning data to all shards
+- Callbacks registered with heap-owning parameters received from other shards
+- `foreign_ptr` with `std::move(*foreign)` extracting the pointed-to data
+
+**DEFENSIVE PATTERN:** When receiving data that *might* come from another shard, force local allocation:
+```cpp
+void receive_tokens(std::vector<int> tokens) {
+    // Force fresh allocation on THIS shard
+    _storage.push_back({
+        std::vector<int>(tokens.begin(), tokens.end()),
+        other_data
+    });
+}
+```
+
+**PROMPT GUARD:** "Never move heap-owning types (vector, string, unique_ptr) across shards—force a fresh allocation on the destination shard using iterator constructors or explicit copy."
+
+---
+
+### Quick Reference: The 15 Hard Rules
 
 | # | Rule | Violation |
 |---|------|-----------|
@@ -212,3 +251,4 @@ The following patterns were identified during an adversarial security audit. Eac
 | 11 | `std::call_once` or `std::atomic` for global state | Unprotected global statics |
 | 12 | Use Seastar file I/O APIs | `std::ifstream/ofstream` in Seastar code |
 | 13 | Thread-local raw new needs destroy function | `thread_local T* = new T()` without cleanup |
+| 14 | Force local allocation for cross-shard data | Moving `vector`/`string` via `submit_to` |
