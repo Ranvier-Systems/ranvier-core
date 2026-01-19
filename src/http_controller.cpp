@@ -247,7 +247,10 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 
     // 1. DATA PLANE (rate limited)
     r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(rate_limit_check, [this](auto req, auto rep) {
-        return this->handle_proxy(std::move(req), std::move(rep));
+        return this->handle_proxy(std::move(req), std::move(rep), "/v1/chat/completions");
+    }));
+    r.add(operation_type::POST, url("/v1/completions"), make_rate_limited_handler(rate_limit_check, [this](auto req, auto rep) {
+        return this->handle_proxy(std::move(req), std::move(rep), "/v1/completions");
     }));
 
     // Define the check once as a local lambda to keep the calls clean.
@@ -438,7 +441,7 @@ future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionB
 
     // Build HTTP request with tracing headers for backend
     sstring http_req =
-        "POST /v1/chat/completions HTTP/1.1\r\n"
+        "POST " + ctx.endpoint + " HTTP/1.1\r\n"
         "Host: localhost\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: " + to_sstring(ctx.forwarded_body.size()) + "\r\n"
@@ -641,7 +644,10 @@ future<> HttpController::stream_backend_response(
 // ---------------------------------------------------------
 // PROXY HANDLER
 // ---------------------------------------------------------
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
+    std::unique_ptr<seastar::httpd::request> req,
+    std::unique_ptr<seastar::httpd::reply> rep,
+    std::string_view endpoint) {
     // Extract or generate request ID for distributed tracing
     std::string request_id = extract_request_id(req->_headers);
     if (request_id.empty()) {
@@ -662,7 +668,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     // Start root span for this request (if tracing is enabled)
     auto request_span = TracingService::start_span("ranvier.request", trace_ctx);
     request_span.set_attribute("http.method", "POST");
-    request_span.set_attribute("http.url", "/v1/chat/completions");
+    request_span.set_attribute("http.url", std::string(endpoint));
     request_span.set_attribute("ranvier.request_id", request_id);
 
     // Check if we're draining - reject new requests with 503
@@ -841,20 +847,41 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
     } // tokenize_span ends here
 
-    // Prepare forwarded body - strip prompt_token_ids if client provided them
-    // vLLM's /v1/chat/completions endpoint ignores prompt_token_ids (only /v1/completions supports it)
-    // We use tokens for routing only, not forwarding to backend
-    //
-    // Note: We no longer add prompt_token_ids via rewrite() since:
-    // 1. vLLM chat/completions ignores it anyway
-    // 2. Adding then stripping wastes CPU on double JSON parse/serialize
+    // Prepare forwarded body based on endpoint:
+    // - /v1/completions: vLLM supports prompt_token_ids, forward them for efficiency
+    // - /v1/chat/completions: vLLM ignores prompt_token_ids, strip them to avoid warnings
     std::string forwarded_body;
-    if (used_client_tokens) {
-        // Client provided tokens - strip them before forwarding
-        forwarded_body = RequestRewriter::strip_prompt_token_ids(body_view);
+    bool is_completions_endpoint = (endpoint == "/v1/completions");
+
+    if (is_completions_endpoint) {
+        // /v1/completions supports prompt_token_ids - forward them for vLLM efficiency
+        if (used_client_tokens) {
+            // Client provided tokens - keep them in body as-is
+            forwarded_body = std::string(body_view);
+            log_proxy.debug("[{}] Forwarding client tokens to /v1/completions", request_id);
+        } else if (_config.enable_token_forwarding && !tokens.empty()) {
+            // Server tokenized - add tokens to body for vLLM
+            auto rewrite_result = RequestRewriter::rewrite(body_view, tokens);
+            if (rewrite_result.success) {
+                forwarded_body = std::move(rewrite_result.body);
+                log_proxy.debug("[{}] Added {} token IDs to /v1/completions request",
+                               request_id, tokens.size());
+            } else {
+                forwarded_body = std::string(body_view);
+                log_proxy.debug("[{}] Token rewrite failed: {}", request_id, rewrite_result.error);
+            }
+        } else {
+            forwarded_body = std::string(body_view);
+        }
     } else {
-        // Server tokenized or no tokenization - just copy the body
-        forwarded_body = std::string(body_view);
+        // /v1/chat/completions ignores prompt_token_ids - strip to avoid vLLM warnings
+        if (used_client_tokens) {
+            forwarded_body = RequestRewriter::strip_prompt_token_ids(body_view);
+            log_proxy.debug("[{}] Stripped client tokens from /v1/chat/completions request", request_id);
+        } else {
+            // No tokens to strip - just copy body
+            forwarded_body = std::string(body_view);
+        }
     }
 
     BackendId target_id;
@@ -962,6 +989,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
     ctx->request_id = request_id;
     ctx->backend_traceparent = backend_traceparent;
     ctx->routing_mode = routing_mode_str;
+    ctx->endpoint = std::string(endpoint);
     ctx->forwarded_body = std::move(forwarded_body);
     ctx->tokens = std::move(tokens);
     ctx->target_id = target_id;
