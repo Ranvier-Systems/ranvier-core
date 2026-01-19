@@ -140,6 +140,8 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+      # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
+      - RAYON_NUM_THREADS=1
     # Use --smp 2 to leverage multi-core performance (segfault fix: sharded<HttpController>)
     # --reserve-memory leaves memory for non-Seastar allocators (Rust tokenizer uses system allocator)
     command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}", "--reserve-memory", "256M"]
