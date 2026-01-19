@@ -808,13 +808,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
 
             // Validate input before passing to tokenizer to prevent crashes
             // The tokenizer (Rust FFI) can segfault on malformed input
-            constexpr size_t MAX_TOKENIZE_LENGTH = 512 * 1024;  // 512KB limit
-            auto validation = TextValidator::validate_for_tokenizer(text_to_tokenize, MAX_TOKENIZE_LENGTH);
+            auto validation = TextValidator::validate_for_tokenizer(
+                text_to_tokenize, TextValidator::DEFAULT_MAX_LENGTH);
 
             if (!validation.valid) {
                 log_proxy.warn("[{}] Input validation failed, falling back to round-robin routing: {}",
                                request_id, validation.error);
                 tokenize_span.set_error(std::string("validation_failed: ") + validation.error);
+                metrics().record_tokenizer_validation_failure();
                 tokens.clear();
             } else {
                 try {
@@ -826,12 +827,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                     log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
                                    request_id, e.what());
                     tokenize_span.set_error(std::string("tokenization_failed: ") + e.what());
+                    metrics().record_tokenizer_error();
                     tokens.clear();
                 } catch (...) {
                     // Catch any other exceptions (including potential Rust panics via FFI)
                     log_proxy.error("[{}] Tokenization failed with unknown exception, falling back to round-robin routing",
                                     request_id);
                     tokenize_span.set_error("tokenization_failed: unknown exception");
+                    metrics().record_tokenizer_error();
                     tokens.clear();
                 }
             }
@@ -1129,10 +1132,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     std::string_view content_view(req->content.data(), req->content.size());
 
     // Validate input before passing to tokenizer
-    constexpr size_t MAX_TOKENIZE_LENGTH = 512 * 1024;  // 512KB limit
-    auto validation = TextValidator::validate_for_tokenizer(content_view, MAX_TOKENIZE_LENGTH);
+    auto validation = TextValidator::validate_for_tokenizer(
+        content_view, TextValidator::DEFAULT_MAX_LENGTH);
     if (!validation.valid) {
         log_control.warn("POST /admin/routes: input validation failed for backend {}: {}", backend_id, validation.error);
+        metrics().record_tokenizer_validation_failure();
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Input validation failed: " + validation.error + "\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
@@ -1142,6 +1146,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         tokens = _tokenizer.encode(content_view);
     } catch (const std::exception& e) {
         log_control.warn("POST /admin/routes: failed to tokenize content for backend {}: {}", backend_id, e.what());
+        metrics().record_tokenizer_error();
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Failed to tokenize request content\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
