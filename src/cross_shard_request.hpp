@@ -122,6 +122,34 @@ struct CrossShardRequestContext {
                (client_tokens.capacity() * sizeof(int32_t));
     }
 
+    // Force local heap allocation for all heap-owning members.
+    // CRITICAL: When receiving a context via foreign_ptr from another shard,
+    // the heap data for std::string and std::vector members is still allocated
+    // on the source shard. Moving the context only transfers metadata (pointers),
+    // not the actual heap memory. Freeing cross-shard memory causes SIGSEGV.
+    //
+    // This method creates a new context with all heap-owning members freshly
+    // allocated on the CURRENT shard, making it safe to store and eventually free.
+    //
+    // Note: seastar::temporary_buffer is Seastar-aware and handles cross-shard
+    // transfer correctly, so we can move it directly.
+    CrossShardRequestContext force_local_allocation() && {
+        CrossShardRequestContext local;
+        // temporary_buffer is Seastar-aware, safe to move
+        local.body = std::move(body);
+        // Force fresh allocations for all std::string members
+        local.request_id = std::string(request_id.begin(), request_id.end());
+        local.client_ip = std::string(client_ip.begin(), client_ip.end());
+        local.traceparent = std::string(traceparent.begin(), traceparent.end());
+        local.method = std::string(method.begin(), method.end());
+        local.path = std::string(path.begin(), path.end());
+        // Force fresh allocation for vector
+        local.client_tokens = std::vector<int32_t>(client_tokens.begin(), client_tokens.end());
+        local.has_client_tokens = has_client_tokens;
+        local.origin_shard = origin_shard;
+        return local;
+    }
+
     // Create from Seastar HTTP request
     // Note: This copies from sstring to temporary_buffer since sstring doesn't
     // provide a way to release its internal buffer. For high-throughput paths,
@@ -341,6 +369,9 @@ public:
     //
     // Note: This uses foreign_ptr to safely transfer ownership across shards.
     // The context is wrapped in a unique_ptr, then foreign_ptr for safe cross-shard access.
+    // CRITICAL: We call force_local_allocation() on the target shard to ensure all
+    // heap-owning members (std::string, std::vector) are allocated locally before
+    // passing to the handler. Without this, freeing cross-shard memory causes SIGSEGV.
     template<typename Handler>
     static seastar::future<CrossShardResult> dispatch(
         uint32_t target_shard,
@@ -358,15 +389,20 @@ public:
 
         return seastar::smp::submit_to(target_shard,
             [foreign = std::move(foreign), handler = std::forward<Handler>(handler)]() mutable {
-                // Move context out of foreign_ptr on target shard
-                // foreign_ptr allows the pointee to be moved out
-                CrossShardRequestContext local_ctx = std::move(*foreign);
+                // CRITICAL: Force local allocation for all heap-owning members.
+                // The context's std::string and std::vector members have heap data
+                // on the source shard. We must allocate fresh copies on THIS shard
+                // before the foreign_ptr is destroyed, otherwise we'd free cross-shard
+                // memory which causes SIGSEGV.
+                CrossShardRequestContext local_ctx = std::move(*foreign).force_local_allocation();
                 return handler(std::move(local_ctx));
             });
     }
 
     // Dispatch with explicit unique_ptr ownership
     // Provided for API compatibility; internally uses foreign_ptr
+    // CRITICAL: Same as dispatch(), we call force_local_allocation() to ensure
+    // all heap-owning members are allocated on the target shard.
     template<typename Handler>
     static seastar::future<CrossShardResult> dispatch_with_foreign(
         uint32_t target_shard,
@@ -382,8 +418,8 @@ public:
 
         return seastar::smp::submit_to(target_shard,
             [foreign = std::move(foreign), handler = std::forward<Handler>(handler)]() mutable {
-                // Move context out on target shard
-                CrossShardRequestContext local_ctx = std::move(*foreign);
+                // CRITICAL: Force local allocation (see dispatch() comment for details)
+                CrossShardRequestContext local_ctx = std::move(*foreign).force_local_allocation();
                 return handler(std::move(local_ctx));
             });
     }

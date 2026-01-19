@@ -182,6 +182,35 @@ TEST_F(CrossShardRequestContextTest, FromBufferFactoryMethod) {
     EXPECT_EQ(ctx2.traceparent, "00-trace-span-01");
 }
 
+TEST_F(CrossShardRequestContextTest, ForceLocalAllocationPreservesAllFields) {
+    // Setup context with all fields populated
+    std::string test_body = "body data";
+    ctx.body = seastar::temporary_buffer<char>(test_body.data(), test_body.size());
+    ctx.request_id = "req-123";
+    ctx.client_ip = "192.168.1.1";
+    ctx.traceparent = "00-trace-span-01";
+    ctx.method = "POST";
+    ctx.path = "/api/v1/completions";
+    ctx.client_tokens = {1, 2, 3, 4, 5};
+    ctx.has_client_tokens = true;
+    ctx.origin_shard = 7;
+
+    // force_local_allocation() is an rvalue-ref qualified method
+    // In real cross-shard scenarios, this creates fresh heap allocations
+    // on the current shard. Here we verify data preservation.
+    auto local = std::move(ctx).force_local_allocation();
+
+    EXPECT_EQ(local.body_view(), "body data");
+    EXPECT_EQ(local.request_id, "req-123");
+    EXPECT_EQ(local.client_ip, "192.168.1.1");
+    EXPECT_EQ(local.traceparent, "00-trace-span-01");
+    EXPECT_EQ(local.method, "POST");
+    EXPECT_EQ(local.path, "/api/v1/completions");
+    EXPECT_EQ(local.client_tokens, std::vector<int32_t>({1, 2, 3, 4, 5}));
+    EXPECT_TRUE(local.has_client_tokens);
+    EXPECT_EQ(local.origin_shard, 7u);
+}
+
 // =============================================================================
 // CrossShardResult Tests
 // =============================================================================
