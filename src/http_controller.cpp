@@ -841,32 +841,21 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         }
     } // tokenize_span ends here
 
-    // Rewrite request body with token IDs if enabled and we tokenized locally
-    // Skip rewriting if client already provided prompt_token_ids (it's already in the body)
-    // Only allocate the forwarded_body string when we need to forward/rewrite
+    // Prepare forwarded body - strip prompt_token_ids if client provided them
+    // vLLM's /v1/chat/completions endpoint ignores prompt_token_ids (only /v1/completions supports it)
+    // We use tokens for routing only, not forwarding to backend
+    //
+    // Note: We no longer add prompt_token_ids via rewrite() since:
+    // 1. vLLM chat/completions ignores it anyway
+    // 2. Adding then stripping wastes CPU on double JSON parse/serialize
     std::string forwarded_body;
-    if (_config.enable_token_forwarding && !tokens.empty() && !used_client_tokens) {
-        // RequestRewriter::rewrite accepts string_view, returns modified body
-        auto rewrite_result = RequestRewriter::rewrite(body_view, tokens);
-        if (rewrite_result.success) {
-            forwarded_body = std::move(rewrite_result.body);
-            log_proxy.debug("[{}] Request rewritten with {} token IDs ({} -> {} bytes)",
-                           request_id, tokens.size(), body_view.size(), forwarded_body.size());
-        } else {
-            // Rewrite failed, use original body (single copy here)
-            forwarded_body = std::string(body_view);
-            log_proxy.debug("[{}] Request rewrite skipped: {}",
-                           request_id, rewrite_result.error);
-        }
+    if (used_client_tokens) {
+        // Client provided tokens - strip them before forwarding
+        forwarded_body = RequestRewriter::strip_prompt_token_ids(body_view);
     } else {
-        // No rewriting needed - single copy for forwarding
+        // Server tokenized or no tokenization - just copy the body
         forwarded_body = std::string(body_view);
     }
-
-    // Strip prompt_token_ids from forwarded body
-    // vLLM's /v1/chat/completions endpoint ignores prompt_token_ids (only /v1/completions supports it)
-    // We keep the tokens for routing but don't forward them to avoid backend warnings
-    forwarded_body = RequestRewriter::strip_prompt_token_ids(forwarded_body);
 
     BackendId target_id;
     std::string routing_mode_str;
