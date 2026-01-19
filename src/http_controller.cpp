@@ -441,7 +441,7 @@ future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionB
 
     // Build HTTP request with tracing headers for backend
     sstring http_req =
-        "POST " + ctx.endpoint + " HTTP/1.1\r\n"
+        "POST " + sstring(ctx.endpoint) + " HTTP/1.1\r\n"
         "Host: localhost\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: " + to_sstring(ctx.forwarded_body.size()) + "\r\n"
