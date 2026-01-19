@@ -57,8 +57,13 @@ Environment Variables:
 
     Client-Side Tokenization:
         CLIENT_TOKENIZE         - Enable client-side tokenization (default: false)
-                                  When enabled, the benchmark pre-tokenizes prompts and sends
-                                  prompt_token_ids in requests. This bypasses ranvier's tokenization.
+                                  When enabled:
+                                  1. Uses /v1/completions endpoint (instead of /v1/chat/completions)
+                                  2. Pre-tokenizes prompts and sends prompt_token_ids
+                                  3. Ranvier uses client tokens for routing (no server tokenization)
+                                  4. vLLM skips tokenization (uses prompt_token_ids directly)
+                                  This provides maximum efficiency by eliminating all tokenization
+                                  on both Ranvier and vLLM.
         TOKENIZER_PATH          - Path to tokenizer JSON file (default: assets/gpt2.json)
                                   If file doesn't exist, falls back to loading from VLLM_MODEL
 
@@ -187,6 +192,19 @@ def tokenize_messages(messages: List[dict]) -> Optional[List[int]]:
     except Exception as e:
         logger.debug(f"Client tokenization failed: {e}")
         return None
+
+
+def messages_to_prompt(messages: List[dict]) -> str:
+    """Convert chat messages to a prompt string for /v1/completions endpoint.
+
+    Uses the same format as tokenize_messages for consistency.
+    """
+    text_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        text_parts.append(f"<|{role}|>\n{content}")
+    return "\n".join(text_parts)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -2810,8 +2828,10 @@ def on_test_start(environment, **kwargs):
     # Initialize client-side tokenizer if enabled
     # This allows bypassing ranvier's tokenization for benchmarking
     if _init_client_tokenizer():
-        logger.info("Client-side tokenization ENABLED - requests will include prompt_token_ids")
-        logger.info("  Ranvier will use client tokens for routing (bypasses local tokenization)")
+        logger.info("Client-side tokenization ENABLED")
+        logger.info("  Endpoint: /v1/completions (supports prompt_token_ids)")
+        logger.info("  Ranvier: uses client tokens for routing (bypasses local tokenization)")
+        logger.info("  vLLM: skips tokenization (uses prompt_token_ids directly)")
     else:
         client_tokenize = os.environ.get("CLIENT_TOKENIZE", "false").lower() in ("true", "1", "yes")
         if client_tokenize:
@@ -3001,19 +3021,31 @@ class RealBackendUser(HttpUser):
         # Determine prefix size bucket for metrics tracking
         prefix_size_bucket = get_prefix_size_bucket(estimated_tokens)
 
-        request_body = {
-            "model": os.environ.get("VLLM_MODEL", "default"),
-            "messages": messages,
-            "stream": True,
-            "max_tokens": 100,  # Limit output for benchmarking
-        }
-
-        # Add prompt_token_ids if client-side tokenization is enabled
-        # This bypasses ranvier's tokenization - ranvier will use these tokens for routing
-        # and forward them to vLLM (which also skips tokenization when prompt_token_ids is present)
+        # Build request body based on whether client tokenization is enabled
+        # When enabled, use /v1/completions endpoint which supports prompt_token_ids
+        # This allows vLLM to skip tokenization entirely for maximum efficiency
         token_ids = tokenize_messages(messages)
+
         if token_ids is not None:
-            request_body["prompt_token_ids"] = token_ids
+            # Client tokenization enabled - use /v1/completions endpoint
+            # Convert messages to prompt string and include token IDs
+            endpoint = "/v1/completions"
+            request_body = {
+                "model": os.environ.get("VLLM_MODEL", "default"),
+                "prompt": messages_to_prompt(messages),
+                "prompt_token_ids": token_ids,
+                "stream": True,
+                "max_tokens": 100,  # Limit output for benchmarking
+            }
+        else:
+            # No client tokenization - use standard chat completions endpoint
+            endpoint = "/v1/chat/completions"
+            request_body = {
+                "model": os.environ.get("VLLM_MODEL", "default"),
+                "messages": messages,
+                "stream": True,
+                "max_tokens": 100,  # Limit output for benchmarking
+            }
 
         # Initialize metrics
         metrics = RequestMetrics(
@@ -3030,7 +3062,7 @@ class RealBackendUser(HttpUser):
 
         try:
             resp = requests.post(
-                f"{target_url}/v1/chat/completions",
+                f"{target_url}{endpoint}",
                 json=request_body,
                 headers={"Content-Type": "application/json"},
                 stream=True,
@@ -3052,7 +3084,7 @@ class RealBackendUser(HttpUser):
             if resp.status_code != 200:
                 events.request.fire(
                     request_type="POST",
-                    name=f"/v1/chat/completions (node{node_index + 1})",
+                    name=f"{endpoint} (node{node_index + 1})",
                     response_time=(time.perf_counter() - start_time) * 1000,
                     response_length=0,
                     exception=Exception(f"Status: {resp.status_code}"),
@@ -3089,7 +3121,7 @@ class RealBackendUser(HttpUser):
             # Fire Locust events
             events.request.fire(
                 request_type="POST",
-                name=f"/v1/chat/completions (node{node_index + 1})",
+                name=f"{endpoint} (node{node_index + 1})",
                 response_time=total_time,
                 response_length=len(response_text),
                 exception=None,
@@ -3157,7 +3189,7 @@ class RealBackendUser(HttpUser):
             total_time = (time.perf_counter() - start_time) * 1000
             events.request.fire(
                 request_type="POST",
-                name=f"/v1/chat/completions (node{node_index + 1})",
+                name=f"{endpoint} (node{node_index + 1})",
                 response_time=total_time,
                 response_length=0,
                 exception=e,
