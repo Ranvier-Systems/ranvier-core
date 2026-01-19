@@ -722,10 +722,10 @@ coredumpctl debug <pid>  # Opens in gdb
 
 **Solutions:**
 
-1. **Use `--disable-memory-allocator`** (recommended):
+1. **Use `--std-alloc`** (recommended):
    ```yaml
    # In docker-compose.benchmark-real.yml
-   command: ["./ranvier_server", "--smp", "2", "--disable-memory-allocator"]
+   command: ["./ranvier_server", "--smp", "2", "--std-alloc"]
    ```
    This uses standard malloc instead of Seastar's per-shard allocator, allowing Rust FFI to work correctly.
 
