@@ -180,7 +180,7 @@ EXTERNAL VLLM OPTIONS:
 OTHER OPTIONS:
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
-    --log-all           Save full shell output to run.log (useful for debugging)
+    --no-log            Disable full output logging (logging is ON by default)
     --debug             Build with debug symbols (CMAKE_BUILD_TYPE=Debug)
     -h, --help          Show this help message
 
@@ -210,8 +210,8 @@ EXAMPLES:
     # Use external vLLM on single host with sequential ports
     ./scripts/bench.sh --skip-vllm --vllm-host 10.0.0.1 --gpus 8
 
-    # Save full shell output to run.log (for debugging)
-    ./scripts/bench.sh --log-all --duration 10m
+    # Disable output logging (logging is ON by default)
+    ./scripts/bench.sh --no-log --duration 10m
 
 EOF
 }
@@ -315,7 +315,7 @@ INSTALL_DEPS=false
 DRY_RUN=false
 SETUP_ONLY=false
 WARMUP=false
-LOG_ALL=false
+LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
 
 while [[ $# -gt 0 ]]; do
@@ -337,7 +337,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=true; shift ;;
         --setup)          SETUP_ONLY=true; shift ;;
         --warmup)         WARMUP=true; shift ;;
-        --log-all)        LOG_ALL=true; shift ;;
+        --log-all)        LOG_ALL=true; shift ;;  # Kept for backwards compatibility (now default)
+        --no-log)         LOG_ALL=false; shift ;;
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
@@ -440,7 +441,7 @@ if [[ "$GPUS" -gt 8 ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Full output logging (--log-all)
+# Full output logging (enabled by default, disable with --no-log)
 # -----------------------------------------------------------------------------
 
 if [[ "$LOG_ALL" = true ]]; then
