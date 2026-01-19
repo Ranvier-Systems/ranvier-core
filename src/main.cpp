@@ -21,6 +21,7 @@
 #include <boost/program_options.hpp>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/smp_options.hh>
 
 using namespace seastar;
 
@@ -354,8 +355,9 @@ int main(int argc, char** argv) {
     app_template app(std::move(app_cfg));
 
     // Configure standard allocator if requested (for Rust FFI compatibility)
+    // Note: const_cast is safe here because we modify before run() is called
     if (use_std_alloc) {
-        app.options().smp_opts.memory_allocator = memory_allocator::standard;
+        const_cast<smp_options&>(app.options().smp_opts).memory_allocator = memory_allocator::standard;
         std::cout << "  Allocator:    standard (--std-alloc)\n";
     }
 
