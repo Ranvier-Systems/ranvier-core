@@ -1012,7 +1012,16 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
                        drop_count, _routes_dropped_overflow);
     }
 
-    _pending_remote_routes.push_back(PendingRemoteRoute{std::move(tokens), backend});
+    // IMPORTANT: Force a fresh allocation on the local shard.
+    // The tokens parameter may have been moved from another shard (via gossip broadcast).
+    // If we just move them, the heap memory stays on the source shard, and when we
+    // try to free them later (in flush_route_batch), Seastar's per-shard allocator
+    // will reject the free() call with "invalid pointer".
+    // By copying to a new vector, we allocate on THIS shard, making cleanup safe.
+    _pending_remote_routes.push_back(PendingRemoteRoute{
+        std::vector<TokenId>(tokens.begin(), tokens.end()),  // Force local allocation
+        backend
+    });
 
     // Flush immediately if buffer is full (don't wait for timer)
     if (_pending_remote_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
