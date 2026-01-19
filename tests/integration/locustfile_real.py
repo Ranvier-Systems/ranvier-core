@@ -475,6 +475,11 @@ SHARED_PREFIX_RATIO = float(os.environ.get("SHARED_PREFIX_RATIO", "0.7"))
 # Configurable thresholds
 P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "5000"))
 
+# Maximum time to wait for a streaming response to complete (seconds)
+# After this timeout, the request is aborted and recorded as a timeout error
+# This prevents indefinite blocking when Locust's run-time expires
+STREAMING_TIMEOUT_SECONDS = int(os.environ.get("STREAMING_TIMEOUT_SECONDS", "300"))  # 5 minutes
+
 # ============================================================================
 # Prompt Templates with Shared Prefixes
 # ============================================================================
@@ -2805,6 +2810,9 @@ def on_test_start(environment, **kwargs):
         logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
         logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
 
+    # Log streaming timeout configuration
+    logger.info(f"Streaming timeout: {STREAMING_TIMEOUT_SECONDS}s (per-request max)")
+
     # Load prompts from file if PROMPT_FILE is set
     if PROMPT_FILE:
         logger.info(f"Loading prompts from file: {PROMPT_FILE}")
@@ -3093,8 +3101,19 @@ class RealBackendUser(HttpUser):
                 _benchmark_stats.record_request(metrics)
                 return
 
-            # Process streaming response
+            # Process streaming response with timeout protection
+            stream_timed_out = False
             for line in resp.iter_lines():
+                # Check for streaming timeout to prevent indefinite blocking
+                elapsed_seconds = time.perf_counter() - start_time
+                if elapsed_seconds > STREAMING_TIMEOUT_SECONDS:
+                    stream_timed_out = True
+                    logger.warning(
+                        f"Streaming timeout after {elapsed_seconds:.1f}s "
+                        f"(limit: {STREAMING_TIMEOUT_SECONDS}s)"
+                    )
+                    break
+
                 if line:
                     decoded = line.decode("utf-8")
                     response_text += decoded + "\n"
@@ -3107,6 +3126,19 @@ class RealBackendUser(HttpUser):
                             break
 
             total_time = (time.perf_counter() - start_time) * 1000
+
+            # Handle streaming timeout as an error
+            if stream_timed_out:
+                events.request.fire(
+                    request_type="POST",
+                    name=f"{endpoint} (node{node_index + 1})",
+                    response_time=total_time,
+                    response_length=len(response_text),
+                    exception=Exception(f"Streaming timeout after {STREAMING_TIMEOUT_SECONDS}s"),
+                    context={},
+                )
+                _benchmark_stats.record_request(metrics)
+                return
 
             # Parse usage stats
             prompt_tokens, completion_tokens = parse_sse_usage(response_text)
