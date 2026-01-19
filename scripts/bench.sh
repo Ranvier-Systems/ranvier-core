@@ -159,13 +159,15 @@ SETUP OPTIONS:
 BENCHMARK OPTIONS:
     --model MODEL       Model to benchmark (default: meta-llama/Llama-3.2-1B-Instruct)
     --gpus N            Number of GPUs to use (default: auto-detect)
-    --duration TIME     Benchmark duration (default: 5m)
+    --duration TIME     Duration per benchmark run (default: 5m). Note: with --compare
+                        this is applied to EACH benchmark, doubling total runtime.
     --users N           Concurrent users (default: 10)
     --spawn-rate N      Users spawned per second (default: 2)
     --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: stress)
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
-    --compare           Run A/B comparison (prefix vs round-robin)
-    --warmup            Run a short warm-up before the main benchmark
+    --compare           Run A/B comparison (prefix vs round-robin). Runs TWO benchmarks
+                        (each for --duration), so total runtime is ~2x duration + 30s.
+    --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
     --output-dir DIR    Custom output directory (default: benchmark-reports)
     --client-tokenize   Tokenize on client (locust) instead of Ranvier server
 
@@ -643,7 +645,7 @@ if [[ "$DRY_RUN" = true ]]; then
     log_header "Dry Run - Configuration"
     echo "  Model:           $MODEL"
     echo "  GPUs:            $GPUS"
-    echo "  Duration:        $DURATION"
+    echo "  Duration:        $DURATION (per benchmark)"
     echo "  Users:           $USERS"
     echo "  Spawn Rate:      $SPAWN_RATE/s"
     echo "  Prompt Dist:     $PROMPT_DIST"
@@ -659,6 +661,22 @@ if [[ "$DRY_RUN" = true ]]; then
     else
         echo "  vLLM Host:       $VLLM_HOST"
     fi
+
+    # Calculate and display total estimated benchmark time
+    DURATION_SECS=$(parse_duration "$DURATION")
+    TOTAL_SECS=$DURATION_SECS
+    if [[ "$WARMUP" = true ]]; then
+        WARMUP_SECS=$(parse_duration "$DEFAULT_WARMUP_DURATION")
+        TOTAL_SECS=$((TOTAL_SECS + WARMUP_SECS + 10))  # +10s pause after warmup
+    fi
+    if [[ "$COMPARE" = true ]]; then
+        TOTAL_SECS=$((TOTAL_SECS + DURATION_SECS + 30))  # Second benchmark + 30s pause
+    fi
+    TOTAL_MINS=$((TOTAL_SECS / 60))
+    TOTAL_SECS_REM=$((TOTAL_SECS % 60))
+    echo ""
+    echo -e "  ${BOLD}Est. Total Time: ${TOTAL_MINS}m ${TOTAL_SECS_REM}s${NC} (benchmark time only, excludes setup)"
+
     echo ""
     if [[ "$SKIP_VLLM" = false ]]; then
         log_info "Would start $GPUS vLLM instances on ports $DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + GPUS - 1))"
@@ -673,7 +691,13 @@ if [[ "$DRY_RUN" = true ]]; then
     if [[ "$WARMUP" = true ]]; then
         log_info "Would run warm-up ($DEFAULT_WARMUP_DURATION, $DEFAULT_WARMUP_USERS users)"
     fi
-    log_info "Would run Locust benchmark ($DURATION, $USERS users)"
+    if [[ "$COMPARE" = true ]]; then
+        log_info "Would run benchmark 1: Round-Robin ($DURATION, $USERS users)"
+        log_info "Would pause 30s between benchmarks"
+        log_info "Would run benchmark 2: Prefix-Aware ($DURATION, $USERS users)"
+    else
+        log_info "Would run Locust benchmark ($DURATION, $USERS users)"
+    fi
     exit 0
 fi
 
@@ -997,6 +1021,10 @@ run_benchmark() {
 
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
+    LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
+    log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)"
+    BENCHMARK_START_TS=$(date +%s)
+
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
         -v "$PWD/$REPORT_DIR:/mnt/locust/output" \
@@ -1011,10 +1039,19 @@ run_benchmark() {
         --headless \
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
-        --run-time "$(parse_duration "$DURATION")s" \
+        --run-time "${LOCUST_RUN_TIME_SECS}s" \
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log"
+
+    BENCHMARK_END_TS=$(date +%s)
+    ACTUAL_DURATION=$((BENCHMARK_END_TS - BENCHMARK_START_TS))
+    EXPECTED_DURATION=$LOCUST_RUN_TIME_SECS
+    DURATION_DIFF=$((ACTUAL_DURATION - EXPECTED_DURATION))
+    log_info "Benchmark timing: expected=${EXPECTED_DURATION}s, actual=${ACTUAL_DURATION}s, diff=${DURATION_DIFF}s"
+    if [[ $DURATION_DIFF -gt 60 ]]; then
+        log_warn "Benchmark ran ${DURATION_DIFF}s longer than expected (>1min overhead)"
+    fi
 
     log_ok "Results saved to: $REPORT_DIR/"
 
@@ -1096,7 +1133,13 @@ fi
 
 if [[ "$COMPARE" = true ]]; then
     log_header "A/B Comparison Mode"
+    # Calculate total time for comparison mode
+    COMPARE_DURATION_SECS=$(parse_duration "$DURATION")
+    COMPARE_TOTAL_SECS=$((COMPARE_DURATION_SECS * 2 + 30))  # 2 benchmarks + 30s pause
+    COMPARE_TOTAL_MINS=$((COMPARE_TOTAL_SECS / 60))
+    COMPARE_TOTAL_SECS_REM=$((COMPARE_TOTAL_SECS % 60))
     log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
+    log_info "Each benchmark: $DURATION | Total estimated time: ${COMPARE_TOTAL_MINS}m ${COMPARE_TOTAL_SECS_REM}s"
 
     REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[1/2]")
 
