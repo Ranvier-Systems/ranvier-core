@@ -144,7 +144,10 @@ if(Seastar_FOUND)
       src/async_persistence.cpp
       src/crypto_offloader.cpp
       src/dtls_context.cpp
+      src/gossip_consensus.cpp
+      src/gossip_protocol.cpp
       src/gossip_service.cpp
+      src/gossip_transport.cpp
       src/health_service.cpp
       src/http_controller.cpp
       src/k8s_discovery_service.cpp
@@ -400,7 +403,10 @@ if(Seastar_FOUND)
       tests/unit/application_test.cpp
       src/application.cpp
       src/crypto_offloader.cpp
+      src/gossip_consensus.cpp
+      src/gossip_protocol.cpp
       src/gossip_service.cpp
+      src/gossip_transport.cpp
       src/node_slab.cpp
       src/router_service.cpp
       src/health_service.cpp
