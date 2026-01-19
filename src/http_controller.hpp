@@ -135,7 +135,8 @@ struct HttpControllerConfig {
 
 class HttpController {
 public:
-    HttpController(TokenizerService& t, RouterService& r, HttpControllerConfig config = {})
+    // Takes sharded<TokenizerService> to access the local shard's tokenizer (thread-safe)
+    HttpController(seastar::sharded<TokenizerService>& t, RouterService& r, HttpControllerConfig config = {})
         : _tokenizer(t), _router(r), _pool(config.pool), _config(config),
           _rate_limiter(config.rate_limit),
           _circuit_breaker(CircuitBreaker::Config{
@@ -222,7 +223,7 @@ public:
     uint64_t get_circuits_removed() const { return _circuit_breaker.get_circuits_removed(); }
 
 private:
-    TokenizerService& _tokenizer;
+    seastar::sharded<TokenizerService>& _tokenizer;  // Access via local() for thread safety
     RouterService& _router;
     ConnectionPool _pool;
     HttpControllerConfig _config;

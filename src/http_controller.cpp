@@ -750,7 +750,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                    request_id, client_ip, body_view.size());
 
     // 1. Validation
-    if (!_tokenizer.is_loaded()) {
+    if (!_tokenizer.local().is_loaded()) {
         log_proxy.warn("[{}] Tokenizer not loaded", request_id);
         metrics().record_failure();
         // active_request_guard destructor will decrement counter
@@ -818,22 +818,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 metrics().record_tokenizer_validation_failure();
                 tokens.clear();
             } else {
-                // DEBUG: Log input before tokenization to identify crash triggers
-                // This log line will appear right before any tokenizer crash
-                {
-                    size_t preview_len = std::min(text_to_tokenize.size(), size_t(200));
-                    std::string preview(text_to_tokenize.substr(0, preview_len));
-                    // Escape control chars for safe logging
-                    for (char& c : preview) {
-                        if (c < 32 && c != '\n' && c != '\t') c = '?';
-                    }
-                    log_proxy.info("[{}] TOKENIZE_DEBUG: size={} preview=\"{}{}\"",
-                                   request_id, text_to_tokenize.size(), preview,
-                                   text_to_tokenize.size() > 200 ? "..." : "");
-                }
-
                 try {
-                    tokens = _tokenizer.encode(text_to_tokenize);
+                    tokens = _tokenizer.local().encode(text_to_tokenize);
                     tokenize_span.set_attribute("ranvier.token_source", "local");
                     tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
                 } catch (const std::exception& e) {
@@ -1157,7 +1143,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     }
 
     try {
-        tokens = _tokenizer.encode(content_view);
+        tokens = _tokenizer.local().encode(content_view);
     } catch (const std::exception& e) {
         log_control.warn("POST /admin/routes: failed to tokenize content for backend {}: {}", backend_id, e.what());
         metrics().record_tokenizer_error();

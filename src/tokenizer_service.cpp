@@ -4,8 +4,6 @@
 
 namespace ranvier {
 
-TokenizerService::TokenizerService() : _impl(nullptr) {}
-
 void TokenizerService::load_from_json(const std::string& json_content) {
     _impl = tokenizers::Tokenizer::FromBlobJSON(json_content);
 }
