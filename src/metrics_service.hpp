@@ -186,6 +186,12 @@ public:
             seastar::metrics::make_counter("backend_metrics_overflow", _backend_metrics_overflow,
                 seastar::metrics::description("Times backend metrics limit was reached, new backends ignored (Rule #4: bounded containers)")),
 
+            seastar::metrics::make_counter("tokenizer_validation_failures", _tokenizer_validation_failures,
+                seastar::metrics::description("Total number of requests with invalid input (UTF-8, null bytes, length) that failed validation before tokenization")),
+
+            seastar::metrics::make_counter("tokenizer_errors", _tokenizer_errors,
+                seastar::metrics::description("Total number of tokenizer errors (exceptions during encode)")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -296,6 +302,12 @@ public:
     // Record stream parser size limit rejections (Slowloris defense)
     void record_stream_parser_size_rejection() { _stream_parser_size_rejections++; }
 
+    // Record tokenizer validation failure (invalid UTF-8, null bytes, etc.)
+    void record_tokenizer_validation_failure() { _tokenizer_validation_failures++; }
+
+    // Record tokenizer error (exception during encode)
+    void record_tokenizer_error() { _tokenizer_errors++; }
+
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
 
@@ -377,6 +389,8 @@ private:
     uint64_t _fallback_attempts = 0;
     uint64_t _stream_parser_size_rejections = 0;
     uint64_t _backend_metrics_overflow = 0;  // Times backend metrics limit was hit (Rule #4)
+    uint64_t _tokenizer_validation_failures = 0;  // Input validation failures before tokenization
+    uint64_t _tokenizer_errors = 0;  // Tokenizer exceptions during encode()
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance

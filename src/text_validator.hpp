@@ -14,6 +14,9 @@ namespace ranvier {
  */
 class TextValidator {
 public:
+    /// Default maximum input length for tokenization (512KB)
+    static constexpr size_t DEFAULT_MAX_LENGTH = 512 * 1024;
+
     struct ValidationResult {
         bool valid;
         std::string error;  // Empty if valid
