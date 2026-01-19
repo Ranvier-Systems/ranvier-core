@@ -11,7 +11,8 @@ RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl libcurl-devel open
 
 # Layer 2: Rust toolchain (rarely changes)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rm -rf /root/.cargo/registry/cache
+    && rm -rf /root/.cargo/registry/cache \
+    && /root/.cargo/bin/cargo --version
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Layer 3: Seastar build - consolidated into single RUN to avoid layer bloat
@@ -43,7 +44,8 @@ COPY assets/ ./assets/
 # OpenTelemetry uses PIMPL pattern to defer initialization until after main() starts
 # Use --build-arg BUILD_TYPE=Debug for debug builds with symbols
 ARG BUILD_TYPE=Release
-RUN mkdir -p build && cd build && \
+RUN cargo --version && \
+    mkdir -p build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} && \
     ninja
 
