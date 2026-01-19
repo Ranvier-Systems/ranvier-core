@@ -724,16 +724,20 @@ if [[ "$SKIP_VLLM" = false ]]; then
     for ((i=0; i<GPUS; i++)); do
         PORT=$((DEFAULT_VLLM_PORT_START + i))
         LOG_FILE="/tmp/vllm_gpu${i}.log"
+        # Each vLLM instance needs a unique MASTER_PORT for PyTorch distributed
+        # to avoid port conflicts when running multiple instances
+        DIST_PORT=$((29500 + i))
 
         log_step "$((i+1))" "$GPUS" "GPU $i: Starting vLLM on :$PORT..."
 
-        CUDA_VISIBLE_DEVICES=$i HF_TOKEN="$HF_TOKEN" \
+        CUDA_VISIBLE_DEVICES=$i HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
             python3 -m vllm.entrypoints.openai.api_server \
             --model "$MODEL" \
             --host 0.0.0.0 \
             --port "$PORT" \
             --enable-prefix-caching \
             --gpu-memory-utilization 0.85 \
+            --disable-frontend-multiprocessing \
             > "$LOG_FILE" 2>&1 &
 
         VLLM_PIDS+=($!)
