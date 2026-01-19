@@ -138,6 +138,8 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      # Accept client-provided prompt_token_ids for routing (bypasses local tokenization)
+      - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
       # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator

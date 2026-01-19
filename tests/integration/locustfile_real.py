@@ -55,6 +55,13 @@ Environment Variables:
         LARGE_PREFIX_MAX_TOKENS - Maximum prefix size (default: 8000)
         NUM_LARGE_PREFIXES      - Number of unique prefixes to generate (default: 5)
 
+    Client-Side Tokenization:
+        CLIENT_TOKENIZE         - Enable client-side tokenization (default: false)
+                                  When enabled, the benchmark pre-tokenizes prompts and sends
+                                  prompt_token_ids in requests. This bypasses ranvier's tokenization.
+        TOKENIZER_PATH          - Path to tokenizer JSON file (default: assets/gpt2.json)
+                                  If file doesn't exist, falls back to loading from VLLM_MODEL
+
 Usage:
     # 8 backends on same host with sequential ports (simplest for multi-GPU):
     NUM_BACKENDS=8 BACKEND_BASE_IP=172.17.0.1 BACKEND_PORT_START=8000 \
@@ -118,6 +125,68 @@ from threading import Lock
 import requests
 from locust import HttpUser, task, between, events
 from locust.runners import MasterRunner, WorkerRunner
+
+# Optional: tokenizers library for client-side tokenization
+# Install with: pip install tokenizers
+_tokenizer = None
+_client_tokenize_enabled = False
+
+def _init_client_tokenizer():
+    """Initialize client-side tokenizer if CLIENT_TOKENIZE is enabled."""
+    global _tokenizer, _client_tokenize_enabled
+
+    client_tokenize = os.environ.get("CLIENT_TOKENIZE", "false").lower() in ("true", "1", "yes")
+    if not client_tokenize:
+        return False
+
+    try:
+        from tokenizers import Tokenizer
+        tokenizer_path = os.environ.get("TOKENIZER_PATH", "assets/gpt2.json")
+
+        # Try to load from file
+        if os.path.exists(tokenizer_path):
+            _tokenizer = Tokenizer.from_file(tokenizer_path)
+            logger.info(f"Client tokenizer loaded from: {tokenizer_path}")
+        else:
+            # Try to load from HuggingFace model name
+            model_name = os.environ.get("VLLM_MODEL", "gpt2")
+            _tokenizer = Tokenizer.from_pretrained(model_name)
+            logger.info(f"Client tokenizer loaded from model: {model_name}")
+
+        _client_tokenize_enabled = True
+        return True
+    except ImportError:
+        logger.warning("CLIENT_TOKENIZE=true but 'tokenizers' package not installed. "
+                      "Install with: pip install tokenizers")
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to initialize client tokenizer: {e}")
+        return False
+
+def tokenize_messages(messages: List[dict]) -> Optional[List[int]]:
+    """Tokenize chat messages and return token IDs.
+
+    Returns None if client tokenization is disabled or fails.
+    """
+    if not _client_tokenize_enabled or _tokenizer is None:
+        return None
+
+    try:
+        # Convert messages to a single string (chat template style)
+        # This matches how vLLM/HuggingFace typically process chat messages
+        text_parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            text_parts.append(f"<|{role}|>\n{content}")
+        text = "\n".join(text_parts)
+
+        # Tokenize
+        encoding = _tokenizer.encode(text)
+        return encoding.ids
+    except Exception as e:
+        logger.debug(f"Client tokenization failed: {e}")
+        return None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -2738,6 +2807,18 @@ def on_test_start(environment, **kwargs):
 
     logger.info("=" * 70)
 
+    # Initialize client-side tokenizer if enabled
+    # This allows bypassing ranvier's tokenization for benchmarking
+    if _init_client_tokenizer():
+        logger.info("Client-side tokenization ENABLED - requests will include prompt_token_ids")
+        logger.info("  Ranvier will use client tokens for routing (bypasses local tokenization)")
+    else:
+        client_tokenize = os.environ.get("CLIENT_TOKENIZE", "false").lower() in ("true", "1", "yes")
+        if client_tokenize:
+            logger.warning("Client-side tokenization requested but failed to initialize")
+        else:
+            logger.info("Client-side tokenization DISABLED - ranvier will tokenize locally")
+
     # Pre-initialize large prefixes if using stress modes
     if dist in ["large_prefix", "stress"]:
         logger.info("Pre-generating large prefixes for stress testing...")
@@ -2926,6 +3007,13 @@ class RealBackendUser(HttpUser):
             "stream": True,
             "max_tokens": 100,  # Limit output for benchmarking
         }
+
+        # Add prompt_token_ids if client-side tokenization is enabled
+        # This bypasses ranvier's tokenization - ranvier will use these tokens for routing
+        # and forward them to vLLM (which also skips tokenization when prompt_token_ids is present)
+        token_ids = tokenize_messages(messages)
+        if token_ids is not None:
+            request_body["prompt_token_ids"] = token_ids
 
         # Initialize metrics
         metrics = RequestMetrics(
