@@ -741,9 +741,13 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
 
                 futures.push_back(
                     seastar::smp::submit_to(shard_id, [callback, foreign = std::move(foreign), b_id] () mutable {
-                        // Move content out of foreign_ptr on target shard
-                        auto tokens = std::move(*foreign);
-                        return callback(std::move(tokens), b_id);
+                        // CRITICAL: Force local allocation on THIS shard.
+                        // foreign_ptr allows safe cross-shard access, but the vector's
+                        // heap data is still on the source shard. We must copy to a
+                        // locally-allocated vector before the foreign_ptr goes out of
+                        // scope, otherwise freeing cross-shard memory causes SIGSEGV.
+                        auto local_tokens = std::vector<TokenId>(foreign->begin(), foreign->end());
+                        return callback(std::move(local_tokens), b_id);
                     })
                 );
             }
