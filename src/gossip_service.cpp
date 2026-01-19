@@ -713,22 +713,43 @@ seastar::future<> GossipService::handle_packet(seastar::net::udp_datagram&& dgra
     }
 
     if (_route_learn_callback) {
-        auto shared_tokens = std::make_shared<std::vector<TokenId>>(std::move(pkt->tokens));
+        // IMPORTANT: Seastar's share-nothing model prohibits cross-shard memory access.
+        // Even moving a std::vector across shards is unsafe because the heap data
+        // pointer still points to the source shard's memory.
+        //
+        // Solution: Use foreign_ptr to wrap each shard's copy. The foreign_ptr
+        // allows safe cross-shard ownership transfer, and we move the content
+        // out on the target shard (similar to CrossShardDispatcher pattern).
+        auto& tokens = pkt->tokens;
         auto b_id = pkt->backend_id;
-        // Copy the callback to avoid cross-shard memory access.
-        // The callback captures RouterService 'this', but learn_route_remote()
-        // only accesses thread_local data, making it safe to call from any shard.
         auto callback = _route_learn_callback;
+        auto local_shard = seastar::this_shard_id();
 
-        // Use an integer range from 0 to seastar::smp::count
-        auto learn_future = seastar::parallel_for_each(
-                boost::irange<unsigned>(0, seastar::smp::count),
-                [callback, shared_tokens, b_id](unsigned shard_id) {
-                return seastar::smp::submit_to(shard_id, [callback, shared_tokens, b_id] {
-                        return callback(*shared_tokens, b_id);
-                        });
-                });
+        // Build futures for all shards
+        std::vector<seastar::future<>> futures;
+        futures.reserve(seastar::smp::count);
 
+        for (unsigned shard_id = 0; shard_id < seastar::smp::count; ++shard_id) {
+            if (shard_id == local_shard) {
+                // Local shard: copy and call directly (no cross-shard issues)
+                auto local_tokens = tokens;  // Copy
+                futures.push_back(callback(std::move(local_tokens), b_id));
+            } else {
+                // Remote shard: wrap in foreign_ptr for safe transfer
+                auto tokens_ptr = std::make_unique<std::vector<TokenId>>(tokens);  // Copy
+                auto foreign = seastar::make_foreign(std::move(tokens_ptr));
+
+                futures.push_back(
+                    seastar::smp::submit_to(shard_id, [callback, foreign = std::move(foreign), b_id] () mutable {
+                        // Move content out of foreign_ptr on target shard
+                        auto tokens = std::move(*foreign);
+                        return callback(std::move(tokens), b_id);
+                    })
+                );
+            }
+        }
+
+        auto learn_future = seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
         return seastar::when_all_succeed(std::move(ack_future), std::move(learn_future)).discard_result();
     }
 
