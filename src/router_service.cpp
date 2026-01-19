@@ -944,7 +944,13 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // Broadcast to all local shards with LOCAL origin
     auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [backend, tokens = shared_tokens] {
+            return seastar::smp::submit_to(shard_id, [backend, &shared_tokens] {
+                // IMPORTANT: Force a fresh allocation on this shard.
+                // shared_tokens is held by do_with on shard 0. If we captured it by value,
+                // the copy's heap would be allocated on shard 0, violating Seastar's
+                // shared-nothing model and causing crashes on free.
+                std::vector<int32_t> tokens(shared_tokens.begin(), shared_tokens.end());
+
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
                 RadixTree* tree = state.tree.get();
@@ -1092,15 +1098,16 @@ seastar::future<> RouterService::flush_route_batch() {
 
     // Send ONE message per shard containing the entire batch.
     //
-    // PERFORMANCE NOTE: Each shard receives a COPY of the batch. This is required by
-    // Seastar's shared-nothing architecture - smp::submit_to serializes data to send
-    // it across cores. While this means O(shards) copies of the batch, the key win is
-    // reducing SMP message count from O(routes × shards) to O(shards). With 1000 routes/sec
-    // and 64 shards, this reduces messages from 64,000/sec to ~640/sec (at 100 routes/batch).
+    // PERFORMANCE NOTE: Each shard receives a COPY of the batch. The copy MUST happen
+    // inside the lambda (on the target shard) to satisfy Seastar's shared-nothing model.
+    // If we captured by value, the heap would be allocated on shard 0, and freeing it
+    // on other shards would crash with "invalid pointer".
     return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& shared_batch) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [&shared_batch](unsigned shard_id) {
-                return seastar::smp::submit_to(shard_id, [batch = shared_batch] {
+                return seastar::smp::submit_to(shard_id, [&shared_batch] {
+                    // Force fresh allocation on this shard
+                    std::vector<PendingRemoteRoute> batch(shared_batch.begin(), shared_batch.end());
                     apply_route_batch_to_local_tree(batch);
                     return seastar::make_ready_future<>();
                 });
