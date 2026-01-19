@@ -124,10 +124,11 @@ if(Seastar_FOUND)
     message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
 
     # Tokenizers-CPP Configuration (Downloads it automatically)
+    # Pinned to v0.1.1 to avoid tokenizers 0.21.4 NormalizedString::slice crash
     FetchContent_Declare(
       tokenizers_cpp
       GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp
-      GIT_TAG        main
+      GIT_TAG        v0.1.1
     )
     FetchContent_MakeAvailable(tokenizers_cpp)
 
