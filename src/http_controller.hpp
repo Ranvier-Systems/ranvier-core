@@ -68,6 +68,7 @@ struct ProxyContext {
     std::string request_id;
     std::string backend_traceparent;
     std::string routing_mode;
+    std::string endpoint;  // API endpoint path (e.g., "/v1/chat/completions" or "/v1/completions")
 
     // Request body and tokens
     std::string forwarded_body;
@@ -260,7 +261,10 @@ private:
     uint32_t select_target_shard();
 
     // Helper handlers
-    seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(
+        std::unique_ptr<seastar::http::request> req,
+        std::unique_ptr<seastar::http::reply> rep,
+        std::string_view endpoint = "/v1/chat/completions");
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_broadcast_route(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
