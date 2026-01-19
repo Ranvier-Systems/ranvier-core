@@ -737,7 +737,7 @@ coredumpctl debug <pid>  # Opens in gdb
 
 3. **Use client-side tokenization** (bypasses ranvier tokenization entirely):
    ```bash
-   CLIENT_TOKENIZE=true ./scripts/bench.sh --duration 10m --users 30
+   ./scripts/bench.sh --client-tokenize --duration 10m --users 30
    ```
    See "Client-Side Tokenization" section below.
 
@@ -755,21 +755,28 @@ The benchmark supports client-side tokenization, which pre-tokenizes prompts in 
 
 ### Configuration
 
+**Option 1: CLI flag (recommended)**
 ```bash
-# Enable client-side tokenization
-export CLIENT_TOKENIZE=true
+./scripts/bench.sh --client-tokenize --duration 10m --users 30
+```
 
-# Optional: specify tokenizer path (default: assets/gpt2.json)
+**Option 2: Environment variable**
+```bash
+CLIENT_TOKENIZE=true ./scripts/bench.sh --duration 10m --users 30
+```
+
+**Optional: Specify tokenizer path** (default: assets/gpt2.json or downloads from model)
+```bash
 export TOKENIZER_PATH=/path/to/tokenizer.json
-
-# Run benchmark
-./scripts/bench.sh --duration 10m --users 30
+./scripts/bench.sh --client-tokenize --duration 10m
 ```
 
 ### Requirements
 
-1. **Install tokenizers package:**
+1. **Install tokenizers package** (automatically installed by `--setup`):
    ```bash
+   ./scripts/bench.sh --setup   # Installs tokenizers automatically
+   # Or manually:
    pip install tokenizers
    ```
 
@@ -795,11 +802,11 @@ When `CLIENT_TOKENIZE=true`:
 ### Comparing Both Paths
 
 ```bash
-# Test with ranvier tokenization
-CLIENT_TOKENIZE=false ./scripts/bench.sh --duration 5m --users 30
+# Test with ranvier tokenization (default)
+./scripts/bench.sh --duration 5m --users 30
 
 # Test with client tokenization (bypasses ranvier tokenizer)
-CLIENT_TOKENIZE=true ./scripts/bench.sh --duration 5m --users 30
+./scripts/bench.sh --client-tokenize --duration 5m --users 30
 ```
 
 ---
