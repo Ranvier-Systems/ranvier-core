@@ -538,35 +538,22 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
 
     if (_route_learn_callback) {
         // Cross-shard dispatch with proper memory handling (Rule #14)
-        auto& tokens = pkt->tokens;
+        // Use shared_ptr to safely share token data across shards, then force local
+        // allocation on each shard to avoid cross-shard heap access
+        auto tokens_shared = std::make_shared<std::vector<TokenId>>(pkt->tokens);
         auto b_id = pkt->backend_id;
         auto callback = _route_learn_callback;
-        auto local_shard = seastar::this_shard_id();
 
-        std::vector<seastar::future<>> futures;
-        futures.reserve(seastar::smp::count);
+        auto learn_future = seastar::parallel_for_each(
+            boost::irange<unsigned>(0, seastar::smp::count),
+            [callback, tokens_shared, b_id](unsigned shard_id) {
+                return seastar::smp::submit_to(shard_id, [callback, tokens_shared, b_id] {
+                    // Force local allocation on THIS shard (Rule #14)
+                    auto local_tokens = std::vector<TokenId>(tokens_shared->begin(), tokens_shared->end());
+                    return callback(std::move(local_tokens), b_id);
+                });
+            });
 
-        for (unsigned shard_id = 0; shard_id < seastar::smp::count; ++shard_id) {
-            if (shard_id == local_shard) {
-                // Local shard: copy and call directly
-                auto local_tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
-                futures.push_back(callback(std::move(local_tokens), b_id));
-            } else {
-                // Remote shard: use foreign_ptr for safe transfer
-                auto tokens_ptr = std::make_unique<std::vector<TokenId>>(tokens);
-                auto foreign = seastar::make_foreign(std::move(tokens_ptr));
-
-                futures.push_back(
-                    seastar::smp::submit_to(shard_id, [callback, foreign = std::move(foreign), b_id] () mutable {
-                        // Force local allocation on THIS shard (Rule #14)
-                        auto local_tokens = std::vector<TokenId>(foreign->begin(), foreign->end());
-                        return callback(std::move(local_tokens), b_id);
-                    })
-                );
-            }
-        }
-
-        auto learn_future = seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
         return seastar::when_all_succeed(std::move(ack_future), std::move(learn_future)).discard_result();
     }
 

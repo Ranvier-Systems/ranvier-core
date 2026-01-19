@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include <boost/range/irange.hpp>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
 
 namespace ranvier {
