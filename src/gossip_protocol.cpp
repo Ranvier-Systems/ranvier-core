@@ -234,8 +234,10 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
 
         // Set up periodic discovery refresh with RAII timer safety
         _discovery_timer.set_callback([this] {
+            // RAII Timer Safety: Holder must outlive the work
+            seastar::gate::holder timer_holder;
             try {
-                [[maybe_unused]] auto timer_holder = _transport->timer_gate().hold();
+                timer_holder = _transport->timer_gate().hold();
             } catch (const seastar::gate_closed_exception&) {
                 return;
             }
@@ -291,7 +293,7 @@ seastar::future<> GossipProtocol::stop() {
 }
 
 seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
-    if (!_config.enabled || !_transport || !_transport->is_ready() || _peer_addresses->empty()) {
+    if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
         return seastar::make_ready_future<>();
     }
 
@@ -366,7 +368,7 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
 }
 
 seastar::future<> GossipProtocol::broadcast_node_state(NodeState state, BackendId local_backend_id) {
-    if (!_config.enabled || !_transport || !_transport->is_ready() || _peer_addresses->empty()) {
+    if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
         return seastar::make_ready_future<>();
     }
 
@@ -386,14 +388,17 @@ seastar::future<> GossipProtocol::broadcast_node_state(NodeState state, BackendI
 }
 
 seastar::future<> GossipProtocol::broadcast_heartbeat() {
-    // RAII Timer Safety
+    // RAII Timer Safety: Holder must outlive the work
+    seastar::gate::holder timer_holder;
     try {
-        [[maybe_unused]] auto timer_holder = _transport->timer_gate().hold();
+        if (_transport) {
+            timer_holder = _transport->timer_gate().hold();
+        }
     } catch (const seastar::gate_closed_exception&) {
         return seastar::make_ready_future<>();
     }
 
-    if (!_transport || !_transport->is_ready() || _peer_addresses->empty()) {
+    if (!_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
         return seastar::make_ready_future<>();
     }
 
@@ -409,6 +414,10 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
     auto src_addr = dgram.get_src();
 
     // Verify source is a known peer
+    if (!_peer_addresses) {
+        ++_packets_untrusted;
+        return seastar::make_ready_future<>();
+    }
     auto it = std::find(_peer_addresses->begin(), _peer_addresses->end(), src_addr);
     if (it == _peer_addresses->end()) {
         ++_packets_untrusted;
@@ -753,9 +762,12 @@ bool GossipProtocol::is_duplicate(const seastar::socket_address& peer, uint32_t 
 }
 
 void GossipProtocol::process_retries() {
-    // RAII Timer Safety
+    // RAII Timer Safety: Holder must outlive the work
+    seastar::gate::holder timer_holder;
     try {
-        [[maybe_unused]] auto timer_holder = _transport->timer_gate().hold();
+        if (_transport) {
+            timer_holder = _transport->timer_gate().hold();
+        }
     } catch (const seastar::gate_closed_exception&) {
         return;
     }

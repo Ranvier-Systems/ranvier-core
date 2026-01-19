@@ -103,8 +103,10 @@ seastar::future<> GossipTransport::initialize_dtls() {
         log_gossip_transport().info("Certificate hot-reload enabled: interval={}s",
                                     _config.tls.cert_reload_interval.count());
         _cert_reload_timer.set_callback([this] {
+            // RAII Timer Safety: Holder must outlive the work
+            seastar::gate::holder timer_holder;
             try {
-                [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+                timer_holder = _timer_gate.hold();
             } catch (const seastar::gate_closed_exception&) {
                 return;
             }
@@ -491,8 +493,10 @@ seastar::future<std::vector<uint8_t>> GossipTransport::encrypt_with_offloading(
 }
 
 void GossipTransport::cleanup_dtls_sessions() {
+    // RAII Timer Safety: Holder must outlive the work
+    seastar::gate::holder timer_holder;
     try {
-        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+        timer_holder = _timer_gate.hold();
     } catch (const seastar::gate_closed_exception&) {
         return;
     }

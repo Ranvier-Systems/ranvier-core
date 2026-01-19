@@ -57,8 +57,10 @@ seastar::future<> GossipConsensus::start(const std::vector<seastar::socket_addre
     // Set up liveness check timer with RAII timer safety
     _liveness_timer.set_callback([this] {
         // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+        // The holder must outlive the work, so declare outside try block.
+        seastar::gate::holder timer_holder;
         try {
-            [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+            timer_holder = _timer_gate.hold();
         } catch (const seastar::gate_closed_exception&) {
             return;
         }
@@ -125,6 +127,11 @@ void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
                     return seastar::smp::submit_to(shard_id, [callback, b_id] {
                         return callback(b_id);
                     });
+                }).handle_exception([b_id](auto ep) {
+                    try { std::rethrow_exception(ep); }
+                    catch (const std::exception& e) {
+                        log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
+                    }
                 });
         }
         _peer_table.erase(it);
@@ -169,6 +176,11 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
                         return seastar::smp::submit_to(shard_id, [callback, b_id] {
                             return callback(b_id);
                         });
+                    }).handle_exception([b_id](auto ep) {
+                        try { std::rethrow_exception(ep); }
+                        catch (const std::exception& e) {
+                            log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
+                        }
                     });
             }
         }
@@ -219,6 +231,11 @@ void GossipConsensus::check_liveness() {
                         return seastar::smp::submit_to(shard_id, [callback, b_id] {
                             return callback(b_id);
                         });
+                    }).handle_exception([b_id](auto ep) {
+                        try { std::rethrow_exception(ep); }
+                        catch (const std::exception& e) {
+                            log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
+                        }
                     });
             }
         }
