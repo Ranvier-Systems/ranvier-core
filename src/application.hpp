@@ -158,8 +158,12 @@ private:
 
     // --- Services (owned by Application) ---
 
-    // Infrastructure layer
-    TokenizerService _tokenizer;
+    // Infrastructure layer - sharded for thread safety
+    // Each shard has its own TokenizerService instance because tokenizers-cpp
+    // is NOT thread-safe for concurrent Encode() calls on the same instance
+    seastar::sharded<TokenizerService> _tokenizer;
+    bool _tokenizer_started = false;
+    std::string _tokenizer_json;  // Cached JSON for loading on each shard
 
     // Domain layer
     std::unique_ptr<RouterService> _router;

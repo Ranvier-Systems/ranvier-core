@@ -67,10 +67,23 @@ seastar::future<> Application::init_tokenizer() {
                     throw std::runtime_error("Failed to read data from tokenizer: " + path);
                 }
 
-                // Final hand-off to the service
-                _tokenizer.load_from_json(std::string(buf.get(), buf.size()));
-                log_main.info("Tokenizer loaded: {} bytes", buf.size());
-                return seastar::make_ready_future<>();
+                // Cache JSON for loading on each shard
+                _tokenizer_json = std::string(buf.get(), buf.size());
+                log_main.info("Tokenizer JSON loaded: {} bytes", _tokenizer_json.size());
+
+                // Start sharded tokenizer service (one instance per core for thread safety)
+                return _tokenizer.start().then([this] {
+                    _tokenizer_started = true;
+                    // Load tokenizer on each shard from cached JSON
+                    return _tokenizer.invoke_on_all([this](TokenizerService& t) {
+                        t.load_from_json(_tokenizer_json);
+                    });
+                }).then([this] {
+                    log_main.info("Tokenizer initialized on {} shards", seastar::smp::count);
+                    // Clear cached JSON to free memory (each shard has its own copy now)
+                    _tokenizer_json.clear();
+                    _tokenizer_json.shrink_to_fit();
+                });
             });
         }).finally([f]() mutable {
             return f.close();
@@ -893,6 +906,17 @@ seastar::future<> Application::stop_services() {
             }
             return _load_balancer.stop().then([] {
                 log_main.debug("  Shard load balancer stopped");
+            });
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 4b: Stop sharded tokenizer service
+            // -------------------------------------------------------------------------
+            if (!_tokenizer_started) {
+                return seastar::make_ready_future<>();
+            }
+            return _tokenizer.stop().then([] {
+                log_main.debug("  TokenizerService stopped on all shards");
             });
         })
         .then([this] {
