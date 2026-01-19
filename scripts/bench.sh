@@ -167,6 +167,7 @@ BENCHMARK OPTIONS:
     --compare           Run A/B comparison (prefix vs round-robin)
     --warmup            Run a short warm-up before the main benchmark
     --output-dir DIR    Custom output directory (default: benchmark-reports)
+    --client-tokenize   Tokenize on client (locust) instead of Ranvier server
 
 EXTERNAL VLLM OPTIONS:
     --skip-vllm             Don't start vLLM (use existing endpoints)
@@ -313,6 +314,7 @@ DRY_RUN=false
 SETUP_ONLY=false
 WARMUP=false
 LOG_ALL=false
+CLIENT_TOKENIZE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -334,6 +336,7 @@ while [[ $# -gt 0 ]]; do
         --setup)          SETUP_ONLY=true; shift ;;
         --warmup)         WARMUP=true; shift ;;
         --log-all)        LOG_ALL=true; shift ;;
+        --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -523,7 +526,7 @@ if [[ "$SETUP_ONLY" = true ]]; then
             PIP="pip"
         else
             log_warn "pip not found - skipping vLLM installation"
-            log_info "Install manually: pip install vllm 'numpy<2'"
+            log_info "Install manually: pip install vllm 'numpy<2' tokenizers"
             PIP=""
         fi
         if [[ -n "$PIP" ]]; then
@@ -533,6 +536,18 @@ if [[ "$SETUP_ONLY" = true ]]; then
         fi
     else
         log_ok "vLLM already installed"
+    fi
+
+    # Install tokenizers (for client-side tokenization option)
+    if ! python3 -c "import tokenizers" 2>/dev/null; then
+        log_info "Installing tokenizers (for client-side tokenization)..."
+        if [[ -n "${PIP:-}" ]] || command -v pip3 &> /dev/null; then
+            PIP="${PIP:-pip3}"
+            $PIP install tokenizers 2>&1 | tail -2
+            log_ok "tokenizers installed"
+        fi
+    else
+        log_ok "tokenizers already installed"
     fi
 
     # Pre-build Docker images
@@ -637,6 +652,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Compare Mode:    $COMPARE"
     echo "  Warmup:          $WARMUP"
     echo "  Log All:         $LOG_ALL"
+    echo "  Client Tokenize: $CLIENT_TOKENIZE"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -975,6 +991,10 @@ run_benchmark() {
         BACKEND_ARGS+=" -e BACKEND${i}_IP=$HOST -e BACKEND${i}_PORT=$PORT"
     done
 
+    # Convert CLIENT_TOKENIZE bash boolean to env var value
+    CLIENT_TOKENIZE_VAL="false"
+    [[ "$CLIENT_TOKENIZE" = true ]] && CLIENT_TOKENIZE_VAL="true"
+
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
@@ -985,6 +1005,7 @@ run_benchmark() {
         -e RANVIER_ROUTING_MODE="$ROUTING_MODE" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
+        -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         $BACKEND_ARGS \
         locust \
         --headless \
@@ -1039,6 +1060,10 @@ if [[ "$WARMUP" = true ]]; then
         BACKEND_ARGS+=" -e BACKEND${i}_IP=$HOST -e BACKEND${i}_PORT=$PORT"
     done
 
+    # Convert CLIENT_TOKENIZE bash boolean to env var value
+    CLIENT_TOKENIZE_VAL="false"
+    [[ "$CLIENT_TOKENIZE" = true ]] && CLIENT_TOKENIZE_VAL="true"
+
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1047,6 +1072,7 @@ if [[ "$WARMUP" = true ]]; then
         -e RANVIER_ROUTING_MODE="prefix" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
+        -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         $BACKEND_ARGS \
         locust \
         --headless \
