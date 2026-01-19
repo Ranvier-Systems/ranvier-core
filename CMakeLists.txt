@@ -210,6 +210,17 @@ target_link_libraries(radix_tree_test
 )
 gtest_discover_tests(radix_tree_test)
 
+# TextValidator Unit Tests (Pure C++, header-only)
+add_executable(text_validator_test
+  tests/unit/text_validator_test.cpp
+)
+target_include_directories(text_validator_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(text_validator_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(text_validator_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
