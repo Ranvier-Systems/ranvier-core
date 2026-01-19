@@ -714,6 +714,94 @@ coredumpctl debug <pid>  # Opens in gdb
 2. **Memory exhaustion:** Reduce `--users` or use smaller model
 3. **Tokenizer issues:** Check HF_TOKEN is valid and model is accessible
 
+### Problem: Tokenizer Crashes with --smp > 1
+
+**Symptoms:** Ranvier crashes in the tokenizer (Rust FFI) when running with multiple shards (`--smp 2` or higher).
+
+**Why this happens:** The tokenizers-cpp library (Rust FFI) has global state that conflicts with Seastar's per-shard memory allocator. This is a known incompatibility.
+
+**Solutions:**
+
+1. **Use `--disable-memory-allocator`** (recommended):
+   ```yaml
+   # In docker-compose.benchmark-real.yml
+   command: ["./ranvier_server", "--smp", "2", "--disable-memory-allocator"]
+   ```
+   This uses standard malloc instead of Seastar's per-shard allocator, allowing Rust FFI to work correctly.
+
+2. **Use `--smp 1`** and scale horizontally:
+   ```yaml
+   command: ["./ranvier_server", "--smp", "1", "--memory", "1G"]
+   ```
+   Run more containers with 1 shard each instead of fewer with multiple shards.
+
+3. **Use client-side tokenization** (bypasses ranvier tokenization entirely):
+   ```bash
+   CLIENT_TOKENIZE=true ./scripts/bench.sh --duration 10m --users 30
+   ```
+   See "Client-Side Tokenization" section below.
+
+---
+
+## Client-Side Tokenization
+
+The benchmark supports client-side tokenization, which pre-tokenizes prompts in the locust client and sends `prompt_token_ids` in requests. This bypasses ranvier's local tokenization.
+
+### When to Use
+
+- **Tokenizer crashes:** If ranvier crashes during tokenization with `--smp > 1`
+- **Performance isolation:** To benchmark routing/proxy performance without tokenization overhead
+- **Production architecture:** When clients already have tokens (e.g., from a separate tokenizer service)
+
+### Configuration
+
+```bash
+# Enable client-side tokenization
+export CLIENT_TOKENIZE=true
+
+# Optional: specify tokenizer path (default: assets/gpt2.json)
+export TOKENIZER_PATH=/path/to/tokenizer.json
+
+# Run benchmark
+./scripts/bench.sh --duration 10m --users 30
+```
+
+### Requirements
+
+1. **Install tokenizers package:**
+   ```bash
+   pip install tokenizers
+   ```
+
+2. **Ensure ranvier accepts client tokens** (enabled by default in benchmark config):
+   ```yaml
+   environment:
+     - RANVIER_ACCEPT_CLIENT_TOKENS=1
+   ```
+
+### What Happens
+
+| CLIENT_TOKENIZE | Ranvier Tokenizes | Client Tokenizes | Notes |
+|-----------------|-------------------|------------------|-------|
+| false (default) | Yes | No | Standard behavior |
+| true | No | Yes | Bypasses ranvier tokenization |
+
+When `CLIENT_TOKENIZE=true`:
+1. Locust pre-tokenizes prompts using Python `tokenizers` library
+2. Sends `prompt_token_ids` in request body
+3. Ranvier extracts tokens for routing (no local tokenization)
+4. Ranvier forwards tokens to vLLM (vLLM also skips tokenization)
+
+### Comparing Both Paths
+
+```bash
+# Test with ranvier tokenization
+CLIENT_TOKENIZE=false ./scripts/bench.sh --duration 5m --users 30
+
+# Test with client tokenization (bypasses ranvier tokenizer)
+CLIENT_TOKENIZE=true ./scripts/bench.sh --duration 5m --users 30
+```
+
 ---
 
 ## Recommended Test Sequence
