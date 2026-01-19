@@ -2,9 +2,9 @@
 2. Context: We recently identified issues in our Adversarial Audit or implementation review.
 
 Build Constraints:
-1. **Static Analysis Only:** Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. **API Verification:** Verify syntax against Seastar documentation logic.
-3. **Manual Verification:** I will build in my Docker container and provide logs if it fails.
+1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
+2. API Verification: Verify syntax against Seastar documentation logic.
+3. Manual Verification: I will build in my Docker container and provide logs if it fails.
 
 ---
 
