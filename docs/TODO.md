@@ -914,7 +914,7 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
 
 | Domain | Grade | Rationale |
 |--------|-------|-----------|
-| **Architecture** | **B+** | Clean separation of concerns, Seastar-native design, proper ART implementation. Deduction: GossipService sprawl (2,161 LOC). |
+| **Architecture** | **A-** | Clean separation of concerns, Seastar-native design, proper ART implementation. GossipService refactored into focused modules (2026-01-19). |
 | **Reliability** | **B** | Security audit score 0/10 (resolved), 57+ Hard Rule references. Deduction: Massive integration test gap (Section 6). |
 | **Progress-to-Goal** | **A-** | Prefix Caching IS the core, not an aspiration. RadixTree fully implemented with path compression, SIMD-ready nodes, slab allocator. |
 
@@ -938,19 +938,17 @@ Critical routing path: `route_request() → get_backend_for_prefix() → tree->l
 
 ### 8.2 Complexity vs. Value Audit
 
-**The Sprawling Module:** `gossip_service.cpp` (2,161 LOC)
+**The Sprawling Module:** `gossip_service.cpp` — **RESOLVED (2026-01-19)**
 
-| Sub-System | LOC (Est.) | Value |
-|------------|------------|-------|
-| UDP Gossip Core | ~400 | Essential |
-| DTLS Encryption | ~500 | Essential |
-| Split-Brain Detection | ~300 | Essential |
-| Reliable Delivery | ~350 | High |
-| DNS Discovery | ~250 | Medium |
-| Quorum Enforcement | ~200 | High |
-| Metrics (27 counters) | ~160 | **Low — Over-instrumented** |
+Original (2,161 LOC) refactored into:
+| Module | LOC | Responsibility |
+|--------|-----|----------------|
+| `gossip_service.cpp` | ~350 | Thin orchestrator, metrics registration |
+| `gossip_consensus.cpp` | ~430 | Peer table, quorum, split-brain detection |
+| `gossip_transport.cpp` | ~540 | UDP channel, DTLS encryption, crypto offloading |
+| `gossip_protocol.cpp` | ~870 | Message handling, reliable delivery, DNS discovery |
 
-**Verdict:** Necessary complexity, but approaching maintainability limit. Route batching is NOT over-engineered (99% SMP traffic reduction).
+**Verdict:** Complexity now properly separated. Each module can be tested and reasoned about independently. Route batching is NOT over-engineered (99% SMP traffic reduction).
 
 ### 8.3 Load-Bearing Files (Blast Radius)
 
@@ -970,7 +968,7 @@ Critical routing path: `route_request() → get_backend_for_prefix() → tree->l
 |----------|--------|----------------|--------|
 | **P0** | Create `test_prefix_routing.py` | No E2E prefix validation | Medium |
 | **P0** | Create `test_graceful_shutdown.py` | Untested shutdown path | Medium |
-| **P1** | Extract `GossipConsensus` class from gossip_service.cpp | Maintainability (2,161 LOC sprawl) | High |
+| **P1** | ~~Extract `GossipConsensus` class from gossip_service.cpp~~ | ~~Maintainability (2,161 LOC sprawl)~~ | ~~High~~ ✅ |
 | **P1** | Reduce gossip metrics from 27 to ~15 | Scrape overhead, debugging artifacts | Low |
 | **P2** | Create `test_persistence_recovery.py` | Data durability | Medium |
 | **P2** | Document RadixTree Hard Rules inline | Knowledge preservation | Low |
@@ -986,16 +984,17 @@ Move these to `DEBUG_METRICS` compile flag:
 - `cluster_dtls_cert_reloads`
 - `cluster_crypto_handshakes_offloaded`
 
-**ONE THING TO REFACTOR:** GossipService state machine extraction
+**ONE THING TO REFACTOR:** ~~GossipService state machine extraction~~ ✅ **DONE (2026-01-19)**
 
 ```
 gossip_service.cpp (2,161 LOC) →
-  ├── gossip_transport.cpp   (~500 LOC) - UDP + DTLS
-  ├── gossip_protocol.cpp    (~800 LOC) - Message handling
-  └── gossip_consensus.cpp   (~500 LOC) - Quorum, split-brain
+  ├── gossip_service.cpp     (~350 LOC) - Thin orchestrator ✓
+  ├── gossip_transport.cpp   (~540 LOC) - UDP + DTLS ✓
+  ├── gossip_protocol.cpp    (~870 LOC) - Message handling ✓
+  └── gossip_consensus.cpp   (~430 LOC) - Quorum, split-brain ✓
 ```
 
-This reduces cognitive load and enables independent testing of quorum logic.
+Refactoring completed with Rule #14 compliant cross-shard dispatch and robustness fixes.
 
 ### 8.6 Action Items (Tracking)
 
@@ -1011,11 +1010,12 @@ This reduces cognitive load and enables independent testing of quorum logic.
   _Files:_ `tests/integration/test_graceful_shutdown.py` (new)
   _Complexity:_ Medium
 
-- [ ] **[P1] Extract GossipConsensus class from gossip_service.cpp**
+- [x] **[P1] Extract GossipConsensus class from gossip_service.cpp** ✓
   _Description:_ Refactor gossip_service.cpp (2,161 LOC) into three focused modules: `gossip_transport.cpp` (UDP/DTLS), `gossip_protocol.cpp` (message handling), `gossip_consensus.cpp` (quorum, split-brain).
   _Rationale:_ Sprawling module exceeds maintainability threshold. Mixed concerns make unit testing quorum logic difficult.
   _Files:_ `src/gossip_service.cpp` (split), `src/gossip_transport.cpp` (new), `src/gossip_protocol.cpp` (new), `src/gossip_consensus.cpp` (new)
   _Complexity:_ High
+  _Completed:_ 2026-01-19. GossipService reduced to thin orchestrator (~350 LOC). Three extracted modules: GossipConsensus (quorum/peer liveness, ~430 LOC), GossipTransport (UDP/DTLS, ~540 LOC), GossipProtocol (message handling/reliability, ~870 LOC). All 27 Prometheus metrics preserved. Rule #14 compliant cross-shard token dispatch using `seastar::do_with`. Added robustness fixes: proper gate holder scoping, exception handling for fire-and-forget futures, defensive null checks.
 
 - [ ] **[P1] Consolidate gossip debug metrics behind compile flag**
   _Description:_ Move 8 debugging-oriented gossip metrics behind `RANVIER_DEBUG_METRICS` compile flag. Keep ~15 operationally-relevant metrics always enabled.
@@ -1075,6 +1075,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-19 | **[Refactor]** Extract GossipService into three focused modules: GossipConsensus (~430 LOC), GossipTransport (~540 LOC), GossipProtocol (~870 LOC). Thin orchestrator (~350 LOC). Rule #14 compliant cross-shard dispatch. Robustness fixes for gate holder scoping and exception handling. | - |
 | 2026-01-16 | **[Security Audit 7.0]** Add circuit entry cleanup when backends are deregistered (remove_circuit method, shard-local callback, Prometheus metric) | - |
 | 2026-01-15 | **[Fix]** Use async I/O for config hot-reload to prevent reactor stalls (Rule #12), add 10s rate limiting | - |
 | 2026-01-15 | **[Feature]** Add automatic cleanup timer to RateLimiter (Rule #5 gate guard pattern) | #158 |
