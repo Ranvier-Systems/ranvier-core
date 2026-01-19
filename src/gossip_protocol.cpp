@@ -10,6 +10,7 @@
 
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/do_with.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
@@ -538,20 +539,30 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
 
     if (_route_learn_callback) {
         // Cross-shard dispatch with proper memory handling (Rule #14)
-        // Use shared_ptr to safely share token data across shards, then force local
-        // allocation on each shard to avoid cross-shard heap access
-        auto tokens_shared = std::make_shared<std::vector<TokenId>>(pkt->tokens);
+        // CRITICAL: Cannot use std::shared_ptr across shards - the destructor would run
+        // on the wrong shard when the last copy is destroyed, causing SIGSEGV.
+        // Instead, use seastar::do_with to keep the vector alive on shard 0, and pass
+        // a raw pointer for reading only. Each shard forces local allocation.
         auto b_id = pkt->backend_id;
         auto callback = _route_learn_callback;
 
-        auto learn_future = seastar::parallel_for_each(
-            boost::irange<unsigned>(0, seastar::smp::count),
-            [callback, tokens_shared, b_id](unsigned shard_id) {
-                return seastar::smp::submit_to(shard_id, [callback, tokens_shared, b_id] {
-                    // Force local allocation on THIS shard (Rule #14)
-                    auto local_tokens = std::vector<TokenId>(tokens_shared->begin(), tokens_shared->end());
-                    return callback(std::move(local_tokens), b_id);
-                });
+        auto learn_future = seastar::do_with(
+            std::vector<TokenId>(pkt->tokens),  // Owned by do_with, destroyed on shard 0
+            [callback, b_id](const std::vector<TokenId>& tokens_on_shard0) {
+                // Raw pointer to shard 0's data - safe to read from other shards
+                // while do_with keeps it alive
+                const std::vector<TokenId>* tokens_ptr = &tokens_on_shard0;
+
+                return seastar::parallel_for_each(
+                    boost::irange<unsigned>(0, seastar::smp::count),
+                    [callback, tokens_ptr, b_id](unsigned shard_id) {
+                        return seastar::smp::submit_to(shard_id, [callback, tokens_ptr, b_id] {
+                            // Force local allocation on THIS shard (Rule #14)
+                            // This creates a new vector with memory from this shard's allocator
+                            auto local_tokens = std::vector<TokenId>(tokens_ptr->begin(), tokens_ptr->end());
+                            return callback(std::move(local_tokens), b_id);
+                        });
+                    });
             });
 
         return seastar::when_all_succeed(std::move(ack_future), std::move(learn_future)).discard_result();
