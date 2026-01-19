@@ -71,7 +71,7 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
     depends_on:
       - backend1
       - backend2
@@ -107,7 +107,7 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
     depends_on:
       - backend1
       - backend2
@@ -143,7 +143,7 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M"]
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
     depends_on:
       - backend1
       - backend2
