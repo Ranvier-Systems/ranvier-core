@@ -92,6 +92,18 @@ public:
     //   - Array must not be empty if present
     static TokenExtractionResult extract_prompt_token_ids(std::string_view body, int32_t max_token_id);
 
+    // Strip prompt_token_ids from a request body
+    //
+    // This is used when forwarding to backends that don't support prompt_token_ids
+    // (e.g., vLLM's /v1/chat/completions endpoint).
+    //
+    // Parameters:
+    //   body: Request body (JSON string) that may contain prompt_token_ids
+    //
+    // Returns:
+    //   Modified body with prompt_token_ids removed, or original if not present
+    static std::string strip_prompt_token_ids(std::string_view body);
+
 private:
     // Internal helper to write token array to JSON
     static void write_token_array(rapidjson::Writer<rapidjson::StringBuffer>& writer,
@@ -275,6 +287,38 @@ inline void RequestRewriter::write_token_array(
         writer.Int(token);
     }
     writer.EndArray();
+}
+
+inline std::string RequestRewriter::strip_prompt_token_ids(std::string_view body) {
+    // Fast path: if prompt_token_ids not present, return original
+    if (body.find("prompt_token_ids") == std::string_view::npos) {
+        return std::string(body);
+    }
+
+    // Parse the JSON document
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::string(body);
+    }
+
+    // Check if prompt_token_ids exists
+    if (!doc.HasMember("prompt_token_ids")) {
+        return std::string(body);
+    }
+
+    // Remove the prompt_token_ids field
+    doc.RemoveMember("prompt_token_ids");
+
+    // Serialize back to string
+    rapidjson::StringBuffer buffer;
+    buffer.Reserve(body.size());
+
+    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+    doc.Accept(writer);
+
+    return std::string(buffer.GetString(), buffer.GetSize());
 }
 
 }  // namespace ranvier

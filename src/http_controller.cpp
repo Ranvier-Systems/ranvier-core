@@ -863,6 +863,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
         forwarded_body = std::string(body_view);
     }
 
+    // Strip prompt_token_ids from forwarded body
+    // vLLM's /v1/chat/completions endpoint ignores prompt_token_ids (only /v1/completions supports it)
+    // We keep the tokens for routing but don't forward them to avoid backend warnings
+    forwarded_body = RequestRewriter::strip_prompt_token_ids(forwarded_body);
+
     BackendId target_id;
     std::string routing_mode_str;
 
