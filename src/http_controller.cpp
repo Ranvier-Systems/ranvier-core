@@ -818,6 +818,20 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(std:
                 metrics().record_tokenizer_validation_failure();
                 tokens.clear();
             } else {
+                // DEBUG: Log input before tokenization to identify crash triggers
+                // This log line will appear right before any tokenizer crash
+                {
+                    size_t preview_len = std::min(text_to_tokenize.size(), size_t(200));
+                    std::string preview(text_to_tokenize.substr(0, preview_len));
+                    // Escape control chars for safe logging
+                    for (char& c : preview) {
+                        if (c < 32 && c != '\n' && c != '\t') c = '?';
+                    }
+                    log_proxy.info("[{}] TOKENIZE_DEBUG: size={} preview=\"{}{}\"",
+                                   request_id, text_to_tokenize.size(), preview,
+                                   text_to_tokenize.size() > 200 ? "..." : "");
+                }
+
                 try {
                     tokens = _tokenizer.encode(text_to_tokenize);
                     tokenize_span.set_attribute("ranvier.token_source", "local");
