@@ -141,7 +141,8 @@ services:
       # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance (segfault fix: sharded<HttpController>)
-    command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}"]
+    # --reserve-memory leaves memory for non-Seastar allocators (Rust tokenizer uses system allocator)
+    command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}", "--reserve-memory", "256M"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -177,7 +178,8 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance (segfault fix: sharded<HttpController>)
-    command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}"]
+    # --reserve-memory leaves memory for non-Seastar allocators (Rust tokenizer uses system allocator)
+    command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}", "--reserve-memory", "256M"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -213,7 +215,8 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance (segfault fix: sharded<HttpController>)
-    command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}"]
+    # --reserve-memory leaves memory for non-Seastar allocators (Rust tokenizer uses system allocator)
+    command: ["./ranvier_server", "--smp", "2", "--memory", "${RANVIER_MEMORY:-1G}", "--reserve-memory", "256M"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s

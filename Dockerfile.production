@@ -99,4 +99,5 @@ USER ranvier
 # Or in docker-compose:
 #   cap_add:
 #     - IPC_LOCK
-CMD ["./ranvier_server", "--smp", "1", "--memory", "1G"]
+# --reserve-memory leaves memory for non-Seastar allocators (Rust tokenizer uses system allocator)
+CMD ["./ranvier_server", "--smp", "1", "--memory", "1G", "--reserve-memory", "256M"]
