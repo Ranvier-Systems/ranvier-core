@@ -547,30 +547,27 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
     }
 
     if (_route_learn_callback) {
-        // Cross-shard dispatch with proper memory handling (Rule #14)
-        // CRITICAL: Cannot use std::shared_ptr across shards - the destructor would run
-        // on the wrong shard when the last copy is destroyed, causing SIGSEGV.
-        // Instead, use seastar::do_with to keep the vector alive on shard 0, and pass
-        // a raw pointer for reading only. Each shard forces local allocation.
+        // Cross-shard dispatch with proper memory handling
+        //
+        // CRITICAL: Copy tokens BEFORE calling submit_to(), not inside the remote lambda.
+        // Accessing shard 0's memory from shard N via pointer/reference is a cross-shard
+        // access violation that causes race conditions and crashes.
         auto b_id = pkt->backend_id;
         auto callback = _route_learn_callback;
 
         auto learn_future = seastar::do_with(
             std::vector<TokenId>(pkt->tokens),  // Owned by do_with, destroyed on shard 0
-            [callback, b_id](const std::vector<TokenId>& tokens_on_shard0) {
-                // Raw pointer to shard 0's data - safe to read from other shards
-                // while do_with keeps it alive
-                const std::vector<TokenId>* tokens_ptr = &tokens_on_shard0;
-
+            [callback, b_id](const std::vector<TokenId>& tokens) {
                 return seastar::parallel_for_each(
                     boost::irange<unsigned>(0, seastar::smp::count),
-                    [callback, tokens_ptr, b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [callback, tokens_ptr, b_id] {
-                            // Force local allocation on THIS shard (Rule #14)
-                            // This creates a new vector with memory from this shard's allocator
-                            auto local_tokens = std::vector<TokenId>(tokens_ptr->begin(), tokens_ptr->end());
-                            return callback(std::move(local_tokens), b_id);
-                        });
+                    [callback, &tokens, b_id](unsigned shard_id) {
+                        // Copy tokens ON SHARD 0 before submitting - safe sequential access
+                        auto tokens_copy = std::vector<TokenId>(tokens.begin(), tokens.end());
+
+                        return seastar::smp::submit_to(shard_id,
+                            [callback, tokens_copy = std::move(tokens_copy), b_id]() mutable {
+                                return callback(std::move(tokens_copy), b_id);
+                            });
                     });
             });
 
