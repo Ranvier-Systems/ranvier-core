@@ -196,7 +196,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 #### 14. The Cross-Shard Heap Memory Anti-Pattern
 
-There are TWO distinct cross-shard memory bugs:
+There are THREE distinct cross-shard memory bugs:
 
 **BUG #1 - Cross-Shard FREE:** Moving heap-owning types across shards causes wrong-shard deallocation:
 ```cpp
@@ -220,7 +220,23 @@ do_with(std::move(data), [](auto& shared_data) {
 });
 ```
 
-**THE CONSEQUENCE:** Bug #1 causes allocator corruption and delayed crashes. Bug #2 causes data corruption, null pointers, or SIGSEGV during reads. Both can manifest long after the bug occurs, making debugging extremely difficult.
+**BUG #3 - Cross-Shard Callback State Access:** A callback captures `this` from shard X, then is broadcast to run on shard Y, accessing shard X's member variables:
+```cpp
+// On shard 0: set up callback that captures 'this'
+service->set_callback([this](Data data) {
+    _member_vector.push_back(data);  // Accesses shard 0's member!
+});
+
+// Later, in some broadcast code:
+parallel_for_each(shards, [callback](unsigned shard_id) {
+    return smp::submit_to(shard_id, [callback, data] {
+        callback(data);  // BUG: Running on shard N, but callback accesses shard 0's state!
+    });
+});
+```
+This is particularly insidious because: (1) the callback looks innocent, (2) the broadcast looks correct, but (3) the combination causes multiple shards to simultaneously access shard 0's state without synchronization—a data race.
+
+**THE CONSEQUENCE:** Bug #1 causes allocator corruption and delayed crashes. Bug #2 causes data corruption, null pointers, or SIGSEGV during reads. Bug #3 causes data races with corrupted containers, lost updates, or crashes. All three can manifest long after the bug occurs, making debugging extremely difficult.
 
 **THE CORRECT PATTERN:** Use `foreign_ptr` to safely pass data across shards:
 ```cpp
@@ -253,8 +269,10 @@ do_with(std::move(data), [](auto& data) {
 - `parallel_for_each` broadcasting heap-owning data to all shards
 - Raw pointers passed to `submit_to` lambdas (e.g., `[ptr = &data]`)
 - `foreign_ptr` with `std::move(*foreign)` extracting data without local copy
+- **Callbacks that capture `this` being broadcast to multiple shards** (Bug #3)
+- `parallel_for_each` + `submit_to` patterns where the callback accesses member variables
 
-**PROMPT GUARD:** "For cross-shard data: (1) Never capture references to outer-scope data in submit_to lambdas. (2) Never move heap-owning types directly—use foreign_ptr and create local allocations on the target shard."
+**PROMPT GUARD:** "For cross-shard data: (1) Never capture references to outer-scope data in submit_to lambdas. (2) Never move heap-owning types directly—use foreign_ptr and create local allocations on the target shard. (3) Never broadcast a callback that captures `this` to multiple shards—either run the callback only on the owning shard, or ensure it only accesses shard-local state."
 
 ---
 
