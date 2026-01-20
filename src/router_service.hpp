@@ -211,11 +211,13 @@ public:
     // Stop the draining reaper timer (call before shutdown)
     void stop_draining_reaper();
 
-    seastar::future<> remove_routes_for_backend(BackendId b_id);
+    // Static: Only uses thread_local g_shard_state, safe to call from any shard
+    static seastar::future<> remove_routes_for_backend(BackendId b_id);
 
     // Handle node state change notifications from cluster peers
     // When a peer broadcasts DRAINING, this sets their backend weight to 0
-    seastar::future<> handle_node_state_change(BackendId backend, NodeState state);
+    // Static: Only uses thread_local g_shard_state, safe to call from any shard
+    static seastar::future<> handle_node_state_change(BackendId backend, NodeState state);
 
     // Get the gossip service (for broadcasting node state on shutdown)
     GossipService* gossip_service() { return _gossip.get(); }

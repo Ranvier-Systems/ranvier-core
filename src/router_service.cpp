@@ -285,14 +285,18 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         });
 
         // Set up callback to prune routes when a peer fails
-        _gossip->set_route_prune_callback([this](BackendId backend) {
-            return remove_routes_for_backend(backend);
+        // NOTE: No `this` capture - remove_routes_for_backend is static and uses only
+        // thread_local state. This prevents accidental cross-shard state access when
+        // the callback is broadcast to all shards.
+        _gossip->set_route_prune_callback([](BackendId backend) {
+            return RouterService::remove_routes_for_backend(backend);
         });
 
         // Set up callback to handle node state changes (e.g., DRAINING notifications)
         // When a peer broadcasts DRAINING, set their backend weight to 0 to stop new traffic
-        _gossip->set_node_state_callback([this](BackendId backend, NodeState state) {
-            return handle_node_state_change(backend, state);
+        // NOTE: No `this` capture - handle_node_state_change is static (see above).
+        _gossip->set_node_state_callback([](BackendId backend, NodeState state) {
+            return RouterService::handle_node_state_change(backend, state);
         });
 
         // Pre-allocate buffer for route batching to avoid reallocations during operation
