@@ -151,9 +151,9 @@ services:
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
     # Use --smp 2 to leverage multi-core performance
-    # --std-alloc uses standard malloc instead of Seastar's per-shard allocator,
+    # --memory-allocator=standard uses glibc malloc instead of Seastar's per-shard allocator,
     # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
-    command: ["./ranvier_server", "--smp", "2", "--std-alloc"]
+    command: ["./ranvier_server", "--smp", "2", "--memory-allocator=standard"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -195,9 +195,9 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance
-    # --std-alloc uses standard malloc instead of Seastar's per-shard allocator,
+    # --memory-allocator=standard uses glibc malloc instead of Seastar's per-shard allocator,
     # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
-    command: ["./ranvier_server", "--smp", "2", "--std-alloc"]
+    command: ["./ranvier_server", "--smp", "2", "--memory-allocator=standard"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -239,9 +239,9 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance
-    # --std-alloc uses standard malloc instead of Seastar's per-shard allocator,
+    # --memory-allocator=standard uses glibc malloc instead of Seastar's per-shard allocator,
     # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
-    command: ["./ranvier_server", "--smp", "2", "--std-alloc"]
+    command: ["./ranvier_server", "--smp", "2", "--memory-allocator=standard"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s

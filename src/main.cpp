@@ -316,9 +316,8 @@ int main(int argc, char** argv) {
     // Load configuration BEFORE Seastar starts
     std::string config_path = "ranvier.yaml";
     bool dry_run = false;
-    bool use_std_alloc = false;
 
-    // Check for --config, --dry-run, and --std-alloc arguments
+    // Check for --config and --dry-run arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
@@ -328,7 +327,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--dry-run") {
             dry_run = true;
         } else if (arg == "--std-alloc") {
-            use_std_alloc = true;
+            // Deprecated: use --memory-allocator=standard instead
+            std::cerr << "WARNING: --std-alloc is deprecated and non-functional.\n"
+                      << "         Use Seastar's native --memory-allocator=standard instead.\n";
         }
     }
 
@@ -354,19 +355,13 @@ int main(int argc, char** argv) {
     app_cfg.name = "ranvier_server";
     app_template app(std::move(app_cfg));
 
-    // Configure standard allocator if requested (for Rust FFI compatibility)
-    // Note: const_cast is safe here because we modify before run() is called
-    if (use_std_alloc) {
-        const_cast<smp_options&>(app.options().smp_opts).memory_allocator = memory_allocator::standard;
-        std::cout << "  Allocator:    standard (--std-alloc)\n";
-    }
-
     // Register our custom options with Seastar so they're recognized
+    // NOTE: For standard allocator, use Seastar's native --memory-allocator=standard
     app.add_options()
         ("config", boost::program_options::value<std::string>()->default_value("ranvier.yaml"),
          "Path to configuration file")
         ("dry-run", "Validate configuration and exit (no server start)")
-        ("std-alloc", "Use standard libc allocator instead of Seastar's (for Rust FFI)");
+        ("std-alloc", "DEPRECATED: use --memory-allocator=standard instead");
 
     // Run the application
     return app.run(argc, argv, [config = std::move(config), config_path]() mutable {
