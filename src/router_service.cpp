@@ -1106,19 +1106,24 @@ seastar::future<> RouterService::flush_route_batch() {
 
     // Send ONE message per shard containing the entire batch.
     //
-    // PERFORMANCE NOTE: Each shard receives a COPY of the batch. The copy MUST happen
-    // inside the lambda (on the target shard) to satisfy Seastar's shared-nothing model.
-    // If we captured by value, the heap would be allocated on shard 0, and freeing it
-    // on other shards would crash with "invalid pointer".
-    return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& shared_batch) {
+    // CRITICAL: We must copy the batch BEFORE calling submit_to(), not inside the remote
+    // lambda. Capturing a reference to shard-0 memory and reading it from shard N is a
+    // cross-shard access violation that causes race conditions and crashes.
+    //
+    // The copy is made on shard 0, then moved into the lambda. Yes, the vector's heap
+    // memory was allocated on shard 0 and will be freed on shard N, but Seastar's
+    // allocators handle this correctly for allocations that go through the system allocator.
+    return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& batch) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-            [&shared_batch](unsigned shard_id) {
-                return seastar::smp::submit_to(shard_id, [&shared_batch] {
-                    // Force fresh allocation on this shard
-                    std::vector<PendingRemoteRoute> batch(shared_batch.begin(), shared_batch.end());
-                    apply_route_batch_to_local_tree(batch);
-                    return seastar::make_ready_future<>();
-                });
+            [&batch](unsigned shard_id) {
+                // Copy batch ON SHARD 0 before submitting - this is safe sequential access
+                std::vector<PendingRemoteRoute> batch_copy(batch.begin(), batch.end());
+
+                return seastar::smp::submit_to(shard_id,
+                    [batch_copy = std::move(batch_copy)]() mutable {
+                        apply_route_batch_to_local_tree(batch_copy);
+                        return seastar::make_ready_future<>();
+                    });
             });
     });
 }
