@@ -938,13 +938,20 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // Broadcast to cluster peers if gossip is enabled
     // NOTE: GossipService only exists on shard 0, so we must submit_to(0) to avoid
     // cross-shard access violations (the gate holder would be created on the wrong shard)
+    //
+    // MEMORY SAFETY: Use foreign_ptr to safely pass tokens to shard 0.
+    // The tokens vector is allocated on the calling shard (could be any shard).
+    // foreign_ptr ensures proper deallocation on the source shard.
     seastar::future<> gossip_future = seastar::make_ready_future<>();
     if (_gossip) {
-        // Copy tokens for gossip broadcast (tokens will be moved for shard broadcast below)
-        auto tokens_copy = tokens;
-        gossip_future = seastar::smp::submit_to(0, [this, tokens_copy = std::move(tokens_copy), backend] {
+        auto tokens_ptr = std::make_unique<std::vector<int32_t>>(tokens);
+        auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
+
+        gossip_future = seastar::smp::submit_to(0, [this, foreign_tokens = std::move(foreign_tokens), backend]() mutable {
             if (_gossip->is_enabled()) {
-                return _gossip->broadcast_route(tokens_copy, backend);
+                // Create local copy on shard 0
+                std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
+                return _gossip->broadcast_route(local_tokens, backend);
             }
             return seastar::make_ready_future<>();
         });

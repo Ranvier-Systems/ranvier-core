@@ -118,6 +118,11 @@ void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
     auto it = _peer_table.find(peer);
     if (it != _peer_table.end()) {
         // Prune routes for removed peer if it had an associated backend
+        // NOTE: std::function is passed across shards here. This relies on Small Buffer
+        // Optimization (SBO) to avoid cross-shard heap issues. The callback lambda only
+        // captures a pointer, which fits in SBO. A proper fix would make callbacks
+        // shard-aware (each shard registers its own callback).
+        // TODO: Refactor to use per-shard callback registration for full memory safety.
         if (it->second.associated_backend && _route_prune_callback) {
             BackendId b_id = *it->second.associated_backend;
             auto callback = _route_prune_callback;
@@ -167,6 +172,7 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
             log_gossip_consensus().info("DNS discovery: peer removed: {}", peer);
 
             // Prune routes for removed peers if they had an associated backend
+            // NOTE: See comment in remove_peer() about std::function SBO reliance.
             if (state.associated_backend && _route_prune_callback) {
                 BackendId b_id = *state.associated_backend;
                 auto callback = _route_prune_callback;
@@ -221,6 +227,7 @@ void GossipConsensus::check_liveness() {
             log_gossip_consensus().warn("Peer marked dead: socket_address={}", addr);
 
             // Prune routes for dead peer if it had an associated backend
+            // NOTE: See comment in remove_peer() about std::function SBO reliance.
             if (state.associated_backend && _route_prune_callback) {
                 BackendId b_id = *state.associated_backend;
                 auto callback = _route_prune_callback;
