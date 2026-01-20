@@ -316,8 +316,9 @@ int main(int argc, char** argv) {
     // Load configuration BEFORE Seastar starts
     std::string config_path = "ranvier.yaml";
     bool dry_run = false;
+    bool use_std_alloc = false;
 
-    // Check for --config and --dry-run arguments
+    // Check for --config, --dry-run, and --std-alloc arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
@@ -327,9 +328,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--dry-run") {
             dry_run = true;
         } else if (arg == "--std-alloc") {
-            // Deprecated: use --memory-allocator=standard instead
-            std::cerr << "WARNING: --std-alloc is deprecated and non-functional.\n"
-                      << "         Use Seastar's native --memory-allocator=standard instead.\n";
+            use_std_alloc = true;
         }
     }
 
@@ -350,18 +349,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Create Seastar app template
-    app_template::config app_cfg;
-    app_cfg.name = "ranvier_server";
-    app_template app(std::move(app_cfg));
+    // Create Seastar app template with proper options
+    app_template::seastar_options opts;
+    opts.name = "ranvier_server";
+
+    // Configure standard allocator if requested (for Rust FFI compatibility)
+    // This MUST be set before app_template is created - cannot be changed after
+    if (use_std_alloc) {
+        opts.smp_opts.memory_allocator = memory_allocator::standard;
+        std::cout << "  Allocator:    standard (--std-alloc)\n";
+    }
+
+    app_template app(std::move(opts));
 
     // Register our custom options with Seastar so they're recognized
-    // NOTE: For standard allocator, use Seastar's native --memory-allocator=standard
     app.add_options()
         ("config", boost::program_options::value<std::string>()->default_value("ranvier.yaml"),
          "Path to configuration file")
         ("dry-run", "Validate configuration and exit (no server start)")
-        ("std-alloc", "DEPRECATED: use --memory-allocator=standard instead");
+        ("std-alloc", "Use standard libc allocator instead of Seastar's (required for Rust FFI)");
 
     // Run the application
     return app.run(argc, argv, [config = std::move(config), config_path]() mutable {
