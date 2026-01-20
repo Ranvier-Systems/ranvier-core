@@ -11,7 +11,6 @@
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
@@ -548,33 +547,17 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
     }
 
     if (_route_learn_callback) {
-        // Cross-shard dispatch with proper memory handling
+        // Call the route learn callback on shard 0 only.
+        // The callback (learn_route_remote) buffers to _pending_remote_routes which
+        // exists only on shard 0. The RouterService's flush_route_batch() then
+        // broadcasts the buffered routes to all shards.
         //
-        // CRITICAL MEMORY SAFETY: Use foreign_ptr to safely pass tokens across shards.
-        // Each shard gets a copy wrapped in foreign_ptr. The target shard reads from
-        // foreign_ptr and creates LOCAL allocations. When foreign_ptr is destroyed,
-        // it returns to shard 0 for proper deallocation.
+        // NOTE: We do NOT broadcast to all shards here - that was causing a data race
+        // where multiple shards simultaneously wrote to shard 0's _pending_remote_routes.
         auto b_id = pkt->backend_id;
-        auto callback = _route_learn_callback;
+        auto tokens = std::vector<TokenId>(pkt->tokens);
 
-        auto learn_future = seastar::do_with(
-            std::vector<TokenId>(pkt->tokens),  // Owned by do_with, destroyed on shard 0
-            [callback, b_id](const std::vector<TokenId>& tokens) {
-                return seastar::parallel_for_each(
-                    boost::irange<unsigned>(0, seastar::smp::count),
-                    [callback, &tokens, b_id](unsigned shard_id) {
-                        // Create a copy wrapped in foreign_ptr for this shard
-                        auto tokens_ptr = std::make_unique<std::vector<TokenId>>(tokens);
-                        auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
-
-                        return seastar::smp::submit_to(shard_id,
-                            [callback, foreign_tokens = std::move(foreign_tokens), b_id]() mutable {
-                                // Force local allocation on THIS shard
-                                std::vector<TokenId> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
-                                return callback(std::move(local_tokens), b_id);
-                            });
-                    });
-            });
+        auto learn_future = _route_learn_callback(std::move(tokens), b_id);
 
         return seastar::when_all_succeed(std::move(ack_future), std::move(learn_future)).discard_result();
     }
