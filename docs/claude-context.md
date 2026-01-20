@@ -196,40 +196,65 @@ The following patterns were identified during an adversarial security audit. Eac
 
 #### 14. The Cross-Shard Heap Memory Anti-Pattern
 
-**THE PATTERN:** Moving `std::vector`, `std::string`, or any heap-owning type across shards via `smp::submit_to`:
+There are TWO distinct cross-shard memory bugs:
+
+**BUG #1 - Cross-Shard FREE:** Moving heap-owning types across shards causes wrong-shard deallocation:
 ```cpp
 auto tokens = get_tokens();  // Heap allocated on shard 0
 smp::submit_to(shard_1, [tokens = std::move(tokens)] {
-    store(std::move(tokens));  // tokens' heap still on shard 0!
+    // tokens' heap memory is still on shard 0!
+    // When destructor runs here on shard 1, SIGSEGV or "free(): invalid pointer"
 });
 ```
 
-**THE CONSEQUENCE:** `std::move` only transfers the pointer/metadata—the actual heap memory stays on the source shard. When the destination shard eventually frees the memory, Seastar's per-shard allocator rejects it with `free(): invalid pointer` or `SIGSEGV`. This can manifest long after the cross-shard transfer, making debugging difficult.
-
-**THE LESSON:** *Hard Rule: Heap-owning types cannot be moved across shards.* The heap data stays where it was allocated. Either:
-1. Force a fresh allocation on the destination: `std::vector<T>(source.begin(), source.end())`
-2. Use POD types only for cross-shard transfer
-3. Serialize/deserialize across the boundary
-4. Redesign to avoid cross-shard data transfer
-
-**RED FLAGS TO AUDIT:**
-- `submit_to` lambdas capturing `vector`, `string`, `unique_ptr`, `shared_ptr`
-- `parallel_for_each` broadcasting heap-owning data to all shards
-- Callbacks registered with heap-owning parameters received from other shards
-- `foreign_ptr` with `std::move(*foreign)` extracting the pointed-to data
-
-**DEFENSIVE PATTERN:** When receiving data that *might* come from another shard, force local allocation:
+**BUG #2 - Cross-Shard READ:** Capturing references to shard-0 memory and reading from shard N is a race:
 ```cpp
-void receive_tokens(std::vector<int> tokens) {
-    // Force fresh allocation on THIS shard
-    _storage.push_back({
-        std::vector<int>(tokens.begin(), tokens.end()),
-        other_data
+do_with(std::move(data), [](auto& shared_data) {
+    return parallel_for_each(shards, [&shared_data](unsigned shard_id) {
+        return smp::submit_to(shard_id, [&shared_data] {  // BUG: &shared_data captured!
+            // Reading shared_data from shard N while it lives on shard 0
+            // This is a cross-shard memory access race condition
+            auto copy = std::vector<T>(shared_data.begin(), shared_data.end());
+        });
     });
-}
+});
 ```
 
-**PROMPT GUARD:** "Never move heap-owning types (vector, string, unique_ptr) across shards—force a fresh allocation on the destination shard using iterator constructors or explicit copy."
+**THE CONSEQUENCE:** Bug #1 causes allocator corruption and delayed crashes. Bug #2 causes data corruption, null pointers, or SIGSEGV during reads. Both can manifest long after the bug occurs, making debugging extremely difficult.
+
+**THE CORRECT PATTERN:** Use `foreign_ptr` to safely pass data across shards:
+```cpp
+do_with(std::move(data), [](auto& data) {
+    return parallel_for_each(shards, [&data](unsigned shard_id) {
+        // 1. Wrap copy in foreign_ptr (allocated on shard 0)
+        auto ptr = std::make_unique<std::vector<T>>(data);
+        auto foreign = seastar::make_foreign(std::move(ptr));
+
+        return smp::submit_to(shard_id, [foreign = std::move(foreign)]() mutable {
+            // 2. Read from foreign_ptr and create LOCAL allocation
+            std::vector<T> local(foreign->begin(), foreign->end());
+            // 3. Use local copy (properly allocated on THIS shard)
+            process(local);
+            // 4. foreign_ptr destructor returns to shard 0 for cleanup
+        });
+    });
+});
+```
+
+**WHY `foreign_ptr` WORKS:**
+- Wraps a `unique_ptr` for safe cross-shard transfer
+- Destructor runs on the HOME shard (where it was created), not current shard
+- Safe to READ from on any shard (data is guaranteed alive)
+- Forces you to explicitly create local allocations
+
+**RED FLAGS TO AUDIT:**
+- `submit_to` lambdas capturing `&reference` to outer scope data
+- `submit_to` lambdas capturing `vector`, `string`, `unique_ptr` by value (wrong-shard free)
+- `parallel_for_each` broadcasting heap-owning data to all shards
+- Raw pointers passed to `submit_to` lambdas (e.g., `[ptr = &data]`)
+- `foreign_ptr` with `std::move(*foreign)` extracting data without local copy
+
+**PROMPT GUARD:** "For cross-shard data: (1) Never capture references to outer-scope data in submit_to lambdas. (2) Never move heap-owning types directly—use foreign_ptr and create local allocations on the target shard."
 
 ---
 
