@@ -5,6 +5,7 @@
 #include "node_slab.hpp"
 
 #include <seastar/core/smp.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/metrics.hh>
