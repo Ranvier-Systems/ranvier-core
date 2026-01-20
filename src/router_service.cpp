@@ -950,14 +950,17 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     }
 
     // Broadcast to all local shards with LOCAL origin
-    auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& shared_tokens) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &shared_tokens] (unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [backend, &shared_tokens] {
-                // IMPORTANT: Force a fresh allocation on this shard.
-                // shared_tokens is held by do_with on shard 0. If we captured it by value,
-                // the copy's heap would be allocated on shard 0, violating Seastar's
-                // shared-nothing model and causing crashes on free.
-                std::vector<int32_t> tokens(shared_tokens.begin(), shared_tokens.end());
+    //
+    // CRITICAL: Copy tokens BEFORE calling submit_to(), not inside the remote lambda.
+    // Capturing a reference to shard-0 memory and reading it from shard N is a cross-shard
+    // access violation that causes race conditions and crashes.
+    auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& tokens) {
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &tokens] (unsigned shard_id) {
+            // Copy tokens ON THIS SHARD before submitting - safe sequential access
+            std::vector<int32_t> tokens_copy(tokens.begin(), tokens.end());
+
+            return seastar::smp::submit_to(shard_id, [backend, tokens_copy = std::move(tokens_copy)]() mutable {
+                auto& tokens = tokens_copy;  // alias for cleaner code below
 
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
