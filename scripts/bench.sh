@@ -516,6 +516,16 @@ if [[ "$SETUP_ONLY" = true ]]; then
         fi
     fi
 
+    # Enable core dumps for crash debugging
+    log_info "Configuring core dumps..."
+    echo "/tmp/core.%e.%p.%t" | sudo tee /proc/sys/kernel/core_pattern > /dev/null 2>&1 && \
+        log_ok "Set core pattern to /tmp/core.%e.%p.%t" || log_warn "Could not set core pattern"
+    # Persist core pattern
+    if ! grep -q "kernel.core_pattern" /etc/sysctl.conf 2>/dev/null; then
+        echo "kernel.core_pattern=/tmp/core.%e.%p.%t" | sudo tee -a /etc/sysctl.conf > /dev/null 2>&1 && \
+            log_ok "Persisted core pattern setting" || log_warn "Could not persist core pattern"
+    fi
+
     # Create directories
     mkdir -p "$OUTPUT_DIR"
     log_ok "Created $OUTPUT_DIR directory"
