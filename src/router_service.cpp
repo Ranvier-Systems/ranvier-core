@@ -951,16 +951,19 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
 
     // Broadcast to all local shards with LOCAL origin
     //
-    // CRITICAL: Copy tokens BEFORE calling submit_to(), not inside the remote lambda.
-    // Capturing a reference to shard-0 memory and reading it from shard N is a cross-shard
-    // access violation that causes race conditions and crashes.
+    // CRITICAL MEMORY SAFETY: Use foreign_ptr to safely pass tokens across shards.
+    // Each shard gets a copy wrapped in foreign_ptr. The target shard reads from
+    // foreign_ptr and creates LOCAL allocations. When foreign_ptr is destroyed,
+    // it returns to shard 0 for proper deallocation.
     auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& tokens) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &tokens] (unsigned shard_id) {
-            // Copy tokens ON THIS SHARD before submitting - safe sequential access
-            std::vector<int32_t> tokens_copy(tokens.begin(), tokens.end());
+            // Create a copy wrapped in foreign_ptr for this shard
+            auto tokens_ptr = std::make_unique<std::vector<int32_t>>(tokens);
+            auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
 
-            return seastar::smp::submit_to(shard_id, [backend, tokens_copy = std::move(tokens_copy)]() mutable {
-                auto& tokens = tokens_copy;  // alias for cleaner code below
+            return seastar::smp::submit_to(shard_id, [backend, foreign_tokens = std::move(foreign_tokens)]() mutable {
+                // Force local allocation on THIS shard
+                std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
 
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
@@ -979,7 +982,7 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
                 }
 
                 // Insert with LOCAL origin (direct request on this node)
-                tree->insert(tokens, backend, RouteOrigin::LOCAL);
+                tree->insert(local_tokens, backend, RouteOrigin::LOCAL);
                 return seastar::make_ready_future<>();
             });
         });
@@ -1109,22 +1112,34 @@ seastar::future<> RouterService::flush_route_batch() {
 
     // Send ONE message per shard containing the entire batch.
     //
-    // CRITICAL: We must copy the batch BEFORE calling submit_to(), not inside the remote
-    // lambda. Capturing a reference to shard-0 memory and reading it from shard N is a
-    // cross-shard access violation that causes race conditions and crashes.
+    // CRITICAL MEMORY SAFETY: Seastar uses per-shard allocators. Memory allocated on
+    // shard 0 must be freed on shard 0, not on other shards. We use foreign_ptr to:
+    // 1. Wrap each batch copy so it can be safely passed to other shards
+    // 2. Ensure proper deallocation on the source shard when foreign_ptr is destroyed
+    // 3. Read from foreign_ptr on target shard and create LOCAL allocations
     //
-    // The copy is made on shard 0, then moved into the lambda. Yes, the vector's heap
-    // memory was allocated on shard 0 and will be freed on shard N, but Seastar's
-    // allocators handle this correctly for allocations that go through the system allocator.
+    // Pattern: Create N copies on shard 0, wrap each in foreign_ptr, send to target shards.
     return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& batch) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [&batch](unsigned shard_id) {
-                // Copy batch ON SHARD 0 before submitting - this is safe sequential access
-                std::vector<PendingRemoteRoute> batch_copy(batch.begin(), batch.end());
+                // Create a copy wrapped in foreign_ptr for this shard
+                // The copy is allocated on shard 0, foreign_ptr ensures it's freed on shard 0
+                auto batch_ptr = std::make_unique<std::vector<PendingRemoteRoute>>(batch);
+                auto foreign_batch = seastar::make_foreign(std::move(batch_ptr));
 
                 return seastar::smp::submit_to(shard_id,
-                    [batch_copy = std::move(batch_copy)]() mutable {
-                        apply_route_batch_to_local_tree(batch_copy);
+                    [foreign_batch = std::move(foreign_batch)]() mutable {
+                        // Force local allocation on THIS shard by copying from foreign_ptr
+                        // When foreign_batch destructor runs, it returns to shard 0 for cleanup
+                        std::vector<PendingRemoteRoute> local_batch;
+                        local_batch.reserve(foreign_batch->size());
+                        for (const auto& route : *foreign_batch) {
+                            local_batch.push_back(PendingRemoteRoute{
+                                std::vector<int32_t>(route.tokens.begin(), route.tokens.end()),
+                                route.backend
+                            });
+                        }
+                        apply_route_batch_to_local_tree(local_batch);
                         return seastar::make_ready_future<>();
                     });
             });

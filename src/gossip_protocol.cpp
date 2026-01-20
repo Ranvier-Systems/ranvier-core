@@ -549,9 +549,10 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
     if (_route_learn_callback) {
         // Cross-shard dispatch with proper memory handling
         //
-        // CRITICAL: Copy tokens BEFORE calling submit_to(), not inside the remote lambda.
-        // Accessing shard 0's memory from shard N via pointer/reference is a cross-shard
-        // access violation that causes race conditions and crashes.
+        // CRITICAL MEMORY SAFETY: Use foreign_ptr to safely pass tokens across shards.
+        // Each shard gets a copy wrapped in foreign_ptr. The target shard reads from
+        // foreign_ptr and creates LOCAL allocations. When foreign_ptr is destroyed,
+        // it returns to shard 0 for proper deallocation.
         auto b_id = pkt->backend_id;
         auto callback = _route_learn_callback;
 
@@ -561,12 +562,15 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
                 return seastar::parallel_for_each(
                     boost::irange<unsigned>(0, seastar::smp::count),
                     [callback, &tokens, b_id](unsigned shard_id) {
-                        // Copy tokens ON SHARD 0 before submitting - safe sequential access
-                        auto tokens_copy = std::vector<TokenId>(tokens.begin(), tokens.end());
+                        // Create a copy wrapped in foreign_ptr for this shard
+                        auto tokens_ptr = std::make_unique<std::vector<TokenId>>(tokens);
+                        auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
 
                         return seastar::smp::submit_to(shard_id,
-                            [callback, tokens_copy = std::move(tokens_copy), b_id]() mutable {
-                                return callback(std::move(tokens_copy), b_id);
+                            [callback, foreign_tokens = std::move(foreign_tokens), b_id]() mutable {
+                                // Force local allocation on THIS shard
+                                std::vector<TokenId> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
+                                return callback(std::move(local_tokens), b_id);
                             });
                     });
             });
