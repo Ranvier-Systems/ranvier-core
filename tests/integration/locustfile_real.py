@@ -41,6 +41,13 @@ Environment Variables:
         SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
         P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
 
+    Timeout Configuration:
+        CONNECT_TIMEOUT_SECONDS   - TCP connection + headers timeout (default: 30)
+        READ_TIMEOUT_SECONDS      - Socket read timeout per chunk (default: 120)
+                                    Applies to each iter_lines() read; prevents indefinite blocking
+        STREAMING_TIMEOUT_SECONDS - Overall streaming timeout (default: 300)
+                                    Total time allowed for streaming response
+
     Custom Prompt File Configuration:
         PROMPT_FILE           - Path to JSONL file containing prompts (optional)
         PROMPT_SAMPLING       - Sampling strategy: "random" (default), "sequential", "weighted"
@@ -128,6 +135,7 @@ from typing import Dict, List, Optional, Tuple
 from threading import Lock
 
 import requests
+from requests.exceptions import ReadTimeout, ConnectTimeout, Timeout
 from locust import HttpUser, task, between, events
 from locust.runners import MasterRunner, WorkerRunner
 
@@ -479,6 +487,14 @@ P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "500
 # After this timeout, the request is aborted and recorded as a timeout error
 # This prevents indefinite blocking when Locust's run-time expires
 STREAMING_TIMEOUT_SECONDS = int(os.environ.get("STREAMING_TIMEOUT_SECONDS", "300"))  # 5 minutes
+
+# Socket-level timeout configuration
+# CONNECT_TIMEOUT: Max time to establish TCP connection and receive response headers
+# READ_TIMEOUT: Max time to wait for each chunk of streaming data (per socket read)
+# Note: READ_TIMEOUT must be > vLLM's time-to-first-token (typically 1-30s for large prompts)
+# If no data arrives within READ_TIMEOUT, the request fails with ReadTimeout exception
+CONNECT_TIMEOUT_SECONDS = int(os.environ.get("CONNECT_TIMEOUT_SECONDS", "30"))
+READ_TIMEOUT_SECONDS = int(os.environ.get("READ_TIMEOUT_SECONDS", "120"))  # 2 min per chunk
 
 # ============================================================================
 # Prompt Templates with Shared Prefixes
@@ -2810,8 +2826,8 @@ def on_test_start(environment, **kwargs):
         logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
         logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
 
-    # Log streaming timeout configuration
-    logger.info(f"Streaming timeout: {STREAMING_TIMEOUT_SECONDS}s (per-request max)")
+    # Log timeout configuration
+    logger.info(f"Timeouts: connect={CONNECT_TIMEOUT_SECONDS}s, read={READ_TIMEOUT_SECONDS}s/chunk, stream={STREAMING_TIMEOUT_SECONDS}s total")
 
     # Load prompts from file if PROMPT_FILE is set
     if PROMPT_FILE:
@@ -3069,12 +3085,15 @@ class RealBackendUser(HttpUser):
         response_text = ""
 
         try:
+            # Use tuple timeout: (connect_timeout, read_timeout)
+            # read_timeout applies to each socket read, preventing indefinite blocking
+            # on iter_lines() when vLLM is slow or unresponsive
             resp = requests.post(
                 f"{target_url}{endpoint}",
                 json=request_body,
                 headers={"Content-Type": "application/json"},
                 stream=True,
-                timeout=60,
+                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
             )
 
             # Get backend ID from response headers (Ranvier sets X-Backend-ID)
@@ -3217,6 +3236,32 @@ class RealBackendUser(HttpUser):
                         context={},
                     )
 
+        except ReadTimeout as e:
+            total_time = (time.perf_counter() - start_time) * 1000
+            error_msg = f"Socket read timeout after {READ_TIMEOUT_SECONDS}s - vLLM may be overloaded or unresponsive"
+            events.request.fire(
+                request_type="POST",
+                name=f"{endpoint} (node{node_index + 1})",
+                response_time=total_time,
+                response_length=0,
+                exception=Exception(error_msg),
+                context={},
+            )
+            _benchmark_stats.record_request(metrics)
+            logger.warning(f"Request to node{node_index + 1} failed: {error_msg}")
+        except ConnectTimeout as e:
+            total_time = (time.perf_counter() - start_time) * 1000
+            error_msg = f"Connection timeout after {CONNECT_TIMEOUT_SECONDS}s - Ranvier node may be down"
+            events.request.fire(
+                request_type="POST",
+                name=f"{endpoint} (node{node_index + 1})",
+                response_time=total_time,
+                response_length=0,
+                exception=Exception(error_msg),
+                context={},
+            )
+            _benchmark_stats.record_request(metrics)
+            logger.warning(f"Request to node{node_index + 1} failed: {error_msg}")
         except Exception as e:
             total_time = (time.perf_counter() - start_time) * 1000
             events.request.fire(
