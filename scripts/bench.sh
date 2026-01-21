@@ -961,26 +961,29 @@ run_benchmark() {
     END_TIME=$(date -d "+${DURATION_SECS} seconds" +%H:%M 2>/dev/null || date -v+${DURATION_SECS}S +%H:%M 2>/dev/null || echo "")
 
     # Prominent banner for visibility
-    echo ""
-    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
-    if [[ -n "$STEP" ]]; then
-        echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}    ${STEP}${NC}"
-    else
-        echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}${NC}"
-    fi
-    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
-    echo "  Model:        $MODEL"
-    echo "  Backends:     $GPUS"
-    if [[ -n "$END_TIME" ]]; then
-        echo "  Duration:     $DURATION (${START_TIME} -> ~${END_TIME})"
-    else
-        echo "  Duration:     $DURATION"
-    fi
-    echo "  Users:        $USERS"
-    echo "  Routing:      $ROUTING_MODE"
-    echo "  Prompt Dist:  $PROMPT_DIST"
-    echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
-    echo ""
+    # Note: Output to stderr so it displays when run_benchmark is called with $()
+    {
+        echo ""
+        echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
+        if [[ -n "$STEP" ]]; then
+            echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}    ${STEP}${NC}"
+        else
+            echo -e "${BOLD}${CYAN}  RUNNING: ${LABEL}${NC}"
+        fi
+        echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
+        echo "  Model:        $MODEL"
+        echo "  Backends:     $GPUS"
+        if [[ -n "$END_TIME" ]]; then
+            echo "  Duration:     $DURATION (${START_TIME} -> ~${END_TIME})"
+        else
+            echo "  Duration:     $DURATION"
+        fi
+        echo "  Users:        $USERS"
+        echo "  Routing:      $ROUTING_MODE"
+        echo "  Prompt Dist:  $PROMPT_DIST"
+        echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
+        echo ""
+    } >&2
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     REPORT_DIR="${OUTPUT_DIR}/${TIMESTAMP}_${GPUS}gpu_${ROUTING_MODE}"
@@ -1037,9 +1040,10 @@ run_benchmark() {
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
-    log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)"
+    log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)" >&2
     BENCHMARK_START_TS=$(date +%s)
 
+    # Note: Output to stderr (via tee /dev/stderr) so it displays when run_benchmark is called with $()
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
         -v "$PWD/$REPORT_DIR:/mnt/locust/output" \
@@ -1057,19 +1061,20 @@ run_benchmark() {
         --run-time "${LOCUST_RUN_TIME_SECS}s" \
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
-        2>&1 | tee "$REPORT_DIR/benchmark.log"
+        2>&1 | tee "$REPORT_DIR/benchmark.log" /dev/stderr > /dev/null
 
     BENCHMARK_END_TS=$(date +%s)
     ACTUAL_DURATION=$((BENCHMARK_END_TS - BENCHMARK_START_TS))
     EXPECTED_DURATION=$LOCUST_RUN_TIME_SECS
     DURATION_DIFF=$((ACTUAL_DURATION - EXPECTED_DURATION))
-    log_info "Benchmark timing: expected=${EXPECTED_DURATION}s, actual=${ACTUAL_DURATION}s, diff=${DURATION_DIFF}s"
+    log_info "Benchmark timing: expected=${EXPECTED_DURATION}s, actual=${ACTUAL_DURATION}s, diff=${DURATION_DIFF}s" >&2
     if [[ $DURATION_DIFF -gt 60 ]]; then
-        log_warn "Benchmark ran ${DURATION_DIFF}s longer than expected (>1min overhead)"
+        log_warn "Benchmark ran ${DURATION_DIFF}s longer than expected (>1min overhead)" >&2
     fi
 
-    log_ok "Results saved to: $REPORT_DIR/"
+    log_ok "Results saved to: $REPORT_DIR/" >&2
 
+    # Return the report directory path (only stdout that gets captured by $())
     echo "$REPORT_DIR"
 }
 
