@@ -191,8 +191,16 @@ seastar::future<> GossipTransport::send(const seastar::socket_address& peer,
 
 seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_address>& peers,
                                               const std::vector<uint8_t>& data) {
-    if (!_dtls_context || !_dtls_context->is_enabled() || peers.empty() || !_channel) {
+    if (peers.empty() || !_channel) {
         return seastar::make_ready_future<>();
+    }
+
+    // Plaintext mode - use parallel_for_each with send()
+    if (!_dtls_context || !_dtls_context->is_enabled()) {
+        auto plaintext_copy = std::make_shared<std::vector<uint8_t>>(data);
+        return seastar::parallel_for_each(peers, [this, plaintext_copy](const seastar::socket_address& peer) {
+            return send(peer, *plaintext_copy);
+        });
     }
 
     // For high fan-out broadcasts, use seastar::async to batch the crypto work
