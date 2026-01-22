@@ -37,6 +37,28 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ---
 
+## 📊 Benchmark Results
+
+Real-world results from 8x A100 40GB with Llama-3.1-8B-Instruct:
+
+| Metric | Round-Robin | Prefix-Aware |
+|--------|-------------|--------------|
+| Cache Hit Rate | 12.7% | **98.0%** |
+| XLarge (4K-8K tokens) TTFT Improvement | ~0% | **~24%** |
+| Failure Rate | 25.2% | **18.4%** |
+
+**Best suited for:**
+- RAG applications with shared context documents
+- Multi-turn chat with large system prompts
+- Few-shot learning with shared examples
+- Any workload with 2K+ token shared prefixes
+
+> **Note:** Benefits scale with prefix size and model size. Use 8B+ parameter models for meaningful KV cache improvements. Small prefixes (<500 tokens) see minimal benefit.
+
+See [Benchmark Guide](docs/benchmark-guide-8xA100.md) for detailed methodology and results.
+
+---
+
 ## 🛠️ Configuration
 Ranvier maps generic HTTP endpoints to specific Tokenizer/Model backends.
 
