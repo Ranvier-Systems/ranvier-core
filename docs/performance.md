@@ -262,7 +262,6 @@ For production LLM workloads with large context windows, see our [detailed bench
 
 - **7.8x better cache hit rate** with prefix-affinity routing (12.7% → 98%)
 - **24% TTFT improvement** for XLarge prefixes (4K-8K tokens) when cache is hit
-- **32% fewer failures** under load (25.2% → 18.4% failure rate)
 - **Model size matters**: 1B models show ~0% improvement; 8B+ recommended for meaningful cache benefits
 - **Small prefix overhead**: Routing cost exceeds cache benefit for <500 token prefixes
 

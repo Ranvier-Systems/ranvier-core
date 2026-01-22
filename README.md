@@ -43,9 +43,9 @@ Real-world results from 8x A100 40GB with Llama-3.1-8B-Instruct:
 
 | Metric | Round-Robin | Prefix-Aware |
 |--------|-------------|--------------|
-| Cache Hit Rate | 12.7% | **98.0%** |
-| XLarge (4K-8K tokens) TTFT Improvement | ~0% | **~24%** |
-| Failure Rate | 25.2% | **18.4%** |
+| Cache Hit Rate | ~12.5% | **~98%** |
+| XLarge TTFT (4K-8K tokens) | ~444ms (hit ≈ miss) | **~500ms hit, ~625ms miss** |
+| XLarge TTFT Improvement | ~0% | **~24%** |
 
 **Best suited for:**
 - RAG applications with shared context documents
