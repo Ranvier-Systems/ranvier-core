@@ -83,10 +83,14 @@ class BenchmarkResults:
 
     # Per-bucket TTFT (real benchmarks only)
     ttft_large_hit_p50_ms: Optional[float] = None
+    ttft_large_hit_p99_ms: Optional[float] = None
     ttft_large_miss_p50_ms: Optional[float] = None
+    ttft_large_miss_p99_ms: Optional[float] = None
     ttft_large_improvement_pct: Optional[float] = None
     ttft_xlarge_hit_p50_ms: Optional[float] = None
+    ttft_xlarge_hit_p99_ms: Optional[float] = None
     ttft_xlarge_miss_p50_ms: Optional[float] = None
+    ttft_xlarge_miss_p99_ms: Optional[float] = None
     ttft_xlarge_improvement_pct: Optional[float] = None
 
     # Standard Locust metrics
@@ -237,11 +241,15 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
                 b = bucket_stats[bucket_name]
                 if bucket_name == "large":
                     results["ttft_large_hit_p50_ms"] = b.get("cache_hit_ttft_p50_ms")
+                    results["ttft_large_hit_p99_ms"] = b.get("cache_hit_ttft_p99_ms")
                     results["ttft_large_miss_p50_ms"] = b.get("cache_miss_ttft_p50_ms")
+                    results["ttft_large_miss_p99_ms"] = b.get("cache_miss_ttft_p99_ms")
                     results["ttft_large_improvement_pct"] = b.get("ttft_improvement_pct")
                 elif bucket_name == "xlarge":
                     results["ttft_xlarge_hit_p50_ms"] = b.get("cache_hit_ttft_p50_ms")
+                    results["ttft_xlarge_hit_p99_ms"] = b.get("cache_hit_ttft_p99_ms")
                     results["ttft_xlarge_miss_p50_ms"] = b.get("cache_miss_ttft_p50_ms")
+                    results["ttft_xlarge_miss_p99_ms"] = b.get("cache_miss_ttft_p99_ms")
                     results["ttft_xlarge_improvement_pct"] = b.get("ttft_improvement_pct")
 
     except json.JSONDecodeError:
@@ -506,11 +514,15 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         # Per-bucket stats from JSON (priority source)
         if json_stats.get("ttft_large_hit_p50_ms"):
             results.ttft_large_hit_p50_ms = json_stats["ttft_large_hit_p50_ms"]
+            results.ttft_large_hit_p99_ms = json_stats.get("ttft_large_hit_p99_ms")
             results.ttft_large_miss_p50_ms = json_stats.get("ttft_large_miss_p50_ms")
+            results.ttft_large_miss_p99_ms = json_stats.get("ttft_large_miss_p99_ms")
             results.ttft_large_improvement_pct = json_stats.get("ttft_large_improvement_pct")
         if json_stats.get("ttft_xlarge_hit_p50_ms"):
             results.ttft_xlarge_hit_p50_ms = json_stats["ttft_xlarge_hit_p50_ms"]
+            results.ttft_xlarge_hit_p99_ms = json_stats.get("ttft_xlarge_hit_p99_ms")
             results.ttft_xlarge_miss_p50_ms = json_stats.get("ttft_xlarge_miss_p50_ms")
+            results.ttft_xlarge_miss_p99_ms = json_stats.get("ttft_xlarge_miss_p99_ms")
             results.ttft_xlarge_improvement_pct = json_stats.get("ttft_xlarge_improvement_pct")
 
         # Parse text-based cache stats (fallback/override for JSON)
@@ -539,14 +551,22 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         bucket_stats = parse_bucket_ttft(content)
         if bucket_stats.get("ttft_large_hit_p50_ms") and not results.ttft_large_hit_p50_ms:
             results.ttft_large_hit_p50_ms = bucket_stats["ttft_large_hit_p50_ms"]
+        if bucket_stats.get("ttft_large_hit_p99_ms") and not results.ttft_large_hit_p99_ms:
+            results.ttft_large_hit_p99_ms = bucket_stats["ttft_large_hit_p99_ms"]
         if bucket_stats.get("ttft_large_miss_p50_ms") and not results.ttft_large_miss_p50_ms:
             results.ttft_large_miss_p50_ms = bucket_stats["ttft_large_miss_p50_ms"]
+        if bucket_stats.get("ttft_large_miss_p99_ms") and not results.ttft_large_miss_p99_ms:
+            results.ttft_large_miss_p99_ms = bucket_stats["ttft_large_miss_p99_ms"]
         if bucket_stats.get("ttft_large_improvement_pct") and not results.ttft_large_improvement_pct:
             results.ttft_large_improvement_pct = bucket_stats["ttft_large_improvement_pct"]
         if bucket_stats.get("ttft_xlarge_hit_p50_ms") and not results.ttft_xlarge_hit_p50_ms:
             results.ttft_xlarge_hit_p50_ms = bucket_stats["ttft_xlarge_hit_p50_ms"]
+        if bucket_stats.get("ttft_xlarge_hit_p99_ms") and not results.ttft_xlarge_hit_p99_ms:
+            results.ttft_xlarge_hit_p99_ms = bucket_stats["ttft_xlarge_hit_p99_ms"]
         if bucket_stats.get("ttft_xlarge_miss_p50_ms") and not results.ttft_xlarge_miss_p50_ms:
             results.ttft_xlarge_miss_p50_ms = bucket_stats["ttft_xlarge_miss_p50_ms"]
+        if bucket_stats.get("ttft_xlarge_miss_p99_ms") and not results.ttft_xlarge_miss_p99_ms:
+            results.ttft_xlarge_miss_p99_ms = bucket_stats["ttft_xlarge_miss_p99_ms"]
         if bucket_stats.get("ttft_xlarge_improvement_pct") and not results.ttft_xlarge_improvement_pct:
             results.ttft_xlarge_improvement_pct = bucket_stats["ttft_xlarge_improvement_pct"]
 
@@ -828,10 +848,14 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     # (key, display_name, lower_is_better, is_improvement_pct)
     bucket_metrics = [
         ("ttft_large_hit_p50_ms", "Large Hit P50 (ms)", True, False),
+        ("ttft_large_hit_p99_ms", "Large Hit P99 (ms)", True, False),
         ("ttft_large_miss_p50_ms", "Large Miss P50 (ms)", True, False),
+        ("ttft_large_miss_p99_ms", "Large Miss P99 (ms)", True, False),
         ("ttft_large_improvement_pct", "Large Improvement (%)", False, True),
         ("ttft_xlarge_hit_p50_ms", "XLarge Hit P50 (ms)", True, False),
+        ("ttft_xlarge_hit_p99_ms", "XLarge Hit P99 (ms)", True, False),
         ("ttft_xlarge_miss_p50_ms", "XLarge Miss P50 (ms)", True, False),
+        ("ttft_xlarge_miss_p99_ms", "XLarge Miss P99 (ms)", True, False),
         ("ttft_xlarge_improvement_pct", "XLarge Improvement (%)", False, True),
     ]
 

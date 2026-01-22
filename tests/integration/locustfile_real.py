@@ -2317,7 +2317,9 @@ class BenchmarkStats:
                             "ttft_min_ms": min(all_ttft) if all_ttft else None,
                             "ttft_max_ms": max(all_ttft) if all_ttft else None,
                             "cache_hit_ttft_p50_ms": self._percentile(hit_ttft, 0.50) if hit_ttft else None,
+                            "cache_hit_ttft_p99_ms": self._percentile(hit_ttft, 0.99) if hit_ttft else None,
                             "cache_miss_ttft_p50_ms": self._percentile(miss_ttft, 0.50) if miss_ttft else None,
+                            "cache_miss_ttft_p99_ms": self._percentile(miss_ttft, 0.99) if miss_ttft else None,
                             "cache_hit_count": len(hit_ttft),
                             "cache_miss_count": len(miss_ttft),
                         }
