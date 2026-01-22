@@ -473,8 +473,20 @@ Prefix Ratio: 0.9
 ### Value Proposition
 
 For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
-- **24% faster TTFT** on 4K-8K token prefixes
-- **98% cache hit rate** vs 12.5% with round-robin
+
+#### Performance by Load Level
+
+| Load | Users | XLarge TTFT Improvement | P99 TTFT Change | Cache Hit Rate |
+|------|-------|-------------------------|-----------------|----------------|
+| **Normal** (1-2 req/GPU) | 10 | **42.7%** | -36.5% | 95.6% |
+| **Heavy** (3+ req/GPU) | 30 | **23.7%** | -22.0% | 98.0% |
+
+**Why the difference?** Under heavy load, requests queue on GPUs with popular prefixes, partially masking cache benefits. Under normal load, cache hits translate directly to faster TTFT without queuing delays.
+
+**Key takeaways:**
+- **Well-provisioned systems** (1-2 req/GPU): Expect ~43% TTFT improvement
+- **Overloaded systems** (3+ req/GPU): Still ~24% improvement despite queuing
+- **Cache hit rate** is excellent (95%+) regardless of load
 - Benefits increase with larger models (70B expected 40-60% improvement)
 
 ---
