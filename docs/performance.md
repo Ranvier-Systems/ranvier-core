@@ -69,15 +69,16 @@ The streaming response path uses optimized buffer management to minimize allocat
 
 > ⚠️ **Note:** These results are from mock backend tests used for integration testing. They demonstrate routing correctness, not real-world LLM performance.
 
-#### Real vLLM Backend (8x A100 40GB, Llama-3.1-8B)
+#### Real vLLM Backend (8x A100 40GB)
 
-| Prefix Size | Cache Miss | Cache Hit | Improvement |
-|-------------|------------|-----------|-------------|
-| Tiny (<100 tokens) | ~387ms | ~379ms | ~2% |
-| Small (100-500) | ~394ms | ~435ms | -10% (overhead) |
-| **XLarge (4K-8K tokens)** | **~655ms** | **~499ms** | **~24%** |
+| Model | Prefix Size | Cache Miss | Cache Hit | Improvement |
+|-------|-------------|------------|-----------|-------------|
+| Llama-3.1-8B | Tiny (<100 tokens) | ~387ms | ~379ms | ~2% |
+| Llama-3.1-8B | Small (100-500) | ~394ms | ~435ms | -10% (overhead) |
+| Llama-3.1-8B | XLarge (4K-8K tokens) | ~655ms | ~499ms | **~24%** |
+| **CodeLlama-13b** | XLarge (4K-8K tokens) | ~1575ms | ~816ms | **~48%** |
 
-**Key insight**: Real-world improvement scales with prefix size. Large prefixes (4K+ tokens) show meaningful TTFT reduction. Small prefixes have routing overhead that exceeds cache benefit.
+**Key insight**: Real-world improvement scales with prefix size and model size. Large prefixes (4K+ tokens) show meaningful TTFT reduction. Larger models (13B+) benefit more because prefill computation is more expensive.
 
 ---
 
@@ -251,21 +252,23 @@ avg(ranvier_radix_tree_average_prefix_skip_length)
 
 For production LLM workloads with large context windows, see our [detailed benchmark guide](benchmark-guide-8xA100.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B-Instruct.
 
-### Summary Results (8x A100 40GB, Llama-3.1-8B, stress distribution)
+### Summary Results (8x A100 40GB, stress distribution)
 
-### Performance by Load Level
+### Performance by Model Size
 
-| Load | Users | XLarge TTFT Improvement | P99 TTFT Change | Cache Hit Rate |
-|------|-------|-------------------------|-----------------|----------------|
-| **Normal** (1-2 req/GPU) | 10 | **42.7%** | -36.5% | 95.6% |
-| **Heavy** (3+ req/GPU) | 30 | **23.7%** | -22.0% | 98.0% |
+| Model | Users | XLarge TTFT Improvement | Cache Hit Rate |
+|-------|-------|-------------------------|----------------|
+| **CodeLlama-13b** | 10 | **48.2%** | 96.4% |
+| Llama-3.1-8B | 10 | 42.7% | 95.6% |
+| Llama-3.1-8B | 30 | 23.7% | 98.0% |
 
-Under heavy load, requests queue on GPUs with popular prefixes, partially masking cache benefits. Under normal load, cache hits translate directly to faster TTFT.
+Larger models benefit more from prefix caching because prefill computation is more expensive. Under heavy load, requests queue on GPUs with popular prefixes, partially masking cache benefits.
 
 ### Key Findings
 
 - **7.8x better cache hit rate** with prefix-affinity routing (12.7% → 98%)
-- **24-43% TTFT improvement** for XLarge prefixes (4K-8K tokens) depending on load
+- **24-48% TTFT improvement** for XLarge prefixes (4K-8K tokens) depending on model size and load
+- **Larger models = bigger improvement**: 13B shows 48% vs 43% for 8B under same conditions
 - **Model size matters**: 1B models show ~0% improvement; 8B+ recommended for meaningful cache benefits
 - **Small prefix overhead**: Routing cost exceeds cache benefit for <500 token prefixes
 
