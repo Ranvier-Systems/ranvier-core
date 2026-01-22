@@ -172,6 +172,8 @@ BENCHMARK OPTIONS:
     --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
     --output-dir DIR    Custom output directory (default: benchmark-reports)
     --client-tokenize   Tokenize on client (locust) instead of Ranvier server
+    --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
+                        Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
 
 EXTERNAL VLLM OPTIONS:
     --skip-vllm             Don't start vLLM (use existing endpoints)
@@ -342,6 +344,7 @@ while [[ $# -gt 0 ]]; do
         --log-all)        LOG_ALL=true; shift ;;  # Kept for backwards compatibility (now default)
         --no-log)         LOG_ALL=false; shift ;;
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
+        --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -750,6 +753,7 @@ if [[ "$SKIP_VLLM" = false ]]; then
             --enable-prefix-caching \
             --gpu-memory-utilization 0.85 \
             --disable-frontend-multiprocessing \
+            ${MAX_MODEL_LEN:+--max-model-len "$MAX_MODEL_LEN"} \
             > "$LOG_FILE" 2>&1 &
 
         VLLM_PIDS+=($!)
