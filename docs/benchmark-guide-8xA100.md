@@ -454,7 +454,6 @@ Prefix Ratio: 0.9
 | Cache Hit Rate | 12.7% | 98.0% | **+85.3%** |
 | Cache Hits | 713 | 5,532 | +676% |
 | Cache Misses | 4,908 | 111 | -97.7% |
-| Failure Rate | 25.2% | 18.4% | -27% better |
 
 ### Per-Bucket TTFT Improvement (The Key Metric)
 
@@ -469,15 +468,13 @@ Prefix Ratio: 0.9
 1. **Cache hit rate is the headline**: 12.7% → 98.0% means nearly every request benefits from cached KV
 2. **Large prefixes show real TTFT improvement**: 24% faster time-to-first-token
 3. **Small prefixes have overhead**: Routing cost exceeds minimal cache benefit
-4. **Failure rate decreased**: More stable under load with prefix routing
-5. **Overall TTFT may look flat**: Small prefix overhead dilutes large prefix gains in aggregate
+4. **Overall TTFT may look flat**: Small prefix overhead dilutes large prefix gains in aggregate
 
 ### Value Proposition
 
 For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 - **24% faster TTFT** on 4K-8K token prefixes
 - **98% cache hit rate** vs 12.5% with round-robin
-- **32% fewer failures** under load
 - Benefits increase with larger models (70B expected 40-60% improvement)
 
 ---
