@@ -743,22 +743,17 @@ def format_change(
     diff = new - baseline
 
     # Special handling for improvement percentages (e.g., TTFT improvement)
-    # Going from negative to positive improvement is always BETTER
+    # Show percentage point change, not percent-of-percent
     if is_improvement_pct:
-        if baseline < 0 and new > 0:
-            # Went from negative improvement to positive - definitely better
-            return f"+{diff:.2f} (BETTER)"
-        elif baseline > 0 and new < 0:
-            # Went from positive improvement to negative - definitely worse
-            return f"{diff:.2f} (WORSE)"
-        elif abs(baseline) < 0.1:
-            # Baseline near zero - avoid division, just show absolute change
-            if new > baseline + 1:
-                return f"+{diff:.2f} (BETTER)"
-            elif new < baseline - 1:
-                return f"{diff:.2f} (WORSE)"
-            else:
-                return f"{diff:+.2f} (SAME)"
+        sign = "+" if diff > 0 else ""
+        # Determine if change is better/worse (higher improvement % is better)
+        if diff > 1:
+            indicator = "BETTER"
+        elif diff < -1:
+            indicator = "WORSE"
+        else:
+            indicator = "SAME"
+        return f"{sign}{diff:.2f}pp ({indicator})"
 
     if baseline == 0:
         if new == 0:
