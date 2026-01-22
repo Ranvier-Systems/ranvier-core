@@ -35,7 +35,9 @@ set -e
 # -----------------------------------------------------------------------------
 
 # Defaults
-DEFAULT_MODEL="meta-llama/Llama-3.2-1B-Instruct"
+# Note: 8B model recommended for meaningful KV cache benchmarks
+# 1B models are too small to show cache benefits (prefill is already fast)
+DEFAULT_MODEL="meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DURATION="5m"
 DEFAULT_USERS="10"
 DEFAULT_SPAWN_RATE="2"
