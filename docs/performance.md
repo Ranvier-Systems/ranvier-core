@@ -60,12 +60,24 @@ The streaming response path uses optimized buffer management to minimize allocat
 
 ### Cache Hit vs. Miss Latency
 
+#### Mock Backend (Integration Tests)
+
 | Scenario | Avg Latency | P99 Latency | Notes |
 |----------|-------------|-------------|-------|
-| Cache Hit (Prefix Match) | ~18ms | ~25ms | Route directly to backend with hot KV-cache |
-| Cache Miss (Random) | ~500ms | ~520ms | Full prefill required on backend |
+| Cache Hit (Prefix Match) | ~18ms | ~25ms | Mock backend with simulated delay |
+| Cache Miss (Random) | ~500ms | ~520ms | Mock backend with 500ms delay |
 
-**Speedup Factor**: Cache hits achieve approximately **28x lower latency** compared to cache misses.
+> ⚠️ **Note:** These results are from mock backend tests used for integration testing. They demonstrate routing correctness, not real-world LLM performance.
+
+#### Real vLLM Backend (8x A100 40GB, Llama-3.1-8B)
+
+| Prefix Size | Cache Miss | Cache Hit | Improvement |
+|-------------|------------|-----------|-------------|
+| Tiny (<100 tokens) | ~387ms | ~379ms | ~2% |
+| Small (100-500) | ~394ms | ~435ms | -10% (overhead) |
+| **XLarge (4K-8K tokens)** | **~655ms** | **~499ms** | **~24%** |
+
+**Key insight**: Real-world improvement scales with prefix size. Large prefixes (4K+ tokens) show meaningful TTFT reduction. Small prefixes have routing overhead that exceeds cache benefit.
 
 ---
 
@@ -237,21 +249,22 @@ avg(ranvier_radix_tree_average_prefix_skip_length)
 
 ## Large-Prefix KV Cache Benchmark
 
-For production LLM workloads with large context windows, see our [detailed benchmark](benchmarks/kv-cache-prefix-routing-benchmark.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B-Instruct.
+For production LLM workloads with large context windows, see our [detailed benchmark guide](benchmark-guide-8xA100.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B-Instruct.
 
-### Summary Results (2000-8000 token prefixes)
+### Summary Results (8x A100 40GB, Llama-3.1-8B, stress distribution)
 
-| Routing Mode | Cache Hit Rate | TTFT P50 (hit) | TTFT P99 (hit) |
-|--------------|----------------|----------------|----------------|
-| Round-Robin | 14.5% | 433.8ms | 925.1ms |
-| **Prefix-Affinity** | **94.1%** | **433.5ms** | **487.4ms** |
+| Routing Mode | Cache Hit Rate | XLarge TTFT (hit) | XLarge TTFT (miss) | Improvement |
+|--------------|----------------|-------------------|--------------------| ------------|
+| Round-Robin | 12.7% | ~445ms | ~444ms | ~0% |
+| **Prefix-Affinity** | **98.0%** | **~499ms** | **~655ms** | **~24%** |
 
 ### Key Findings
 
-- **6.5x better cache hit rate** with prefix-affinity routing
-- **47% lower P99 tail latency** for cache hits
-- **37% TTFT improvement** for XLarge prefixes (4-8K tokens)
-- **7% higher throughput** overall (847 vs 800 requests/5min)
+- **7.8x better cache hit rate** with prefix-affinity routing (12.7% → 98%)
+- **24% TTFT improvement** for XLarge prefixes (4K-8K tokens) when cache is hit
+- **32% fewer failures** under load (25.2% → 18.4% failure rate)
+- **Model size matters**: 1B models show ~0% improvement; 8B+ recommended for meaningful cache benefits
+- **Small prefix overhead**: Routing cost exceeds cache benefit for <500 token prefixes
 
 ### Routing Modes
 
