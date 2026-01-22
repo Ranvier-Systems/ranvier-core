@@ -253,15 +253,19 @@ For production LLM workloads with large context windows, see our [detailed bench
 
 ### Summary Results (8x A100 40GB, Llama-3.1-8B, stress distribution)
 
-| Routing Mode | Cache Hit Rate | XLarge TTFT (hit) | XLarge TTFT (miss) | Improvement |
-|--------------|----------------|-------------------|--------------------| ------------|
-| Round-Robin | 12.7% | ~445ms | ~444ms | ~0% |
-| **Prefix-Affinity** | **98.0%** | **~499ms** | **~655ms** | **~24%** |
+### Performance by Load Level
+
+| Load | Users | XLarge TTFT Improvement | P99 TTFT Change | Cache Hit Rate |
+|------|-------|-------------------------|-----------------|----------------|
+| **Normal** (1-2 req/GPU) | 10 | **42.7%** | -36.5% | 95.6% |
+| **Heavy** (3+ req/GPU) | 30 | **23.7%** | -22.0% | 98.0% |
+
+Under heavy load, requests queue on GPUs with popular prefixes, partially masking cache benefits. Under normal load, cache hits translate directly to faster TTFT.
 
 ### Key Findings
 
 - **7.8x better cache hit rate** with prefix-affinity routing (12.7% → 98%)
-- **24% TTFT improvement** for XLarge prefixes (4K-8K tokens) when cache is hit
+- **24-43% TTFT improvement** for XLarge prefixes (4K-8K tokens) depending on load
 - **Model size matters**: 1B models show ~0% improvement; 8B+ recommended for meaningful cache benefits
 - **Small prefix overhead**: Routing cost exceeds cache benefit for <500 token prefixes
 

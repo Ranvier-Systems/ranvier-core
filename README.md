@@ -41,11 +41,14 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 Real-world results from 8x A100 40GB with Llama-3.1-8B-Instruct:
 
-| Metric | Round-Robin | Prefix-Aware |
-|--------|-------------|--------------|
-| Cache Hit Rate | ~12.5% | **~98%** |
-| XLarge TTFT (4K-8K tokens) | ~444ms (hit ≈ miss) | **~500ms hit, ~625ms miss** |
-| XLarge TTFT Improvement | ~0% | **~24%** |
+### Performance by Load Level
+
+| Load | Users | XLarge TTFT Improvement | P99 TTFT Change | Cache Hit Rate |
+|------|-------|-------------------------|-----------------|----------------|
+| **Normal** (1-2 req/GPU) | 10 | **42.7%** | -36.5% | 95.6% |
+| **Heavy** (3+ req/GPU) | 30 | **23.7%** | -22.0% | 98.0% |
+
+**Why the difference?** Under heavy load, requests queue on popular-prefix GPUs, partially masking cache benefits. Under normal load, cache hits translate directly to faster TTFT.
 
 **Best suited for:**
 - RAG applications with shared context documents
