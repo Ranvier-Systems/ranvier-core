@@ -322,7 +322,19 @@ tail -f /tmp/vllm_gpu*.log
 
 **Expected:** Good balance of speed and quality. Recommended for most tests.
 
-#### 6c. Large Model (70B parameters)
+#### 6c. Code Model (13B parameters)
+```bash
+./scripts/bench.sh \
+  --model meta-llama/CodeLlama-13b-Instruct-hf \
+  --duration 10m \
+  --users 10 \
+  --max-model-len 8192 \
+  --prompt-dist stress
+```
+
+**Expected:** Higher cache benefit than 8B (~48% TTFT improvement). Requires `--max-model-len 8192` on 40GB GPUs to fit in memory. Use fewer users (10) due to slower inference.
+
+#### 6d. Large Model (70B parameters)
 ```bash
 ./scripts/bench.sh \
   --model meta-llama/Llama-3.1-70B-Instruct \
@@ -398,21 +410,21 @@ grep "Cache" benchmark-reports/*/benchmark.log
 
 ### TTFT (Time To First Token)
 
-Real-world results from 8x A100 40GB benchmarks (stress distribution, 30 users):
+Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
-| Model | Prefix Size | Cache Miss | Cache Hit | Improvement |
-|-------|-------------|------------|-----------|-------------|
-| 1B | XLarge (4-8K tokens) | ~130ms | ~130ms | **~0%** |
-| 8B | Tiny (<100 tokens) | ~387ms | ~379ms | ~2% |
-| 8B | Small (100-500) | ~394ms | ~435ms | -10% (overhead) |
-| 8B | XLarge (4-8K tokens) | ~655ms | ~499ms | **~24%** |
-| 70B | XLarge (4-8K tokens) | TBD | TBD | Expected 40-60% |
+| Model | Users | Prefix Size | Cache Miss | Cache Hit | Improvement |
+|-------|-------|-------------|------------|-----------|-------------|
+| 1B | 30 | XLarge (4-8K tokens) | ~130ms | ~130ms | **~0%** |
+| 8B | 30 | XLarge (4-8K tokens) | ~655ms | ~499ms | **~24%** |
+| 8B | 10 | XLarge (4-8K tokens) | ~580ms | ~333ms | **~43%** |
+| **13B** | 10 | XLarge (4-8K tokens) | ~1575ms | ~816ms | **~48%** |
+| 70B | - | XLarge (4-8K tokens) | TBD | TBD | Expected 50-60% |
 
 **Key insights:**
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
 - **Small prefixes have overhead** — Routing cost exceeds cache benefit
-- **Large prefixes (4K+ tokens) show real improvement** — 24% TTFT reduction
-- **Larger models amplify benefits** — 70B expected to show 40-60% improvement
+- **Large prefixes (4K+ tokens) show real improvement** — 24-48% TTFT reduction
+- **Larger models amplify benefits** — 13B shows 48% vs 43% for 8B under same load
 
 ### Cache Hit Rate
 
@@ -474,20 +486,21 @@ Prefix Ratio: 0.9
 
 For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
-#### Performance by Load Level
+#### Performance by Model Size and Load
 
-| Load | Users | XLarge TTFT Improvement | P99 TTFT Change | Cache Hit Rate |
-|------|-------|-------------------------|-----------------|----------------|
-| **Normal** (1-2 req/GPU) | 10 | **42.7%** | -36.5% | 95.6% |
-| **Heavy** (3+ req/GPU) | 30 | **23.7%** | -22.0% | 98.0% |
+| Model | Load | Users | XLarge TTFT Improvement | Cache Hit Rate |
+|-------|------|-------|-------------------------|----------------|
+| **CodeLlama-13b** | Normal | 10 | **48.2%** | 96.4% |
+| Llama-3.1-8B | Normal | 10 | 42.7% | 95.6% |
+| Llama-3.1-8B | Heavy | 30 | 23.7% | 98.0% |
 
-**Why the difference?** Under heavy load, requests queue on GPUs with popular prefixes, partially masking cache benefits. Under normal load, cache hits translate directly to faster TTFT without queuing delays.
+**Why larger models benefit more:** Prefill computation scales with model parameters. A 13B model has ~1.6x the compute per prefill token compared to 8B, so cache hits save proportionally more time.
 
 **Key takeaways:**
-- **Well-provisioned systems** (1-2 req/GPU): Expect ~43% TTFT improvement
-- **Overloaded systems** (3+ req/GPU): Still ~24% improvement despite queuing
-- **Cache hit rate** is excellent (95%+) regardless of load
-- Benefits increase with larger models (70B expected 40-60% improvement)
+- **Larger models** see bigger improvements (48% for 13B vs 43% for 8B)
+- **Well-provisioned systems** (1-2 req/GPU): Best results
+- **Overloaded systems** (3+ req/GPU): Still significant improvement despite queuing
+- **Cache hit rate** is excellent (95%+) regardless of load or model size
 
 ---
 

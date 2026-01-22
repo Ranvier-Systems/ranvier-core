@@ -39,16 +39,17 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ## 📊 Benchmark Results
 
-Real-world results from 8x A100 40GB with Llama-3.1-8B-Instruct:
+Real-world results from 8x A100 40GB:
 
-### Performance by Load Level
+### Performance by Model Size
 
-| Load | Users | XLarge TTFT Improvement | P99 TTFT Change | Cache Hit Rate |
-|------|-------|-------------------------|-----------------|----------------|
-| **Normal** (1-2 req/GPU) | 10 | **42.7%** | -36.5% | 95.6% |
-| **Heavy** (3+ req/GPU) | 30 | **23.7%** | -22.0% | 98.0% |
+| Model | Users | XLarge TTFT Improvement | Cache Hit Rate | Notes |
+|-------|-------|-------------------------|----------------|-------|
+| **CodeLlama-13b** | 10 | **48.2%** | 96.4% | Larger model = bigger improvement |
+| Llama-3.1-8B | 10 | 42.7% | 95.6% | Normal load (1-2 req/GPU) |
+| Llama-3.1-8B | 30 | 23.7% | 98.0% | Heavy load (3+ req/GPU) |
 
-**Why the difference?** Under heavy load, requests queue on popular-prefix GPUs, partially masking cache benefits. Under normal load, cache hits translate directly to faster TTFT.
+**Key insight:** Larger models benefit more from prefix caching because prefill computation is more expensive. The 13B model shows 48% TTFT improvement vs 43% for 8B under equivalent load.
 
 **Best suited for:**
 - RAG applications with shared context documents
