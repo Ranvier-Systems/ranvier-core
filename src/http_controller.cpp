@@ -775,8 +775,18 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     // Timing: capture tokenization start
     auto tokenization_start = std::chrono::steady_clock::now();
 
-    // Start tokenization span
-    {
+    // OPTIMIZATION: Skip tokenization entirely in RANDOM routing mode
+    // Random routing ignores tokens completely, so tokenization is wasted work.
+    // This saves ~5-6ms per request (Rust FFI + HuggingFace tokenizer overhead).
+    bool tokenization_skipped = _config.is_random_mode();
+    if (tokenization_skipped) {
+        // Skip tokenization - tokens remain empty, router will use random backend selection
+        metrics().record_tokenization_skipped();
+        log_proxy.debug("[{}] Skipping tokenization (random routing mode)", request_id);
+    }
+
+    // Start tokenization span (only do actual work if not in random mode)
+    if (!tokenization_skipped) {
         auto tokenize_span = TracingService::start_child_span("ranvier.tokenize");
 
         // First, check if client provided pre-tokenized prompt_token_ids
@@ -848,7 +858,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                 }
             }
         }
-    } // tokenize_span ends here
+    } // tokenization block ends here (tokenize_span goes out of scope)
 
     // Timing: record tokenization latency
     auto tokenization_end = std::chrono::steady_clock::now();
