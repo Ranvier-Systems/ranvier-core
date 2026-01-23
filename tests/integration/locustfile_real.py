@@ -2409,67 +2409,167 @@ def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
         return None
 
 
+def get_histogram_percentile(metrics_url: str, metric_name: str, percentile: float) -> Optional[float]:
+    """Calculate percentile from Prometheus histogram buckets using linear interpolation.
+
+    Reference: https://prometheus.io/docs/practices/histograms/#quantiles
+
+    Args:
+        metrics_url: Base URL for Prometheus metrics endpoint
+        metric_name: Name of the histogram metric (without _bucket suffix)
+        percentile: Percentile to calculate (0.0 to 1.0, e.g., 0.5 for P50, 0.99 for P99)
+
+    Returns:
+        Estimated percentile value, or None if calculation fails
+    """
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        # Parse bucket data: metric_name_bucket{le="X"} value
+        # Buckets are cumulative counts up to boundary le
+        buckets = []  # List of (upper_bound, cumulative_count)
+
+        bucket_pattern = re.compile(
+            rf'{metric_name}_bucket\{{le="([^"]+)"\}}\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+        )
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            match = bucket_pattern.search(line)
+            if match:
+                le_str = match.group(1)
+                count = float(match.group(2))
+                # Handle +Inf bucket
+                if le_str == "+Inf":
+                    upper_bound = float("inf")
+                else:
+                    upper_bound = float(le_str)
+                buckets.append((upper_bound, count))
+
+        if not buckets:
+            return None
+
+        # Sort buckets by upper bound
+        buckets.sort(key=lambda x: x[0])
+
+        # Get total count from +Inf bucket
+        total_count = buckets[-1][1] if buckets else 0
+        if total_count == 0:
+            return None
+
+        # Target count for the percentile
+        target_count = percentile * total_count
+
+        # Find the bucket where cumulative count crosses the target
+        prev_bound = 0.0
+        prev_count = 0.0
+
+        for upper_bound, cumulative_count in buckets:
+            if cumulative_count >= target_count:
+                # Linear interpolation within this bucket
+                # Formula: lower_bound + (upper_bound - lower_bound) * (target - prev_count) / (current - prev_count)
+                if upper_bound == float("inf"):
+                    # Can't interpolate into +Inf bucket, return previous bound
+                    return prev_bound
+                bucket_count = cumulative_count - prev_count
+                if bucket_count == 0:
+                    return prev_bound
+                fraction = (target_count - prev_count) / bucket_count
+                return prev_bound + (upper_bound - prev_bound) * fraction
+            prev_bound = upper_bound
+            prev_count = cumulative_count
+
+        # If we get here, return the highest finite bucket bound
+        for upper_bound, _ in reversed(buckets):
+            if upper_bound != float("inf"):
+                return upper_bound
+        return None
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch histogram percentile from {metrics_url}: {e}")
+        return None
+    except (ValueError, ZeroDivisionError) as e:
+        logger.warning(f"Failed to calculate percentile for {metric_name}: {e}")
+        return None
+
+
 def get_ranvier_latency_breakdown() -> dict:
     """Get Ranvier's internal latency breakdown from Prometheus metrics.
 
-    Returns average latencies in milliseconds for:
-    - routing_latency: Time spent making routing decision
+    Returns P50 and P99 latencies in milliseconds for:
+    - routing_latency: Time spent making routing decision (includes tokenization + ART lookup)
+    - tokenization_latency: Time spent tokenizing the request
+    - art_lookup_latency: Time spent looking up prefix in ART (routing - tokenization)
     - connect_latency: Time to establish backend connection
-    - first_byte_latency: Time to receive first byte from backend (TTFT)
-    - total_latency: Total request processing time
+
+    Note: Percentiles are calculated per-node then averaged across nodes.
+    For accurate global percentiles, you would need histogram aggregation.
     """
     breakdown = {
-        "routing_latency_ms": None,
-        "tokenization_latency_ms": None,
-        "connect_latency_ms": None,
-        "first_byte_latency_ms": None,
-        "total_latency_ms": None,
+        "routing_latency_p50_ms": None,
+        "routing_latency_p99_ms": None,
+        "tokenization_latency_p50_ms": None,
+        "tokenization_latency_p99_ms": None,
+        "art_lookup_latency_p50_ms": None,
+        "art_lookup_latency_p99_ms": None,
+        "connect_latency_p50_ms": None,
+        "connect_latency_p99_ms": None,
     }
 
-    # Aggregate from all nodes
-    routing_sum, routing_count = 0.0, 0
-    tokenization_sum, tokenization_count = 0.0, 0
-    connect_sum, connect_count = 0.0, 0
-    first_byte_sum, first_byte_count = 0.0, 0
-    total_sum, total_count = 0.0, 0
+    # Collect percentiles from all nodes
+    routing_p50_vals, routing_p99_vals = [], []
+    tokenization_p50_vals, tokenization_p99_vals = [], []
+    connect_p50_vals, connect_p99_vals = [], []
 
     for metrics_url in RANVIER_METRICS:
-        routing = get_histogram_avg(metrics_url, "router_routing_latency_seconds")
-        if routing is not None:
-            routing_sum += routing
-            routing_count += 1
+        # Routing latency (includes tokenization + ART lookup)
+        routing_p50 = get_histogram_percentile(metrics_url, "router_routing_latency_seconds", 0.50)
+        routing_p99 = get_histogram_percentile(metrics_url, "router_routing_latency_seconds", 0.99)
+        if routing_p50 is not None:
+            routing_p50_vals.append(routing_p50)
+        if routing_p99 is not None:
+            routing_p99_vals.append(routing_p99)
 
-        tokenization = get_histogram_avg(metrics_url, "router_tokenization_latency_seconds")
-        if tokenization is not None:
-            tokenization_sum += tokenization
-            tokenization_count += 1
+        # Tokenization latency
+        tokenization_p50 = get_histogram_percentile(metrics_url, "router_tokenization_latency_seconds", 0.50)
+        tokenization_p99 = get_histogram_percentile(metrics_url, "router_tokenization_latency_seconds", 0.99)
+        if tokenization_p50 is not None:
+            tokenization_p50_vals.append(tokenization_p50)
+        if tokenization_p99 is not None:
+            tokenization_p99_vals.append(tokenization_p99)
 
-        connect = get_histogram_avg(metrics_url, "backend_connect_duration_seconds")
-        if connect is not None:
-            connect_sum += connect
-            connect_count += 1
-
-        first_byte = get_histogram_avg(metrics_url, "backend_response_duration_seconds")
-        if first_byte is not None:
-            first_byte_sum += first_byte
-            first_byte_count += 1
-
-        total = get_histogram_avg(metrics_url, "router_request_total_latency_seconds")
-        if total is not None:
-            total_sum += total
-            total_count += 1
+        # Backend connect latency
+        connect_p50 = get_histogram_percentile(metrics_url, "backend_connect_duration_seconds", 0.50)
+        connect_p99 = get_histogram_percentile(metrics_url, "backend_connect_duration_seconds", 0.99)
+        if connect_p50 is not None:
+            connect_p50_vals.append(connect_p50)
+        if connect_p99 is not None:
+            connect_p99_vals.append(connect_p99)
 
     # Calculate averages across nodes (convert to ms)
-    if routing_count > 0:
-        breakdown["routing_latency_ms"] = (routing_sum / routing_count) * 1000
-    if tokenization_count > 0:
-        breakdown["tokenization_latency_ms"] = (tokenization_sum / tokenization_count) * 1000
-    if connect_count > 0:
-        breakdown["connect_latency_ms"] = (connect_sum / connect_count) * 1000
-    if first_byte_count > 0:
-        breakdown["first_byte_latency_ms"] = (first_byte_sum / first_byte_count) * 1000
-    if total_count > 0:
-        breakdown["total_latency_ms"] = (total_sum / total_count) * 1000
+    if routing_p50_vals:
+        breakdown["routing_latency_p50_ms"] = (sum(routing_p50_vals) / len(routing_p50_vals)) * 1000
+    if routing_p99_vals:
+        breakdown["routing_latency_p99_ms"] = (sum(routing_p99_vals) / len(routing_p99_vals)) * 1000
+    if tokenization_p50_vals:
+        breakdown["tokenization_latency_p50_ms"] = (sum(tokenization_p50_vals) / len(tokenization_p50_vals)) * 1000
+    if tokenization_p99_vals:
+        breakdown["tokenization_latency_p99_ms"] = (sum(tokenization_p99_vals) / len(tokenization_p99_vals)) * 1000
+    if connect_p50_vals:
+        breakdown["connect_latency_p50_ms"] = (sum(connect_p50_vals) / len(connect_p50_vals)) * 1000
+    if connect_p99_vals:
+        breakdown["connect_latency_p99_ms"] = (sum(connect_p99_vals) / len(connect_p99_vals)) * 1000
+
+    # Calculate ART lookup latency (routing - tokenization)
+    if breakdown["routing_latency_p50_ms"] is not None and breakdown["tokenization_latency_p50_ms"] is not None:
+        art_p50 = breakdown["routing_latency_p50_ms"] - breakdown["tokenization_latency_p50_ms"]
+        breakdown["art_lookup_latency_p50_ms"] = max(0, art_p50)  # Ensure non-negative
+    if breakdown["routing_latency_p99_ms"] is not None and breakdown["tokenization_latency_p99_ms"] is not None:
+        art_p99 = breakdown["routing_latency_p99_ms"] - breakdown["tokenization_latency_p99_ms"]
+        breakdown["art_lookup_latency_p99_ms"] = max(0, art_p99)  # Ensure non-negative
 
     return breakdown
 
@@ -2969,27 +3069,43 @@ def on_test_stop(environment, **kwargs):
     logger.info(f"  Total Completion Tokens: {summary['total_completion_tokens']}")
     logger.info(f"  Tokens/Second: {summary['tokens_per_second']:.1f}")
 
-    # Print Ranvier internal latency breakdown
+    # Print Ranvier internal latency breakdown (P50/P99)
     latency_breakdown = get_ranvier_latency_breakdown()
-    logger.info(f"\nRanvier Latency Breakdown (avg):")
-    if latency_breakdown["routing_latency_ms"] is not None:
-        logger.info(f"  Routing Decision: {latency_breakdown['routing_latency_ms']:.2f}ms")
-    if latency_breakdown["tokenization_latency_ms"] is not None:
-        logger.info(f"    - Tokenization: {latency_breakdown['tokenization_latency_ms']:.2f}ms")
-    if latency_breakdown["connect_latency_ms"] is not None:
-        logger.info(f"  Backend Connect: {latency_breakdown['connect_latency_ms']:.2f}ms")
-    if latency_breakdown["first_byte_latency_ms"] is not None:
-        logger.info(f"  Backend First Byte: {latency_breakdown['first_byte_latency_ms']:.2f}ms")
-    if latency_breakdown["total_latency_ms"] is not None:
-        logger.info(f"  Total Request: {latency_breakdown['total_latency_ms']:.2f}ms")
+    logger.info(f"\nRanvier Latency Breakdown (percentiles):")
+    logger.info(f"  {'Metric':<25} {'P50':>10} {'P99':>10}")
+    logger.info(f"  {'-'*45}")
 
-    # Calculate actual Ranvier overhead (routing + connect)
-    routing = latency_breakdown.get("routing_latency_ms") or 0
-    connect = latency_breakdown.get("connect_latency_ms") or 0
-    if routing > 0 or connect > 0:
-        ranvier_overhead = routing + connect
-        logger.info(f"  Ranvier Overhead: {ranvier_overhead:.2f}ms (routing + connect)")
-        latency_breakdown["ranvier_overhead_ms"] = ranvier_overhead
+    # Routing Decision (total)
+    p50 = latency_breakdown.get("routing_latency_p50_ms")
+    p99 = latency_breakdown.get("routing_latency_p99_ms")
+    if p50 is not None or p99 is not None:
+        p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
+        p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
+        logger.info(f"  {'Routing Decision':<25} {p50_str:>10} {p99_str:>10}")
+
+    # Tokenization (sub-component of routing)
+    p50 = latency_breakdown.get("tokenization_latency_p50_ms")
+    p99 = latency_breakdown.get("tokenization_latency_p99_ms")
+    if p50 is not None or p99 is not None:
+        p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
+        p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
+        logger.info(f"  {'  - Tokenization':<25} {p50_str:>10} {p99_str:>10}")
+
+    # ART Lookup (sub-component of routing)
+    p50 = latency_breakdown.get("art_lookup_latency_p50_ms")
+    p99 = latency_breakdown.get("art_lookup_latency_p99_ms")
+    if p50 is not None or p99 is not None:
+        p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
+        p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
+        logger.info(f"  {'  - ART Lookup':<25} {p50_str:>10} {p99_str:>10}")
+
+    # Backend Connect
+    p50 = latency_breakdown.get("connect_latency_p50_ms")
+    p99 = latency_breakdown.get("connect_latency_p99_ms")
+    if p50 is not None or p99 is not None:
+        p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
+        p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
+        logger.info(f"  {'Backend Connect':<25} {p50_str:>10} {p99_str:>10}")
 
     # Add to summary for JSON output
     summary.update(latency_breakdown)
