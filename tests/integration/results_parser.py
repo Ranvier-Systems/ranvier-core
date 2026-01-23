@@ -83,6 +83,7 @@ class BenchmarkResults:
 
     # Ranvier overhead metrics (from Prometheus)
     routing_latency_ms: Optional[float] = None
+    tokenization_latency_ms: Optional[float] = None
     connect_latency_ms: Optional[float] = None
     ranvier_overhead_ms: Optional[float] = None
 
@@ -227,6 +228,7 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
 
         # Ranvier overhead metrics
         results["routing_latency_ms"] = stats.get("routing_latency_ms")
+        results["tokenization_latency_ms"] = stats.get("tokenization_latency_ms")
         results["connect_latency_ms"] = stats.get("connect_latency_ms")
         results["ranvier_overhead_ms"] = stats.get("ranvier_overhead_ms")
 
@@ -503,6 +505,7 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
 
         # Ranvier overhead metrics
         results.routing_latency_ms = json_stats.get("routing_latency_ms")
+        results.tokenization_latency_ms = json_stats.get("tokenization_latency_ms")
         results.connect_latency_ms = json_stats.get("connect_latency_ms")
         results.ranvier_overhead_ms = json_stats.get("ranvier_overhead_ms")
 
@@ -955,6 +958,7 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
 
         overhead_metrics = [
             ("routing_latency_ms", "Routing Decision (ms)", True),
+            ("tokenization_latency_ms", "  - Tokenization (ms)", True),
             ("connect_latency_ms", "Backend Connect (ms)", True),
             ("ranvier_overhead_ms", "Total Overhead (ms)", True),
         ]
