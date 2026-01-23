@@ -39,13 +39,11 @@ inline std::vector<double> latency_buckets() {
     };
 }
 
-// Optimized routing latency buckets: 10μs to 100ms
-// Designed for microsecond-scale routing decisions
+// Optimized routing latency buckets: 100μs to 100ms
+// Note: Seastar's Prometheus exporter truncates very small values (< 0.0001)
+// to 0.000000, so we start at 100μs to ensure proper bucket boundaries.
 inline std::vector<double> routing_latency_buckets() {
     return {
-        0.00001,  // 10μs
-        0.000025, // 25μs
-        0.00005,  // 50μs
         0.0001,   // 100μs
         0.00025,  // 250μs
         0.0005,   // 500μs

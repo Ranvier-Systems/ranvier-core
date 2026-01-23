@@ -2542,28 +2542,47 @@ def get_ranvier_latency_breakdown() -> dict:
 
     for metrics_url in RANVIER_METRICS:
         # Routing latency (includes tokenization + ART lookup)
-        routing_p50 = get_histogram_percentile(metrics_url, "router_routing_latency_seconds", 0.50)
-        routing_p99 = get_histogram_percentile(metrics_url, "router_routing_latency_seconds", 0.99)
+        # Note: Seastar metrics use "seastar_ranvier_" prefix
+        # Known issue: Seastar truncates small bucket boundaries (10μs) to 0.000000,
+        # making percentile calculation unreliable. Fall back to averages when needed.
+        routing_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_routing_latency_seconds", 0.50)
+        routing_p99 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_routing_latency_seconds", 0.99)
         if routing_p50 is not None:
             routing_p50_vals.append(routing_p50)
-        if routing_p99 is not None:
-            routing_p99_vals.append(routing_p99)
+            if routing_p99 is not None:
+                routing_p99_vals.append(routing_p99)
+        else:
+            # Fall back to average if percentile fails (bucket precision issue)
+            routing_avg = get_histogram_avg(metrics_url, "seastar_ranvier_router_routing_latency_seconds")
+            if routing_avg is not None:
+                routing_p50_vals.append(routing_avg)
+                routing_p99_vals.append(routing_avg)
 
         # Tokenization latency
-        tokenization_p50 = get_histogram_percentile(metrics_url, "router_tokenization_latency_seconds", 0.50)
-        tokenization_p99 = get_histogram_percentile(metrics_url, "router_tokenization_latency_seconds", 0.99)
+        tokenization_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_tokenization_latency_seconds", 0.50)
+        tokenization_p99 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_tokenization_latency_seconds", 0.99)
         if tokenization_p50 is not None:
             tokenization_p50_vals.append(tokenization_p50)
-        if tokenization_p99 is not None:
-            tokenization_p99_vals.append(tokenization_p99)
+            if tokenization_p99 is not None:
+                tokenization_p99_vals.append(tokenization_p99)
+        else:
+            tokenization_avg = get_histogram_avg(metrics_url, "seastar_ranvier_router_tokenization_latency_seconds")
+            if tokenization_avg is not None:
+                tokenization_p50_vals.append(tokenization_avg)
+                tokenization_p99_vals.append(tokenization_avg)
 
         # Backend connect latency
-        connect_p50 = get_histogram_percentile(metrics_url, "backend_connect_duration_seconds", 0.50)
-        connect_p99 = get_histogram_percentile(metrics_url, "backend_connect_duration_seconds", 0.99)
+        connect_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_backend_connect_duration_seconds", 0.50)
+        connect_p99 = get_histogram_percentile(metrics_url, "seastar_ranvier_backend_connect_duration_seconds", 0.99)
         if connect_p50 is not None:
             connect_p50_vals.append(connect_p50)
-        if connect_p99 is not None:
-            connect_p99_vals.append(connect_p99)
+            if connect_p99 is not None:
+                connect_p99_vals.append(connect_p99)
+        else:
+            connect_avg = get_histogram_avg(metrics_url, "seastar_ranvier_backend_connect_duration_seconds")
+            if connect_avg is not None:
+                connect_p50_vals.append(connect_avg)
+                connect_p99_vals.append(connect_avg)
 
     # Calculate averages across nodes (convert to ms)
     if routing_p50_vals:
