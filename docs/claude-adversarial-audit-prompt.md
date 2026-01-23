@@ -1,9 +1,9 @@
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
-2. Run /compact if the conversation exceeds 4 turns.
+I am requesting an ADVERSARIAL SYSTEM AUDIT of the source files under src/
 
 ---
 
-I am requesting an ADVERSARIAL SYSTEM AUDIT of the source files under src/
+1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+2. Run /compact if the conversation exceeds 4 turns.
 
 ---
 
@@ -88,5 +88,5 @@ Will this hold up at 100x scale?
 ```
 
 ### Anti-Pattern Candidates
-If any issues are systemic, flag them for `claude-pattern-extractor-prompt.md` to formalize into the 12 Hard Rules.
+If any issues are systemic, flag them for `claude-pattern-extractor-prompt.md` to formalize into the Hard Rules.
 

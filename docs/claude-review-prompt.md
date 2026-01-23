@@ -1,3 +1,8 @@
+I have written code for:
+<INSERT_TASK_NAME>
+
+---
+
 1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
 2. Run /compact if the conversation exceeds 4 turns.
 
@@ -8,17 +13,9 @@ Build Constraints:
 
 ---
 
-I have written code for: <INSERT_TASK_NAME>
-
-**Files modified:**
-- <FILE_1>
-- <FILE_2>
-
----
-
 ## SELF-REVIEW (before commit)
 
-Run through each of the 14 Hard Rules. For each rule, provide one of:
+Run through each of the Hard Rules listed in docs/claude-context.md. For each rule, provide one of:
 - `[N/A]` - Not applicable to this change
 - `[OK]` - Compliant because: [brief reason]
 - `[FIX]` - Violation found at [file:line]: [description]
@@ -27,6 +24,9 @@ Run through each of the 14 Hard Rules. For each rule, provide one of:
 
 ## COMPLIANCE TABLE
 
+Verify compliance with the list of Hard Rules outlined in docs/claude-context.md
+
+For example:
 | # | Rule | Status | Notes |
 |---|------|--------|-------|
 | 0 | No `std::shared_ptr` in Seastar code | | |

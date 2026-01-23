@@ -81,12 +81,15 @@ class BenchmarkResults:
     tokens_per_second: Optional[float] = None
     unique_prefixes: Optional[int] = None
 
-    # Ranvier overhead metrics (from Prometheus)
-    routing_latency_ms: Optional[float] = None
-    tokenization_latency_ms: Optional[float] = None
-    art_lookup_latency_ms: Optional[float] = None
-    connect_latency_ms: Optional[float] = None
-    ranvier_overhead_ms: Optional[float] = None
+    # Ranvier overhead metrics (from Prometheus) - P50/P99 percentiles
+    routing_latency_p50_ms: Optional[float] = None
+    routing_latency_p99_ms: Optional[float] = None
+    tokenization_latency_p50_ms: Optional[float] = None
+    tokenization_latency_p99_ms: Optional[float] = None
+    art_lookup_latency_p50_ms: Optional[float] = None
+    art_lookup_latency_p99_ms: Optional[float] = None
+    connect_latency_p50_ms: Optional[float] = None
+    connect_latency_p99_ms: Optional[float] = None
 
     # Per-bucket TTFT (real benchmarks only)
     ttft_large_hit_p50_ms: Optional[float] = None
@@ -102,7 +105,9 @@ class BenchmarkResults:
 
     # Standard Locust metrics
     total_requests: int = 0
-    failed_requests: int = 0
+    failed_requests: int = 0      # Actual errors (non-2xx, timeouts, parse errors)
+    incomplete_requests: int = 0  # Got HTTP 200 but terminated before TTFT recorded
+    incomplete_rate_pct: float = 0.0
     failure_rate_pct: float = 0.0
     avg_response_time_ms: Optional[float] = None
     requests_per_sec: float = 0.0
@@ -227,16 +232,21 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
         results["tokens_per_second"] = stats.get("tokens_per_second")
         results["unique_prefixes"] = stats.get("unique_prefixes")
 
-        # Ranvier overhead metrics
-        results["routing_latency_ms"] = stats.get("routing_latency_ms")
-        results["tokenization_latency_ms"] = stats.get("tokenization_latency_ms")
-        results["art_lookup_latency_ms"] = stats.get("art_lookup_latency_ms")
-        results["connect_latency_ms"] = stats.get("connect_latency_ms")
-        results["ranvier_overhead_ms"] = stats.get("ranvier_overhead_ms")
+        # Ranvier overhead metrics (P50/P99 percentiles)
+        results["routing_latency_p50_ms"] = stats.get("routing_latency_p50_ms")
+        results["routing_latency_p99_ms"] = stats.get("routing_latency_p99_ms")
+        results["tokenization_latency_p50_ms"] = stats.get("tokenization_latency_p50_ms")
+        results["tokenization_latency_p99_ms"] = stats.get("tokenization_latency_p99_ms")
+        results["art_lookup_latency_p50_ms"] = stats.get("art_lookup_latency_p50_ms")
+        results["art_lookup_latency_p99_ms"] = stats.get("art_lookup_latency_p99_ms")
+        results["connect_latency_p50_ms"] = stats.get("connect_latency_p50_ms")
+        results["connect_latency_p99_ms"] = stats.get("connect_latency_p99_ms")
 
         # Request counts
         results["total_requests"] = stats.get("total_requests")
         results["failed_requests"] = stats.get("failed_requests")
+        results["incomplete_requests"] = stats.get("incomplete_requests")
+        results["incomplete_rate_pct"] = stats.get("incomplete_rate_pct")
 
         # TTFT stats from JSON (more accurate)
         if stats.get("ttft_cache_hit_p50_ms"):
@@ -429,14 +439,20 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
         if total_match:
             results["total_requests"] = int(total_match.group(1))
 
-        # Failed Requests: 0
-        failed_match = re.search(r"Failed Requests:\s*(\d+)", content)
+        # Failed (errors): 0
+        failed_match = re.search(r"Failed \(errors\):\s*(\d+)", content)
         if failed_match:
             results["failed_requests"] = int(failed_match.group(1))
 
-        # Calculate failure rate
+        # Incomplete (timeout): 0
+        incomplete_match = re.search(r"Incomplete \(timeout\):\s*(\d+)", content)
+        if incomplete_match:
+            results["incomplete_requests"] = int(incomplete_match.group(1))
+
+        # Calculate failure rate and incomplete rate
         if results["total_requests"] > 0:
             results["failure_rate_pct"] = (results["failed_requests"] / results["total_requests"]) * 100
+            results["incomplete_rate_pct"] = (results.get("incomplete_requests", 0) / results["total_requests"]) * 100
 
         # Requests/Second: 9.18
         rps_match = re.search(r"Requests/Second:\s*([0-9.]+)", content)
@@ -505,12 +521,15 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.tokens_per_second = json_stats.get("tokens_per_second")
         results.unique_prefixes = json_stats.get("unique_prefixes")
 
-        # Ranvier overhead metrics
-        results.routing_latency_ms = json_stats.get("routing_latency_ms")
-        results.tokenization_latency_ms = json_stats.get("tokenization_latency_ms")
-        results.art_lookup_latency_ms = json_stats.get("art_lookup_latency_ms")
-        results.connect_latency_ms = json_stats.get("connect_latency_ms")
-        results.ranvier_overhead_ms = json_stats.get("ranvier_overhead_ms")
+        # Ranvier overhead metrics (P50/P99 percentiles)
+        results.routing_latency_p50_ms = json_stats.get("routing_latency_p50_ms")
+        results.routing_latency_p99_ms = json_stats.get("routing_latency_p99_ms")
+        results.tokenization_latency_p50_ms = json_stats.get("tokenization_latency_p50_ms")
+        results.tokenization_latency_p99_ms = json_stats.get("tokenization_latency_p99_ms")
+        results.art_lookup_latency_p50_ms = json_stats.get("art_lookup_latency_p50_ms")
+        results.art_lookup_latency_p99_ms = json_stats.get("art_lookup_latency_p99_ms")
+        results.connect_latency_p50_ms = json_stats.get("connect_latency_p50_ms")
+        results.connect_latency_p99_ms = json_stats.get("connect_latency_p99_ms")
 
         # Override cache TTFT from JSON if available
         if json_stats.get("ttft_cache_hit_p50_ms"):
@@ -932,7 +951,9 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
 
     request_metrics = [
         ("total_requests", "Total Requests", False),
-        ("failed_requests", "Failed Requests", True),
+        ("failed_requests", "Failed (errors)", True),
+        ("incomplete_requests", "Incomplete (timeout)", True),
+        ("incomplete_rate_pct", "Incomplete Rate (%)", True),
         ("failure_rate_pct", "Failure Rate (%)", True),
         ("requests_per_sec", "Requests/sec", False),
         ("sync_errors", "Sync Errors", True),
@@ -950,24 +971,25 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
 
     # RANVIER OVERHEAD (optional - only shown if data available)
-    has_overhead = (baseline.routing_latency_ms is not None or new.routing_latency_ms is not None)
+    has_overhead = (baseline.routing_latency_p50_ms is not None or new.routing_latency_p50_ms is not None)
     if has_overhead:
         lines.append("")
         lines.append("-" * 80)
-        lines.append("RANVIER OVERHEAD (from Prometheus metrics, averages)")
+        lines.append("RANVIER OVERHEAD (from Prometheus metrics)")
         lines.append("-" * 80)
-        lines.append("  (Prefix-aware routing adds no extra overhead)")
-        lines.append("")
 
         overhead_metrics = [
-            ("routing_latency_ms", "Routing Decision (ms)", True),
-            ("tokenization_latency_ms", "  - Tokenization (ms)", True),
-            ("art_lookup_latency_ms", "  - ART Lookup (ms)", True),
-            ("connect_latency_ms", "Backend Connect (ms)", True),
-            ("ranvier_overhead_ms", "Total Overhead (ms)", True),
+            ("routing_latency_p50_ms", "Routing Decision P50 (ms)", True),
+            ("routing_latency_p99_ms", "Routing Decision P99 (ms)", True),
+            ("tokenization_latency_p50_ms", "  - Tokenization P50 (ms)", True),
+            ("tokenization_latency_p99_ms", "  - Tokenization P99 (ms)", True),
+            ("art_lookup_latency_p50_ms", "  - ART Lookup P50 (ms)", True),
+            ("art_lookup_latency_p99_ms", "  - ART Lookup P99 (ms)", True),
+            ("connect_latency_p50_ms", "Backend Connect P50 (ms)", True),
+            ("connect_latency_p99_ms", "Backend Connect P99 (ms)", True),
         ]
 
-        lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
+        lines.append(f"{'Metric':<30} {'Baseline':>12} {'New':>12} {'Change':>30}")
         for key, name, lower_is_better in overhead_metrics:
             baseline_val = getattr(baseline, key, None)
             new_val = getattr(new, key, None)
@@ -976,7 +998,7 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
             baseline_str = f"{baseline_val:.2f}" if baseline_val is not None else "N/A"
             new_str = f"{new_val:.2f}" if new_val is not None else "N/A"
             change_str = format_change(baseline_val, new_val, lower_is_better)
-            lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
+            lines.append(f"{name:<30} {baseline_str:>12} {new_str:>12} {change_str:>30}")
 
     lines.append("")
     lines.append("-" * 80)

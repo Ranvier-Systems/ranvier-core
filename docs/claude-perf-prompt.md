@@ -1,17 +1,7 @@
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /docs or /assets folders.
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
-
----
-
 ## PERFORMANCE INVESTIGATION
 
-**Area:** <COMPONENT_OR_FEATURE>
+**Area:**
+<COMPONENT_OR_FEATURE>
 
 **Observation:**
 - Current performance: <METRIC> (e.g., "500 req/s", "p99 = 50ms")
@@ -26,6 +16,16 @@ Build Constraints:
 - [ ] Profiler data available
 - [ ] Metrics showing bottleneck
 - [ ] Anecdotal observation
+
+---
+1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+2. DO NOT read the full /docs or /assets folders.
+3. Run /compact if the conversation exceeds 4 turns.
+
+Build Constraints:
+1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
+2. API Verification: Verify syntax against Seastar documentation logic.
+3. Manual Verification: I will build in my Docker container and provide logs if it fails.
 
 ---
 
@@ -137,7 +137,7 @@ co_await seastar::parallel_for_each(items, [](auto& item) {
 ## POST-OPTIMIZATION CHECKLIST
 
 - [ ] Baseline metrics documented
-- [ ] Optimization doesn't violate 12 Hard Rules
+- [ ] Optimization doesn't violate the list of Hard Rules
 - [ ] Trade-offs are acceptable
 - [ ] Improvement is measurable
 - [ ] No new failure modes introduced

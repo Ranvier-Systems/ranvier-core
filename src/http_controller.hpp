@@ -280,6 +280,9 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_backends(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_drain_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
+    // Health check handler (public, no auth required)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_health(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;
 

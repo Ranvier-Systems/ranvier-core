@@ -1,13 +1,3 @@
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
-2. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
-
----
-
 ## INCIDENT REPORT
 
 **Severity:** [P0-Critical / P1-High / P2-Medium / P3-Low]
@@ -34,6 +24,16 @@ Build Constraints:
 - [ ] Specific request pattern: [which]
 
 ---
+1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+2. Run /compact if the conversation exceeds 4 turns.
+
+Build Constraints:
+1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
+2. API Verification: Verify syntax against Seastar documentation logic.
+3. Manual Verification: I will build in my Docker container and provide logs if it fails.
+
+---
+
 
 ## INCIDENT RESPONSE PROTOCOL
 
@@ -81,7 +81,7 @@ Gather:
 Root Cause:       [description]
 Affected Component: [file/service/function]
 Failure Mode:     [which pattern from Phase 3]
-Rule Violated:    [#N from 12 Hard Rules, or "New pattern"]
+Rule Violated:    [#N from the list of Hard Rules, or "New pattern"]
 ```
 
 ### Immediate Mitigation

@@ -242,6 +242,12 @@ auto make_rate_limited_handler(RateLimitCheck&& rate_limit_check, Func&& handler
 void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
+    // 0. HEALTH CHECK (public, no auth required - for load balancer probes)
+    r.add(operation_type::GET, url("/health"), new async_handler<std::function<future<std::unique_ptr<seastar::httpd::reply>>(std::unique_ptr<seastar::httpd::request>, std::unique_ptr<seastar::httpd::reply>)>>(
+        [this](auto req, auto rep) {
+            return this->handle_health(std::move(req), std::move(rep));
+        }));
+
     // Define the check once as a local lambda to keep the calls clean.
     auto rate_limit_check = [this](const auto& req) { return this->check_rate_limit(req); };
 
@@ -775,8 +781,18 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     // Timing: capture tokenization start
     auto tokenization_start = std::chrono::steady_clock::now();
 
-    // Start tokenization span
-    {
+    // OPTIMIZATION: Skip tokenization entirely in RANDOM routing mode
+    // Random routing ignores tokens completely, so tokenization is wasted work.
+    // This saves ~5-6ms per request (Rust FFI + HuggingFace tokenizer overhead).
+    bool tokenization_skipped = _config.is_random_mode();
+    if (tokenization_skipped) {
+        // Skip tokenization - tokens remain empty, router will use random backend selection
+        metrics().record_tokenization_skipped();
+        log_proxy.debug("[{}] Skipping tokenization (random routing mode)", request_id);
+    }
+
+    // Start tokenization span (only do actual work if not in random mode)
+    if (!tokenization_skipped) {
         auto tokenize_span = TracingService::start_child_span("ranvier.tokenize");
 
         // First, check if client provided pre-tokenized prompt_token_ids
@@ -848,7 +864,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                 }
             }
         }
-    } // tokenize_span ends here
+    } // tokenization block ends here (tokenize_span goes out of scope)
 
     // Timing: record tokenization latency
     auto tokenization_end = std::chrono::steady_clock::now();
@@ -1838,6 +1854,42 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_back
         rep->write_body("json", oss.str());
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     });
+}
+
+// ---------------------------------------------------------
+// HEALTH CHECK HANDLER (public, no auth)
+// ---------------------------------------------------------
+
+future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_health(
+    std::unique_ptr<seastar::httpd::request> req,
+    std::unique_ptr<seastar::httpd::reply> rep) {
+
+    // Check draining state first (atomic read - lock-free per Anti-Pattern #1)
+    if (_draining.load(std::memory_order_relaxed)) {
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->write_body("json", "{\"status\": \"draining\"}");
+        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    }
+
+    // Determine quorum status
+    // Default to true (has quorum) when cluster mode is not enabled
+    bool has_quorum = true;
+
+    auto* gossip = _router.gossip_service();
+    if (gossip && gossip->is_enabled()) {
+        auto state = gossip->get_cluster_state();
+        // ACTIVE state means we have quorum; QUORUM_LOSS means we don't
+        has_quorum = (state.quorum_state == "ACTIVE");
+    }
+
+    // Return healthy status with quorum info
+    // Both quorum=true and quorum=false return 200 OK (still serving requests)
+    std::string response = has_quorum
+        ? "{\"status\": \"healthy\", \"quorum\": true}"
+        : "{\"status\": \"healthy\", \"quorum\": false}";
+
+    rep->write_body("json", response);
+    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
 }
 
 } // namespace ranvier
