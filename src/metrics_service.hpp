@@ -214,6 +214,10 @@ public:
                 seastar::metrics::description("Router lookup/decision latency in seconds (10μs-100ms buckets)"),
                 [this] { return _routing_latency.data; }),
 
+            seastar::metrics::make_histogram("router_tokenization_latency_seconds",
+                seastar::metrics::description("Tokenization latency in seconds (10μs-100ms buckets)"),
+                [this] { return _tokenization_latency.data; }),
+
             seastar::metrics::make_histogram("router_backend_latency_seconds",
                 seastar::metrics::description("Backend processing latency for LLM inference in seconds (50ms-10s buckets)"),
                 [this] { return _router_backend_latency.data; }),
@@ -340,6 +344,11 @@ public:
         _routing_latency.record(seconds);
     }
 
+    // Record tokenization latency (time to tokenize request body)
+    void record_tokenization_latency(double seconds) {
+        _tokenization_latency.record(seconds);
+    }
+
     // Record backend processing latency (optimized for LLM inference timescales)
     void record_router_backend_latency(double seconds) {
         _router_backend_latency.record(seconds);
@@ -419,6 +428,7 @@ private:
 
     // New advanced histogram accumulators with optimized buckets
     MetricHistogram _routing_latency{routing_latency_buckets()};
+    MetricHistogram _tokenization_latency{routing_latency_buckets()};
     MetricHistogram _router_backend_latency{backend_latency_buckets()};
     MetricHistogram _router_total_latency{total_request_latency_buckets()};
 

@@ -772,6 +772,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     std::vector<int32_t> tokens;
     bool used_client_tokens = false;
 
+    // Timing: capture tokenization start
+    auto tokenization_start = std::chrono::steady_clock::now();
+
     // Start tokenization span
     {
         auto tokenize_span = TracingService::start_child_span("ranvier.tokenize");
@@ -846,6 +849,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
             }
         }
     } // tokenize_span ends here
+
+    // Timing: record tokenization latency
+    auto tokenization_end = std::chrono::steady_clock::now();
+    metrics().record_tokenization_latency(
+        MetricsService::to_seconds(tokenization_end - tokenization_start));
 
     // Prepare forwarded body based on endpoint:
     // - /v1/completions: vLLM supports prompt_token_ids, forward them for efficiency
