@@ -192,6 +192,9 @@ public:
             seastar::metrics::make_counter("tokenizer_errors", _tokenizer_errors,
                 seastar::metrics::description("Total number of tokenizer errors (exceptions during encode)")),
 
+            seastar::metrics::make_counter("tokenization_skipped", _tokenization_skipped,
+                seastar::metrics::description("Total number of requests where tokenization was skipped (random routing mode)")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -316,6 +319,9 @@ public:
     // Record tokenizer error (exception during encode)
     void record_tokenizer_error() { _tokenizer_errors++; }
 
+    // Record tokenization skipped (random routing mode optimization)
+    void record_tokenization_skipped() { _tokenization_skipped++; }
+
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
 
@@ -409,6 +415,7 @@ private:
     uint64_t _backend_metrics_overflow = 0;  // Times backend metrics limit was hit (Rule #4)
     uint64_t _tokenizer_validation_failures = 0;  // Input validation failures before tokenization
     uint64_t _tokenizer_errors = 0;  // Tokenizer exceptions during encode()
+    uint64_t _tokenization_skipped = 0;  // Tokenization skipped in random routing mode
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance
