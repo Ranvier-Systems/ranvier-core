@@ -55,7 +55,7 @@ src/config.hpp
 // In http_controller.cpp
 float estimate_request_cost(const ProxyContext& ctx) {
     uint32_t input_tokens = ctx.token_ids.size();
-    uint32_t output_tokens = ctx.max_tokens.value_or(_config.default_max_tokens);
+    uint32_t output_tokens = estimate_output_tokens(ctx);
 
     // Decode is ~10x more expensive than prefill per token
     return (input_tokens * _config.prefill_cost_per_token) +
@@ -63,7 +63,48 @@ float estimate_request_cost(const ProxyContext& ctx) {
 }
 ```
 
-**Effort**: 1 week
+> **CRITICAL: The "Max Tokens" Trap**
+>
+> Most agentic clients (Cursor, Cline) default `max_tokens` to 4096-8192 to avoid
+> truncation, even when expecting ~50 lines of code. Naively using `max_tokens`
+> will make Ranvier think every request is "expensive," causing aggressive
+> throttling and GPU underutilization.
+
+**Solution: Heuristic Decay**
+
+```cpp
+// Track actual output tokens per User-Agent
+struct AgentOutputStats {
+    std::string user_agent_pattern;
+    double moving_avg_output_tokens;  // Exponential moving average
+    uint64_t sample_count;
+};
+
+uint32_t estimate_output_tokens(const ProxyContext& ctx) {
+    // 1. Check if we have historical data for this agent
+    if (auto stats = _agent_stats.find(ctx.user_agent)) {
+        // Use reality-based estimate with 20% safety margin
+        return static_cast<uint32_t>(stats->moving_avg_output_tokens * 1.2);
+    }
+
+    // 2. Fall back to max_tokens for unknown agents (conservative)
+    return ctx.max_tokens.value_or(_config.default_max_tokens);
+}
+
+// Called after each request completes
+void record_actual_output(const ProxyContext& ctx, uint32_t actual_tokens) {
+    auto& stats = _agent_stats[ctx.user_agent];
+    constexpr double alpha = 0.1;  // EMA smoothing factor
+    stats.moving_avg_output_tokens =
+        alpha * actual_tokens + (1 - alpha) * stats.moving_avg_output_tokens;
+    stats.sample_count++;
+}
+```
+
+**Result**: Reserve resources based on reality, not safety limits. After ~50 requests
+from an agent, estimates converge to actual behavior.
+
+**Effort**: 1.5 weeks (increased for heuristic decay)
 **Risk**: Low - additive change, no breaking modifications
 **Dependencies**: None
 
@@ -305,8 +346,43 @@ src/router_service.cpp
            c. Record was_load_redirect = true
         4. Return selected_backend_id
 
-  └── Add select_least_loaded_backend() -> backend_id
+  └── Add select_alternative_p2c(exclude_id) -> backend_id  // P2C selection
   └── Add find_alternative_for_prefix(tokens, exclude_id) -> optional<backend_id>
+```
+
+> **CRITICAL: Avoid the "Thundering Herd"**
+>
+> If Node A is overloaded and Node B is empty, a naive "find least loaded" approach
+> will instantly switch ALL pending requests to Node B, overloading it in milliseconds.
+> This causes oscillation where load ping-pongs between backends.
+
+**Solution: Power of Two Choices (P2C)**
+
+Don't scan all backends for the "best" one. Pick two random candidates and choose
+the better of the two. This is mathematically proven to balance load without oscillation.
+
+```cpp
+backend_id select_alternative_p2c(backend_id exclude_id) {
+    // Get two random candidates (excluding the overloaded one)
+    auto candidates = get_healthy_backends();
+    candidates.erase(exclude_id);
+
+    if (candidates.size() < 2) {
+        return candidates.empty() ? exclude_id : candidates[0];
+    }
+
+    // Pick two random backends
+    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+    auto idx1 = dist(_rng);
+    auto idx2 = dist(_rng);
+    while (idx2 == idx1) idx2 = dist(_rng);
+
+    auto b1 = candidates[idx1];
+    auto b2 = candidates[idx2];
+
+    // Return the one with lower load
+    return get_backend_load(b1) < get_backend_load(b2) ? b1 : b2;
+}
 ```
 
 **Routing Decision Flow**:
@@ -326,17 +402,16 @@ Radix Tree Lookup
     │       └─► Load >= 0.7:
     │               │
     │               ▼
-    │           Find alternative with prefix?
+    │           P2C Selection (pick 2 random, choose better)
     │               │
-    │               ├─► Found B2 with load < 0.7: Route to B2
-    │               │
-    │               └─► Not found:
-    │                       │
-    │                       ├─► prefer_cache_over_load=true: Route to B1 anyway
-    │                       └─► prefer_cache_over_load=false: Route to least loaded
+    │               └─► Route to winner of P2C
     │
-    └─► Cache Miss: Consistent hash → check load → route
+    └─► Cache Miss: Consistent hash → P2C if overloaded → route
 ```
+
+**Why P2C Works**: With N backends, naive "least loaded" has O(N) coordination cost
+and causes herding. P2C has O(1) cost and provably achieves O(log log N) maximum load,
+which is nearly optimal.
 
 **Effort**: 2 weeks
 **Risk**: Medium - changes core routing logic, needs A/B testing
@@ -396,9 +471,19 @@ src/http_controller.cpp
 
 **What to Build**:
 - Port scanning for known LLM server ports
-- OpenAI-compatible API detection (`/v1/models` probe)
+- **Semantic liveness checks** (not just TCP connect)
 - Backend capability detection (model name, context length)
 - Hot-add/remove as local servers start/stop
+
+> **CRITICAL: The "Zombie Port" Problem**
+>
+> Local LLM servers (especially vLLM) often crash but leave the socket open
+> (`TIME_WAIT`) or enter a zombie state where they accept TCP connections but
+> hang on HTTP requests. A simple `connect()` will succeed, but requests will timeout.
+
+**Solution: Semantic Liveness Check**
+
+Don't just connect - send a minimal HTTP request and require a fast response.
 
 **New Files**:
 ```
@@ -416,6 +501,7 @@ public:
         std::string server_type;  // "ollama", "vllm", "lmstudio", "llamacpp"
         std::vector<std::string> available_models;
         uint32_t max_context_length;
+        std::chrono::steady_clock::time_point last_healthy;
     };
 
     // Probe known ports for LLM servers
@@ -438,10 +524,48 @@ private:
         3000,   // LocalAI
     };
 
+    // Semantic liveness: must respond to HTTP in <50ms
+    static constexpr auto LIVENESS_TIMEOUT = std::chrono::milliseconds(50);
+
     seastar::future<std::optional<DiscoveredBackend>> probe_port(uint16_t port);
     std::string detect_server_type(const http::response& resp);
 };
+
+// Semantic probe - not just TCP connect
+seastar::future<std::optional<DiscoveredBackend>>
+LocalDiscoveryService::probe_port(uint16_t port) {
+    auto start = std::chrono::steady_clock::now();
+
+    try {
+        // 1. TCP connect with short timeout
+        auto conn = co_await connect_with_timeout(
+            socket_address(ipv4_addr("127.0.0.1", port)),
+            std::chrono::milliseconds(20)
+        );
+
+        // 2. Send actual HTTP request (semantic check)
+        auto resp = co_await http_get_with_timeout(
+            conn, "/v1/models", LIVENESS_TIMEOUT
+        );
+
+        auto elapsed = std::chrono::steady_clock::now() - start;
+
+        // 3. Must respond in <50ms total to be considered healthy
+        if (elapsed > LIVENESS_TIMEOUT) {
+            co_return std::nullopt;  // Too slow = zombie
+        }
+
+        // 4. Parse response to detect server type and capabilities
+        co_return parse_discovery_response(port, resp);
+
+    } catch (...) {
+        co_return std::nullopt;  // Connection failed or timeout
+    }
+}
 ```
+
+**Why 50ms?** Local servers should respond to `/v1/models` in <5ms when healthy.
+A 50ms timeout catches zombies quickly while allowing for brief CPU spikes.
 
 **Integration Points**:
 ```
@@ -543,8 +667,23 @@ GET  /admin/agents/{agent_id}/stats   # Agent-specific metrics
 - Per-agent request queues (not just per-priority)
 - Pause: stop dequeuing from agent's queue
 - Resume: start dequeuing again
-- Preemption: higher priority can interrupt lower priority's GPU time
+- **Queue-jumping** (not true preemption - see note below)
 - Fair scheduling within same priority tier
+
+> **Clarification: "Preemption" = Queue-Jumping**
+>
+> True preemption (stopping a running GPU request mid-generation) is **impossible**
+> with current HTTP APIs. Once a request is sent to vLLM, it will complete.
+>
+> What we can do:
+> - **Queue-jumping**: When a CRITICAL request arrives, it goes to the front of
+>   Ranvier's queue, guaranteeing the next available GPU slot.
+> - **Pause low-priority**: Stop sending LOW priority requests until CRITICAL clears.
+>
+> Future consideration (Phase 4+): For very long requests, we could potentially
+> implement "chunked generation" where Ranvier requests smaller `max_tokens` batches
+> and re-queues continuations, creating natural preemption points. This requires
+> backend support for KV cache persistence.
 
 **Files to Modify**:
 ```
@@ -703,12 +842,49 @@ Phase 4 (Polish)
 
 ## Next Steps
 
-1. **Validate Phase 1.1**: Implement request size estimation, measure overhead
-2. **Benchmark priority queue**: Prototype, measure latency impact
-3. **Test vLLM metrics**: Verify metrics endpoint stability across versions
-4. **Design review**: Get feedback on Phase 3 scheduling algorithm
+### Immediate Priority: Validate the "Permission to Build"
+
+Before writing code, **prove the value exists**:
+
+1. **Run the "Tax vs Dividend" Benchmark** (Priority 0)
+   - Execute the 10-30 concurrent user benchmark against real vLLM
+   - Confirm the ~40% TTFT improvement still holds
+   - Document the "7ms overhead → 40% gain" tradeoff as the core value proposition
+   - **Why first?** This data point justifies the entire 16-week effort. If it doesn't hold, pivot.
+
+2. **Phase 1.1 + 1.2 (Merged)** - Simplified First Implementation
+   - Build `ProxyContext` with cost tracking
+   - Build `PriorityQueue` infrastructure
+   - **Simplification**: For MVP, use `input_tokens` (prefill) as the cost proxy
+     - Prefill is the primary cause of HoL blocking in high-concurrency batches
+     - Heuristic decay for output estimation can come in v1.1
+   - **Deliverable**: Priority queue working, cost tracked, metrics exposed
+
+3. **Phase 2.1: vLLM Metrics** - Enable Load-Awareness
+   - Verify `/metrics` endpoint stability across vLLM versions
+   - Implement scraping and storage
+   - **Gate**: Must complete before 2.2 (load-aware routing)
+
+4. **Benchmark Again** - Measure the "Intelligence Layer" Delta
+   - Compare: baseline → prefix routing → prefix + priority + load-aware
+   - Quantify each layer's contribution to TTFT improvement
+
+### Revised Phase 1 Structure
+
+```
+Original:
+  1.1 Size Estimation (1 week)
+  1.2 Priority Infrastructure (2 weeks)
+  1.3 Local Mode Config (1 week)
+
+Revised:
+  1.0 Benchmark validation (0.5 weeks) ← NEW: gates everything
+  1.1 Cost + Priority (merged) (2.5 weeks) ← Simplified: input_tokens only
+  1.2 Local Mode Config (1 week) ← Renumbered
+```
 
 ---
 
 *Document created: 2026-01-23*
 *Last updated: 2026-01-23*
+*Revision: Incorporated staff engineer review feedback*
