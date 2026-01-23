@@ -8,11 +8,8 @@ Build Constraints:
 
 ---
 
-I have written code for: <INSERT_TASK_NAME>
-
-**Files modified:**
-- <FILE_1>
-- <FILE_2>
+I have written code for (use the following to generate the session title and git branch):
+<INSERT_TASK_NAME>
 
 ---
 
@@ -27,6 +24,9 @@ Run through each of the 14 Hard Rules. For each rule, provide one of:
 
 ## COMPLIANCE TABLE
 
+Verify compliance with the list of Hard Rules outlined in docs/claude-context.md
+
+For example:
 | # | Rule | Status | Notes |
 |---|------|--------|-------|
 | 0 | No `std::shared_ptr` in Seastar code | | |

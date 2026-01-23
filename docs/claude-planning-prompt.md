@@ -9,7 +9,7 @@ Build Constraints:
 
 ---
 
-I am STARTING A PLANNING SESSION for the following feature:
+I am STARTING A PLANNING SESSION for the following feature (use the following to generate the session title and git branch):
 <INSERT_FEATURE_DESCRIPTION>
 
 ---

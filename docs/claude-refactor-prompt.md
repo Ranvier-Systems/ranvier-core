@@ -9,11 +9,8 @@ Build Constraints:
 
 ---
 
-I am REFACTORING: <DESCRIPTION>
-
-**Scope:**
-- <FILE_1>
-- <FILE_2>
+I am REFACTORING (use the following to generate the session title and git branch):
+<DESCRIPTION>
 
 **Goal:** [clarity / modularity / performance / testability]
 
@@ -111,7 +108,7 @@ Why Equivalent: [mechanical transformation / logic preserved because...]
 - [ ] **Medium risk** - Logic restructuring, needs careful review
 - [ ] **High risk** - Async flow changes, needs thorough testing
 
-### 12 Hard Rules Check
+### Hard Rules Check
 Verify refactoring doesn't introduce violations:
 - [ ] No new `std::shared_ptr`
 - [ ] No new `std::mutex`

@@ -9,7 +9,7 @@ Build Constraints:
 
 ---
 
-I am requesting a STRATEGIC PROJECT ASSESSMENT. 
+I am requesting a STRATEGIC PROJECT ASSESSMENT.
 
 Act as an External CTO and Lead Architect. I need a "brutally honest" evaluation of where Ranvier Core stands today versus our stated goal of "Layer 7+ load balancer with Prefix Caching."
 
@@ -24,7 +24,7 @@ TASK: Analyze the current 33-file structure and docs/TODO.md to answer:
 - Are we over-engineering the shard-broadcast logic relative to the current feature set?
 
 3. THE "HIDDEN FRAGILITY" ASSESSMENT:
-- Identify the "Load-Bearing" files—if these fail, the whole system collapses. Are these files sufficiently guarded by our 12 Hard Rules?
+- Identify the "Load-Bearing" files—if these fail, the whole system collapses. Are these files sufficiently guarded by our list of Hard Rules?
 - Based on the TODO list, what is the "Next Big Risk" we are about to take on?
 
 4. THE "STAFF ENGINEER" RECOMMENDATION:

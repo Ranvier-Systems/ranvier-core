@@ -88,5 +88,5 @@ Will this hold up at 100x scale?
 ```
 
 ### Anti-Pattern Candidates
-If any issues are systemic, flag them for `claude-pattern-extractor-prompt.md` to formalize into the 12 Hard Rules.
+If any issues are systemic, flag them for `claude-pattern-extractor-prompt.md` to formalize into the Hard Rules.
 

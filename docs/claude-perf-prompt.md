@@ -137,7 +137,7 @@ co_await seastar::parallel_for_each(items, [](auto& item) {
 ## POST-OPTIMIZATION CHECKLIST
 
 - [ ] Baseline metrics documented
-- [ ] Optimization doesn't violate 12 Hard Rules
+- [ ] Optimization doesn't violate the list of Hard Rules
 - [ ] Trade-offs are acceptable
 - [ ] Improvement is measurable
 - [ ] No new failure modes introduced

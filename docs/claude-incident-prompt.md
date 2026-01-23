@@ -81,7 +81,7 @@ Gather:
 Root Cause:       [description]
 Affected Component: [file/service/function]
 Failure Mode:     [which pattern from Phase 3]
-Rule Violated:    [#N from 12 Hard Rules, or "New pattern"]
+Rule Violated:    [#N from the list of Hard Rules, or "New pattern"]
 ```
 
 ### Immediate Mitigation

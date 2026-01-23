@@ -19,5 +19,5 @@ Before writing any code, verify:
 
 ---
 
-I am starting a task:
+I am starting a task (use the following to generate the session title and git branch):
 

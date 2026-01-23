@@ -9,7 +9,7 @@ Build Constraints:
 
 ---
 
-I am STARTING AN IMPLEMENTATION TASK:
+I am STARTING AN IMPLEMENTATION TASK (use the following to generate the session title and git branch):
 <INSERT_TASK_FROM_TODO_LIST>
 
 ---
@@ -26,7 +26,7 @@ List every file you will modify or create in a numbered list:
 Wait for my confirmation before proceeding.
 
 ### Step 2: Quick Rule Check
-For this specific task, which of the 12 Hard Rules apply?
+For this specific task, which of the Hard Rules apply?
 - [ ] Rule #X applies because...
 - [ ] Rule #Y applies because...
 

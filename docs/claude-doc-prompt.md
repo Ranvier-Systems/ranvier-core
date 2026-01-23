@@ -8,7 +8,8 @@ Build Constraints:
 
 ---
 
-I have implemented the code for: <INSERT_TASK_NAME>
+I have implemented the code for (use the following to generate the session title and git branch):
+<INSERT_TASK_NAME>
 
 The final logic is verified. Now complete the maintenance tasks.
 
