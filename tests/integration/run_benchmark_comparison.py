@@ -221,7 +221,8 @@ def format_comparison_table(prefix_results: Dict, random_results: Dict) -> str:
         ("TTFT Cache Miss P50 (ms)", "ttft_cache_miss_p50_ms", True),
         ("Tokens/Second", "tokens_per_second", False),
         ("Total Requests", "total_requests", False),
-        ("Failed Requests", "failed_requests", True),
+        ("Failed (errors)", "failed_requests", True),
+        ("Incomplete (timeout)", "incomplete_requests", True),
         ("Requests/sec", "requests_per_sec", False),
     ]
 

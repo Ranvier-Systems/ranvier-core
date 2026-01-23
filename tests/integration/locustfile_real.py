@@ -2184,6 +2184,8 @@ class RequestMetrics:
     routing_mode: str = "unknown"
     prefix_size_bucket: str = "unknown"
     estimated_prefix_tokens: int = 0
+    # Track whether we received HTTP 200 to distinguish incomplete vs failed
+    got_http_ok: bool = False
 
 
 @dataclass
@@ -2191,7 +2193,8 @@ class BenchmarkStats:
     """Aggregated benchmark statistics."""
     total_requests: int = 0
     successful_requests: int = 0
-    failed_requests: int = 0
+    failed_requests: int = 0      # Actual errors (non-2xx, parse errors, timeouts)
+    incomplete_requests: int = 0  # Got HTTP 200 but terminated before TTFT recorded
 
     # Cache hit tracking
     cache_hits: int = 0
@@ -2224,7 +2227,13 @@ class BenchmarkStats:
             self.total_requests += 1
 
             if metrics.ttft_ms is None:
-                self.failed_requests += 1
+                # Distinguish between actual failures and incomplete requests
+                # Incomplete: got HTTP 200 but stream was interrupted before TTFT
+                # Failed: HTTP error, connection timeout, or other actual error
+                if metrics.got_http_ok:
+                    self.incomplete_requests += 1
+                else:
+                    self.failed_requests += 1
                 return
 
             self.successful_requests += 1
@@ -2283,10 +2292,17 @@ class BenchmarkStats:
             if self.total_generation_time_s > 0:
                 tokens_per_sec = self.total_completion_tokens / self.total_generation_time_s
 
+            # Calculate incomplete rate (percentage of requests that were incomplete)
+            incomplete_rate_pct = 0.0
+            if self.total_requests > 0:
+                incomplete_rate_pct = (self.incomplete_requests / self.total_requests) * 100
+
             summary = {
                 "total_requests": self.total_requests,
                 "successful_requests": self.successful_requests,
                 "failed_requests": self.failed_requests,
+                "incomplete_requests": self.incomplete_requests,
+                "incomplete_rate_pct": incomplete_rate_pct,
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
                 "cache_hit_rate_pct": cache_hit_rate,
@@ -3069,6 +3085,22 @@ def on_test_stop(environment, **kwargs):
     logger.info(f"  Total Completion Tokens: {summary['total_completion_tokens']}")
     logger.info(f"  Tokens/Second: {summary['tokens_per_second']:.1f}")
 
+    # Print request statistics
+    logger.info(f"\nRequest Statistics:")
+    logger.info(f"  Total Requests:      {summary['total_requests']}")
+    logger.info(f"  Successful:          {summary['successful_requests']}")
+    logger.info(f"  Failed (errors):     {summary['failed_requests']}")
+    logger.info(f"  Incomplete (timeout): {summary['incomplete_requests']}")
+
+    # Warn if incomplete rate is high (>10%)
+    incomplete_rate = summary.get('incomplete_rate_pct', 0)
+    if incomplete_rate > 10:
+        logger.warning(
+            f"High incomplete rate ({incomplete_rate:.1f}%): "
+            f"{summary['incomplete_requests']} requests were terminated before TTFT. "
+            "Consider reducing --users or increasing --stop-timeout."
+        )
+
     # Print Ranvier internal latency breakdown (P50/P99)
     latency_breakdown = get_ranvier_latency_breakdown()
     logger.info(f"\nRanvier Latency Breakdown (percentiles):")
@@ -3248,6 +3280,9 @@ class RealBackendUser(HttpUser):
                 )
                 _benchmark_stats.record_request(metrics)
                 return
+
+            # Mark that we received HTTP 200 - distinguishes incomplete from failed
+            metrics.got_http_ok = True
 
             # Process streaming response with timeout protection
             stream_timed_out = False

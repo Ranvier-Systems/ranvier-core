@@ -105,7 +105,9 @@ class BenchmarkResults:
 
     # Standard Locust metrics
     total_requests: int = 0
-    failed_requests: int = 0
+    failed_requests: int = 0      # Actual errors (non-2xx, timeouts, parse errors)
+    incomplete_requests: int = 0  # Got HTTP 200 but terminated before TTFT recorded
+    incomplete_rate_pct: float = 0.0
     failure_rate_pct: float = 0.0
     avg_response_time_ms: Optional[float] = None
     requests_per_sec: float = 0.0
@@ -243,6 +245,8 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
         # Request counts
         results["total_requests"] = stats.get("total_requests")
         results["failed_requests"] = stats.get("failed_requests")
+        results["incomplete_requests"] = stats.get("incomplete_requests")
+        results["incomplete_rate_pct"] = stats.get("incomplete_rate_pct")
 
         # TTFT stats from JSON (more accurate)
         if stats.get("ttft_cache_hit_p50_ms"):
@@ -435,14 +439,20 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
         if total_match:
             results["total_requests"] = int(total_match.group(1))
 
-        # Failed Requests: 0
-        failed_match = re.search(r"Failed Requests:\s*(\d+)", content)
+        # Failed (errors): 0
+        failed_match = re.search(r"Failed \(errors\):\s*(\d+)", content)
         if failed_match:
             results["failed_requests"] = int(failed_match.group(1))
 
-        # Calculate failure rate
+        # Incomplete (timeout): 0
+        incomplete_match = re.search(r"Incomplete \(timeout\):\s*(\d+)", content)
+        if incomplete_match:
+            results["incomplete_requests"] = int(incomplete_match.group(1))
+
+        # Calculate failure rate and incomplete rate
         if results["total_requests"] > 0:
             results["failure_rate_pct"] = (results["failed_requests"] / results["total_requests"]) * 100
+            results["incomplete_rate_pct"] = (results.get("incomplete_requests", 0) / results["total_requests"]) * 100
 
         # Requests/Second: 9.18
         rps_match = re.search(r"Requests/Second:\s*([0-9.]+)", content)
@@ -941,7 +951,9 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
 
     request_metrics = [
         ("total_requests", "Total Requests", False),
-        ("failed_requests", "Failed Requests", True),
+        ("failed_requests", "Failed (errors)", True),
+        ("incomplete_requests", "Incomplete (timeout)", True),
+        ("incomplete_rate_pct", "Incomplete Rate (%)", True),
         ("failure_rate_pct", "Failure Rate (%)", True),
         ("requests_per_sec", "Requests/sec", False),
         ("sync_errors", "Sync Errors", True),
