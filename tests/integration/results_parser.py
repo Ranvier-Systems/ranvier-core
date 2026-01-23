@@ -954,7 +954,7 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     if has_overhead:
         lines.append("")
         lines.append("-" * 80)
-        lines.append("RANVIER OVERHEAD (from Prometheus metrics)")
+        lines.append("RANVIER OVERHEAD (from Prometheus metrics, averages)")
         lines.append("-" * 80)
         lines.append("  (Prefix-aware routing adds no extra overhead)")
         lines.append("")
