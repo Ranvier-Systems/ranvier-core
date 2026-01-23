@@ -900,7 +900,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         auto route_span = TracingService::start_child_span("ranvier.route_lookup");
 
         // Unified routing decision - all mode logic is encapsulated in RouterService
+        auto art_lookup_start = std::chrono::steady_clock::now();
         auto route_result = _router.route_request(tokens, request_id);
+        auto art_lookup_end = std::chrono::steady_clock::now();
+        metrics().record_art_lookup_latency(
+            MetricsService::to_seconds(art_lookup_end - art_lookup_start));
         routing_mode_str = route_result.routing_mode;
         route_span.set_attribute("ranvier.routing_mode", route_result.routing_mode);
         route_span.set_attribute("ranvier.cache_hit", route_result.cache_hit);

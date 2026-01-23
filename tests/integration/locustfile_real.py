@@ -2421,6 +2421,7 @@ def get_ranvier_latency_breakdown() -> dict:
     breakdown = {
         "routing_latency_ms": None,
         "tokenization_latency_ms": None,
+        "art_lookup_latency_ms": None,
         "connect_latency_ms": None,
         "first_byte_latency_ms": None,
         "total_latency_ms": None,
@@ -2429,6 +2430,7 @@ def get_ranvier_latency_breakdown() -> dict:
     # Aggregate from all nodes
     routing_sum, routing_count = 0.0, 0
     tokenization_sum, tokenization_count = 0.0, 0
+    art_lookup_sum, art_lookup_count = 0.0, 0
     connect_sum, connect_count = 0.0, 0
     first_byte_sum, first_byte_count = 0.0, 0
     total_sum, total_count = 0.0, 0
@@ -2443,6 +2445,11 @@ def get_ranvier_latency_breakdown() -> dict:
         if tokenization is not None:
             tokenization_sum += tokenization
             tokenization_count += 1
+
+        art_lookup = get_histogram_avg(metrics_url, "router_art_lookup_latency_seconds")
+        if art_lookup is not None:
+            art_lookup_sum += art_lookup
+            art_lookup_count += 1
 
         connect = get_histogram_avg(metrics_url, "backend_connect_duration_seconds")
         if connect is not None:
@@ -2464,6 +2471,8 @@ def get_ranvier_latency_breakdown() -> dict:
         breakdown["routing_latency_ms"] = (routing_sum / routing_count) * 1000
     if tokenization_count > 0:
         breakdown["tokenization_latency_ms"] = (tokenization_sum / tokenization_count) * 1000
+    if art_lookup_count > 0:
+        breakdown["art_lookup_latency_ms"] = (art_lookup_sum / art_lookup_count) * 1000
     if connect_count > 0:
         breakdown["connect_latency_ms"] = (connect_sum / connect_count) * 1000
     if first_byte_count > 0:
@@ -2976,6 +2985,8 @@ def on_test_stop(environment, **kwargs):
         logger.info(f"  Routing Decision: {latency_breakdown['routing_latency_ms']:.2f}ms")
     if latency_breakdown["tokenization_latency_ms"] is not None:
         logger.info(f"    - Tokenization: {latency_breakdown['tokenization_latency_ms']:.2f}ms")
+    if latency_breakdown["art_lookup_latency_ms"] is not None:
+        logger.info(f"    - ART Lookup: {latency_breakdown['art_lookup_latency_ms']:.2f}ms")
     if latency_breakdown["connect_latency_ms"] is not None:
         logger.info(f"  Backend Connect: {latency_breakdown['connect_latency_ms']:.2f}ms")
     if latency_breakdown["first_byte_latency_ms"] is not None:
