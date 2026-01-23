@@ -1,3 +1,11 @@
+I am requesting a POST-MORTEM PATTERN EXTRACTION.
+
+**Issues to formalize:**
+- <ISSUE_1>
+- <ISSUE_2>
+- <ISSUE_3>
+
+---
 1. Ref docs/claude-context.md for project constraints.
 2. Context: We recently identified issues in our Adversarial Audit or implementation review.
 
@@ -5,15 +13,6 @@ Build Constraints:
 1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
 2. API Verification: Verify syntax against Seastar documentation logic.
 3. Manual Verification: I will build in my Docker container and provide logs if it fails.
-
----
-
-I am requesting a POST-MORTEM PATTERN EXTRACTION.
-
-**Issues to formalize:**
-- <ISSUE_1>
-- <ISSUE_2>
-- <ISSUE_3>
 
 ---
 

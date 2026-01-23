@@ -1,14 +1,3 @@
-1. Ref docs/claude-context.md for core project essence and "No Locks/Async Only" rules.
-2. DO NOT read /assets or /docs (except for TODO.md and claude-context.md).
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
-
----
-
 I am requesting a STRATEGIC PROJECT ASSESSMENT.
 
 Act as an External CTO and Lead Architect. I need a "brutally honest" evaluation of where Ranvier Core stands today versus our stated goal of "Layer 7+ load balancer with Prefix Caching."
@@ -31,3 +20,14 @@ TASK: Analyze the current 33-file structure and docs/TODO.md to answer:
 - If you were taking over this project today, what is the one thing you would delete, and the one thing you would refactor immediately to reach production readiness?
 
 OUTPUT: Provide a "State of the Project" scorecard (A-F) for Architecture, Reliability, and Progress-to-Goal, followed by the prioritized analysis.
+
+---
+
+1. Ref docs/claude-context.md for core project essence and "No Locks/Async Only" rules.
+2. DO NOT read /assets or /docs (except for TODO.md and claude-context.md).
+3. Run /compact if the conversation exceeds 4 turns.
+
+Build Constraints:
+1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
+2. API Verification: Verify syntax against Seastar documentation logic.
+3. Manual Verification: I will build in my Docker container and provide logs if it fails.

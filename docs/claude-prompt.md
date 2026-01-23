@@ -1,3 +1,7 @@
+I am starting a task:
+
+---
+
 1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 3. Run /compact if the conversation exceeds 4 turns.
@@ -16,8 +20,4 @@ Before writing any code, verify:
 - [ ] Any new timer/callback? → Needs gate guard
 - [ ] Any new metrics lambda capturing `this`? → Deregister in `stop()`
 - [ ] Any C API string returns? → Null-guard required
-
----
-
-I am starting a task (use the following to generate the session title and git branch):
 

@@ -1,3 +1,10 @@
+I have implemented the code for:
+<INSERT_TASK_NAME>
+
+The final logic is verified. Now complete the maintenance tasks.
+
+---
+
 1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 
@@ -5,13 +12,6 @@ Build Constraints:
 1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
 2. API Verification: Verify syntax against Seastar documentation logic.
 3. Manual Verification: I will build in my Docker container and provide logs if it fails.
-
----
-
-I have implemented the code for (use the following to generate the session title and git branch):
-<INSERT_TASK_NAME>
-
-The final logic is verified. Now complete the maintenance tasks.
 
 ---
 

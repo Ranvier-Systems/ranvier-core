@@ -1,14 +1,14 @@
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
-2. Run /compact if the conversation exceeds 4 turns.
-
----
-
 I am requesting a HOLISTIC SYSTEM AUDIT.
 
 **Context:** We have recently completed:
 - <TASK_1>
 - <TASK_2>
 - <TASK_3>
+
+---
+
+1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+2. Run /compact if the conversation exceeds 4 turns.
 
 ---
 

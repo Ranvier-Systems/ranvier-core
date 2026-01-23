@@ -1,14 +1,3 @@
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /docs or /assets folders.
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
-
----
-
 I have a BUILD/RUNTIME FAILURE.
 
 **Error type:** [compile / link / runtime / test failure]
@@ -18,9 +7,16 @@ I have a BUILD/RUNTIME FAILURE.
 <PASTE_ERROR_LOG>
 ```
 
-**Recent changes:**
-- <FILE_1>
-- <FILE_2>
+---
+
+1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+2. DO NOT read the full /docs or /assets folders.
+3. Run /compact if the conversation exceeds 4 turns.
+
+Build Constraints:
+1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
+2. API Verification: Verify syntax against Seastar documentation logic.
+3. Manual Verification: I will build in my Docker container and provide logs if it fails.
 
 ---
 
