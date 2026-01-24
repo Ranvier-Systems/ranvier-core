@@ -8,12 +8,32 @@
 
 | Phase | Focus | Duration | Outcome |
 |-------|-------|----------|---------|
-| **Phase 1** | Foundation | 3-4 weeks | Request awareness, priority infrastructure |
+| **Phase 1** | Foundation | 4-5 weeks | Request awareness, intent classification, priority infrastructure |
 | **Phase 2** | Cloud Intelligence | 4-5 weeks | GPU-aware routing, HoL prevention |
 | **Phase 3** | Local Product | 3-4 weeks | Ranvier Local MVP |
 | **Phase 4** | Polish | 2-3 weeks | Integration, documentation, release |
 
-**Total Estimated Effort**: 12-16 weeks for full vision
+**Total Estimated Effort**: 13-17 weeks for full vision
+
+---
+
+## The Core Value Proposition
+
+> **"Why would I use Ranvier instead of just picking a model from a dropdown?"**
+
+A dropdown (Cursor, etc.) sets a **global preference**. Ranvier makes **per-request decisions**:
+
+| Scenario | Dropdown | Ranvier |
+|----------|----------|---------|
+| You type a character | Goes to your selected model | Routes to Local (0ms latency) |
+| You hit "Apply Fix" | Goes to your selected model | Routes to Cloud/Smart (high intelligence) |
+| Agent fires 5000 requests | All go to same model | Each routed by intent + cost |
+| Dev pastes PII | Goes wherever | Blocked or routed to compliant provider |
+
+**The "Extra Layer" pays rent by**:
+- Lowering bills (cost arbitrage between providers)
+- Lowering latency (localhost routing for autocomplete)
+- Ensuring safety (PII filtering, audit logs)
 
 ---
 
@@ -237,6 +257,132 @@ routing:
 **Effort**: 1 week
 **Risk**: Low - feature flag pattern, doesn't affect cloud path
 **Dependencies**: None
+
+---
+
+### 1.4 Request Intent Classification (Protocol Fingerprinting)
+
+**Why**: **Length ≠ Complexity.** A 50-token request could be a simple autocomplete (needs 10ms latency) or a complex "Apply Fix" instruction (needs GPT-4 intelligence). Heuristics based solely on token count will misroute critical "short but smart" tasks.
+
+> **The Product Question This Solves**
+>
+> "Why would I use Ranvier instead of just picking a model from a dropdown?"
+>
+> Answer: A dropdown is a **global preference**. Ranvier makes **per-request decisions**
+> based on the wire format. When you type a character, it routes to Local (0ms). When
+> you hit "Apply Fix," it routes to Cloud (smart). A dropdown can't do millisecond-level
+> intent-based switching.
+
+**What to Build**:
+- **Wire-Format Inspector**: Use simdjson to detect the "shape" of the request payload
+- **Intent Detector**: Classify requests into `AUTOCOMPLETE` (FIM), `CHAT` (Interactive), or `EDIT` (Complex Instruction)
+- **Routing Rules**: Map intents to backend tiers (e.g., `AUTOCOMPLETE` → Local/Groq, `EDIT` → Claude 3.5/GPT-4)
+
+**Files to Modify**:
+```
+src/http_controller.hpp
+  └── ProxyContext struct
+      + enum class RequestIntent { AUTOCOMPLETE, CHAT, EDIT, UNKNOWN }
+      + RequestIntent intent
+
+src/router_service.hpp
+  └── Add IntentRoutingConfig
+      + backend_id autocomplete_backend  // Fast, local
+      + backend_id chat_backend          // Balanced
+      + backend_id edit_backend          // Smart, cloud
+
+src/router_service.cpp
+  └── Add classify_intent(const rapidjson::Document& json_body)
+  └── Modify route_request() to consider intent
+```
+
+**The Protocol Fingerprints**:
+
+| Intent | Wire Format Signal | Example |
+|--------|-------------------|---------|
+| **AUTOCOMPLETE** | `suffix`, `fim_prefix`, `fim_middle`, `<\|fim_hole\|>` tokens | Cursor typing completion |
+| **EDIT** | System prompt contains "rewrite", "diff", "refactor"; XML tags like `<diff>` | "Apply Fix" button |
+| **CHAT** | Generic messages array, no special fields | Normal conversation |
+
+**Technical Approach**:
+```cpp
+// src/router_service.cpp - Zero-copy JSON inspection with simdjson
+
+RequestIntent classify_intent(const ProxyContext& ctx) {
+    // 1. Check for FIM (Autocomplete) - The "Typing" Case
+    // Fast path: autocomplete requests have 'suffix' or specific FIM params
+    if (ctx.json_body.contains("suffix") ||
+        ctx.json_body.contains("fim_prefix") ||
+        ctx.json_body.contains("fim_middle")) {
+        return RequestIntent::AUTOCOMPLETE;  // Route to Local/Fast
+    }
+
+    // 2. Check for "Edit/Fix" Patterns - The "Apply Fix" Case
+    // Look for keywords in system prompt indicating complex rewriting
+    const auto system_prompt = ctx.get_system_prompt();
+    if (system_prompt.contains("diff") ||
+        system_prompt.contains("rewrite") ||
+        system_prompt.contains("refactor") ||
+        system_prompt.contains("You are an expert")) {
+        return RequestIntent::EDIT;  // Route to Cloud/Smart
+    }
+
+    // 3. Check for edit-specific XML tags in any message
+    for (const auto& msg : ctx.messages) {
+        if (msg.content.contains("<diff>") ||
+            msg.content.contains("<edit>") ||
+            msg.content.contains("<code_change>")) {
+            return RequestIntent::EDIT;
+        }
+    }
+
+    // 4. Default to CHAT
+    return RequestIntent::CHAT;
+}
+
+// Integration into routing decision
+RouteResult route_request(const ProxyContext& ctx) {
+    auto intent = classify_intent(ctx);
+
+    switch (intent) {
+        case RequestIntent::AUTOCOMPLETE:
+            // Latency is king - use fastest available backend
+            return route_to_fastest_backend(ctx);
+
+        case RequestIntent::EDIT:
+            // Intelligence is king - use smartest backend regardless of cost
+            return route_to_smartest_backend(ctx);
+
+        case RequestIntent::CHAT:
+        default:
+            // Use existing prefix-based routing with cost awareness
+            return route_by_prefix(ctx);
+    }
+}
+```
+
+**Why This Matters for Each Product**:
+
+| Product | Without Intent Classification | With Intent Classification |
+|---------|------------------------------|---------------------------|
+| **Ranvier Local** | All requests go to same local model | Typing → qwen-2.5-coder (fast), Apply Fix → Claude API (smart) |
+| **Ranvier Cloud** | Token-count based routing only | Short edit requests get GPU priority, long chats can wait |
+| **Enterprise** | No visibility into request types | Audit logs show: "34% autocomplete, 12% edits, 54% chat" |
+
+**Metrics to Add**:
+```cpp
+// Per-intent counters for visibility
+requests_by_intent[AUTOCOMPLETE]  // "How often are devs typing?"
+requests_by_intent[EDIT]          // "How often are devs applying fixes?"
+requests_by_intent[CHAT]          // "How often are devs chatting?"
+
+latency_by_intent[intent]         // "Are we meeting latency targets per intent?"
+cost_by_intent[intent]            // "What's our spend per intent type?"
+```
+
+**Effort**: 1 week
+**Risk**: Low - pure logic change, highly testable with captured request payloads
+**Dependencies**: Phase 1.1 (Request Parsing infrastructure)
 
 ---
 
@@ -781,27 +927,30 @@ std::optional<ProxyContext> RequestScheduler::dequeue() {
 ```
 Phase 1 (Foundation)
     ├── 1.1 Request Size Estimation ──────────────────┐
-    │                                                  │
-    ├── 1.2 Priority Infrastructure ──────────────────┼──┐
-    │           │                                      │  │
-    │           │                                      │  │
-    └── 1.3 Local Mode Config ────────────────────────┼──┼──┐
-                │                                      │  │  │
-                ▼                                      │  │  │
-Phase 2 (Cloud)                                        │  │  │
-    ├── 2.1 vLLM Metrics ◄─────────────────────────────┘  │  │
-    │           │                                         │  │
-    │           ▼                                         │  │
-    ├── 2.2 Load-Aware Routing ◄──────────────────────────┘  │
-    │           │                                            │
-    │           ▼                                            │
-    └── 2.3 Cost-Based Routing ◄── 1.1                       │
-                                                             │
-Phase 3 (Local)                                              │
-    ├── 3.1 Local Discovery ◄────────────────────────────────┘
+    │           │                                      │
+    │           ▼                                      │
+    ├── 1.4 Intent Classification ◄── 1.1 ────────────┼──┐
+    │                                                  │  │
+    ├── 1.2 Priority Infrastructure ──────────────────┼──┼──┐
+    │           │                                      │  │  │
+    │           │                                      │  │  │
+    └── 1.3 Local Mode Config ────────────────────────┼──┼──┼──┐
+                │                                      │  │  │  │
+                ▼                                      │  │  │  │
+Phase 2 (Cloud)                                        │  │  │  │
+    ├── 2.1 vLLM Metrics ◄─────────────────────────────┘  │  │  │
+    │           │                                         │  │  │
+    │           ▼                                         │  │  │
+    ├── 2.2 Load-Aware Routing ◄──────────────────────────┘  │  │
+    │           │                                            │  │
+    │           ▼                                            │  │
+    └── 2.3 Cost-Based Routing ◄── 1.1, 1.4 ─────────────────┘  │
+                                                                │
+Phase 3 (Local)                                                 │
+    ├── 3.1 Local Discovery ◄───────────────────────────────────┘
     │           │
     │           ▼
-    ├── 3.2 Agent Awareness ◄── 1.2
+    ├── 3.2 Agent Awareness ◄── 1.2, 1.4
     │           │
     │           ▼
     └── 3.3 Request Scheduling ◄── 3.2
@@ -809,6 +958,10 @@ Phase 3 (Local)                                              │
 Phase 4 (Polish)
     └── 4.1, 4.2, 4.3 (parallel, after Phase 3)
 ```
+
+**Key Insight**: Phase 1.4 (Intent Classification) feeds into both Cloud (2.3 Cost-Based Routing)
+and Local (3.2 Agent Awareness) paths. It's the "Protocol Fingerprinting" that makes
+per-request routing decisions possible.
 
 ---
 
@@ -873,14 +1026,15 @@ Before writing code, **prove the value exists**:
 
 ```
 Original:
-  1.1 Size Estimation (1 week)
+  1.1 Size Estimation (1.5 weeks)
   1.2 Priority Infrastructure (2 weeks)
   1.3 Local Mode Config (1 week)
 
 Revised:
   1.0 Benchmark validation (0.5 weeks) ← NEW: gates everything
   1.1 Cost + Priority (merged) (2.5 weeks) ← Simplified: input_tokens only
-  1.2 Local Mode Config (1 week) ← Renumbered
+  1.2 Local Mode Config (1 week)
+  1.4 Intent Classification (1 week) ← NEW: "Length ≠ Complexity"
 ```
 
 ---
