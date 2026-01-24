@@ -59,6 +59,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Verify base image exists before attempting build
+      - name: Check base image exists
+        run: |
+          echo "Checking if base image exists: ${{ env.BASE_IMAGE }}"
+          if docker manifest inspect ${{ env.BASE_IMAGE }} > /dev/null 2>&1; then
+            echo "✓ Base image found: ${{ env.BASE_IMAGE }}"
+          else
+            echo "::error::Base image not found: ${{ env.BASE_IMAGE }}"
+            echo ""
+            echo "=========================================="
+            echo "ERROR: Base image does not exist in GHCR"
+            echo "=========================================="
+            echo ""
+            echo "The production build requires a pre-built base image containing"
+            echo "Seastar and build dependencies. This image must be built first."
+            echo ""
+            echo "To fix this, run the 'Docker Base Image' workflow manually:"
+            echo ""
+            echo "  1. Go to: https://github.com/${{ github.repository }}/actions/workflows/docker-base.yml"
+            echo "  2. Click 'Run workflow'"
+            echo "  3. Wait for it to complete (~20-30 minutes)"
+            echo "  4. Re-run this workflow"
+            echo ""
+            echo "Or use GitHub CLI:"
+            echo "  gh workflow run docker-base.yml"
+            echo ""
+            exit 1
+          fi
+
       # Extract metadata for Docker tags and labels
       - name: Extract Docker metadata
         id: meta
