@@ -202,6 +202,42 @@ def tokenize_messages(messages: List[dict]) -> Optional[List[int]]:
         return None
 
 
+def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
+    """Tokenize only the system messages and return the token count.
+
+    This is used to calculate prefix_token_count for routing hints.
+    The prefix_token_count tells Ranvier how many tokens constitute the
+    "shared prefix" (system messages) for prefix-aware routing.
+
+    Returns None if:
+    - Client tokenization is disabled
+    - No system messages found
+    - Tokenization fails
+    """
+    if not _client_tokenize_enabled or _tokenizer is None:
+        return None
+
+    try:
+        # Extract system messages only
+        system_parts = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if content:
+                    system_parts.append(f"<|system|>\n{content}")
+
+        if not system_parts:
+            return None
+
+        # Tokenize the system messages
+        system_text = "\n".join(system_parts)
+        encoding = _tokenizer.encode(system_text)
+        return len(encoding.ids)
+    except Exception as e:
+        logger.debug(f"System message tokenization failed: {e}")
+        return None
+
+
 def messages_to_prompt(messages: List[dict]) -> str:
     """Convert chat messages to a prompt string for /v1/completions endpoint.
 
@@ -3039,6 +3075,7 @@ def on_test_start(environment, **kwargs):
         logger.info("  Endpoint: /v1/completions (supports prompt_token_ids)")
         logger.info("  Ranvier: uses client tokens for routing (bypasses local tokenization)")
         logger.info("  vLLM: skips tokenization (uses prompt_token_ids directly)")
+        logger.info("  Prefix hints: prefix_token_count sent for system messages")
     else:
         client_tokenize = os.environ.get("CLIENT_TOKENIZE", "false").lower() in ("true", "1", "yes")
         if client_tokenize:
@@ -3292,6 +3329,12 @@ class RealBackendUser(HttpUser):
                 "stream": True,
                 "max_tokens": 100,  # Limit output for benchmarking
             }
+
+            # Calculate and include prefix_token_count for routing hints
+            # This tells Ranvier how many tokens are the "shared prefix" (system messages)
+            prefix_token_count = tokenize_system_messages(messages)
+            if prefix_token_count is not None and prefix_token_count > 0:
+                request_body["prefix_token_count"] = prefix_token_count
         else:
             # No client tokenization - use standard chat completions endpoint
             endpoint = "/v1/chat/completions"

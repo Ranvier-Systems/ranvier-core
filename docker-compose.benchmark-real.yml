@@ -146,6 +146,8 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       # Accept client-provided prompt_token_ids for routing (bypasses local tokenization)
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
+      # Accept client-provided prefix_token_count for prefix boundary hints
+      - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
@@ -193,6 +195,8 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
+      - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance
     # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
@@ -237,6 +241,8 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
+      - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
     # Use --smp 2 to leverage multi-core performance
     # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
