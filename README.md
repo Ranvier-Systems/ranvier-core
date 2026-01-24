@@ -7,6 +7,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Standard](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
 [![Status](https://img.shields.io/badge/Status-Alpha-orange)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Defined-blue)](docs/ARCHITECTURE_AND_VISION.md)
 
 ---
 
@@ -60,6 +61,28 @@ Real-world results from 8x A100 40GB:
 > **Note:** Benefits scale with prefix size and model size. Use 8B+ parameter models for meaningful KV cache improvements. Small prefixes (<500 tokens) see minimal benefit.
 
 See [Benchmark Guide](docs/benchmark-guide-8xA100.md) for detailed methodology and results.
+
+---
+
+## 🗺️ Architecture & Vision
+
+Ranvier is evolving from a "smart router" into a full **Intelligence Layer for AI Inference Infrastructure**.
+
+**The Core Insight**: A dropdown menu for model selection is a global preference. Ranvier makes **per-request routing decisions** based on intent, cost, and latency requirements:
+
+| Your Action | Standard Proxy | Ranvier |
+|-------------|----------------|---------|
+| Type a character | → Your selected model | → Local backend (0ms latency) |
+| Hit "Apply Fix" | → Your selected model | → Cloud/Smart (high intelligence) |
+| Agent fires 5000 requests | All to same model | Each routed by intent + cost |
+
+**Read the full architecture document**: [📐 Architecture & Vision](docs/ARCHITECTURE_AND_VISION.md)
+
+Key planned capabilities:
+- **Request Intent Classification** - Route by FIM/Chat/Edit detection, not just token count
+- **Priority Queues** - Interactive requests never blocked by batch jobs
+- **Load-Aware Routing** - Ingest vLLM metrics for GPU-aware decisions
+- **Local Mode** - Auto-discover Ollama, LM Studio, llama.cpp
 
 ---
 

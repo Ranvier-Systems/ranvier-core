@@ -1,17 +1,28 @@
-# Ranvier Intelligence Layer - Technical Roadmap
+# Ranvier Intelligence Layer - Architecture & Vision
+
+[![Status: Architecture Defined](https://img.shields.io/badge/Status-Architecture%20Defined-blue)](docs/ARCHITECTURE_AND_VISION.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **Goal**: Transform Ranvier from a "smart router" into a full "Intelligence Layer for Inference Infrastructure" with two product lines: Ranvier Cloud and Ranvier Local.
 
 ---
 
+> **Note**: This document outlines the architectural vision for the Ranvier Intelligence Layer.
+>
+> **Ranvier Core** (routing, priority queues, prefix-based caching) is developed in the open under MIT license.
+>
+> **Advanced capabilities** (enterprise policy enforcement, team management, advanced analytics) may be developed as separate modules or plugins with different licensing. Features marked with 🔓 are Core/Open Source. Features marked with 🏢 are planned Enterprise capabilities.
+
+---
+
 ## Executive Summary
 
-| Phase | Focus | Duration | Outcome |
-|-------|-------|----------|---------|
-| **Phase 1** | Foundation | 4-5 weeks | Request awareness, intent classification, priority infrastructure |
-| **Phase 2** | Cloud Intelligence | 4-5 weeks | GPU-aware routing, HoL prevention |
-| **Phase 3** | Local Product | 3-4 weeks | Ranvier Local MVP |
-| **Phase 4** | Polish | 2-3 weeks | Integration, documentation, release |
+| Phase | Focus | Duration | Outcome | License |
+|-------|-------|----------|---------|---------|
+| **Phase 1** | Foundation | 4-5 weeks | Request awareness, intent classification, priority infrastructure | 🔓 Core |
+| **Phase 2** | Cloud Intelligence | 4-5 weeks | GPU-aware routing, HoL prevention | 🔓 Core |
+| **Phase 3** | Local Product | 3-4 weeks | Ranvier Local MVP | 🔓 Core |
+| **Phase 4** | Polish | 2-3 weeks | Integration, documentation, release | 🔓 Core |
 
 **Total Estimated Effort**: 13-17 weeks for full vision
 
@@ -37,7 +48,9 @@ A dropdown (Cursor, etc.) sets a **global preference**. Ranvier makes **per-requ
 
 ---
 
-## Phase 1: Foundation (Weeks 1-4)
+## Phase 1: Foundation (Weeks 1-4) 🔓
+
+> **License**: All Phase 1 components are Ranvier Core (MIT Licensed)
 
 ### 1.1 Request Size Estimation
 
@@ -386,7 +399,9 @@ cost_by_intent[intent]            // "What's our spend per intent type?"
 
 ---
 
-## Phase 2: Cloud Intelligence (Weeks 5-9)
+## Phase 2: Cloud Intelligence (Weeks 5-9) 🔓
+
+> **License**: Core routing intelligence is MIT Licensed. Advanced SLA enforcement and multi-tenant policies may be Enterprise.
 
 ### 2.1 vLLM Metrics Ingestion
 
@@ -609,7 +624,9 @@ src/http_controller.cpp
 
 ---
 
-## Phase 3: Ranvier Local Product (Weeks 10-13)
+## Phase 3: Ranvier Local Product (Weeks 10-13) 🔓
+
+> **License**: Local discovery and agent scheduling are MIT Licensed. Team policy management may be Enterprise.
 
 ### 3.1 Local Backend Discovery
 
@@ -884,7 +901,7 @@ std::optional<ProxyContext> RequestScheduler::dequeue() {
 
 ---
 
-## Phase 4: Polish & Release (Weeks 14-16)
+## Phase 4: Polish & Release (Weeks 14-16) 🔓
 
 ### 4.1 Single-Binary Local Distribution
 
@@ -1039,6 +1056,24 @@ Revised:
 
 ---
 
+## Future Considerations 🏢
+
+The following capabilities are being explored for potential future development. These may be
+developed as separate enterprise modules or offered as managed services:
+
+| Capability | Description | Status |
+|------------|-------------|--------|
+| **Team Policy Enforcement** | Define routing policies per team (e.g., "Engineering → Claude", "Support → GPT-4") | Exploring |
+| **PII/Secrets Detection** | Automatically detect and block requests containing sensitive data | Exploring |
+| **Cost Attribution** | Track and report AI spend per user, team, or project | Exploring |
+| **Compliance Logging** | Audit trail of all routing decisions for regulated industries | Exploring |
+| **Multi-Tenant Isolation** | Hard isolation between tenants in shared infrastructure | Exploring |
+| **SLA Guarantees** | Contractual latency/availability commitments with alerting | Exploring |
+
+*Interested in these capabilities? Open an issue or reach out to discuss your use case.*
+
+---
+
 *Document created: 2026-01-23*
-*Last updated: 2026-01-23*
-*Revision: Incorporated staff engineer review feedback*
+*Last updated: 2026-01-24*
+*Revision: Restructured as Architecture & Vision document with Core/Enterprise distinction*
