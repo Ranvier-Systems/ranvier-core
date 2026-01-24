@@ -914,7 +914,7 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
                                                        const std::string& request_id,
                                                        size_t prefix_boundary) {
     // Determine effective prefix length for route storage:
-    // 1. If prefix_boundary > 0, use it (truncate to shared prefix like system messages)
+    // 1. If prefix_boundary > 0 and valid, use it (truncate to shared prefix like system messages)
     // 2. Otherwise, fall back to config.prefix_token_length (default: 128)
     //
     // prefix_boundary enables prefix-aware routing for multi-turn conversations.
@@ -922,8 +922,10 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // message token count), so requests with the same system prompt but different
     // user queries route to the same backend for KV-cache efficiency.
     size_t effective_prefix_len;
+    bool used_shared_prefix = false;
     if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
         effective_prefix_len = prefix_boundary;
+        used_shared_prefix = true;
     } else {
         effective_prefix_len = std::min(tokens.size(), _config.prefix_token_length);
     }
@@ -946,11 +948,10 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     }
 
     // Log route learning with request_id on shard 0 before broadcasting
-    // Note: prefix_boundary > 0 indicates a shared prefix was identified (e.g., system messages)
     if (!request_id.empty()) {
-        if (prefix_boundary > 0) {
-            log_router.info("[{}] Learning route: {} tokens (shared_prefix={}) -> backend {}",
-                            request_id, tokens.size(), prefix_boundary, backend);
+        if (used_shared_prefix) {
+            log_router.info("[{}] Learning route: {} tokens (shared_prefix) -> backend {}",
+                            request_id, tokens.size(), backend);
         } else {
             log_router.info("[{}] Learning route: {} tokens (default_prefix) -> backend {}",
                             request_id, tokens.size(), backend);
