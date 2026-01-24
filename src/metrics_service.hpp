@@ -193,6 +193,12 @@ public:
             seastar::metrics::make_counter("tokenization_skipped", _tokenization_skipped,
                 seastar::metrics::description("Total number of requests where tokenization was skipped (random routing mode)")),
 
+            seastar::metrics::make_counter("prefix_boundary_used", _prefix_boundary_used,
+                seastar::metrics::description("Total number of requests where system message prefix boundary was identified and used for routing")),
+
+            seastar::metrics::make_counter("prefix_boundary_skipped", _prefix_boundary_skipped,
+                seastar::metrics::description("Total number of requests where prefix boundary was skipped (no system messages, too short, or disabled)")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -320,6 +326,10 @@ public:
     // Record tokenization skipped (random routing mode optimization)
     void record_tokenization_skipped() { _tokenization_skipped++; }
 
+    // Record prefix boundary detection results
+    void record_prefix_boundary_used() { _prefix_boundary_used++; }
+    void record_prefix_boundary_skipped() { _prefix_boundary_skipped++; }
+
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
 
@@ -414,6 +424,8 @@ private:
     uint64_t _tokenizer_validation_failures = 0;  // Input validation failures before tokenization
     uint64_t _tokenizer_errors = 0;  // Tokenizer exceptions during encode()
     uint64_t _tokenization_skipped = 0;  // Tokenization skipped in random routing mode
+    uint64_t _prefix_boundary_used = 0;  // System message prefix boundary was used
+    uint64_t _prefix_boundary_skipped = 0;  // Prefix boundary skipped (no system messages, too short, disabled)
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance

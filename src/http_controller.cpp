@@ -881,14 +881,21 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                 if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
                     system_tokens.size() < tokens.size()) {
                     prefix_boundary = system_tokens.size();
+                    metrics().record_prefix_boundary_used();
                     log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
                                     request_id, prefix_boundary);
+                } else {
+                    metrics().record_prefix_boundary_skipped();
                 }
             } catch (...) {
                 // System message tokenization failed - not fatal, just skip prefix boundary
+                metrics().record_prefix_boundary_skipped();
                 log_proxy.debug("[{}] System message tokenization failed, using default prefix",
                                 request_id);
             }
+        } else {
+            // No system messages found
+            metrics().record_prefix_boundary_skipped();
         }
     }
 
