@@ -87,6 +87,12 @@ struct RoutingConfig {
     // over automatic system message detection when present.
     bool accept_client_prefix_boundary = false;  // Accept client-provided prefix_token_count
 
+    // Multi-depth route storage (Option C)
+    // When enabled, routes are stored at multiple message boundaries for optimal cache
+    // reuse in branching or continuing conversations. Each boundary represents a natural
+    // breakpoint (end of system message, end of user turn, etc.)
+    bool enable_multi_depth_routing = false;  // Store routes at multiple depths
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
@@ -539,6 +545,9 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY")) {
         routing.accept_client_prefix_boundary = (*v == "1" || *v == "true" || *v == "yes");
     }
+    if (auto v = get_env("RANVIER_ENABLE_MULTI_DEPTH_ROUTING")) {
+        routing.enable_multi_depth_routing = (*v == "1" || *v == "true" || *v == "yes");
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -950,6 +959,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["accept_client_prefix_boundary"]) {
                 config.routing.accept_client_prefix_boundary = r["accept_client_prefix_boundary"].as<bool>();
+            }
+            if (r["enable_multi_depth_routing"]) {
+                config.routing.enable_multi_depth_routing = r["enable_multi_depth_routing"].as<bool>();
             }
         }
 

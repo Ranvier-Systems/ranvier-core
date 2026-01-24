@@ -729,3 +729,218 @@ TEST_F(RequestRewriterTest, ExtractPrefixTokenCountOne) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 1);
 }
+
+// =============================================================================
+// extract_prefix_boundaries tests (multi-depth routing)
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesBasic) {
+    std::string body = R"({"prefix_boundaries": [100, 200, 300]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+    EXPECT_EQ(result[2], 300);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesNotFound) {
+    std::string body = R"({"prompt": "Hello"})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesEmptyArray) {
+    std::string body = R"({"prefix_boundaries": []})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesNotArray) {
+    std::string body = R"({"prefix_boundaries": 100})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesFiltersZeroAndNegative) {
+    // Zero and negative values should be filtered out
+    std::string body = R"({"prefix_boundaries": [0, 100, -5, 200, 0]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 2);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesSortsAndDeduplicates) {
+    // Result should be sorted and deduplicated
+    std::string body = R"({"prefix_boundaries": [300, 100, 200, 100, 300]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+    EXPECT_EQ(result[2], 300);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesMixedTypes) {
+    // Should handle different integer types
+    std::string body = R"({"prefix_boundaries": [100, 2147483648, 50]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 50);
+    EXPECT_EQ(result[1], 100);
+    EXPECT_EQ(result[2], 2147483648ULL);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesIgnoresNonIntegers) {
+    // Non-integer values should be ignored
+    std::string body = R"({"prefix_boundaries": [100, "string", 200, null, 300]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+    EXPECT_EQ(result[2], 300);
+}
+
+// =============================================================================
+// extract_message_boundaries tests (multi-depth routing)
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesBasic) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello!"}
+        ]
+    })";
+
+    // Simple tokenizer: 1 token per character
+    auto tokenize_fn = [](const std::string& text) -> size_t {
+        return text.length();
+    };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->boundaries.size(), 2);
+    // Each message is "<|role|>\ncontent"
+    // System: "<|system|>\nYou are helpful." = 11 + 16 = 27 chars
+    // User: "<|user|>\nHello!" = 9 + 6 = 15 chars
+    EXPECT_GT(result->boundaries[0], 0);
+    EXPECT_GT(result->boundaries[1], result->boundaries[0]);
+    EXPECT_GT(result->system_boundary, 0);
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesNoTokenizer) {
+    std::string body = R"({"messages": [{"role": "user", "content": "Hello"}]})";
+
+    auto result = RequestRewriter::extract_message_boundaries(body, nullptr);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesInvalidJson) {
+    std::string body = "not valid json";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesNoMessages) {
+    std::string body = R"({"prompt": "Hello"})";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesEmptyMessages) {
+    std::string body = R"({"messages": []})";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesSystemBoundary) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "System prompt here"},
+            {"role": "user", "content": "User message"}
+        ]
+    })";
+
+    // Fixed tokenizer: each message = 100 tokens
+    auto tokenize_fn = [](const std::string&) -> size_t { return 100; };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    // System boundary should be at 100 (before user message)
+    EXPECT_EQ(result->system_boundary, 100);
+    // Boundaries should be [100, 200]
+    ASSERT_EQ(result->boundaries.size(), 2);
+    EXPECT_EQ(result->boundaries[0], 100);
+    EXPECT_EQ(result->boundaries[1], 200);
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesOnlySystemMessages) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "First system"},
+            {"role": "system", "content": "Second system"}
+        ]
+    })";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 50; };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    // All messages are system, so system_boundary should be at the end
+    EXPECT_EQ(result->system_boundary, 100);
+    ASSERT_EQ(result->boundaries.size(), 2);
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesMultiTurn) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "How are you?"}
+        ]
+    })";
+
+    // Each message = 10 tokens for simplicity
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    // 4 messages = 4 boundaries at 10, 20, 30, 40
+    ASSERT_EQ(result->boundaries.size(), 4);
+    EXPECT_EQ(result->boundaries[0], 10);
+    EXPECT_EQ(result->boundaries[1], 20);
+    EXPECT_EQ(result->boundaries[2], 30);
+    EXPECT_EQ(result->boundaries[3], 40);
+    // System boundary is before first non-system message
+    EXPECT_EQ(result->system_boundary, 10);
+}

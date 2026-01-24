@@ -74,6 +74,7 @@ struct ProxyContext {
     std::string forwarded_body;
     std::vector<int32_t> tokens;
     size_t prefix_boundary = 0;  // Token count of shared prefix (e.g., system messages)
+    std::vector<size_t> prefix_boundaries;  // Multi-depth boundaries for Option C routing
 
     // Target backend
     BackendId target_id;
@@ -129,6 +130,7 @@ struct HttpControllerConfig {
     bool enable_prefix_boundary = true;         // Enable automatic prefix boundary detection
     size_t min_prefix_boundary_tokens = 4;      // Minimum system message tokens for prefix boundary
     bool accept_client_prefix_boundary = false; // Accept client-provided prefix_token_count
+    bool enable_multi_depth_routing = false;    // Enable multi-depth route storage (Option C)
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
