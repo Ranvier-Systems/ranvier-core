@@ -73,6 +73,7 @@ struct ProxyContext {
     // Request body and tokens
     std::string forwarded_body;
     std::vector<int32_t> tokens;
+    size_t prefix_boundary = 0;  // Token count of shared prefix (e.g., system messages)
 
     // Target backend
     BackendId target_id;

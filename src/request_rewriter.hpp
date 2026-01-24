@@ -65,6 +65,23 @@ public:
     //   The extracted text, or nullopt if no tokenizable content found
     static std::optional<std::string> extract_text(std::string_view body);
 
+    // Extract only system message content from a chat completion request
+    //
+    // For prefix-aware routing, we need to identify the "shared prefix" boundary.
+    // In multi-turn conversations, all requests typically share the same system
+    // message(s), while user/assistant content varies. By tokenizing system
+    // messages separately, we can store routes at this shared prefix boundary.
+    //
+    // For "messages" field: Concatenates content from messages with role="system"
+    // For "prompt" field: Returns nullopt (no system message concept)
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //
+    // Returns:
+    //   The concatenated system message content, or nullopt if none found
+    static std::optional<std::string> extract_system_messages(std::string_view body);
+
     // Result of extracting prompt_token_ids from a request
     struct TokenExtractionResult {
         std::vector<int32_t> tokens;  // Extracted token IDs (empty if not found)
@@ -206,6 +223,50 @@ inline std::optional<std::string> RequestRewriter::extract_text(std::string_view
     }
 
     return std::nullopt;
+}
+
+inline std::optional<std::string> RequestRewriter::extract_system_messages(std::string_view body) {
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::nullopt;
+    }
+
+    // System messages only exist in chat completion API (messages field)
+    // The completion API (prompt field) has no system message concept
+    if (!doc.HasMember("messages") || !doc["messages"].IsArray()) {
+        return std::nullopt;
+    }
+
+    std::string combined;
+    const auto& messages = doc["messages"];
+
+    for (rapidjson::SizeType i = 0; i < messages.Size(); ++i) {
+        const auto& msg = messages[i];
+        if (!msg.IsObject()) continue;
+
+        // Check for role="system"
+        if (!msg.HasMember("role") || !msg["role"].IsString()) continue;
+        std::string_view role(msg["role"].GetString(), msg["role"].GetStringLength());
+        if (role != "system") continue;
+
+        // Extract content
+        if (!msg.HasMember("content")) continue;
+        const auto& content = msg["content"];
+        if (content.IsString()) {
+            if (!combined.empty()) {
+                combined += "\n";  // Separator between system messages
+            }
+            combined.append(content.GetString(), content.GetStringLength());
+        }
+    }
+
+    if (combined.empty()) {
+        return std::nullopt;
+    }
+
+    return combined;
 }
 
 inline RequestRewriter::TokenExtractionResult RequestRewriter::extract_prompt_token_ids(
