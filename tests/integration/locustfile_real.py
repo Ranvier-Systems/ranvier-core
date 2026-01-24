@@ -2609,6 +2609,43 @@ def get_ranvier_latency_breakdown() -> dict:
     return breakdown
 
 
+def get_prefix_boundary_stats() -> dict:
+    """Fetch prefix boundary usage statistics from all Ranvier nodes.
+
+    These metrics indicate how often the system message prefix boundary
+    optimization is being applied. High prefix_boundary_used ratio should
+    correlate with improved cache hit rates for multi-turn conversation
+    workloads with shared system prompts.
+
+    Returns dict with:
+    - prefix_boundary_used: Total count of requests where system message
+      prefix boundary was identified and used for routing
+    - prefix_boundary_skipped: Total count where boundary was skipped
+      (no system messages, too short, disabled, or tokenization failed)
+    - prefix_boundary_ratio_pct: Percentage of requests using prefix boundary
+    """
+    stats = {
+        "prefix_boundary_used": 0,
+        "prefix_boundary_skipped": 0,
+        "prefix_boundary_ratio_pct": None,
+    }
+
+    for metrics_url in RANVIER_METRICS:
+        used = get_metric_value(metrics_url, "seastar_ranvier_prefix_boundary_used")
+        skipped = get_metric_value(metrics_url, "seastar_ranvier_prefix_boundary_skipped")
+
+        if used is not None:
+            stats["prefix_boundary_used"] += int(used)
+        if skipped is not None:
+            stats["prefix_boundary_skipped"] += int(skipped)
+
+    total = stats["prefix_boundary_used"] + stats["prefix_boundary_skipped"]
+    if total > 0:
+        stats["prefix_boundary_ratio_pct"] = (stats["prefix_boundary_used"] / total) * 100
+
+    return stats
+
+
 def register_backends_on_all_nodes():
     """Register backends on all Ranvier nodes."""
     global _backends_registered
@@ -3053,6 +3090,19 @@ def on_test_stop(environment, **kwargs):
     logger.info(f"  Cache Hit Rate: {summary['cache_hit_rate_pct']:.1f}%")
     logger.info(f"  Unique Prefixes: {summary['unique_prefixes']}")
 
+    # Print prefix boundary optimization stats (server-side)
+    prefix_stats = get_prefix_boundary_stats()
+    if prefix_stats["prefix_boundary_used"] > 0 or prefix_stats["prefix_boundary_skipped"] > 0:
+        logger.info(f"\nPrefix Boundary Optimization (Server-Side):")
+        logger.info(f"  Prefix Boundary Used: {prefix_stats['prefix_boundary_used']}")
+        logger.info(f"  Prefix Boundary Skipped: {prefix_stats['prefix_boundary_skipped']}")
+        if prefix_stats["prefix_boundary_ratio_pct"] is not None:
+            logger.info(f"  Usage Ratio: {prefix_stats['prefix_boundary_ratio_pct']:.1f}%")
+            # Correlation hint
+            if prefix_stats["prefix_boundary_ratio_pct"] < 50 and summary['cache_hit_rate_pct'] < 50:
+                logger.info(f"  Note: Low prefix boundary usage may explain low cache hit rate")
+                logger.info(f"        (requests may lack system messages or have short system prompts)")
+
     # Print TTFT comparison
     logger.info(f"\nTTFT Comparison:")
     if summary['ttft_cache_hit_p50_ms']:
@@ -3160,6 +3210,7 @@ def on_test_stop(environment, **kwargs):
 
     # Add to summary for JSON output
     summary.update(latency_breakdown)
+    summary.update(prefix_stats)
 
     # Check sync errors
     sync_passed, sync_msg = check_sync_errors()
