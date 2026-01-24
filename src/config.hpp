@@ -74,6 +74,13 @@ struct RoutingConfig {
     RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity with ART
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
+    // Prefix boundary detection for multi-turn conversations
+    // When enabled, system messages are tokenized separately to identify the "shared prefix"
+    // boundary. Routes are stored at this boundary instead of prefix_token_length, improving
+    // cache hit rates for requests sharing the same system prompt.
+    bool enable_prefix_boundary = true;  // Enable automatic prefix boundary detection
+    size_t min_prefix_boundary_tokens = 4;  // Minimum system message tokens to use as boundary
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
@@ -517,6 +524,12 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
         routing.prefix_token_length = *v;
     }
+    if (auto v = get_env("RANVIER_ENABLE_PREFIX_BOUNDARY")) {
+        routing.enable_prefix_boundary = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_MIN_PREFIX_BOUNDARY_TOKENS")) {
+        routing.min_prefix_boundary_tokens = *v;
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -919,6 +932,12 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["prefix_token_length"]) {
                 config.routing.prefix_token_length = r["prefix_token_length"].as<size_t>();
+            }
+            if (r["enable_prefix_boundary"]) {
+                config.routing.enable_prefix_boundary = r["enable_prefix_boundary"].as<bool>();
+            }
+            if (r["min_prefix_boundary_tokens"]) {
+                config.routing.min_prefix_boundary_tokens = r["min_prefix_boundary_tokens"].as<size_t>();
             }
         }
 

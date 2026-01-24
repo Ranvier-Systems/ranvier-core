@@ -871,14 +871,15 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     // Extract and tokenize system messages to determine shared prefix boundary
     // This enables prefix-aware routing for multi-turn conversations where
     // requests share the same system prompt but have different user queries
-    if (!tokens.empty() && !tokenization_skipped) {
+    if (_config.enable_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
         auto system_messages = RequestRewriter::extract_system_messages(body_view);
         if (system_messages.has_value() && !system_messages->empty()) {
             try {
                 auto system_tokens = _tokenizer.local().encode(*system_messages);
-                // Only use as boundary if system tokens are shorter than full tokens
-                // and represent a meaningful prefix (at least 4 tokens)
-                if (system_tokens.size() >= 4 && system_tokens.size() < tokens.size()) {
+                // Only use as boundary if system tokens meet minimum threshold
+                // and are shorter than full tokens (otherwise it's not a prefix)
+                if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
+                    system_tokens.size() < tokens.size()) {
                     prefix_boundary = system_tokens.size();
                     log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
                                     request_id, prefix_boundary);

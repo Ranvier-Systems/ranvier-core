@@ -126,6 +126,8 @@ struct HttpControllerConfig {
     int32_t max_token_id = 100000;              // Maximum valid token ID for validation (security)
     RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;  // Routing mode
     uint32_t block_alignment = 16;              // vLLM PagedAttention block size for route alignment
+    bool enable_prefix_boundary = true;         // Enable automatic prefix boundary detection
+    size_t min_prefix_boundary_tokens = 4;      // Minimum system message tokens for prefix boundary
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
