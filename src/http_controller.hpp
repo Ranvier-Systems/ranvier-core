@@ -128,6 +128,7 @@ struct HttpControllerConfig {
     uint32_t block_alignment = 16;              // vLLM PagedAttention block size for route alignment
     bool enable_prefix_boundary = true;         // Enable automatic prefix boundary detection
     size_t min_prefix_boundary_tokens = 4;      // Minimum system message tokens for prefix boundary
+    bool accept_client_prefix_boundary = false; // Accept client-provided prefix_token_count
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }

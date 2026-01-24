@@ -82,6 +82,27 @@ public:
     //   The concatenated system message content, or nullopt if none found
     static std::optional<std::string> extract_system_messages(std::string_view body);
 
+    // Extract client-provided prefix_token_count from a request body
+    //
+    // Clients can specify how many tokens constitute their "shared prefix" for
+    // routing purposes. This is useful when clients know their prefix structure
+    // better than the router's automatic system message detection.
+    //
+    // For example, if a client has a 1000-token system prompt, they can include
+    // "prefix_token_count": 1000 in their request. The router will use this value
+    // instead of automatically detecting system messages.
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //
+    // Returns:
+    //   The prefix_token_count value, or nullopt if not present/invalid
+    //
+    // Validation:
+    //   - Must be a positive integer
+    //   - Zero or negative values are rejected (returns nullopt)
+    static std::optional<size_t> extract_prefix_token_count(std::string_view body);
+
     // Result of extracting prompt_token_ids from a request
     struct TokenExtractionResult {
         std::vector<int32_t> tokens;  // Extracted token IDs (empty if not found)
@@ -267,6 +288,53 @@ inline std::optional<std::string> RequestRewriter::extract_system_messages(std::
     }
 
     return combined;
+}
+
+inline std::optional<size_t> RequestRewriter::extract_prefix_token_count(std::string_view body) {
+    // Fast path: if prefix_token_count not present, return early
+    if (body.find("prefix_token_count") == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::nullopt;
+    }
+
+    // Check if prefix_token_count field exists
+    if (!doc.HasMember("prefix_token_count")) {
+        return std::nullopt;
+    }
+
+    const auto& value = doc["prefix_token_count"];
+
+    // Must be a positive integer
+    if (value.IsUint64()) {
+        uint64_t count = value.GetUint64();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    } else if (value.IsInt64()) {
+        int64_t count = value.GetInt64();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    } else if (value.IsUint()) {
+        uint32_t count = value.GetUint();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    } else if (value.IsInt()) {
+        int32_t count = value.GetInt();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    }
+
+    // Not a valid positive integer
+    return std::nullopt;
 }
 
 inline RequestRewriter::TokenExtractionResult RequestRewriter::extract_prompt_token_ids(

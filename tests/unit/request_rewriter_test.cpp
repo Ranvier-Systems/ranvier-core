@@ -600,3 +600,132 @@ TEST_F(RequestRewriterTest, ExtractPromptTokenIdsFloatInArray) {
     EXPECT_FALSE(result.valid);
     EXPECT_EQ(result.error, "prompt_token_ids[1] is not an integer");
 }
+
+// =============================================================================
+// extract_prefix_token_count tests
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountBasic) {
+    std::string body = R"({"prompt": "Hello", "prefix_token_count": 100})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 100);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountNotFound) {
+    std::string body = R"({"prompt": "Hello", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountZeroValue) {
+    // Zero is rejected - must be positive
+    std::string body = R"({"prefix_token_count": 0})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountNegativeValue) {
+    // Negative values are rejected
+    std::string body = R"({"prefix_token_count": -10})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountLargeValue) {
+    std::string body = R"({"prefix_token_count": 1000000})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1000000);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountStringValue) {
+    // String values are rejected - must be integer
+    std::string body = R"({"prefix_token_count": "100"})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountFloatValue) {
+    // Float values are rejected - must be integer
+    std::string body = R"({"prefix_token_count": 100.5})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountWithOtherFields) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "prefix_token_count": 256,
+        "max_tokens": 100
+    })";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 256);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountInt64) {
+    // Test with a value that requires int64
+    std::string body = R"({"prefix_token_count": 2147483648})";  // INT32_MAX + 1
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 2147483648ULL);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountNull) {
+    // Null value is rejected
+    std::string body = R"({"prefix_token_count": null})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountBoolValue) {
+    // Bool value is rejected
+    std::string body = R"({"prefix_token_count": true})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountArrayValue) {
+    // Array value is rejected - must be integer
+    std::string body = R"({"prefix_token_count": [100]})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountObjectValue) {
+    // Object value is rejected - must be integer
+    std::string body = R"({"prefix_token_count": {"value": 100}})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountOne) {
+    // Minimum valid value is 1
+    std::string body = R"({"prefix_token_count": 1})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1);
+}
