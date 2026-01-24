@@ -540,6 +540,67 @@ def cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prefixes(args: argparse.Namespace) -> int:
+    """Analyze prefix distribution in a prompt file."""
+    loader = PromptLoader()
+    stats = loader.load_file(args.file)
+
+    if stats.total_loaded == 0:
+        print(f"ERROR: No valid prompts loaded from {args.file}", file=sys.stderr)
+        return 1
+
+    # Group prompts by prefix hash
+    prefixes: Dict[str, List[LoadedPrompt]] = {}
+    for prompt in loader.prompts:
+        h = prompt.prefix_hash
+        if h not in prefixes:
+            prefixes[h] = []
+        prefixes[h].append(prompt)
+
+    print(f"Prefix Analysis: {args.file}")
+    print()
+    print(f"Total prompts:      {stats.total_loaded}")
+    print(f"Unique prefixes:    {len(prefixes)}")
+    print(f"Avg per prefix:     {stats.total_loaded / len(prefixes):.1f}")
+    print()
+
+    # Sort by count descending
+    sorted_prefixes = sorted(prefixes.items(), key=lambda x: -len(x[1]))
+
+    # Show top N prefixes
+    top_n = min(args.top, len(sorted_prefixes))
+    print(f"Top {top_n} most common prefixes:")
+    print()
+
+    for i, (prefix_hash, prompts) in enumerate(sorted_prefixes[:top_n]):
+        count = len(prompts)
+        pct = 100 * count / stats.total_loaded
+
+        # Get the system message for this prefix
+        sample = prompts[0]
+        system_msg = ""
+        for msg in sample.messages:
+            if msg.get("role") == "system":
+                system_msg = msg.get("content", "")[:60]
+                break
+
+        if not system_msg:
+            # Fallback to first message
+            if sample.messages:
+                system_msg = sample.messages[0].get("content", "")[:60]
+
+        print(f"  {i+1}. {count:5d} prompts ({pct:5.1f}%): \"{system_msg}...\"")
+
+    # Show distribution summary
+    if len(sorted_prefixes) > top_n:
+        remaining = len(sorted_prefixes) - top_n
+        remaining_count = sum(len(p) for _, p in sorted_prefixes[top_n:])
+        print()
+        print(f"  ... and {remaining} more prefixes with {remaining_count} prompts")
+
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prompt file loader and validator for LLM benchmarks",
@@ -550,6 +611,7 @@ Examples:
   %(prog)s stats prompts.jsonl
   %(prog)s preview prompts.jsonl --count 3
   %(prog)s convert prompts.jsonl --format openai > converted.jsonl
+  %(prog)s prefixes prompts.jsonl --top 10
 
 Official Datasets (ShareGPT format):
   - ShareGPT: huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered
@@ -579,6 +641,11 @@ Official Datasets (ShareGPT format):
     p_convert.add_argument("--format", "-f", choices=["openai", "sharegpt", "simple"],
                           default="openai", help="Output format")
 
+    # prefixes command
+    p_prefixes = subparsers.add_parser("prefixes", help="Analyze prefix distribution for cache efficiency")
+    p_prefixes.add_argument("file", help="Path to JSONL file")
+    p_prefixes.add_argument("--top", "-n", type=int, default=10, help="Number of top prefixes to show")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -590,6 +657,7 @@ Official Datasets (ShareGPT format):
         "stats": cmd_stats,
         "preview": cmd_preview,
         "convert": cmd_convert,
+        "prefixes": cmd_prefixes,
     }
 
     return commands[args.command](args)
