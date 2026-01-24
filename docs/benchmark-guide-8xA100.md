@@ -926,20 +926,24 @@ export TOKENIZER_PATH=/path/to/tokenizer.json
    ```yaml
    environment:
      - RANVIER_ACCEPT_CLIENT_TOKENS=1
+     - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=1
    ```
 
 ### What Happens
 
-| CLIENT_TOKENIZE | Ranvier Tokenizes | Client Tokenizes | Notes |
-|-----------------|-------------------|------------------|-------|
-| false (default) | Yes | No | Standard behavior |
-| true | No | Yes | Bypasses ranvier tokenization |
+| CLIENT_TOKENIZE | Ranvier Tokenizes | Client Tokenizes | Prefix Hints |
+|-----------------|-------------------|------------------|--------------|
+| false (default) | Yes | No | Auto-detected from system messages |
+| true | No | Yes | Calculated and sent by client |
 
 When `CLIENT_TOKENIZE=true`:
 1. Locust pre-tokenizes prompts using Python `tokenizers` library
-2. Sends `prompt_token_ids` in request body
-3. Ranvier extracts tokens for routing (no local tokenization)
-4. Ranvier forwards tokens to vLLM (vLLM also skips tokenization)
+2. Locust tokenizes system messages separately to calculate `prefix_token_count`
+3. Sends `prompt_token_ids` and `prefix_token_count` in request body
+4. Ranvier uses client-provided prefix boundary for routing (no local tokenization)
+5. Ranvier forwards tokens to vLLM (vLLM also skips tokenization)
+
+**Prefix Boundary Benefit**: By sending `prefix_token_count`, clients tell Ranvier exactly where their "shared prefix" ends. This enables optimal routing for multi-turn conversations where requests share the same system prompt but have different user queries.
 
 ### Comparing Both Paths
 

@@ -57,6 +57,84 @@ Each component serves a specific purpose:
 
 The ART enables **partial prefix matching**: if request B shares a prefix with previously-seen request A, it routes to the same backend even if B is longer. Simple hashing alone cannot do this.
 
+## Prefix Boundary Detection
+
+### The Multi-Turn Problem
+
+In multi-turn conversations, the tokenized request includes both shared content (system messages) and unique content (user queries). When using a fixed `prefix_token_length`, requests with the same system prompt but different user messages may hash to different backends:
+
+```
+Request 1: [system tokens...][user: "What is 2+2?"]  → Backend 1
+Request 2: [system tokens...][user: "Hello!"]        → Backend 2  ❌ Cache miss!
+```
+
+Both requests share the same system prompt, but the user query difference causes different routing.
+
+### Solution: Prefix Boundary
+
+Ranvier detects the "shared prefix boundary" - the point where common content (system messages) ends and unique content (user queries) begins. Routes are stored at this boundary instead of `prefix_token_length`:
+
+```
+Request 1: [system tokens] | [user: "What is 2+2?"]  → Backend 1
+Request 2: [system tokens] | [user: "Hello!"]        → Backend 1  ✓ Cache hit!
+                          ↑
+                   prefix boundary
+```
+
+### Detection Methods
+
+Ranvier supports two methods for determining the prefix boundary:
+
+#### 1. Automatic System Message Detection (Default)
+
+Ranvier automatically extracts and tokenizes system messages from chat completion requests:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ]
+}
+```
+
+The system message tokens become the prefix boundary. This works transparently without client changes.
+
+#### 2. Client-Provided Prefix Boundary (Opt-in)
+
+Clients can explicitly specify their prefix length using the `prefix_token_count` field:
+
+```json
+{
+  "messages": [...],
+  "prompt_token_ids": [1, 2, 3, ...],
+  "prefix_token_count": 256
+}
+```
+
+This is useful when:
+- Clients pre-tokenize requests (know exact token counts)
+- System message detection doesn't capture the full shared prefix
+- Complex multi-part system prompts need custom boundaries
+
+Client-provided boundaries take precedence over automatic detection.
+
+### Prefix Boundary Configuration
+
+| Option | Default | Env Variable | Description |
+|--------|---------|--------------|-------------|
+| `enable_prefix_boundary` | `true` | `RANVIER_ENABLE_PREFIX_BOUNDARY` | Enable automatic system message detection |
+| `min_prefix_boundary_tokens` | `4` | `RANVIER_MIN_PREFIX_BOUNDARY_TOKENS` | Minimum tokens for valid boundary |
+| `accept_client_prefix_boundary` | `false` | `RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY` | Accept client-provided `prefix_token_count` |
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `prefix_boundary_used` | System message boundary detected and used |
+| `prefix_boundary_skipped` | Boundary skipped (no system messages, too short, etc.) |
+| `prefix_boundary_client` | Client-provided `prefix_token_count` was used |
+
 ## Configuration
 
 ### Environment Variables
@@ -71,6 +149,11 @@ RANVIER_PREFIX_TOKEN_LENGTH=128
 # Alternative: set routing mode directly
 # "prefix" enables prefix-affinity, "round_robin" disables it
 RANVIER_ROUTING_MODE=prefix
+
+# Prefix boundary detection (for multi-turn conversations)
+RANVIER_ENABLE_PREFIX_BOUNDARY=true
+RANVIER_MIN_PREFIX_BOUNDARY_TOKENS=4
+RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=false
 ```
 
 ### YAML Configuration
@@ -80,6 +163,9 @@ routing:
   prefix_affinity_enabled: true
   prefix_token_length: 128
   block_alignment: 16  # Align to vLLM's PagedAttention block size
+  enable_prefix_boundary: true  # Detect system message boundaries
+  min_prefix_boundary_tokens: 4
+  accept_client_prefix_boundary: false  # Accept client-provided prefix_token_count
 ```
 
 ### Configuration Options
@@ -89,6 +175,9 @@ routing:
 | `prefix_affinity_enabled` | `true` | Enable hybrid ART + hash routing |
 | `prefix_token_length` | `128` | Number of tokens to use as routing key |
 | `block_alignment` | `16` | Align prefix to vLLM block boundaries |
+| `enable_prefix_boundary` | `true` | Detect system message boundaries for multi-turn |
+| `min_prefix_boundary_tokens` | `4` | Minimum system message tokens to use as boundary |
+| `accept_client_prefix_boundary` | `false` | Accept client-provided `prefix_token_count` |
 
 ## Implementation Details
 
