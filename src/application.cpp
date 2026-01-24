@@ -114,6 +114,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.block_alignment = config.routing.block_alignment;
     cfg.enable_prefix_boundary = config.routing.enable_prefix_boundary;
     cfg.min_prefix_boundary_tokens = config.routing.min_prefix_boundary_tokens;
+    cfg.accept_client_prefix_boundary = config.routing.accept_client_prefix_boundary;
     // Timeout settings
     cfg.connect_timeout = config.timeouts.connect_timeout;
     cfg.request_timeout = config.timeouts.request_timeout;

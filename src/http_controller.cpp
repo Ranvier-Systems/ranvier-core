@@ -868,10 +868,31 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         }
     } // tokenization block ends here (tokenize_span goes out of scope)
 
-    // Extract and tokenize system messages to determine shared prefix boundary
-    // This enables prefix-aware routing for multi-turn conversations where
-    // requests share the same system prompt but have different user queries
-    if (_config.enable_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
+    // Determine shared prefix boundary for routing
+    // Priority: 1) Client-provided prefix_token_count, 2) Automatic system message detection
+    bool prefix_boundary_set = false;
+
+    // Option 1: Check for client-provided prefix_token_count
+    if (_config.accept_client_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
+        auto client_prefix = RequestRewriter::extract_prefix_token_count(body_view);
+        if (client_prefix.has_value()) {
+            size_t count = *client_prefix;
+            // Validate: must be positive and less than total tokens
+            if (count > 0 && count < tokens.size()) {
+                prefix_boundary = count;
+                prefix_boundary_set = true;
+                metrics().record_prefix_boundary_client();
+                log_proxy.debug("[{}] Using client-provided prefix boundary: {} tokens",
+                                request_id, prefix_boundary);
+            } else {
+                log_proxy.debug("[{}] Ignoring invalid client prefix_token_count: {} (tokens={})",
+                                request_id, count, tokens.size());
+            }
+        }
+    }
+
+    // Option 2: Automatic system message detection (fallback if client didn't provide)
+    if (!prefix_boundary_set && _config.enable_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
         auto system_messages = RequestRewriter::extract_system_messages(body_view);
         if (system_messages.has_value() && !system_messages->empty()) {
             try {
@@ -881,6 +902,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                 if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
                     system_tokens.size() < tokens.size()) {
                     prefix_boundary = system_tokens.size();
+                    prefix_boundary_set = true;
                     metrics().record_prefix_boundary_used();
                     log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
                                     request_id, prefix_boundary);

@@ -81,6 +81,12 @@ struct RoutingConfig {
     bool enable_prefix_boundary = true;  // Enable automatic prefix boundary detection
     size_t min_prefix_boundary_tokens = 4;  // Minimum system message tokens to use as boundary
 
+    // Client-provided prefix boundary (prefix_token_count field in requests)
+    // When enabled, clients can include a "prefix_token_count" field in their requests
+    // to specify how many tokens constitute their shared prefix. This takes precedence
+    // over automatic system message detection when present.
+    bool accept_client_prefix_boundary = false;  // Accept client-provided prefix_token_count
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
@@ -530,6 +536,9 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_MIN_PREFIX_BOUNDARY_TOKENS")) {
         routing.min_prefix_boundary_tokens = *v;
     }
+    if (auto v = get_env("RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY")) {
+        routing.accept_client_prefix_boundary = (*v == "1" || *v == "true" || *v == "yes");
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -938,6 +947,9 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["min_prefix_boundary_tokens"]) {
                 config.routing.min_prefix_boundary_tokens = r["min_prefix_boundary_tokens"].as<size_t>();
+            }
+            if (r["accept_client_prefix_boundary"]) {
+                config.routing.accept_client_prefix_boundary = r["accept_client_prefix_boundary"].as<bool>();
             }
         }
 
