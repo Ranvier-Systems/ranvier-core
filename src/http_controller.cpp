@@ -602,9 +602,10 @@ future<> HttpController::stream_backend_response(
             }
 
             // Learn route in the ART for future prefix matching
+            // Use prefix_boundary (system message token count) if available for better cache locality
             if (_config.should_learn_routes() && ctx.tokens.size() >= _config.min_token_length) {
                 // Route learning is best-effort; don't fail the request if it fails
-                (void)_router.learn_route_global(ctx.tokens, ctx.current_backend, ctx.request_id)
+                (void)_router.learn_route_global(ctx.tokens, ctx.current_backend, ctx.request_id, ctx.prefix_boundary)
                     .handle_exception([request_id = ctx.request_id](auto) {
                         log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
                     });
@@ -777,6 +778,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     // Get tokens for routing - either from client or by tokenizing locally
     std::vector<int32_t> tokens;
     bool used_client_tokens = false;
+    size_t prefix_boundary = 0;  // Token count of shared prefix (system messages)
 
     // Timing: capture tokenization start
     auto tokenization_start = std::chrono::steady_clock::now();
@@ -865,6 +867,29 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
             }
         }
     } // tokenization block ends here (tokenize_span goes out of scope)
+
+    // Extract and tokenize system messages to determine shared prefix boundary
+    // This enables prefix-aware routing for multi-turn conversations where
+    // requests share the same system prompt but have different user queries
+    if (!tokens.empty() && !tokenization_skipped) {
+        auto system_messages = RequestRewriter::extract_system_messages(body_view);
+        if (system_messages.has_value() && !system_messages->empty()) {
+            try {
+                auto system_tokens = _tokenizer.local().encode(*system_messages);
+                // Only use as boundary if system tokens are shorter than full tokens
+                // and represent a meaningful prefix (at least 4 tokens)
+                if (system_tokens.size() >= 4 && system_tokens.size() < tokens.size()) {
+                    prefix_boundary = system_tokens.size();
+                    log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
+                                    request_id, prefix_boundary);
+                }
+            } catch (...) {
+                // System message tokenization failed - not fatal, just skip prefix boundary
+                log_proxy.debug("[{}] System message tokenization failed, using default prefix",
+                                request_id);
+            }
+        }
+    }
 
     // Timing: record tokenization latency
     auto tokenization_end = std::chrono::steady_clock::now();
@@ -1020,6 +1045,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     ctx->endpoint = std::string(endpoint);
     ctx->forwarded_body = std::move(forwarded_body);
     ctx->tokens = std::move(tokens);
+    ctx->prefix_boundary = prefix_boundary;
     ctx->target_id = target_id;
     ctx->target_addr = target_addr;
     ctx->current_backend = target_id;

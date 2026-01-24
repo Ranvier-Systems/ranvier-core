@@ -115,9 +115,14 @@ public:
     // 2. CONTROL PLANE (Async Broadcasts)
     // Teach the tree a new prefix (Prefix -> ID) with LRU eviction
     // request_id: Optional request ID for tracing (empty string if not tracing)
+    // prefix_boundary: Optional token count for "shared prefix" (e.g., system message length).
+    //                  If provided and > 0, route is stored at this boundary instead of
+    //                  full prefix_token_length. This enables prefix-aware routing for
+    //                  multi-turn conversations where requests share a common system prompt.
     // Also broadcasts to cluster peers if gossip is enabled
     seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend,
-                                          const std::string& request_id = "");
+                                          const std::string& request_id = "",
+                                          size_t prefix_boundary = 0);
 
     // Learn a route from a remote cluster peer (marks as REMOTE origin)
     // REMOTE routes can be evicted more aggressively than LOCAL routes
