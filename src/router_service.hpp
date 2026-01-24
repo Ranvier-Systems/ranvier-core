@@ -124,6 +124,23 @@ public:
                                           const std::string& request_id = "",
                                           size_t prefix_boundary = 0);
 
+    // Multi-depth route learning (Option C)
+    // Stores routes at multiple prefix boundaries for optimal cache reuse in
+    // branching or continuing conversations. Each boundary represents a natural
+    // breakpoint (e.g., end of system message, end of user turn, etc.)
+    //
+    // prefix_boundaries: Vector of cumulative token counts where routes should be stored.
+    //                   Routes are stored at each boundary, allowing lookups to match
+    //                   at any conversation depth.
+    //
+    // Example: boundaries = [256, 306, 406] stores 3 routes:
+    //   - tokens[0..256] → backend (system message)
+    //   - tokens[0..306] → backend (system + user1)
+    //   - tokens[0..406] → backend (system + user1 + assistant1)
+    seastar::future<> learn_route_global_multi(std::vector<int32_t> tokens, BackendId backend,
+                                                const std::string& request_id,
+                                                const std::vector<size_t>& prefix_boundaries);
+
     // Learn a route from a remote cluster peer (marks as REMOTE origin)
     // REMOTE routes can be evicted more aggressively than LOCAL routes
     seastar::future<> learn_route_remote(std::vector<int32_t> tokens, BackendId backend);

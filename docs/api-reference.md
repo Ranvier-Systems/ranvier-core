@@ -69,16 +69,23 @@ Proxies completion requests with support for pre-tokenized input.
 |-------|------|-------------|
 | `prompt_token_ids` | `int[]` | Pre-tokenized prompt (bypasses Ranvier tokenization) |
 | `prefix_token_count` | `int` | Number of tokens that constitute the "shared prefix" for routing |
+| `prefix_boundaries` | `int[]` | Multi-depth boundaries for route storage (cumulative token counts) |
 
 **When to use `prefix_token_count`**:
 - You're sending pre-tokenized requests (`prompt_token_ids`)
 - You know exactly how many tokens are your "shared prefix" (e.g., system prompt)
 - You want optimal KV-cache locality across requests sharing the same prefix
 
+**When to use `prefix_boundaries`** (multi-depth routing):
+- You want routes stored at multiple conversation depths
+- Enables cache reuse for branching or continuing conversations
+- Example: `[256, 306, 406]` stores routes at each message boundary
+
 **Example**: If your system prompt tokenizes to 256 tokens, set `prefix_token_count: 256`. All requests with the same first 256 tokens will route to the same backend.
 
 **Requirements**:
 - `accept_client_tokens` must be enabled for `prompt_token_ids`
+- `enable_multi_depth_routing` must be enabled for `prefix_boundaries`
 - `accept_client_prefix_boundary` must be enabled for `prefix_token_count`
 
 ---

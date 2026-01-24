@@ -119,6 +119,41 @@ This is useful when:
 
 Client-provided boundaries take precedence over automatic detection.
 
+### Multi-Depth Route Storage (Option C)
+
+For optimal cache reuse in multi-turn conversations, Ranvier can store routes at multiple depths:
+
+```
+[system: 256 tokens][user1: 50 tokens][assistant1: 100 tokens][user2: 30 tokens]
+       ↑                    ↑                    ↑                    ↑
+   depth 1 (256)        depth 2 (306)       depth 3 (406)       depth 4 (436)
+```
+
+With multi-depth routing enabled:
+- Routes are stored at each message boundary (not just the system message boundary)
+- A request continuing an existing conversation can match at any previous depth
+- Enables cache reuse for branching conversations and conversation continuations
+
+#### Enabling Multi-Depth Routing
+
+```bash
+# Enable multi-depth route storage
+RANVIER_ENABLE_MULTI_DEPTH_ROUTING=true
+```
+
+#### Client-Provided Boundaries
+
+Clients can specify multiple boundaries using the `prefix_boundaries` array:
+
+```json
+{
+  "prompt_token_ids": [...],
+  "prefix_boundaries": [256, 306, 406]
+}
+```
+
+This tells Ranvier to store routes at tokens 256, 306, and 406.
+
 ### Prefix Boundary Configuration
 
 | Option | Default | Env Variable | Description |
@@ -126,6 +161,7 @@ Client-provided boundaries take precedence over automatic detection.
 | `enable_prefix_boundary` | `true` | `RANVIER_ENABLE_PREFIX_BOUNDARY` | Enable automatic system message detection |
 | `min_prefix_boundary_tokens` | `4` | `RANVIER_MIN_PREFIX_BOUNDARY_TOKENS` | Minimum tokens for valid boundary |
 | `accept_client_prefix_boundary` | `false` | `RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY` | Accept client-provided `prefix_token_count` |
+| `enable_multi_depth_routing` | `false` | `RANVIER_ENABLE_MULTI_DEPTH_ROUTING` | Store routes at multiple message depths |
 
 ### Metrics
 
@@ -134,6 +170,7 @@ Client-provided boundaries take precedence over automatic detection.
 | `prefix_boundary_used` | System message boundary detected and used |
 | `prefix_boundary_skipped` | Boundary skipped (no system messages, too short, etc.) |
 | `prefix_boundary_client` | Client-provided `prefix_token_count` was used |
+| `multi_depth_routes_stored` | Total routes stored via multi-depth learning |
 
 ## Configuration
 
@@ -154,6 +191,7 @@ RANVIER_ROUTING_MODE=prefix
 RANVIER_ENABLE_PREFIX_BOUNDARY=true
 RANVIER_MIN_PREFIX_BOUNDARY_TOKENS=4
 RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=false
+RANVIER_ENABLE_MULTI_DEPTH_ROUTING=false
 ```
 
 ### YAML Configuration
@@ -166,6 +204,7 @@ routing:
   enable_prefix_boundary: true  # Detect system message boundaries
   min_prefix_boundary_tokens: 4
   accept_client_prefix_boundary: false  # Accept client-provided prefix_token_count
+  enable_multi_depth_routing: false     # Store routes at multiple message depths
 ```
 
 ### Configuration Options
@@ -178,6 +217,7 @@ routing:
 | `enable_prefix_boundary` | `true` | Detect system message boundaries for multi-turn |
 | `min_prefix_boundary_tokens` | `4` | Minimum system message tokens to use as boundary |
 | `accept_client_prefix_boundary` | `false` | Accept client-provided `prefix_token_count` |
+| `enable_multi_depth_routing` | `false` | Store routes at multiple message depths |
 
 ## Implementation Details
 

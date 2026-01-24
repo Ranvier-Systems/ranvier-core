@@ -115,6 +115,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.enable_prefix_boundary = config.routing.enable_prefix_boundary;
     cfg.min_prefix_boundary_tokens = config.routing.min_prefix_boundary_tokens;
     cfg.accept_client_prefix_boundary = config.routing.accept_client_prefix_boundary;
+    cfg.enable_multi_depth_routing = config.routing.enable_multi_depth_routing;
     // Timeout settings
     cfg.connect_timeout = config.timeouts.connect_timeout;
     cfg.request_timeout = config.timeouts.request_timeout;
