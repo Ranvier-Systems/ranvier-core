@@ -156,7 +156,7 @@ Before benchmarking, verify your prompt file has good prefix sharing characteris
 
 ```bash
 # Check prefix distribution
-python tests/integration/prompt_loader.py prefixes data/prompts.jsonl
+python3 tests/integration/prompt_loader.py prefixes data/prompts.jsonl
 
 # Example output for a well-structured file:
 # Total prompts:      9950
@@ -185,8 +185,8 @@ python tests/integration/prompt_loader.py prefixes data/prompts.jsonl
 tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
 
 # Validate before use
-python tests/integration/prompt_loader.py prefixes tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
-python tests/integration/prompt_loader.py stats tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+python3 tests/integration/prompt_loader.py prefixes tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+python3 tests/integration/prompt_loader.py stats tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
 ```
 
 ---
