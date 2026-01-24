@@ -108,6 +108,172 @@ TEST_F(RequestRewriterTest, ExtractTextSkipsMessagesWithoutContent) {
 }
 
 // =============================================================================
+// extract_system_messages tests
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesBasic) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "You are a helpful assistant.");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesMultiple) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "Be concise in your responses."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "You are a helpful assistant.\nBe concise in your responses.");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNoneFound) {
+    std::string body = R"({
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesFromPromptField) {
+    // Prompt field has no system message concept - should return nullopt
+    std::string body = R"({"prompt": "Hello, world!", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesEmptyMessagesArray) {
+    std::string body = R"({"messages": []})";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNoRoleField) {
+    std::string body = R"({
+        "messages": [
+            {"content": "I have no role"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNoContentField) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesEmptyContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesUnicodeContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "你是一个有帮助的助手。🤖"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "你是一个有帮助的助手。🤖");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesInterleavedRoles) {
+    // System messages can appear anywhere in the array
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "First system message."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"},
+            {"role": "system", "content": "Second system message."},
+            {"role": "user", "content": "How are you?"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "First system message.\nSecond system message.");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNonObjectMessage) {
+    std::string body = R"({
+        "messages": [
+            "not an object",
+            {"role": "system", "content": "Valid system message"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "Valid system message");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNonStringRole) {
+    std::string body = R"({
+        "messages": [
+            {"role": 123, "content": "Invalid role type"},
+            {"role": "system", "content": "Valid system message"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "Valid system message");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNonStringContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": 12345},
+            {"role": "system", "content": "Valid content"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "Valid content");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesLongContent) {
+    // Test with a longer system message typical of real-world usage
+    std::string long_system = std::string(1000, 'a');  // 1000 character system message
+    std::string body = R"({"messages": [{"role": "system", "content": ")" + long_system + R"("}]})";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), long_system);
+}
+
+// =============================================================================
 // rewrite tests
 // =============================================================================
 
