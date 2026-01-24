@@ -137,6 +137,58 @@ The benchmark categorizes prompts into size buckets for analysis:
 
 **Key insight:** XLarge prefixes show the most dramatic improvement (25-40% TTFT reduction) because they save the most KV cache computation.
 
+### Using Custom Prompt Files (`--prompt-file`)
+
+Instead of synthetic prompts, you can benchmark with real conversation data using JSONL files.
+
+**Basic usage:**
+```bash
+./scripts/bench.sh --compare --prompt-file data/prompts.jsonl --duration 10m --users 10
+```
+
+**Supported formats:**
+- **OpenAI:** `{"messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]}`
+- **ShareGPT:** `{"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}`
+
+**Validating prompt files:**
+
+Before benchmarking, verify your prompt file has good prefix sharing characteristics:
+
+```bash
+# Check prefix distribution
+python tests/integration/prompt_loader.py prefixes data/prompts.jsonl
+
+# Example output for a well-structured file:
+# Total prompts:      9950
+# Unique prefixes:    3
+# Avg per prefix:     3316.7
+#
+# Top 3 most common prefixes:
+#   1.  3342 prompts (33.6%): "You are a coding expert..."
+#   2.  3324 prompts (33.4%): "You are a customer service agent..."
+#   3.  3284 prompts (33.0%): "You are a helpful assistant..."
+```
+
+**What makes a good prompt file for cache benchmarking:**
+
+| Characteristic | Good | Poor |
+|----------------|------|------|
+| Unique prefixes | 3-50 | 1000+ |
+| Prompts per prefix | 100+ | <10 |
+| System message presence | Yes | No |
+
+**Important:** The benchmark tracks cache hits based on **system messages only** (the shared prefix). Multi-turn conversation history is unique per conversation and doesn't contribute to cache hits.
+
+**Included test files:**
+```bash
+# Synthetic with shared prefixes (good for benchmarking)
+tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+
+# Validate before use
+python tests/integration/prompt_loader.py prefixes tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+python tests/integration/prompt_loader.py stats tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+```
+
 ---
 
 ## Test Scenarios
