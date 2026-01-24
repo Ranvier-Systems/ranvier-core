@@ -200,32 +200,26 @@ def estimate_tokens(text: str) -> int:
 def compute_prefix_hash(messages: List[dict]) -> str:
     """Compute a prefix hash for cache tracking.
 
-    Only hashes the shared prefix portion (system prompt + any assistant context),
-    excluding the final user message which is typically unique per request.
-    This allows conversations with the same system prompt to share cache entries.
+    Hashes only the system message(s), which represent the shared prefix that
+    can be cached across conversations. User/assistant conversation history
+    is unique per conversation and shouldn't be included in the prefix hash.
     """
     if not messages:
         return str(hash(""))
 
-    # For single message, use the first portion of it
-    if len(messages) == 1:
-        content = messages[0].get("content", "")
-        return str(hash(content[:800]))
+    # Extract only system messages (the shared prefix)
+    system_content = ""
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_content += msg.get("content", "") + "\n"
 
-    # For multi-message: hash everything EXCEPT the last message
-    # (the last message is typically the unique user query)
-    prefix_text = ""
-    for msg in messages[:-1]:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        prefix_text += f"{role}: {content}\n"
+    # If there's a system message, hash it
+    if system_content.strip():
+        return str(hash(system_content[:1600]))
 
-    # If prefix is empty (e.g., only user messages), use first message
-    if not prefix_text.strip():
-        content = messages[0].get("content", "")
-        return str(hash(content[:800]))
-
-    return str(hash(prefix_text[:1600]))
+    # Fallback: no system message, use first message prefix
+    first_content = messages[0].get("content", "")
+    return str(hash(first_content[:400]))
 
 
 def extract_prefix_group(messages: List[dict]) -> str:
