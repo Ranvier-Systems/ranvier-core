@@ -198,16 +198,34 @@ def estimate_tokens(text: str) -> int:
 
 
 def compute_prefix_hash(messages: List[dict]) -> str:
-    """Compute a prefix hash for cache tracking."""
-    full_text = ""
-    for msg in messages:
+    """Compute a prefix hash for cache tracking.
+
+    Only hashes the shared prefix portion (system prompt + any assistant context),
+    excluding the final user message which is typically unique per request.
+    This allows conversations with the same system prompt to share cache entries.
+    """
+    if not messages:
+        return str(hash(""))
+
+    # For single message, use the first portion of it
+    if len(messages) == 1:
+        content = messages[0].get("content", "")
+        return str(hash(content[:800]))
+
+    # For multi-message: hash everything EXCEPT the last message
+    # (the last message is typically the unique user query)
+    prefix_text = ""
+    for msg in messages[:-1]:
         role = msg.get("role", "")
         content = msg.get("content", "")
-        full_text += f"{role}: {content}\n"
+        prefix_text += f"{role}: {content}\n"
 
-    # Take first ~400 characters (approximately first 100 tokens)
-    prefix = full_text[:400]
-    return str(hash(prefix))
+    # If prefix is empty (e.g., only user messages), use first message
+    if not prefix_text.strip():
+        content = messages[0].get("content", "")
+        return str(hash(content[:800]))
+
+    return str(hash(prefix_text[:1600]))
 
 
 def extract_prefix_group(messages: List[dict]) -> str:
