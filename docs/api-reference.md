@@ -39,11 +39,47 @@ Proxies requests to backend LLM servers with intelligent routing.
 **Response**: Streamed response from backend (SSE format)
 
 **Routing Logic**:
-1. Tokenize request body
-2. Look up longest prefix match in RadixTree
-3. If hit → route to matched backend
-4. If miss → route to random healthy backend
-5. On success → learn route for future requests
+1. Tokenize request body (or use client-provided `prompt_token_ids`)
+2. Determine prefix boundary (system messages or client-provided `prefix_token_count`)
+3. Look up longest prefix match in RadixTree
+4. If hit → route to matched backend
+5. If miss → route via consistent hash (deterministic)
+6. On success → learn route at prefix boundary for future requests
+
+---
+
+### POST /v1/completions
+
+Proxies completion requests with support for pre-tokenized input.
+
+**Request**: OpenAI-compatible completion request with optional routing hints
+```json
+{
+  "model": "llama2",
+  "prompt": "Hello, world!",
+  "prompt_token_ids": [15496, 11, 995, 0],
+  "prefix_token_count": 128,
+  "stream": true
+}
+```
+
+**Ranvier-Specific Fields**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prompt_token_ids` | `int[]` | Pre-tokenized prompt (bypasses Ranvier tokenization) |
+| `prefix_token_count` | `int` | Number of tokens that constitute the "shared prefix" for routing |
+
+**When to use `prefix_token_count`**:
+- You're sending pre-tokenized requests (`prompt_token_ids`)
+- You know exactly how many tokens are your "shared prefix" (e.g., system prompt)
+- You want optimal KV-cache locality across requests sharing the same prefix
+
+**Example**: If your system prompt tokenizes to 256 tokens, set `prefix_token_count: 256`. All requests with the same first 256 tokens will route to the same backend.
+
+**Requirements**:
+- `accept_client_tokens` must be enabled for `prompt_token_ids`
+- `accept_client_prefix_boundary` must be enabled for `prefix_token_count`
 
 ---
 
