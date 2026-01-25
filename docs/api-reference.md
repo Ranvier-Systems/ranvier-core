@@ -76,6 +76,14 @@ Proxies completion requests with support for pre-tokenized input.
 - You know exactly how many tokens are your "shared prefix" (e.g., system prompt)
 - You want optimal KV-cache locality across requests sharing the same prefix
 
+**Tokenization Format Requirement**: When computing `prefix_token_count`, you must tokenize using Ranvier's internal format: raw message content with `\n` separators. Do **not** use chat template format (e.g., `<|system|>\n{content}`).
+
+```python
+# Correct: raw content with newline separator
+system_text = system_content + "\n"
+prefix_token_count = len(tokenizer.encode(system_text))
+```
+
 **When to use `prefix_boundaries`** (multi-depth routing):
 - You want routes stored at multiple conversation depths
 - Enables cache reuse for branching or continuing conversations

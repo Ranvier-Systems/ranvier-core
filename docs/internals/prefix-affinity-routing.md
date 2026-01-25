@@ -119,6 +119,27 @@ This is useful when:
 
 Client-provided boundaries take precedence over automatic detection.
 
+**Important: Tokenization Format**
+
+When using client-provided `prompt_token_ids` with `prefix_token_count`, the tokenization format must match Ranvier's internal format. Ranvier tokenizes the raw message content with newline separators:
+
+```
+{system_content}\n{user_content}\n...
+```
+
+**Do not** use chat template format (e.g., `<|system|>\n{content}`) when computing `prefix_token_count`. Use raw content concatenated with `\n` separators.
+
+Example (Python):
+```python
+# Correct: raw content with newlines
+system_text = system_content + "\n"
+tokens = tokenizer.encode(system_text)
+prefix_token_count = len(tokens)
+
+# Incorrect: chat template format
+# tokens = tokenizer.apply_chat_template(messages)  # Don't use this
+```
+
 ### Multi-Depth Route Storage (Option C)
 
 For optimal cache reuse in multi-turn conversations, Ranvier can store routes at multiple depths:
@@ -228,6 +249,35 @@ routing:
 - `src/radix_tree.hpp` - Adaptive Radix Tree with longest prefix match
 - `src/http_controller.cpp` - Routing decision and `X-Backend-ID` header
 - `src/config.hpp` - Configuration parsing
+
+### BPE Tokenization Boundary Alignment
+
+BPE (Byte Pair Encoding) tokenizers produce different tokens depending on context. For example, "helpful" may tokenize differently than "helpful\n" due to subword boundaries.
+
+To ensure the system message tokens are an exact prefix of the full request tokens, Ranvier appends a trailing newline when tokenizing system messages:
+
+```cpp
+// Ensures BPE tokens match the prefix of full text tokenization
+auto system_text = extract_system_messages(body) + "\n";
+auto system_tokens = tokenizer.encode(system_text);
+```
+
+This aligns with how `extract_text()` formats messages internally (content separated by newlines).
+
+### Cluster-Wide Hash Consistency
+
+In multi-node deployments, each Ranvier node learns routes independently. Before routes are learned, the hash fallback must be deterministic across all nodes.
+
+Ranvier uses `prefix_boundary` (not `prefix_token_length`) for hash computation when available:
+
+```cpp
+// Use prefix_boundary for hash to ensure cluster-wide consistency
+size_t hash_len = (prefix_boundary > 0) ? prefix_boundary : prefix_token_length;
+auto hash = hash_prefix(tokens.data(), hash_len, block_alignment);
+backend_id = hash % num_backends;
+```
+
+This ensures that requests with the same system message (but different user queries) hash to the same backend across all nodes, even before routes are learned.
 
 ### Hash Function
 
