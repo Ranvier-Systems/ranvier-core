@@ -50,7 +50,12 @@ jobs:
       # Larger ARM runners may not have Docker pre-configured
       - name: Set up Docker (ARM)
         if: matrix.arch == 'arm64'
-        uses: docker/setup-docker-action@v4
+        run: |
+          # Install Docker on ARM runner
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker $USER
+          sudo systemctl start docker
+          docker --version
 
       # Free up disk space for large Docker builds
       # GitHub runners have limited space (~14GB free)
