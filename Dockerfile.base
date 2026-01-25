@@ -1,8 +1,8 @@
 # ---------------------------------------------------------
 # Ranvier Base Builder Image
 # ---------------------------------------------------------
-# This image contains OS, build tools, Rust, and Seastar pre-built.
-# Build once and push to your registry to drastically reduce build times.
+# This image contains OS, build tools, Rust, Seastar, and pre-built
+# CMake FetchContent dependencies (tokenizers-cpp, abseil, opentelemetry, etc.)
 #
 # Build:
 #   docker build -f Dockerfile.base -t my-registry/ranvier-base:latest .
@@ -14,12 +14,14 @@
 # Rebuild this base image only when:
 #   - Upgrading Fedora version
 #   - Upgrading Seastar version
+#   - Upgrading tokenizers-cpp, abseil, opentelemetry versions
 #   - Adding new system-level build dependencies
+#   - Changing CMakeLists.txt FetchContent declarations
 # ---------------------------------------------------------
 FROM fedora:39
 
 LABEL org.opencontainers.image.title="Ranvier Base Builder"
-LABEL org.opencontainers.image.description="Pre-built Seastar + Rust toolchain for Ranvier builds"
+LABEL org.opencontainers.image.description="Pre-built Seastar + Rust + FetchContent deps for Ranvier builds"
 
 # Layer 1: System packages (rarely changes)
 RUN dnf install -y \
@@ -32,6 +34,7 @@ RUN dnf install -y \
         curl \
         libcurl-devel \
         openssl-devel \
+        protobuf-devel \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
@@ -52,5 +55,55 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
     cd /tmp && \
     rm -rf seastar && \
     rm -rf /var/cache/dnf /root/.cache /tmp/*
+
+# Layer 4: Pre-build FetchContent dependencies
+# This fetches and compiles tokenizers-cpp (Rust), abseil, opentelemetry, etc.
+# Production builds will reuse these cached dependencies.
+WORKDIR /src
+
+# Copy CMakeLists.txt to know what dependencies to fetch
+COPY CMakeLists.txt ./
+
+# Create minimal stub source files to satisfy CMake configure
+# These are just enough for CMake to run and build dependencies
+RUN mkdir -p src tests/unit assets && \
+    echo 'int main() { return 0; }' > src/main.cpp && \
+    for f in application async_persistence crypto_offloader dtls_context \
+             gossip_consensus gossip_protocol gossip_service gossip_transport \
+             health_service http_controller k8s_discovery_service node_slab \
+             router_service stream_parser tokenizer_service sqlite_persistence \
+             tracing_service; do \
+        echo "// stub" > src/${f}.cpp; \
+    done && \
+    echo '// stub' > tests/unit/radix_tree_test.cpp && \
+    echo '// stub' > tests/unit/text_validator_test.cpp && \
+    echo '// stub' > tests/unit/persistence_test.cpp && \
+    echo '// stub' > tests/unit/config_test.cpp && \
+    echo '// stub' > tests/unit/gossip_protocol_test.cpp && \
+    echo '// stub' > tests/unit/route_batching_test.cpp && \
+    echo '// stub' > tests/unit/k8s_discovery_test.cpp && \
+    echo '// stub' > tests/unit/request_rewriter_test.cpp && \
+    echo '// stub' > tests/unit/prefix_affinity_test.cpp && \
+    echo '// stub' > tests/unit/quorum_test.cpp && \
+    echo '// stub' > tests/unit/circuit_breaker_test.cpp && \
+    echo '// stub' > tests/unit/sharded_config_test.cpp && \
+    echo '// stub' > tests/unit/crypto_offloader_test.cpp && \
+    echo '// stub' > tests/unit/stream_parser_test.cpp && \
+    echo '// stub' > tests/unit/async_persistence_test.cpp && \
+    echo '// stub' > tests/unit/application_test.cpp
+
+# Run cmake configure to fetch all dependencies
+# Then build just the dependencies (will fail on linking stubs, but deps are built)
+RUN mkdir -p build && cd build && \
+    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 && \
+    ninja tokenizers_cpp opentelemetry_api opentelemetry_trace \
+          opentelemetry_exporter_zipkin_trace yaml-cpp absl_flat_hash_map \
+          gtest || true && \
+    echo "=== Dependencies built ===" && \
+    ls -la _deps/ && \
+    rm -rf /root/.cargo/registry/cache
+
+# Clean up stub source files but keep the build directory with dependencies
+RUN rm -rf src/* tests/*
 
 WORKDIR /src
