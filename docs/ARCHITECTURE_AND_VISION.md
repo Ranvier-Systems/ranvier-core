@@ -50,7 +50,7 @@ A dropdown (Cursor, etc.) sets a **global preference**. Ranvier makes **per-requ
 
 ## Phase 1: Foundation (Weeks 1-4) 🔓
 
-> **License**: All Phase 1 components are Ranvier Core (MIT Licensed)
+> **License**: All Phase 1 components are Ranvier Core (Apache 2.0)
 
 ### 1.1 Request Size Estimation
 
@@ -401,7 +401,7 @@ cost_by_intent[intent]            // "What's our spend per intent type?"
 
 ## Phase 2: Cloud Intelligence (Weeks 5-9) 🔓
 
-> **License**: Core routing intelligence is MIT Licensed. Advanced SLA enforcement and multi-tenant policies may be Enterprise.
+> **License**: Core routing intelligence is Apache 2.0. Advanced SLA enforcement and multi-tenant policies may be Enterprise.
 
 ### 2.1 vLLM Metrics Ingestion
 
@@ -626,7 +626,7 @@ src/http_controller.cpp
 
 ## Phase 3: Ranvier Local Product (Weeks 10-13) 🔓
 
-> **License**: Local discovery and agent scheduling are MIT Licensed. Team policy management may be Enterprise.
+> **License**: Local discovery and agent scheduling are Apache 2.0. Team policy management may be Enterprise.
 
 ### 3.1 Local Backend Discovery
 
