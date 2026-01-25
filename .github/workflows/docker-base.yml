@@ -53,8 +53,8 @@ jobs:
         run: |
           # Install Docker on ARM runner
           curl -fsSL https://get.docker.com | sudo sh
-          sudo usermod -aG docker $USER
           sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
           docker --version
 
       # Free up disk space for large Docker builds
