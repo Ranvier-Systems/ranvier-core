@@ -89,6 +89,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Larger ARM runners may not have Docker pre-configured
+      - name: Set up Docker (ARM)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-docker-action@v4
+
       # Free up disk space for large Docker builds
       # GitHub runners have limited space (~14GB free)
       - name: Free disk space
