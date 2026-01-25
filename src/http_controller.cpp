@@ -960,7 +960,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
             auto system_messages = RequestRewriter::extract_system_messages(body_view);
             if (system_messages.has_value() && !system_messages->empty()) {
                 try {
-                    auto system_tokens = _tokenizer.local().encode(*system_messages);
+                    // IMPORTANT: Add trailing newline to match how extract_text formats messages.
+                    // BPE tokenizers may tokenize "helpful" differently than "helpful\n" due to
+                    // subword boundaries. By including the separator, we ensure the token sequence
+                    // matches the prefix of the full text tokenization.
+                    auto system_text = *system_messages + "\n";
+                    auto system_tokens = _tokenizer.local().encode(system_text);
                     // Only use as boundary if system tokens meet minimum threshold
                     // and are shorter than full tokens (otherwise it's not a prefix)
                     if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
