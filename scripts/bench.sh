@@ -174,6 +174,9 @@ BENCHMARK OPTIONS:
     --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
     --output-dir DIR    Custom output directory (default: benchmark-reports)
     --client-tokenize   Tokenize on client (locust) instead of Ranvier server
+    --multi-depth       Enable multi-depth route storage (Option C). Stores routes at
+                        each message boundary, not just system message. Useful for
+                        conversation continuations and branching scenarios.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
 
@@ -323,6 +326,7 @@ SETUP_ONLY=false
 WARMUP=false
 LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
+MULTI_DEPTH=false
 PROMPT_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -348,6 +352,7 @@ while [[ $# -gt 0 ]]; do
         --log-all)        LOG_ALL=true; shift ;;  # Kept for backwards compatibility (now default)
         --no-log)         LOG_ALL=false; shift ;;
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
+        --multi-depth)    MULTI_DEPTH=true; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
@@ -683,6 +688,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Warmup:          $WARMUP"
     echo "  Log All:         $LOG_ALL"
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
+    echo "  Multi-Depth:     $MULTI_DEPTH"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -939,6 +945,12 @@ if ! docker image inspect ranvier-locust:latest &> /dev/null; then
     log_info "Building Locust image..."
     docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1
     log_ok "Locust image built"
+fi
+
+# Export multi-depth routing setting for docker-compose
+if [[ "$MULTI_DEPTH" = true ]]; then
+    export RANVIER_ENABLE_MULTI_DEPTH_ROUTING=true
+    log_info "Multi-depth routing enabled (Option C)"
 fi
 
 # Start Ranvier nodes
