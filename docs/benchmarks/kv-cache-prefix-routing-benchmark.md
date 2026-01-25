@@ -293,6 +293,26 @@ The `--compare` flag automatically runs both round-robin and prefix-aware routin
   benchmark-reports/*prefix*/benchmark.log
 ```
 
+### Multi-Depth Routing (Option C)
+
+For workloads with conversation continuations or branching, test multi-depth route storage:
+
+```bash
+# Enable multi-depth routing - stores routes at each message boundary
+./scripts/bench.sh --multi-depth --compare --duration 10m --users 10
+
+# Best with conversation-style prompts that share history
+./scripts/bench.sh --multi-depth --duration 10m \
+  --prompt-file tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+```
+
+Multi-depth routing is most beneficial when:
+- Users continue existing conversations (routes learned at deeper depths)
+- Multiple users branch from a common conversation point
+- System prompts are combined with multi-turn dialogue
+
+See [Prefix Affinity Routing Internals](../internals/prefix-affinity-routing.md) for details on Options A, B, and C.
+
 ### Manual Multi-Mode Comparison
 
 For testing all three routing modes individually:
@@ -325,3 +345,4 @@ done
 - `src/router_service.cpp` - Routing implementation (ART + consistent hashing)
 - `src/http_controller.cpp` - Request handling with routing mode selection
 - `src/radix_tree.cpp` - Adaptive Radix Tree for prefix matching
+- `docs/internals/prefix-affinity-routing.md` - Options A, B, C routing strategies
