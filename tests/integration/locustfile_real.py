@@ -2759,20 +2759,30 @@ def check_sync_errors() -> Tuple[bool, str]:
 def hash_prompt_prefix(messages: List[dict], token_limit: int = 100) -> str:
     """Generate a hash of the prompt prefix for cache tracking.
 
-    This approximates what the router does - extracting the first N tokens
-    to determine routing affinity.
+    This matches what Ranvier does - extracting system messages as the
+    "shared prefix" for routing affinity. Requests with the same system
+    messages but different user queries should route to the same backend.
     """
-    # Combine all message content
+    # Extract only system messages (matching Ranvier's extract_system_messages)
+    system_text = ""
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            system_text += content + "\n"
+
+    if system_text:
+        # Hash system messages only
+        return str(hash(system_text))
+
+    # No system messages - fall back to first 400 chars of all content
+    # This handles prompts without system messages
     full_text = ""
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
         full_text += f"{role}: {content}\n"
 
-    # Take first ~400 characters as approximation of first 100 tokens
     prefix = full_text[:400]
-
-    # Simple hash
     return str(hash(prefix))
 
 
