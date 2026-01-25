@@ -209,6 +209,10 @@ def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
     The prefix_token_count tells Ranvier how many tokens constitute the
     "shared prefix" (system messages) for prefix-aware routing.
 
+    IMPORTANT: The tokenization format must match what Ranvier's extract_text()
+    produces: raw content concatenated with "\n" separators, followed by a
+    trailing "\n" to match the BPE boundary alignment fix.
+
     Returns None if:
     - Client tokenization is disabled
     - No system messages found
@@ -218,19 +222,21 @@ def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
         return None
 
     try:
-        # Extract system messages only
+        # Extract system message content only (matching Ranvier's extract_system_messages)
         system_parts = []
         for msg in messages:
             if msg.get("role") == "system":
                 content = msg.get("content", "")
                 if content:
-                    system_parts.append(f"<|system|>\n{content}")
+                    system_parts.append(content)
 
         if not system_parts:
             return None
 
-        # Tokenize the system messages
-        system_text = "\n".join(system_parts)
+        # Format must match Ranvier's extract_text() + "\n" for BPE boundary alignment
+        # - Multiple system messages: "content1\ncontent2\n"
+        # - Single system message: "content\n"
+        system_text = "\n".join(system_parts) + "\n"
         encoding = _tokenizer.encode(system_text)
         return len(encoding.ids)
     except Exception as e:
