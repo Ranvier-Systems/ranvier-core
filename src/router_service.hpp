@@ -101,8 +101,13 @@ public:
     // Returns RouteResult with backend_id, routing_mode, cache_hit, and error_message
     // This is the primary method HttpController should call for routing decisions.
     // request_id: Optional request ID for tracing (empty string if not tracing)
+    // prefix_boundary: Optional token count for "shared prefix" (e.g., system message length).
+    //                  If provided and > 0, the hash fallback uses this boundary instead of
+    //                  prefix_token_length. This ensures consistent routing across cluster nodes
+    //                  for requests sharing the same system prompt but different user queries.
     RouteResult route_request(const std::vector<int32_t>& tokens,
-                              const std::string& request_id = "");
+                              const std::string& request_id = "",
+                              size_t prefix_boundary = 0);
 
     // Find which Backend ID owns this prefix (radix tree lookup)
     // request_id: Optional request ID for tracing (empty string if not tracing)
@@ -171,8 +176,11 @@ public:
 
     // Get a backend using prefix-affinity routing (ART + consistent hash fallback)
     // Routes requests with the same prefix to the same backend for KV cache reuse
+    // prefix_boundary: If > 0, used for hash fallback instead of prefix_token_length.
+    //                  Ensures consistent routing across cluster nodes for same system prompt.
     std::optional<BackendId> get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                     const std::string& request_id = "");
+                                                     const std::string& request_id = "",
+                                                     size_t prefix_boundary = 0);
 
     // Get a backend using consistent hash only (no ART, no learning)
     // Used to measure baseline hash performance vs ART
