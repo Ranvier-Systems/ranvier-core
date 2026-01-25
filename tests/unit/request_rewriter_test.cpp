@@ -944,3 +944,135 @@ TEST_F(RequestRewriterTest, ExtractMessageBoundariesMultiTurn) {
     // System boundary is before first non-system message
     EXPECT_EQ(result->system_boundary, 10);
 }
+
+// =============================================================================
+// BPE Tokenization Boundary Alignment Tests
+// =============================================================================
+// These tests verify that extract_system_messages() + "\n" is a text prefix of
+// extract_text(). This property is critical for correct BPE tokenization:
+//
+// BPE tokenizers may produce different tokens for "text" vs "text\n" due to
+// subword boundary effects. For example:
+//   tokenize("helpful")     -> [1234]        (one way)
+//   tokenize("helpful\n")   -> [5678]        (different token!)
+//   tokenize("helpful\nHi") -> [5678, 9999]  (5678, not 1234)
+//
+// By ensuring system_messages + "\n" is a text prefix of the full text,
+// we guarantee that tokenizing (system_messages + "\n") produces tokens
+// that are a prefix of tokenizing the full text.
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentBasic) {
+    // Single system message followed by user message
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    // The key property: system_text + "\n" should be a prefix of full_text
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentMultipleSystemMessages) {
+    // Multiple system messages followed by user message
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    // Multiple system messages are joined with \n, then another \n before user
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentMultiTurnConversation) {
+    // Multi-turn conversation with system, user, assistant, user
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "How are you?"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentSpecialCharacters) {
+    // System message with characters that might affect BPE boundaries
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful.\nFollow instructions carefully."},
+            {"role": "user", "content": "Test query"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentEmptyContent) {
+    // Edge case: empty user content after system message
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": ""}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    // Even with empty user content, the format should be consistent
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
