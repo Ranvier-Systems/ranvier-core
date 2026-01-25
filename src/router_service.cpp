@@ -607,7 +607,8 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 }
 
 RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
-                                         const std::string& request_id) {
+                                         const std::string& request_id,
+                                         size_t prefix_boundary) {
     RouteResult result;
 
     // ==========================================================================
@@ -644,7 +645,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
-        auto affinity_backend = get_backend_for_prefix(tokens, request_id);
+        auto affinity_backend = get_backend_for_prefix(tokens, request_id, prefix_boundary);
 
         if (affinity_backend.has_value()) {
             result.backend_id = affinity_backend.value();
@@ -759,7 +760,8 @@ std::optional<BackendId> RouterService::get_random_backend() {
 }
 
 std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                                 const std::string& request_id) {
+                                                                 const std::string& request_id,
+                                                                 size_t prefix_boundary) {
     if (!g_shard_state) return std::nullopt;
     auto& state = shard_state();
 
@@ -790,8 +792,17 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     // Sort for deterministic ordering across shards
     std::sort(live_backends.begin(), live_backends.end());
 
-    // Extract prefix (first N tokens)
-    size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    // Determine prefix length for hash fallback:
+    // 1. If prefix_boundary is valid (> 0 and <= tokens.size()), use it
+    //    This ensures consistent hashing across cluster nodes for requests
+    //    with the same system message but different user queries.
+    // 2. Otherwise, fall back to prefix_token_length (default: 128)
+    size_t prefix_len;
+    if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
+        prefix_len = prefix_boundary;
+    } else {
+        prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    }
     if (prefix_len == 0) {
         // No tokens to route on, fall back to first backend
         return live_backends[0];
@@ -839,6 +850,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
 
     // Step 2: No ART match (or backend unavailable) - use consistent hashing
     // This provides deterministic routing for new prefixes
+    // Uses prefix_boundary if provided (system message only) for multi-node consistency
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
     size_t index = prefix_hash % live_backends.size();
     BackendId selected = live_backends[index];

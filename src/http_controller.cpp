@@ -1041,8 +1041,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         auto route_span = TracingService::start_child_span("ranvier.route_lookup");
 
         // Unified routing decision - all mode logic is encapsulated in RouterService
+        // Pass prefix_boundary for consistent hash fallback across cluster nodes
         auto art_lookup_start = std::chrono::steady_clock::now();
-        auto route_result = _router.route_request(tokens, request_id);
+        auto route_result = _router.route_request(tokens, request_id, prefix_boundary);
         auto art_lookup_end = std::chrono::steady_clock::now();
         metrics().record_art_lookup_latency(
             MetricsService::to_seconds(art_lookup_end - art_lookup_start));
