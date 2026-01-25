@@ -136,8 +136,8 @@ graph TD
     Route == "Keep-Alive" ==> GPU1["GPU 1 (vLLM)"]
     Route == "Keep-Alive" ==> GPU2["GPU 2 (vLLM)"]
 
-    style Router fill:#f9f,stroke:#333,stroke-width:4px
-    style Radix fill:#ccf,stroke:#333
+    style Router fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+    style Radix fill:#d1fae5,stroke:#059669,stroke-width:2px
 ```
 
 ---
