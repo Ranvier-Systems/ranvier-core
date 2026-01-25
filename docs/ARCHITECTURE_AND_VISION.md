@@ -1,7 +1,7 @@
 # Ranvier Intelligence Layer - Architecture & Vision
 
 [![Status: Architecture Defined](https://img.shields.io/badge/Status-Architecture%20Defined-blue)](docs/ARCHITECTURE_AND_VISION.md)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE)
 
 > **Goal**: Transform Ranvier from a "smart router" into a full "Intelligence Layer for Inference Infrastructure" with two product lines: Ranvier Cloud and Ranvier Local.
 
@@ -9,7 +9,7 @@
 
 > **Note**: This document outlines the architectural vision for the Ranvier Intelligence Layer.
 >
-> **Ranvier Core** (routing, priority queues, prefix-based caching) is developed in the open under MIT license.
+> **Ranvier Core** (routing, priority queues, prefix-based caching) is developed in the open under the Apache 2.0 license.
 >
 > **Advanced capabilities** (enterprise policy enforcement, team management, advanced analytics) may be developed as separate modules or plugins with different licensing. Features marked with 🔓 are Core/Open Source. Features marked with 🏢 are planned Enterprise capabilities.
 

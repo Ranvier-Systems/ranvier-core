@@ -1,12 +1,16 @@
 # Ranvier Core
 
-> **Saltatory Conduction for LLM Inference.**
+> **48% faster Time-To-First-Token** through intelligent prefix-aware routing.
 >
-> A standalone, Seastar-native router that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
+> A high-performance LLM traffic controller that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
+
+```bash
+# Quick start (requires Docker)
+docker run -p 8080:8080 ghcr.io/ranvier-systems/ranvier:latest
+```
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Standard](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
-[![Status](https://img.shields.io/badge/Status-Alpha-orange)]()
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
 [![Architecture](https://img.shields.io/badge/Architecture-Defined-blue)](docs/ARCHITECTURE_AND_VISION.md)
 
 ---
