@@ -31,10 +31,19 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ---
 
-## 🚀 Performance Goals
-* **Zero-Copy Hot Path:** Request bodies are parsed and hashed without unnecessary copying to userspace.
-* **Microsecond Overhead:** Routing decisions occur in $< 50\mu s$.
-* **Linear Scaling:** Throughput scales linearly with CPU cores due to Seastar's sharding.
+## 🚀 Performance Characteristics
+
+| Metric | Measured | Notes |
+|--------|----------|-------|
+| **Radix Tree Lookup** | < 50μs | Pure routing decision (O(L) where L = prefix length) |
+| **Total Routing Overhead** | 1-10ms | Includes tokenization; scales with prompt size |
+| **Ranvier P50 Overhead** | ~7ms | Measured vs direct vLLM connection |
+| **Cache Hit Rate** | 94-98% | With prefix-heavy workloads (RAG, few-shot) |
+
+**Design Principles:**
+* **Minimized Copying:** Uses `string_view` parsing with single network buffer copy; Radix lookups use `std::span` for zero-copy token access.
+* **Shared-Nothing Architecture:** Thread-per-core via Seastar; no locks on the hot path. Each shard maintains its own routing tree.
+* **Near-Linear Scaling:** Throughput scales well up to 4-8 cores; diminishing returns beyond due to cross-shard route learning broadcasts.
 
 ---
 
@@ -66,23 +75,21 @@ See [Benchmark Guide](docs/benchmark-guide-8xA100.md) for detailed methodology a
 
 ## 🗺️ Architecture & Vision
 
-Ranvier is evolving from a "smart router" into a full **Intelligence Layer for AI Inference Infrastructure**.
+Ranvier is evolving from a prefix-aware router into a full **Intelligence Layer for AI Inference Infrastructure**.
 
-**The Core Insight**: A dropdown menu for model selection is a global preference. Ranvier makes **per-request routing decisions** based on intent, cost, and latency requirements:
+**Current Capabilities (v0.x):**
+- Token prefix-based routing via Adaptive Radix Tree
+- Passive route learning (learns which prefixes → which backends)
+- Backend health checking with circuit breaker
+- Multi-node clustering with gossip protocol
 
-| Your Action | Standard Proxy | Ranvier |
-|-------------|----------------|---------|
-| Type a character | → Your selected model | → Local backend (0ms latency) |
-| Hit "Apply Fix" | → Your selected model | → Cloud/Smart (high intelligence) |
-| Agent fires 5000 requests | All to same model | Each routed by intent + cost |
-
-**Read the full architecture document**: [📐 Architecture & Vision](docs/ARCHITECTURE_AND_VISION.md)
-
-Key planned capabilities:
+**Planned Capabilities ([see roadmap](docs/ARCHITECTURE_AND_VISION.md)):**
 - **Request Intent Classification** - Route by FIM/Chat/Edit detection, not just token count
 - **Priority Queues** - Interactive requests never blocked by batch jobs
 - **Load-Aware Routing** - Ingest vLLM metrics for GPU-aware decisions
 - **Local Mode** - Auto-discover Ollama, LM Studio, llama.cpp
+
+The vision: A dropdown menu sets a global model preference. Ranvier will make **per-request routing decisions** based on intent, cost, and latency requirements.
 
 ---
 
