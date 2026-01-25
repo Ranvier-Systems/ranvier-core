@@ -119,21 +119,22 @@ graph TD
     User["User / Client"] -->|HTTP POST| Router["Ranvier Router"]
 
     subgraph "Ranvier Core (C++ Seastar)"
-        Router -->|Parse| Tokenizer["GPT-2 Tokenizer"]
-        Tokenizer -->|Tokens| Radix["Radix Tree"]
+        Router -->|Parse| Tokenizer["Tokenizer"]
+        Tokenizer -->|Tokens| Radix["Radix Tree (ART)"]
         Radix -->|Lookup| Cache{"Known Prefix?"}
-        Cache -- Yes --> BackendID
-        Cache -- No --> LB["Random Load Balancer"]
-        LB --> BackendID
+        Cache -- Yes --> Route["Route to Cached Backend"]
+        Cache -- No --> Hash["Consistent Hash (FNV-1a)"]
+        Hash --> Route
+        Route -->|Learn| Radix
     end
 
-    subgraph "Infrastructure"
-        Sidecar["Python Sidecar"] -.->|Watch| DockerDaemon
-        Sidecar -.->|Register| Router
+    subgraph "Backend Discovery"
+        K8s["K8s EndpointSlice"] -.->|Watch| Router
+        Config["YAML Config"] -.->|Load| Router
     end
 
-    Router == "Keep-Alive Connection" ==> GPU1["GPU 1 (Context A)"]
-    Router == "Keep-Alive Connection" ==> GPU2["GPU 2 (Context B)"]
+    Route == "Keep-Alive" ==> GPU1["GPU 1 (vLLM)"]
+    Route == "Keep-Alive" ==> GPU2["GPU 2 (vLLM)"]
 
     style Router fill:#f9f,stroke:#333,stroke-width:4px
     style Radix fill:#ccf,stroke:#333
