@@ -146,7 +146,7 @@ graph TD
 
 ### Docker
 
-Pre-built images are available on GitHub Container Registry (linux/amd64):
+Pre-built images are available on GitHub Container Registry (linux/amd64, linux/arm64):
 
 ```bash
 # Pull the latest image
