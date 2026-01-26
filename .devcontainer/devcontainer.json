@@ -1,6 +1,11 @@
 {
     "name": "Ranvier Dev",
-    "build": { "dockerfile": "Dockerfile" },
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "BASE_IMAGE": "ghcr.io/ranvier-systems/ranvier-base:latest"
+        }
+    },
     "customizations": {
         "vscode": {
             "extensions": [
