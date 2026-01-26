@@ -58,7 +58,9 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
 
 # Layer 4: Pre-clone and pre-build tokenizers-cpp (the slowest dependency)
 # This builds the Rust tokenizers crate which takes ~5-8 minutes
+# Set CARGO_TARGET_DIR so production builds can reuse the Rust artifacts
 WORKDIR /deps
+ENV CARGO_TARGET_DIR=/deps/tokenizers-cpp/rust/target
 RUN git clone https://github.com/mlc-ai/tokenizers-cpp.git && \
     cd tokenizers-cpp && \
     git submodule update --init --recursive && \
