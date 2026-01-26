@@ -4,38 +4,59 @@ project(ranvier)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# FetchContent for external dependencies
+# FetchContent for external dependencies (fallback when system packages unavailable)
 include(FetchContent)
 
-# Google Test Configuration (Always available for unit tests)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest
-  GIT_TAG        v1.14.0
-)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+# Google Test Configuration
+# Try system package first, fall back to FetchContent
+find_package(GTest QUIET)
+if(GTest_FOUND)
+    message(STATUS "Found system GTest: ${GTest_VERSION}")
+else()
+    message(STATUS "System GTest not found - fetching from source")
+    FetchContent_Declare(
+      googletest
+      GIT_REPOSITORY https://github.com/google/googletest
+      GIT_TAG        v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+endif()
 
-# yaml-cpp Configuration (for config file parsing)
-FetchContent_Declare(
-  yaml-cpp
-  GIT_REPOSITORY https://github.com/jbeder/yaml-cpp
-  GIT_TAG        0.8.0
-)
-set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(yaml-cpp)
+# yaml-cpp Configuration
+# Try system package first, fall back to FetchContent
+find_package(yaml-cpp QUIET)
+if(yaml-cpp_FOUND)
+    message(STATUS "Found system yaml-cpp")
+else()
+    message(STATUS "System yaml-cpp not found - fetching from source")
+    FetchContent_Declare(
+      yaml-cpp
+      GIT_REPOSITORY https://github.com/jbeder/yaml-cpp
+      GIT_TAG        0.8.0
+    )
+    set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(yaml-cpp)
+endif()
 
-# Abseil Configuration (High-performance containers)
-FetchContent_Declare(
-  abseil-cpp
-  GIT_REPOSITORY https://github.com/abseil/abseil-cpp
-  GIT_TAG        20240116.1
-)
-set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
-set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(abseil-cpp)
+# Abseil Configuration
+# Try system package first, fall back to FetchContent
+find_package(absl QUIET)
+if(absl_FOUND)
+    message(STATUS "Found system Abseil")
+else()
+    message(STATUS "System Abseil not found - fetching from source")
+    FetchContent_Declare(
+      abseil-cpp
+      GIT_REPOSITORY https://github.com/abseil/abseil-cpp
+      GIT_TAG        20240116.1
+    )
+    set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+    set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(abseil-cpp)
+endif()
 
 # RapidJSON Configuration
 FetchContent_Declare(

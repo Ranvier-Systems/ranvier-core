@@ -2,8 +2,10 @@
 # STAGE 1: Builder (Uses pre-built base image with Seastar + deps)
 # ---------------------------------------------------------
 # Uses the pre-built base image from GitHub Container Registry.
-# Build times drop from ~15 minutes to ~2-3 minutes since Seastar
-# and FetchContent dependencies (tokenizers-cpp, abseil, etc.) are cached.
+# Build times drop significantly because:
+# - Seastar is pre-installed
+# - tokenizers-cpp (Rust) is pre-built in /deps
+# - System packages provide abseil, yaml-cpp, gtest, sqlite
 #
 # Pull the base image (or it will be pulled automatically):
 #   docker pull ghcr.io/ranvier-systems/ranvier-base:latest
@@ -13,7 +15,7 @@ FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /src
 
-# Copy CMakeLists.txt (should match base image version for dep compatibility)
+# Copy CMakeLists.txt
 COPY CMakeLists.txt ./
 
 # Copy the source code, tests, and assets
@@ -21,12 +23,13 @@ COPY src/ ./src/
 COPY tests/ ./tests/
 COPY assets/ ./assets/
 
-# Build Ranvier using pre-built dependencies from base image
-# FETCHCONTENT_UPDATES_DISCONNECTED=ON prevents re-downloading deps
-# The build/_deps directory already contains compiled dependencies
-RUN cd build && \
+# Build Ranvier using pre-built/pre-cloned dependencies from base image
+# FETCHCONTENT_SOURCE_DIR_* tells CMake to use local dirs instead of cloning
+RUN mkdir -p build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DFETCHCONTENT_UPDATES_DISCONNECTED=ON && \
+        -DFETCHCONTENT_SOURCE_DIR_TOKENIZERS_CPP=/deps/tokenizers-cpp \
+        -DFETCHCONTENT_SOURCE_DIR_OPENTELEMETRY-CPP=/deps/opentelemetry-cpp \
+        -DFETCHCONTENT_SOURCE_DIR_RAPIDJSON=/deps/rapidjson && \
     ninja ranvier_server
 
 # Collect all shared libraries needed at runtime (including symlinks)
