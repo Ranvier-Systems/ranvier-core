@@ -1104,6 +1104,7 @@ run_benchmark() {
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
+        -e HF_TOKEN="${HF_TOKEN:-}" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
         locust \
@@ -1190,6 +1191,7 @@ if [[ "$WARMUP" = true ]]; then
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
+        -e HF_TOKEN="${HF_TOKEN:-}" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
         locust \
