@@ -420,6 +420,17 @@ seastar::future<> Application::startup() {
             // 2. Initialize tokenizer (async with DMA file I/O) - failure is fatal
             return init_tokenizer();
         }).then([this] {
+            // 2b. Auto-configure max_token_id from tokenizer vocabulary size
+            // This ensures client-provided tokens are validated against the actual tokenizer
+            size_t vocab_size = _tokenizer.local().vocab_size();
+            if (vocab_size > 0) {
+                auto current_max = static_cast<size_t>(_config.routing.max_token_id);
+                if (current_max < vocab_size) {
+                    _config.routing.max_token_id = static_cast<int32_t>(vocab_size);
+                    log_main.info("Auto-configured max_token_id from tokenizer vocab size: {}", vocab_size);
+                }
+            }
+        }).then([this] {
             // 3. Initialize OpenTelemetry tracing
             TracingService::init(_config.telemetry);
             if (_config.telemetry.enabled) {
