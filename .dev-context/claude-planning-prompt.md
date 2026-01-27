@@ -3,7 +3,7 @@ I am STARTING A PLANNING SESSION for the following feature:
 
 ---
 
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 3. Run /compact if the conversation exceeds 4 turns.
 
@@ -74,8 +74,8 @@ Which steps depend on others? Create a dependency graph if complex.
 ### Post-Implementation
 - [ ] Run claude-review-prompt.md
 - [ ] Run claude-doc-prompt.md
-- [ ] Update TODO.md
+- [ ] Update BACKLOG.md
 ```
 
-Save output to docs/TODO.md under a new feature section.
+Save output to BACKLOG.md under a new feature section.
 

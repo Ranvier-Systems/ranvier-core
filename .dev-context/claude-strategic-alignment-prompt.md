@@ -2,7 +2,7 @@ I am requesting a STRATEGIC PROJECT ASSESSMENT.
 
 Act as an External CTO and Lead Architect. I need a "brutally honest" evaluation of where Ranvier Core stands today versus our stated goal of "Layer 7+ load balancer with Prefix Caching."
 
-TASK: Analyze the current 33-file structure and docs/TODO.md to answer:
+TASK: Analyze the current 33-file structure and BACKLOG.md to answer:
 
 1. THE "GOAL ALIGNMENT" CHECK:
 - Based on the code implemented, are we actually building a Prefix Caching balancer, or have we drifted into a general-purpose proxy?
@@ -23,8 +23,8 @@ OUTPUT: Provide a "State of the Project" scorecard (A-F) for Architecture, Relia
 
 ---
 
-1. Ref docs/claude-context.md for core project essence and "No Locks/Async Only" rules.
-2. DO NOT read /assets or /docs (except for TODO.md and claude-context.md).
+1. Ref .dev-context/claude-context.md for core project essence and "No Locks/Async Only" rules.
+2. DO NOT read /assets or /docs (except for BACKLOG.md and .dev-context/claude-context.md).
 3. Run /compact if the conversation exceeds 4 turns.
 
 Build Constraints:

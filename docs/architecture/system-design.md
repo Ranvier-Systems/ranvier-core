@@ -136,7 +136,7 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 - **ConnectionPool**: Reusable connections with LRU eviction
 
 ### Persistence Layer
-- **AsyncPersistenceManager**: Fire-and-forget queue that decouples SQLite writes from the reactor thread. See [Async Persistence Internals](internals/async-persistence.md).
+- **AsyncPersistenceManager**: Fire-and-forget queue that decouples SQLite writes from the reactor thread. See [Async Persistence Internals](../internals/async-persistence.md).
 - **SqlitePersistence**: Durable storage for routes and backends in WAL mode (survives restarts)
 
 ## Distributed State
@@ -193,7 +193,7 @@ The GossipService operates on Shard 0 and uses UDP for low-latency route propaga
 5. **Batched Shard Broadcast**: Remote routes are buffered on Shard 0 and broadcast in batches (every 10ms or 100 routes) to prevent "SMP storms". This reduces cross-core message traffic from O(routes × shards) to O(batches × shards), achieving 99% message reduction at high ingestion rates.
 6. **Peer Liveness**: Heartbeat mechanism tracks peer health; stale peers trigger route pruning callbacks.
 
-See [Gossip Protocol Internals](internals/gossip-protocol.md) for detailed wire format and reliability mechanisms.
+See [Gossip Protocol Internals](../internals/gossip-protocol.md) for detailed wire format and reliability mechanisms.
 
 ### Configuration
 
@@ -353,4 +353,4 @@ architecture guarantees are maintained. Run `make validate` to test:
 | SMP Gossip Storm | Cross-core messaging at 5000+ PPS |
 | Atomic-Free Execution | No shared_ptr in RadixTree hot paths |
 
-See [Validation Suite](validation.md) for full documentation.
+See [Validation Suite](../validation.md) for full documentation.

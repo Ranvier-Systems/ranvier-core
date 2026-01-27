@@ -6,7 +6,7 @@ I am requesting a POST-MORTEM PATTERN EXTRACTION.
 - <ISSUE_3>
 
 ---
-1. Ref docs/claude-context.md for project constraints.
+1. Ref .dev-context/claude-context.md for project constraints.
 2. Context: We recently identified issues in our Adversarial Audit or implementation review.
 
 Build Constraints:
@@ -18,7 +18,7 @@ Build Constraints:
 
 ## PERSONA
 
-Act as a **Principal Engineer** performing a Post-Mortem. Transform recent bug fixes and audit findings into formal "Anti-Patterns & Lessons Learned" entries for `claude-context.md`.
+Act as a **Principal Engineer** performing a Post-Mortem. Transform recent bug fixes and audit findings into formal "Anti-Patterns & Lessons Learned" entries for `.dev-context/claude-context.md`.
 
 ---
 
@@ -64,7 +64,7 @@ Each entry must:
 
 ## OUTPUT FORMAT
 
-### New Anti-Patterns (for claude-context.md)
+### New Anti-Patterns (for .dev-context/claude-context.md)
 
 ```markdown
 ---

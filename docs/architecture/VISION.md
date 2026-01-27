@@ -1,6 +1,6 @@
 # Ranvier Intelligence Layer - Architecture & Vision
 
-[![Status: Architecture Defined](https://img.shields.io/badge/Status-Architecture%20Defined-blue)](docs/ARCHITECTURE_AND_VISION.md)
+[![Status: Architecture Defined](https://img.shields.io/badge/Status-Architecture%20Defined-blue)](VISION.md)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE)
 
 > **Goal**: Transform Ranvier from a "smart router" into a full "Intelligence Layer for Inference Infrastructure" with two product lines: Ranvier Cloud and Ranvier Local.

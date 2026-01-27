@@ -5,7 +5,7 @@ The final logic is verified. Now complete the maintenance tasks.
 
 ---
 
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 
 Build Constraints:
@@ -75,7 +75,7 @@ Maintain existing documentation tone and format.
 
 ---
 
-## TASK 3: Update TODO.md
+## TASK 3: Update BACKLOG.md
 
 Provide the specific line to mark this task complete:
 
@@ -102,7 +102,7 @@ tests/unit/foo_test.cc - Added 3 test cases for new feature
 docs/api.md - Added endpoint documentation for /new-route
 ```
 
-### TODO.md Changes
+### BACKLOG.md Changes
 ```
 Line 42: Changed [ ] to [x] for "Implement feature X"
 Line 43: Added new follow-up task

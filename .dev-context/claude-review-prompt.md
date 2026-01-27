@@ -3,7 +3,7 @@ I have written code for:
 
 ---
 
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. Run /compact if the conversation exceeds 4 turns.
 
 Build Constraints:
@@ -15,7 +15,7 @@ Build Constraints:
 
 ## SELF-REVIEW (before commit)
 
-Run through each of the Hard Rules listed in docs/claude-context.md. For each rule, provide one of:
+Run through each of the Hard Rules listed in .dev-context/claude-context.md. For each rule, provide one of:
 - `[N/A]` - Not applicable to this change
 - `[OK]` - Compliant because: [brief reason]
 - `[FIX]` - Violation found at [file:line]: [description]
@@ -24,7 +24,7 @@ Run through each of the Hard Rules listed in docs/claude-context.md. For each ru
 
 ## COMPLIANCE TABLE
 
-Verify compliance with the list of Hard Rules outlined in docs/claude-context.md
+Verify compliance with the list of Hard Rules outlined in .dev-context/claude-context.md
 
 For example:
 | # | Rule | Status | Notes |

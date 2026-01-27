@@ -338,7 +338,7 @@ persistence:
 
 ## References
 
-- [Architecture Overview](../architecture.md)
+- [Architecture Overview](../architecture/system-design.md)
 - [Request Flow](../request-flow.md)
 - [SQLite WAL Mode](https://www.sqlite.org/wal.html)
 - [Seastar Async](https://github.com/scylladb/seastar/blob/master/doc/tutorial.md#threads-and-blocking)

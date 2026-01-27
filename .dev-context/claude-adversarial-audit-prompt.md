@@ -2,7 +2,7 @@ I am requesting an ADVERSARIAL SYSTEM AUDIT of the source files under src/
 
 ---
 
-1. Ref docs/claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. Run /compact if the conversation exceeds 4 turns.
 
 ---
@@ -80,7 +80,7 @@ Will this hold up at 100x scale?
 #### Scale & Leak
 ...
 
-### Structural Fixes (for TODO.md)
+### Structural Fixes (for BACKLOG.md)
 ```markdown
 - [ ] [CRITICAL] Fix: description (adversarial audit YYYY-MM-DD)
 - [ ] [HIGH] Fix: description

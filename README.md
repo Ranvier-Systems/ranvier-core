@@ -11,7 +11,7 @@ docker run -p 8080:8080 ghcr.io/ranvier-systems/ranvier:latest
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-Defined-blue)](docs/ARCHITECTURE_AND_VISION.md)
+[![Architecture](https://img.shields.io/badge/Architecture-Defined-blue)](docs/architecture/VISION.md)
 
 ---
 
@@ -73,7 +73,7 @@ Real-world results from 8x A100 40GB:
 
 > **Note:** Benefits scale with prefix size and model size. Use 8B+ parameter models for meaningful KV cache improvements. Small prefixes (<500 tokens) see minimal benefit.
 
-See [Benchmark Guide](docs/benchmark-guide-8xA100.md) for detailed methodology and results.
+See [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for detailed methodology and results.
 
 ---
 
@@ -87,7 +87,7 @@ Ranvier is evolving from a prefix-aware router into a full **Intelligence Layer 
 - Backend health checking with circuit breaker
 - Multi-node clustering with gossip protocol
 
-**Planned Capabilities ([see roadmap](docs/ARCHITECTURE_AND_VISION.md)):**
+**Planned Capabilities ([see roadmap](docs/architecture/VISION.md)):**
 - **Request Intent Classification** - Route by FIM/Chat/Edit detection, not just token count
 - **Priority Queues** - Interactive requests never blocked by batch jobs
 - **Load-Aware Routing** - Ingest vLLM metrics for GPU-aware decisions
@@ -236,17 +236,17 @@ helm install ranvier ./deploy/helm/ranvier \
   --set serviceMonitor.enabled=true
 ```
 
-See [Kubernetes Deployment Guide](docs/kubernetes.md) for detailed configuration options.
+See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed configuration options.
 
 ---
 
 ## 📖 Documentation
 
-- [Architecture Overview](docs/architecture.md)
-- [API Reference](docs/api-reference.md)
+- [Architecture Overview](docs/architecture/system-design.md)
+- [API Reference](docs/api/reference.md)
 - [Request Flow](docs/request-flow.md)
-- [Kubernetes Deployment](docs/kubernetes.md)
-- [Performance Tuning](docs/performance.md)
+- [Kubernetes Deployment](docs/deployment/kubernetes.md)
+- [Performance Tuning](docs/deployment/performance.md)
 - **Internals:**
   - [Gossip Protocol](docs/internals/gossip-protocol.md)
   - [Radix Tree](docs/internals/radix-tree.md)

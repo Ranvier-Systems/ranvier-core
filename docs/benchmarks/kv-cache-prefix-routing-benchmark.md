@@ -205,7 +205,7 @@ export HF_TOKEN="hf_your_token_here"
   benchmark-reports/*prefix*/benchmark.log
 ```
 
-For detailed scenarios and expected results, see: [Benchmark Guide for 8x A100](../benchmark-guide-8xA100.md)
+For detailed scenarios and expected results, see: [Benchmark Guide for 8x A100](benchmark-guide-8xA100.md)
 
 ### Manual Method (Advanced)
 
