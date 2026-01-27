@@ -240,17 +240,17 @@ avg(ranvier_radix_tree_average_prefix_skip_length)
 
 ## References
 
-- [Architecture Overview](architecture.md)
-- [Request Flow Diagrams](request-flow.md)
-- [API Reference](api-reference.md)
-- [Locust Test Configuration](../tests/integration/README.md)
-- [KV Cache Prefix-Routing Benchmark](benchmarks/kv-cache-prefix-routing-benchmark.md)
+- [Architecture Overview](../architecture/system-design.md)
+- [Request Flow Diagrams](../request-flow.md)
+- [API Reference](../api/reference.md)
+- [Locust Test Configuration](../../tests/integration/README.md)
+- [KV Cache Prefix-Routing Benchmark](../benchmarks/kv-cache-prefix-routing-benchmark.md)
 
 ---
 
 ## Large-Prefix KV Cache Benchmark
 
-For production LLM workloads with large context windows, see our [detailed benchmark guide](benchmark-guide-8xA100.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B-Instruct.
+For production LLM workloads with large context windows, see our [detailed benchmark guide](../benchmarks/benchmark-guide-8xA100.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B-Instruct.
 
 ### Summary Results (8x A100 40GB, stress distribution)
 
