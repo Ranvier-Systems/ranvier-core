@@ -2805,7 +2805,7 @@ def parse_sse_usage(response_text: str) -> Tuple[int, int]:
         if line.startswith("data: ") and line != "data: [DONE]":
             try:
                 data = json.loads(line[6:])
-                if "usage" in data:
+                if "usage" in data and data["usage"] is not None:
                     usage = data["usage"]
                     prompt_tokens = usage.get("prompt_tokens", 0)
                     completion_tokens = usage.get("completion_tokens", 0)
