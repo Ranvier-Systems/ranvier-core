@@ -5,7 +5,7 @@ The final logic is verified. Now complete the maintenance tasks.
 
 ---
 
-1. Ref claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 
 Build Constraints:

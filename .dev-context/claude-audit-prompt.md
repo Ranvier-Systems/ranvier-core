@@ -7,7 +7,7 @@ I am requesting a HOLISTIC SYSTEM AUDIT.
 
 ---
 
-1. Ref claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. Run /compact if the conversation exceeds 4 turns.
 
 ---
@@ -20,7 +20,7 @@ I am requesting a HOLISTIC SYSTEM AUDIT.
 - Any direct cross-layer calls bypassing the service layer?
 
 ### 2. 12 Hard Rules Compliance
-Scan the recently changed files for violations of Hard Rules outline in claude-context.md
+Scan the recently changed files for violations of Hard Rules outline in .dev-context/claude-context.md
 
 ### 3. Async Integrity
 - Any hidden blocking calls?

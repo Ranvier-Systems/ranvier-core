@@ -121,4 +121,4 @@ This audit applied four adversarial lenses:
 3. **Architecture Drift**: Layer boundary violations (controller calling persistence directly, business logic in wrong layers)
 4. **Scale & Leak**: Resource exhaustion vectors (unbounded containers, O(n^2) algorithms, uncleaned callbacks, timer leaks)
 
-Reference: `claude-context.md` "No Locks/Async Only" rules and Anti-Patterns section.
+Reference: `.dev-context/claude-context.md` "No Locks/Async Only" rules and Anti-Patterns section.

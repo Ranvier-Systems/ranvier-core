@@ -23,8 +23,8 @@ OUTPUT: Provide a "State of the Project" scorecard (A-F) for Architecture, Relia
 
 ---
 
-1. Ref claude-context.md for core project essence and "No Locks/Async Only" rules.
-2. DO NOT read /assets or /docs (except for BACKLOG.md and claude-context.md).
+1. Ref .dev-context/claude-context.md for core project essence and "No Locks/Async Only" rules.
+2. DO NOT read /assets or /docs (except for BACKLOG.md and .dev-context/claude-context.md).
 3. Run /compact if the conversation exceeds 4 turns.
 
 Build Constraints:

@@ -24,7 +24,7 @@
 - [ ] Specific request pattern: [which]
 
 ---
-1. Ref claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. Run /compact if the conversation exceeds 4 turns.
 
 Build Constraints:
@@ -114,7 +114,7 @@ Expected Result: [what should improve]
 ## POST-INCIDENT ACTIONS
 
 ### Documentation
-- [ ] Add to claude-context.md anti-patterns? → Use `claude-pattern-extractor-prompt.md`
+- [ ] Add to .dev-context/claude-context.md anti-patterns? → Use `claude-pattern-extractor-prompt.md`
 - [ ] Update runbooks/playbooks?
 
 ### Monitoring

@@ -3,7 +3,7 @@ I am STARTING AN IMPLEMENTATION TASK:
 
 ---
 Note:
-1. Ref claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 3. Run /compact if the conversation exceeds 4 turns.
 4. Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox. Do static analysis only.

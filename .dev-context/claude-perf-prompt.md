@@ -18,7 +18,7 @@
 - [ ] Anecdotal observation
 
 ---
-1. Ref claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 3. Run /compact if the conversation exceeds 4 turns.
 

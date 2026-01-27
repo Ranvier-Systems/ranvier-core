@@ -9,7 +9,7 @@ I have a BUILD/RUNTIME FAILURE.
 
 ---
 
-1. Ref claude-context.md for the "No Locks/Async Only" rules.
+1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
 2. DO NOT read the full /docs or /assets folders.
 3. Run /compact if the conversation exceeds 4 turns.
 
@@ -87,6 +87,6 @@ Rule Violated: [#N if applicable, or "N/A"]
 3. [Any runtime verification needed]
 
 ### Prevention
-- [ ] Should this become a new anti-pattern in claude-context.md?
+- [ ] Should this become a new anti-pattern in .dev-context/claude-context.md?
 - [ ] Is there a missing test case that would have caught this?
 
