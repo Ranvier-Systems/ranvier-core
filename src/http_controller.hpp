@@ -124,7 +124,7 @@ struct HttpControllerConfig {
     std::chrono::seconds drain_timeout{30};     // Max time to wait for in-flight requests during shutdown
     bool enable_token_forwarding = false;       // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;          // Accept pre-tokenized prompt_token_ids from clients for routing
-    int32_t max_token_id = 200000;              // Maximum valid token ID for validation (security)
+    int32_t max_token_id = 200000;              // Maximum valid token ID (auto-set from tokenizer vocab)
     RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;  // Routing mode
     uint32_t block_alignment = 16;              // vLLM PagedAttention block size for route alignment
     bool enable_prefix_boundary = true;         // Enable automatic prefix boundary detection

@@ -38,6 +38,10 @@ public:
     // Check if ready
     bool is_loaded() const;
 
+    // Get vocabulary size (for max_token_id validation)
+    // Returns 0 if tokenizer is not loaded
+    size_t vocab_size() const;
+
     // Seastar sharded service requirement: stop() must return future<>
     seastar::future<> stop() {
         _impl.reset();
