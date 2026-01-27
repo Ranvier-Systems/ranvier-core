@@ -819,7 +819,7 @@ TEST_F(ConfigTest, AcceptClientTokensDefaults) {
     auto config = RanvierConfig::defaults();
 
     EXPECT_FALSE(config.routing.accept_client_tokens);
-    EXPECT_EQ(config.routing.max_token_id, 100000);
+    EXPECT_EQ(config.routing.max_token_id, 200000);  // Default supports Llama-3 vocab size
 }
 
 TEST_F(ConfigTest, AcceptClientTokensFromYaml) {
@@ -894,7 +894,7 @@ TEST_F(ConfigTest, RoutingConfigStructDefaults) {
     RoutingConfig routing;
 
     EXPECT_FALSE(routing.accept_client_tokens);
-    EXPECT_EQ(routing.max_token_id, 100000);
+    EXPECT_EQ(routing.max_token_id, 200000);  // Default supports Llama-3 vocab size
     EXPECT_FALSE(routing.enable_token_forwarding);
 }
 
