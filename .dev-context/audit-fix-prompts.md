@@ -14,7 +14,7 @@ PROBLEM:
 - Code: `std::ifstream ca_file(_config.ca_cert_path)` performs blocking file I/O
 - Impact: Stalls Seastar reactor thread during K8s discovery, blocking all network I/O
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Rule #2: "Async Only - All I/O must return seastar::future<>"
 - Anti-pattern #12: "Never use std::ifstream/ofstream in Seastar code"
 
@@ -46,7 +46,7 @@ PROBLEM:
 - Code: `_reaper_timer([this] { reap_dead_connections(); })` captures `this`
 - Impact: Race condition if timer callback executes after destructor begins
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Anti-pattern #5: "Timer callbacks need gate guards"
 - Pattern: Callbacks acquire _timer_gate.hold() at entry; stop() closes gate first
 
@@ -85,7 +85,7 @@ PROBLEM:
 - Code: `return *g_metrics;` dereferences potentially null pointer
 - Impact: Segfault if metrics() called before init_metrics()
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Defensive coding: All accessors should handle uninitialized state gracefully
 
 FIX APPROACH (choose one):
@@ -125,7 +125,7 @@ PROBLEM:
 - Code: `g_metrics = new MetricsService()` with no corresponding delete
 - Impact: Memory leaked on process shutdown (one MetricsService per shard)
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Anti-pattern #13: "Never use raw 'new' with thread_local pointers"
 - Prefer unique_ptr or explicit destroy function
 
@@ -173,7 +173,7 @@ PROBLEM:
 - Code: `std::unordered_map<BackendId, BackendMetrics> _per_backend_metrics`
 - Impact: Attacker can exhaust memory by spoofing unique backend IDs
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Anti-pattern #4: "Every growing container must have explicit MAX_SIZE"
 - Anti-pattern #14: "Every map keyed by external IDs must have MAX_SIZE with eviction"
 
@@ -211,7 +211,7 @@ PROBLEM:
 - Code: `std::unordered_map<BackendId, BackendCircuit> _circuits`
 - Impact: Memory grows monotonically as backends come and go
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Anti-pattern #14: "Every map keyed by external IDs must have MAX_SIZE with eviction"
 
 FIX APPROACH:
@@ -273,7 +273,7 @@ PROBLEM:
 - Code: _received_seq_sets and _received_seq_windows grow per peer address
 - Impact: Memory grows with number of unique peer addresses seen
 
-CONSTRAINTS (from docs/claude-context.md):
+CONSTRAINTS (from claude-context.md):
 - Anti-pattern #14: "Every map keyed by external IDs must have MAX_SIZE"
 
 NOTE: The sliding window already evicts old sequence numbers per peer (line 1188).
@@ -322,7 +322,7 @@ fix(<component>): <short description>
 
 <detailed description of the fix>
 
-Fixes audit issue: <issue title from TODO.md>
+Fixes audit issue: <issue title from BACKLOG.md>
 Location: <file:line>
 Severity: <Critical|High|Medium>
 ```

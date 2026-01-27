@@ -6,7 +6,7 @@ I am requesting a POST-MORTEM PATTERN EXTRACTION.
 - <ISSUE_3>
 
 ---
-1. Ref docs/claude-context.md for project constraints.
+1. Ref claude-context.md for project constraints.
 2. Context: We recently identified issues in our Adversarial Audit or implementation review.
 
 Build Constraints:
