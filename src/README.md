@@ -75,7 +75,9 @@ The gossip subsystem is split into focused modules:
 ## Architecture Notes
 
 - **Shared-Nothing**: Each CPU core has its own shard. No `std::mutex` in reactor-callable code.
-- **Async Only**: All I/O returns `seastar::future<>`. See `.dev-context/claude-context.md` for Hard Rules.
+- **Async Only**: All I/O returns `seastar::future<>`. Never use blocking syscalls (e.g., `std::sleep`, `fs::read`).
+- **Memory**: No `new`/`delete`. Use `seastar::lw_shared_ptr` or `std::unique_ptr`.
+- **Exceptions**: Use `seastar::make_exception_future` path, not `throw`, for runtime errors.
 - **Hot Path**: `HttpController` -> `TokenizerService` -> `RouterService` -> `RadixTree` -> `ConnectionPool`
 
 ## Load-Bearing Files (High Blast Radius)
