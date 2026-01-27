@@ -64,7 +64,7 @@ struct RoutingConfig {
     std::chrono::seconds backend_drain_timeout{60};  // Time to wait before fully removing a draining backend
     bool enable_token_forwarding = false;  // Forward pre-computed token IDs to backends (vLLM prompt_token_ids)
     bool accept_client_tokens = false;  // Accept pre-tokenized prompt_token_ids from clients for routing
-    int32_t max_token_id = 100000;  // Maximum valid token ID for validation (security: reject out-of-range tokens)
+    int32_t max_token_id = 200000;  // Maximum valid token ID for validation (security: reject out-of-range tokens)
 
     // Routing mode: determines how requests are routed to backends
     // - "prefix": ART lookup + consistent hash fallback (best for KV cache, learns routes)
