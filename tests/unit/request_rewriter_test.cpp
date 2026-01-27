@@ -108,6 +108,172 @@ TEST_F(RequestRewriterTest, ExtractTextSkipsMessagesWithoutContent) {
 }
 
 // =============================================================================
+// extract_system_messages tests
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesBasic) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "You are a helpful assistant.");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesMultiple) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "Be concise in your responses."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "You are a helpful assistant.\nBe concise in your responses.");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNoneFound) {
+    std::string body = R"({
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesFromPromptField) {
+    // Prompt field has no system message concept - should return nullopt
+    std::string body = R"({"prompt": "Hello, world!", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesEmptyMessagesArray) {
+    std::string body = R"({"messages": []})";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNoRoleField) {
+    std::string body = R"({
+        "messages": [
+            {"content": "I have no role"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNoContentField) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesEmptyContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesUnicodeContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "你是一个有帮助的助手。🤖"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "你是一个有帮助的助手。🤖");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesInterleavedRoles) {
+    // System messages can appear anywhere in the array
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "First system message."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"},
+            {"role": "system", "content": "Second system message."},
+            {"role": "user", "content": "How are you?"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "First system message.\nSecond system message.");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNonObjectMessage) {
+    std::string body = R"({
+        "messages": [
+            "not an object",
+            {"role": "system", "content": "Valid system message"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "Valid system message");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNonStringRole) {
+    std::string body = R"({
+        "messages": [
+            {"role": 123, "content": "Invalid role type"},
+            {"role": "system", "content": "Valid system message"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "Valid system message");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesNonStringContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": 12345},
+            {"role": "system", "content": "Valid content"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), "Valid content");
+}
+
+TEST_F(RequestRewriterTest, ExtractSystemMessagesLongContent) {
+    // Test with a longer system message typical of real-world usage
+    std::string long_system = std::string(1000, 'a');  // 1000 character system message
+    std::string body = R"({"messages": [{"role": "system", "content": ")" + long_system + R"("}]})";
+    auto result = RequestRewriter::extract_system_messages(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), long_system);
+}
+
+// =============================================================================
 // rewrite tests
 // =============================================================================
 
@@ -433,4 +599,480 @@ TEST_F(RequestRewriterTest, ExtractPromptTokenIdsFloatInArray) {
     EXPECT_TRUE(result.found);
     EXPECT_FALSE(result.valid);
     EXPECT_EQ(result.error, "prompt_token_ids[1] is not an integer");
+}
+
+// =============================================================================
+// extract_prefix_token_count tests
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountBasic) {
+    std::string body = R"({"prompt": "Hello", "prefix_token_count": 100})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 100);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountNotFound) {
+    std::string body = R"({"prompt": "Hello", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountZeroValue) {
+    // Zero is rejected - must be positive
+    std::string body = R"({"prefix_token_count": 0})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountNegativeValue) {
+    // Negative values are rejected
+    std::string body = R"({"prefix_token_count": -10})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountLargeValue) {
+    std::string body = R"({"prefix_token_count": 1000000})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1000000);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountStringValue) {
+    // String values are rejected - must be integer
+    std::string body = R"({"prefix_token_count": "100"})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountFloatValue) {
+    // Float values are rejected - must be integer
+    std::string body = R"({"prefix_token_count": 100.5})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountWithOtherFields) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "prefix_token_count": 256,
+        "max_tokens": 100
+    })";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 256);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountInt64) {
+    // Test with a value that requires int64
+    std::string body = R"({"prefix_token_count": 2147483648})";  // INT32_MAX + 1
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 2147483648ULL);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountNull) {
+    // Null value is rejected
+    std::string body = R"({"prefix_token_count": null})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountBoolValue) {
+    // Bool value is rejected
+    std::string body = R"({"prefix_token_count": true})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountArrayValue) {
+    // Array value is rejected - must be integer
+    std::string body = R"({"prefix_token_count": [100]})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountObjectValue) {
+    // Object value is rejected - must be integer
+    std::string body = R"({"prefix_token_count": {"value": 100}})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixTokenCountOne) {
+    // Minimum valid value is 1
+    std::string body = R"({"prefix_token_count": 1})";
+    auto result = RequestRewriter::extract_prefix_token_count(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1);
+}
+
+// =============================================================================
+// extract_prefix_boundaries tests (multi-depth routing)
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesBasic) {
+    std::string body = R"({"prefix_boundaries": [100, 200, 300]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+    EXPECT_EQ(result[2], 300);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesNotFound) {
+    std::string body = R"({"prompt": "Hello"})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesEmptyArray) {
+    std::string body = R"({"prefix_boundaries": []})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesNotArray) {
+    std::string body = R"({"prefix_boundaries": 100})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesFiltersZeroAndNegative) {
+    // Zero and negative values should be filtered out
+    std::string body = R"({"prefix_boundaries": [0, 100, -5, 200, 0]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 2);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesSortsAndDeduplicates) {
+    // Result should be sorted and deduplicated
+    std::string body = R"({"prefix_boundaries": [300, 100, 200, 100, 300]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+    EXPECT_EQ(result[2], 300);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesMixedTypes) {
+    // Should handle different integer types
+    std::string body = R"({"prefix_boundaries": [100, 2147483648, 50]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 50);
+    EXPECT_EQ(result[1], 100);
+    EXPECT_EQ(result[2], 2147483648ULL);
+}
+
+TEST_F(RequestRewriterTest, ExtractPrefixBoundariesIgnoresNonIntegers) {
+    // Non-integer values should be ignored
+    std::string body = R"({"prefix_boundaries": [100, "string", 200, null, 300]})";
+    auto result = RequestRewriter::extract_prefix_boundaries(body);
+
+    ASSERT_EQ(result.size(), 3);
+    EXPECT_EQ(result[0], 100);
+    EXPECT_EQ(result[1], 200);
+    EXPECT_EQ(result[2], 300);
+}
+
+// =============================================================================
+// extract_message_boundaries tests (multi-depth routing)
+// =============================================================================
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesBasic) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello!"}
+        ]
+    })";
+
+    // Simple tokenizer: 1 token per character
+    auto tokenize_fn = [](const std::string& text) -> size_t {
+        return text.length();
+    };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->boundaries.size(), 2);
+    // Each message is "<|role|>\ncontent"
+    // System: "<|system|>\nYou are helpful." = 11 + 16 = 27 chars
+    // User: "<|user|>\nHello!" = 9 + 6 = 15 chars
+    EXPECT_GT(result->boundaries[0], 0);
+    EXPECT_GT(result->boundaries[1], result->boundaries[0]);
+    EXPECT_GT(result->system_boundary, 0);
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesNoTokenizer) {
+    std::string body = R"({"messages": [{"role": "user", "content": "Hello"}]})";
+
+    auto result = RequestRewriter::extract_message_boundaries(body, nullptr);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesInvalidJson) {
+    std::string body = "not valid json";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesNoMessages) {
+    std::string body = R"({"prompt": "Hello"})";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesEmptyMessages) {
+    std::string body = R"({"messages": []})";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesSystemBoundary) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "System prompt here"},
+            {"role": "user", "content": "User message"}
+        ]
+    })";
+
+    // Fixed tokenizer: each message = 100 tokens
+    auto tokenize_fn = [](const std::string&) -> size_t { return 100; };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    // System boundary should be at 100 (before user message)
+    EXPECT_EQ(result->system_boundary, 100);
+    // Boundaries should be [100, 200]
+    ASSERT_EQ(result->boundaries.size(), 2);
+    EXPECT_EQ(result->boundaries[0], 100);
+    EXPECT_EQ(result->boundaries[1], 200);
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesOnlySystemMessages) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "First system"},
+            {"role": "system", "content": "Second system"}
+        ]
+    })";
+
+    auto tokenize_fn = [](const std::string&) -> size_t { return 50; };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    // All messages are system, so system_boundary should be at the end
+    EXPECT_EQ(result->system_boundary, 100);
+    ASSERT_EQ(result->boundaries.size(), 2);
+}
+
+TEST_F(RequestRewriterTest, ExtractMessageBoundariesMultiTurn) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "How are you?"}
+        ]
+    })";
+
+    // Each message = 10 tokens for simplicity
+    auto tokenize_fn = [](const std::string&) -> size_t { return 10; };
+
+    auto result = RequestRewriter::extract_message_boundaries(body, tokenize_fn);
+
+    ASSERT_TRUE(result.has_value());
+    // 4 messages = 4 boundaries at 10, 20, 30, 40
+    ASSERT_EQ(result->boundaries.size(), 4);
+    EXPECT_EQ(result->boundaries[0], 10);
+    EXPECT_EQ(result->boundaries[1], 20);
+    EXPECT_EQ(result->boundaries[2], 30);
+    EXPECT_EQ(result->boundaries[3], 40);
+    // System boundary is before first non-system message
+    EXPECT_EQ(result->system_boundary, 10);
+}
+
+// =============================================================================
+// BPE Tokenization Boundary Alignment Tests
+// =============================================================================
+// These tests verify that extract_system_messages() + "\n" is a text prefix of
+// extract_text(). This property is critical for correct BPE tokenization:
+//
+// BPE tokenizers may produce different tokens for "text" vs "text\n" due to
+// subword boundary effects. For example:
+//   tokenize("helpful")     -> [1234]        (one way)
+//   tokenize("helpful\n")   -> [5678]        (different token!)
+//   tokenize("helpful\nHi") -> [5678, 9999]  (5678, not 1234)
+//
+// By ensuring system_messages + "\n" is a text prefix of the full text,
+// we guarantee that tokenizing (system_messages + "\n") produces tokens
+// that are a prefix of tokenizing the full text.
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentBasic) {
+    // Single system message followed by user message
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    // The key property: system_text + "\n" should be a prefix of full_text
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentMultipleSystemMessages) {
+    // Multiple system messages followed by user message
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    // Multiple system messages are joined with \n, then another \n before user
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentMultiTurnConversation) {
+    // Multi-turn conversation with system, user, assistant, user
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "How are you?"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentSpecialCharacters) {
+    // System message with characters that might affect BPE boundaries
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful.\nFollow instructions carefully."},
+            {"role": "user", "content": "Test query"}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
+}
+
+TEST_F(RequestRewriterTest, BPEBoundaryAlignmentEmptyContent) {
+    // Edge case: empty user content after system message
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": ""}
+        ]
+    })";
+
+    auto full_text = RequestRewriter::extract_text(body);
+    auto system_text = RequestRewriter::extract_system_messages(body);
+
+    ASSERT_TRUE(full_text.has_value());
+    ASSERT_TRUE(system_text.has_value());
+
+    // Even with empty user content, the format should be consistent
+    std::string system_with_newline = *system_text + "\n";
+    EXPECT_TRUE(full_text->starts_with(system_with_newline))
+        << "Expected full_text to start with system_text + newline\n"
+        << "full_text: \"" << *full_text << "\"\n"
+        << "system_text + \\n: \"" << system_with_newline << "\"";
 }

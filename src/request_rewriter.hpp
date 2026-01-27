@@ -10,7 +10,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -64,6 +66,94 @@ public:
     // Returns:
     //   The extracted text, or nullopt if no tokenizable content found
     static std::optional<std::string> extract_text(std::string_view body);
+
+    // Extract only system message content from a chat completion request
+    //
+    // For prefix-aware routing, we need to identify the "shared prefix" boundary.
+    // In multi-turn conversations, all requests typically share the same system
+    // message(s), while user/assistant content varies. By tokenizing system
+    // messages separately, we can store routes at this shared prefix boundary.
+    //
+    // For "messages" field: Concatenates content from messages with role="system"
+    // For "prompt" field: Returns nullopt (no system message concept)
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //
+    // Returns:
+    //   The concatenated system message content, or nullopt if none found
+    static std::optional<std::string> extract_system_messages(std::string_view body);
+
+    // Result of extracting message boundaries from a request
+    struct MessageBoundaries {
+        std::vector<size_t> boundaries;  // Cumulative token counts at each message boundary
+        size_t system_boundary = 0;      // Token count at end of system messages (first non-system)
+    };
+
+    // Extract message boundaries from a chat completion request
+    //
+    // This identifies natural prefix boundaries in multi-turn conversations by
+    // calculating cumulative token counts at each message. Used for multi-depth
+    // route storage (Option C) to enable cache reuse at any conversation depth.
+    //
+    // For a request like:
+    //   [system: 256 tokens][user: 50 tokens][assistant: 100 tokens][user: 30 tokens]
+    //
+    // Returns boundaries: [256, 306, 406, 436]
+    //   - 256: end of system message
+    //   - 306: end of first user message
+    //   - 406: end of assistant response
+    //   - 436: end of second user message
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //   tokenize_fn: Function to tokenize message content (returns token count)
+    //
+    // Returns:
+    //   MessageBoundaries with cumulative boundaries, or nullopt if parsing fails
+    //
+    // Note: This requires a tokenizer callback since boundaries are in token space.
+    //       The callback should match the tokenizer used for routing.
+    static std::optional<MessageBoundaries> extract_message_boundaries(
+        std::string_view body,
+        std::function<size_t(const std::string&)> tokenize_fn);
+
+    // Extract client-provided prefix_token_count from a request body
+    //
+    // Clients can specify how many tokens constitute their "shared prefix" for
+    // routing purposes. This is useful when clients know their prefix structure
+    // better than the router's automatic system message detection.
+    //
+    // For example, if a client has a 1000-token system prompt, they can include
+    // "prefix_token_count": 1000 in their request. The router will use this value
+    // instead of automatically detecting system messages.
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //
+    // Returns:
+    //   The prefix_token_count value, or nullopt if not present/invalid
+    //
+    // Validation:
+    //   - Must be a positive integer
+    //   - Zero or negative values are rejected (returns nullopt)
+    static std::optional<size_t> extract_prefix_token_count(std::string_view body);
+
+    // Extract client-provided prefix boundaries (array form) from a request body
+    //
+    // Clients can specify multiple prefix boundaries for multi-depth route storage.
+    // This enables routes to be stored at multiple conversation depths for optimal
+    // cache reuse in branching or continuing conversations.
+    //
+    // Example: "prefix_boundaries": [256, 306, 406]
+    //   - Routes stored at token 256 (system), 306 (system+user1), 406 (system+user1+asst1)
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //
+    // Returns:
+    //   Vector of boundaries (sorted, deduplicated), or empty if not present/invalid
+    static std::vector<size_t> extract_prefix_boundaries(std::string_view body);
 
     // Result of extracting prompt_token_ids from a request
     struct TokenExtractionResult {
@@ -206,6 +296,221 @@ inline std::optional<std::string> RequestRewriter::extract_text(std::string_view
     }
 
     return std::nullopt;
+}
+
+inline std::optional<std::string> RequestRewriter::extract_system_messages(std::string_view body) {
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::nullopt;
+    }
+
+    // System messages only exist in chat completion API (messages field)
+    // The completion API (prompt field) has no system message concept
+    if (!doc.HasMember("messages") || !doc["messages"].IsArray()) {
+        return std::nullopt;
+    }
+
+    std::string combined;
+    const auto& messages = doc["messages"];
+
+    for (rapidjson::SizeType i = 0; i < messages.Size(); ++i) {
+        const auto& msg = messages[i];
+        if (!msg.IsObject()) continue;
+
+        // Check for role="system"
+        if (!msg.HasMember("role") || !msg["role"].IsString()) continue;
+        std::string_view role(msg["role"].GetString(), msg["role"].GetStringLength());
+        if (role != "system") continue;
+
+        // Extract content
+        if (!msg.HasMember("content")) continue;
+        const auto& content = msg["content"];
+        if (content.IsString()) {
+            if (!combined.empty()) {
+                combined += "\n";  // Separator between system messages
+            }
+            combined.append(content.GetString(), content.GetStringLength());
+        }
+    }
+
+    if (combined.empty()) {
+        return std::nullopt;
+    }
+
+    return combined;
+}
+
+inline std::optional<size_t> RequestRewriter::extract_prefix_token_count(std::string_view body) {
+    // Fast path: if prefix_token_count not present, return early
+    if (body.find("prefix_token_count") == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::nullopt;
+    }
+
+    // Check if prefix_token_count field exists
+    if (!doc.HasMember("prefix_token_count")) {
+        return std::nullopt;
+    }
+
+    const auto& value = doc["prefix_token_count"];
+
+    // Must be a positive integer
+    if (value.IsUint64()) {
+        uint64_t count = value.GetUint64();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    } else if (value.IsInt64()) {
+        int64_t count = value.GetInt64();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    } else if (value.IsUint()) {
+        uint32_t count = value.GetUint();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    } else if (value.IsInt()) {
+        int32_t count = value.GetInt();
+        if (count > 0) {
+            return static_cast<size_t>(count);
+        }
+    }
+
+    // Not a valid positive integer
+    return std::nullopt;
+}
+
+inline std::vector<size_t> RequestRewriter::extract_prefix_boundaries(std::string_view body) {
+    // Fast path: if prefix_boundaries not present, return early
+    if (body.find("prefix_boundaries") == std::string_view::npos) {
+        return {};
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return {};
+    }
+
+    // Check if prefix_boundaries field exists and is an array
+    if (!doc.HasMember("prefix_boundaries") || !doc["prefix_boundaries"].IsArray()) {
+        return {};
+    }
+
+    const auto& arr = doc["prefix_boundaries"];
+    std::vector<size_t> boundaries;
+    boundaries.reserve(arr.Size());
+
+    for (rapidjson::SizeType i = 0; i < arr.Size(); ++i) {
+        const auto& value = arr[i];
+        size_t boundary = 0;
+
+        if (value.IsUint64()) {
+            uint64_t v = value.GetUint64();
+            if (v > 0) boundary = static_cast<size_t>(v);
+        } else if (value.IsInt64()) {
+            int64_t v = value.GetInt64();
+            if (v > 0) boundary = static_cast<size_t>(v);
+        } else if (value.IsUint()) {
+            uint32_t v = value.GetUint();
+            if (v > 0) boundary = static_cast<size_t>(v);
+        } else if (value.IsInt()) {
+            int32_t v = value.GetInt();
+            if (v > 0) boundary = static_cast<size_t>(v);
+        }
+
+        if (boundary > 0) {
+            boundaries.push_back(boundary);
+        }
+    }
+
+    // Sort and deduplicate
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+
+    return boundaries;
+}
+
+inline std::optional<RequestRewriter::MessageBoundaries> RequestRewriter::extract_message_boundaries(
+    std::string_view body,
+    std::function<size_t(const std::string&)> tokenize_fn) {
+
+    if (!tokenize_fn) {
+        return std::nullopt;
+    }
+
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::nullopt;
+    }
+
+    // Only works with chat completion API (messages field)
+    if (!doc.HasMember("messages") || !doc["messages"].IsArray()) {
+        return std::nullopt;
+    }
+
+    const auto& messages = doc["messages"];
+    if (messages.Size() == 0) {
+        return std::nullopt;
+    }
+
+    MessageBoundaries result;
+    size_t cumulative_tokens = 0;
+    bool found_non_system = false;
+
+    for (rapidjson::SizeType i = 0; i < messages.Size(); ++i) {
+        const auto& msg = messages[i];
+        if (!msg.IsObject()) continue;
+
+        // Get role
+        if (!msg.HasMember("role") || !msg["role"].IsString()) continue;
+        std::string_view role(msg["role"].GetString(), msg["role"].GetStringLength());
+
+        // Get content
+        if (!msg.HasMember("content")) continue;
+        const auto& content = msg["content"];
+        if (!content.IsString()) continue;
+
+        // Build the formatted message (matching tokenize_messages format)
+        std::string formatted = "<|" + std::string(role) + "|>\n";
+        formatted.append(content.GetString(), content.GetStringLength());
+
+        // Tokenize and accumulate
+        size_t token_count = tokenize_fn(formatted);
+        cumulative_tokens += token_count;
+
+        // Track system boundary (first non-system message starts user content)
+        if (!found_non_system && role != "system") {
+            result.system_boundary = cumulative_tokens - token_count;  // Boundary is BEFORE this message
+            found_non_system = true;
+        }
+
+        // Store boundary after each message
+        result.boundaries.push_back(cumulative_tokens);
+    }
+
+    // If all messages were system messages, system_boundary is at the end
+    if (!found_non_system && cumulative_tokens > 0) {
+        result.system_boundary = cumulative_tokens;
+    }
+
+    if (result.boundaries.empty()) {
+        return std::nullopt;
+    }
+
+    return result;
 }
 
 inline RequestRewriter::TokenExtractionResult RequestRewriter::extract_prompt_token_ids(

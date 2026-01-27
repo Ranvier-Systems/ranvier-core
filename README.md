@@ -1,12 +1,17 @@
 # Ranvier Core
 
-> **Saltatory Conduction for LLM Inference.**
+> **48% faster Time-To-First-Token** through intelligent prefix-aware routing.
 >
-> A standalone, Seastar-native router that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
+> A high-performance LLM traffic controller that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
+
+```bash
+# Quick start (requires Docker)
+docker run -p 8080:8080 ghcr.io/ranvier-systems/ranvier:latest
+```
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Standard](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
-[![Status](https://img.shields.io/badge/Status-Alpha-orange)]()
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
+[![Architecture](https://img.shields.io/badge/Architecture-Defined-blue)](docs/architecture/VISION.md)
 
 ---
 
@@ -30,10 +35,19 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ---
 
-## 🚀 Performance Goals
-* **Zero-Copy Hot Path:** Request bodies are parsed and hashed without unnecessary copying to userspace.
-* **Microsecond Overhead:** Routing decisions occur in $< 50\mu s$.
-* **Linear Scaling:** Throughput scales linearly with CPU cores due to Seastar's sharding.
+## 🚀 Performance Characteristics
+
+| Metric | Measured | Notes |
+|--------|----------|-------|
+| **Radix Tree Lookup** | < 50μs | Pure routing decision (O(L) where L = prefix length) |
+| **Total Routing Overhead** | 1-10ms | Includes tokenization; scales with prompt size |
+| **Ranvier P50 Overhead** | ~7ms | Measured vs direct vLLM connection |
+| **Cache Hit Rate** | 94-98% | With prefix-heavy workloads (RAG, few-shot) |
+
+**Design Principles:**
+* **Minimized Copying:** Uses `string_view` parsing with single network buffer copy; Radix lookups use `std::span` for zero-copy token access.
+* **Shared-Nothing Architecture:** Thread-per-core via Seastar; no locks on the hot path. Each shard maintains its own routing tree.
+* **Near-Linear Scaling:** Throughput scales well up to 4-8 cores; diminishing returns beyond due to cross-shard route learning broadcasts.
 
 ---
 
@@ -59,7 +73,27 @@ Real-world results from 8x A100 40GB:
 
 > **Note:** Benefits scale with prefix size and model size. Use 8B+ parameter models for meaningful KV cache improvements. Small prefixes (<500 tokens) see minimal benefit.
 
-See [Benchmark Guide](docs/benchmark-guide-8xA100.md) for detailed methodology and results.
+See [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for detailed methodology and results.
+
+---
+
+## 🗺️ Architecture & Vision
+
+Ranvier is evolving from a prefix-aware router into a full **Intelligence Layer for AI Inference Infrastructure**.
+
+**Current Capabilities (v0.x):**
+- Token prefix-based routing via Adaptive Radix Tree
+- Passive route learning (learns which prefixes → which backends)
+- Backend health checking with circuit breaker
+- Multi-node clustering with gossip protocol
+
+**Planned Capabilities ([see roadmap](docs/architecture/VISION.md)):**
+- **Request Intent Classification** - Route by FIM/Chat/Edit detection, not just token count
+- **Priority Queues** - Interactive requests never blocked by batch jobs
+- **Load-Aware Routing** - Ingest vLLM metrics for GPU-aware decisions
+- **Local Mode** - Auto-discover Ollama, LM Studio, llama.cpp
+
+The vision: A dropdown menu sets a global model preference. Ranvier will make **per-request routing decisions** based on intent, cost, and latency requirements.
 
 ---
 
@@ -85,24 +119,25 @@ graph TD
     User["User / Client"] -->|HTTP POST| Router["Ranvier Router"]
 
     subgraph "Ranvier Core (C++ Seastar)"
-        Router -->|Parse| Tokenizer["GPT-2 Tokenizer"]
-        Tokenizer -->|Tokens| Radix["Radix Tree"]
+        Router -->|Parse| Tokenizer["Tokenizer"]
+        Tokenizer -->|Tokens| Radix["Radix Tree (ART)"]
         Radix -->|Lookup| Cache{"Known Prefix?"}
-        Cache -- Yes --> BackendID
-        Cache -- No --> LB["Random Load Balancer"]
-        LB --> BackendID
+        Cache -- Yes --> Route["Route to Cached Backend"]
+        Cache -- No --> Hash["Consistent Hash (FNV-1a)"]
+        Hash --> Route
+        Route -->|Learn| Radix
     end
 
-    subgraph "Infrastructure"
-        Sidecar["Python Sidecar"] -.->|Watch| DockerDaemon
-        Sidecar -.->|Register| Router
+    subgraph "Backend Discovery"
+        K8s["K8s EndpointSlice"] -.->|Watch| Router
+        Config["YAML Config"] -.->|Load| Router
     end
 
-    Router == "Keep-Alive Connection" ==> GPU1["GPU 1 (Context A)"]
-    Router == "Keep-Alive Connection" ==> GPU2["GPU 2 (Context B)"]
+    Route == "Keep-Alive" ==> GPU1["GPU 1 (vLLM)"]
+    Route == "Keep-Alive" ==> GPU2["GPU 2 (vLLM)"]
 
-    style Router fill:#f9f,stroke:#333,stroke-width:4px
-    style Radix fill:#ccf,stroke:#333
+    style Router fill:#dbeafe,stroke:#2563eb,stroke-width:2px
+    style Radix fill:#d1fae5,stroke:#059669,stroke-width:2px
 ```
 
 ---
@@ -111,7 +146,7 @@ graph TD
 
 ### Docker
 
-Pre-built images are available on GitHub Container Registry (linux/amd64):
+Pre-built images are available on GitHub Container Registry (linux/amd64, linux/arm64):
 
 ```bash
 # Pull the latest image
@@ -201,17 +236,17 @@ helm install ranvier ./deploy/helm/ranvier \
   --set serviceMonitor.enabled=true
 ```
 
-See [Kubernetes Deployment Guide](docs/kubernetes.md) for detailed configuration options.
+See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed configuration options.
 
 ---
 
 ## 📖 Documentation
 
-- [Architecture Overview](docs/architecture.md)
-- [API Reference](docs/api-reference.md)
+- [Architecture Overview](docs/architecture/system-design.md)
+- [API Reference](docs/api/reference.md)
 - [Request Flow](docs/request-flow.md)
-- [Kubernetes Deployment](docs/kubernetes.md)
-- [Performance Tuning](docs/performance.md)
+- [Kubernetes Deployment](docs/deployment/kubernetes.md)
+- [Performance Tuning](docs/deployment/performance.md)
 - **Internals:**
   - [Gossip Protocol](docs/internals/gossip-protocol.md)
   - [Radix Tree](docs/internals/radix-tree.md)

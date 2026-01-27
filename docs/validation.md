@@ -275,7 +275,7 @@ independent reactor. These tests verify Ranvier properly leverages this:
 
 ### Related Documentation
 
-- [Architecture Overview](architecture.md)
+- [Architecture Overview](architecture/system-design.md)
 - [Async Persistence](internals/async-persistence.md)
 - [Gossip Protocol](internals/gossip-protocol.md)
 - [RadixTree Implementation](internals/radix-tree.md)

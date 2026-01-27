@@ -69,6 +69,7 @@ struct ShardLocalState {
         uint64_t radix_tree_lookup_hits = 0;
         uint64_t radix_tree_lookup_misses = 0;
         uint64_t prefix_affinity_routes = 0;
+        uint64_t multi_depth_routes_stored = 0;  // Routes stored via multi-depth learning
         // Compaction stats (cumulative since process start)
         uint64_t compaction_nodes_removed = 0;
         uint64_t compaction_nodes_shrunk = 0;
@@ -84,6 +85,7 @@ struct ShardLocalState {
             radix_tree_lookup_hits = 0;
             radix_tree_lookup_misses = 0;
             prefix_affinity_routes = 0;
+            multi_depth_routes_stored = 0;
             compaction_nodes_removed = 0;
             compaction_nodes_shrunk = 0;
             compaction_bytes_reclaimed = 0;
@@ -342,6 +344,9 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_prefix_affinity_routes",
             [] { return g_shard_state ? g_shard_state->stats.prefix_affinity_routes : 0UL; },
             seastar::metrics::description("Total number of requests routed via prefix affinity")),
+        seastar::metrics::make_counter("router_multi_depth_routes_stored",
+            [] { return g_shard_state ? g_shard_state->stats.multi_depth_routes_stored : 0UL; },
+            seastar::metrics::description("Total number of routes stored via multi-depth learning")),
         seastar::metrics::make_counter("router_routes_dropped_buffer_overflow_total",
             [this] { return _routes_dropped_overflow; },
             seastar::metrics::description("Total routes dropped due to remote route buffer overflow")),
@@ -602,7 +607,8 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 }
 
 RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
-                                         const std::string& request_id) {
+                                         const std::string& request_id,
+                                         size_t prefix_boundary) {
     RouteResult result;
 
     // ==========================================================================
@@ -639,7 +645,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
-        auto affinity_backend = get_backend_for_prefix(tokens, request_id);
+        auto affinity_backend = get_backend_for_prefix(tokens, request_id, prefix_boundary);
 
         if (affinity_backend.has_value()) {
             result.backend_id = affinity_backend.value();
@@ -754,7 +760,8 @@ std::optional<BackendId> RouterService::get_random_backend() {
 }
 
 std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                                 const std::string& request_id) {
+                                                                 const std::string& request_id,
+                                                                 size_t prefix_boundary) {
     if (!g_shard_state) return std::nullopt;
     auto& state = shard_state();
 
@@ -785,8 +792,17 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     // Sort for deterministic ordering across shards
     std::sort(live_backends.begin(), live_backends.end());
 
-    // Extract prefix (first N tokens)
-    size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    // Determine prefix length for hash fallback:
+    // 1. If prefix_boundary is valid (> 0 and <= tokens.size()), use it
+    //    This ensures consistent hashing across cluster nodes for requests
+    //    with the same system message but different user queries.
+    // 2. Otherwise, fall back to prefix_token_length (default: 128)
+    size_t prefix_len;
+    if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
+        prefix_len = prefix_boundary;
+    } else {
+        prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
+    }
     if (prefix_len == 0) {
         // No tokens to route on, fall back to first backend
         return live_backends[0];
@@ -834,6 +850,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
 
     // Step 2: No ART match (or backend unavailable) - use consistent hashing
     // This provides deterministic routing for new prefixes
+    // Uses prefix_boundary if provided (system message only) for multi-node consistency
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
     size_t index = prefix_hash % live_backends.size();
     BackendId selected = live_backends[index];
@@ -911,13 +928,27 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 }
 
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
-                                                       const std::string& request_id) {
-    // Truncate to prefix length - we only store the prefix in the ART, not the full sequence
-    // This ensures that requests with the same prefix (e.g., same system prompt) but
-    // different suffixes (e.g., different user queries) share the same routing entry.
-    size_t prefix_len = std::min(tokens.size(), _config.prefix_token_length);
-    if (prefix_len < tokens.size()) {
-        tokens.resize(prefix_len);
+                                                       const std::string& request_id,
+                                                       size_t prefix_boundary) {
+    // Determine effective prefix length for route storage:
+    // 1. If prefix_boundary > 0 and valid, use it (truncate to shared prefix like system messages)
+    // 2. Otherwise, fall back to config.prefix_token_length (default: 128)
+    //
+    // prefix_boundary enables prefix-aware routing for multi-turn conversations.
+    // When provided, routes are stored at the "shared prefix" boundary (e.g., system
+    // message token count), so requests with the same system prompt but different
+    // user queries route to the same backend for KV-cache efficiency.
+    size_t effective_prefix_len;
+    bool used_shared_prefix = false;
+    if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
+        effective_prefix_len = prefix_boundary;
+        used_shared_prefix = true;
+    } else {
+        effective_prefix_len = std::min(tokens.size(), _config.prefix_token_length);
+    }
+
+    if (effective_prefix_len < tokens.size()) {
+        tokens.resize(effective_prefix_len);
     }
 
     // ========================================================================
@@ -935,8 +966,13 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
 
     // Log route learning with request_id on shard 0 before broadcasting
     if (!request_id.empty()) {
-        log_router.info("[{}] Learning route: {} tokens (prefix) -> backend {}",
-                        request_id, tokens.size(), backend);
+        if (used_shared_prefix) {
+            log_router.info("[{}] Learning route: {} tokens (shared_prefix) -> backend {}",
+                            request_id, tokens.size(), backend);
+        } else {
+            log_router.info("[{}] Learning route: {} tokens (default_prefix) -> backend {}",
+                            request_id, tokens.size(), backend);
+        }
     }
 
     // Broadcast to cluster peers if gossip is enabled
@@ -1002,6 +1038,117 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
 
     // Wait for both gossip broadcast and shard updates
     return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
+}
+
+seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> tokens, BackendId backend,
+                                                           const std::string& request_id,
+                                                           const std::vector<size_t>& prefix_boundaries) {
+    // Multi-depth route learning: store routes at each provided boundary
+    // This enables cache reuse at any conversation depth (Option C)
+
+    if (prefix_boundaries.empty()) {
+        // No boundaries provided - fall back to single-depth learning
+        return learn_route_global(std::move(tokens), backend, request_id, 0);
+    }
+
+    // Filter boundaries: must be > 0 and <= tokens.size()
+    std::vector<size_t> valid_boundaries;
+    valid_boundaries.reserve(prefix_boundaries.size());
+    for (size_t b : prefix_boundaries) {
+        if (b > 0 && b <= tokens.size()) {
+            valid_boundaries.push_back(b);
+        }
+    }
+
+    if (valid_boundaries.empty()) {
+        // No valid boundaries - fall back to default prefix length
+        return learn_route_global(std::move(tokens), backend, request_id, 0);
+    }
+
+    // Log multi-depth learning
+    if (!request_id.empty()) {
+        std::string boundaries_str;
+        for (size_t i = 0; i < valid_boundaries.size(); ++i) {
+            if (i > 0) boundaries_str += ",";
+            boundaries_str += std::to_string(valid_boundaries[i]);
+        }
+        log_router.info("[{}] Learning multi-depth routes: {} boundaries [{}] -> backend {}",
+                        request_id, valid_boundaries.size(), boundaries_str, backend);
+    }
+
+    // Record metric for multi-depth routes
+    if (g_shard_state) {
+        shard_state().stats.multi_depth_routes_stored += valid_boundaries.size();
+    }
+
+    // Learn a route at each boundary depth
+    std::vector<seastar::future<>> futures;
+    futures.reserve(valid_boundaries.size());
+
+    for (size_t boundary : valid_boundaries) {
+        // Create a prefix at this boundary
+        std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + boundary);
+
+        // Validate token count
+        if (_config.max_route_tokens > 0 && prefix.size() > _config.max_route_tokens) {
+            continue;  // Skip this boundary if it exceeds the limit
+        }
+
+        // Broadcast to all local shards
+        futures.push_back(
+            seastar::do_with(std::move(prefix), [backend](std::vector<int32_t>& prefix_tokens) {
+                return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &prefix_tokens](unsigned shard_id) {
+                    auto tokens_ptr = std::make_unique<std::vector<int32_t>>(prefix_tokens);
+                    auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
+
+                    return seastar::smp::submit_to(shard_id, [backend, foreign_tokens = std::move(foreign_tokens)]() mutable {
+                        std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
+
+                        if (!g_shard_state) return seastar::make_ready_future<>();
+                        auto& state = shard_state();
+                        RadixTree* tree = state.tree.get();
+                        if (!tree) return seastar::make_ready_future<>();
+
+                        // LRU eviction if at capacity
+                        if (state.config.max_routes > 0) {
+                            while (tree->route_count() >= state.config.max_routes) {
+                                if (tree->evict_oldest()) {
+                                    state.stats.routes_evicted++;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+
+                        tree->insert(local_tokens, backend, RouteOrigin::LOCAL);
+                        return seastar::make_ready_future<>();
+                    });
+                });
+            })
+        );
+    }
+
+    // Gossip: broadcast the deepest boundary only (full context)
+    // Other depths are local optimizations that peers will compute themselves
+    seastar::future<> gossip_future = seastar::make_ready_future<>();
+    if (_gossip && !valid_boundaries.empty()) {
+        size_t deepest = valid_boundaries.back();  // Already sorted
+        std::vector<int32_t> deepest_prefix(tokens.begin(), tokens.begin() + deepest);
+        auto tokens_ptr = std::make_unique<std::vector<int32_t>>(std::move(deepest_prefix));
+        auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
+
+        gossip_future = seastar::smp::submit_to(0, [this, foreign_tokens = std::move(foreign_tokens), backend]() mutable {
+            if (_gossip->is_enabled()) {
+                std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
+                return _gossip->broadcast_route(local_tokens, backend);
+            }
+            return seastar::make_ready_future<>();
+        });
+    }
+
+    futures.push_back(std::move(gossip_future));
+
+    return seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
 }
 
 // ============================================================================

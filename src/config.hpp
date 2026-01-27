@@ -74,6 +74,25 @@ struct RoutingConfig {
     RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity with ART
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
+    // Prefix boundary detection for multi-turn conversations
+    // When enabled, system messages are tokenized separately to identify the "shared prefix"
+    // boundary. Routes are stored at this boundary instead of prefix_token_length, improving
+    // cache hit rates for requests sharing the same system prompt.
+    bool enable_prefix_boundary = true;  // Enable automatic prefix boundary detection
+    size_t min_prefix_boundary_tokens = 4;  // Minimum system message tokens to use as boundary
+
+    // Client-provided prefix boundary (prefix_token_count field in requests)
+    // When enabled, clients can include a "prefix_token_count" field in their requests
+    // to specify how many tokens constitute their shared prefix. This takes precedence
+    // over automatic system message detection when present.
+    bool accept_client_prefix_boundary = false;  // Accept client-provided prefix_token_count
+
+    // Multi-depth route storage (Option C)
+    // When enabled, routes are stored at multiple message boundaries for optimal cache
+    // reuse in branching or continuing conversations. Each boundary represents a natural
+    // breakpoint (end of system message, end of user turn, etc.)
+    bool enable_multi_depth_routing = false;  // Store routes at multiple depths
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
@@ -517,6 +536,18 @@ inline void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
         routing.prefix_token_length = *v;
     }
+    if (auto v = get_env("RANVIER_ENABLE_PREFIX_BOUNDARY")) {
+        routing.enable_prefix_boundary = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_MIN_PREFIX_BOUNDARY_TOKENS")) {
+        routing.min_prefix_boundary_tokens = *v;
+    }
+    if (auto v = get_env("RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY")) {
+        routing.accept_client_prefix_boundary = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_ENABLE_MULTI_DEPTH_ROUTING")) {
+        routing.enable_multi_depth_routing = (*v == "1" || *v == "true" || *v == "yes");
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -919,6 +950,18 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["prefix_token_length"]) {
                 config.routing.prefix_token_length = r["prefix_token_length"].as<size_t>();
+            }
+            if (r["enable_prefix_boundary"]) {
+                config.routing.enable_prefix_boundary = r["enable_prefix_boundary"].as<bool>();
+            }
+            if (r["min_prefix_boundary_tokens"]) {
+                config.routing.min_prefix_boundary_tokens = r["min_prefix_boundary_tokens"].as<size_t>();
+            }
+            if (r["accept_client_prefix_boundary"]) {
+                config.routing.accept_client_prefix_boundary = r["accept_client_prefix_boundary"].as<bool>();
+            }
+            if (r["enable_multi_depth_routing"]) {
+                config.routing.enable_multi_depth_routing = r["enable_multi_depth_routing"].as<bool>();
             }
         }
 

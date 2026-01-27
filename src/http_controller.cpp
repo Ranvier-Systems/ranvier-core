@@ -602,12 +602,22 @@ future<> HttpController::stream_backend_response(
             }
 
             // Learn route in the ART for future prefix matching
+            // Use prefix_boundaries for multi-depth routing, or prefix_boundary for single-depth
             if (_config.should_learn_routes() && ctx.tokens.size() >= _config.min_token_length) {
                 // Route learning is best-effort; don't fail the request if it fails
-                (void)_router.learn_route_global(ctx.tokens, ctx.current_backend, ctx.request_id)
-                    .handle_exception([request_id = ctx.request_id](auto) {
-                        log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
-                    });
+                if (!ctx.prefix_boundaries.empty() && _config.enable_multi_depth_routing) {
+                    // Multi-depth routing: store routes at multiple boundaries
+                    (void)_router.learn_route_global_multi(ctx.tokens, ctx.current_backend, ctx.request_id, ctx.prefix_boundaries)
+                        .handle_exception([request_id = ctx.request_id](auto) {
+                            log_proxy.debug("[{}] Multi-depth route learning failed (non-fatal)", request_id);
+                        });
+                } else {
+                    // Single-depth routing: use prefix_boundary or default
+                    (void)_router.learn_route_global(ctx.tokens, ctx.current_backend, ctx.request_id, ctx.prefix_boundary)
+                        .handle_exception([request_id = ctx.request_id](auto) {
+                            log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
+                        });
+                }
 
                 // Queue route for async persistence (fire-and-forget, non-blocking)
                 if (_persistence) {
@@ -777,6 +787,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     // Get tokens for routing - either from client or by tokenizing locally
     std::vector<int32_t> tokens;
     bool used_client_tokens = false;
+    size_t prefix_boundary = 0;  // Token count of shared prefix (system messages)
 
     // Timing: capture tokenization start
     auto tokenization_start = std::chrono::steady_clock::now();
@@ -866,6 +877,120 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         }
     } // tokenization block ends here (tokenize_span goes out of scope)
 
+    // Determine shared prefix boundary for routing
+    // Priority: 1) Client-provided prefix_token_count/prefix_boundaries, 2) Automatic detection
+    bool prefix_boundary_set = false;
+    std::vector<size_t> prefix_boundaries;  // For multi-depth routing (Option C)
+
+    // Option 1a: Check for client-provided prefix_boundaries array (multi-depth)
+    if (_config.accept_client_prefix_boundary && _config.enable_multi_depth_routing &&
+        !tokens.empty() && !tokenization_skipped) {
+        auto client_boundaries = RequestRewriter::extract_prefix_boundaries(body_view);
+        if (!client_boundaries.empty()) {
+            // Filter valid boundaries (must be < tokens.size())
+            for (size_t b : client_boundaries) {
+                if (b > 0 && b < tokens.size()) {
+                    prefix_boundaries.push_back(b);
+                }
+            }
+            if (!prefix_boundaries.empty()) {
+                prefix_boundary = prefix_boundaries.front();  // Use first as primary
+                prefix_boundary_set = true;
+                metrics().record_prefix_boundary_client();
+                log_proxy.debug("[{}] Using client-provided multi-depth boundaries: {} depths",
+                                request_id, prefix_boundaries.size());
+            }
+        }
+    }
+
+    // Option 1b: Check for client-provided prefix_token_count (single boundary)
+    if (!prefix_boundary_set && _config.accept_client_prefix_boundary &&
+        !tokens.empty() && !tokenization_skipped) {
+        auto client_prefix = RequestRewriter::extract_prefix_token_count(body_view);
+        if (client_prefix.has_value()) {
+            size_t count = *client_prefix;
+            // Validate: must be positive and less than total tokens
+            if (count > 0 && count < tokens.size()) {
+                prefix_boundary = count;
+                prefix_boundary_set = true;
+                metrics().record_prefix_boundary_client();
+                log_proxy.debug("[{}] Using client-provided prefix boundary: {} tokens",
+                                request_id, prefix_boundary);
+            } else {
+                log_proxy.debug("[{}] Ignoring invalid client prefix_token_count: {} (tokens={})",
+                                request_id, count, tokens.size());
+            }
+        }
+    }
+
+    // Option 2: Automatic message boundary detection
+    if (!prefix_boundary_set && _config.enable_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
+        // For multi-depth routing, calculate boundaries at each message
+        if (_config.enable_multi_depth_routing) {
+            auto tokenize_fn = [this](const std::string& text) -> size_t {
+                try {
+                    return _tokenizer.local().encode(text).size();
+                } catch (...) {
+                    return 0;
+                }
+            };
+            auto msg_boundaries = RequestRewriter::extract_message_boundaries(body_view, tokenize_fn);
+            if (msg_boundaries.has_value() && !msg_boundaries->boundaries.empty()) {
+                // Use all message boundaries for multi-depth storage
+                for (size_t b : msg_boundaries->boundaries) {
+                    if (b > 0 && b < tokens.size()) {
+                        prefix_boundaries.push_back(b);
+                    }
+                }
+                if (!prefix_boundaries.empty()) {
+                    prefix_boundary = msg_boundaries->system_boundary;
+                    if (prefix_boundary == 0 && !prefix_boundaries.empty()) {
+                        prefix_boundary = prefix_boundaries.front();
+                    }
+                    prefix_boundary_set = true;
+                    metrics().record_prefix_boundary_used();
+                    log_proxy.debug("[{}] Identified {} message boundaries for multi-depth routing",
+                                    request_id, prefix_boundaries.size());
+                }
+            }
+        }
+
+        // Fallback: single boundary from system messages
+        if (!prefix_boundary_set) {
+            auto system_messages = RequestRewriter::extract_system_messages(body_view);
+            if (system_messages.has_value() && !system_messages->empty()) {
+                try {
+                    // IMPORTANT: Add trailing newline to match how extract_text formats messages.
+                    // BPE tokenizers may tokenize "helpful" differently than "helpful\n" due to
+                    // subword boundaries. By including the separator, we ensure the token sequence
+                    // matches the prefix of the full text tokenization.
+                    auto system_text = *system_messages + "\n";
+                    auto system_tokens = _tokenizer.local().encode(system_text);
+                    // Only use as boundary if system tokens meet minimum threshold
+                    // and are shorter than full tokens (otherwise it's not a prefix)
+                    if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
+                        system_tokens.size() < tokens.size()) {
+                        prefix_boundary = system_tokens.size();
+                        prefix_boundary_set = true;
+                        metrics().record_prefix_boundary_used();
+                        log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
+                                        request_id, prefix_boundary);
+                    } else {
+                        metrics().record_prefix_boundary_skipped();
+                    }
+                } catch (...) {
+                    // System message tokenization failed - not fatal, just skip prefix boundary
+                    metrics().record_prefix_boundary_skipped();
+                    log_proxy.debug("[{}] System message tokenization failed, using default prefix",
+                                    request_id);
+                }
+            } else {
+                // No system messages found
+                metrics().record_prefix_boundary_skipped();
+            }
+        }
+    }
+
     // Timing: record tokenization latency
     auto tokenization_end = std::chrono::steady_clock::now();
     metrics().record_tokenization_latency(
@@ -916,8 +1041,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         auto route_span = TracingService::start_child_span("ranvier.route_lookup");
 
         // Unified routing decision - all mode logic is encapsulated in RouterService
+        // Pass prefix_boundary for consistent hash fallback across cluster nodes
         auto art_lookup_start = std::chrono::steady_clock::now();
-        auto route_result = _router.route_request(tokens, request_id);
+        auto route_result = _router.route_request(tokens, request_id, prefix_boundary);
         auto art_lookup_end = std::chrono::steady_clock::now();
         metrics().record_art_lookup_latency(
             MetricsService::to_seconds(art_lookup_end - art_lookup_start));
@@ -1020,6 +1146,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     ctx->endpoint = std::string(endpoint);
     ctx->forwarded_body = std::move(forwarded_body);
     ctx->tokens = std::move(tokens);
+    ctx->prefix_boundary = prefix_boundary;
+    ctx->prefix_boundaries = std::move(prefix_boundaries);
     ctx->target_id = target_id;
     ctx->target_addr = target_addr;
     ctx->current_backend = target_id;

@@ -202,6 +202,48 @@ def tokenize_messages(messages: List[dict]) -> Optional[List[int]]:
         return None
 
 
+def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
+    """Tokenize only the system messages and return the token count.
+
+    This is used to calculate prefix_token_count for routing hints.
+    The prefix_token_count tells Ranvier how many tokens constitute the
+    "shared prefix" (system messages) for prefix-aware routing.
+
+    IMPORTANT: The tokenization format must match what Ranvier's extract_text()
+    produces: raw content concatenated with "\n" separators, followed by a
+    trailing "\n" to match the BPE boundary alignment fix.
+
+    Returns None if:
+    - Client tokenization is disabled
+    - No system messages found
+    - Tokenization fails
+    """
+    if not _client_tokenize_enabled or _tokenizer is None:
+        return None
+
+    try:
+        # Extract system message content only (matching Ranvier's extract_system_messages)
+        system_parts = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content", "")
+                if content:
+                    system_parts.append(content)
+
+        if not system_parts:
+            return None
+
+        # Format must match Ranvier's extract_text() + "\n" for BPE boundary alignment
+        # - Multiple system messages: "content1\ncontent2\n"
+        # - Single system message: "content\n"
+        system_text = "\n".join(system_parts) + "\n"
+        encoding = _tokenizer.encode(system_text)
+        return len(encoding.ids)
+    except Exception as e:
+        logger.debug(f"System message tokenization failed: {e}")
+        return None
+
+
 def messages_to_prompt(messages: List[dict]) -> str:
     """Convert chat messages to a prompt string for /v1/completions endpoint.
 
@@ -2609,6 +2651,43 @@ def get_ranvier_latency_breakdown() -> dict:
     return breakdown
 
 
+def get_prefix_boundary_stats() -> dict:
+    """Fetch prefix boundary usage statistics from all Ranvier nodes.
+
+    These metrics indicate how often the system message prefix boundary
+    optimization is being applied. High prefix_boundary_used ratio should
+    correlate with improved cache hit rates for multi-turn conversation
+    workloads with shared system prompts.
+
+    Returns dict with:
+    - prefix_boundary_used: Total count of requests where system message
+      prefix boundary was identified and used for routing
+    - prefix_boundary_skipped: Total count where boundary was skipped
+      (no system messages, too short, disabled, or tokenization failed)
+    - prefix_boundary_ratio_pct: Percentage of requests using prefix boundary
+    """
+    stats = {
+        "prefix_boundary_used": 0,
+        "prefix_boundary_skipped": 0,
+        "prefix_boundary_ratio_pct": None,
+    }
+
+    for metrics_url in RANVIER_METRICS:
+        used = get_metric_value(metrics_url, "seastar_ranvier_prefix_boundary_used")
+        skipped = get_metric_value(metrics_url, "seastar_ranvier_prefix_boundary_skipped")
+
+        if used is not None:
+            stats["prefix_boundary_used"] += int(used)
+        if skipped is not None:
+            stats["prefix_boundary_skipped"] += int(skipped)
+
+    total = stats["prefix_boundary_used"] + stats["prefix_boundary_skipped"]
+    if total > 0:
+        stats["prefix_boundary_ratio_pct"] = (stats["prefix_boundary_used"] / total) * 100
+
+    return stats
+
+
 def register_backends_on_all_nodes():
     """Register backends on all Ranvier nodes."""
     global _backends_registered
@@ -2686,20 +2765,30 @@ def check_sync_errors() -> Tuple[bool, str]:
 def hash_prompt_prefix(messages: List[dict], token_limit: int = 100) -> str:
     """Generate a hash of the prompt prefix for cache tracking.
 
-    This approximates what the router does - extracting the first N tokens
-    to determine routing affinity.
+    This matches what Ranvier does - extracting system messages as the
+    "shared prefix" for routing affinity. Requests with the same system
+    messages but different user queries should route to the same backend.
     """
-    # Combine all message content
+    # Extract only system messages (matching Ranvier's extract_system_messages)
+    system_text = ""
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            system_text += content + "\n"
+
+    if system_text:
+        # Hash system messages only
+        return str(hash(system_text))
+
+    # No system messages - fall back to first 400 chars of all content
+    # This handles prompts without system messages
     full_text = ""
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
         full_text += f"{role}: {content}\n"
 
-    # Take first ~400 characters as approximation of first 100 tokens
     prefix = full_text[:400]
-
-    # Simple hash
     return str(hash(prefix))
 
 
@@ -3002,6 +3091,7 @@ def on_test_start(environment, **kwargs):
         logger.info("  Endpoint: /v1/completions (supports prompt_token_ids)")
         logger.info("  Ranvier: uses client tokens for routing (bypasses local tokenization)")
         logger.info("  vLLM: skips tokenization (uses prompt_token_ids directly)")
+        logger.info("  Prefix hints: prefix_token_count sent for system messages")
     else:
         client_tokenize = os.environ.get("CLIENT_TOKENIZE", "false").lower() in ("true", "1", "yes")
         if client_tokenize:
@@ -3052,6 +3142,19 @@ def on_test_stop(environment, **kwargs):
     logger.info(f"  Cache Misses: {summary['cache_misses']}")
     logger.info(f"  Cache Hit Rate: {summary['cache_hit_rate_pct']:.1f}%")
     logger.info(f"  Unique Prefixes: {summary['unique_prefixes']}")
+
+    # Print prefix boundary optimization stats (server-side)
+    prefix_stats = get_prefix_boundary_stats()
+    if prefix_stats["prefix_boundary_used"] > 0 or prefix_stats["prefix_boundary_skipped"] > 0:
+        logger.info(f"\nPrefix Boundary Optimization (Server-Side):")
+        logger.info(f"  Prefix Boundary Used: {prefix_stats['prefix_boundary_used']}")
+        logger.info(f"  Prefix Boundary Skipped: {prefix_stats['prefix_boundary_skipped']}")
+        if prefix_stats["prefix_boundary_ratio_pct"] is not None:
+            logger.info(f"  Usage Ratio: {prefix_stats['prefix_boundary_ratio_pct']:.1f}%")
+            # Correlation hint
+            if prefix_stats["prefix_boundary_ratio_pct"] < 50 and summary['cache_hit_rate_pct'] < 50:
+                logger.info(f"  Note: Low prefix boundary usage may explain low cache hit rate")
+                logger.info(f"        (requests may lack system messages or have short system prompts)")
 
     # Print TTFT comparison
     logger.info(f"\nTTFT Comparison:")
@@ -3160,6 +3263,7 @@ def on_test_stop(environment, **kwargs):
 
     # Add to summary for JSON output
     summary.update(latency_breakdown)
+    summary.update(prefix_stats)
 
     # Check sync errors
     sync_passed, sync_msg = check_sync_errors()
@@ -3241,6 +3345,12 @@ class RealBackendUser(HttpUser):
                 "stream": True,
                 "max_tokens": 100,  # Limit output for benchmarking
             }
+
+            # Calculate and include prefix_token_count for routing hints
+            # This tells Ranvier how many tokens are the "shared prefix" (system messages)
+            prefix_token_count = tokenize_system_messages(messages)
+            if prefix_token_count is not None and prefix_token_count > 0:
+                request_body["prefix_token_count"] = prefix_token_count
         else:
             # No client tokenization - use standard chat completions endpoint
             endpoint = "/v1/chat/completions"

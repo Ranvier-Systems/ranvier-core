@@ -146,8 +146,12 @@ services:
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
       # Accept client-provided prompt_token_ids for routing (bypasses local tokenization)
       - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
+      # Accept client-provided prefix_token_count for prefix boundary hints
+      - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       # Routing mode: "prefix" for prefix-aware, "round_robin" for baseline
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+      # Multi-depth route storage: stores routes at each message boundary (Option C)
+      - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
     # Use --smp 2 to leverage multi-core performance
@@ -193,7 +197,11 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
+      - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+      - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
+      - RAYON_NUM_THREADS=1
     # Use --smp 2 to leverage multi-core performance
     # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
     # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
@@ -237,7 +245,11 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=${RANVIER_MIN_TOKEN_LENGTH:-10}
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-1}
+      - RANVIER_ACCEPT_CLIENT_TOKENS=${RANVIER_ACCEPT_CLIENT_TOKENS:-1}
+      - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
+      - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
+      - RAYON_NUM_THREADS=1
     # Use --smp 2 to leverage multi-core performance
     # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
     # which is required for Rust FFI (tokenizers) to work correctly with multiple shards

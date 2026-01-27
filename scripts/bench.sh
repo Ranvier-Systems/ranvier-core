@@ -166,12 +166,17 @@ BENCHMARK OPTIONS:
     --users N           Concurrent users (default: 10)
     --spawn-rate N      Users spawned per second (default: 2)
     --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: stress)
+    --prompt-file FILE  Path to JSONL prompt file (ShareGPT/OpenAI format)
+                        See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --compare           Run A/B comparison (prefix vs round-robin). Runs TWO benchmarks
                         (each for --duration), so total runtime is ~2x duration + 30s.
     --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
     --output-dir DIR    Custom output directory (default: benchmark-reports)
     --client-tokenize   Tokenize on client (locust) instead of Ranvier server
+    --multi-depth       Enable multi-depth route storage (Option C). Stores routes at
+                        each message boundary, not just system message. Useful for
+                        conversation continuations and branching scenarios.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
 
@@ -321,6 +326,8 @@ SETUP_ONLY=false
 WARMUP=false
 LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
+MULTI_DEPTH=false
+PROMPT_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -330,6 +337,7 @@ while [[ $# -gt 0 ]]; do
         --users)          USERS="$2"; shift 2 ;;
         --spawn-rate)     SPAWN_RATE="$2"; shift 2 ;;
         --prompt-dist)    PROMPT_DIST="$2"; shift 2 ;;
+        --prompt-file)    PROMPT_FILE="$2"; shift 2 ;;
         --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
@@ -344,6 +352,7 @@ while [[ $# -gt 0 ]]; do
         --log-all)        LOG_ALL=true; shift ;;  # Kept for backwards compatibility (now default)
         --no-log)         LOG_ALL=false; shift ;;
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
+        --multi-depth)    MULTI_DEPTH=true; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
@@ -355,6 +364,11 @@ done
 if [[ -n "$VLLM_ENDPOINTS_RAW" ]]; then
     IFS=',' read -ra VLLM_ENDPOINTS <<< "$VLLM_ENDPOINTS_RAW"
     SKIP_VLLM=true  # Implicit --skip-vllm when endpoints are provided
+fi
+
+# If prompt file is specified, automatically set distribution to "file"
+if [[ -n "$PROMPT_FILE" ]]; then
+    PROMPT_DIST="file"
 fi
 
 # -----------------------------------------------------------------------------
@@ -665,12 +679,16 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Users:           $USERS"
     echo "  Spawn Rate:      $SPAWN_RATE/s"
     echo "  Prompt Dist:     $PROMPT_DIST"
+    if [[ -n "$PROMPT_FILE" ]]; then
+        echo "  Prompt File:     $PROMPT_FILE"
+    fi
     echo "  Prefix Ratio:    $PREFIX_RATIO"
     echo "  Output Dir:      $OUTPUT_DIR"
     echo "  Compare Mode:    $COMPARE"
     echo "  Warmup:          $WARMUP"
     echo "  Log All:         $LOG_ALL"
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
+    echo "  Multi-Depth:     $MULTI_DEPTH"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -715,6 +733,18 @@ if [[ "$DRY_RUN" = true ]]; then
         log_info "Would run Locust benchmark ($DURATION, $USERS users)"
     fi
     exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Validate prompt file if specified
+# -----------------------------------------------------------------------------
+
+if [[ -n "$PROMPT_FILE" ]]; then
+    if [[ ! -f "$PROMPT_FILE" ]]; then
+        log_error "Prompt file not found: $PROMPT_FILE"
+        exit 1
+    fi
+    log_ok "Prompt file: $PROMPT_FILE"
 fi
 
 # -----------------------------------------------------------------------------
@@ -917,6 +947,12 @@ if ! docker image inspect ranvier-locust:latest &> /dev/null; then
     log_ok "Locust image built"
 fi
 
+# Export multi-depth routing setting for docker-compose
+if [[ "$MULTI_DEPTH" = true ]]; then
+    export RANVIER_ENABLE_MULTI_DEPTH_ROUTING=true
+    log_info "Multi-depth routing enabled (Option C)"
+fi
+
 # Start Ranvier nodes
 log_info "Starting Ranvier nodes..."
 $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real up -d ranvier1 ranvier2 ranvier3 2>/dev/null
@@ -1001,6 +1037,7 @@ run_benchmark() {
     export RANVIER_ROUTING_MODE="$ROUTING_MODE"
     export PROMPT_DISTRIBUTION="$PROMPT_DIST"
     export SHARED_PREFIX_RATIO="$PREFIX_RATIO"
+    [[ -n "$PROMPT_FILE" ]] && export PROMPT_FILE
 
     # Export backend configuration
     for ((i=1; i<=GPUS; i++)); do
@@ -1043,6 +1080,14 @@ run_benchmark() {
     CLIENT_TOKENIZE_VAL="false"
     [[ "$CLIENT_TOKENIZE" = true ]] && CLIENT_TOKENIZE_VAL="true"
 
+    # Build prompt file args (volume mount + env var) if specified
+    PROMPT_FILE_ARGS=""
+    if [[ -n "$PROMPT_FILE" ]]; then
+        # Get absolute path for mounting
+        PROMPT_FILE_ABS="$(cd "$(dirname "$PROMPT_FILE")" && pwd)/$(basename "$PROMPT_FILE")"
+        PROMPT_FILE_ARGS="-v $PROMPT_FILE_ABS:/mnt/locust/prompts/custom_prompts.jsonl:ro -e PROMPT_FILE=/mnt/locust/prompts/custom_prompts.jsonl"
+    fi
+
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
@@ -1060,6 +1105,7 @@ run_benchmark() {
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         $BACKEND_ARGS \
+        $PROMPT_FILE_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -1128,6 +1174,13 @@ if [[ "$WARMUP" = true ]]; then
     CLIENT_TOKENIZE_VAL="false"
     [[ "$CLIENT_TOKENIZE" = true ]] && CLIENT_TOKENIZE_VAL="true"
 
+    # Build prompt file args (volume mount + env var) if specified
+    PROMPT_FILE_ARGS=""
+    if [[ -n "$PROMPT_FILE" ]]; then
+        PROMPT_FILE_ABS="$(cd "$(dirname "$PROMPT_FILE")" && pwd)/$(basename "$PROMPT_FILE")"
+        PROMPT_FILE_ARGS="-v $PROMPT_FILE_ABS:/mnt/locust/prompts/custom_prompts.jsonl:ro -e PROMPT_FILE=/mnt/locust/prompts/custom_prompts.jsonl"
+    fi
+
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1138,6 +1191,7 @@ if [[ "$WARMUP" = true ]]; then
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         $BACKEND_ARGS \
+        $PROMPT_FILE_ARGS \
         locust \
         --headless \
         --users "$USERS" \
