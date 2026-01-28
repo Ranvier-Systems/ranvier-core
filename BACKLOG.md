@@ -144,6 +144,22 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/crypto_offloader.hpp:181-188`
   _Complexity:_ Medium
 
+- [ ] **Audit codebase for abseil container opportunities**
+  _Justification:_ The codebase uses `std::unordered_map` and `std::vector` in several places where abseil alternatives (`absl::flat_hash_map`, `absl::InlinedVector`) would provide better performance. Abseil is already a dependency (used in RadixTree and TokenizationCache).
+  _Candidates:_
+  - `absl::flat_hash_map`: Replace `std::unordered_map` for better cache locality and ~20-40% faster lookups. Already done for TokenizationCache.
+  - `absl::InlinedVector<T, N>`: Replace `std::vector<T>` for small, bounded collections to avoid heap allocation. Good for: token vectors in cache entries (N=64), small config lists, temporary buffers.
+  - `absl::flat_hash_set`: Replace `std::unordered_set` where used.
+  _Files to audit:_
+  - `src/circuit_breaker.hpp` - `_circuits` map
+  - `src/rate_limiter.hpp` - `_buckets` map
+  - `src/connection_pool.hpp` - `_pools` map
+  - `src/gossip_service.cpp` - various peer tracking maps
+  - `src/router_service.cpp` - pending routes vectors
+  _Note:_ While individual gains are small (microseconds), cumulative effect across hot paths may be measurable. Low complexity since abseil is already linked.
+  _Location:_ Multiple files (see candidates above)
+  _Complexity:_ Low
+
 ### 1.5 Shard-Aware Load Balancing
 
 - [x] **Implement P2C load balancer for cross-shard request dispatch** ✓
@@ -1082,6 +1098,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | Performance | Remove unnecessary atomics from ShardLoadMetrics | Low | |
 | **P3 - Low** | Performance | Batch CryptoOffloader statistics updates | Medium | |
 | **P3 - Low** | Performance | Offload tokenizer FFI to thread pool | High | |
+| **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
 
 ---
