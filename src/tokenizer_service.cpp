@@ -23,7 +23,7 @@ bool TokenizerService::is_loaded() const {
 
 size_t TokenizerService::vocab_size() const {
     if (!_impl) return 0;
-    return static_cast<size_t>(_impl->GetVocabSize());
+    return _impl->GetVocabSize();
 }
 
 } // namespace ranvier
