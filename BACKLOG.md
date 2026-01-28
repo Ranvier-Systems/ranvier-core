@@ -1066,6 +1066,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | Python admin SDK (rvctl CLI) | Medium | ✅ Done |
 | **P3 - Low** | Performance | Remove unnecessary atomics from ShardLoadMetrics | Low | |
 | **P3 - Low** | Performance | Batch CryptoOffloader statistics updates | Medium | |
+| **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
 
 ---
 
