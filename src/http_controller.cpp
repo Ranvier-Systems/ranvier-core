@@ -855,9 +855,17 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                 tokens.clear();
             } else {
                 try {
-                    tokens = _tokenizer.local().encode(text_to_tokenize);
-                    tokenize_span.set_attribute("ranvier.token_source", "local");
+                    // Use cached tokenization for performance (high hit rate for system messages)
+                    auto [result_tokens, cache_hit] = _tokenizer.local().encode_cached(text_to_tokenize);
+                    tokens = std::move(result_tokens);
+                    tokenize_span.set_attribute("ranvier.token_source", cache_hit ? "cache" : "local");
                     tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
+                    // Record cache metrics
+                    if (cache_hit) {
+                        metrics().record_tokenization_cache_hit();
+                    } else {
+                        metrics().record_tokenization_cache_miss();
+                    }
                 } catch (const std::exception& e) {
                     // Tokenizer failed - log and continue without tokens (fall back to round-robin)
                     log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
@@ -929,7 +937,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         if (_config.enable_multi_depth_routing) {
             auto tokenize_fn = [this](const std::string& text) -> size_t {
                 try {
-                    return _tokenizer.local().encode(text).size();
+                    // Use cached tokenization for message boundaries (high hit rate for role tags)
+                    auto [result_tokens, cache_hit] = _tokenizer.local().encode_cached(text);
+                    if (cache_hit) {
+                        metrics().record_tokenization_cache_hit();
+                    } else {
+                        metrics().record_tokenization_cache_miss();
+                    }
+                    return result_tokens.size();
                 } catch (...) {
                     return 0;
                 }
@@ -965,7 +980,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                     // subword boundaries. By including the separator, we ensure the token sequence
                     // matches the prefix of the full text tokenization.
                     auto system_text = *system_messages + "\n";
-                    auto system_tokens = _tokenizer.local().encode(system_text);
+                    // Use cached tokenization (system messages have ~90%+ cache hit rate)
+                    auto [system_tokens, cache_hit] = _tokenizer.local().encode_cached(system_text);
+                    if (cache_hit) {
+                        metrics().record_tokenization_cache_hit();
+                    } else {
+                        metrics().record_tokenization_cache_miss();
+                    }
                     // Only use as boundary if system tokens meet minimum threshold
                     // and are shorter than full tokens (otherwise it's not a prefix)
                     if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&

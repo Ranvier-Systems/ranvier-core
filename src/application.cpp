@@ -75,12 +75,21 @@ seastar::future<> Application::init_tokenizer() {
                 // Start sharded tokenizer service (one instance per core for thread safety)
                 return _tokenizer.start().then([this] {
                     _tokenizer_started = true;
-                    // Load tokenizer on each shard from cached JSON
-                    return _tokenizer.invoke_on_all([this](TokenizerService& t) {
+                    // Configure tokenization cache from config (before loading tokenizer)
+                    TokenizationCacheConfig cache_cfg;
+                    cache_cfg.enabled = _config.assets.tokenization_cache_enabled;
+                    cache_cfg.max_entries = _config.assets.tokenization_cache_size;
+                    cache_cfg.max_text_length = _config.assets.tokenization_cache_max_text;
+                    // Load tokenizer and configure cache on each shard from cached JSON
+                    return _tokenizer.invoke_on_all([this, cache_cfg](TokenizerService& t) {
+                        t.configure_cache(cache_cfg);
                         t.load_from_json(_tokenizer_json);
                     });
                 }).then([this] {
-                    log_main.info("Tokenizer initialized on {} shards", seastar::smp::count);
+                    log_main.info("Tokenizer initialized on {} shards (cache: {}, max_entries: {})",
+                                  seastar::smp::count,
+                                  _config.assets.tokenization_cache_enabled ? "enabled" : "disabled",
+                                  _config.assets.tokenization_cache_size);
                     // Clear cached JSON to free memory (each shard has its own copy now)
                     _tokenizer_json.clear();
                     _tokenizer_json.shrink_to_fit();
