@@ -6,9 +6,9 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
+#include <absl/container/flat_hash_map.h>
 #include <seastar/core/future.hh>
 #include <tokenizers_cpp.h>
 
@@ -92,9 +92,9 @@ private:
     std::list<CacheEntry> _lru_list;
 
     // Hash map: text -> iterator into LRU list
-    // Uses transparent hashing to allow lookup with string_view
-    std::unordered_map<std::string_view, std::list<CacheEntry>::iterator,
-                       StringHash, StringEqual> _cache;
+    // Uses absl::flat_hash_map for better cache locality and lookup performance
+    absl::flat_hash_map<std::string_view, std::list<CacheEntry>::iterator,
+                        StringHash, StringEqual> _cache;
 
     // Statistics (lock-free, shard-local)
     uint64_t _hits = 0;

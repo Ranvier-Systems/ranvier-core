@@ -471,6 +471,7 @@ if(Seastar_FOUND)
       PRIVATE
       Seastar::seastar
       tokenizers_cpp
+      absl::flat_hash_map
       GTest::gtest_main
     )
     gtest_discover_tests(tokenization_cache_test)
