@@ -110,6 +110,12 @@ struct TimeoutConfig {
 // Tokenizer/assets configuration
 struct AssetsConfig {
     std::string tokenizer_path = "assets/gpt2.json";
+
+    // Tokenization cache settings (optimization for repeated texts like system messages)
+    // Expected hit rates: system messages 80-90%, role tags 95%+
+    bool tokenization_cache_enabled = true;    // Enable LRU cache for tokenization results
+    size_t tokenization_cache_size = 1000;     // Maximum cache entries (Rule #4: bounded)
+    size_t tokenization_cache_max_text = 8192; // Don't cache texts longer than this (bytes)
 };
 
 // TLS configuration

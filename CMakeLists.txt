@@ -459,4 +459,20 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(application_test)
+
+    # TokenizationCache Unit Tests (Requires Seastar types for header includes)
+    # Tests LRU cache for tokenization results (Rule #4: bounded container)
+    add_executable(tokenization_cache_test
+      tests/unit/tokenization_cache_test.cpp
+      src/tokenizer_service.cpp
+    )
+    target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(tokenization_cache_test
+      PRIVATE
+      Seastar::seastar
+      tokenizers_cpp
+      absl::flat_hash_map
+      GTest::gtest_main
+    )
+    gtest_discover_tests(tokenization_cache_test)
 endif()

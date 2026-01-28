@@ -193,6 +193,12 @@ public:
             seastar::metrics::make_counter("tokenization_skipped", _tokenization_skipped,
                 seastar::metrics::description("Total number of requests where tokenization was skipped (random routing mode)")),
 
+            seastar::metrics::make_counter("tokenization_cache_hits", _tokenization_cache_hits,
+                seastar::metrics::description("Total number of tokenization cache hits (avoided FFI calls)")),
+
+            seastar::metrics::make_counter("tokenization_cache_misses", _tokenization_cache_misses,
+                seastar::metrics::description("Total number of tokenization cache misses (required FFI calls)")),
+
             seastar::metrics::make_counter("prefix_boundary_used", _prefix_boundary_used,
                 seastar::metrics::description("Total number of requests where system message prefix boundary was identified and used for routing")),
 
@@ -329,6 +335,13 @@ public:
     // Record tokenization skipped (random routing mode optimization)
     void record_tokenization_skipped() { _tokenization_skipped++; }
 
+    // Tokenization cache hit/miss tracking
+    // These are shard-local (lock-free) for hot path efficiency
+    void record_tokenization_cache_hit() { _tokenization_cache_hits++; }
+    void record_tokenization_cache_miss() { _tokenization_cache_misses++; }
+    uint64_t get_tokenization_cache_hits() const { return _tokenization_cache_hits; }
+    uint64_t get_tokenization_cache_misses() const { return _tokenization_cache_misses; }
+
     // Record prefix boundary detection results
     void record_prefix_boundary_used() { _prefix_boundary_used++; }
     void record_prefix_boundary_skipped() { _prefix_boundary_skipped++; }
@@ -428,6 +441,8 @@ private:
     uint64_t _tokenizer_validation_failures = 0;  // Input validation failures before tokenization
     uint64_t _tokenizer_errors = 0;  // Tokenizer exceptions during encode()
     uint64_t _tokenization_skipped = 0;  // Tokenization skipped in random routing mode
+    uint64_t _tokenization_cache_hits = 0;    // Tokenization cache hits (avoided FFI)
+    uint64_t _tokenization_cache_misses = 0;  // Tokenization cache misses (required FFI)
     uint64_t _prefix_boundary_used = 0;  // System message prefix boundary was used
     uint64_t _prefix_boundary_skipped = 0;  // Prefix boundary skipped (no system messages, too short, disabled)
     uint64_t _prefix_boundary_client = 0;  // Client-provided prefix_token_count was used

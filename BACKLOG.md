@@ -42,6 +42,21 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/tokenizer_service.cpp`
   _Complexity:_ Low
 
+- [ ] **Offload tokenizer FFI calls to thread pool to avoid reactor stalls**
+  _Justification:_ The `_impl->Encode()` FFI call to the Rust tokenizers library blocks the Seastar reactor for ~5-13ms per call. While the LRU cache (added 2026-01-28) mitigates this for repeated texts (80-90% hit rate for system messages), cache misses still block the reactor. This stalls all other requests on that shard during tokenization.
+  _Approach:_ Investigate options:
+  1. **seastar::async**: Runs in Seastar thread context but still same core. May help if Seastar can preempt/poll between operations, but pure CPU-bound FFI with no yield points may not benefit.
+  2. **Dedicated tokenizer thread pool**: Create N worker threads (one per shard) with lock-free SPSC queue. Reactor enqueues text, worker tokenizes, result returned via promise. Adds latency but unblocks reactor.
+  3. **seastar::alien::submit_to**: Submit to Seastar's alien thread pool for true parallelism. Requires careful lifetime management.
+  _Challenges:_
+  - Tokenizer is NOT thread-safe - each shard has its own instance, so option 2/3 need per-shard worker threads
+  - Added latency from queue/context-switch may exceed blocking time for short texts
+  - Complexity of promise/future plumbing across thread boundary
+  _Metrics to validate:_ Compare P99 tokenization latency and overall request P99 before/after. Only worth it if reactor stall reduction outweighs added queue latency.
+  _Location:_ `src/tokenizer_service.hpp`, `src/tokenizer_service.cpp`, `src/http_controller.cpp`
+  _Complexity:_ High
+  _Priority:_ P3 (cache optimization reduces urgency; revisit if cache hit rate proves insufficient)
+
 - [x] **Use Seastar async file I/O for tokenizer loading** ✓
   _Justification:_ Tokenizer loading used blocking `std::ifstream` during startup, blocking the reactor thread. This is an architectural hazard in Seastar that could cause stalls on slow storage.
   _Approach:_ Replaced `std::ifstream` with Seastar's non-blocking DMA file I/O (`seastar::open_file_dma`, `seastar::make_file_input_stream`). Added validation for empty files, max file size (100MB), and proper stream cleanup via `finally()`. Method now returns `seastar::future<>` for proper async chaining in startup sequence.
@@ -128,6 +143,22 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Approach:_ Use per-operation local counters that batch into atomics periodically (e.g., every 100 ops or via timer). Consider non-atomic counters for same-shard-only statistics, exposing them via snapshot functions.
   _Location:_ `src/crypto_offloader.hpp:181-188`
   _Complexity:_ Medium
+
+- [ ] **Audit codebase for abseil container opportunities**
+  _Justification:_ The codebase uses `std::unordered_map` and `std::vector` in several places where abseil alternatives (`absl::flat_hash_map`, `absl::InlinedVector`) would provide better performance. Abseil is already a dependency (used in RadixTree and TokenizationCache).
+  _Candidates:_
+  - `absl::flat_hash_map`: Replace `std::unordered_map` for better cache locality and ~20-40% faster lookups. Already done for TokenizationCache.
+  - `absl::InlinedVector<T, N>`: Replace `std::vector<T>` for small, bounded collections to avoid heap allocation. Good for: token vectors in cache entries (N=64), small config lists, temporary buffers.
+  - `absl::flat_hash_set`: Replace `std::unordered_set` where used.
+  _Files to audit:_
+  - `src/circuit_breaker.hpp` - `_circuits` map
+  - `src/rate_limiter.hpp` - `_buckets` map
+  - `src/connection_pool.hpp` - `_pools` map
+  - `src/gossip_service.cpp` - various peer tracking maps
+  - `src/router_service.cpp` - pending routes vectors
+  _Note:_ While individual gains are small (microseconds), cumulative effect across hot paths may be measurable. Low complexity since abseil is already linked.
+  _Location:_ Multiple files (see candidates above)
+  _Complexity:_ Low
 
 ### 1.5 Shard-Aware Load Balancing
 
@@ -1066,6 +1097,8 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | Python admin SDK (rvctl CLI) | Medium | ✅ Done |
 | **P3 - Low** | Performance | Remove unnecessary atomics from ShardLoadMetrics | Low | |
 | **P3 - Low** | Performance | Batch CryptoOffloader statistics updates | Medium | |
+| **P3 - Low** | Performance | Offload tokenizer FFI to thread pool | High | |
+| **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
 
 ---
