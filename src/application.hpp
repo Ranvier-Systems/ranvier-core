@@ -228,6 +228,11 @@ private:
     // Log warnings for config changes that require restart
     void log_non_reloadable_changes(const RanvierConfig& new_config) const;
 
+    // Auto-configure max_token_id from tokenizer vocabulary size
+    // Called during startup and optionally during config reload
+    // Updates both _config and _sharded_config for consistency
+    seastar::future<> apply_vocab_size_config();
+
     // --- Private Helpers: Server Lifecycle ---
 
     // Setup TLS credentials (if enabled)

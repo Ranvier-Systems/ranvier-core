@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 
 #include <seastar/core/fstream.hh>
 #include <seastar/core/prometheus.hh>
@@ -228,6 +229,48 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
     }
 }
 
+seastar::future<> Application::apply_vocab_size_config() {
+    // Auto-configure max_token_id from tokenizer vocabulary size
+    // This ensures client-provided tokens are validated against the actual tokenizer
+    size_t vocab_size = _tokenizer.local().vocab_size();
+
+    if (vocab_size == 0) {
+        // Tokenizer may not have loaded correctly, or vocab size unavailable
+        log_main.warn("Tokenizer vocab_size returned 0 - using configured max_token_id: {}",
+                      _config.routing.max_token_id);
+        return seastar::make_ready_future<>();
+    }
+
+    // Bounds check: vocab_size must fit in int32_t (max ~2.1 billion)
+    // Current LLMs have vocab sizes up to ~256k, so this is a sanity check
+    constexpr size_t MAX_SAFE_VOCAB = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    if (vocab_size > MAX_SAFE_VOCAB) {
+        log_main.warn("Tokenizer vocab_size ({}) exceeds int32_t max - clamping to {}",
+                      vocab_size, MAX_SAFE_VOCAB);
+        vocab_size = MAX_SAFE_VOCAB;
+    }
+
+    auto current_max = static_cast<size_t>(_config.routing.max_token_id);
+    if (current_max < vocab_size) {
+        _config.routing.max_token_id = static_cast<int32_t>(vocab_size);
+        log_main.info("Auto-configured max_token_id from tokenizer vocab size: {}", vocab_size);
+
+        // Update ShardedConfig so all shards have consistent config
+        // This ensures Application::local_config() returns the correct value
+        return _sharded_config.invoke_on_all([max_id = _config.routing.max_token_id](ShardedConfig& cfg) {
+            // Get a mutable copy, update max_token_id, and apply
+            RanvierConfig updated = cfg.config();
+            updated.routing.max_token_id = max_id;
+            cfg.update(std::move(updated));
+        });
+    } else {
+        log_main.debug("max_token_id ({}) already >= vocab_size ({}), no auto-config needed",
+                       current_max, vocab_size);
+    }
+
+    return seastar::make_ready_future<>();
+}
+
 // =============================================================================
 // Service Initialization
 // =============================================================================
@@ -422,14 +465,7 @@ seastar::future<> Application::startup() {
         }).then([this] {
             // 2b. Auto-configure max_token_id from tokenizer vocabulary size
             // This ensures client-provided tokens are validated against the actual tokenizer
-            size_t vocab_size = _tokenizer.local().vocab_size();
-            if (vocab_size > 0) {
-                auto current_max = static_cast<size_t>(_config.routing.max_token_id);
-                if (current_max < vocab_size) {
-                    _config.routing.max_token_id = static_cast<int32_t>(vocab_size);
-                    log_main.info("Auto-configured max_token_id from tokenizer vocab size: {}", vocab_size);
-                }
-            }
+            return apply_vocab_size_config();
         }).then([this] {
             // 3. Initialize OpenTelemetry tracing
             TracingService::init(_config.telemetry);
@@ -1068,6 +1104,11 @@ seastar::future<> Application::reload_config() {
             // This ensures consistency - if any step fails, master config is unchanged
             _config = *config_ptr;
             _last_reload_time = now;
+
+            // Step 6: Re-apply auto-configure for max_token_id from tokenizer vocab size
+            // This ensures the tokenizer-derived value is preserved across reloads
+            return apply_vocab_size_config();
+        }).then([] {
             log_main.info("Configuration reloaded successfully on all cores");
         });
     }).handle_exception([](auto ep) {
