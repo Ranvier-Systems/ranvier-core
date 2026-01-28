@@ -41,12 +41,9 @@ struct TokenizationCacheConfig {
  * - Pro: Uses existing P2C infrastructure, no thread-safety issues
  * - Con: Cross-shard latency (~1-10μs) + string copy overhead
  * - Con: Cache locality reduced (each shard builds own cache)
- *
- * Recommended: Enable when cache hit rate < 80% or P99 latency is dominated
- * by tokenization stalls on hot shards.
  */
 struct CrossShardTokenizationConfig {
-    bool enabled = false;  // Disabled by default; enable after validating metrics
+    bool enabled = true;  // Enabled by default; requires set_cross_shard_refs() to work
 
     // Minimum text length (bytes) to consider cross-shard dispatch.
     // Short texts tokenize quickly; cross-shard overhead may exceed benefit.
