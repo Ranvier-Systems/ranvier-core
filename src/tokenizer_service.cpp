@@ -1,8 +1,13 @@
 #include "tokenizer_service.hpp"
+#include "shard_load_balancer.hpp"
 
 #include <stdexcept>
 
+#include <seastar/util/log.hh>
+
 namespace ranvier {
+
+static seastar::logger log_tokenizer("tokenizer");
 
 // ============================================================================
 // TokenizationCache Implementation
@@ -118,6 +123,186 @@ std::pair<std::vector<int32_t>, bool> TokenizerService::encode_cached(std::strin
     _cache.insert(text, tokens);
 
     return {std::move(tokens), false};
+}
+
+void TokenizerService::configure_cross_shard(CrossShardTokenizationConfig config) {
+    _cross_shard_config = config;
+    if (config.enabled) {
+        log_tokenizer.info("Cross-shard tokenization enabled on shard {} "
+                          "(min_text_length={}, max_text_length={})",
+                          seastar::this_shard_id(),
+                          config.min_text_length,
+                          config.max_text_length);
+    }
+}
+
+void TokenizerService::set_cross_shard_refs(
+    seastar::sharded<ShardLoadBalancer>* load_balancer,
+    seastar::sharded<TokenizerService>* tokenizer) {
+    _load_balancer = load_balancer;
+    _tokenizer_sharded = tokenizer;
+}
+
+bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
+    // Cross-shard must be enabled
+    if (!_cross_shard_config.enabled) {
+        return false;
+    }
+
+    // Must have references set up
+    if (!_load_balancer || !_tokenizer_sharded) {
+        return false;
+    }
+
+    // Only dispatch if we have multiple shards
+    if (seastar::smp::count <= 1) {
+        return false;
+    }
+
+    // Check text length bounds
+    if (text_length < _cross_shard_config.min_text_length ||
+        text_length > _cross_shard_config.max_text_length) {
+        return false;
+    }
+
+    return true;
+}
+
+uint32_t TokenizerService::select_tokenization_shard() const {
+    if (!_load_balancer) {
+        return seastar::this_shard_id();
+    }
+
+    // Use P2C to select least-loaded shard
+    return _load_balancer->local().select_shard();
+}
+
+seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
+    uint32_t local_shard = seastar::this_shard_id();
+
+    // Fast path: check local cache first (no async overhead for hits)
+    const auto* cached = _cache.lookup(text);
+    if (cached) {
+        TokenizationResult result;
+        result.tokens = *cached;  // Copy from cache
+        result.cache_hit = true;
+        result.cross_shard = false;
+        result.source_shard = local_shard;
+        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+    }
+
+    // Cache miss - check if tokenizer is loaded
+    if (!_impl) {
+        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+    }
+
+    // Decide whether to dispatch cross-shard
+    if (!should_dispatch_cross_shard(text.size())) {
+        // Tokenize locally (blocks reactor but avoids cross-shard overhead)
+        ++_cross_shard_local_fallbacks;
+
+        TokenizationResult result;
+        try {
+            result.tokens = _impl->Encode(std::string(text));
+        } catch (const std::exception& e) {
+            // Rule #9: Log exceptions at warn level with context
+            log_tokenizer.warn("Local tokenization failed on shard {}: {}",
+                              local_shard, e.what());
+            return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+        }
+        result.cache_hit = false;
+        result.cross_shard = false;
+        result.source_shard = local_shard;
+
+        // Cache locally for future hits
+        _cache.insert(text, result.tokens);
+
+        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+    }
+
+    // Select target shard via P2C
+    uint32_t target_shard = select_tokenization_shard();
+
+    if (target_shard == local_shard) {
+        // P2C selected local shard - process locally
+        ++_cross_shard_local_fallbacks;
+
+        TokenizationResult result;
+        try {
+            result.tokens = _impl->Encode(std::string(text));
+        } catch (const std::exception& e) {
+            log_tokenizer.warn("Local tokenization failed on shard {}: {}",
+                              local_shard, e.what());
+            return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+        }
+        result.cache_hit = false;
+        result.cross_shard = false;
+        result.source_shard = local_shard;
+
+        _cache.insert(text, result.tokens);
+
+        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+    }
+
+    // Cross-shard dispatch: copy text for transfer (Rule #14: safe cross-shard data)
+    ++_cross_shard_dispatches;
+
+    // IMPORTANT: We must copy the text into an owned string because:
+    // 1. The original string_view may point to temporary_buffer that could be freed
+    // 2. Rule #14: Cannot pass references across shard boundaries
+    std::string text_copy(text);
+
+    // Capture sharded pointer by value (not `this`) to avoid cross-shard memory access
+    auto tokenizer_sharded = _tokenizer_sharded;
+
+    return seastar::smp::submit_to(target_shard,
+        [tokenizer_sharded, text_copy = std::move(text_copy), target_shard]() mutable
+            -> std::pair<std::vector<int32_t>, bool> {
+            // On target shard: get local TokenizerService and check cache
+            auto& target_tokenizer = tokenizer_sharded->local();
+
+            const auto* target_cached = target_tokenizer._cache.lookup(text_copy);
+            if (target_cached) {
+                // Target cache hit - return copy of cached tokens
+                return {*target_cached, true};
+            }
+
+            // Target cache miss - perform tokenization (blocks target reactor)
+            if (!target_tokenizer._impl) {
+                return {{}, false};
+            }
+
+            std::vector<int32_t> tokens;
+            try {
+                tokens = target_tokenizer._impl->Encode(text_copy);
+            } catch (const std::exception& e) {
+                log_tokenizer.warn("Cross-shard tokenization failed on shard {}: {}",
+                                  target_shard, e.what());
+                return {{}, false};
+            }
+
+            // Cache on target shard for future cross-shard requests
+            target_tokenizer._cache.insert(text_copy, tokens);
+
+            return {std::move(tokens), false};
+        })
+        .then([this, local_shard, target_shard, text = std::string(text)]
+              (std::pair<std::vector<int32_t>, bool> remote_result) {
+            // Back on calling shard: package result and cache locally
+
+            TokenizationResult result;
+            result.tokens = std::move(remote_result.first);
+            result.cache_hit = remote_result.second;  // Was it a cache hit on target?
+            result.cross_shard = true;
+            result.source_shard = target_shard;
+
+            // Cache locally so future requests on this shard hit local cache
+            if (!result.tokens.empty()) {
+                _cache.insert(text, result.tokens);
+            }
+
+            return result;
+        });
 }
 
 bool TokenizerService::is_loaded() const {

@@ -855,16 +855,33 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                 tokens.clear();
             } else {
                 try {
-                    // Use cached tokenization for performance (high hit rate for system messages)
-                    auto [result_tokens, cache_hit] = _tokenizer.local().encode_cached(text_to_tokenize);
-                    tokens = std::move(result_tokens);
-                    tokenize_span.set_attribute("ranvier.token_source", cache_hit ? "cache" : "local");
+                    // Use async cached tokenization with cross-shard dispatch
+                    // On cache hit: returns immediately (no async overhead)
+                    // On cache miss: may dispatch to least-loaded shard via P2C,
+                    //   freeing this reactor to handle other requests during FFI.
+                    auto tok_result = co_await _tokenizer.local().encode_cached_async(text_to_tokenize);
+                    tokens = std::move(tok_result.tokens);
+
+                    // Set tracing attributes based on tokenization source
+                    if (tok_result.cache_hit) {
+                        tokenize_span.set_attribute("ranvier.token_source", "cache");
+                    } else if (tok_result.cross_shard) {
+                        tokenize_span.set_attribute("ranvier.token_source", "cross_shard");
+                        tokenize_span.set_attribute("ranvier.tokenizer_shard",
+                                                   static_cast<int64_t>(tok_result.source_shard));
+                    } else {
+                        tokenize_span.set_attribute("ranvier.token_source", "local");
+                    }
                     tokenize_span.set_attribute("ranvier.token_count", static_cast<int64_t>(tokens.size()));
-                    // Record cache metrics
-                    if (cache_hit) {
+
+                    // Record cache and cross-shard metrics
+                    if (tok_result.cache_hit) {
                         metrics().record_tokenization_cache_hit();
                     } else {
                         metrics().record_tokenization_cache_miss();
+                        if (tok_result.cross_shard) {
+                            metrics().record_tokenization_cross_shard();
+                        }
                     }
                 } catch (const std::exception& e) {
                     // Tokenizer failed - log and continue without tokens (fall back to round-robin)
