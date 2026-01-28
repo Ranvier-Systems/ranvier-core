@@ -36,6 +36,11 @@ void TokenizationCache::insert(std::string_view text, std::vector<int32_t> token
         return;
     }
 
+    // Don't cache if max_entries is 0 (effectively disabled)
+    if (_config.max_entries == 0) {
+        return;
+    }
+
     // Don't cache very long texts (memory optimization)
     if (text.size() > _config.max_text_length) {
         return;
