@@ -47,8 +47,8 @@ struct CrossShardTokenizationConfig {
 
     // Minimum text length (bytes) to consider cross-shard dispatch.
     // Short texts tokenize quickly; cross-shard overhead may exceed benefit.
-    // Default 256 bytes (~50-100 tokens) based on typical FFI overhead.
-    size_t min_text_length = 256;
+    // Default 64 bytes - even small texts benefit from reactor unblocking.
+    size_t min_text_length = 64;
 
     // Maximum text length (bytes) for cross-shard dispatch.
     // Very long texts would require large string copies across shards.
