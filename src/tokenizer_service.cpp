@@ -184,15 +184,18 @@ bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
 }
 
 uint32_t TokenizerService::select_tokenization_shard() const {
-    if (!_load_balancer) {
-        return seastar::this_shard_id();
+    uint32_t local = seastar::this_shard_id();
+    uint32_t shard_count = seastar::smp::count;
+
+    if (shard_count <= 1) {
+        return local;
     }
 
-    // Use P2C to select least-loaded shard
-    uint32_t selected = _load_balancer->local().select_shard();
-    uint32_t local = seastar::this_shard_id();
-    log_tokenizer.trace("P2C selected shard {} (local={})", selected, local);
-    return selected;
+    // For tokenization offloading, we want to dispatch to a DIFFERENT shard
+    // to free the local reactor. Simple round-robin to next shard.
+    uint32_t target = (local + 1) % shard_count;
+    log_tokenizer.trace("Tokenization dispatch: local={} -> target={}", local, target);
+    return target;
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
