@@ -141,27 +141,41 @@ void TokenizerService::set_cross_shard_refs(
     seastar::sharded<TokenizerService>* tokenizer) {
     _load_balancer = load_balancer;
     _tokenizer_sharded = tokenizer;
+    log_tokenizer.info("Cross-shard tokenization refs set on shard {} (lb={}, tok={})",
+                       seastar::this_shard_id(),
+                       load_balancer != nullptr,
+                       tokenizer != nullptr);
 }
 
 bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
     // Cross-shard must be enabled
     if (!_cross_shard_config.enabled) {
+        log_tokenizer.trace("Cross-shard skip: disabled");
         return false;
     }
 
     // Must have references set up
     if (!_load_balancer || !_tokenizer_sharded) {
+        log_tokenizer.trace("Cross-shard skip: refs not set (lb={}, tok={})",
+                           _load_balancer != nullptr, _tokenizer_sharded != nullptr);
         return false;
     }
 
     // Only dispatch if we have multiple shards
     if (seastar::smp::count <= 1) {
+        log_tokenizer.trace("Cross-shard skip: single shard");
         return false;
     }
 
     // Check text length bounds
-    if (text_length < _cross_shard_config.min_text_length ||
-        text_length > _cross_shard_config.max_text_length) {
+    if (text_length < _cross_shard_config.min_text_length) {
+        log_tokenizer.trace("Cross-shard skip: text too small ({} < {})",
+                           text_length, _cross_shard_config.min_text_length);
+        return false;
+    }
+    if (text_length > _cross_shard_config.max_text_length) {
+        log_tokenizer.trace("Cross-shard skip: text too large ({} > {})",
+                           text_length, _cross_shard_config.max_text_length);
         return false;
     }
 
