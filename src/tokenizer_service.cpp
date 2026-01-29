@@ -189,7 +189,10 @@ uint32_t TokenizerService::select_tokenization_shard() const {
     }
 
     // Use P2C to select least-loaded shard
-    return _load_balancer->local().select_shard();
+    uint32_t selected = _load_balancer->local().select_shard();
+    uint32_t local = seastar::this_shard_id();
+    log_tokenizer.trace("P2C selected shard {} (local={})", selected, local);
+    return selected;
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
