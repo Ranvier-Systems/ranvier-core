@@ -8,6 +8,7 @@ Communicates with the Ranvier Admin API via JSON/HTTP.
 Usage:
     rvctl inspect routes [--prefix TOKEN_IDS] [--shard SHARD_ID]
     rvctl inspect backends
+    rvctl inspect metrics [--raw] [--filter PATTERN]
     rvctl cluster status
     rvctl drain <backend_id>
     rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]
@@ -27,6 +28,18 @@ Examples:
 
     # Show backend health status
     rvctl inspect backends
+
+    # Show Prometheus metrics summary
+    rvctl inspect metrics
+
+    # Show raw Prometheus metrics
+    rvctl inspect metrics --raw
+
+    # Filter metrics by pattern
+    rvctl inspect metrics --filter "backend_latency"
+
+    # Use custom metrics URL (for Docker port mapping)
+    rvctl --metrics-url http://localhost:19180 inspect metrics
 
     # Show cluster/quorum status
     rvctl cluster status
@@ -53,11 +66,13 @@ Examples:
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 
 # ANSI color codes for terminal output
@@ -124,6 +139,124 @@ def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
     except Exception as e:
         print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def fetch_metrics_text(url: str) -> str:
+    """Fetch raw Prometheus metrics text from the metrics endpoint."""
+    headers = {
+        'Accept': 'text/plain',
+    }
+
+    req = urllib.request.Request(url, method='GET', headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read().decode('utf-8')
+    except urllib.error.HTTPError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} HTTP {e.code}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_prometheus_metrics(text: str) -> Dict[str, Any]:
+    """Parse Prometheus text format into structured data.
+
+    Returns a dict with:
+      - metrics: dict of metric_name -> list of (labels_dict, value)
+      - help: dict of metric_name -> help text
+      - type: dict of metric_name -> metric type (counter, gauge, histogram, etc.)
+    """
+    metrics: Dict[str, List[Tuple[Dict[str, str], float]]] = {}
+    help_text: Dict[str, str] = {}
+    metric_type: Dict[str, str] = {}
+
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Parse HELP lines
+        if line.startswith('# HELP '):
+            parts = line[7:].split(' ', 1)
+            if len(parts) == 2:
+                help_text[parts[0]] = parts[1]
+            continue
+
+        # Parse TYPE lines
+        if line.startswith('# TYPE '):
+            parts = line[7:].split(' ', 1)
+            if len(parts) == 2:
+                metric_type[parts[0]] = parts[1]
+            continue
+
+        # Skip other comments
+        if line.startswith('#'):
+            continue
+
+        # Parse metric lines: name{labels} value or name value
+        match = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}\s+(.+)$', line)
+        if match:
+            name, labels_str, value_str = match.groups()
+            # Parse labels
+            labels = {}
+            for label_match in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"', labels_str):
+                labels[label_match.group(1)] = label_match.group(2)
+            try:
+                value = float(value_str.split()[0])  # Handle optional timestamp
+            except ValueError:
+                continue
+            if name not in metrics:
+                metrics[name] = []
+            metrics[name].append((labels, value))
+        else:
+            # No labels
+            match = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(.+)$', line)
+            if match:
+                name, value_str = match.groups()
+                try:
+                    value = float(value_str.split()[0])
+                except ValueError:
+                    continue
+                if name not in metrics:
+                    metrics[name] = []
+                metrics[name].append(({}, value))
+
+    return {
+        'metrics': metrics,
+        'help': help_text,
+        'type': metric_type,
+    }
+
+
+def get_metric_value(parsed: Dict[str, Any], name: str, labels: Optional[Dict[str, str]] = None) -> Optional[float]:
+    """Get a single metric value, optionally filtered by labels."""
+    metrics = parsed['metrics'].get(name, [])
+    for metric_labels, value in metrics:
+        if labels is None:
+            return value
+        if all(metric_labels.get(k) == v for k, v in labels.items()):
+            return value
+    return None
+
+
+def format_number(value: float) -> str:
+    """Format a number for display."""
+    if value == 0:
+        return "0"
+    if abs(value) >= 1_000_000:
+        return f"{value/1_000_000:.2f}M"
+    if abs(value) >= 1_000:
+        return f"{value/1_000:.2f}K"
+    if abs(value) < 0.01:
+        return f"{value:.6f}"
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}"
 
 
 def format_timestamp(ms: int) -> str:
@@ -575,6 +708,208 @@ def cmd_backend_delete(args):
         sys.exit(1)
 
 
+def cmd_inspect_metrics(args):
+    """Handle 'inspect metrics' command."""
+    # Determine metrics URL
+    # Priority: --metrics-url > RANVIER_METRICS_URL > derive from --url with --metrics-port
+    if args.metrics_url:
+        metrics_url = args.metrics_url.rstrip('/')
+    elif os.environ.get('RANVIER_METRICS_URL'):
+        metrics_url = os.environ.get('RANVIER_METRICS_URL').rstrip('/')
+    else:
+        # Derive from --url, replacing the port
+        parsed = urllib.parse.urlparse(args.url)
+        metrics_port = args.metrics_port or 9180
+        metrics_url = f"{parsed.scheme}://{parsed.hostname}:{metrics_port}"
+
+    url = f"{metrics_url}/metrics"
+
+    if args.verbose:
+        print(f"{Colors.BOLD}Fetching metrics from {url}...{Colors.RESET}")
+        print()
+
+    raw_text = fetch_metrics_text(url)
+
+    # If --raw flag, just print the raw output (with optional filter)
+    if args.raw:
+        if args.filter:
+            pattern = re.compile(args.filter, re.IGNORECASE)
+            lines = []
+            current_metric = None
+            for line in raw_text.split('\n'):
+                if line.startswith('# HELP ') or line.startswith('# TYPE '):
+                    metric_name = line.split()[2] if len(line.split()) > 2 else ''
+                    current_metric = metric_name
+                    if pattern.search(metric_name):
+                        lines.append(line)
+                elif line.startswith('#'):
+                    continue
+                elif line.strip():
+                    metric_name = line.split('{')[0].split()[0] if line else ''
+                    if pattern.search(metric_name):
+                        lines.append(line)
+            print('\n'.join(lines))
+        else:
+            print(raw_text)
+        return
+
+    # Parse and display formatted metrics
+    parsed = parse_prometheus_metrics(raw_text)
+    metrics = parsed['metrics']
+
+    # If filter specified, show filtered metrics
+    if args.filter:
+        pattern = re.compile(args.filter, re.IGNORECASE)
+        filtered = {k: v for k, v in metrics.items() if pattern.search(k)}
+
+        print(f"{Colors.BOLD}Filtered Metrics{Colors.RESET} (pattern: {args.filter})")
+        print("=" * 70)
+
+        if not filtered:
+            print(f"{Colors.GRAY}(no metrics match filter){Colors.RESET}")
+            return
+
+        for name in sorted(filtered.keys()):
+            values = filtered[name]
+            mtype = parsed['type'].get(name, 'unknown')
+            print(f"\n{Colors.CYAN}{name}{Colors.RESET} ({mtype})")
+            for labels, value in values:
+                if labels:
+                    label_str = ', '.join(f'{k}="{v}"' for k, v in labels.items())
+                    print(f"  {{{label_str}}}: {format_number(value)}")
+                else:
+                    print(f"  {format_number(value)}")
+        return
+
+    # Display formatted summary
+    print(f"{Colors.BOLD}Ranvier Metrics Summary{Colors.RESET}")
+    print("=" * 70)
+
+    # Request Counters
+    print(f"\n{Colors.BOLD}Request Counters{Colors.RESET}")
+    print("─" * 40)
+
+    total = get_metric_value(parsed, 'ranvier_http_requests_total') or 0
+    success = get_metric_value(parsed, 'ranvier_http_requests_success') or 0
+    failed = get_metric_value(parsed, 'ranvier_http_requests_failed') or 0
+    timeout = get_metric_value(parsed, 'ranvier_http_requests_timeout') or 0
+    rate_limited = get_metric_value(parsed, 'ranvier_http_requests_rate_limited') or 0
+    backpressure = get_metric_value(parsed, 'ranvier_http_requests_backpressure_rejected') or 0
+
+    print(f"  Total Requests:     {format_number(total)}")
+    print(f"  {Colors.GREEN}Successful:{Colors.RESET}         {format_number(success)}")
+    print(f"  {Colors.RED}Failed:{Colors.RESET}             {format_number(failed)}")
+    print(f"  {Colors.YELLOW}Timeout:{Colors.RESET}            {format_number(timeout)}")
+    print(f"  {Colors.YELLOW}Rate Limited:{Colors.RESET}       {format_number(rate_limited)}")
+    print(f"  {Colors.YELLOW}Backpressure:{Colors.RESET}       {format_number(backpressure)}")
+
+    if total > 0:
+        success_rate = (success / total) * 100
+        color = Colors.GREEN if success_rate >= 99 else (Colors.YELLOW if success_rate >= 95 else Colors.RED)
+        print(f"  {Colors.BOLD}Success Rate:{Colors.RESET}       {color}{success_rate:.2f}%{Colors.RESET}")
+
+    # Active Requests
+    active = get_metric_value(parsed, 'ranvier_active_proxy_requests')
+    if active is not None:
+        print(f"  Active Requests:    {format_number(active)}")
+
+    # Cache Performance
+    print(f"\n{Colors.BOLD}Cache Performance{Colors.RESET}")
+    print("─" * 40)
+
+    cache_ratio = get_metric_value(parsed, 'ranvier_cache_hit_ratio')
+    if cache_ratio is not None:
+        pct = cache_ratio * 100
+        color = Colors.GREEN if pct >= 80 else (Colors.YELLOW if pct >= 50 else Colors.RED)
+        print(f"  Cache Hit Ratio:    {color}{pct:.1f}%{Colors.RESET}")
+
+    avg_skip = get_metric_value(parsed, 'ranvier_radix_tree_average_prefix_skip_length')
+    if avg_skip is not None:
+        print(f"  Avg Prefix Skip:    {avg_skip:.1f} tokens")
+
+    # Radix Tree Stats
+    tree_hits = get_metric_value(parsed, 'ranvier_radix_tree_lookup_hits_total')
+    tree_misses = get_metric_value(parsed, 'ranvier_radix_tree_lookup_misses_total')
+    if tree_hits is not None and tree_misses is not None:
+        tree_total = tree_hits + tree_misses
+        if tree_total > 0:
+            hit_rate = (tree_hits / tree_total) * 100
+            print(f"  Tree Lookup Hits:   {format_number(tree_hits)} ({hit_rate:.1f}%)")
+            print(f"  Tree Lookup Misses: {format_number(tree_misses)}")
+
+    # Slab utilization
+    slab_util = get_metric_value(parsed, 'ranvier_radix_tree_slab_utilization_ratio')
+    if slab_util is not None:
+        print(f"  Slab Utilization:   {slab_util*100:.1f}%")
+
+    # Circuit Breaker
+    print(f"\n{Colors.BOLD}Circuit Breaker{Colors.RESET}")
+    print("─" * 40)
+
+    cb_opens = get_metric_value(parsed, 'ranvier_circuit_breaker_opens') or 0
+    fallbacks = get_metric_value(parsed, 'ranvier_fallback_attempts') or 0
+
+    if cb_opens > 0:
+        print(f"  {Colors.RED}Circuit Opens:{Colors.RESET}      {format_number(cb_opens)}")
+    else:
+        print(f"  Circuit Opens:      {format_number(cb_opens)}")
+    print(f"  Fallback Attempts:  {format_number(fallbacks)}")
+
+    # Tokenizer Stats
+    print(f"\n{Colors.BOLD}Tokenizer{Colors.RESET}")
+    print("─" * 40)
+
+    tok_errors = get_metric_value(parsed, 'ranvier_tokenizer_errors') or 0
+    tok_skipped = get_metric_value(parsed, 'ranvier_tokenization_skipped') or 0
+    prefix_used = get_metric_value(parsed, 'ranvier_prefix_boundary_used') or 0
+    prefix_client = get_metric_value(parsed, 'ranvier_prefix_boundary_client') or 0
+
+    if tok_errors > 0:
+        print(f"  {Colors.RED}Tokenizer Errors:{Colors.RESET}   {format_number(tok_errors)}")
+    else:
+        print(f"  Tokenizer Errors:   {format_number(tok_errors)}")
+    print(f"  Tokenization Skip:  {format_number(tok_skipped)}")
+    print(f"  Prefix Boundary:    {format_number(prefix_used)} (client: {format_number(prefix_client)})")
+
+    # Cross-shard dispatch
+    cross_shard = get_metric_value(parsed, 'ranvier_tokenizer_cross_shard_dispatches')
+    if cross_shard is not None:
+        print(f"  Cross-Shard Dispatch: {format_number(cross_shard)}")
+
+    # Per-Backend Latencies (if any)
+    backend_latencies = [(labels, value) for labels, value in metrics.get('ranvier_backend_latency_seconds_sum', [])
+                         if 'backend_id' in labels]
+    backend_counts = {labels.get('backend_id'): value
+                      for labels, value in metrics.get('ranvier_backend_latency_seconds_count', [])}
+
+    if backend_latencies:
+        print(f"\n{Colors.BOLD}Per-Backend Latency (avg){Colors.RESET}")
+        print("─" * 40)
+        for labels, sum_val in sorted(backend_latencies, key=lambda x: x[0].get('backend_id', '')):
+            backend_id = labels.get('backend_id', '?')
+            count = backend_counts.get(backend_id, 1)
+            avg_ms = (sum_val / count) * 1000 if count > 0 else 0
+            color = Colors.GREEN if avg_ms < 100 else (Colors.YELLOW if avg_ms < 500 else Colors.RED)
+            print(f"  Backend {backend_id:>3}: {color}{avg_ms:.1f}ms{Colors.RESET} (n={format_number(count)})")
+
+    # Cluster Stats (if available)
+    peers_alive = get_metric_value(parsed, 'ranvier_cluster_peers_alive')
+    if peers_alive is not None:
+        print(f"\n{Colors.BOLD}Cluster{Colors.RESET}")
+        print("─" * 40)
+        print(f"  Peers Alive:        {format_number(peers_alive)}")
+
+        gossip_sent = get_metric_value(parsed, 'ranvier_cluster_gossip_messages_sent')
+        gossip_recv = get_metric_value(parsed, 'ranvier_cluster_gossip_messages_received')
+        if gossip_sent is not None:
+            print(f"  Gossip Sent:        {format_number(gossip_sent)}")
+        if gossip_recv is not None:
+            print(f"  Gossip Received:    {format_number(gossip_recv)}")
+
+    print()
+    print(f"{Colors.GRAY}Use --raw for full Prometheus output, --filter <pattern> to search{Colors.RESET}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
@@ -588,6 +923,10 @@ def main():
     parser.add_argument('--admin-key', '-k',
                         default=os.environ.get('RANVIER_ADMIN_KEY'),
                         help='Admin API key (or set RANVIER_ADMIN_KEY env var)')
+    parser.add_argument('--metrics-url',
+                        help='Metrics endpoint URL (or set RANVIER_METRICS_URL env var)')
+    parser.add_argument('--metrics-port', type=int,
+                        help='Metrics port (default: 9180, used with --url host)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose output')
 
@@ -606,6 +945,13 @@ def main():
 
     # inspect backends
     backends_parser = inspect_subparsers.add_parser('backends', help='Inspect backend status')
+
+    # inspect metrics
+    metrics_parser = inspect_subparsers.add_parser('metrics', help='Inspect Prometheus metrics')
+    metrics_parser.add_argument('--raw', '-r', action='store_true',
+                                 help='Output raw Prometheus format')
+    metrics_parser.add_argument('--filter', '-f',
+                                 help='Filter metrics by name pattern (regex)')
 
     # cluster command
     cluster_parser = subparsers.add_parser('cluster', help='Cluster operations')
@@ -669,6 +1015,8 @@ def main():
             cmd_inspect_routes(args)
         elif args.inspect_target == 'backends':
             cmd_inspect_backends(args)
+        elif args.inspect_target == 'metrics':
+            cmd_inspect_metrics(args)
         else:
             print(f"Unknown inspect target: {args.inspect_target}", file=sys.stderr)
             sys.exit(1)

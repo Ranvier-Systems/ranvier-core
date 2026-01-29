@@ -559,7 +559,7 @@ Tooling, testing, and documentation improvements for contributors and operators.
 
 The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier's Admin API. Several endpoints and quality-of-life features are not yet exposed.
 
-- [ ] **Add `rvctl inspect metrics` command**
+- [x] **Add `rvctl inspect metrics` command** ✓
   _Justification:_ Prometheus metrics endpoint (`:9180/metrics`) is not integrated into rvctl. Operators must use curl or helper scripts to view metrics. A CLI command with parsed/formatted output improves operational visibility.
   _Features:_
   - Fetch from `/metrics` endpoint with configurable URL
@@ -1186,7 +1186,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | Performance | Offload tokenizer FFI via dedicated thread pool | High | |
 | **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
-| **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | |
+| **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | ✅ Done |
 | **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | ✅ Done |
 | **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `route delete` command | Low | |
