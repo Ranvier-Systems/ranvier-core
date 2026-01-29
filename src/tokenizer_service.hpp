@@ -10,9 +10,14 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
 #include <tokenizers_cpp.h>
 
 namespace ranvier {
+
+// Forward declaration for cross-shard dispatch
+class ShardLoadBalancer;
 
 /**
  * Configuration for the tokenization cache.
@@ -22,6 +27,33 @@ struct TokenizationCacheConfig {
     bool enabled = true;           // Enable/disable caching
     size_t max_entries = 1000;     // Maximum cache entries (Rule #4: bounded container)
     size_t max_text_length = 8192; // Don't cache texts longer than this (avoid memory bloat)
+};
+
+/**
+ * Configuration for cross-shard tokenization offloading.
+ *
+ * On cache miss, instead of blocking the local reactor for 5-13ms during FFI,
+ * dispatch to the least-loaded shard via P2C. The calling shard's reactor is
+ * freed to handle other requests while waiting.
+ *
+ * Trade-offs:
+ * - Pro: Unblocks reactor on calling shard during tokenization
+ * - Pro: Uses existing P2C infrastructure, no thread-safety issues
+ * - Con: Cross-shard latency (~1-10μs) + string copy overhead
+ * - Con: Cache locality reduced (each shard builds own cache)
+ */
+struct CrossShardTokenizationConfig {
+    bool enabled = true;  // Enabled by default; requires set_cross_shard_refs() to work
+
+    // Minimum text length (bytes) to consider cross-shard dispatch.
+    // Short texts tokenize quickly; cross-shard overhead may exceed benefit.
+    // Default 64 bytes - even small texts benefit from reactor unblocking.
+    size_t min_text_length = 64;
+
+    // Maximum text length (bytes) for cross-shard dispatch.
+    // Very long texts would require large string copies across shards.
+    // Default 32KB; longer texts tokenize locally to avoid copy overhead.
+    size_t max_text_length = 32768;
 };
 
 /**
@@ -102,6 +134,16 @@ private:
 };
 
 /**
+ * Result from async tokenization with source information.
+ */
+struct TokenizationResult {
+    std::vector<int32_t> tokens;
+    bool cache_hit = false;       // True if served from local cache
+    bool cross_shard = false;     // True if tokenized on a different shard
+    uint32_t source_shard = 0;    // Shard that performed tokenization
+};
+
+/**
  * TokenizerService wraps the HuggingFace tokenizers library.
  *
  * IMPORTANT: This service must be sharded (one instance per Seastar shard/core)
@@ -115,6 +157,10 @@ private:
  *
  * OPTIMIZATION: Use encode_cached() for hot paths to leverage LRU caching.
  * System messages have 80-90% cache hit rates, dramatically reducing tokenization overhead.
+ *
+ * ASYNC OPTIMIZATION: Use encode_cached_async() with cross-shard dispatch enabled
+ * to offload cache-miss tokenization to the least-loaded shard via P2C. This frees
+ * the calling shard's reactor during the 5-13ms FFI call.
  */
 class TokenizerService {
 public:
@@ -127,16 +173,36 @@ public:
     // Configure the tokenization cache (call before or after load_from_json)
     void configure_cache(TokenizationCacheConfig config);
 
+    // Configure cross-shard tokenization offloading
+    void configure_cross_shard(CrossShardTokenizationConfig config);
+
+    // Set references for cross-shard dispatch (call after services are started)
+    // load_balancer: P2C load balancer for shard selection
+    // tokenizer: sharded tokenizer service (self-reference for cross-shard calls)
+    void set_cross_shard_refs(
+        seastar::sharded<ShardLoadBalancer>* load_balancer,
+        seastar::sharded<TokenizerService>* tokenizer);
+
     // The main API: Text -> Integers (uncached, direct FFI call)
     // Accepts string_view for zero-copy tokenization from temporary_buffer
     // NOT thread-safe - must only be called from the owning shard
     std::vector<int32_t> encode(std::string_view text) const;
 
-    // OPTIMIZED API: Text -> Integers with LRU caching
+    // OPTIMIZED API: Text -> Integers with LRU caching (SYNCHRONOUS)
     // For hot paths (handle_proxy), use this to avoid redundant tokenization.
     // Returns pair<tokens, cache_hit> for metrics recording.
     // NOT thread-safe - must only be called from the owning shard
+    // WARNING: Blocks reactor for 5-13ms on cache miss. Prefer encode_cached_async().
     std::pair<std::vector<int32_t>, bool> encode_cached(std::string_view text);
+
+    // ASYNC OPTIMIZED API: Text -> Integers with caching + cross-shard dispatch
+    // On cache hit: returns immediately (no async overhead)
+    // On cache miss with cross-shard enabled: dispatches to least-loaded shard,
+    //   freeing the calling reactor to handle other requests during FFI.
+    // On cache miss with cross-shard disabled: tokenizes locally (blocks reactor).
+    //
+    // The result includes metadata about where tokenization occurred for metrics.
+    seastar::future<TokenizationResult> encode_cached_async(std::string_view text);
 
     // Check if ready
     bool is_loaded() const;
@@ -152,6 +218,11 @@ public:
     size_t cache_max_size() const { return _cache.max_size(); }
     bool cache_enabled() const { return _cache.enabled(); }
 
+    // Cross-shard dispatch statistics (for metrics)
+    uint64_t cross_shard_dispatches() const { return _cross_shard_dispatches; }
+    uint64_t cross_shard_local_fallbacks() const { return _cross_shard_local_fallbacks; }
+    bool cross_shard_enabled() const { return _cross_shard_config.enabled; }
+
     // Clear the cache (for testing or config hot-reload)
     void clear_cache() { _cache.clear(); }
 
@@ -165,6 +236,22 @@ public:
 private:
     std::unique_ptr<tokenizers::Tokenizer> _impl;
     TokenizationCache _cache;
+
+    // Cross-shard dispatch configuration and references
+    CrossShardTokenizationConfig _cross_shard_config;
+    seastar::sharded<ShardLoadBalancer>* _load_balancer = nullptr;
+    seastar::sharded<TokenizerService>* _tokenizer_sharded = nullptr;
+
+    // Cross-shard dispatch statistics (shard-local, lock-free)
+    uint64_t _cross_shard_dispatches = 0;      // Cache misses dispatched to other shards
+    uint64_t _cross_shard_local_fallbacks = 0; // Cache misses processed locally (no eligible target)
+
+    // Select target shard for cross-shard dispatch using P2C
+    // Returns local shard ID if cross-shard is disabled or not beneficial
+    uint32_t select_tokenization_shard() const;
+
+    // Check if text qualifies for cross-shard dispatch
+    bool should_dispatch_cross_shard(size_t text_length) const;
 };
 
 } // namespace ranvier

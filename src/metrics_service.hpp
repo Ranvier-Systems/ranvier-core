@@ -199,6 +199,9 @@ public:
             seastar::metrics::make_counter("tokenization_cache_misses", _tokenization_cache_misses,
                 seastar::metrics::description("Total number of tokenization cache misses (required FFI calls)")),
 
+            seastar::metrics::make_counter("tokenization_cross_shard", _tokenization_cross_shard,
+                seastar::metrics::description("Total number of tokenization cache misses dispatched to other shards via P2C")),
+
             seastar::metrics::make_counter("prefix_boundary_used", _prefix_boundary_used,
                 seastar::metrics::description("Total number of requests where system message prefix boundary was identified and used for routing")),
 
@@ -339,8 +342,10 @@ public:
     // These are shard-local (lock-free) for hot path efficiency
     void record_tokenization_cache_hit() { _tokenization_cache_hits++; }
     void record_tokenization_cache_miss() { _tokenization_cache_misses++; }
+    void record_tokenization_cross_shard() { _tokenization_cross_shard++; }
     uint64_t get_tokenization_cache_hits() const { return _tokenization_cache_hits; }
     uint64_t get_tokenization_cache_misses() const { return _tokenization_cache_misses; }
+    uint64_t get_tokenization_cross_shard() const { return _tokenization_cross_shard; }
 
     // Record prefix boundary detection results
     void record_prefix_boundary_used() { _prefix_boundary_used++; }
@@ -443,6 +448,7 @@ private:
     uint64_t _tokenization_skipped = 0;  // Tokenization skipped in random routing mode
     uint64_t _tokenization_cache_hits = 0;    // Tokenization cache hits (avoided FFI)
     uint64_t _tokenization_cache_misses = 0;  // Tokenization cache misses (required FFI)
+    uint64_t _tokenization_cross_shard = 0;   // Cache misses dispatched to other shards via P2C
     uint64_t _prefix_boundary_used = 0;  // System message prefix boundary was used
     uint64_t _prefix_boundary_skipped = 0;  // Prefix boundary skipped (no system messages, too short, disabled)
     uint64_t _prefix_boundary_client = 0;  // Client-provided prefix_token_count was used
