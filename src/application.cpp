@@ -548,6 +548,14 @@ seastar::future<> Application::startup() {
                 log_main.info("Shard load balancer disabled (requests processed locally)");
             }
         }).then([this] {
+            // Set cross-shard refs for tokenizer (enables async cross-shard dispatch on cache miss)
+            if (_tokenizer_started && _load_balancer_started) {
+                return _tokenizer.invoke_on_all([this](TokenizerService& t) {
+                    t.set_cross_shard_refs(&_load_balancer, &_tokenizer);
+                });
+            }
+            return seastar::make_ready_future<>();
+        }).then([this] {
             // 10. Initialize persistence
             return init_persistence();
         }).then([this] {
