@@ -555,7 +555,76 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `src/sharded_config.hpp`, `src/application.hpp`, `src/application.cpp`
   _Complexity:_ Medium
 
-### 5.5 Build System
+### 5.5 rvctl CLI Enhancements
+
+The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier's Admin API. Several endpoints and quality-of-life features are not yet exposed.
+
+- [ ] **Add `rvctl inspect metrics` command**
+  _Justification:_ Prometheus metrics endpoint (`:9180/metrics`) is not integrated into rvctl. Operators must use curl or helper scripts to view metrics. A CLI command with parsed/formatted output improves operational visibility.
+  _Features:_
+  - Fetch from `/metrics` on configurable metrics port (default 9180)
+  - Parse and display key metrics in readable format (cache hit ratio, request counters, active requests, per-backend latencies)
+  - Support `--raw` flag for raw Prometheus format output
+  - Support `--filter <pattern>` for metric name filtering
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Medium
+  _Priority:_ High
+
+- [ ] **Add `rvctl backend add` command**
+  _Justification:_ Backend registration requires curl. CLI command simplifies operator workflow and enables scripting.
+  _Usage:_ `rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]`
+  _Endpoint:_ POST /admin/backends
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ High
+
+- [ ] **Add `rvctl backend delete` command**
+  _Justification:_ Backend removal requires curl. Completes full backend lifecycle management in rvctl.
+  _Usage:_ `rvctl backend delete --id <id>`
+  _Endpoint:_ DELETE /admin/backends
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ High
+
+- [ ] **Add `rvctl route delete` command**
+  _Justification:_ Route deletion for a backend requires curl. Enables cleanup workflows.
+  _Usage:_ `rvctl route delete --backend <id>`
+  _Endpoint:_ DELETE /admin/routes
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Medium
+
+- [ ] **Add `rvctl keys reload` command**
+  _Justification:_ API key hot-reload requires curl. CLI command simplifies key rotation workflows.
+  _Usage:_ `rvctl keys reload`
+  _Endpoint:_ POST /admin/keys/reload
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Medium
+
+- [ ] **Add `rvctl health` command**
+  _Justification:_ Quick health check without authentication. Useful for scripting and monitoring integration.
+  _Usage:_ `rvctl health`
+  _Endpoint:_ GET /health (public, no auth required)
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Medium
+
+- [ ] **Add `--output json` global flag**
+  _Justification:_ Current output is human-formatted. JSON output enables piping to jq and scripting integration.
+  _Usage:_ `rvctl --output json inspect backends`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Low
+
+- [ ] **Add `--watch` mode for continuous monitoring**
+  _Justification:_ Operators often need to monitor state during deployments. Watch mode with configurable refresh interval reduces manual polling.
+  _Usage:_ `rvctl --watch [--interval 2s] inspect backends`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Medium
+  _Priority:_ Low
+
+### 5.6 Build System
 
 - [ ] **Add Windows/macOS cross-compilation support**
   _Justification:_ Contributors on non-Linux need Docker for development. Native builds improve DX.
@@ -1113,6 +1182,14 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | Performance | Offload tokenizer FFI via dedicated thread pool | High | |
 | **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
+| **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | |
+| **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | |
+| **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `route delete` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `health` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | |
+| **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | |
 
 ---
 
