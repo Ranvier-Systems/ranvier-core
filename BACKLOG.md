@@ -562,10 +562,14 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 - [ ] **Add `rvctl inspect metrics` command**
   _Justification:_ Prometheus metrics endpoint (`:9180/metrics`) is not integrated into rvctl. Operators must use curl or helper scripts to view metrics. A CLI command with parsed/formatted output improves operational visibility.
   _Features:_
-  - Fetch from `/metrics` on configurable metrics port (default 9180)
+  - Fetch from `/metrics` endpoint with configurable URL
+  - Add `--metrics-url` flag for full URL override (e.g., `http://metrics.ranvier:9180`)
+  - Add `--metrics-port` flag for port-only override, derives host from `--url` (default 9180)
   - Parse and display key metrics in readable format (cache hit ratio, request counters, active requests, per-backend latencies)
   - Support `--raw` flag for raw Prometheus format output
   - Support `--filter <pattern>` for metric name filtering
+  - Support `RANVIER_METRICS_URL` environment variable
+  _Note:_ Metrics port may differ from API port, especially in containerized deployments where ports are remapped.
   _Location:_ `tools/rvctl`
   _Complexity:_ Medium
   _Priority:_ High
