@@ -10,6 +10,8 @@ Usage:
     rvctl inspect backends
     rvctl cluster status
     rvctl drain <backend_id>
+    rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]
+    rvctl backend delete --id <id>
     rvctl route add --backend <id> --content "prompt text"
     rvctl route add --backend <id> --stdin < file.txt
 
@@ -31,6 +33,15 @@ Examples:
 
     # Drain a specific backend
     rvctl drain 1
+
+    # Register a new backend
+    rvctl backend add --id 1 --ip 192.168.1.100 --port 8000
+
+    # Register a backend with weight and priority
+    rvctl backend add --id 2 --ip gpu-server.local --port 8000 --weight 200 --priority 1
+
+    # Remove a backend
+    rvctl backend delete --id 1
 
     # Add a route for a backend (content from argument)
     rvctl route add --backend 1 --content "You are a helpful assistant."
@@ -500,6 +511,70 @@ def cmd_route_add(args):
         sys.exit(1)
 
 
+def cmd_backend_add(args):
+    """Handle 'backend add' command."""
+    base_url = args.url.rstrip('/')
+
+    # Build query parameters
+    params = [
+        f"id={args.id}",
+        f"ip={args.ip}",
+        f"port={args.port}",
+    ]
+
+    if args.weight is not None:
+        params.append(f"weight={args.weight}")
+    if args.priority is not None:
+        params.append(f"priority={args.priority}")
+
+    url = f"{base_url}/admin/backends?{'&'.join(params)}"
+
+    print(f"{Colors.BOLD}Registering backend {args.id}...{Colors.RESET}")
+    if args.verbose:
+        print(f"  Address: {args.ip}:{args.port}")
+        if args.weight is not None:
+            print(f"  Weight: {args.weight}")
+        if args.priority is not None:
+            print(f"  Priority: {args.priority}")
+
+    data = make_request(url, method='POST', admin_key=args.admin_key)
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        weight = data.get('weight', args.weight or 100)
+        priority = data.get('priority', args.priority or 0)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Backend {args.id} registered")
+        print(f"  Address:  {args.ip}:{args.port}")
+        print(f"  Weight:   {weight}")
+        print(f"  Priority: {priority}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
+def cmd_backend_delete(args):
+    """Handle 'backend delete' command."""
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/backends?id={args.id}"
+
+    print(f"{Colors.BOLD}Deleting backend {args.id}...{Colors.RESET}")
+
+    data = make_request(url, method='DELETE', admin_key=args.admin_key)
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        deleted_id = data.get('backend_deleted', args.id)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Backend {deleted_id} deleted")
+        print(f"  All associated routes have been removed.")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
@@ -542,6 +617,28 @@ def main():
     # drain command
     drain_parser = subparsers.add_parser('drain', help='Drain a backend')
     drain_parser.add_argument('backend_id', type=int, help='Backend ID to drain')
+
+    # backend command
+    backend_parser = subparsers.add_parser('backend', help='Backend management')
+    backend_subparsers = backend_parser.add_subparsers(dest='backend_action', help='Backend action')
+
+    # backend add
+    backend_add_parser = backend_subparsers.add_parser('add', help='Register a new backend')
+    backend_add_parser.add_argument('--id', type=int, required=True,
+                                     help='Unique backend identifier')
+    backend_add_parser.add_argument('--ip', required=True,
+                                     help='Backend IP address or hostname')
+    backend_add_parser.add_argument('--port', type=int, required=True,
+                                     help='Backend port')
+    backend_add_parser.add_argument('--weight', type=int,
+                                     help='Load balancing weight (default: 100)')
+    backend_add_parser.add_argument('--priority', type=int,
+                                     help='Routing priority (default: 0, lower = preferred)')
+
+    # backend delete
+    backend_delete_parser = backend_subparsers.add_parser('delete', help='Remove a backend')
+    backend_delete_parser.add_argument('--id', type=int, required=True,
+                                        help='Backend ID to delete')
 
     # route command
     route_parser = subparsers.add_parser('route', help='Route management')
@@ -591,6 +688,20 @@ def main():
     # Handle drain command
     elif args.command == 'drain':
         cmd_drain(args)
+
+    # Handle backend command
+    elif args.command == 'backend':
+        if not args.backend_action:
+            backend_parser.print_help()
+            sys.exit(1)
+
+        if args.backend_action == 'add':
+            cmd_backend_add(args)
+        elif args.backend_action == 'delete':
+            cmd_backend_delete(args)
+        else:
+            print(f"Unknown backend action: {args.backend_action}", file=sys.stderr)
+            sys.exit(1)
 
     # Handle route command
     elif args.command == 'route':

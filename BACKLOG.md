@@ -574,7 +574,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Medium
   _Priority:_ High
 
-- [ ] **Add `rvctl backend add` command**
+- [x] **Add `rvctl backend add` command** ✓
   _Justification:_ Backend registration requires curl. CLI command simplifies operator workflow and enables scripting.
   _Usage:_ `rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]`
   _Endpoint:_ POST /admin/backends
@@ -582,7 +582,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Low
   _Priority:_ High
 
-- [ ] **Add `rvctl backend delete` command**
+- [x] **Add `rvctl backend delete` command** ✓
   _Justification:_ Backend removal requires curl. Completes full backend lifecycle management in rvctl.
   _Usage:_ `rvctl backend delete --id <id>`
   _Endpoint:_ DELETE /admin/backends
@@ -1187,8 +1187,8 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
 | **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | |
-| **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | |
-| **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | |
+| **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | ✅ Done |
+| **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `route delete` command | Low | |
 | **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | |
 | **P3 - Low** | DX | rvctl: Add `health` command | Low | |
