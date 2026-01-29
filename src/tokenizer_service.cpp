@@ -179,6 +179,7 @@ bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
         return false;
     }
 
+    log_tokenizer.trace("Cross-shard eligible: text_length={}", text_length);
     return true;
 }
 
@@ -194,9 +195,12 @@ uint32_t TokenizerService::select_tokenization_shard() const {
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
     uint32_t local_shard = seastar::this_shard_id();
 
+    log_tokenizer.trace("encode_cached_async called: text_length={}", text.size());
+
     // Fast path: check local cache first (no async overhead for hits)
     const auto* cached = _cache.lookup(text);
     if (cached) {
+        log_tokenizer.trace("Cache hit for text_length={}", text.size());
         TokenizationResult result;
         result.tokens = *cached;  // Copy from cache
         result.cache_hit = true;
