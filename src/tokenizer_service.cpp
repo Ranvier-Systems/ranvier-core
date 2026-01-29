@@ -148,38 +148,23 @@ void TokenizerService::set_cross_shard_refs(
 }
 
 bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
-    // Cross-shard must be enabled
     if (!_cross_shard_config.enabled) {
-        log_tokenizer.trace("Cross-shard skip: disabled");
         return false;
     }
 
-    // Must have references set up
     if (!_load_balancer || !_tokenizer_sharded) {
-        log_tokenizer.trace("Cross-shard skip: refs not set (lb={}, tok={})",
-                           _load_balancer != nullptr, _tokenizer_sharded != nullptr);
         return false;
     }
 
-    // Only dispatch if we have multiple shards
     if (seastar::smp::count <= 1) {
-        log_tokenizer.trace("Cross-shard skip: single shard");
         return false;
     }
 
-    // Check text length bounds
-    if (text_length < _cross_shard_config.min_text_length) {
-        log_tokenizer.trace("Cross-shard skip: text too small ({} < {})",
-                           text_length, _cross_shard_config.min_text_length);
-        return false;
-    }
-    if (text_length > _cross_shard_config.max_text_length) {
-        log_tokenizer.trace("Cross-shard skip: text too large ({} > {})",
-                           text_length, _cross_shard_config.max_text_length);
+    if (text_length < _cross_shard_config.min_text_length ||
+        text_length > _cross_shard_config.max_text_length) {
         return false;
     }
 
-    log_tokenizer.trace("Cross-shard eligible: text_length={}", text_length);
     return true;
 }
 
@@ -191,24 +176,19 @@ uint32_t TokenizerService::select_tokenization_shard() const {
         return local;
     }
 
-    // For tokenization offloading, we want to dispatch to a DIFFERENT shard
+    // For tokenization offloading, dispatch to a different shard
     // to free the local reactor. Simple round-robin to next shard.
-    uint32_t target = (local + 1) % shard_count;
-    log_tokenizer.trace("Tokenization dispatch: local={} -> target={}", local, target);
-    return target;
+    return (local + 1) % shard_count;
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
     uint32_t local_shard = seastar::this_shard_id();
 
-    log_tokenizer.trace("encode_cached_async called: text_length={}", text.size());
-
     // Fast path: check local cache first (no async overhead for hits)
     const auto* cached = _cache.lookup(text);
     if (cached) {
-        log_tokenizer.trace("Cache hit for text_length={}", text.size());
         TokenizationResult result;
-        result.tokens = *cached;  // Copy from cache
+        result.tokens = *cached;
         result.cache_hit = true;
         result.cross_shard = false;
         result.source_shard = local_shard;
