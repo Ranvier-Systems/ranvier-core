@@ -598,7 +598,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Low
   _Priority:_ Medium
 
-- [ ] **Add `rvctl keys reload` command**
+- [x] **Add `rvctl keys reload` command** ✓
   _Justification:_ API key hot-reload requires curl. CLI command simplifies key rotation workflows.
   _Usage:_ `rvctl keys reload`
   _Endpoint:_ POST /admin/keys/reload
@@ -1190,7 +1190,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | ✅ Done |
 | **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `route delete` command | Low | ✅ Done |
-| **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `health` command | Low | |
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | |

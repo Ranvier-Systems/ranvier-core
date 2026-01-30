@@ -16,6 +16,7 @@ Usage:
     rvctl route add --backend <id> --content "prompt text"
     rvctl route add --backend <id> --stdin < file.txt
     rvctl route delete --backend <id>
+    rvctl keys reload
 
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
@@ -65,6 +66,9 @@ Examples:
 
     # Delete all routes for a backend
     rvctl route delete --backend 1
+
+    # Hot-reload API keys from disk
+    rvctl keys reload
 """
 
 import argparse
@@ -670,6 +674,27 @@ def cmd_route_delete(args):
         sys.exit(1)
 
 
+def cmd_keys_reload(args):
+    """Handle 'keys reload' command."""
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/keys/reload"
+
+    print(f"{Colors.BOLD}Reloading API keys...{Colors.RESET}")
+
+    data = make_request(url, method='POST', admin_key=args.admin_key)
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        keys_loaded = data.get('keys_loaded', 0)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} API keys reloaded")
+        print(f"  Keys loaded: {keys_loaded}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
 def cmd_backend_add(args):
     """Handle 'backend add' command."""
     base_url = args.url.rstrip('/')
@@ -1030,6 +1055,13 @@ def main():
     route_delete_parser.add_argument('--backend', '-b', type=int, required=True,
                                       help='Backend ID to delete routes for')
 
+    # keys command
+    keys_parser = subparsers.add_parser('keys', help='API key management')
+    keys_subparsers = keys_parser.add_subparsers(dest='keys_action', help='Keys action')
+
+    # keys reload
+    keys_reload_parser = keys_subparsers.add_parser('reload', help='Hot-reload API keys from disk')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1094,6 +1126,18 @@ def main():
             cmd_route_delete(args)
         else:
             print(f"Unknown route action: {args.route_action}", file=sys.stderr)
+            sys.exit(1)
+
+    # Handle keys command
+    elif args.command == 'keys':
+        if not args.keys_action:
+            keys_parser.print_help()
+            sys.exit(1)
+
+        if args.keys_action == 'reload':
+            cmd_keys_reload(args)
+        else:
+            print(f"Unknown keys action: {args.keys_action}", file=sys.stderr)
             sys.exit(1)
 
     else:
