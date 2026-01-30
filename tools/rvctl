@@ -1376,7 +1376,7 @@ _rvctl() {
     esac
 }
 
-_rvctl "$@"
+compdef _rvctl rvctl
 '''
 
 FISH_COMPLETION = r'''# rvctl fish completion
