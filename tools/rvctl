@@ -1826,7 +1826,7 @@ _rvctl_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="inspect cluster drain backend route keys health top wait profile export import completion"
+    local commands="inspect cluster drain backend route keys health top wait profile export import logs completion"
     local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --dry-run --help -h"
 
     # Determine command position (skip global options)
@@ -1914,6 +1914,9 @@ _rvctl_completions() {
         import)
             COMPREPLY=($(compgen -W "--file -f --stdin" -- "$cur"))
             ;;
+        logs)
+            COMPREPLY=($(compgen -W "--follow -f --lines -n --filter -g --ignore-case -i --no-color" -- "$cur"))
+            ;;
         "")
             # No command yet - suggest commands and global options
             if [[ "$cur" == -* ]]; then
@@ -1962,6 +1965,7 @@ _rvctl() {
         'profile:Manage server profiles'
         'export:Export backends and routes'
         'import:Import backends and routes'
+        'logs:Tail server logs'
         'completion:Generate shell completion scripts'
     )
 
@@ -2128,6 +2132,15 @@ _rvctl() {
                         '(-f --file)'{-f,--file}'[Input file]:file:_files' \
                         '--stdin[Read from stdin]'
                     ;;
+                logs)
+                    _arguments \
+                        '1::log file:_files' \
+                        '(-f --follow)'{-f,--follow}'[Follow log output]' \
+                        '(-n --lines)'{-n,--lines}'[Number of lines to show]:lines' \
+                        '(-g --filter)'{-g,--filter}'[Filter by regex pattern]:pattern' \
+                        '(-i --ignore-case)'{-i,--ignore-case}'[Case insensitive filter]' \
+                        '--no-color[Disable colorization]'
+                    ;;
             esac
             ;;
     esac
@@ -2157,19 +2170,20 @@ complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
 complete -c rvctl -l dry-run -d 'Show what would be done without making changes'
 
 # Commands (only when no command is specified yet)
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a inspect -d 'Inspect Ranvier state'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a cluster -d 'Cluster operations'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a drain -d 'Drain a backend'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a backend -d 'Backend management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a route -d 'Route management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a keys -d 'API key management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a health -d 'Quick health check'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a top -d 'Real-time dashboard'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a wait -d 'Wait for a condition'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a profile -d 'Manage server profiles'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a export -d 'Export backends and routes'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a import -d 'Import backends and routes'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a completion -d 'Generate shell completion scripts'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a top -d 'Real-time dashboard'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a wait -d 'Wait for a condition'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a profile -d 'Manage server profiles'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a export -d 'Export backends and routes'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a import -d 'Import backends and routes'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a logs -d 'Tail server logs'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a completion -d 'Generate shell completion scripts'
 
 # inspect subcommands
 complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
@@ -2253,6 +2267,13 @@ complete -c rvctl -n "__fish_seen_subcommand_from export" -s f -l file -d 'Outpu
 # import options
 complete -c rvctl -n "__fish_seen_subcommand_from import" -s f -l file -d 'Input file' -r
 complete -c rvctl -n "__fish_seen_subcommand_from import" -l stdin -d 'Read from stdin'
+
+# logs options
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s f -l follow -d 'Follow log output'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s n -l lines -d 'Number of lines to show'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s g -l filter -d 'Filter by regex pattern'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s i -l ignore-case -d 'Case insensitive filter'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -l no-color -d 'Disable colorization'
 '''
 
 
@@ -2659,6 +2680,130 @@ def cmd_import(args):
         sys.exit(1)
 
 
+def cmd_logs(args):
+    """Handle 'logs' command - tail server logs."""
+    import re as regex
+
+    # Determine log file path
+    log_file = args.log_file or 'ranvier.log'
+
+    # Check if file exists
+    if not os.path.exists(log_file):
+        print(f"{Colors.RED}Error:{Colors.RESET} Log file not found: {log_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # Compile filter pattern if provided
+    filter_pattern = None
+    if args.filter:
+        try:
+            filter_pattern = regex.compile(args.filter, regex.IGNORECASE if args.ignore_case else 0)
+        except regex.error as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Invalid regex pattern: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def matches_filter(line: str) -> bool:
+        """Check if line matches the filter pattern."""
+        if filter_pattern is None:
+            return True
+        return filter_pattern.search(line) is not None
+
+    def colorize_log_line(line: str) -> str:
+        """Add color to log line based on level."""
+        line = line.rstrip()
+        if not line:
+            return line
+
+        # Common log level patterns
+        if 'ERROR' in line or 'error' in line.lower()[:50]:
+            return f"{Colors.RED}{line}{Colors.RESET}"
+        elif 'WARN' in line or 'warn' in line.lower()[:50]:
+            return f"{Colors.YELLOW}{line}{Colors.RESET}"
+        elif 'DEBUG' in line:
+            return f"{Colors.GRAY}{line}{Colors.RESET}"
+        elif 'INFO' in line:
+            return f"{Colors.CYAN}{line}{Colors.RESET}"
+        return line
+
+    def read_last_n_lines(filepath: str, n: int) -> List[str]:
+        """Read the last n lines from a file efficiently."""
+        lines = []
+        try:
+            with open(filepath, 'rb') as f:
+                # Seek to end
+                f.seek(0, 2)
+                file_size = f.tell()
+
+                # Read chunks from end
+                buffer = b''
+                chunk_size = 8192
+                pos = file_size
+
+                while pos > 0 and len(lines) <= n:
+                    read_size = min(chunk_size, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    buffer = f.read(read_size) + buffer
+
+                    # Count newlines
+                    lines = buffer.decode('utf-8', errors='replace').splitlines()
+
+                # If file is smaller than n lines, read all
+                if pos == 0:
+                    f.seek(0)
+                    lines = f.read().decode('utf-8', errors='replace').splitlines()
+
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to read log file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        return lines[-n:] if len(lines) > n else lines
+
+    def tail_follow(filepath: str):
+        """Follow a file like tail -f."""
+        try:
+            with open(filepath, 'r') as f:
+                # Seek to end
+                f.seek(0, 2)
+
+                while True:
+                    line = f.readline()
+                    if line:
+                        if matches_filter(line):
+                            if args.no_color:
+                                print(line.rstrip())
+                            else:
+                                print(colorize_log_line(line))
+                    else:
+                        time.sleep(0.1)  # Small delay before checking again
+        except KeyboardInterrupt:
+            print()  # Clean exit on Ctrl+C
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to read log file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Show header unless quiet
+    if not args.quiet:
+        if args.follow:
+            print(f"{Colors.BOLD}Tailing {log_file}...{Colors.RESET} (Ctrl+C to exit)")
+            if filter_pattern:
+                print(f"{Colors.DIM}Filter: {args.filter}{Colors.RESET}")
+            print()
+
+    # Read and display initial lines
+    lines = read_last_n_lines(log_file, args.lines)
+
+    for line in lines:
+        if matches_filter(line):
+            if args.no_color:
+                print(line.rstrip() if line else '')
+            else:
+                print(colorize_log_line(line) if line else '')
+
+    # Follow mode
+    if args.follow:
+        tail_follow(log_file)
+
+
 def main():
     # Load config file (priority: CLI args > env vars > active profile > base config > defaults)
     raw_config = load_config()
@@ -2860,6 +3005,21 @@ def main():
     import_parser.add_argument('--stdin', dest='import_stdin', action='store_true',
                                 help='Read from stdin')
 
+    # logs command
+    logs_parser = subparsers.add_parser('logs', help='Tail server logs')
+    logs_parser.add_argument('log_file', nargs='?', default=None,
+                              help='Log file path (default: ranvier.log)')
+    logs_parser.add_argument('--follow', '-f', action='store_true',
+                              help='Follow log output (like tail -f)')
+    logs_parser.add_argument('--lines', '-n', type=int, default=10,
+                              help='Number of lines to show (default: 10)')
+    logs_parser.add_argument('--filter', '-g',
+                              help='Filter log lines by regex pattern')
+    logs_parser.add_argument('--ignore-case', '-i', action='store_true',
+                              help='Case insensitive filter matching')
+    logs_parser.add_argument('--no-color', action='store_true',
+                              help='Disable log level colorization')
+
     # completion command
     completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
     completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
@@ -3008,6 +3168,11 @@ def main():
     # Handle import command
     elif args.command == 'import':
         cmd_import(args)
+        sys.exit(0)
+
+    # Handle logs command (special case - doesn't need server connection)
+    elif args.command == 'logs':
+        cmd_logs(args)
         sys.exit(0)
 
     # Handle completion command (special case - just print and exit)
