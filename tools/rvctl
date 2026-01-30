@@ -22,6 +22,14 @@ Usage:
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
 
+Global Options:
+    --url, -u          Admin API URL (default: http://localhost:8080)
+    --admin-key, -k    Admin API key (or set RANVIER_ADMIN_KEY)
+    --timeout, -t      Request timeout in seconds (default: 30)
+    --metrics-url      Metrics endpoint URL (or set RANVIER_METRICS_URL)
+    --metrics-port     Metrics port override (default: 9180)
+    --verbose, -v      Enable verbose output
+
 Examples:
     # Inspect all routes across shards
     rvctl inspect routes
@@ -73,6 +81,9 @@ Examples:
 
     # Quick health check (no auth required)
     rvctl health
+
+    # Use shorter timeout for faster failure detection
+    rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
 """
 
 import argparse
@@ -120,7 +131,8 @@ if not sys.stdout.isatty():
 
 def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
                  data: Optional[bytes] = None,
-                 content_type: str = 'application/json') -> Dict[str, Any]:
+                 content_type: str = 'application/json',
+                 timeout: int = 30) -> Dict[str, Any]:
     """Make an HTTP request to the Ranvier Admin API."""
     headers = {
         'Content-Type': content_type,
@@ -133,7 +145,7 @@ def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
     req = urllib.request.Request(url, method=method, headers=headers, data=data)
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read().decode('utf-8')
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
@@ -146,14 +158,22 @@ def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
         print(f"{Colors.RED}Error:{Colors.RESET} HTTP {e.code}: {error_msg}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
-        print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        if 'timed out' in str(e.reason):
+            print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+            print(f"  Hint: Use --timeout to increase timeout, or check if the server is responding", file=sys.stderr)
+        else:
+            print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+        print(f"  Hint: Use --timeout to increase timeout, or check if the server is responding", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
         sys.exit(1)
 
 
-def fetch_metrics_text(url: str) -> str:
+def fetch_metrics_text(url: str, timeout: int = 30) -> str:
     """Fetch raw Prometheus metrics text from the metrics endpoint."""
     headers = {
         'Accept': 'text/plain',
@@ -162,13 +182,21 @@ def fetch_metrics_text(url: str) -> str:
     req = urllib.request.Request(url, method='GET', headers=headers)
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.read().decode('utf-8')
     except urllib.error.HTTPError as e:
         print(f"{Colors.RED}Error:{Colors.RESET} HTTP {e.code}: {e.reason}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
-        print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        if 'timed out' in str(e.reason):
+            print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+            print(f"  Hint: Use --timeout to increase timeout", file=sys.stderr)
+        else:
+            print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+        print(f"  Hint: Use --timeout to increase timeout", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
@@ -392,7 +420,7 @@ def cmd_inspect_routes(args):
     print(f"{Colors.BOLD}Fetching routes from {args.url}...{Colors.RESET}")
     print()
 
-    data = make_request(url, admin_key=args.admin_key)
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
 
     shard_id = data.get('shard_id', 0)
     tree = data.get('tree')
@@ -441,7 +469,7 @@ def cmd_inspect_backends(args):
     print(f"{Colors.BOLD}Fetching backends from {args.url}...{Colors.RESET}")
     print()
 
-    data = make_request(url, admin_key=args.admin_key)
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
 
     shard_id = data.get('shard_id', 0)
     backends = data.get('backends', [])
@@ -511,7 +539,7 @@ def cmd_cluster_status(args):
     print(f"{Colors.BOLD}Fetching cluster status from {args.url}...{Colors.RESET}")
     print()
 
-    data = make_request(url, admin_key=args.admin_key)
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
 
     cluster_enabled = data.get('cluster_enabled', False)
 
@@ -582,7 +610,7 @@ def cmd_drain(args):
 
     print(f"{Colors.BOLD}Initiating drain for backend {backend_id}...{Colors.RESET}")
 
-    data = make_request(url, method='POST', admin_key=args.admin_key)
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
     status = data.get('status', 'unknown')
     action = data.get('action', 'unknown')
@@ -632,7 +660,8 @@ def cmd_route_add(args):
         method='POST',
         admin_key=args.admin_key,
         data=content.encode('utf-8'),
-        content_type='text/plain'
+        content_type='text/plain',
+        timeout=args.timeout
     )
 
     status = data.get('status', 'unknown')
@@ -664,7 +693,7 @@ def cmd_route_delete(args):
 
     print(f"{Colors.BOLD}Deleting routes for backend {backend_id}...{Colors.RESET}")
 
-    data = make_request(url, method='DELETE', admin_key=args.admin_key)
+    data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
 
     status = data.get('status', 'unknown')
 
@@ -685,7 +714,7 @@ def cmd_keys_reload(args):
 
     print(f"{Colors.BOLD}Reloading API keys...{Colors.RESET}")
 
-    data = make_request(url, method='POST', admin_key=args.admin_key)
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
     status = data.get('status', 'unknown')
 
@@ -705,7 +734,7 @@ def cmd_health(args):
     url = f"{base_url}/health"
 
     # Health endpoint is public, no auth required
-    data = make_request(url, method='GET')
+    data = make_request(url, method='GET', timeout=args.timeout)
 
     status = data.get('status', 'unknown')
     is_draining = data.get('draining', False)
@@ -757,7 +786,7 @@ def cmd_backend_add(args):
         if args.priority is not None:
             print(f"  Priority: {args.priority}")
 
-    data = make_request(url, method='POST', admin_key=args.admin_key)
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
     status = data.get('status', 'unknown')
 
@@ -781,7 +810,7 @@ def cmd_backend_delete(args):
 
     print(f"{Colors.BOLD}Deleting backend {args.id}...{Colors.RESET}")
 
-    data = make_request(url, method='DELETE', admin_key=args.admin_key)
+    data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
 
     status = data.get('status', 'unknown')
 
@@ -815,7 +844,7 @@ def cmd_inspect_metrics(args):
         print(f"{Colors.BOLD}Fetching metrics from {url}...{Colors.RESET}")
         print()
 
-    raw_text = fetch_metrics_text(url)
+    raw_text = fetch_metrics_text(url, timeout=args.timeout)
 
     # If --raw flag, just print the raw output (with optional filter)
     if args.raw:
@@ -1016,6 +1045,8 @@ def main():
                         help='Metrics port (default: 9180, used with --url host)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose output')
+    parser.add_argument('--timeout', '-t', type=int, default=30,
+                        help='Request timeout in seconds (default: 30)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
