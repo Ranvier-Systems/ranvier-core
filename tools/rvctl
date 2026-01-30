@@ -12,6 +12,7 @@ Usage:
     rvctl cluster status
     rvctl drain <backend_id>
     rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]
+    rvctl backend update --id <id> [--weight <w>] [--priority <p>]
     rvctl backend delete --id <id>
     rvctl route add --backend <id> --content "prompt text"
     rvctl route add --backend <id> --stdin < file.txt
@@ -93,6 +94,12 @@ Examples:
 
     # Register a backend with weight and priority
     rvctl backend add --id 2 --ip gpu-server.local --port 8000 --weight 200 --priority 1
+
+    # Update backend weight (for load balancing adjustments)
+    rvctl backend update --id 1 --weight 200
+
+    # Update backend priority
+    rvctl backend update --id 1 --priority 1
 
     # Remove a backend
     rvctl backend delete --id 1
@@ -1389,6 +1396,105 @@ def cmd_backend_delete(args):
         sys.exit(1)
 
 
+def cmd_backend_update(args):
+    """Handle 'backend update' command."""
+    base_url = args.url.rstrip('/')
+
+    # Check that at least one update field is specified
+    if args.weight is None and args.priority is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify --weight and/or --priority to update",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # First, get current backend info
+    backends_url = f"{base_url}/admin/dump/backends"
+    backends_data = make_request_safe(backends_url, admin_key=args.admin_key, timeout=args.timeout)
+
+    if backends_data is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to fetch backends", file=sys.stderr)
+        sys.exit(1)
+
+    # Find the target backend
+    backends = backends_data.get('backends', [])
+    target_backend = None
+    for b in backends:
+        if b.get('id') == args.id:
+            target_backend = b
+            break
+
+    if target_backend is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Backend {args.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Build update parameters (use current values as defaults)
+    current_weight = target_backend.get('weight', 100)
+    current_priority = target_backend.get('priority', 0)
+    address = target_backend.get('address')
+    port = target_backend.get('port')
+
+    new_weight = args.weight if args.weight is not None else current_weight
+    new_priority = args.priority if args.priority is not None else current_priority
+
+    # Delete and re-add with new values (Ranvier API doesn't have a direct update)
+    # First delete
+    delete_url = f"{base_url}/admin/backends?id={args.id}"
+    delete_result = make_request_safe(delete_url, method='DELETE',
+                                       admin_key=args.admin_key, timeout=args.timeout)
+
+    if delete_result is None or delete_result.get('status') != 'ok':
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to update backend (delete step failed)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Then re-add with new values
+    params = [
+        f"id={args.id}",
+        f"ip={address}",
+        f"port={port}",
+        f"weight={new_weight}",
+        f"priority={new_priority}"
+    ]
+    add_url = f"{base_url}/admin/backends?{'&'.join(params)}"
+    add_result = make_request_safe(add_url, method='POST',
+                                    admin_key=args.admin_key, timeout=args.timeout)
+
+    if add_result is None or add_result.get('status') != 'ok':
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to update backend (add step failed)",
+              file=sys.stderr)
+        print(f"{Colors.YELLOW}Warning:{Colors.RESET} Backend may be in an inconsistent state!",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # JSON output mode
+    if args.output == 'json':
+        output = {
+            'status': 'ok',
+            'id': args.id,
+            'address': address,
+            'port': port,
+            'weight': new_weight,
+            'priority': new_priority,
+            'previous_weight': current_weight,
+            'previous_priority': current_priority
+        }
+        print(json.dumps(output, indent=2))
+        return
+
+    # Text output
+    print(f"{Colors.GREEN}Success:{Colors.RESET} Backend {args.id} updated")
+    print(f"  Address:  {address}:{port}")
+
+    if args.weight is not None:
+        print(f"  Weight:   {current_weight} -> {new_weight}")
+    else:
+        print(f"  Weight:   {new_weight}")
+
+    if args.priority is not None:
+        print(f"  Priority: {current_priority} -> {new_priority}")
+    else:
+        print(f"  Priority: {new_priority}")
+
+
 def cmd_inspect_metrics(args):
     """Handle 'inspect metrics' command."""
     # Determine metrics URL
@@ -1669,9 +1775,11 @@ _rvctl_completions() {
             ;;
         backend)
             if [[ $cword -eq $((cmd_index + 1)) ]]; then
-                COMPREPLY=($(compgen -W "add delete" -- "$cur"))
+                COMPREPLY=($(compgen -W "add update delete" -- "$cur"))
             elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
                 COMPREPLY=($(compgen -W "--id --ip --port --weight --priority" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "update" ]]; then
+                COMPREPLY=($(compgen -W "--id --weight --priority" -- "$cur"))
             elif [[ "${words[cmd_index + 1]}" == "delete" ]]; then
                 COMPREPLY=($(compgen -W "--id" -- "$cur"))
             fi
@@ -1822,6 +1930,7 @@ _rvctl() {
                     local -a backend_actions
                     backend_actions=(
                         'add:Register a new backend'
+                        'update:Update backend settings'
                         'delete:Remove a backend'
                     )
                     if [[ $CURRENT -eq 2 ]]; then
@@ -1835,6 +1944,12 @@ _rvctl() {
                                     '--port[Backend port]:port' \
                                     '--weight[Load balancing weight]:weight' \
                                     '--priority[Routing priority]:priority'
+                                ;;
+                            update)
+                                _arguments \
+                                    '--id[Backend ID]:id' \
+                                    '--weight[New load balancing weight]:weight' \
+                                    '--priority[New routing priority]:priority'
                                 ;;
                             delete)
                                 _arguments '--id[Backend ID]:id'
@@ -1979,8 +2094,9 @@ complete -c rvctl -n "__fish_seen_subcommand_from metrics" -s f -l filter -d 'Fi
 complete -c rvctl -n "__fish_seen_subcommand_from cluster; and not __fish_seen_subcommand_from status" -a status -d 'Show cluster status'
 
 # backend subcommands
-complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add delete" -a add -d 'Register a new backend'
-complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add delete" -a delete -d 'Remove a backend'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add update delete" -a add -d 'Register a new backend'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add update delete" -a update -d 'Update backend settings'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add update delete" -a delete -d 'Remove a backend'
 
 # backend add options
 complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l id -d 'Backend ID'
@@ -1988,6 +2104,11 @@ complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subco
 complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l port -d 'Backend port'
 complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l weight -d 'Load balancing weight'
 complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l priority -d 'Routing priority'
+
+# backend update options
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from update" -l id -d 'Backend ID'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from update" -l weight -d 'New load balancing weight'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from update" -l priority -d 'New routing priority'
 
 # backend delete options
 complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from delete" -l id -d 'Backend ID'
@@ -2528,6 +2649,15 @@ def main():
     backend_add_parser.add_argument('--priority', type=int,
                                      help='Routing priority (default: 0, lower = preferred)')
 
+    # backend update
+    backend_update_parser = backend_subparsers.add_parser('update', help='Update backend settings')
+    backend_update_parser.add_argument('--id', type=int, required=True,
+                                        help='Backend ID to update')
+    backend_update_parser.add_argument('--weight', type=int,
+                                        help='New load balancing weight')
+    backend_update_parser.add_argument('--priority', type=int,
+                                        help='New routing priority')
+
     # backend delete
     backend_delete_parser = backend_subparsers.add_parser('delete', help='Remove a backend')
     backend_delete_parser.add_argument('--id', type=int, required=True,
@@ -2689,6 +2819,9 @@ def main():
 
         if args.backend_action == 'add':
             cmd_func = cmd_backend_add
+            supports_watch = False  # mutation
+        elif args.backend_action == 'update':
+            cmd_func = cmd_backend_update
             supports_watch = False  # mutation
         elif args.backend_action == 'delete':
             cmd_func = cmd_backend_delete
