@@ -18,6 +18,7 @@ Usage:
     rvctl route delete --backend <id>
     rvctl keys reload
     rvctl health
+    rvctl top
     rvctl completion {bash,zsh,fish}
 
 Authentication:
@@ -102,6 +103,12 @@ Examples:
 
     # Quick health check (no auth required)
     rvctl health
+
+    # Real-time dashboard showing cluster health, backends, and metrics
+    rvctl top
+
+    # Dashboard with 1-second refresh interval
+    rvctl top --interval 1
 
     # Use shorter timeout for faster failure detection
     rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
@@ -809,6 +816,38 @@ def cmd_keys_reload(args):
         sys.exit(1)
 
 
+def make_request_safe(url: str, method: str = 'GET', admin_key: Optional[str] = None,
+                      timeout: int = 30) -> Optional[Dict[str, Any]]:
+    """Make an HTTP request, returning None on error instead of exiting."""
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    if admin_key:
+        headers['Authorization'] = f'Bearer {admin_key}'
+
+    req = urllib.request.Request(url, method=method, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode('utf-8')
+            return json.loads(body) if body else {}
+    except Exception:
+        return None
+
+
+def fetch_metrics_text_safe(url: str, timeout: int = 30) -> Optional[str]:
+    """Fetch raw Prometheus metrics text, returning None on error."""
+    headers = {'Accept': 'text/plain'}
+    req = urllib.request.Request(url, method='GET', headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.read().decode('utf-8')
+    except Exception:
+        return None
+
+
 def cmd_health(args):
     """Handle 'health' command."""
     base_url = args.url.rstrip('/')
@@ -847,6 +886,216 @@ def cmd_health(args):
         print(f"{Colors.RED}UNHEALTHY{Colors.RESET}")
         print(f"  Status: {status}")
         sys.exit(1)
+
+
+def cmd_top(args):
+    """Handle 'top' command - real-time dashboard."""
+    base_url = args.url.rstrip('/')
+    interval = args.interval
+
+    # Determine metrics URL
+    if args.metrics_url:
+        metrics_url = args.metrics_url.rstrip('/')
+    elif os.environ.get('RANVIER_METRICS_URL'):
+        metrics_url = os.environ.get('RANVIER_METRICS_URL').rstrip('/')
+    else:
+        parsed = urllib.parse.urlparse(args.url)
+        metrics_port = args.metrics_port or 9180
+        metrics_url = f"{parsed.scheme}://{parsed.hostname}:{metrics_port}"
+
+    try:
+        while True:
+            # Clear screen
+            print('\033[2J\033[H', end='')
+
+            # Header
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{Colors.BOLD}rvctl top{Colors.RESET} - {args.url}")
+            print(f"{Colors.GRAY}Updated: {timestamp} | Refresh: {interval}s | Press Ctrl+C to exit{Colors.RESET}")
+            print()
+
+            # Fetch data concurrently (well, sequentially in Python stdlib)
+            health_data = make_request_safe(f"{base_url}/health", timeout=args.timeout)
+            backends_data = make_request_safe(f"{base_url}/admin/dump/backends",
+                                               admin_key=args.admin_key, timeout=args.timeout)
+            metrics_text = fetch_metrics_text_safe(f"{metrics_url}/metrics", timeout=args.timeout)
+
+            # Parse metrics if available
+            metrics = None
+            if metrics_text:
+                metrics = parse_prometheus_metrics(metrics_text)
+
+            # === HEALTH STATUS ===
+            print(f"{Colors.BOLD}Health{Colors.RESET}")
+            print("─" * 60)
+            if health_data:
+                status = health_data.get('status', 'unknown')
+                is_draining = health_data.get('draining', False)
+                quorum_healthy = health_data.get('quorum_healthy')
+
+                if status in ('healthy', 'ok'):
+                    if is_draining:
+                        status_str = f"{Colors.YELLOW}DRAINING{Colors.RESET}"
+                    else:
+                        status_str = f"{Colors.GREEN}HEALTHY{Colors.RESET}"
+                elif status == 'draining':
+                    status_str = f"{Colors.YELLOW}DRAINING{Colors.RESET}"
+                else:
+                    status_str = f"{Colors.RED}{status.upper()}{Colors.RESET}"
+
+                quorum_str = ""
+                if quorum_healthy is not None:
+                    if quorum_healthy:
+                        quorum_str = f"  Quorum: {Colors.GREEN}healthy{Colors.RESET}"
+                    else:
+                        quorum_str = f"  Quorum: {Colors.RED}degraded{Colors.RESET}"
+
+                print(f"  Status: {status_str}{quorum_str}")
+            else:
+                print(f"  {Colors.RED}Unable to fetch health status{Colors.RESET}")
+
+            print()
+
+            # === BACKENDS ===
+            print(f"{Colors.BOLD}Backends{Colors.RESET}")
+            print("─" * 60)
+            if backends_data:
+                backends = backends_data.get('backends', [])
+                if backends:
+                    # Summary counts
+                    healthy_count = sum(1 for b in backends if not b.get('is_draining') and not b.get('is_dead'))
+                    draining_count = sum(1 for b in backends if b.get('is_draining'))
+                    dead_count = sum(1 for b in backends if b.get('is_dead'))
+
+                    print(f"  Total: {len(backends)}  "
+                          f"{Colors.GREEN}Healthy: {healthy_count}{Colors.RESET}  "
+                          f"{Colors.YELLOW}Draining: {draining_count}{Colors.RESET}  "
+                          f"{Colors.RED}Dead: {dead_count}{Colors.RESET}")
+                    print()
+
+                    # Backend table (compact)
+                    print(f"  {'ID':>3} {'Address':<22} {'W':>4} {'P':>2} {'Status':<10}")
+                    print(f"  {'─'*3} {'─'*22} {'─'*4} {'─'*2} {'─'*10}")
+                    for b in backends[:10]:  # Show top 10
+                        bid = b.get('id', 0)
+                        address = f"{b.get('address', '?')}:{b.get('port', 0)}"[:22]
+                        weight = b.get('weight', 100)
+                        priority = b.get('priority', 0)
+                        is_draining = b.get('is_draining', False)
+                        is_dead = b.get('is_dead', False)
+
+                        if is_dead:
+                            status_str = f"{Colors.RED}DEAD{Colors.RESET}"
+                        elif is_draining:
+                            status_str = f"{Colors.YELLOW}DRAINING{Colors.RESET}"
+                        else:
+                            status_str = f"{Colors.GREEN}HEALTHY{Colors.RESET}"
+
+                        print(f"  {bid:>3} {address:<22} {weight:>4} {priority:>2} {status_str:<10}")
+
+                    if len(backends) > 10:
+                        print(f"  {Colors.GRAY}... and {len(backends) - 10} more{Colors.RESET}")
+                else:
+                    print(f"  {Colors.GRAY}(no backends registered){Colors.RESET}")
+            else:
+                print(f"  {Colors.RED}Unable to fetch backends{Colors.RESET}")
+
+            print()
+
+            # === METRICS ===
+            print(f"{Colors.BOLD}Requests{Colors.RESET}")
+            print("─" * 60)
+            if metrics:
+                total = get_metric_value(metrics, 'ranvier_http_requests_total') or 0
+                success = get_metric_value(metrics, 'ranvier_http_requests_success') or 0
+                failed = get_metric_value(metrics, 'ranvier_http_requests_failed') or 0
+                timeout_count = get_metric_value(metrics, 'ranvier_http_requests_timeout') or 0
+                rate_limited = get_metric_value(metrics, 'ranvier_http_requests_rate_limited') or 0
+                active = get_metric_value(metrics, 'ranvier_active_proxy_requests') or 0
+
+                success_rate = (success / total * 100) if total > 0 else 0
+                rate_color = Colors.GREEN if success_rate >= 99 else (Colors.YELLOW if success_rate >= 95 else Colors.RED)
+
+                print(f"  Total: {format_number(total)}  "
+                      f"{Colors.GREEN}OK: {format_number(success)}{Colors.RESET}  "
+                      f"{Colors.RED}Fail: {format_number(failed)}{Colors.RESET}  "
+                      f"{Colors.YELLOW}Timeout: {format_number(timeout_count)}{Colors.RESET}  "
+                      f"RateLimit: {format_number(rate_limited)}")
+                print(f"  Active: {format_number(active)}  "
+                      f"Success Rate: {rate_color}{success_rate:.1f}%{Colors.RESET}")
+            else:
+                print(f"  {Colors.RED}Unable to fetch metrics{Colors.RESET}")
+
+            print()
+
+            # === CACHE ===
+            print(f"{Colors.BOLD}Cache{Colors.RESET}")
+            print("─" * 60)
+            if metrics:
+                cache_ratio = get_metric_value(metrics, 'ranvier_cache_hit_ratio')
+                tree_hits = get_metric_value(metrics, 'ranvier_radix_tree_lookup_hits_total')
+                tree_misses = get_metric_value(metrics, 'ranvier_radix_tree_lookup_misses_total')
+                avg_skip = get_metric_value(metrics, 'ranvier_radix_tree_average_prefix_skip_length')
+
+                parts = []
+                if cache_ratio is not None:
+                    pct = cache_ratio * 100
+                    color = Colors.GREEN if pct >= 80 else (Colors.YELLOW if pct >= 50 else Colors.RED)
+                    parts.append(f"Hit Ratio: {color}{pct:.1f}%{Colors.RESET}")
+
+                if tree_hits is not None and tree_misses is not None:
+                    tree_total = tree_hits + tree_misses
+                    if tree_total > 0:
+                        tree_hit_pct = tree_hits / tree_total * 100
+                        parts.append(f"Tree Hits: {format_number(tree_hits)} ({tree_hit_pct:.0f}%)")
+
+                if avg_skip is not None:
+                    parts.append(f"Avg Skip: {avg_skip:.1f} tokens")
+
+                if parts:
+                    print(f"  {' │ '.join(parts)}")
+                else:
+                    print(f"  {Colors.GRAY}(no cache metrics){Colors.RESET}")
+            else:
+                print(f"  {Colors.GRAY}(metrics unavailable){Colors.RESET}")
+
+            print()
+
+            # === PER-BACKEND LATENCY (if available) ===
+            if metrics:
+                backend_latencies = metrics['metrics'].get('ranvier_backend_latency_seconds_sum', [])
+                backend_counts = {labels.get('backend_id'): value
+                                  for labels, value in metrics['metrics'].get('ranvier_backend_latency_seconds_count', [])}
+
+                if backend_latencies:
+                    print(f"{Colors.BOLD}Backend Latency{Colors.RESET}")
+                    print("─" * 60)
+                    latency_items = []
+                    for labels, sum_val in backend_latencies:
+                        if 'backend_id' in labels:
+                            backend_id = labels.get('backend_id', '?')
+                            count = backend_counts.get(backend_id, 1)
+                            avg_ms = (sum_val / count) * 1000 if count > 0 else 0
+                            latency_items.append((backend_id, avg_ms, count))
+
+                    # Sort by backend ID and show up to 8
+                    latency_items.sort(key=lambda x: x[0])
+                    for backend_id, avg_ms, count in latency_items[:8]:
+                        color = Colors.GREEN if avg_ms < 100 else (Colors.YELLOW if avg_ms < 500 else Colors.RED)
+                        bar_len = min(int(avg_ms / 50), 20)  # Scale: 50ms per char, max 20 chars
+                        bar = "█" * bar_len
+                        print(f"  {backend_id:>3}: {color}{avg_ms:>6.1f}ms{Colors.RESET} {Colors.GRAY}{bar}{Colors.RESET}")
+
+                    if len(latency_items) > 8:
+                        print(f"  {Colors.GRAY}... and {len(latency_items) - 8} more{Colors.RESET}")
+                    print()
+
+            # Wait for next refresh
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print(f"\n{Colors.GRAY}Dashboard stopped.{Colors.RESET}")
+        sys.exit(0)
 
 
 def cmd_backend_add(args):
@@ -1166,7 +1415,7 @@ _rvctl_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="inspect cluster drain backend route keys health completion"
+    local commands="inspect cluster drain backend route keys health top completion"
     local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --help -h"
 
     # Determine command position (skip global options)
@@ -1233,7 +1482,7 @@ _rvctl_completions() {
                 COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
             fi
             ;;
-        drain|health)
+        drain|health|top)
             # No subcommands
             ;;
         "")
@@ -1276,6 +1525,7 @@ _rvctl() {
         'route:Route management'
         'keys:API key management'
         'health:Quick health check'
+        'top:Real-time dashboard'
         'completion:Generate shell completion scripts'
     )
 
@@ -1417,14 +1667,15 @@ complete -c rvctl -s v -l verbose -d 'Enable verbose output'
 complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
 
 # Commands (only when no command is specified yet)
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a inspect -d 'Inspect Ranvier state'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a cluster -d 'Cluster operations'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a drain -d 'Drain a backend'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a backend -d 'Backend management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a route -d 'Route management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a keys -d 'API key management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a health -d 'Quick health check'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a completion -d 'Generate shell completion scripts'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a top -d 'Real-time dashboard'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a completion -d 'Generate shell completion scripts'
 
 # inspect subcommands
 complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
@@ -1628,6 +1879,9 @@ def main():
     # health command (top-level, no subcommand)
     health_parser = subparsers.add_parser('health', help='Quick health check (no auth required)')
 
+    # top command (real-time dashboard)
+    top_parser = subparsers.add_parser('top', help='Real-time dashboard showing health, backends, and metrics')
+
     # completion command
     completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
     completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
@@ -1733,6 +1987,11 @@ def main():
     elif args.command == 'health':
         cmd_func = cmd_health
         supports_watch = True
+
+    # Handle top command (has its own internal loop, so skip watch logic)
+    elif args.command == 'top':
+        cmd_top(args)
+        sys.exit(0)
 
     # Handle completion command (special case - just print and exit)
     elif args.command == 'completion':
