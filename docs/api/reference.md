@@ -762,6 +762,7 @@ rvctl keys reload
 | `--output` | `-o` | Output format: `text` (default) or `json` |
 | `--watch` | `-w` | Watch mode: continuously refresh output |
 | `--interval` | | Watch refresh interval in seconds (default: 2.0) |
+| `--quiet` | `-q` | Suppress output (exit code only) |
 | `--metrics-url` | | Metrics endpoint URL (overrides `--url` for metrics) |
 | `--metrics-port` | | Metrics port (default: 9180, used with `--url` host) |
 | `--verbose` | `-v` | Enable verbose output |
@@ -819,10 +820,37 @@ After enabling completions, you can use `Tab` to complete:
 - Options: `rvctl --out<Tab>` → `rvctl --output`
 - Option values: `rvctl --output <Tab>` → `text json`
 
+### Configuration File
+
+rvctl loads defaults from a JSON config file. Searched locations (in order):
+
+1. `~/.config/rvctl/config.json`
+2. `~/.rvctl.json`
+
+**Example config:**
+```json
+{
+    "url": "http://ranvier.example.com:8080",
+    "admin_key": "your-api-key",
+    "metrics_url": "http://ranvier.example.com:9180",
+    "metrics_port": 9180,
+    "timeout": 60,
+    "output": "json",
+    "interval": 1.0
+}
+```
+
+**Priority** (highest to lowest):
+1. Command-line arguments
+2. Environment variables
+3. Config file
+4. Built-in defaults
+
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
+| `RANVIER_URL` | Default admin API URL |
 | `RANVIER_ADMIN_KEY` | Default admin API key |
 | `RANVIER_METRICS_URL` | Default metrics endpoint URL |
 

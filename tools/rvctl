@@ -23,6 +23,22 @@ Usage:
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
 
+Configuration:
+    rvctl loads defaults from config file (JSON format):
+    - ~/.config/rvctl/config.json (preferred)
+    - ~/.rvctl.json (fallback)
+
+    Example config:
+    {
+        "url": "http://ranvier.example.com:8080",
+        "admin_key": "your-api-key",
+        "metrics_url": "http://ranvier.example.com:9180",
+        "timeout": 60,
+        "output": "json"
+    }
+
+    Priority: CLI args > environment variables > config file > defaults
+
 Global Options:
     --url, -u          Admin API URL (default: http://localhost:8080)
     --admin-key, -k    Admin API key (or set RANVIER_ADMIN_KEY)
@@ -1460,34 +1476,72 @@ complete -c rvctl -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
 '''
 
 
+def load_config() -> Dict[str, Any]:
+    """Load configuration from config file.
+
+    Searches for config in order:
+    1. ~/.config/rvctl/config.json
+    2. ~/.rvctl.json
+
+    Returns empty dict if no config file found.
+    """
+    config_paths = [
+        os.path.expanduser('~/.config/rvctl/config.json'),
+        os.path.expanduser('~/.rvctl.json'),
+    ]
+
+    for path in config_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"{Colors.YELLOW}Warning:{Colors.RESET} Failed to load config from {path}: {e}",
+                      file=sys.stderr)
+                return {}
+
+    return {}
+
+
 def main():
+    # Load config file (priority: CLI args > env vars > config file > defaults)
+    config = load_config()
+
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
 
+    # Determine defaults: env var > config > built-in default
+    default_url = os.environ.get('RANVIER_URL', config.get('url', 'http://localhost:8080'))
+    default_admin_key = os.environ.get('RANVIER_ADMIN_KEY', config.get('admin_key'))
+    default_metrics_url = os.environ.get('RANVIER_METRICS_URL', config.get('metrics_url'))
+    default_metrics_port = config.get('metrics_port')
+    default_timeout = config.get('timeout', 30)
+    default_output = config.get('output', 'text')
+    default_interval = config.get('interval', 2.0)
+
     # Global options
-    parser.add_argument('--url', '-u', default='http://localhost:8080',
+    parser.add_argument('--url', '-u', default=default_url,
                         help='Ranvier Admin API URL (default: http://localhost:8080)')
-    parser.add_argument('--admin-key', '-k',
-                        default=os.environ.get('RANVIER_ADMIN_KEY'),
+    parser.add_argument('--admin-key', '-k', default=default_admin_key,
                         help='Admin API key (or set RANVIER_ADMIN_KEY env var)')
-    parser.add_argument('--metrics-url',
+    parser.add_argument('--metrics-url', default=default_metrics_url,
                         help='Metrics endpoint URL (or set RANVIER_METRICS_URL env var)')
-    parser.add_argument('--metrics-port', type=int,
+    parser.add_argument('--metrics-port', type=int, default=default_metrics_port,
                         help='Metrics port (default: 9180, used with --url host)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose output')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Suppress output (exit code only)')
-    parser.add_argument('--timeout', '-t', type=int, default=30,
+    parser.add_argument('--timeout', '-t', type=int, default=default_timeout,
                         help='Request timeout in seconds (default: 30)')
-    parser.add_argument('--output', '-o', choices=['text', 'json'], default='text',
+    parser.add_argument('--output', '-o', choices=['text', 'json'], default=default_output,
                         help='Output format: text (default) or json')
     parser.add_argument('--watch', '-w', action='store_true',
                         help='Watch mode: continuously refresh output')
-    parser.add_argument('--interval', type=float, default=2.0,
+    parser.add_argument('--interval', type=float, default=default_interval,
                         help='Watch refresh interval in seconds (default: 2.0)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
