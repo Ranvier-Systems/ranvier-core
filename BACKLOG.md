@@ -628,6 +628,27 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Medium
   _Priority:_ Low
 
+- [ ] **Refactor rvctl into package structure when >4000 lines**
+  _Justification:_ Currently ~3300 lines as single file for easy deployment. If significant features are added, refactoring improves maintainability. Current section comments provide navigation.
+  _Threshold:_ >4000 lines or >50 functions
+  _Structure:_ `rvctl_lib/{cli.py, client.py, config.py, commands/, completions/}`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Medium
+  _Priority:_ Low (defer until threshold reached)
+
+- [ ] **Add unit tests for rvctl command functions**
+  _Justification:_ CLI commands lack automated testing. Mock-based tests would catch regressions.
+  _Location:_ `tests/unit/test_rvctl.py` (new)
+  _Complexity:_ Medium
+  _Priority:_ Low
+
+- [ ] **Add `rvctl doctor` command for connectivity troubleshooting**
+  _Justification:_ Operators need quick diagnosis of connection issues. Command would check: API reachability, auth validity, metrics endpoint, DNS resolution.
+  _Usage:_ `rvctl doctor`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Low
+
 ### 5.6 Build System
 
 - [ ] **Add Windows/macOS cross-compilation support**

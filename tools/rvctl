@@ -205,7 +205,10 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
 
-# ANSI color codes for terminal output
+# =============================================================================
+# SECTION: Constants & Terminal Colors
+# =============================================================================
+
 class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
@@ -235,6 +238,10 @@ class Colors:
 if not sys.stdout.isatty():
     Colors.disable()
 
+
+# =============================================================================
+# SECTION: HTTP Client & API Utilities
+# =============================================================================
 
 def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
                  data: Optional[bytes] = None,
@@ -391,6 +398,10 @@ def get_metric_value(parsed: Dict[str, Any], name: str, labels: Optional[Dict[st
     return None
 
 
+# =============================================================================
+# SECTION: Formatting Utilities
+# =============================================================================
+
 def format_number(value: float) -> str:
     """Format a number for display."""
     if value == 0:
@@ -514,6 +525,10 @@ class TreePrinter:
             self.print_tree(child_node, edge_prefix + ("    " if is_last_child else "│   "),
                            True, child_path)
 
+
+# =============================================================================
+# SECTION: Command Implementations - Inspect
+# =============================================================================
 
 def cmd_inspect_routes(args):
     """Handle 'inspect routes' command."""
@@ -648,6 +663,10 @@ def cmd_inspect_backends(args):
           f"{Colors.RED}Dead:{Colors.RESET} {dead}")
 
 
+# =============================================================================
+# SECTION: Command Implementations - Cluster
+# =============================================================================
+
 def cmd_cluster_status(args):
     """Handle 'cluster status' command."""
     base_url = args.url.rstrip('/')
@@ -724,6 +743,10 @@ def cmd_cluster_status(args):
             print(f"  {address:^25} │ {status:^10} │ {last_seen:^15}{backend_str}")
 
 
+# =============================================================================
+# SECTION: Command Implementations - Drain
+# =============================================================================
+
 def cmd_drain(args):
     """Handle 'drain' command."""
     backend_id = args.backend_id
@@ -759,6 +782,10 @@ def cmd_drain(args):
         if message:
             print(f"  {message}")
 
+
+# =============================================================================
+# SECTION: Command Implementations - Routes
+# =============================================================================
 
 def cmd_route_add(args):
     """Handle 'route add' command."""
@@ -869,6 +896,10 @@ def cmd_route_delete(args):
         sys.exit(1)
 
 
+# =============================================================================
+# SECTION: Command Implementations - Keys
+# =============================================================================
+
 def cmd_keys_reload(args):
     """Handle 'keys reload' command."""
     base_url = args.url.rstrip('/')
@@ -934,6 +965,10 @@ def fetch_metrics_text_safe(url: str, timeout: int = 30) -> Optional[str]:
     except Exception:
         return None
 
+
+# =============================================================================
+# SECTION: Command Implementations - Health, Top, Wait
+# =============================================================================
 
 def cmd_health(args):
     """Handle 'health' command."""
@@ -1382,6 +1417,10 @@ def cmd_wait(args):
         sys.exit(130)  # Standard exit code for Ctrl+C
 
 
+# =============================================================================
+# SECTION: Command Implementations - Backend Management
+# =============================================================================
+
 def cmd_backend_add(args):
     """Handle 'backend add' command."""
     base_url = args.url.rstrip('/')
@@ -1586,6 +1625,10 @@ def cmd_backend_update(args):
     else:
         print(f"  Priority: {new_priority}")
 
+
+# =============================================================================
+# SECTION: Command Implementations - Metrics
+# =============================================================================
 
 def cmd_inspect_metrics(args):
     """Handle 'inspect metrics' command."""
@@ -1807,6 +1850,10 @@ def cmd_inspect_metrics(args):
     print()
     print(f"{Colors.GRAY}Use --raw for full Prometheus output, --filter <pattern> to search{Colors.RESET}")
 
+
+# =============================================================================
+# SECTION: Shell Completion Scripts
+# =============================================================================
 
 def print_completion_script(shell: str):
     """Print shell completion script for the specified shell."""
@@ -2277,6 +2324,10 @@ complete -c rvctl -n "__fish_seen_subcommand_from logs" -l no-color -d 'Disable 
 '''
 
 
+# =============================================================================
+# SECTION: Configuration & Profile Management
+# =============================================================================
+
 def get_config_path() -> str:
     """Get the path to the config file, creating directory if needed."""
     config_dir = os.path.expanduser('~/.config/rvctl')
@@ -2523,6 +2574,10 @@ def cmd_profile_delete(args, config: Dict[str, Any]):
         print(f"{Colors.GREEN}Success:{Colors.RESET} Deleted profile '{name}'")
 
 
+# =============================================================================
+# SECTION: Command Implementations - Export/Import
+# =============================================================================
+
 def cmd_export(args):
     """Handle 'export' command - export backends and routes."""
     base_url = args.url.rstrip('/')
@@ -2680,6 +2735,10 @@ def cmd_import(args):
         sys.exit(1)
 
 
+# =============================================================================
+# SECTION: Command Implementations - Logs
+# =============================================================================
+
 def cmd_logs(args):
     """Handle 'logs' command - tail server logs."""
     import re as regex
@@ -2803,6 +2862,10 @@ def cmd_logs(args):
     if args.follow:
         tail_follow(log_file)
 
+
+# =============================================================================
+# SECTION: Main Entry Point & Argument Parsing
+# =============================================================================
 
 def main():
     # Load config file (priority: CLI args > env vars > active profile > base config > defaults)
