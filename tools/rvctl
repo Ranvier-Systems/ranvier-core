@@ -30,6 +30,7 @@ Global Options:
     --output, -o       Output format: text (default) or json
     --watch, -w        Watch mode: continuously refresh output
     --interval         Watch refresh interval in seconds (default: 2.0)
+    --quiet, -q        Suppress output (exit code only)
     --metrics-url      Metrics endpoint URL (or set RANVIER_METRICS_URL)
     --metrics-port     Metrics port override (default: 9180)
     --verbose, -v      Enable verbose output
@@ -1150,7 +1151,7 @@ _rvctl_completions() {
     _init_completion || return
 
     local commands="inspect cluster drain backend route keys health completion"
-    local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --metrics-url --metrics-port --verbose -v --help -h"
+    local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --help -h"
 
     # Determine command position (skip global options)
     local cmd=""
@@ -1160,7 +1161,7 @@ _rvctl_completions() {
             --url|-u|--admin-key|-k|--timeout|-t|--output|-o|--interval|--metrics-url|--metrics-port)
                 ((i++))  # skip option value
                 ;;
-            --watch|-w|--verbose|-v|--help|-h)
+            --watch|-w|--quiet|-q|--verbose|-v|--help|-h)
                 ;;  # flag only
             -*)
                 ;;  # unknown option
@@ -1272,6 +1273,7 @@ _rvctl() {
         '--metrics-url[Metrics endpoint URL]:url'
         '--metrics-port[Metrics port]:port'
         '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
+        '(-q --quiet)'{-q,--quiet}'[Suppress output (exit code only)]'
     )
 
     _arguments -C \
@@ -1396,6 +1398,7 @@ complete -c rvctl -l interval -d 'Watch refresh interval in seconds'
 complete -c rvctl -l metrics-url -d 'Metrics endpoint URL'
 complete -c rvctl -l metrics-port -d 'Metrics port'
 complete -c rvctl -s v -l verbose -d 'Enable verbose output'
+complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
 
 # Commands (only when no command is specified yet)
 complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a inspect -d 'Inspect Ranvier state'
@@ -1476,6 +1479,8 @@ def main():
                         help='Metrics port (default: 9180, used with --url host)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose output')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='Suppress output (exit code only)')
     parser.add_argument('--timeout', '-t', type=int, default=30,
                         help='Request timeout in seconds (default: 30)')
     parser.add_argument('--output', '-o', choices=['text', 'json'], default='text',
@@ -1579,6 +1584,10 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Quiet mode: redirect stdout to devnull (errors still go to stderr)
+    if args.quiet:
+        sys.stdout = open(os.devnull, 'w')
 
     # Determine the command function and whether it supports watch mode
     cmd_func = None
