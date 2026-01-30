@@ -963,6 +963,12 @@ def cmd_top(args):
         metrics_port = args.metrics_port or 9180
         metrics_url = f"{parsed.scheme}://{parsed.hostname}:{metrics_port}"
 
+    # Track previous metrics for rate calculation
+    prev_total = None
+    prev_success = None
+    prev_failed = None
+    prev_time = None
+
     try:
         while True:
             # Clear screen
@@ -1073,8 +1079,39 @@ def cmd_top(args):
                 rate_limited = get_metric_value(metrics, 'ranvier_http_requests_rate_limited') or 0
                 active = get_metric_value(metrics, 'ranvier_active_proxy_requests') or 0
 
-                success_rate = (success / total * 100) if total > 0 else 0
-                rate_color = Colors.GREEN if success_rate >= 99 else (Colors.YELLOW if success_rate >= 95 else Colors.RED)
+                # Calculate request rates
+                current_time = time.time()
+                req_rate = None
+                success_rate_per_sec = None
+                fail_rate_per_sec = None
+
+                if prev_total is not None and prev_time is not None:
+                    time_delta = current_time - prev_time
+                    if time_delta > 0:
+                        req_rate = (total - prev_total) / time_delta
+                        success_rate_per_sec = (success - prev_success) / time_delta
+                        fail_rate_per_sec = (failed - prev_failed) / time_delta
+
+                # Update previous values for next iteration
+                prev_total = total
+                prev_success = success
+                prev_failed = failed
+                prev_time = current_time
+
+                success_pct = (success / total * 100) if total > 0 else 0
+                pct_color = Colors.GREEN if success_pct >= 99 else (Colors.YELLOW if success_pct >= 95 else Colors.RED)
+
+                # Build rate string
+                if req_rate is not None:
+                    rate_str = f"  Rate: {Colors.CYAN}{req_rate:.1f}/s{Colors.RESET}"
+                    if success_rate_per_sec is not None and success_rate_per_sec > 0:
+                        rate_str += f" ({Colors.GREEN}+{success_rate_per_sec:.1f}{Colors.RESET}"
+                    if fail_rate_per_sec is not None and fail_rate_per_sec > 0:
+                        rate_str += f" {Colors.RED}-{fail_rate_per_sec:.1f}{Colors.RESET}"
+                    if success_rate_per_sec is not None and success_rate_per_sec > 0:
+                        rate_str += ")"
+                else:
+                    rate_str = f"  Rate: {Colors.GRAY}calculating...{Colors.RESET}"
 
                 print(f"  Total: {format_number(total)}  "
                       f"{Colors.GREEN}OK: {format_number(success)}{Colors.RESET}  "
@@ -1082,7 +1119,7 @@ def cmd_top(args):
                       f"{Colors.YELLOW}Timeout: {format_number(timeout_count)}{Colors.RESET}  "
                       f"RateLimit: {format_number(rate_limited)}")
                 print(f"  Active: {format_number(active)}  "
-                      f"Success Rate: {rate_color}{success_rate:.1f}%{Colors.RESET}")
+                      f"Success: {pct_color}{success_pct:.1f}%{Colors.RESET}{rate_str}")
             else:
                 print(f"  {Colors.RED}Unable to fetch metrics{Colors.RESET}")
 
