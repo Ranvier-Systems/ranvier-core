@@ -614,7 +614,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Low
   _Priority:_ Medium
 
-- [ ] **Add `--output json` global flag**
+- [x] **Add `--output json` global flag** ✓
   _Justification:_ Current output is human-formatted. JSON output enables piping to jq and scripting integration.
   _Usage:_ `rvctl --output json inspect backends`
   _Location:_ `tools/rvctl`
@@ -1204,7 +1204,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `route delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `health` command | Low | ✅ Done |
-| **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | |
+| **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | |
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
 
