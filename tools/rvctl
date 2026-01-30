@@ -26,6 +26,7 @@ Global Options:
     --url, -u          Admin API URL (default: http://localhost:8080)
     --admin-key, -k    Admin API key (or set RANVIER_ADMIN_KEY)
     --timeout, -t      Request timeout in seconds (default: 30)
+    --output, -o       Output format: text (default) or json
     --metrics-url      Metrics endpoint URL (or set RANVIER_METRICS_URL)
     --metrics-port     Metrics port override (default: 9180)
     --verbose, -v      Enable verbose output
@@ -84,6 +85,9 @@ Examples:
 
     # Use shorter timeout for faster failure detection
     rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
+
+    # Output as JSON for scripting
+    rvctl --output json inspect backends | jq '.backends[].id'
 """
 
 import argparse
@@ -417,10 +421,15 @@ def cmd_inspect_routes(args):
     if args.prefix:
         url += f"?prefix={args.prefix}"
 
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
     print(f"{Colors.BOLD}Fetching routes from {args.url}...{Colors.RESET}")
     print()
-
-    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
 
     shard_id = data.get('shard_id', 0)
     tree = data.get('tree')
@@ -466,10 +475,15 @@ def cmd_inspect_backends(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/dump/backends"
 
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
     print(f"{Colors.BOLD}Fetching backends from {args.url}...{Colors.RESET}")
     print()
-
-    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
 
     shard_id = data.get('shard_id', 0)
     backends = data.get('backends', [])
@@ -536,10 +550,15 @@ def cmd_cluster_status(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/dump/cluster"
 
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
     print(f"{Colors.BOLD}Fetching cluster status from {args.url}...{Colors.RESET}")
     print()
-
-    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
 
     cluster_enabled = data.get('cluster_enabled', False)
 
@@ -608,9 +627,14 @@ def cmd_drain(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/drain?backend_id={backend_id}"
 
-    print(f"{Colors.BOLD}Initiating drain for backend {backend_id}...{Colors.RESET}")
-
     data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
+    print(f"{Colors.BOLD}Initiating drain for backend {backend_id}...{Colors.RESET}")
 
     status = data.get('status', 'unknown')
     action = data.get('action', 'unknown')
@@ -664,6 +688,13 @@ def cmd_route_add(args):
         timeout=args.timeout
     )
 
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
     status = data.get('status', 'unknown')
 
     if status == 'ok':
@@ -691,9 +722,16 @@ def cmd_route_delete(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/routes?backend_id={backend_id}"
 
-    print(f"{Colors.BOLD}Deleting routes for backend {backend_id}...{Colors.RESET}")
-
     data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Deleting routes for backend {backend_id}...{Colors.RESET}")
 
     status = data.get('status', 'unknown')
 
@@ -712,9 +750,16 @@ def cmd_keys_reload(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/keys/reload"
 
-    print(f"{Colors.BOLD}Reloading API keys...{Colors.RESET}")
-
     data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Reloading API keys...{Colors.RESET}")
 
     status = data.get('status', 'unknown')
 
@@ -735,6 +780,14 @@ def cmd_health(args):
 
     # Health endpoint is public, no auth required
     data = make_request(url, method='GET', timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        status = data.get('status', 'unknown')
+        if status not in ('healthy', 'ok', 'draining'):
+            sys.exit(1)
+        return
 
     status = data.get('status', 'unknown')
     is_draining = data.get('draining', False)
@@ -778,6 +831,15 @@ def cmd_backend_add(args):
 
     url = f"{base_url}/admin/backends?{'&'.join(params)}"
 
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
     print(f"{Colors.BOLD}Registering backend {args.id}...{Colors.RESET}")
     if args.verbose:
         print(f"  Address: {args.ip}:{args.port}")
@@ -785,8 +847,6 @@ def cmd_backend_add(args):
             print(f"  Weight: {args.weight}")
         if args.priority is not None:
             print(f"  Priority: {args.priority}")
-
-    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
     status = data.get('status', 'unknown')
 
@@ -808,9 +868,16 @@ def cmd_backend_delete(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/backends?id={args.id}"
 
-    print(f"{Colors.BOLD}Deleting backend {args.id}...{Colors.RESET}")
-
     data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Deleting backend {args.id}...{Colors.RESET}")
 
     status = data.get('status', 'unknown')
 
@@ -871,6 +938,25 @@ def cmd_inspect_metrics(args):
 
     # Parse and display formatted metrics
     parsed = parse_prometheus_metrics(raw_text)
+
+    # JSON output mode
+    if args.output == 'json':
+        # Convert parsed metrics to JSON-friendly format
+        output = {
+            'metrics': {},
+            'help': parsed.get('help', {}),
+            'type': parsed.get('type', {})
+        }
+        for name, values in parsed['metrics'].items():
+            if args.filter and not re.search(args.filter, name, re.IGNORECASE):
+                continue
+            output['metrics'][name] = [
+                {'labels': labels, 'value': value}
+                for labels, value in values
+            ]
+        print(json.dumps(output, indent=2))
+        return
+
     metrics = parsed['metrics']
 
     # If filter specified, show filtered metrics
@@ -1047,6 +1133,8 @@ def main():
                         help='Enable verbose output')
     parser.add_argument('--timeout', '-t', type=int, default=30,
                         help='Request timeout in seconds (default: 30)')
+    parser.add_argument('--output', '-o', choices=['text', 'json'], default='text',
+                        help='Output format: text (default) or json')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
