@@ -730,6 +730,12 @@ def cmd_drain(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/drain?backend_id={backend_id}"
 
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would drain backend {backend_id}")
+        print(f"  POST {url}")
+        return
+
     data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
     # JSON output mode
@@ -764,13 +770,22 @@ def cmd_route_add(args):
     if args.stdin:
         content = sys.stdin.read()
         if not content:
-            print(f"{Colors.RED}Error:{Colors.RESET} No content provided on stdin", file=sys.stderr)
+            print(f"{Colors.RED}Error:{Colors.RESET} No content provided via stdin", file=sys.stderr)
             sys.exit(1)
     elif args.content:
         content = args.content
     else:
-        print(f"{Colors.RED}Error:{Colors.RESET} Must provide --content or --stdin", file=sys.stderr)
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify --content or --stdin", file=sys.stderr)
         sys.exit(1)
+
+    # Dry-run mode
+    if args.dry_run:
+        content_preview = content[:50] + "..." if len(content) > 50 else content
+        content_preview = content_preview.replace('\n', '\\n')
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would add route for backend {backend_id}")
+        print(f"  POST {url}")
+        print(f"  Content: \"{content_preview}\"")
+        return
 
     content = content.strip()
     if not content:
@@ -825,6 +840,12 @@ def cmd_route_delete(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/routes?backend_id={backend_id}"
 
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would delete routes for backend {backend_id}")
+        print(f"  DELETE {url}")
+        return
+
     data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
 
     # JSON output mode
@@ -852,6 +873,12 @@ def cmd_keys_reload(args):
     """Handle 'keys reload' command."""
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/keys/reload"
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would reload API keys")
+        print(f"  POST {url}")
+        return
 
     data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
@@ -1373,6 +1400,17 @@ def cmd_backend_add(args):
 
     url = f"{base_url}/admin/backends?{'&'.join(params)}"
 
+    # Dry-run mode
+    if args.dry_run:
+        weight = args.weight if args.weight is not None else 100
+        priority = args.priority if args.priority is not None else 0
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would add backend {args.id}")
+        print(f"  POST {url}")
+        print(f"  Address:  {args.ip}:{args.port}")
+        print(f"  Weight:   {weight}")
+        print(f"  Priority: {priority}")
+        return
+
     data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
 
     # JSON output mode
@@ -1409,6 +1447,13 @@ def cmd_backend_delete(args):
     """Handle 'backend delete' command."""
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/backends?id={args.id}"
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would delete backend {args.id}")
+        print(f"  DELETE {url}")
+        print(f"  All associated routes would be removed.")
+        return
 
     data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
 
@@ -1471,6 +1516,16 @@ def cmd_backend_update(args):
 
     new_weight = args.weight if args.weight is not None else current_weight
     new_priority = args.priority if args.priority is not None else current_priority
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would update backend {args.id}")
+        print(f"  Address:  {address}:{port}")
+        if args.weight is not None:
+            print(f"  Weight:   {current_weight} -> {new_weight}")
+        if args.priority is not None:
+            print(f"  Priority: {current_priority} -> {new_priority}")
+        return
 
     # Delete and re-add with new values (Ranvier API doesn't have a direct update)
     # First delete
@@ -1772,7 +1827,7 @@ _rvctl_completions() {
     _init_completion || return
 
     local commands="inspect cluster drain backend route keys health top wait profile export import completion"
-    local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --help -h"
+    local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --dry-run --help -h"
 
     # Determine command position (skip global options)
     local cmd=""
@@ -1782,7 +1837,7 @@ _rvctl_completions() {
             --url|-u|--admin-key|-k|--timeout|-t|--output|-o|--interval|--metrics-url|--metrics-port)
                 ((i++))  # skip option value
                 ;;
-            --watch|-w|--quiet|-q|--verbose|-v|--help|-h)
+            --watch|-w|--quiet|-q|--verbose|-v|--dry-run|--help|-h)
                 ;;  # flag only
             -*)
                 ;;  # unknown option
@@ -1921,6 +1976,7 @@ _rvctl() {
         '--metrics-port[Metrics port]:port'
         '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
         '(-q --quiet)'{-q,--quiet}'[Suppress output (exit code only)]'
+        '--dry-run[Show what would be done without making changes]'
     )
 
     _arguments -C \
@@ -2098,6 +2154,7 @@ complete -c rvctl -l metrics-url -d 'Metrics endpoint URL'
 complete -c rvctl -l metrics-port -d 'Metrics port'
 complete -c rvctl -s v -l verbose -d 'Enable verbose output'
 complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
+complete -c rvctl -l dry-run -d 'Show what would be done without making changes'
 
 # Commands (only when no command is specified yet)
 complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a inspect -d 'Inspect Ranvier state'
@@ -2568,6 +2625,13 @@ def cmd_import(args):
         ]
         url = f"{base_url}/admin/backends?{'&'.join(params)}"
 
+        # Dry-run mode
+        if args.dry_run:
+            imported_count += 1
+            if not args.quiet:
+                print(f"  {Colors.CYAN}[dry-run]{Colors.RESET} Would import backend {bid}: {address}:{port} (weight={weight}, priority={priority})")
+            continue
+
         result = make_request_safe(url, method='POST', admin_key=args.admin_key,
                                     timeout=args.timeout)
 
@@ -2584,7 +2648,9 @@ def cmd_import(args):
     # Summary
     if not args.quiet:
         print()
-        if failed_count == 0:
+        if args.dry_run:
+            print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would import {imported_count} backends")
+        elif failed_count == 0:
             print(f"{Colors.GREEN}Success:{Colors.RESET} Imported {imported_count} backends")
         else:
             print(f"{Colors.YELLOW}Completed:{Colors.RESET} {imported_count} imported, {failed_count} failed")
@@ -2634,6 +2700,8 @@ def main():
                         help='Watch mode: continuously refresh output')
     parser.add_argument('--interval', type=float, default=default_interval,
                         help='Watch refresh interval in seconds (default: 2.0)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be done without making changes')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
