@@ -15,6 +15,7 @@ Usage:
     rvctl backend delete --id <id>
     rvctl route add --backend <id> --content "prompt text"
     rvctl route add --backend <id> --stdin < file.txt
+    rvctl route delete --backend <id>
 
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
@@ -61,6 +62,9 @@ Examples:
 
     # Add a route for a backend (content from stdin)
     echo "System prompt here" | rvctl route add --backend 1 --stdin
+
+    # Delete all routes for a backend
+    rvctl route delete --backend 1
 """
 
 import argparse
@@ -644,6 +648,28 @@ def cmd_route_add(args):
         sys.exit(1)
 
 
+def cmd_route_delete(args):
+    """Handle 'route delete' command."""
+    backend_id = args.backend
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/routes?backend_id={backend_id}"
+
+    print(f"{Colors.BOLD}Deleting routes for backend {backend_id}...{Colors.RESET}")
+
+    data = make_request(url, method='DELETE', admin_key=args.admin_key)
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        routes_deleted = data.get('routes_deleted', 0)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Routes deleted for backend {backend_id}")
+        print(f"  Routes removed: {routes_deleted}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
 def cmd_backend_add(args):
     """Handle 'backend add' command."""
     base_url = args.url.rstrip('/')
@@ -999,6 +1025,11 @@ def main():
     route_add_parser.add_argument('--stdin', '-i', action='store_true',
                                    help='Read content from stdin')
 
+    # route delete
+    route_delete_parser = route_subparsers.add_parser('delete', help='Delete routes for a backend')
+    route_delete_parser.add_argument('--backend', '-b', type=int, required=True,
+                                      help='Backend ID to delete routes for')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1059,6 +1090,8 @@ def main():
 
         if args.route_action == 'add':
             cmd_route_add(args)
+        elif args.route_action == 'delete':
+            cmd_route_delete(args)
         else:
             print(f"Unknown route action: {args.route_action}", file=sys.stderr)
             sys.exit(1)

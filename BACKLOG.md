@@ -590,7 +590,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Low
   _Priority:_ High
 
-- [ ] **Add `rvctl route delete` command**
+- [x] **Add `rvctl route delete` command** ✓
   _Justification:_ Route deletion for a backend requires curl. Enables cleanup workflows.
   _Usage:_ `rvctl route delete --backend <id>`
   _Endpoint:_ DELETE /admin/routes
@@ -1189,7 +1189,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | ✅ Done |
 | **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | ✅ Done |
 | **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | ✅ Done |
-| **P3 - Low** | DX | rvctl: Add `route delete` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `route delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | |
 | **P3 - Low** | DX | rvctl: Add `health` command | Low | |
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | |
