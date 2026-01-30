@@ -19,6 +19,7 @@ Usage:
     rvctl keys reload
     rvctl health
     rvctl top
+    rvctl wait [--healthy] [--quorum] [--backend ID --status STATUS] [--timeout SECS]
     rvctl completion {bash,zsh,fish}
 
 Authentication:
@@ -109,6 +110,21 @@ Examples:
 
     # Dashboard with 1-second refresh interval
     rvctl top --interval 1
+
+    # Wait for server to become healthy (useful in scripts)
+    rvctl wait --healthy
+
+    # Wait for server to be healthy with 60-second timeout
+    rvctl wait --healthy --timeout 60
+
+    # Wait for quorum to be established
+    rvctl wait --quorum
+
+    # Wait for a specific backend to be healthy
+    rvctl wait --backend 1 --status healthy
+
+    # Wait for backend to finish draining
+    rvctl wait --backend 1 --status drained
 
     # Use shorter timeout for faster failure detection
     rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
@@ -1098,6 +1114,166 @@ def cmd_top(args):
         sys.exit(0)
 
 
+def cmd_wait(args):
+    """Handle 'wait' command - wait for a condition to be met."""
+    base_url = args.url.rstrip('/')
+    wait_timeout = args.wait_timeout
+    poll_interval = 1.0  # Check every second
+
+    # Validate arguments
+    has_condition = args.healthy or args.quorum or args.backend is not None
+    if not has_condition:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify at least one condition: --healthy, --quorum, or --backend with --status",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.backend is not None and not args.status:
+        print(f"{Colors.RED}Error:{Colors.RESET} --backend requires --status", file=sys.stderr)
+        sys.exit(1)
+
+    if args.status and args.backend is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} --status requires --backend", file=sys.stderr)
+        sys.exit(1)
+
+    # Build condition description
+    conditions = []
+    if args.healthy:
+        conditions.append("server healthy")
+    if args.quorum:
+        conditions.append("quorum established")
+    if args.backend is not None:
+        conditions.append(f"backend {args.backend} {args.status}")
+
+    condition_desc = " and ".join(conditions)
+
+    if not args.quiet:
+        timeout_str = f" (timeout: {wait_timeout}s)" if wait_timeout else ""
+        print(f"{Colors.BOLD}Waiting for:{Colors.RESET} {condition_desc}{timeout_str}")
+
+    start_time = time.time()
+
+    try:
+        while True:
+            elapsed = time.time() - start_time
+
+            # Check timeout
+            if wait_timeout and elapsed >= wait_timeout:
+                if not args.quiet:
+                    print(f"\n{Colors.RED}Timeout:{Colors.RESET} Condition not met after {wait_timeout}s")
+                sys.exit(1)
+
+            all_conditions_met = True
+            status_parts = []
+
+            # Check --healthy condition
+            if args.healthy:
+                health_data = make_request_safe(f"{base_url}/health", timeout=args.timeout)
+                if health_data:
+                    status = health_data.get('status', 'unknown')
+                    is_healthy = status in ('healthy', 'ok')
+                    if is_healthy:
+                        status_parts.append(f"{Colors.GREEN}healthy{Colors.RESET}")
+                    else:
+                        status_parts.append(f"{Colors.YELLOW}{status}{Colors.RESET}")
+                        all_conditions_met = False
+                else:
+                    status_parts.append(f"{Colors.RED}unreachable{Colors.RESET}")
+                    all_conditions_met = False
+
+            # Check --quorum condition
+            if args.quorum:
+                health_data = make_request_safe(f"{base_url}/health", timeout=args.timeout)
+                if health_data:
+                    quorum_healthy = health_data.get('quorum_healthy')
+                    if quorum_healthy is True:
+                        status_parts.append(f"quorum:{Colors.GREEN}ok{Colors.RESET}")
+                    elif quorum_healthy is False:
+                        status_parts.append(f"quorum:{Colors.YELLOW}degraded{Colors.RESET}")
+                        all_conditions_met = False
+                    else:
+                        # quorum_healthy not in response - maybe not clustered
+                        status_parts.append(f"quorum:{Colors.GRAY}n/a{Colors.RESET}")
+                        # Consider this met if clustering isn't enabled
+                else:
+                    status_parts.append(f"quorum:{Colors.RED}unreachable{Colors.RESET}")
+                    all_conditions_met = False
+
+            # Check --backend --status condition
+            if args.backend is not None:
+                backends_data = make_request_safe(f"{base_url}/admin/dump/backends",
+                                                   admin_key=args.admin_key, timeout=args.timeout)
+                backend_found = False
+                backend_status = "unknown"
+
+                if backends_data:
+                    backends = backends_data.get('backends', [])
+                    for b in backends:
+                        if b.get('id') == args.backend:
+                            backend_found = True
+                            is_dead = b.get('is_dead', False)
+                            is_draining = b.get('is_draining', False)
+
+                            if is_dead:
+                                backend_status = "dead"
+                            elif is_draining:
+                                backend_status = "draining"
+                            else:
+                                backend_status = "healthy"
+                            break
+
+                # Determine if condition is met
+                target_status = args.status.lower()
+                condition_met = False
+
+                if target_status == 'healthy':
+                    condition_met = backend_found and backend_status == 'healthy'
+                elif target_status == 'draining':
+                    condition_met = backend_found and backend_status == 'draining'
+                elif target_status == 'dead':
+                    condition_met = backend_found and backend_status == 'dead'
+                elif target_status == 'drained':
+                    # "drained" means backend is gone or dead (fully drained)
+                    condition_met = not backend_found or backend_status == 'dead'
+                elif target_status == 'gone' or target_status == 'removed':
+                    condition_met = not backend_found
+                else:
+                    print(f"{Colors.RED}Error:{Colors.RESET} Unknown status '{args.status}'. "
+                          f"Valid: healthy, draining, dead, drained, gone", file=sys.stderr)
+                    sys.exit(1)
+
+                if backend_found:
+                    color = Colors.GREEN if condition_met else Colors.YELLOW
+                    status_parts.append(f"backend {args.backend}:{color}{backend_status}{Colors.RESET}")
+                else:
+                    if target_status in ('drained', 'gone', 'removed'):
+                        status_parts.append(f"backend {args.backend}:{Colors.GREEN}gone{Colors.RESET}")
+                    else:
+                        status_parts.append(f"backend {args.backend}:{Colors.GRAY}not found{Colors.RESET}")
+
+                if not condition_met:
+                    all_conditions_met = False
+
+            # Print progress (overwrite line)
+            if not args.quiet:
+                elapsed_str = f"{elapsed:.0f}s"
+                status_str = " | ".join(status_parts)
+                print(f"\r  [{elapsed_str}] {status_str}    ", end='', flush=True)
+
+            # Check if all conditions met
+            if all_conditions_met:
+                if not args.quiet:
+                    print(f"\n{Colors.GREEN}Success:{Colors.RESET} All conditions met after {elapsed:.1f}s")
+                sys.exit(0)
+
+            # Wait before next check
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print(f"\n{Colors.YELLOW}Cancelled{Colors.RESET}")
+        sys.exit(130)  # Standard exit code for Ctrl+C
+
+
 def cmd_backend_add(args):
     """Handle 'backend add' command."""
     base_url = args.url.rstrip('/')
@@ -1415,7 +1591,7 @@ _rvctl_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="inspect cluster drain backend route keys health top completion"
+    local commands="inspect cluster drain backend route keys health top wait completion"
     local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --help -h"
 
     # Determine command position (skip global options)
@@ -1485,6 +1661,9 @@ _rvctl_completions() {
         drain|health|top)
             # No subcommands
             ;;
+        wait)
+            COMPREPLY=($(compgen -W "--healthy --quorum --backend --status --wait-timeout" -- "$cur"))
+            ;;
         "")
             # No command yet - suggest commands and global options
             if [[ "$cur" == -* ]]; then
@@ -1499,6 +1678,9 @@ _rvctl_completions() {
     case "$prev" in
         --output|-o)
             COMPREPLY=($(compgen -W "text json" -- "$cur"))
+            ;;
+        --status)
+            COMPREPLY=($(compgen -W "healthy draining dead drained gone" -- "$cur"))
             ;;
         --url|-u|--admin-key|-k|--metrics-url)
             # No completion for URLs/keys
@@ -1526,6 +1708,7 @@ _rvctl() {
         'keys:API key management'
         'health:Quick health check'
         'top:Real-time dashboard'
+        'wait:Wait for a condition'
         'completion:Generate shell completion scripts'
     )
 
@@ -1639,6 +1822,14 @@ _rvctl() {
                 drain)
                     _arguments '1:backend_id'
                     ;;
+                wait)
+                    _arguments \
+                        '--healthy[Wait for server to be healthy]' \
+                        '--quorum[Wait for quorum to be established]' \
+                        '--backend[Backend ID to wait for]:id' \
+                        '--status[Target backend status]:status:(healthy draining dead drained gone)' \
+                        '--wait-timeout[Maximum wait time in seconds]:seconds'
+                    ;;
             esac
             ;;
     esac
@@ -1667,15 +1858,16 @@ complete -c rvctl -s v -l verbose -d 'Enable verbose output'
 complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
 
 # Commands (only when no command is specified yet)
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a inspect -d 'Inspect Ranvier state'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a cluster -d 'Cluster operations'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a drain -d 'Drain a backend'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a backend -d 'Backend management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a route -d 'Route management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a keys -d 'API key management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a health -d 'Quick health check'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a top -d 'Real-time dashboard'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top completion" -a completion -d 'Generate shell completion scripts'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a top -d 'Real-time dashboard'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a wait -d 'Wait for a condition'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a completion -d 'Generate shell completion scripts'
 
 # inspect subcommands
 complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
@@ -1724,6 +1916,13 @@ complete -c rvctl -n "__fish_seen_subcommand_from keys; and not __fish_seen_subc
 
 # completion subcommands
 complete -c rvctl -n "__fish_seen_subcommand_from completion" -a "bash zsh fish" -d 'Shell type'
+
+# wait options
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l healthy -d 'Wait for server to be healthy'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l quorum -d 'Wait for quorum to be established'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l backend -d 'Backend ID to wait for'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l status -d 'Target backend status' -xa 'healthy draining dead drained gone'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l wait-timeout -d 'Maximum wait time in seconds'
 '''
 
 
@@ -1882,6 +2081,19 @@ def main():
     # top command (real-time dashboard)
     top_parser = subparsers.add_parser('top', help='Real-time dashboard showing health, backends, and metrics')
 
+    # wait command
+    wait_parser = subparsers.add_parser('wait', help='Wait for a condition to be met')
+    wait_parser.add_argument('--healthy', action='store_true',
+                              help='Wait for server to be healthy')
+    wait_parser.add_argument('--quorum', action='store_true',
+                              help='Wait for quorum to be established')
+    wait_parser.add_argument('--backend', type=int,
+                              help='Backend ID to wait for (requires --status)')
+    wait_parser.add_argument('--status', choices=['healthy', 'draining', 'dead', 'drained', 'gone'],
+                              help='Target backend status (requires --backend)')
+    wait_parser.add_argument('--wait-timeout', type=int, default=None,
+                              help='Maximum time to wait in seconds (default: wait forever)')
+
     # completion command
     completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
     completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
@@ -1991,6 +2203,11 @@ def main():
     # Handle top command (has its own internal loop, so skip watch logic)
     elif args.command == 'top':
         cmd_top(args)
+        sys.exit(0)
+
+    # Handle wait command (has its own loop, so skip watch logic)
+    elif args.command == 'wait':
+        cmd_wait(args)
         sys.exit(0)
 
     # Handle completion command (special case - just print and exit)
