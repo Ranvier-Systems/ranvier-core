@@ -606,7 +606,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Low
   _Priority:_ Medium
 
-- [ ] **Add `rvctl health` command**
+- [x] **Add `rvctl health` command** ✓
   _Justification:_ Quick health check without authentication. Useful for scripting and monitoring integration.
   _Usage:_ `rvctl health`
   _Endpoint:_ GET /health (public, no auth required)
@@ -1191,7 +1191,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `route delete` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | ✅ Done |
-| **P3 - Low** | DX | rvctl: Add `health` command | Low | |
+| **P3 - Low** | DX | rvctl: Add `health` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | |
 

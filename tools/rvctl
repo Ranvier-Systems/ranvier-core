@@ -17,6 +17,7 @@ Usage:
     rvctl route add --backend <id> --stdin < file.txt
     rvctl route delete --backend <id>
     rvctl keys reload
+    rvctl health
 
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
@@ -69,6 +70,9 @@ Examples:
 
     # Hot-reload API keys from disk
     rvctl keys reload
+
+    # Quick health check (no auth required)
+    rvctl health
 """
 
 import argparse
@@ -695,6 +699,38 @@ def cmd_keys_reload(args):
         sys.exit(1)
 
 
+def cmd_health(args):
+    """Handle 'health' command."""
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/health"
+
+    # Health endpoint is public, no auth required
+    data = make_request(url, method='GET')
+
+    status = data.get('status', 'unknown')
+    is_healthy = data.get('healthy', False)
+    is_draining = data.get('draining', False)
+
+    if is_healthy:
+        if is_draining:
+            print(f"{Colors.YELLOW}DRAINING{Colors.RESET}")
+            print(f"  Status: {status}")
+            print(f"  Server is healthy but draining (not accepting new connections)")
+        else:
+            print(f"{Colors.GREEN}HEALTHY{Colors.RESET}")
+            print(f"  Status: {status}")
+
+        # Show additional info if available
+        quorum = data.get('quorum_healthy')
+        if quorum is not None:
+            quorum_str = f"{Colors.GREEN}healthy{Colors.RESET}" if quorum else f"{Colors.RED}degraded{Colors.RESET}"
+            print(f"  Quorum: {quorum_str}")
+    else:
+        print(f"{Colors.RED}UNHEALTHY{Colors.RESET}")
+        print(f"  Status: {status}")
+        sys.exit(1)
+
+
 def cmd_backend_add(args):
     """Handle 'backend add' command."""
     base_url = args.url.rstrip('/')
@@ -1062,6 +1098,9 @@ def main():
     # keys reload
     keys_reload_parser = keys_subparsers.add_parser('reload', help='Hot-reload API keys from disk')
 
+    # health command (top-level, no subcommand)
+    health_parser = subparsers.add_parser('health', help='Quick health check (no auth required)')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1139,6 +1178,10 @@ def main():
         else:
             print(f"Unknown keys action: {args.keys_action}", file=sys.stderr)
             sys.exit(1)
+
+    # Handle health command
+    elif args.command == 'health':
+        cmd_health(args)
 
     else:
         print(f"Unknown command: {args.command}", file=sys.stderr)
