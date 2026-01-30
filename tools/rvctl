@@ -25,6 +25,8 @@ Usage:
     rvctl profile use <name>
     rvctl profile show [<name>]
     rvctl profile delete <name>
+    rvctl export [--file <path>]
+    rvctl import [--file <path>] [--stdin]
     rvctl completion {bash,zsh,fish}
 
 Authentication:
@@ -145,6 +147,21 @@ Examples:
 
     # Show current profile details
     rvctl profile show
+
+    # Export current backends and routes to a file
+    rvctl export --file backup.json
+
+    # Export to stdout (for piping)
+    rvctl export > backup.json
+
+    # Import configuration from a file
+    rvctl import --file backup.json
+
+    # Import from stdin
+    cat backup.json | rvctl import --stdin
+
+    # Clone configuration between environments
+    rvctl --url $PROD export | rvctl --url $STAGING import --stdin
 
     # Use shorter timeout for faster failure detection
     rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
@@ -1611,7 +1628,7 @@ _rvctl_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="inspect cluster drain backend route keys health top wait profile completion"
+    local commands="inspect cluster drain backend route keys health top wait profile export import completion"
     local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --help -h"
 
     # Determine command position (skip global options)
@@ -1691,6 +1708,12 @@ _rvctl_completions() {
                 COMPREPLY=($(compgen -W "--url --admin-key --metrics-url --metrics-port --timeout --force" -- "$cur"))
             fi
             ;;
+        export)
+            COMPREPLY=($(compgen -W "--file -f" -- "$cur"))
+            ;;
+        import)
+            COMPREPLY=($(compgen -W "--file -f --stdin" -- "$cur"))
+            ;;
         "")
             # No command yet - suggest commands and global options
             if [[ "$cur" == -* ]]; then
@@ -1737,6 +1760,8 @@ _rvctl() {
         'top:Real-time dashboard'
         'wait:Wait for a condition'
         'profile:Manage server profiles'
+        'export:Export backends and routes'
+        'import:Import backends and routes'
         'completion:Generate shell completion scripts'
     )
 
@@ -1887,6 +1912,14 @@ _rvctl() {
                         esac
                     fi
                     ;;
+                export)
+                    _arguments '(-f --file)'{-f,--file}'[Output file]:file:_files'
+                    ;;
+                import)
+                    _arguments \
+                        '(-f --file)'{-f,--file}'[Input file]:file:_files' \
+                        '--stdin[Read from stdin]'
+                    ;;
             esac
             ;;
     esac
@@ -1915,17 +1948,19 @@ complete -c rvctl -s v -l verbose -d 'Enable verbose output'
 complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
 
 # Commands (only when no command is specified yet)
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a inspect -d 'Inspect Ranvier state'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a cluster -d 'Cluster operations'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a drain -d 'Drain a backend'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a backend -d 'Backend management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a route -d 'Route management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a keys -d 'API key management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a health -d 'Quick health check'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a top -d 'Real-time dashboard'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a wait -d 'Wait for a condition'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a profile -d 'Manage server profiles'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a completion -d 'Generate shell completion scripts'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a top -d 'Real-time dashboard'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a wait -d 'Wait for a condition'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a profile -d 'Manage server profiles'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a export -d 'Export backends and routes'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a import -d 'Import backends and routes'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import completion" -a completion -d 'Generate shell completion scripts'
 
 # inspect subcommands
 complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
@@ -1996,6 +2031,13 @@ complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subco
 complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l metrics-port -d 'Metrics port'
 complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l timeout -d 'Default timeout'
 complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -s f -l force -d 'Overwrite existing profile'
+
+# export options
+complete -c rvctl -n "__fish_seen_subcommand_from export" -s f -l file -d 'Output file' -r
+
+# import options
+complete -c rvctl -n "__fish_seen_subcommand_from import" -s f -l file -d 'Input file' -r
+complete -c rvctl -n "__fish_seen_subcommand_from import" -l stdin -d 'Read from stdin'
 '''
 
 
@@ -2245,6 +2287,154 @@ def cmd_profile_delete(args, config: Dict[str, Any]):
         print(f"{Colors.GREEN}Success:{Colors.RESET} Deleted profile '{name}'")
 
 
+def cmd_export(args):
+    """Handle 'export' command - export backends and routes."""
+    base_url = args.url.rstrip('/')
+
+    # Fetch backends
+    backends_data = make_request_safe(
+        f"{base_url}/admin/dump/backends",
+        admin_key=args.admin_key,
+        timeout=args.timeout
+    )
+
+    if backends_data is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to fetch backends", file=sys.stderr)
+        sys.exit(1)
+
+    # Fetch routes (tree)
+    routes_data = make_request_safe(
+        f"{base_url}/admin/dump/tree",
+        admin_key=args.admin_key,
+        timeout=args.timeout
+    )
+
+    if routes_data is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to fetch routes", file=sys.stderr)
+        sys.exit(1)
+
+    # Build export data
+    export_data = {
+        'version': 1,
+        'exported_at': datetime.now().isoformat(),
+        'source_url': args.url,
+        'backends': backends_data.get('backends', []),
+        'routes': routes_data
+    }
+
+    output_json = json.dumps(export_data, indent=2)
+
+    # Write to file or stdout
+    if args.export_file:
+        try:
+            with open(args.export_file, 'w') as f:
+                f.write(output_json)
+            if not args.quiet:
+                backend_count = len(export_data['backends'])
+                print(f"{Colors.GREEN}Success:{Colors.RESET} Exported {backend_count} backends to {args.export_file}")
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to write to {args.export_file}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(output_json)
+
+
+def cmd_import(args):
+    """Handle 'import' command - import backends and routes."""
+    base_url = args.url.rstrip('/')
+
+    # Read import data
+    if args.import_stdin:
+        import_text = sys.stdin.read()
+    elif args.import_file:
+        try:
+            with open(args.import_file, 'r') as f:
+                import_text = f.read()
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to read {args.import_file}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify --file or --stdin", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse JSON
+    try:
+        import_data = json.loads(import_text)
+    except json.JSONDecodeError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} Invalid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate format
+    if 'backends' not in import_data:
+        print(f"{Colors.RED}Error:{Colors.RESET} Invalid export format: missing 'backends' key",
+              file=sys.stderr)
+        sys.exit(1)
+
+    backends = import_data.get('backends', [])
+
+    if not args.quiet:
+        print(f"{Colors.BOLD}Importing configuration...{Colors.RESET}")
+        if import_data.get('source_url'):
+            print(f"  Source: {import_data['source_url']}")
+        if import_data.get('exported_at'):
+            print(f"  Exported: {import_data['exported_at']}")
+        print(f"  Backends: {len(backends)}")
+        print()
+
+    # Import backends
+    imported_count = 0
+    failed_count = 0
+
+    for backend in backends:
+        bid = backend.get('id')
+        address = backend.get('address')
+        port = backend.get('port')
+        weight = backend.get('weight', 100)
+        priority = backend.get('priority', 0)
+
+        if bid is None or address is None or port is None:
+            if not args.quiet:
+                print(f"  {Colors.YELLOW}Skipping:{Colors.RESET} Invalid backend (missing id/address/port)")
+            failed_count += 1
+            continue
+
+        # Build URL for backend add
+        params = [
+            f"id={bid}",
+            f"ip={address}",
+            f"port={port}",
+            f"weight={weight}",
+            f"priority={priority}"
+        ]
+        url = f"{base_url}/admin/backends?{'&'.join(params)}"
+
+        result = make_request_safe(url, method='POST', admin_key=args.admin_key,
+                                    timeout=args.timeout)
+
+        if result and result.get('status') == 'ok':
+            imported_count += 1
+            if not args.quiet:
+                print(f"  {Colors.GREEN}✓{Colors.RESET} Backend {bid}: {address}:{port}")
+        else:
+            failed_count += 1
+            if not args.quiet:
+                error = result.get('error', 'unknown error') if result else 'connection failed'
+                print(f"  {Colors.RED}✗{Colors.RESET} Backend {bid}: {error}")
+
+    # Summary
+    if not args.quiet:
+        print()
+        if failed_count == 0:
+            print(f"{Colors.GREEN}Success:{Colors.RESET} Imported {imported_count} backends")
+        else:
+            print(f"{Colors.YELLOW}Completed:{Colors.RESET} {imported_count} imported, {failed_count} failed")
+
+    if failed_count > 0:
+        sys.exit(1)
+
+
 def main():
     # Load config file (priority: CLI args > env vars > active profile > base config > defaults)
     raw_config = load_config()
@@ -2423,6 +2613,18 @@ def main():
     profile_delete_parser = profile_subparsers.add_parser('delete', help='Delete a profile')
     profile_delete_parser.add_argument('profile_name', help='Profile name to delete')
 
+    # export command
+    export_parser = subparsers.add_parser('export', help='Export backends and routes to JSON')
+    export_parser.add_argument('--file', '-f', dest='export_file',
+                                help='Output file (default: stdout)')
+
+    # import command
+    import_parser = subparsers.add_parser('import', help='Import backends and routes from JSON')
+    import_parser.add_argument('--file', '-f', dest='import_file',
+                                help='Input file')
+    import_parser.add_argument('--stdin', dest='import_stdin', action='store_true',
+                                help='Read from stdin')
+
     # completion command
     completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
     completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
@@ -2558,6 +2760,16 @@ def main():
         else:
             print(f"Unknown profile action: {args.profile_action}", file=sys.stderr)
             sys.exit(1)
+        sys.exit(0)
+
+    # Handle export command
+    elif args.command == 'export':
+        cmd_export(args)
+        sys.exit(0)
+
+    # Handle import command
+    elif args.command == 'import':
+        cmd_import(args)
         sys.exit(0)
 
     # Handle completion command (special case - just print and exit)
