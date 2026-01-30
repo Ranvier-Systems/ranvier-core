@@ -18,6 +18,7 @@ Usage:
     rvctl route delete --backend <id>
     rvctl keys reload
     rvctl health
+    rvctl completion {bash,zsh,fish}
 
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
@@ -96,6 +97,15 @@ Examples:
 
     # Watch health continuously
     rvctl -w health
+
+    # Enable shell completions (bash)
+    eval "$(rvctl completion bash)"
+
+    # Enable shell completions (zsh)
+    eval "$(rvctl completion zsh)"
+
+    # Enable shell completions (fish)
+    rvctl completion fish > ~/.config/fish/completions/rvctl.fish
 """
 
 import argparse
@@ -1121,6 +1131,332 @@ def cmd_inspect_metrics(args):
     print(f"{Colors.GRAY}Use --raw for full Prometheus output, --filter <pattern> to search{Colors.RESET}")
 
 
+def print_completion_script(shell: str):
+    """Print shell completion script for the specified shell."""
+    if shell == 'bash':
+        print(BASH_COMPLETION)
+    elif shell == 'zsh':
+        print(ZSH_COMPLETION)
+    elif shell == 'fish':
+        print(FISH_COMPLETION)
+
+
+BASH_COMPLETION = r'''# rvctl bash completion
+# Add to ~/.bashrc: eval "$(rvctl completion bash)"
+# Or save to /etc/bash_completion.d/rvctl
+
+_rvctl_completions() {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="inspect cluster drain backend route keys health completion"
+    local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --metrics-url --metrics-port --verbose -v --help -h"
+
+    # Determine command position (skip global options)
+    local cmd=""
+    local cmd_index=0
+    for ((i=1; i < cword; i++)); do
+        case "${words[i]}" in
+            --url|-u|--admin-key|-k|--timeout|-t|--output|-o|--interval|--metrics-url|--metrics-port)
+                ((i++))  # skip option value
+                ;;
+            --watch|-w|--verbose|-v|--help|-h)
+                ;;  # flag only
+            -*)
+                ;;  # unknown option
+            *)
+                if [[ -z "$cmd" ]]; then
+                    cmd="${words[i]}"
+                    cmd_index=$i
+                fi
+                ;;
+        esac
+    done
+
+    case "$cmd" in
+        inspect)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "routes backends metrics" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "routes" ]]; then
+                COMPREPLY=($(compgen -W "--prefix -p --shard -s" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "metrics" ]]; then
+                COMPREPLY=($(compgen -W "--raw -r --filter -f" -- "$cur"))
+            fi
+            ;;
+        cluster)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "status" -- "$cur"))
+            fi
+            ;;
+        backend)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "add delete" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
+                COMPREPLY=($(compgen -W "--id --ip --port --weight --priority" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "delete" ]]; then
+                COMPREPLY=($(compgen -W "--id" -- "$cur"))
+            fi
+            ;;
+        route)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "add delete" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
+                COMPREPLY=($(compgen -W "--backend -b --content -c --stdin -i" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "delete" ]]; then
+                COMPREPLY=($(compgen -W "--backend -b" -- "$cur"))
+            fi
+            ;;
+        keys)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "reload" -- "$cur"))
+            fi
+            ;;
+        completion)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            fi
+            ;;
+        drain|health)
+            # No subcommands
+            ;;
+        "")
+            # No command yet - suggest commands and global options
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "$global_opts" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+            fi
+            ;;
+    esac
+
+    # Handle option value completions
+    case "$prev" in
+        --output|-o)
+            COMPREPLY=($(compgen -W "text json" -- "$cur"))
+            ;;
+        --url|-u|--admin-key|-k|--metrics-url)
+            # No completion for URLs/keys
+            ;;
+    esac
+}
+
+complete -F _rvctl_completions rvctl
+'''
+
+ZSH_COMPLETION = r'''#compdef rvctl
+# rvctl zsh completion
+# Add to ~/.zshrc: eval "$(rvctl completion zsh)"
+# Or save to a file in your $fpath
+
+_rvctl() {
+    local -a commands global_opts
+
+    commands=(
+        'inspect:Inspect Ranvier state'
+        'cluster:Cluster operations'
+        'drain:Drain a backend'
+        'backend:Backend management'
+        'route:Route management'
+        'keys:API key management'
+        'health:Quick health check'
+        'completion:Generate shell completion scripts'
+    )
+
+    global_opts=(
+        '(-u --url)'{-u,--url}'[Ranvier Admin API URL]:url'
+        '(-k --admin-key)'{-k,--admin-key}'[Admin API key]:key'
+        '(-t --timeout)'{-t,--timeout}'[Request timeout in seconds]:seconds'
+        '(-o --output)'{-o,--output}'[Output format]:format:(text json)'
+        '(-w --watch)'{-w,--watch}'[Watch mode]'
+        '--interval[Watch refresh interval]:seconds'
+        '--metrics-url[Metrics endpoint URL]:url'
+        '--metrics-port[Metrics port]:port'
+        '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
+    )
+
+    _arguments -C \
+        $global_opts \
+        '1:command:->command' \
+        '*::arg:->args'
+
+    case "$state" in
+        command)
+            _describe -t commands 'rvctl commands' commands
+            ;;
+        args)
+            case "$words[1]" in
+                inspect)
+                    local -a inspect_targets
+                    inspect_targets=(
+                        'routes:Inspect radix tree routes'
+                        'backends:Inspect backend status'
+                        'metrics:Inspect Prometheus metrics'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t targets 'inspect targets' inspect_targets
+                    else
+                        case "$words[2]" in
+                            routes)
+                                _arguments \
+                                    '(-p --prefix)'{-p,--prefix}'[Filter by prefix]:prefix' \
+                                    '(-s --shard)'{-s,--shard}'[Query specific shard]:shard'
+                                ;;
+                            metrics)
+                                _arguments \
+                                    '(-r --raw)'{-r,--raw}'[Output raw Prometheus format]' \
+                                    '(-f --filter)'{-f,--filter}'[Filter metrics by pattern]:pattern'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                cluster)
+                    local -a cluster_actions
+                    cluster_actions=('status:Show cluster status')
+                    _describe -t actions 'cluster actions' cluster_actions
+                    ;;
+                backend)
+                    local -a backend_actions
+                    backend_actions=(
+                        'add:Register a new backend'
+                        'delete:Remove a backend'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t actions 'backend actions' backend_actions
+                    else
+                        case "$words[2]" in
+                            add)
+                                _arguments \
+                                    '--id[Backend ID]:id' \
+                                    '--ip[Backend IP/hostname]:ip' \
+                                    '--port[Backend port]:port' \
+                                    '--weight[Load balancing weight]:weight' \
+                                    '--priority[Routing priority]:priority'
+                                ;;
+                            delete)
+                                _arguments '--id[Backend ID]:id'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                route)
+                    local -a route_actions
+                    route_actions=(
+                        'add:Add a route for a backend'
+                        'delete:Delete routes for a backend'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t actions 'route actions' route_actions
+                    else
+                        case "$words[2]" in
+                            add)
+                                _arguments \
+                                    '(-b --backend)'{-b,--backend}'[Backend ID]:id' \
+                                    '(-c --content)'{-c,--content}'[Content/prompt]:content' \
+                                    '(-i --stdin)'{-i,--stdin}'[Read content from stdin]'
+                                ;;
+                            delete)
+                                _arguments '(-b --backend)'{-b,--backend}'[Backend ID]:id'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                keys)
+                    local -a keys_actions
+                    keys_actions=('reload:Hot-reload API keys from disk')
+                    _describe -t actions 'keys actions' keys_actions
+                    ;;
+                completion)
+                    _arguments '1:shell:(bash zsh fish)'
+                    ;;
+                drain)
+                    _arguments '1:backend_id'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_rvctl "$@"
+'''
+
+FISH_COMPLETION = r'''# rvctl fish completion
+# Add to ~/.config/fish/completions/rvctl.fish
+# Or run: rvctl completion fish > ~/.config/fish/completions/rvctl.fish
+
+# Disable file completion by default
+complete -c rvctl -f
+
+# Global options
+complete -c rvctl -s u -l url -d 'Ranvier Admin API URL'
+complete -c rvctl -s k -l admin-key -d 'Admin API key'
+complete -c rvctl -s t -l timeout -d 'Request timeout in seconds'
+complete -c rvctl -s o -l output -d 'Output format' -xa 'text json'
+complete -c rvctl -s w -l watch -d 'Watch mode'
+complete -c rvctl -l interval -d 'Watch refresh interval in seconds'
+complete -c rvctl -l metrics-url -d 'Metrics endpoint URL'
+complete -c rvctl -l metrics-port -d 'Metrics port'
+complete -c rvctl -s v -l verbose -d 'Enable verbose output'
+
+# Commands (only when no command is specified yet)
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health completion" -a completion -d 'Generate shell completion scripts'
+
+# inspect subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
+complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a backends -d 'Inspect backend status'
+complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a metrics -d 'Inspect Prometheus metrics'
+
+# inspect routes options
+complete -c rvctl -n "__fish_seen_subcommand_from routes" -s p -l prefix -d 'Filter by prefix'
+complete -c rvctl -n "__fish_seen_subcommand_from routes" -s s -l shard -d 'Query specific shard'
+
+# inspect metrics options
+complete -c rvctl -n "__fish_seen_subcommand_from metrics" -s r -l raw -d 'Output raw Prometheus format'
+complete -c rvctl -n "__fish_seen_subcommand_from metrics" -s f -l filter -d 'Filter metrics by pattern'
+
+# cluster subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from cluster; and not __fish_seen_subcommand_from status" -a status -d 'Show cluster status'
+
+# backend subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add delete" -a add -d 'Register a new backend'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add delete" -a delete -d 'Remove a backend'
+
+# backend add options
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l id -d 'Backend ID'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l ip -d 'Backend IP/hostname'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l port -d 'Backend port'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l weight -d 'Load balancing weight'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l priority -d 'Routing priority'
+
+# backend delete options
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from delete" -l id -d 'Backend ID'
+
+# route subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from route; and not __fish_seen_subcommand_from add delete" -a add -d 'Add a route for a backend'
+complete -c rvctl -n "__fish_seen_subcommand_from route; and not __fish_seen_subcommand_from add delete" -a delete -d 'Delete routes for a backend'
+
+# route add options
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from add" -s b -l backend -d 'Backend ID'
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from add" -s c -l content -d 'Content/prompt'
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from add" -s i -l stdin -d 'Read content from stdin'
+
+# route delete options
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from delete" -s b -l backend -d 'Backend ID'
+
+# keys subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from keys; and not __fish_seen_subcommand_from reload" -a reload -d 'Hot-reload API keys from disk'
+
+# completion subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from completion" -a "bash zsh fish" -d 'Shell type'
+'''
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
@@ -1233,6 +1569,11 @@ def main():
     # health command (top-level, no subcommand)
     health_parser = subparsers.add_parser('health', help='Quick health check (no auth required)')
 
+    # completion command
+    completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
+    completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
+                                    help='Shell type for completion script')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1329,6 +1670,11 @@ def main():
     elif args.command == 'health':
         cmd_func = cmd_health
         supports_watch = True
+
+    # Handle completion command (special case - just print and exit)
+    elif args.command == 'completion':
+        print_completion_script(args.shell)
+        sys.exit(0)
 
     else:
         print(f"Unknown command: {args.command}", file=sys.stderr)

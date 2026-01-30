@@ -798,6 +798,27 @@ rvctl -o json inspect backends | jq '.backends[].id'
 rvctl -o json health
 ```
 
+### Shell Completions
+
+Generate shell completion scripts for tab-completion of commands and options:
+
+```bash
+# Bash - add to ~/.bashrc
+eval "$(rvctl completion bash)"
+
+# Zsh - add to ~/.zshrc
+eval "$(rvctl completion zsh)"
+
+# Fish - save to completions directory
+rvctl completion fish > ~/.config/fish/completions/rvctl.fish
+```
+
+After enabling completions, you can use `Tab` to complete:
+- Commands: `rvctl ins<Tab>` → `rvctl inspect`
+- Subcommands: `rvctl inspect b<Tab>` → `rvctl inspect backends`
+- Options: `rvctl --out<Tab>` → `rvctl --output`
+- Option values: `rvctl --output <Tab>` → `text json`
+
 ### Environment Variables
 
 | Variable | Description |
