@@ -27,6 +27,8 @@ Global Options:
     --admin-key, -k    Admin API key (or set RANVIER_ADMIN_KEY)
     --timeout, -t      Request timeout in seconds (default: 30)
     --output, -o       Output format: text (default) or json
+    --watch, -w        Watch mode: continuously refresh output
+    --interval         Watch refresh interval in seconds (default: 2.0)
     --metrics-url      Metrics endpoint URL (or set RANVIER_METRICS_URL)
     --metrics-port     Metrics port override (default: 9180)
     --verbose, -v      Enable verbose output
@@ -88,6 +90,12 @@ Examples:
 
     # Output as JSON for scripting
     rvctl --output json inspect backends | jq '.backends[].id'
+
+    # Watch backend status with 1-second refresh
+    rvctl --watch --interval 1 inspect backends
+
+    # Watch health continuously
+    rvctl -w health
 """
 
 import argparse
@@ -95,6 +103,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -1135,6 +1144,10 @@ def main():
                         help='Request timeout in seconds (default: 30)')
     parser.add_argument('--output', '-o', choices=['text', 'json'], default='text',
                         help='Output format: text (default) or json')
+    parser.add_argument('--watch', '-w', action='store_true',
+                        help='Watch mode: continuously refresh output')
+    parser.add_argument('--interval', type=float, default=2.0,
+                        help='Watch refresh interval in seconds (default: 2.0)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -1226,6 +1239,10 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # Determine the command function and whether it supports watch mode
+    cmd_func = None
+    supports_watch = False
+
     # Handle inspect command
     if args.command == 'inspect':
         if not args.inspect_target:
@@ -1233,11 +1250,14 @@ def main():
             sys.exit(1)
 
         if args.inspect_target == 'routes':
-            cmd_inspect_routes(args)
+            cmd_func = cmd_inspect_routes
+            supports_watch = True
         elif args.inspect_target == 'backends':
-            cmd_inspect_backends(args)
+            cmd_func = cmd_inspect_backends
+            supports_watch = True
         elif args.inspect_target == 'metrics':
-            cmd_inspect_metrics(args)
+            cmd_func = cmd_inspect_metrics
+            supports_watch = True
         else:
             print(f"Unknown inspect target: {args.inspect_target}", file=sys.stderr)
             sys.exit(1)
@@ -1249,14 +1269,16 @@ def main():
             sys.exit(1)
 
         if args.cluster_action == 'status':
-            cmd_cluster_status(args)
+            cmd_func = cmd_cluster_status
+            supports_watch = True
         else:
             print(f"Unknown cluster action: {args.cluster_action}", file=sys.stderr)
             sys.exit(1)
 
-    # Handle drain command
+    # Handle drain command (mutation - no watch)
     elif args.command == 'drain':
-        cmd_drain(args)
+        cmd_func = cmd_drain
+        supports_watch = False
 
     # Handle backend command
     elif args.command == 'backend':
@@ -1265,9 +1287,11 @@ def main():
             sys.exit(1)
 
         if args.backend_action == 'add':
-            cmd_backend_add(args)
+            cmd_func = cmd_backend_add
+            supports_watch = False  # mutation
         elif args.backend_action == 'delete':
-            cmd_backend_delete(args)
+            cmd_func = cmd_backend_delete
+            supports_watch = False  # mutation
         else:
             print(f"Unknown backend action: {args.backend_action}", file=sys.stderr)
             sys.exit(1)
@@ -1279,9 +1303,11 @@ def main():
             sys.exit(1)
 
         if args.route_action == 'add':
-            cmd_route_add(args)
+            cmd_func = cmd_route_add
+            supports_watch = False  # mutation
         elif args.route_action == 'delete':
-            cmd_route_delete(args)
+            cmd_func = cmd_route_delete
+            supports_watch = False  # mutation
         else:
             print(f"Unknown route action: {args.route_action}", file=sys.stderr)
             sys.exit(1)
@@ -1293,18 +1319,69 @@ def main():
             sys.exit(1)
 
         if args.keys_action == 'reload':
-            cmd_keys_reload(args)
+            cmd_func = cmd_keys_reload
+            supports_watch = False  # mutation
         else:
             print(f"Unknown keys action: {args.keys_action}", file=sys.stderr)
             sys.exit(1)
 
     # Handle health command
     elif args.command == 'health':
-        cmd_health(args)
+        cmd_func = cmd_health
+        supports_watch = True
 
     else:
         print(f"Unknown command: {args.command}", file=sys.stderr)
         sys.exit(1)
+
+    # Check watch mode compatibility
+    if args.watch and not supports_watch:
+        print(f"{Colors.RED}Error:{Colors.RESET} --watch is not supported for mutation commands", file=sys.stderr)
+        sys.exit(1)
+
+    # Execute command (with optional watch loop)
+    if args.watch:
+        run_watch_loop(cmd_func, args)
+    else:
+        cmd_func(args)
+
+
+def run_watch_loop(cmd_func, args):
+    """Run a command repeatedly in watch mode."""
+    interval = args.interval
+    iteration = 0
+
+    try:
+        while True:
+            iteration += 1
+
+            # Clear screen (ANSI escape code)
+            print('\033[2J\033[H', end='')
+
+            # Print header with timestamp
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cmd_desc = f"{args.command}"
+            if hasattr(args, 'inspect_target') and args.inspect_target:
+                cmd_desc += f" {args.inspect_target}"
+            elif hasattr(args, 'cluster_action') and args.cluster_action:
+                cmd_desc += f" {args.cluster_action}"
+
+            print(f"{Colors.GRAY}Every {interval}s: rvctl {cmd_desc} | {timestamp}{Colors.RESET}")
+            print()
+
+            try:
+                cmd_func(args)
+            except SystemExit:
+                # Command called sys.exit() on error - continue watching
+                pass
+
+            # Wait for next iteration
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        # Clean exit on Ctrl+C
+        print(f"\n{Colors.GRAY}Watch stopped.{Colors.RESET}")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
