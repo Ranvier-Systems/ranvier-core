@@ -20,6 +20,11 @@ Usage:
     rvctl health
     rvctl top
     rvctl wait [--healthy] [--quorum] [--backend ID --status STATUS] [--timeout SECS]
+    rvctl profile list
+    rvctl profile add <name> --url <url> [--admin-key <key>] [--metrics-url <url>]
+    rvctl profile use <name>
+    rvctl profile show [<name>]
+    rvctl profile delete <name>
     rvctl completion {bash,zsh,fish}
 
 Authentication:
@@ -125,6 +130,21 @@ Examples:
 
     # Wait for backend to finish draining
     rvctl wait --backend 1 --status drained
+
+    # Create a profile for production environment
+    rvctl profile add prod --url https://ranvier.prod.example.com --admin-key $PROD_KEY
+
+    # Create a profile for staging
+    rvctl profile add staging --url https://ranvier.staging.example.com
+
+    # Switch to production profile
+    rvctl profile use prod
+
+    # List all profiles
+    rvctl profile list
+
+    # Show current profile details
+    rvctl profile show
 
     # Use shorter timeout for faster failure detection
     rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
@@ -1591,7 +1611,7 @@ _rvctl_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="inspect cluster drain backend route keys health top wait completion"
+    local commands="inspect cluster drain backend route keys health top wait profile completion"
     local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --help -h"
 
     # Determine command position (skip global options)
@@ -1664,6 +1684,13 @@ _rvctl_completions() {
         wait)
             COMPREPLY=($(compgen -W "--healthy --quorum --backend --status --wait-timeout" -- "$cur"))
             ;;
+        profile)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "list add use show delete" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
+                COMPREPLY=($(compgen -W "--url --admin-key --metrics-url --metrics-port --timeout --force" -- "$cur"))
+            fi
+            ;;
         "")
             # No command yet - suggest commands and global options
             if [[ "$cur" == -* ]]; then
@@ -1709,6 +1736,7 @@ _rvctl() {
         'health:Quick health check'
         'top:Real-time dashboard'
         'wait:Wait for a condition'
+        'profile:Manage server profiles'
         'completion:Generate shell completion scripts'
     )
 
@@ -1830,6 +1858,35 @@ _rvctl() {
                         '--status[Target backend status]:status:(healthy draining dead drained gone)' \
                         '--wait-timeout[Maximum wait time in seconds]:seconds'
                     ;;
+                profile)
+                    local -a profile_actions
+                    profile_actions=(
+                        'list:List all profiles'
+                        'add:Add a new profile'
+                        'use:Switch to a profile'
+                        'show:Show profile details'
+                        'delete:Delete a profile'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t actions 'profile actions' profile_actions
+                    else
+                        case "$words[2]" in
+                            add)
+                                _arguments \
+                                    '1:profile name' \
+                                    '--url[Ranvier Admin API URL]:url' \
+                                    '--admin-key[Admin API key]:key' \
+                                    '--metrics-url[Metrics endpoint URL]:url' \
+                                    '--metrics-port[Metrics port]:port' \
+                                    '--timeout[Default timeout]:seconds' \
+                                    '(-f --force)'{-f,--force}'[Overwrite existing profile]'
+                                ;;
+                            use|show|delete)
+                                _arguments '1:profile name'
+                                ;;
+                        esac
+                    fi
+                    ;;
             esac
             ;;
     esac
@@ -1858,16 +1915,17 @@ complete -c rvctl -s v -l verbose -d 'Enable verbose output'
 complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
 
 # Commands (only when no command is specified yet)
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a inspect -d 'Inspect Ranvier state'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a cluster -d 'Cluster operations'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a drain -d 'Drain a backend'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a backend -d 'Backend management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a route -d 'Route management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a keys -d 'API key management'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a health -d 'Quick health check'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a top -d 'Real-time dashboard'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a wait -d 'Wait for a condition'
-complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait completion" -a completion -d 'Generate shell completion scripts'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a top -d 'Real-time dashboard'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a wait -d 'Wait for a condition'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a profile -d 'Manage server profiles'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile completion" -a completion -d 'Generate shell completion scripts'
 
 # inspect subcommands
 complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
@@ -1923,7 +1981,35 @@ complete -c rvctl -n "__fish_seen_subcommand_from wait" -l quorum -d 'Wait for q
 complete -c rvctl -n "__fish_seen_subcommand_from wait" -l backend -d 'Backend ID to wait for'
 complete -c rvctl -n "__fish_seen_subcommand_from wait" -l status -d 'Target backend status' -xa 'healthy draining dead drained gone'
 complete -c rvctl -n "__fish_seen_subcommand_from wait" -l wait-timeout -d 'Maximum wait time in seconds'
+
+# profile subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a list -d 'List all profiles'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a add -d 'Add a new profile'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a use -d 'Switch to a profile'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a show -d 'Show profile details'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a delete -d 'Delete a profile'
+
+# profile add options
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l url -d 'Ranvier Admin API URL'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l admin-key -d 'Admin API key'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l metrics-url -d 'Metrics endpoint URL'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l metrics-port -d 'Metrics port'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l timeout -d 'Default timeout'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -s f -l force -d 'Overwrite existing profile'
 '''
+
+
+def get_config_path() -> str:
+    """Get the path to the config file, creating directory if needed."""
+    config_dir = os.path.expanduser('~/.config/rvctl')
+    config_path = os.path.join(config_dir, 'config.json')
+
+    # Also check legacy path
+    legacy_path = os.path.expanduser('~/.rvctl.json')
+    if os.path.exists(legacy_path) and not os.path.exists(config_path):
+        return legacy_path
+
+    return config_path
 
 
 def load_config() -> Dict[str, Any]:
@@ -1953,9 +2039,216 @@ def load_config() -> Dict[str, Any]:
     return {}
 
 
+def save_config(config: Dict[str, Any]) -> bool:
+    """Save configuration to config file."""
+    config_path = get_config_path()
+    config_dir = os.path.dirname(config_path)
+
+    try:
+        # Create config directory if it doesn't exist
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir, mode=0o700)
+
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        return True
+    except IOError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to save config to {config_path}: {e}",
+              file=sys.stderr)
+        return False
+
+
+def get_active_profile(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Get the currently active profile settings."""
+    active_name = config.get('active_profile')
+    if not active_name:
+        return None
+
+    profiles = config.get('profiles', {})
+    return profiles.get(active_name)
+
+
+def get_effective_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Get effective configuration, merging active profile with base config."""
+    # Start with base config (excluding profiles metadata)
+    effective = {k: v for k, v in config.items()
+                 if k not in ('profiles', 'active_profile')}
+
+    # Overlay active profile settings
+    active_profile = get_active_profile(config)
+    if active_profile:
+        effective.update(active_profile)
+
+    return effective
+
+
+def cmd_profile_list(args, config: Dict[str, Any]):
+    """Handle 'profile list' command."""
+    profiles = config.get('profiles', {})
+    active_name = config.get('active_profile')
+
+    if args.output == 'json':
+        output = {
+            'profiles': list(profiles.keys()),
+            'active': active_name
+        }
+        print(json.dumps(output, indent=2))
+        return
+
+    if not profiles:
+        print(f"{Colors.GRAY}(no profiles configured){Colors.RESET}")
+        print()
+        print(f"Create a profile with: rvctl profile add <name> --url <url>")
+        return
+
+    print(f"{Colors.BOLD}Profiles{Colors.RESET}")
+    print("─" * 50)
+
+    for name, profile in sorted(profiles.items()):
+        if name == active_name:
+            marker = f"{Colors.GREEN}*{Colors.RESET}"
+            name_display = f"{Colors.GREEN}{name}{Colors.RESET}"
+        else:
+            marker = " "
+            name_display = name
+
+        url = profile.get('url', '(no url)')
+        print(f"  {marker} {name_display:<15} {url}")
+
+    print()
+    if active_name:
+        print(f"Active profile: {Colors.GREEN}{active_name}{Colors.RESET}")
+    else:
+        print(f"No active profile. Use: rvctl profile use <name>")
+
+
+def cmd_profile_add(args, config: Dict[str, Any]):
+    """Handle 'profile add' command."""
+    name = args.profile_name
+
+    # Initialize profiles dict if needed
+    if 'profiles' not in config:
+        config['profiles'] = {}
+
+    # Check if profile already exists
+    if name in config['profiles'] and not args.force:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' already exists. Use --force to overwrite.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Build profile settings
+    profile = {}
+    if args.profile_url:
+        profile['url'] = args.profile_url
+    if args.profile_admin_key:
+        profile['admin_key'] = args.profile_admin_key
+    if args.profile_metrics_url:
+        profile['metrics_url'] = args.profile_metrics_url
+    if args.profile_metrics_port:
+        profile['metrics_port'] = args.profile_metrics_port
+    if args.profile_timeout:
+        profile['timeout'] = args.profile_timeout
+
+    if not profile:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify at least --url for the profile",
+              file=sys.stderr)
+        sys.exit(1)
+
+    config['profiles'][name] = profile
+
+    if save_config(config):
+        action = "Updated" if name in config.get('profiles', {}) else "Created"
+        print(f"{Colors.GREEN}Success:{Colors.RESET} {action} profile '{name}'")
+
+        # Offer to activate if no active profile
+        if not config.get('active_profile'):
+            print(f"  Tip: Use 'rvctl profile use {name}' to activate this profile")
+    else:
+        sys.exit(1)
+
+
+def cmd_profile_use(args, config: Dict[str, Any]):
+    """Handle 'profile use' command."""
+    name = args.profile_name
+    profiles = config.get('profiles', {})
+
+    if name not in profiles:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' not found", file=sys.stderr)
+        if profiles:
+            print(f"  Available profiles: {', '.join(sorted(profiles.keys()))}", file=sys.stderr)
+        sys.exit(1)
+
+    config['active_profile'] = name
+
+    if save_config(config):
+        profile = profiles[name]
+        url = profile.get('url', '(no url)')
+        print(f"{Colors.GREEN}Switched to profile '{name}'{Colors.RESET}")
+        print(f"  URL: {url}")
+
+
+def cmd_profile_show(args, config: Dict[str, Any]):
+    """Handle 'profile show' command."""
+    profiles = config.get('profiles', {})
+    active_name = config.get('active_profile')
+
+    # Determine which profile to show
+    name = args.profile_name if args.profile_name else active_name
+
+    if not name:
+        print(f"{Colors.YELLOW}No active profile.{Colors.RESET}")
+        print(f"  Use 'rvctl profile use <name>' to activate a profile")
+        print(f"  Or specify a profile: rvctl profile show <name>")
+        return
+
+    if name not in profiles:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    profile = profiles[name]
+
+    if args.output == 'json':
+        output = {'name': name, 'active': name == active_name, **profile}
+        print(json.dumps(output, indent=2))
+        return
+
+    is_active = " (active)" if name == active_name else ""
+    print(f"{Colors.BOLD}Profile: {name}{Colors.RESET}{Colors.GREEN}{is_active}{Colors.RESET}")
+    print("─" * 40)
+
+    for key, value in sorted(profile.items()):
+        # Mask admin_key for security
+        if key == 'admin_key' and value:
+            display_value = value[:4] + '...' + value[-4:] if len(value) > 12 else '****'
+        else:
+            display_value = value
+        print(f"  {key}: {display_value}")
+
+
+def cmd_profile_delete(args, config: Dict[str, Any]):
+    """Handle 'profile delete' command."""
+    name = args.profile_name
+    profiles = config.get('profiles', {})
+
+    if name not in profiles:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Remove profile
+    del config['profiles'][name]
+
+    # Clear active profile if it was the deleted one
+    if config.get('active_profile') == name:
+        config['active_profile'] = None
+
+    if save_config(config):
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Deleted profile '{name}'")
+
+
 def main():
-    # Load config file (priority: CLI args > env vars > config file > defaults)
-    config = load_config()
+    # Load config file (priority: CLI args > env vars > active profile > base config > defaults)
+    raw_config = load_config()
+    config = get_effective_config(raw_config)
 
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
@@ -1963,7 +2256,7 @@ def main():
         epilog=__doc__
     )
 
-    # Determine defaults: env var > config > built-in default
+    # Determine defaults: env var > effective config > built-in default
     default_url = os.environ.get('RANVIER_URL', config.get('url', 'http://localhost:8080'))
     default_admin_key = os.environ.get('RANVIER_ADMIN_KEY', config.get('admin_key'))
     default_metrics_url = os.environ.get('RANVIER_METRICS_URL', config.get('metrics_url'))
@@ -2094,6 +2387,42 @@ def main():
     wait_parser.add_argument('--wait-timeout', type=int, default=None,
                               help='Maximum time to wait in seconds (default: wait forever)')
 
+    # profile command
+    profile_parser = subparsers.add_parser('profile', help='Manage server profiles')
+    profile_subparsers = profile_parser.add_subparsers(dest='profile_action', help='Profile action')
+
+    # profile list
+    profile_list_parser = profile_subparsers.add_parser('list', help='List all profiles')
+
+    # profile add
+    profile_add_parser = profile_subparsers.add_parser('add', help='Add a new profile')
+    profile_add_parser.add_argument('profile_name', help='Profile name')
+    profile_add_parser.add_argument('--url', dest='profile_url',
+                                     help='Ranvier Admin API URL')
+    profile_add_parser.add_argument('--admin-key', dest='profile_admin_key',
+                                     help='Admin API key')
+    profile_add_parser.add_argument('--metrics-url', dest='profile_metrics_url',
+                                     help='Metrics endpoint URL')
+    profile_add_parser.add_argument('--metrics-port', dest='profile_metrics_port', type=int,
+                                     help='Metrics port')
+    profile_add_parser.add_argument('--timeout', dest='profile_timeout', type=int,
+                                     help='Default timeout')
+    profile_add_parser.add_argument('--force', '-f', action='store_true',
+                                     help='Overwrite existing profile')
+
+    # profile use
+    profile_use_parser = profile_subparsers.add_parser('use', help='Switch to a profile')
+    profile_use_parser.add_argument('profile_name', help='Profile name to activate')
+
+    # profile show
+    profile_show_parser = profile_subparsers.add_parser('show', help='Show profile details')
+    profile_show_parser.add_argument('profile_name', nargs='?', default=None,
+                                      help='Profile name (default: active profile)')
+
+    # profile delete
+    profile_delete_parser = profile_subparsers.add_parser('delete', help='Delete a profile')
+    profile_delete_parser.add_argument('profile_name', help='Profile name to delete')
+
     # completion command
     completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
     completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
@@ -2208,6 +2537,27 @@ def main():
     # Handle wait command (has its own loop, so skip watch logic)
     elif args.command == 'wait':
         cmd_wait(args)
+        sys.exit(0)
+
+    # Handle profile command (manages config, so uses raw_config)
+    elif args.command == 'profile':
+        if not args.profile_action:
+            profile_parser.print_help()
+            sys.exit(1)
+
+        if args.profile_action == 'list':
+            cmd_profile_list(args, raw_config)
+        elif args.profile_action == 'add':
+            cmd_profile_add(args, raw_config)
+        elif args.profile_action == 'use':
+            cmd_profile_use(args, raw_config)
+        elif args.profile_action == 'show':
+            cmd_profile_show(args, raw_config)
+        elif args.profile_action == 'delete':
+            cmd_profile_delete(args, raw_config)
+        else:
+            print(f"Unknown profile action: {args.profile_action}", file=sys.stderr)
+            sys.exit(1)
         sys.exit(0)
 
     # Handle completion command (special case - just print and exit)
