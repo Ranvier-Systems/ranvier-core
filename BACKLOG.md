@@ -958,6 +958,18 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
   _Severity:_ Medium
   _Fixed:_ PR #127 - std::call_once for init, std::atomic for enabled flag, shutdown guard
 
+- [ ] **Add DNS resolution timeout in backend registration**
+  _Issue:_ `src/http_controller.cpp:1469` calls `seastar::net::dns::get_host_by_name()` without timeout. If hostname doesn't resolve (especially `.local` mDNS domains), the request hangs indefinitely waiting for DNS response.
+  _Fix:_ Wrap DNS call with `seastar::with_timeout()`:
+  ```cpp
+  auto hostent = co_await seastar::with_timeout(
+      std::chrono::seconds(5),
+      seastar::net::dns::get_host_by_name(std::string(ip_str))
+  );
+  ```
+  _Location:_ `src/http_controller.cpp:1469`
+  _Severity:_ Medium
+
 ### 7.3 Architecture Drift
 
 - [x] **Move token count limits from persistence layer to business layer** ✓
@@ -1194,6 +1206,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `health` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | |
+| **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
 
 ---
 
