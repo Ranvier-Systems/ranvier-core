@@ -708,17 +708,17 @@ def cmd_health(args):
     data = make_request(url, method='GET')
 
     status = data.get('status', 'unknown')
-    is_healthy = data.get('healthy', False)
     is_draining = data.get('draining', False)
 
+    # Health endpoint returns status: "healthy" or "draining" or other values
+    is_healthy = status in ('healthy', 'ok', 'draining')
+
     if is_healthy:
-        if is_draining:
+        if is_draining or status == 'draining':
             print(f"{Colors.YELLOW}DRAINING{Colors.RESET}")
-            print(f"  Status: {status}")
             print(f"  Server is healthy but draining (not accepting new connections)")
         else:
             print(f"{Colors.GREEN}HEALTHY{Colors.RESET}")
-            print(f"  Status: {status}")
 
         # Show additional info if available
         quorum = data.get('quorum_healthy')
