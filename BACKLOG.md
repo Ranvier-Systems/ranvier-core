@@ -621,7 +621,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Low
   _Priority:_ Low
 
-- [ ] **Add `--watch` mode for continuous monitoring**
+- [x] **Add `--watch` mode for continuous monitoring** ✓
   _Justification:_ Operators often need to monitor state during deployments. Watch mode with configurable refresh interval reduces manual polling.
   _Usage:_ `rvctl --watch [--interval 2s] inspect backends`
   _Location:_ `tools/rvctl`
@@ -1205,7 +1205,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `health` command | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | ✅ Done |
-| **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | |
+| **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | ✅ Done |
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
 
 ---
