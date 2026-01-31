@@ -1157,11 +1157,12 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
   _Complexity:_ Medium
   _Completed:_ 2026-01-31. Created comprehensive test suite with 8 tests: (1) same_prefix_routes_consistently, (2) route_learning_creates_cache_entry, (3) cache_hit_ratio_increases, (4) different_prefixes_can_route_differently, (5) route_propagation_across_cluster, (6) backend_affinity_under_load, (7) metrics_reflect_behavior, (8) all_nodes_route_consistently.
 
-- [ ] **[P0] Create graceful shutdown test suite**
+- [x] **[P0] Create graceful shutdown test suite** ✓
   _Description:_ Create `tests/integration/test_graceful_shutdown.py` with tests for: in-flight requests complete, new connections rejected after signal, exit code 0 for clean shutdown.
   _Rationale:_ Shutdown path exercises multiple lifecycle guards (gates, timers, RAII). Untested path is high-risk for production incidents.
   _Files:_ `tests/integration/test_graceful_shutdown.py` (new)
   _Complexity:_ Medium
+  _Completed:_ 2026-01-31. Created comprehensive test suite with 8 tests validating shutdown lifecycle guards: (1) healthy_state_returns_200, (2) metrics_accessible_when_healthy, (3) cluster_status_not_draining, (4) concurrent_requests_accepted, (5) health_returns_503_during_drain, (6) requests_rejected_during_drain, (7) cluster_status_shows_draining, (8) cluster_maintains_consensus_during_node_shutdown.
 
 - [x] **[P1] Extract GossipConsensus class from gossip_service.cpp** ✓
   _Description:_ Refactor gossip_service.cpp (2,161 LOC) into three focused modules: `gossip_transport.cpp` (UDP/DTLS), `gossip_protocol.cpp` (message handling), `gossip_consensus.cpp` (quorum, split-brain).
@@ -1246,7 +1247,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | ✅ Done |
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
 | **P0 - Critical** | Testing | E2E prefix routing test suite | Medium | ✅ Done |
-| **P0 - Critical** | Testing | Graceful shutdown test suite | Medium | |
+| **P0 - Critical** | Testing | Graceful shutdown test suite | Medium | ✅ Done |
 | **P1 - High** | DX | Consolidate gossip debug metrics behind compile flag | Low | |
 | **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
 | **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | |
