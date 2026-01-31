@@ -116,6 +116,14 @@ struct AssetsConfig {
     bool tokenization_cache_enabled = true;    // Enable LRU cache for tokenization results
     size_t tokenization_cache_size = 1000;     // Maximum cache entries (Rule #4: bounded)
     size_t tokenization_cache_max_text = 8192; // Don't cache texts longer than this (bytes)
+
+    // Tokenizer thread pool settings (P3: disabled by default)
+    // Offloads tokenization FFI to dedicated OS threads, fully freeing reactors.
+    // Enable if cross-shard dispatch is insufficient under high load.
+    bool tokenizer_thread_pool_enabled = false;     // Disabled by default (benchmark first)
+    size_t tokenizer_thread_pool_queue_size = 256;  // Max pending jobs per shard (Rule #4)
+    size_t tokenizer_thread_pool_min_text = 256;    // Min text length for thread pool dispatch
+    size_t tokenizer_thread_pool_max_text = 65536;  // Max text length for thread pool dispatch
 };
 
 // TLS configuration
@@ -565,6 +573,28 @@ inline void RanvierConfig::apply_env_overrides() {
 
     // Assets overrides
     if (auto v = get_env("RANVIER_TOKENIZER_PATH")) assets.tokenizer_path = *v;
+    if (auto v = get_env("RANVIER_TOKENIZATION_CACHE_ENABLED")) {
+        assets.tokenization_cache_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TOKENIZATION_CACHE_SIZE")) {
+        assets.tokenization_cache_size = *v;
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TOKENIZATION_CACHE_MAX_TEXT")) {
+        assets.tokenization_cache_max_text = *v;
+    }
+    // Tokenizer thread pool overrides
+    if (auto v = get_env("RANVIER_TOKENIZER_THREAD_POOL_ENABLED")) {
+        assets.tokenizer_thread_pool_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TOKENIZER_THREAD_POOL_QUEUE_SIZE")) {
+        assets.tokenizer_thread_pool_queue_size = *v;
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TOKENIZER_THREAD_POOL_MIN_TEXT")) {
+        assets.tokenizer_thread_pool_min_text = *v;
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TOKENIZER_THREAD_POOL_MAX_TEXT")) {
+        assets.tokenizer_thread_pool_max_text = *v;
+    }
 
     // TLS overrides
     if (auto v = get_env("RANVIER_TLS_ENABLED")) {
@@ -986,6 +1016,29 @@ inline RanvierConfig RanvierConfig::load(const std::string& config_path) {
         if (yaml["assets"]) {
             YAML::Node a = yaml["assets"];
             if (a["tokenizer_path"]) config.assets.tokenizer_path = a["tokenizer_path"].as<std::string>();
+            // Tokenization cache settings
+            if (a["tokenization_cache_enabled"]) {
+                config.assets.tokenization_cache_enabled = a["tokenization_cache_enabled"].as<bool>();
+            }
+            if (a["tokenization_cache_size"]) {
+                config.assets.tokenization_cache_size = a["tokenization_cache_size"].as<size_t>();
+            }
+            if (a["tokenization_cache_max_text"]) {
+                config.assets.tokenization_cache_max_text = a["tokenization_cache_max_text"].as<size_t>();
+            }
+            // Tokenizer thread pool settings (P3 feature)
+            if (a["tokenizer_thread_pool_enabled"]) {
+                config.assets.tokenizer_thread_pool_enabled = a["tokenizer_thread_pool_enabled"].as<bool>();
+            }
+            if (a["tokenizer_thread_pool_queue_size"]) {
+                config.assets.tokenizer_thread_pool_queue_size = a["tokenizer_thread_pool_queue_size"].as<size_t>();
+            }
+            if (a["tokenizer_thread_pool_min_text"]) {
+                config.assets.tokenizer_thread_pool_min_text = a["tokenizer_thread_pool_min_text"].as<size_t>();
+            }
+            if (a["tokenizer_thread_pool_max_text"]) {
+                config.assets.tokenizer_thread_pool_max_text = a["tokenizer_thread_pool_max_text"].as<size_t>();
+            }
         }
 
         // TLS section

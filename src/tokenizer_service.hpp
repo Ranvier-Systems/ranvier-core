@@ -14,6 +14,8 @@
 #include <seastar/core/smp.hh>
 #include <tokenizers_cpp.h>
 
+#include "tokenizer_thread_pool.hpp"
+
 namespace ranvier {
 
 // Forward declaration for cross-shard dispatch
@@ -183,6 +185,10 @@ public:
         seastar::sharded<ShardLoadBalancer>* load_balancer,
         seastar::sharded<TokenizerService>* tokenizer);
 
+    // Set reference to thread pool for encode_threaded_async()
+    // Call after thread pool workers are started
+    void set_thread_pool_ref(seastar::sharded<TokenizerThreadPool>* thread_pool);
+
     // The main API: Text -> Integers (uncached, direct FFI call)
     // Accepts string_view for zero-copy tokenization from temporary_buffer
     // NOT thread-safe - must only be called from the owning shard
@@ -204,6 +210,18 @@ public:
     // The result includes metadata about where tokenization occurred for metrics.
     seastar::future<TokenizationResult> encode_cached_async(std::string_view text);
 
+    // THREAD POOL API: Text -> Integers with caching + dedicated thread pool
+    // This is the highest-performance path for non-blocking tokenization.
+    //
+    // Priority order:
+    // 1. Local cache hit → immediate return
+    // 2. Thread pool available → submit to worker thread (non-blocking)
+    // 3. Cross-shard dispatch available → dispatch via P2C (frees local reactor)
+    // 4. Fallback → local tokenization (blocks reactor)
+    //
+    // Requires set_thread_pool_ref() to be called after thread pool is started.
+    seastar::future<TokenizationResult> encode_threaded_async(std::string_view text);
+
     // Check if ready
     bool is_loaded() const;
 
@@ -222,6 +240,13 @@ public:
     uint64_t cross_shard_dispatches() const { return _cross_shard_dispatches; }
     uint64_t cross_shard_local_fallbacks() const { return _cross_shard_local_fallbacks; }
     bool cross_shard_enabled() const { return _cross_shard_config.enabled; }
+
+    // Thread pool dispatch statistics (for metrics)
+    uint64_t thread_pool_dispatches() const { return _thread_pool_dispatches; }
+    uint64_t thread_pool_fallbacks() const { return _thread_pool_fallbacks; }
+    bool thread_pool_enabled() const {
+        return _thread_pool && _thread_pool->local().enabled();
+    }
 
     // Clear the cache (for testing or config hot-reload)
     void clear_cache() { _cache.clear(); }
@@ -245,6 +270,11 @@ private:
     // Cross-shard dispatch statistics (shard-local, lock-free)
     uint64_t _cross_shard_dispatches = 0;      // Cache misses dispatched to other shards
     uint64_t _cross_shard_local_fallbacks = 0; // Cache misses processed locally (no eligible target)
+
+    // Thread pool reference and statistics
+    seastar::sharded<TokenizerThreadPool>* _thread_pool = nullptr;
+    uint64_t _thread_pool_dispatches = 0;    // Cache misses dispatched to thread pool
+    uint64_t _thread_pool_fallbacks = 0;     // Thread pool unavailable, fell back to other methods
 
     // Select target shard for cross-shard dispatch using P2C
     // Returns local shard ID if cross-shard is disabled or not beneficial
