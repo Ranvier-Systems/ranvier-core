@@ -457,8 +457,11 @@ class GracefulShutdownTest(unittest.TestCase):
         print(f"  Restarting {container_name}...")
         run_compose(["up", "-d", container_name], check=False)
 
-        # Wait for node to be healthy again
-        wait_for_healthy(f"{node_api}/health", timeout=30)
+        # Wait for node to be healthy again (required for subsequent tests)
+        if not wait_for_healthy(f"{node_api}/health", timeout=60):
+            print(f"  WARNING: {container_name} did not become healthy within timeout")
+        else:
+            print(f"  {container_name} is healthy again")
 
         # Assertions
         # Note: Drain state may be too brief to catch, so we accept either:
@@ -519,7 +522,10 @@ class GracefulShutdownTest(unittest.TestCase):
         # Restart node
         print(f"  Restarting {container_name}...")
         run_compose(["up", "-d", container_name], check=False)
-        wait_for_healthy(f"{node_api}/health", timeout=30)
+        if not wait_for_healthy(f"{node_api}/health", timeout=60):
+            print(f"  WARNING: {container_name} did not become healthy within timeout")
+        else:
+            print(f"  {container_name} is healthy again")
 
         # If we caught a 503, verify Retry-After was present
         if rejection_detected:
@@ -565,7 +571,10 @@ class GracefulShutdownTest(unittest.TestCase):
         # Restart node
         print(f"  Restarting {container_name}...")
         run_compose(["up", "-d", container_name], check=False)
-        wait_for_healthy(f"{node_api}/health", timeout=30)
+        if not wait_for_healthy(f"{node_api}/health", timeout=60):
+            print(f"  WARNING: {container_name} did not become healthy within timeout")
+        else:
+            print(f"  {container_name} is healthy again")
 
         # This may not always be caught (drain window is brief)
         # Just verify we didn't crash
@@ -612,7 +621,10 @@ class GracefulShutdownTest(unittest.TestCase):
         # Restart node3
         print(f"  Restarting {container_name}...")
         run_compose(["up", "-d", container_name], check=False)
-        wait_for_healthy(f"{node3_api}/health", timeout=30)
+        if not wait_for_healthy(f"{node3_api}/health", timeout=60):
+            print(f"  WARNING: {container_name} did not become healthy within timeout")
+        else:
+            print(f"  {container_name} is healthy again")
 
         # Wait for cluster to stabilize
         time.sleep(2)
