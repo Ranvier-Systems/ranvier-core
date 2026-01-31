@@ -234,27 +234,7 @@ def get_all_metrics(metrics_url: str) -> Dict[str, List[float]]:
         return {}
 
 
-def debug_print_routing_metrics(metrics_url: str) -> None:
-    """Print all metrics containing routing-related keywords for debugging."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            print(f"    DEBUG: Failed to fetch metrics: {resp.status_code}")
-            return
-
-        keywords = ["radix", "lookup", "route", "tree", "cache", "hit", "miss"]
-        print("    DEBUG: Routing-related metrics found:")
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            line_lower = line.lower()
-            if any(kw in line_lower for kw in keywords):
-                print(f"      {line[:120]}")
-    except requests.exceptions.RequestException as e:
-        print(f"    DEBUG: Error fetching metrics: {e}")
-
-
-def get_cache_metrics(metrics_url: str, debug: bool = False) -> Dict[str, float]:
+def get_cache_metrics(metrics_url: str) -> Dict[str, float]:
     """Get all cache-related metrics.
 
     Note: Seastar prefixes all metrics with 'seastar_', so actual names are:
@@ -265,9 +245,6 @@ def get_cache_metrics(metrics_url: str, debug: bool = False) -> Dict[str, float]
     - seastar_ranvier_cache_hit_ratio (gauge from metrics_service.hpp)
     """
     metrics = get_all_metrics(metrics_url)
-
-    if debug:
-        debug_print_routing_metrics(metrics_url)
 
     return {
         # Radix tree lookup metrics (Seastar adds 'seastar_' prefix)
@@ -290,8 +267,7 @@ def send_chat_request(
     messages: List[Dict[str, str]],
     stream: bool = True,
     timeout: int = REQUEST_TIMEOUT,
-    retries: int = 3,
-    debug: bool = False
+    retries: int = 3
 ) -> Tuple[int, str, Dict[str, str]]:
     """Send a chat completion request and return (status_code, response_text, headers).
 
@@ -301,7 +277,6 @@ def send_chat_request(
         stream: Whether to use streaming response
         timeout: Request timeout in seconds
         retries: Number of retries for empty responses
-        debug: Print debug information
 
     Returns:
         Tuple of (status_code, aggregated_response_text, response_headers)
@@ -341,8 +316,6 @@ def send_chat_request(
                             except json.JSONDecodeError:
                                 pass
 
-                if debug and not response_text:
-                    print(f"    DEBUG: Empty response, raw lines: {raw_lines[:5]}")
             else:
                 response_text = resp.text
 
@@ -352,8 +325,6 @@ def send_chat_request(
 
             # Empty response with 200 status - retry
             if attempt < retries - 1:
-                if debug:
-                    print(f"    DEBUG: Empty response on attempt {attempt + 1}, retrying...")
                 time.sleep(0.5)
                 continue
 
@@ -575,7 +546,7 @@ class PrefixRoutingTest(unittest.TestCase):
         # Send the same request multiple times
         backend_ids = []
         for i in range(5):
-            status, response, headers = send_chat_request(api_url, prompt, debug=(i == 0))
+            status, response, headers = send_chat_request(api_url, prompt)
             self.assertEqual(status, 200, f"Request {i+1} failed: {response}")
 
             backend_id = extract_backend_id(response, headers)
@@ -614,7 +585,7 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # First request - should be cache miss, route will be learned
         print("  Sending first request (expect cache miss)...")
-        status1, response1, headers1 = send_chat_request(api_url, unique_prompt, debug=True)
+        status1, response1, headers1 = send_chat_request(api_url, unique_prompt)
         self.assertEqual(status1, 200, f"First request failed: {response1}")
         backend1 = extract_backend_id(response1, headers1)
         self.assertIsNotNone(backend1, f"Could not extract backend ID from first request")
@@ -630,7 +601,7 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # Second request - should be cache hit
         print("  Sending second request (expect cache hit)...")
-        status2, response2, headers2 = send_chat_request(api_url, unique_prompt, debug=True)
+        status2, response2, headers2 = send_chat_request(api_url, unique_prompt)
         self.assertEqual(status2, 200, f"Second request failed: {response2}")
         backend2 = extract_backend_id(response2, headers2)
         self.assertIsNotNone(backend2, f"Could not extract backend ID from second request")
