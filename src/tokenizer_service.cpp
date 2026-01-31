@@ -147,6 +147,13 @@ void TokenizerService::set_cross_shard_refs(
                        tokenizer != nullptr);
 }
 
+void TokenizerService::set_thread_pool_ref(seastar::sharded<TokenizerThreadPool>* thread_pool) {
+    _thread_pool = thread_pool;
+    log_tokenizer.info("Thread pool ref set on shard {} (pool={})",
+                       seastar::this_shard_id(),
+                       thread_pool != nullptr);
+}
+
 bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
     if (!_cross_shard_config.enabled) {
         return false;
@@ -202,50 +209,14 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
 
     // Decide whether to dispatch cross-shard
     if (!should_dispatch_cross_shard(text.size())) {
-        // Tokenize locally (blocks reactor but avoids cross-shard overhead)
-        ++_cross_shard_local_fallbacks;
-
-        TokenizationResult result;
-        try {
-            result.tokens = _impl->Encode(std::string(text));
-        } catch (const std::exception& e) {
-            // Rule #9: Log exceptions at warn level with context
-            log_tokenizer.warn("Local tokenization failed on shard {}: {}",
-                              local_shard, e.what());
-            return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
-        }
-        result.cache_hit = false;
-        result.cross_shard = false;
-        result.source_shard = local_shard;
-
-        // Cache locally for future hits
-        _cache.insert(text, result.tokens);
-
-        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+        return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
     }
 
     // Select target shard via P2C
     uint32_t target_shard = select_tokenization_shard();
 
     if (target_shard == local_shard) {
-        // P2C selected local shard - process locally
-        ++_cross_shard_local_fallbacks;
-
-        TokenizationResult result;
-        try {
-            result.tokens = _impl->Encode(std::string(text));
-        } catch (const std::exception& e) {
-            log_tokenizer.warn("Local tokenization failed on shard {}: {}",
-                              local_shard, e.what());
-            return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
-        }
-        result.cache_hit = false;
-        result.cross_shard = false;
-        result.source_shard = local_shard;
-
-        _cache.insert(text, result.tokens);
-
-        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+        return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
     }
 
     // Cross-shard dispatch: copy text for transfer (Rule #14: safe cross-shard data)
@@ -307,6 +278,87 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
 
             return result;
         });
+}
+
+seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std::string_view text) {
+    uint32_t local_shard = seastar::this_shard_id();
+
+    // Fast path: check local cache first (no async overhead for hits)
+    const auto* cached = _cache.lookup(text);
+    if (cached) {
+        TokenizationResult result;
+        result.tokens = *cached;
+        result.cache_hit = true;
+        result.cross_shard = false;
+        result.source_shard = local_shard;
+        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+    }
+
+    // Cache miss - check if tokenizer is loaded
+    if (!_impl) {
+        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+    }
+
+    // Priority 1: Try thread pool (truly non-blocking)
+    if (_thread_pool) {
+        auto& pool = _thread_pool->local();
+        if (pool.should_use_thread_pool(text.size())) {
+            auto future_opt = pool.submit_async(text);
+            if (future_opt) {
+                // Successfully submitted to thread pool
+                ++_thread_pool_dispatches;
+
+                // Convert ThreadPoolTokenizationResult to TokenizationResult
+                return std::move(*future_opt).then(
+                    [this, local_shard, text_copy = std::string(text)]
+                    (ThreadPoolTokenizationResult pool_result) {
+                        TokenizationResult result;
+                        result.tokens = std::move(pool_result.tokens);
+                        result.cache_hit = pool_result.cache_hit;
+                        result.cross_shard = false;  // Thread pool is shard-local
+                        result.source_shard = local_shard;
+
+                        // Cache locally for future lookups
+                        if (!result.tokens.empty()) {
+                            _cache.insert(text_copy, result.tokens);
+                        }
+
+                        return result;
+                    });
+            }
+            // Queue full - fall through to other methods
+            ++_thread_pool_fallbacks;
+        }
+    }
+
+    // Priority 2: Try cross-shard dispatch (frees local reactor)
+    if (should_dispatch_cross_shard(text.size())) {
+        // Delegate to existing cross-shard implementation
+        return encode_cached_async(text);
+    }
+
+    // Priority 3: Local tokenization (blocks reactor)
+    return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+}
+
+TokenizationResult TokenizerService::tokenize_locally(std::string_view text) {
+    uint32_t local_shard = seastar::this_shard_id();
+    ++_cross_shard_local_fallbacks;
+
+    TokenizationResult result;
+    try {
+        result.tokens = _impl->Encode(std::string(text));
+    } catch (const std::exception& e) {
+        log_tokenizer.warn("Local tokenization failed on shard {}: {}",
+                          local_shard, e.what());
+        return TokenizationResult{};
+    }
+    result.cache_hit = false;
+    result.cross_shard = false;
+    result.source_shard = local_shard;
+
+    _cache.insert(text, result.tokens);
+    return result;
 }
 
 bool TokenizerService::is_loaded() const {

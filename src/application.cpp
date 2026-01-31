@@ -90,9 +90,8 @@ seastar::future<> Application::init_tokenizer() {
                                   seastar::smp::count,
                                   _config.assets.tokenization_cache_enabled ? "enabled" : "disabled",
                                   _config.assets.tokenization_cache_size);
-                    // Clear cached JSON to free memory (each shard has its own copy now)
-                    _tokenizer_json.clear();
-                    _tokenizer_json.shrink_to_fit();
+                    // Note: _tokenizer_json is kept for thread pool worker initialization
+                    // It will be cleared after thread pool workers are started
                 });
             });
         }).finally([f]() mutable {
@@ -556,6 +555,56 @@ seastar::future<> Application::startup() {
             }
             return seastar::make_ready_future<>();
         }).then([this] {
+            // Start tokenizer thread pool (P3: disabled by default, enable via config)
+            // Thread pool provides truly non-blocking tokenization by offloading FFI
+            // to dedicated OS threads outside Seastar's reactor.
+            if (!_tokenizer_started) {
+                return seastar::make_ready_future<>();
+            }
+
+            // Build thread pool config from application config
+            ThreadPoolTokenizationConfig pool_cfg;
+            pool_cfg.enabled = _config.assets.tokenizer_thread_pool_enabled;
+            pool_cfg.max_queue_size = _config.assets.tokenizer_thread_pool_queue_size;
+            pool_cfg.min_text_length = _config.assets.tokenizer_thread_pool_min_text;
+            pool_cfg.max_text_length = _config.assets.tokenizer_thread_pool_max_text;
+
+            return _tokenizer_thread_pool.start(pool_cfg).then([this, pool_cfg] {
+                _tokenizer_thread_pool_started = true;
+
+                if (!pool_cfg.enabled) {
+                    log_main.debug("Tokenizer thread pool disabled");
+                    return seastar::make_ready_future<>();
+                }
+
+                // Load tokenizer and start workers on each shard
+                return _tokenizer_thread_pool.invoke_on_all([this](TokenizerThreadPool& pool) {
+                    pool.load_tokenizer(_tokenizer_json);
+                    // Get alien instance for cross-thread signaling
+                    // Note: default_instance is a pointer, dereference to get reference
+                    pool.start_worker(*seastar::alien::internal::default_instance);
+                    pool.register_metrics();
+                });
+            }).then([this, pool_cfg] {
+                if (pool_cfg.enabled) {
+                    log_main.info("Tokenizer thread pool started on {} shards "
+                                  "(queue_size={}, min_text={}, max_text={})",
+                                  seastar::smp::count,
+                                  pool_cfg.max_queue_size,
+                                  pool_cfg.min_text_length,
+                                  pool_cfg.max_text_length);
+                }
+
+                // Set thread pool ref on tokenizer service
+                return _tokenizer.invoke_on_all([this](TokenizerService& t) {
+                    t.set_thread_pool_ref(&_tokenizer_thread_pool);
+                });
+            }).then([this] {
+                // Now we can clear the cached JSON
+                _tokenizer_json.clear();
+                _tokenizer_json.shrink_to_fit();
+            });
+        }).then([this] {
             // 10. Initialize persistence
             return init_persistence();
         }).then([this] {
@@ -966,6 +1015,23 @@ seastar::future<> Application::stop_services() {
             }
             return _controller.stop().then([] {
                 log_main.debug("  HttpController stopped on all shards");
+            });
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 4a: Stop tokenizer thread pool workers (blocks until threads exit)
+            // -------------------------------------------------------------------------
+            if (!_tokenizer_thread_pool_started) {
+                return seastar::make_ready_future<>();
+            }
+            // First stop all worker threads (this blocks until each thread exits)
+            return _tokenizer_thread_pool.invoke_on_all([](TokenizerThreadPool& pool) {
+                pool.stop_worker();
+            }).then([this] {
+                // Then stop the sharded service
+                return _tokenizer_thread_pool.stop();
+            }).then([] {
+                log_main.debug("  TokenizerThreadPool stopped on all shards");
             });
         })
         .then([this] {

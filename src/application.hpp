@@ -22,6 +22,7 @@
 #include "shard_load_balancer.hpp"
 #include "sharded_config.hpp"
 #include "tokenizer_service.hpp"
+#include "tokenizer_thread_pool.hpp"
 
 #include <atomic>
 #include <memory>
@@ -164,6 +165,11 @@ private:
     seastar::sharded<TokenizerService> _tokenizer;
     bool _tokenizer_started = false;
     std::string _tokenizer_json;  // Cached JSON for loading on each shard
+
+    // Tokenizer thread pool for non-blocking FFI offload
+    // Each shard has its own worker thread with dedicated tokenizer instance
+    seastar::sharded<TokenizerThreadPool> _tokenizer_thread_pool;
+    bool _tokenizer_thread_pool_started = false;
 
     // Domain layer
     std::unique_ptr<RouterService> _router;

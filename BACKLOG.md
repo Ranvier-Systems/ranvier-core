@@ -56,18 +56,21 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/tokenizer_service.hpp`, `src/tokenizer_service.cpp`, `src/http_controller.cpp`, `src/application.cpp`
   _Completed:_ 2026-01-29
 
-- [ ] **Offload tokenizer FFI calls via dedicated thread pool**
+- [x] **Offload tokenizer FFI calls via dedicated thread pool** ✓
   _Justification:_ Cross-shard dispatch (implemented above) frees the calling reactor but still blocks the target shard's reactor during FFI. For true parallelism without blocking any reactor, a dedicated thread pool can run tokenization outside Seastar's event loop entirely.
-  _Approach:_ Create per-shard worker threads with lock-free SPSC queues. Reactor enqueues (text, promise) pair, worker thread tokenizes, completes promise. Worker runs in a separate OS thread, not blocking any Seastar reactor.
-  _Challenges:_
-  - Tokenizer is NOT thread-safe - need one worker thread per shard, each with its own tokenizer instance
-  - Promise/future plumbing across thread boundary via `seastar::alien::submit_to` or manual signaling
-  - Memory lifetime: text must be copied into queue, results copied back
-  - Complexity higher than cross-shard approach
-  _When to pursue:_ If benchmarks show cross-shard dispatch insufficient (target shard still stalling under high load), or if single-shard deployments need non-blocking tokenization.
-  _Location:_ `src/tokenizer_service.hpp`, `src/tokenizer_service.cpp`
+  _Approach implemented:_ Per-shard worker threads with lock-free SPSC queues (`boost::lockfree::spsc_queue`). Reactor enqueues (job_id, text, source_shard), worker thread tokenizes using dedicated tokenizer instance, signals completion via `seastar::alien::run_on()`. Worker runs in separate OS thread, not blocking any Seastar reactor.
+  _Implementation details:_
+  - `TokenizerWorker` class: owns worker thread + tokenizer instance (tokenizer is NOT thread-safe)
+  - `TokenizerThreadPool` class: per-shard service managing worker lifecycle and promise/future plumbing
+  - Thread-local completion callback pattern for worker → reactor signaling
+  - Bounded queue (Rule #4) with backpressure: falls back to cross-shard or local tokenization when full
+  - Config: `tokenizer_thread_pool_enabled` (false by default), `tokenizer_thread_pool_queue_size`, `tokenizer_thread_pool_min_text`, `tokenizer_thread_pool_max_text`
+  - `encode_threaded_async()` API with priority: cache hit → thread pool → cross-shard → local
+  - Prometheus metrics: `jobs_submitted`, `jobs_completed`, `jobs_fallback`, `pending_jobs`, `worker_running`
+  _Location:_ `src/tokenizer_thread_pool.hpp`, `src/tokenizer_thread_pool.cpp`, `src/tokenizer_service.hpp`, `src/tokenizer_service.cpp`, `src/application.hpp`, `src/application.cpp`, `src/config.hpp`
   _Complexity:_ High
-  _Priority:_ P3 (cross-shard approach may be sufficient; benchmark first)
+  _Priority:_ P3 (disabled by default; benchmark to enable)
+  _Completed:_ 2026-01-31
 
 - [x] **Use Seastar async file I/O for tokenizer loading** ✓
   _Justification:_ Tokenizer loading used blocking `std::ifstream` during startup, blocking the reactor thread. This is an architectural hazard in Seastar that could cause stalls on slow storage.
@@ -1216,7 +1219,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | Performance | Remove unnecessary atomics from ShardLoadMetrics | Low | |
 | **P3 - Low** | Performance | Batch CryptoOffloader statistics updates | Medium | |
 | **P3 - Low** | Performance | Offload tokenizer FFI via cross-shard dispatch | Medium | ✅ Done |
-| **P3 - Low** | Performance | Offload tokenizer FFI via dedicated thread pool | High | |
+| **P3 - Low** | Performance | Offload tokenizer FFI via dedicated thread pool | High | ✅ Done |
 | **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
 | **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | ✅ Done |
@@ -1237,6 +1240,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-31 | **[Performance]** Offload tokenizer FFI via dedicated thread pool. Added `TokenizerWorker` and `TokenizerThreadPool` classes using `boost::lockfree::spsc_queue` and `seastar::alien::run_on()` for non-blocking tokenization. Per-shard worker threads with dedicated tokenizer instances. `encode_threaded_async()` API with priority fallback (cache → thread pool → cross-shard → local). Disabled by default (P3). Unit tests added. | - |
 | 2026-01-29 | **[Performance]** Offload tokenizer FFI via cross-shard dispatch. Added `encode_cached_async()` with round-robin shard selection. On cache miss, dispatches tokenization to different shard via `smp::submit_to`, freeing calling reactor. Rule #14 compliant (text copied, sharded pointer captured). Prometheus metrics for dispatch tracking. | - |
 | 2026-01-19 | **[Refactor]** Extract GossipService into three focused modules: GossipConsensus (~430 LOC), GossipTransport (~540 LOC), GossipProtocol (~870 LOC). Thin orchestrator (~350 LOC). Rule #14 compliant cross-shard dispatch. Robustness fixes for gate holder scoping and exception handling. | - |
 | 2026-01-16 | **[Security Audit 7.0]** Add circuit entry cleanup when backends are deregistered (remove_circuit method, shard-local callback, Prometheus metric) | - |
