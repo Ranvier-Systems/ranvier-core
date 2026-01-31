@@ -289,16 +289,18 @@ that verify distributed behavior using a Docker Compose cluster.
 ### Running Integration Tests
 
 ```bash
-# Start the test cluster (if not already running)
-docker compose -f docker-compose.test.yml up -d
+# Run all integration tests via make (recommended)
+make test-integration
 
-# Run individual suites
+# Or run individual suites manually
 python3 tests/integration/test_cluster.py
 python3 tests/integration/test_prefix_routing.py
 python3 tests/integration/test_graceful_shutdown.py
 
-# Stop test cluster
-docker compose -f docker-compose.test.yml down
+# Start test cluster for debugging (keeps running)
+make integration-up
+make integration-logs
+make integration-down
 ```
 
 ### Test Descriptions
