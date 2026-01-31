@@ -478,4 +478,19 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(tokenization_cache_test)
+
+    # TokenizerThreadPool Unit Tests (Requires Seastar types for header includes)
+    # Tests dedicated thread pool for non-blocking FFI offload (Rule #4, #11)
+    add_executable(tokenizer_thread_pool_test
+      tests/unit/tokenizer_thread_pool_test.cpp
+      src/tokenizer_thread_pool.cpp
+    )
+    target_include_directories(tokenizer_thread_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(tokenizer_thread_pool_test
+      PRIVATE
+      Seastar::seastar
+      tokenizers_cpp
+      GTest::gtest_main
+    )
+    gtest_discover_tests(tokenizer_thread_pool_test)
 endif()
