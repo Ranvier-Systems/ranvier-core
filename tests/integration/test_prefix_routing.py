@@ -257,11 +257,12 @@ def debug_print_routing_metrics(metrics_url: str) -> None:
 def get_cache_metrics(metrics_url: str, debug: bool = False) -> Dict[str, float]:
     """Get all cache-related metrics.
 
-    Note: Metric names in Prometheus format:
-    - ranvier_radix_tree_lookup_hits_total (from router_service.cpp)
-    - ranvier_radix_tree_lookup_misses_total (from router_service.cpp)
-    - ranvier_cache_hit_ratio (gauge from metrics_service.hpp)
-    - ranvier_tokenization_cache_hits (from metrics_service.hpp)
+    Note: Seastar prefixes all metrics with 'seastar_', so actual names are:
+    - seastar_ranvier_radix_tree_lookup_hits_total (from router_service.cpp)
+    - seastar_ranvier_radix_tree_lookup_misses_total (from router_service.cpp)
+    - seastar_ranvier_router_cache_hits (from router_service.cpp)
+    - seastar_ranvier_router_cache_misses (from router_service.cpp)
+    - seastar_ranvier_cache_hit_ratio (gauge from metrics_service.hpp)
     """
     metrics = get_all_metrics(metrics_url)
 
@@ -269,14 +270,14 @@ def get_cache_metrics(metrics_url: str, debug: bool = False) -> Dict[str, float]
         debug_print_routing_metrics(metrics_url)
 
     return {
-        # Radix tree lookup metrics (exposed in router_service.cpp)
-        "radix_tree_lookup_hits": sum(metrics.get("ranvier_radix_tree_lookup_hits_total", [0])),
-        "radix_tree_lookup_misses": sum(metrics.get("ranvier_radix_tree_lookup_misses_total", [0])),
+        # Radix tree lookup metrics (Seastar adds 'seastar_' prefix)
+        "radix_tree_lookup_hits": sum(metrics.get("seastar_ranvier_radix_tree_lookup_hits_total", [0])),
+        "radix_tree_lookup_misses": sum(metrics.get("seastar_ranvier_radix_tree_lookup_misses_total", [0])),
+        # Router cache metrics
+        "router_cache_hits": sum(metrics.get("seastar_ranvier_router_cache_hits", [0])),
+        "router_cache_misses": sum(metrics.get("seastar_ranvier_router_cache_misses", [0])),
         # Cache hit ratio gauge
-        "cache_hit_ratio": metrics.get("ranvier_cache_hit_ratio", [0])[0] if metrics.get("ranvier_cache_hit_ratio") else 0,
-        # Tokenization cache metrics
-        "tokenization_cache_hits": sum(metrics.get("ranvier_tokenization_cache_hits", [0])),
-        "tokenization_cache_misses": sum(metrics.get("ranvier_tokenization_cache_misses", [0])),
+        "cache_hit_ratio": metrics.get("seastar_ranvier_cache_hit_ratio", [0])[0] if metrics.get("seastar_ranvier_cache_hit_ratio") else 0,
     }
 
 
