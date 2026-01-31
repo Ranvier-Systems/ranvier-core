@@ -273,6 +273,54 @@ independent reactor. These tests verify Ranvier properly leverages this:
 4. **Atomic-Free** - `shared_ptr` uses atomic reference counting which causes
    cache line bouncing. `unique_ptr` with explicit ownership is preferred.
 
+## Integration Tests
+
+In addition to performance validation, Ranvier includes functional integration tests
+that verify distributed behavior using a Docker Compose cluster.
+
+### Test Suites
+
+| Suite | Purpose | Tests | Duration |
+|-------|---------|-------|----------|
+| `test_cluster.py` | Gossip, peer discovery, route propagation | 7 | ~45s |
+| `test_prefix_routing.py` | Prefix caching core value proposition | 8 | ~40s |
+| `test_graceful_shutdown.py` | Shutdown lifecycle guards | 6 | ~30s |
+
+### Running Integration Tests
+
+```bash
+# Start the test cluster (if not already running)
+docker compose -f docker-compose.test.yml up -d
+
+# Run individual suites
+python3 tests/integration/test_cluster.py
+python3 tests/integration/test_prefix_routing.py
+python3 tests/integration/test_graceful_shutdown.py
+
+# Stop test cluster
+docker compose -f docker-compose.test.yml down
+```
+
+### Test Descriptions
+
+**test_cluster.py** — Distributed cluster behavior:
+- Peer connectivity and gossip discovery
+- Backend registration propagation across nodes
+- Route learning and cross-node propagation
+- Node failure detection and recovery
+
+**test_prefix_routing.py** — Core value proposition:
+- Same prefix routes to same backend (cache affinity)
+- Route learning creates cache entries
+- Cache hit metrics increase with repeated requests
+- Backend affinity persists under load
+
+**test_graceful_shutdown.py** — Lifecycle guards:
+- Health endpoint transitions 200→503 during drain
+- Metrics remain accessible during shutdown (no dangling pointers)
+- Requests rejected with 503 + Retry-After header
+- Cluster maintains quorum during single node shutdown
+
 ### Related Documentation
 
 - [Architecture Overview](architecture/system-design.md)
