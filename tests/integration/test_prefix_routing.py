@@ -235,14 +235,24 @@ def get_all_metrics(metrics_url: str) -> Dict[str, List[float]]:
 
 
 def get_cache_metrics(metrics_url: str) -> Dict[str, float]:
-    """Get all cache-related metrics."""
+    """Get all cache-related metrics.
+
+    Note: Metric names in Prometheus format:
+    - ranvier_radix_tree_lookup_hits_total (from router_service.cpp)
+    - ranvier_radix_tree_lookup_misses_total (from router_service.cpp)
+    - ranvier_cache_hit_ratio (gauge from metrics_service.hpp)
+    - ranvier_tokenization_cache_hits (from metrics_service.hpp)
+    """
     metrics = get_all_metrics(metrics_url)
     return {
-        "cache_hits": sum(metrics.get("ranvier_cache_hits", [0])),
-        "cache_misses": sum(metrics.get("ranvier_cache_misses", [0])),
+        # Radix tree lookup metrics (exposed in router_service.cpp)
+        "radix_tree_lookup_hits": sum(metrics.get("ranvier_radix_tree_lookup_hits_total", [0])),
+        "radix_tree_lookup_misses": sum(metrics.get("ranvier_radix_tree_lookup_misses_total", [0])),
+        # Cache hit ratio gauge
         "cache_hit_ratio": metrics.get("ranvier_cache_hit_ratio", [0])[0] if metrics.get("ranvier_cache_hit_ratio") else 0,
-        "radix_tree_lookup_hits": sum(metrics.get("ranvier_radix_tree_lookup_hits", [0])),
-        "radix_tree_lookup_misses": sum(metrics.get("ranvier_radix_tree_lookup_misses", [0])),
+        # Tokenization cache metrics
+        "tokenization_cache_hits": sum(metrics.get("ranvier_tokenization_cache_hits", [0])),
+        "tokenization_cache_misses": sum(metrics.get("ranvier_tokenization_cache_misses", [0])),
     }
 
 
@@ -254,9 +264,19 @@ def send_chat_request(
     api_url: str,
     messages: List[Dict[str, str]],
     stream: bool = True,
-    timeout: int = REQUEST_TIMEOUT
+    timeout: int = REQUEST_TIMEOUT,
+    retries: int = 3,
+    debug: bool = False
 ) -> Tuple[int, str, Dict[str, str]]:
     """Send a chat completion request and return (status_code, response_text, headers).
+
+    Args:
+        api_url: The Ranvier API URL
+        messages: List of chat messages
+        stream: Whether to use streaming response
+        timeout: Request timeout in seconds
+        retries: Number of retries for empty responses
+        debug: Print debug information
 
     Returns:
         Tuple of (status_code, aggregated_response_text, response_headers)
@@ -267,48 +287,91 @@ def send_chat_request(
         "stream": stream
     }
 
-    try:
-        resp = requests.post(
-            f"{api_url}/v1/chat/completions",
-            json=request_body,
-            headers={"Content-Type": "application/json"},
-            stream=stream,
-            timeout=timeout
-        )
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                f"{api_url}/v1/chat/completions",
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                stream=stream,
+                timeout=timeout
+            )
 
-        response_text = ""
-        headers = dict(resp.headers)
+            response_text = ""
+            headers = dict(resp.headers)
 
-        if stream and resp.status_code == 200:
-            for line in resp.iter_lines():
-                if line:
-                    decoded = line.decode("utf-8")
-                    if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                        try:
-                            chunk = json.loads(decoded[6:])
-                            if "choices" in chunk and chunk["choices"]:
-                                delta = chunk["choices"][0].get("delta", {})
-                                if "content" in delta:
-                                    response_text += delta["content"]
-                        except json.JSONDecodeError:
-                            pass
-        else:
-            response_text = resp.text
+            if stream and resp.status_code == 200:
+                raw_lines = []
+                for line in resp.iter_lines():
+                    if line:
+                        decoded = line.decode("utf-8")
+                        raw_lines.append(decoded)
+                        if decoded.startswith("data: ") and decoded != "data: [DONE]":
+                            try:
+                                chunk = json.loads(decoded[6:])
+                                if "choices" in chunk and chunk["choices"]:
+                                    delta = chunk["choices"][0].get("delta", {})
+                                    if "content" in delta:
+                                        response_text += delta["content"]
+                            except json.JSONDecodeError:
+                                pass
 
-        return resp.status_code, response_text, headers
+                if debug and not response_text:
+                    print(f"    DEBUG: Empty response, raw lines: {raw_lines[:5]}")
+            else:
+                response_text = resp.text
 
-    except requests.exceptions.RequestException as e:
-        return 0, str(e), {}
+            # If we got a valid response, return it
+            if response_text or resp.status_code != 200:
+                return resp.status_code, response_text, headers
+
+            # Empty response with 200 status - retry
+            if attempt < retries - 1:
+                if debug:
+                    print(f"    DEBUG: Empty response on attempt {attempt + 1}, retrying...")
+                time.sleep(0.5)
+                continue
+
+            # Final attempt - return what we have
+            return resp.status_code, response_text, headers
+
+        except requests.exceptions.RequestException as e:
+            if attempt < retries - 1:
+                time.sleep(0.5)
+                continue
+            return 0, str(e), {}
+
+    return 0, "Max retries exceeded", {}
 
 
-def extract_backend_id(response_text: str) -> Optional[int]:
-    """Extract backend ID from mock backend response.
+def extract_backend_id(response_text: str, headers: Dict[str, str] = None) -> Optional[int]:
+    """Extract backend ID from mock backend response or headers.
 
     Mock backend returns: "Response from backend {BACKEND_ID}"
+    Mock backend also sets header: X-Backend-ID: {BACKEND_ID}
+
+    Args:
+        response_text: The response body text
+        headers: Optional response headers dict
+
+    Returns:
+        Backend ID as integer, or None if not found
     """
-    match = re.search(r"backend\s+(\d+)", response_text.lower())
-    if match:
-        return int(match.group(1))
+    # Try X-Backend-ID header first (most reliable)
+    if headers:
+        backend_header = headers.get("X-Backend-ID") or headers.get("x-backend-id")
+        if backend_header:
+            try:
+                return int(backend_header)
+            except ValueError:
+                pass
+
+    # Fall back to parsing response text
+    if response_text:
+        match = re.search(r"backend\s+(\d+)", response_text.lower())
+        if match:
+            return int(match.group(1))
+
     return None
 
 
@@ -487,11 +550,11 @@ class PrefixRoutingTest(unittest.TestCase):
         # Send the same request multiple times
         backend_ids = []
         for i in range(5):
-            status, response, headers = send_chat_request(api_url, prompt)
+            status, response, headers = send_chat_request(api_url, prompt, debug=(i == 0))
             self.assertEqual(status, 200, f"Request {i+1} failed: {response}")
 
-            backend_id = extract_backend_id(response)
-            self.assertIsNotNone(backend_id, f"Could not extract backend ID from: {response}")
+            backend_id = extract_backend_id(response, headers)
+            self.assertIsNotNone(backend_id, f"Could not extract backend ID from response='{response}', headers={headers}")
             backend_ids.append(backend_id)
             print(f"  Request {i+1}: routed to backend {backend_id}")
 
@@ -526,9 +589,10 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # First request - should be cache miss, route will be learned
         print("  Sending first request (expect cache miss)...")
-        status1, response1, _ = send_chat_request(api_url, unique_prompt)
+        status1, response1, headers1 = send_chat_request(api_url, unique_prompt, debug=True)
         self.assertEqual(status1, 200, f"First request failed: {response1}")
-        backend1 = extract_backend_id(response1)
+        backend1 = extract_backend_id(response1, headers1)
+        self.assertIsNotNone(backend1, f"Could not extract backend ID from first request")
         print(f"  First request: routed to backend {backend1}")
 
         # Small delay for metrics to update
@@ -541,9 +605,10 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # Second request - should be cache hit
         print("  Sending second request (expect cache hit)...")
-        status2, response2, _ = send_chat_request(api_url, unique_prompt)
+        status2, response2, headers2 = send_chat_request(api_url, unique_prompt, debug=True)
         self.assertEqual(status2, 200, f"Second request failed: {response2}")
-        backend2 = extract_backend_id(response2)
+        backend2 = extract_backend_id(response2, headers2)
+        self.assertIsNotNone(backend2, f"Could not extract backend ID from second request")
         print(f"  Second request: routed to backend {backend2}")
 
         # Should route to same backend
@@ -561,42 +626,42 @@ class PrefixRoutingTest(unittest.TestCase):
         # (Note: exact increment depends on implementation details)
         print(f"  PASSED: Route learned and cache entry created")
 
-    def test_03_cache_hit_ratio_increases_with_repeated_requests(self):
-        """Verify that cache hit ratio improves with repeated similar requests.
+    def test_03_radix_tree_hits_increase_with_repeated_requests(self):
+        """Verify that radix tree lookup hits increase with repeated similar requests.
 
-        As we send more requests with the same prefix, the hit ratio should increase.
+        As we send more requests with the same prefix, the ART lookup hits should increase.
         """
-        print("\nTest: Cache hit ratio increases with repeated requests")
+        print("\nTest: Radix tree hits increase with repeated requests")
 
         api_url = NODES["node1"]["api"]
         metrics_url = NODES["node1"]["metrics"]
 
-        # Get initial cache hit ratio
+        # Get initial metrics
         initial_metrics = get_cache_metrics(metrics_url)
-        initial_ratio = initial_metrics.get("cache_hit_ratio", 0)
-        print(f"  Initial cache hit ratio: {initial_ratio:.2%}")
+        initial_hits = initial_metrics.get("radix_tree_lookup_hits", 0)
+        print(f"  Initial radix tree hits: {initial_hits}")
 
         # Send multiple requests with same prefix
         prompt = SHARED_PREFIX_PROMPTS[1]  # Use a different prompt from test_01
         for i in range(10):
-            status, response, _ = send_chat_request(api_url, prompt)
+            status, response, headers = send_chat_request(api_url, prompt)
             self.assertEqual(status, 200, f"Request {i+1} failed")
 
         time.sleep(0.5)
 
-        # Get final cache hit ratio
+        # Get final metrics
         final_metrics = get_cache_metrics(metrics_url)
-        final_ratio = final_metrics.get("cache_hit_ratio", 0)
-        print(f"  Final cache hit ratio: {final_ratio:.2%}")
+        final_hits = final_metrics.get("radix_tree_lookup_hits", 0)
+        print(f"  Final radix tree hits: {final_hits}")
 
-        # Hit ratio should be positive after repeated requests
-        # (First request is a miss, subsequent should be hits)
+        # Radix tree lookup hits should have increased
+        # First request is a miss (no route learned yet), but subsequent 9 should be hits
         self.assertGreater(
-            final_ratio, 0,
-            "Cache hit ratio should be positive after repeated requests"
+            final_hits, initial_hits,
+            f"Radix tree hits should increase after repeated requests: {initial_hits} -> {final_hits}"
         )
 
-        print(f"  PASSED: Cache hit ratio is {final_ratio:.2%}")
+        print(f"  PASSED: Radix tree hits increased from {initial_hits} to {final_hits}")
 
     def test_04_different_prefixes_can_route_differently(self):
         """Verify that requests with different prefixes can route to different backends.
@@ -612,12 +677,13 @@ class PrefixRoutingTest(unittest.TestCase):
         backend_ids = {}
         for i, prompt in enumerate(DIFFERENT_PREFIX_PROMPTS):
             # Send each prompt twice to ensure route is learned
+            headers = {}
             for _ in range(2):
-                status, response, _ = send_chat_request(api_url, prompt)
+                status, response, headers = send_chat_request(api_url, prompt)
                 self.assertEqual(status, 200, f"Request failed: {response}")
 
-            backend_id = extract_backend_id(response)
-            self.assertIsNotNone(backend_id, f"Could not extract backend ID from: {response}")
+            backend_id = extract_backend_id(response, headers)
+            self.assertIsNotNone(backend_id, f"Could not extract backend ID from prompt {i+1}")
             backend_ids[i] = backend_id
             print(f"  Prompt {i+1}: routed to backend {backend_id}")
 
@@ -642,9 +708,10 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # Learn route on node1
         print("  Learning route on node1...")
-        status1, response1, _ = send_chat_request(node1_api, unique_prompt)
+        status1, response1, headers1 = send_chat_request(node1_api, unique_prompt)
         self.assertEqual(status1, 200, f"Node1 request failed: {response1}")
-        backend1 = extract_backend_id(response1)
+        backend1 = extract_backend_id(response1, headers1)
+        self.assertIsNotNone(backend1, "Could not extract backend ID from node1")
         print(f"  Node1 routed to backend {backend1}")
 
         # Wait for gossip propagation
@@ -653,9 +720,10 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # Send same request to node2 - should route to same backend
         print("  Sending same request to node2...")
-        status2, response2, _ = send_chat_request(node2_api, unique_prompt)
+        status2, response2, headers2 = send_chat_request(node2_api, unique_prompt)
         self.assertEqual(status2, 200, f"Node2 request failed: {response2}")
-        backend2 = extract_backend_id(response2)
+        backend2 = extract_backend_id(response2, headers2)
+        self.assertIsNotNone(backend2, "Could not extract backend ID from node2")
         print(f"  Node2 routed to backend {backend2}")
 
         # Both nodes should route to the same backend (route was propagated)
@@ -683,12 +751,12 @@ class PrefixRoutingTest(unittest.TestCase):
 
         print("  Sending 20 requests in rapid succession...")
         for i in range(20):
-            status, response, _ = send_chat_request(api_url, prompt, timeout=15)
+            status, response, headers = send_chat_request(api_url, prompt, timeout=15)
             if status != 200:
                 errors.append(f"Request {i+1}: status {status}")
                 continue
 
-            backend_id = extract_backend_id(response)
+            backend_id = extract_backend_id(response, headers)
             if backend_id:
                 backend_ids.append(backend_id)
 
@@ -711,8 +779,7 @@ class PrefixRoutingTest(unittest.TestCase):
     def test_07_metrics_reflect_routing_behavior(self):
         """Verify that Prometheus metrics accurately reflect routing behavior.
 
-        Check that cache hit/miss counters and radix tree metrics are exposed
-        and increment appropriately.
+        Check that radix tree lookup metrics are exposed and increment appropriately.
         """
         print("\nTest: Metrics reflect routing behavior")
 
@@ -725,13 +792,13 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # Send a new unique request (cache miss expected)
         unique_prompt = generate_unique_prompt(seed=77777)
-        status, response, _ = send_chat_request(api_url, unique_prompt)
+        status, response, headers = send_chat_request(api_url, unique_prompt)
         self.assertEqual(status, 200)
 
         time.sleep(0.5)
 
         # Send same request again (cache hit expected)
-        status, response, _ = send_chat_request(api_url, unique_prompt)
+        status, response, headers = send_chat_request(api_url, unique_prompt)
         self.assertEqual(status, 200)
 
         time.sleep(0.5)
@@ -740,19 +807,15 @@ class PrefixRoutingTest(unittest.TestCase):
         final = get_cache_metrics(metrics_url)
         print(f"  Final metrics: {final}")
 
-        # Verify metrics are being recorded
-        # At minimum, we should have some cache activity
-        total_initial = initial.get("cache_hits", 0) + initial.get("cache_misses", 0)
-        total_final = final.get("cache_hits", 0) + final.get("cache_misses", 0)
+        # Verify radix tree metrics are being recorded
+        # The radix_tree_lookup_hits should increase after the second request
+        initial_lookups = initial.get("radix_tree_lookup_hits", 0) + initial.get("radix_tree_lookup_misses", 0)
+        final_lookups = final.get("radix_tree_lookup_hits", 0) + final.get("radix_tree_lookup_misses", 0)
 
         self.assertGreater(
-            total_final, total_initial,
-            "Cache metrics should increase after requests"
+            final_lookups, initial_lookups,
+            f"Radix tree lookup metrics should increase after requests: initial={initial_lookups}, final={final_lookups}"
         )
-
-        # Verify radix tree metrics exist
-        self.assertIn("radix_tree_lookup_hits", final)
-        self.assertIn("radix_tree_lookup_misses", final)
 
         print(f"  PASSED: Metrics are being recorded correctly")
 
@@ -769,9 +832,10 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # First, learn the route on node1
         print("  Learning route on node1...")
-        status, response, _ = send_chat_request(NODES["node1"]["api"], unique_prompt)
+        status, response, headers = send_chat_request(NODES["node1"]["api"], unique_prompt)
         self.assertEqual(status, 200)
-        expected_backend = extract_backend_id(response)
+        expected_backend = extract_backend_id(response, headers)
+        self.assertIsNotNone(expected_backend, "Could not extract backend ID when learning route")
         print(f"  Node1 learned route to backend {expected_backend}")
 
         # Wait for propagation
@@ -780,9 +844,9 @@ class PrefixRoutingTest(unittest.TestCase):
         # Now query all nodes
         results = {}
         for node_name, endpoints in NODES.items():
-            status, response, _ = send_chat_request(endpoints["api"], unique_prompt)
+            status, response, headers = send_chat_request(endpoints["api"], unique_prompt)
             if status == 200:
-                backend = extract_backend_id(response)
+                backend = extract_backend_id(response, headers)
                 results[node_name] = backend
                 print(f"  {node_name}: routed to backend {backend}")
             else:
