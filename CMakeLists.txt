@@ -176,6 +176,7 @@ if(Seastar_FOUND)
       src/router_service.cpp
       src/stream_parser.cpp
       src/tokenizer_service.cpp
+      src/tokenizer_thread_pool.cpp
       src/sqlite_persistence.cpp
       src/tracing_service.cpp
     )
@@ -438,6 +439,7 @@ if(Seastar_FOUND)
       src/stream_parser.cpp
       src/dtls_context.cpp
       src/tokenizer_service.cpp
+      src/tokenizer_thread_pool.cpp
       src/tracing_service.cpp
     )
     target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
@@ -465,6 +467,7 @@ if(Seastar_FOUND)
     add_executable(tokenization_cache_test
       tests/unit/tokenization_cache_test.cpp
       src/tokenizer_service.cpp
+      src/tokenizer_thread_pool.cpp
     )
     target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenization_cache_test
