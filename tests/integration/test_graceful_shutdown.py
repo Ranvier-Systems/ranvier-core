@@ -251,7 +251,29 @@ class GracefulShutdownTest(unittest.TestCase):
 
         run_compose(["down", "-v", "--remove-orphans"], check=False)
 
+        # Check for pre-built images
         skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
+
+        if not skip_build:
+            # Try to create containers without building to see if images exist
+            try:
+                compose_cmd = get_compose_cmd()
+                create_result = subprocess.run(
+                    compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
+                                   "create", "--no-build"],
+                    capture_output=True, text=True, timeout=30
+                )
+                if create_result.returncode == 0:
+                    print("Docker images already exist. Skipping build.")
+                    skip_build = True
+                    # Clean up the created containers
+                    subprocess.run(
+                        compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "rm", "-f"],
+                        capture_output=True, timeout=30
+                    )
+            except (subprocess.TimeoutExpired, Exception):
+                pass
+
         if not skip_build:
             print("Building images (set SKIP_BUILD=1 to skip)...")
             run_compose(["build"], timeout=600)
