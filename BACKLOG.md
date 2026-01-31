@@ -1150,11 +1150,12 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 
 ### 8.6 Action Items (Tracking)
 
-- [ ] **[P0] Create E2E prefix routing test suite**
+- [x] **[P0] Create E2E prefix routing test suite** ✓
   _Description:_ Create `tests/integration/test_prefix_routing.py` with tests for: same prefix routes to same backend consistently, route learning verified via metrics, cache hit/miss validation.
   _Rationale:_ The core value proposition (prefix caching) has NO E2E validation. A regression in `lookup_instrumented()` could silently break cache affinity.
   _Files:_ `tests/integration/test_prefix_routing.py` (new)
   _Complexity:_ Medium
+  _Completed:_ 2026-01-31. Created comprehensive test suite with 8 tests: (1) same_prefix_routes_consistently, (2) route_learning_creates_cache_entry, (3) cache_hit_ratio_increases, (4) different_prefixes_can_route_differently, (5) route_propagation_across_cluster, (6) backend_affinity_under_load, (7) metrics_reflect_behavior, (8) all_nodes_route_consistently.
 
 - [ ] **[P0] Create graceful shutdown test suite**
   _Description:_ Create `tests/integration/test_graceful_shutdown.py` with tests for: in-flight requests complete, new connections rejected after signal, exit code 0 for clean shutdown.
@@ -1244,7 +1245,7 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | ✅ Done |
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
-| **P0 - Critical** | Testing | E2E prefix routing test suite | Medium | |
+| **P0 - Critical** | Testing | E2E prefix routing test suite | Medium | ✅ Done |
 | **P0 - Critical** | Testing | Graceful shutdown test suite | Medium | |
 | **P1 - High** | DX | Consolidate gossip debug metrics behind compile flag | Low | |
 | **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
@@ -1259,6 +1260,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-31 | **[Testing]** E2E prefix routing test suite. Created `tests/integration/test_prefix_routing.py` with 8 comprehensive tests validating core value proposition: cache affinity, route learning, metrics verification, cluster propagation. | - |
 | 2026-01-31 | **[Performance]** Offload tokenizer FFI via dedicated thread pool. Added `TokenizerWorker` and `TokenizerThreadPool` classes using `boost::lockfree::spsc_queue` and `seastar::alien::run_on()` for non-blocking tokenization. Per-shard worker threads with dedicated tokenizer instances. `encode_threaded_async()` API with priority fallback (cache → thread pool → cross-shard → local). Disabled by default (P3). Unit tests added. | - |
 | 2026-01-29 | **[Performance]** Offload tokenizer FFI via cross-shard dispatch. Added `encode_cached_async()` with round-robin shard selection. On cache miss, dispatches tokenization to different shard via `smp::submit_to`, freeing calling reactor. Rule #14 compliant (text copied, sharded pointer captured). Prometheus metrics for dispatch tracking. | - |
 | 2026-01-19 | **[Refactor]** Extract GossipService into three focused modules: GossipConsensus (~430 LOC), GossipTransport (~540 LOC), GossipProtocol (~870 LOC). Thin orchestrator (~350 LOC). Rule #14 compliant cross-shard dispatch. Robustness fixes for gate holder scoping and exception handling. | - |
