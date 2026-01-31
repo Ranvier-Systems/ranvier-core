@@ -1056,11 +1056,11 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
 
 ---
 
-## 8. Strategic Assessment (2026-01-19)
+## 8. Strategic Assessment (2026-01-31)
 
 > **External CTO/Lead Architect Review**
-> Generated: 2026-01-19
-> Scope: Full codebase analysis (~20,500 LOC across 33 files) against stated goal of "Layer 7+ Load Balancer with Prefix Caching"
+> Generated: 2026-01-19 | Updated: 2026-01-31
+> Scope: Full codebase analysis (~23,000 LOC across 52 files) against stated goal of "Layer 7+ Load Balancer with Prefix Caching"
 
 ### 8.0 State of the Project Scorecard
 
@@ -1150,17 +1150,19 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 
 ### 8.6 Action Items (Tracking)
 
-- [ ] **[P0] Create E2E prefix routing test suite**
+- [x] **[P0] Create E2E prefix routing test suite** ✓
   _Description:_ Create `tests/integration/test_prefix_routing.py` with tests for: same prefix routes to same backend consistently, route learning verified via metrics, cache hit/miss validation.
   _Rationale:_ The core value proposition (prefix caching) has NO E2E validation. A regression in `lookup_instrumented()` could silently break cache affinity.
   _Files:_ `tests/integration/test_prefix_routing.py` (new)
   _Complexity:_ Medium
+  _Completed:_ 2026-01-31. Created comprehensive test suite with 8 tests: (1) same_prefix_routes_consistently, (2) route_learning_creates_cache_entry, (3) cache_hit_ratio_increases, (4) different_prefixes_can_route_differently, (5) route_propagation_across_cluster, (6) backend_affinity_under_load, (7) metrics_reflect_behavior, (8) all_nodes_route_consistently.
 
-- [ ] **[P0] Create graceful shutdown test suite**
+- [x] **[P0] Create graceful shutdown test suite** ✓
   _Description:_ Create `tests/integration/test_graceful_shutdown.py` with tests for: in-flight requests complete, new connections rejected after signal, exit code 0 for clean shutdown.
   _Rationale:_ Shutdown path exercises multiple lifecycle guards (gates, timers, RAII). Untested path is high-risk for production incidents.
   _Files:_ `tests/integration/test_graceful_shutdown.py` (new)
   _Complexity:_ Medium
+  _Completed:_ 2026-01-31. Created comprehensive test suite with 8 tests validating shutdown lifecycle guards: (1) healthy_state_returns_200, (2) metrics_accessible_when_healthy, (3) cluster_status_not_draining, (4) concurrent_requests_accepted, (5) health_returns_503_during_drain, (6) requests_rejected_during_drain, (7) cluster_status_shows_draining, (8) cluster_maintains_consensus_during_node_shutdown.
 
 - [x] **[P1] Extract GossipConsensus class from gossip_service.cpp** ✓
   _Description:_ Refactor gossip_service.cpp (2,161 LOC) into three focused modules: `gossip_transport.cpp` (UDP/DTLS), `gossip_protocol.cpp` (message handling), `gossip_consensus.cpp` (quorum, split-brain).
@@ -1180,6 +1182,19 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
   _Rationale:_ Knowledge preservation for future maintainers. Explicit documentation prevents accidental rule violations during optimization work.
   _Files:_ `src/radix_tree.hpp`
   _Complexity:_ Low
+
+- [ ] **[P2] Add inline Hard Rule documentation to router_service.cpp**
+  _Description:_ Add explicit Hard Rule comments to load-bearing code paths in RouterService (route_request, learn_route_global, get_backend_for_prefix). Currently only 1 reference despite being second most critical file.
+  _Rationale:_ Knowledge preservation for future maintainers. RouterService orchestrates all routing decisions; undocumented constraints risk silent regressions.
+  _Files:_ `src/router_service.cpp`
+  _Complexity:_ Low
+
+- [ ] **[P3] Track config.hpp complexity - split when >2000 LOC**
+  _Description:_ Monitor `config.hpp` (currently 1,510 LOC). When exceeding 2000 LOC, split into `config_schema.hpp` (type definitions) and `config_loader.cpp` (YAML parsing logic).
+  _Rationale:_ Prevent config.hpp from becoming the next "sprawling module". Current growth trajectory suggests split needed within 2-3 feature additions.
+  _Files:_ `src/config.hpp` → `src/config_schema.hpp` (new), `src/config_loader.cpp` (new)
+  _Complexity:_ Medium
+  _Trigger:_ >2000 LOC or >50 config fields
 
 ---
 
@@ -1231,6 +1246,12 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | ✅ Done |
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
+| **P0 - Critical** | Testing | E2E prefix routing test suite | Medium | ✅ Done |
+| **P0 - Critical** | Testing | Graceful shutdown test suite | Medium | ✅ Done |
+| **P1 - High** | DX | Consolidate gossip debug metrics behind compile flag | Low | |
+| **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
+| **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | |
+| **P3 - Low** | DX | Split config.hpp when >2000 LOC | Medium | |
 
 ---
 
@@ -1240,6 +1261,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-01-31 | **[Testing]** E2E prefix routing test suite. Created `tests/integration/test_prefix_routing.py` with 8 comprehensive tests validating core value proposition: cache affinity, route learning, metrics verification, cluster propagation. | - |
 | 2026-01-31 | **[Performance]** Offload tokenizer FFI via dedicated thread pool. Added `TokenizerWorker` and `TokenizerThreadPool` classes using `boost::lockfree::spsc_queue` and `seastar::alien::run_on()` for non-blocking tokenization. Per-shard worker threads with dedicated tokenizer instances. `encode_threaded_async()` API with priority fallback (cache → thread pool → cross-shard → local). Disabled by default (P3). Unit tests added. | - |
 | 2026-01-29 | **[Performance]** Offload tokenizer FFI via cross-shard dispatch. Added `encode_cached_async()` with round-robin shard selection. On cache miss, dispatches tokenization to different shard via `smp::submit_to`, freeing calling reactor. Rule #14 compliant (text copied, sharded pointer captured). Prometheus metrics for dispatch tracking. | - |
 | 2026-01-19 | **[Refactor]** Extract GossipService into three focused modules: GossipConsensus (~430 LOC), GossipTransport (~540 LOC), GossipProtocol (~870 LOC). Thin orchestrator (~350 LOC). Rule #14 compliant cross-shard dispatch. Robustness fixes for gate holder scoping and exception handling. | - |
