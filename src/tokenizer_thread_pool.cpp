@@ -166,7 +166,7 @@ void TokenizerWorker::worker_loop(seastar::alien::instance& alien_instance) {
                     // The completion callback was registered during setup.
                     // Use thread_local to access the shard-local pool.
                     if (auto* callback = get_thread_pool_completion_callback()) {
-                        callback(job_id, std::move(tokens), success);
+                        (*callback)(job_id, std::move(tokens), success);
                     }
                 });
         } catch (const std::exception& e) {
