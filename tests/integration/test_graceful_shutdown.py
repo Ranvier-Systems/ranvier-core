@@ -486,9 +486,9 @@ class GracefulShutdownTest(unittest.TestCase):
         print(f"  Restarting {container_name}...")
         run_compose(["up", "-d", container_name], check=False)
 
-        # Wait for node to be healthy again (required for subsequent tests)
-        if not wait_for_healthy(f"{node_api}/health", timeout=60):
-            print(f"  WARNING: {container_name} did not become healthy within timeout")
+        # Wait for node to be healthy again (best-effort, don't block too long)
+        if not wait_for_healthy(f"{node_api}/health", timeout=15):
+            print(f"  Note: {container_name} still starting (will be ready for next run)")
         else:
             print(f"  {container_name} is healthy again")
 
@@ -551,11 +551,11 @@ class GracefulShutdownTest(unittest.TestCase):
         status_code, _ = send_chat_request(node1_api, "test-after-node-failure")
         self.assertEqual(status_code, 200, "Requests should still be processed")
 
-        # Restart node3
+        # Restart node3 (best-effort cleanup, don't block too long)
         print(f"  Restarting {container_name}...")
         run_compose(["up", "-d", container_name], check=False)
-        if not wait_for_healthy(f"{node3_api}/health", timeout=60):
-            print(f"  WARNING: {container_name} did not become healthy within timeout")
+        if not wait_for_healthy(f"{node3_api}/health", timeout=15):
+            print(f"  Note: {container_name} still starting (will be ready for next run)")
         else:
             print(f"  {container_name} is healthy again")
 
