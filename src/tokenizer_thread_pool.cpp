@@ -30,7 +30,18 @@ TokenizerWorker::~TokenizerWorker() {
 void TokenizerWorker::load_tokenizer(const std::string& json_content) {
     // Load tokenizer on the main thread before worker starts
     // This ensures the tokenizer is ready when the worker thread begins
-    _tokenizer = tokenizers::Tokenizer::FromBlobJSON(json_content);
+    try {
+        _tokenizer = tokenizers::Tokenizer::FromBlobJSON(json_content);
+        if (!_tokenizer) {
+            log_thread_pool.error("TokenizerWorker::load_tokenizer() returned null "
+                                 "tokenizer on shard {}", _shard_id);
+        }
+    } catch (const std::exception& e) {
+        // Rule #9: Log exceptions at warn level with context
+        log_thread_pool.warn("Failed to load tokenizer on shard {}: {}",
+                            _shard_id, e.what());
+        _tokenizer.reset();
+    }
 }
 
 void TokenizerWorker::start(seastar::alien::instance& alien_instance) {
@@ -297,6 +308,11 @@ TokenizerThreadPool::submit_async(std::string_view text) {
         return std::nullopt;
     }
 
+    // Double-check worker is still valid (defensive against race during shutdown)
+    if (!_worker) {
+        return std::nullopt;
+    }
+
     // Create job with owned copy of text (Rule #14)
     uint64_t job_id = _next_job_id++;
     TokenizationJob job{
@@ -333,6 +349,12 @@ void TokenizerThreadPool::complete_job(
         log_thread_pool.debug("Completion for unknown job {} on shard {}",
                              job_id, _shard_id);
         return;
+    }
+
+    // Log failed tokenizations (Rule #9)
+    if (!success) {
+        log_thread_pool.warn("Tokenization job {} failed on shard {} "
+                            "(returning empty tokens)", job_id, _shard_id);
     }
 
     ThreadPoolTokenizationResult result;
