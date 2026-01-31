@@ -234,7 +234,27 @@ def get_all_metrics(metrics_url: str) -> Dict[str, List[float]]:
         return {}
 
 
-def get_cache_metrics(metrics_url: str) -> Dict[str, float]:
+def debug_print_routing_metrics(metrics_url: str) -> None:
+    """Print all metrics containing routing-related keywords for debugging."""
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            print(f"    DEBUG: Failed to fetch metrics: {resp.status_code}")
+            return
+
+        keywords = ["radix", "lookup", "route", "tree", "cache", "hit", "miss"]
+        print("    DEBUG: Routing-related metrics found:")
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            line_lower = line.lower()
+            if any(kw in line_lower for kw in keywords):
+                print(f"      {line[:120]}")
+    except requests.exceptions.RequestException as e:
+        print(f"    DEBUG: Error fetching metrics: {e}")
+
+
+def get_cache_metrics(metrics_url: str, debug: bool = False) -> Dict[str, float]:
     """Get all cache-related metrics.
 
     Note: Metric names in Prometheus format:
@@ -244,6 +264,10 @@ def get_cache_metrics(metrics_url: str) -> Dict[str, float]:
     - ranvier_tokenization_cache_hits (from metrics_service.hpp)
     """
     metrics = get_all_metrics(metrics_url)
+
+    if debug:
+        debug_print_routing_metrics(metrics_url)
+
     return {
         # Radix tree lookup metrics (exposed in router_service.cpp)
         "radix_tree_lookup_hits": sum(metrics.get("ranvier_radix_tree_lookup_hits_total", [0])),
@@ -636,8 +660,8 @@ class PrefixRoutingTest(unittest.TestCase):
         api_url = NODES["node1"]["api"]
         metrics_url = NODES["node1"]["metrics"]
 
-        # Get initial metrics
-        initial_metrics = get_cache_metrics(metrics_url)
+        # Get initial metrics (with debug to see available metrics)
+        initial_metrics = get_cache_metrics(metrics_url, debug=True)
         initial_hits = initial_metrics.get("radix_tree_lookup_hits", 0)
         print(f"  Initial radix tree hits: {initial_hits}")
 
