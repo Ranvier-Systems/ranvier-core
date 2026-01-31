@@ -150,6 +150,9 @@ private:
     // Worker thread main loop
     void worker_loop(seastar::alien::instance& alien_instance);
 
+    // Process a single job and signal completion
+    void process_job(TokenizationJob& job, seastar::alien::instance& alien_instance);
+
     uint32_t _shard_id;
 
     // SPSC queue for job submission (reactor → worker)

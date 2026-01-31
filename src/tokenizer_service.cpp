@@ -209,50 +209,14 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
 
     // Decide whether to dispatch cross-shard
     if (!should_dispatch_cross_shard(text.size())) {
-        // Tokenize locally (blocks reactor but avoids cross-shard overhead)
-        ++_cross_shard_local_fallbacks;
-
-        TokenizationResult result;
-        try {
-            result.tokens = _impl->Encode(std::string(text));
-        } catch (const std::exception& e) {
-            // Rule #9: Log exceptions at warn level with context
-            log_tokenizer.warn("Local tokenization failed on shard {}: {}",
-                              local_shard, e.what());
-            return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
-        }
-        result.cache_hit = false;
-        result.cross_shard = false;
-        result.source_shard = local_shard;
-
-        // Cache locally for future hits
-        _cache.insert(text, result.tokens);
-
-        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+        return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
     }
 
     // Select target shard via P2C
     uint32_t target_shard = select_tokenization_shard();
 
     if (target_shard == local_shard) {
-        // P2C selected local shard - process locally
-        ++_cross_shard_local_fallbacks;
-
-        TokenizationResult result;
-        try {
-            result.tokens = _impl->Encode(std::string(text));
-        } catch (const std::exception& e) {
-            log_tokenizer.warn("Local tokenization failed on shard {}: {}",
-                              local_shard, e.what());
-            return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
-        }
-        result.cache_hit = false;
-        result.cross_shard = false;
-        result.source_shard = local_shard;
-
-        _cache.insert(text, result.tokens);
-
-        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+        return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
     }
 
     // Cross-shard dispatch: copy text for transfer (Rule #14: safe cross-shard data)
@@ -374,25 +338,27 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
     }
 
     // Priority 3: Local tokenization (blocks reactor)
+    return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+}
+
+TokenizationResult TokenizerService::tokenize_locally(std::string_view text) {
+    uint32_t local_shard = seastar::this_shard_id();
     ++_cross_shard_local_fallbacks;
 
     TokenizationResult result;
     try {
         result.tokens = _impl->Encode(std::string(text));
     } catch (const std::exception& e) {
-        // Rule #9: Log exceptions at warn level with context
         log_tokenizer.warn("Local tokenization failed on shard {}: {}",
                           local_shard, e.what());
-        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+        return TokenizationResult{};
     }
     result.cache_hit = false;
     result.cross_shard = false;
     result.source_shard = local_shard;
 
-    // Cache locally for future hits
     _cache.insert(text, result.tokens);
-
-    return seastar::make_ready_future<TokenizationResult>(std::move(result));
+    return result;
 }
 
 bool TokenizerService::is_loaded() const {

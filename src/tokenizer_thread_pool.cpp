@@ -111,14 +111,11 @@ bool TokenizerWorker::submit(TokenizationJob job) {
 void TokenizerWorker::worker_loop(seastar::alien::instance& alien_instance) {
     log_thread_pool.debug("Worker thread started for shard {}", _shard_id);
 
-    // Spin-wait parameters for low latency while not burning CPU
     constexpr auto SPIN_ITERATIONS = 1000;
     constexpr auto SLEEP_DURATION = std::chrono::microseconds(100);
 
     while (!_shutdown.load(std::memory_order_acquire)) {
         TokenizationJob job;
-
-        // Try to pop a job from the queue
         bool got_job = false;
 
         // Spin briefly before sleeping (reduces latency for bursty workloads)
@@ -130,73 +127,49 @@ void TokenizerWorker::worker_loop(seastar::alien::instance& alien_instance) {
         }
 
         if (!got_job) {
-            // No job available after spinning, sleep briefly
             std::this_thread::sleep_for(SLEEP_DURATION);
             continue;
         }
 
-        // Process the job
-        std::vector<int32_t> tokens;
-        bool success = false;
-
-        try {
-            tokens = _tokenizer->Encode(job.text);
-            success = true;
-        } catch (const std::exception& e) {
-            // Rule #9: Log exceptions at warn level with context
-            log_thread_pool.warn("Worker tokenization failed on shard {}: {}",
-                                _shard_id, e.what());
-        }
-
-        _jobs_processed.fetch_add(1, std::memory_order_relaxed);
-
-        // Signal completion back to the reactor thread
-        // IMPORTANT: We capture job.source_shard and job.job_id by value.
-        // tokens is moved into the lambda.
-        // The lambda will be executed on the reactor thread.
-        uint32_t target_shard = job.source_shard;
-        uint64_t job_id = job.job_id;
-
-        // alien::run_on() requires void return and noexcept
-        // We can't directly access TokenizerThreadPool from here (different thread),
-        // so we use a global registry pattern with shard-local lookup.
-        //
-        // Actually, the better pattern is to store a function pointer/callback
-        // that was set during initialization. But for simplicity, we use
-        // seastar's per-shard sharded<> pattern.
-        //
-        // Since we can't easily get a reference to the sharded<TokenizerThreadPool>
-        // from here, we'll use a thread_local callback approach.
-
-        try {
-            seastar::alien::run_on(alien_instance, target_shard,
-                [job_id, tokens = std::move(tokens), success]() noexcept {
-                    // This runs on the reactor thread for target_shard
-                    // We need to signal the TokenizerThreadPool::complete_job()
-                    //
-                    // The completion callback was registered during setup.
-                    // Use thread_local to access the shard-local pool.
-                    if (auto* callback = get_thread_pool_completion_callback()) {
-                        (*callback)(job_id, std::move(tokens), success);
-                    }
-                });
-        } catch (const std::exception& e) {
-            // alien::run_on can throw if the reactor is shutting down
-            log_thread_pool.warn("Failed to signal completion for job {} on shard {}: {}",
-                                job_id, target_shard, e.what());
-            _jobs_dropped.fetch_add(1, std::memory_order_relaxed);
-        }
+        process_job(job, alien_instance);
     }
 
     log_thread_pool.debug("Worker thread exiting for shard {}", _shard_id);
 }
 
-// ============================================================================
-// Thread-local callback for completion signaling
-// ============================================================================
+void TokenizerWorker::process_job(TokenizationJob& job, seastar::alien::instance& alien_instance) {
+    std::vector<int32_t> tokens;
+    bool success = false;
 
-// Thread-local callback function pointer (Rule #8: consolidated state)
-// This is set by TokenizerThreadPool::start_worker() and cleared on stop.
+    try {
+        tokens = _tokenizer->Encode(job.text);
+        success = true;
+    } catch (const std::exception& e) {
+        log_thread_pool.warn("Worker tokenization failed on shard {}: {}",
+                            _shard_id, e.what());
+    }
+
+    _jobs_processed.fetch_add(1, std::memory_order_relaxed);
+
+    uint32_t target_shard = job.source_shard;
+    uint64_t job_id = job.job_id;
+
+    try {
+        seastar::alien::run_on(alien_instance, target_shard,
+            [job_id, tokens = std::move(tokens), success]() noexcept {
+                if (auto* callback = get_thread_pool_completion_callback()) {
+                    (*callback)(job_id, std::move(tokens), success);
+                }
+            });
+    } catch (const std::exception& e) {
+        log_thread_pool.warn("Failed to signal completion for job {} on shard {}: {}",
+                            job_id, target_shard, e.what());
+        _jobs_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// Thread-local callback for worker → reactor completion signaling.
+// Set by TokenizerThreadPool::start_worker(), cleared on stop.
 namespace {
     thread_local std::function<void(uint64_t, std::vector<int32_t>, bool)>*
         tl_completion_callback = nullptr;
@@ -255,19 +228,15 @@ void TokenizerThreadPool::start_worker(seastar::alien::instance& alien_instance)
         return;
     }
 
-    // Create worker with configured queue size
     _worker = std::make_unique<TokenizerWorker>(_shard_id, _config.max_queue_size);
     _worker->load_tokenizer(_tokenizer_json);
 
-    // Set up completion callback (thread-local, shard-local)
-    // Rule #13: Store callback in member to ensure lifetime
+    // Static thread_local ensures callback lifetime (Rule #13)
     static thread_local std::function<void(uint64_t, std::vector<int32_t>, bool)> callback;
     callback = [this](uint64_t job_id, std::vector<int32_t> tokens, bool success) {
         complete_job(job_id, std::move(tokens), success);
     };
     set_thread_pool_completion_callback(&callback);
-
-    // Start worker thread with alien instance for cross-thread signaling
     _worker->start(alien_instance);
 
     log_thread_pool.info("Thread pool worker started on shard {}", _shard_id);
@@ -278,10 +247,7 @@ void TokenizerThreadPool::stop_worker() {
         _worker->stop();
         _worker.reset();
     }
-
-    // Clear completion callback
     set_thread_pool_completion_callback(nullptr);
-
     log_thread_pool.debug("Thread pool worker stopped on shard {}", _shard_id);
 }
 

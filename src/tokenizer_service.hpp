@@ -282,6 +282,9 @@ private:
 
     // Check if text qualifies for cross-shard dispatch
     bool should_dispatch_cross_shard(size_t text_length) const;
+
+    // Perform local tokenization with caching (shared logic for async methods)
+    TokenizationResult tokenize_locally(std::string_view text);
 };
 
 } // namespace ranvier
