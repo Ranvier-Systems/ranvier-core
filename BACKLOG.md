@@ -555,7 +555,101 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `src/sharded_config.hpp`, `src/application.hpp`, `src/application.cpp`
   _Complexity:_ Medium
 
-### 5.5 Build System
+### 5.5 rvctl CLI Enhancements
+
+The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier's Admin API. Several endpoints and quality-of-life features are not yet exposed.
+
+- [x] **Add `rvctl inspect metrics` command** ✓
+  _Justification:_ Prometheus metrics endpoint (`:9180/metrics`) is not integrated into rvctl. Operators must use curl or helper scripts to view metrics. A CLI command with parsed/formatted output improves operational visibility.
+  _Features:_
+  - Fetch from `/metrics` endpoint with configurable URL
+  - Add `--metrics-url` flag for full URL override (e.g., `http://metrics.ranvier:9180`)
+  - Add `--metrics-port` flag for port-only override, derives host from `--url` (default 9180)
+  - Parse and display key metrics in readable format (cache hit ratio, request counters, active requests, per-backend latencies)
+  - Support `--raw` flag for raw Prometheus format output
+  - Support `--filter <pattern>` for metric name filtering
+  - Support `RANVIER_METRICS_URL` environment variable
+  _Note:_ Metrics port may differ from API port, especially in containerized deployments where ports are remapped.
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Medium
+  _Priority:_ High
+
+- [x] **Add `rvctl backend add` command** ✓
+  _Justification:_ Backend registration requires curl. CLI command simplifies operator workflow and enables scripting.
+  _Usage:_ `rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]`
+  _Endpoint:_ POST /admin/backends
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ High
+
+- [x] **Add `rvctl backend delete` command** ✓
+  _Justification:_ Backend removal requires curl. Completes full backend lifecycle management in rvctl.
+  _Usage:_ `rvctl backend delete --id <id>`
+  _Endpoint:_ DELETE /admin/backends
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ High
+
+- [x] **Add `rvctl route delete` command** ✓
+  _Justification:_ Route deletion for a backend requires curl. Enables cleanup workflows.
+  _Usage:_ `rvctl route delete --backend <id>`
+  _Endpoint:_ DELETE /admin/routes
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Medium
+
+- [x] **Add `rvctl keys reload` command** ✓
+  _Justification:_ API key hot-reload requires curl. CLI command simplifies key rotation workflows.
+  _Usage:_ `rvctl keys reload`
+  _Endpoint:_ POST /admin/keys/reload
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Medium
+
+- [x] **Add `rvctl health` command** ✓
+  _Justification:_ Quick health check without authentication. Useful for scripting and monitoring integration.
+  _Usage:_ `rvctl health`
+  _Endpoint:_ GET /health (public, no auth required)
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Medium
+
+- [x] **Add `--output json` global flag** ✓
+  _Justification:_ Current output is human-formatted. JSON output enables piping to jq and scripting integration.
+  _Usage:_ `rvctl --output json inspect backends`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Low
+
+- [x] **Add `--watch` mode for continuous monitoring** ✓
+  _Justification:_ Operators often need to monitor state during deployments. Watch mode with configurable refresh interval reduces manual polling.
+  _Usage:_ `rvctl --watch [--interval 2s] inspect backends`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Medium
+  _Priority:_ Low
+
+- [ ] **Refactor rvctl into package structure when >4000 lines**
+  _Justification:_ Currently ~3300 lines as single file for easy deployment. If significant features are added, refactoring improves maintainability. Current section comments provide navigation.
+  _Threshold:_ >4000 lines or >50 functions
+  _Structure:_ `rvctl_lib/{cli.py, client.py, config.py, commands/, completions/}`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Medium
+  _Priority:_ Low (defer until threshold reached)
+
+- [ ] **Add unit tests for rvctl command functions**
+  _Justification:_ CLI commands lack automated testing. Mock-based tests would catch regressions.
+  _Location:_ `tests/unit/test_rvctl.py` (new)
+  _Complexity:_ Medium
+  _Priority:_ Low
+
+- [ ] **Add `rvctl doctor` command for connectivity troubleshooting**
+  _Justification:_ Operators need quick diagnosis of connection issues. Command would check: API reachability, auth validity, metrics endpoint, DNS resolution.
+  _Usage:_ `rvctl doctor`
+  _Location:_ `tools/rvctl`
+  _Complexity:_ Low
+  _Priority:_ Low
+
+### 5.6 Build System
 
 - [ ] **Add Windows/macOS cross-compilation support**
   _Justification:_ Contributors on non-Linux need Docker for development. Native builds improve DX.
@@ -885,6 +979,18 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
   _Severity:_ Medium
   _Fixed:_ PR #127 - std::call_once for init, std::atomic for enabled flag, shutdown guard
 
+- [ ] **Add DNS resolution timeout in backend registration**
+  _Issue:_ `src/http_controller.cpp:1469` calls `seastar::net::dns::get_host_by_name()` without timeout. If hostname doesn't resolve (especially `.local` mDNS domains), the request hangs indefinitely waiting for DNS response.
+  _Fix:_ Wrap DNS call with `seastar::with_timeout()`:
+  ```cpp
+  auto hostent = co_await seastar::with_timeout(
+      std::chrono::seconds(5),
+      seastar::net::dns::get_host_by_name(std::string(ip_str))
+  );
+  ```
+  _Location:_ `src/http_controller.cpp:1469`
+  _Severity:_ Medium
+
 ### 7.3 Architecture Drift
 
 - [x] **Move token count limits from persistence layer to business layer** ✓
@@ -1113,6 +1219,15 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | Performance | Offload tokenizer FFI via dedicated thread pool | High | |
 | **P3 - Low** | Performance | Audit codebase for abseil container opportunities | Low | |
 | **P3 - Low** | DX | Change max_token_id type from int32_t to uint32_t | Low | |
+| **P2 - Medium** | DX | rvctl: Add `inspect metrics` command | Medium | ✅ Done |
+| **P2 - Medium** | DX | rvctl: Add `backend add` command | Low | ✅ Done |
+| **P2 - Medium** | DX | rvctl: Add `backend delete` command | Low | ✅ Done |
+| **P3 - Low** | DX | rvctl: Add `route delete` command | Low | ✅ Done |
+| **P3 - Low** | DX | rvctl: Add `keys reload` command | Low | ✅ Done |
+| **P3 - Low** | DX | rvctl: Add `health` command | Low | ✅ Done |
+| **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | ✅ Done |
+| **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | ✅ Done |
+| **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
 
 ---
 

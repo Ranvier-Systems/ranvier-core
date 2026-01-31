@@ -629,6 +629,26 @@ Total Backends: 2
   Healthy: 1  Draining: 1  Dead: 0
 ```
 
+#### inspect metrics
+
+Display Prometheus metrics in human-readable format.
+
+```bash
+# Show formatted metrics summary
+rvctl inspect metrics
+
+# Show raw Prometheus format
+rvctl inspect metrics --raw
+
+# Filter metrics by name pattern (regex)
+rvctl inspect metrics --filter "latency"
+
+# Use custom metrics URL (for Docker port mapping)
+rvctl --metrics-url http://localhost:19180 inspect metrics
+```
+
+**Output**: Request counts, cache hit ratio, latency percentiles, per-backend stats, circuit breaker status.
+
 #### cluster status
 
 Show cluster health and peer status.
@@ -638,6 +658,16 @@ rvctl cluster status
 ```
 
 **Output**: Quorum state, peer count, local backend ID, and peer table with last-seen timestamps.
+
+#### health
+
+Quick health check (no authentication required).
+
+```bash
+rvctl health
+```
+
+**Output**: `HEALTHY`, `DRAINING`, or `UNHEALTHY` status with quorum info if available.
 
 #### drain
 
@@ -653,6 +683,38 @@ rvctl drain 2
 # Success: Backend 2 drain initiated
 ```
 
+#### backend add
+
+Register a new backend.
+
+```bash
+rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]
+```
+
+**Example**:
+```bash
+# Basic registration
+rvctl backend add --id 1 --ip 192.168.1.100 --port 8000
+
+# With weight and priority
+rvctl backend add --id 2 --ip gpu-server.local --port 8000 --weight 200 --priority 1
+```
+
+#### backend delete
+
+Remove a backend and all its associated routes.
+
+```bash
+rvctl backend delete --id <id>
+```
+
+**Example**:
+```bash
+rvctl backend delete --id 1
+# Success: Backend 1 deleted
+#   All associated routes have been removed.
+```
+
 #### route add
 
 Manually register a route (prefix → backend mapping).
@@ -665,18 +727,131 @@ rvctl route add --backend 1 --content "You are a helpful assistant."
 echo "System prompt here" | rvctl route add --backend 1 --stdin
 ```
 
+#### route delete
+
+Delete all routes for a backend.
+
+```bash
+rvctl route delete --backend <id>
+```
+
+**Example**:
+```bash
+rvctl route delete --backend 1
+# Success: Routes deleted for backend 1
+#   Routes removed: 5
+```
+
+#### keys reload
+
+Hot-reload API keys from disk without restarting.
+
+```bash
+rvctl keys reload
+```
+
+**Output**: Number of keys loaded from the keys file.
+
 ### Global Options
 
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--url` | `-u` | Ranvier Admin API URL (default: `http://localhost:8080`) |
 | `--admin-key` | `-k` | Admin API key |
+| `--timeout` | `-t` | Request timeout in seconds (default: 30) |
+| `--output` | `-o` | Output format: `text` (default) or `json` |
+| `--watch` | `-w` | Watch mode: continuously refresh output |
+| `--interval` | | Watch refresh interval in seconds (default: 2.0) |
+| `--quiet` | `-q` | Suppress output (exit code only) |
+| `--metrics-url` | | Metrics endpoint URL (overrides `--url` for metrics) |
+| `--metrics-port` | | Metrics port (default: 9180, used with `--url` host) |
 | `--verbose` | `-v` | Enable verbose output |
+
+### Watch Mode
+
+Watch mode continuously refreshes the output, similar to the `watch` command. Only read commands support watch mode:
+
+```bash
+# Watch backend status with 1-second refresh
+rvctl --watch --interval 1 inspect backends
+
+# Watch health continuously
+rvctl -w health
+
+# Watch metrics
+rvctl --watch inspect metrics
+```
+
+Press `Ctrl+C` to stop watching.
+
+### JSON Output
+
+All commands support `--output json` for machine-readable output:
+
+```bash
+# Get backends as JSON
+rvctl --output json inspect backends
+
+# Pipe to jq for field extraction
+rvctl -o json inspect backends | jq '.backends[].id'
+
+# Health check with JSON output
+rvctl -o json health
+```
+
+### Shell Completions
+
+Generate shell completion scripts for tab-completion of commands and options:
+
+```bash
+# Bash - add to ~/.bashrc
+eval "$(rvctl completion bash)"
+
+# Zsh - add to ~/.zshrc
+eval "$(rvctl completion zsh)"
+
+# Fish - save to completions directory
+rvctl completion fish > ~/.config/fish/completions/rvctl.fish
+```
+
+After enabling completions, you can use `Tab` to complete:
+- Commands: `rvctl ins<Tab>` → `rvctl inspect`
+- Subcommands: `rvctl inspect b<Tab>` → `rvctl inspect backends`
+- Options: `rvctl --out<Tab>` → `rvctl --output`
+- Option values: `rvctl --output <Tab>` → `text json`
+
+### Configuration File
+
+rvctl loads defaults from a JSON config file. Searched locations (in order):
+
+1. `~/.config/rvctl/config.json`
+2. `~/.rvctl.json`
+
+**Example config:**
+```json
+{
+    "url": "http://ranvier.example.com:8080",
+    "admin_key": "your-api-key",
+    "metrics_url": "http://ranvier.example.com:9180",
+    "metrics_port": 9180,
+    "timeout": 60,
+    "output": "json",
+    "interval": 1.0
+}
+```
+
+**Priority** (highest to lowest):
+1. Command-line arguments
+2. Environment variables
+3. Config file
+4. Built-in defaults
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
+| `RANVIER_URL` | Default admin API URL |
 | `RANVIER_ADMIN_KEY` | Default admin API key |
+| `RANVIER_METRICS_URL` | Default metrics endpoint URL |
 
 ---

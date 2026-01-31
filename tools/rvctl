@@ -8,13 +8,58 @@ Communicates with the Ranvier Admin API via JSON/HTTP.
 Usage:
     rvctl inspect routes [--prefix TOKEN_IDS] [--shard SHARD_ID]
     rvctl inspect backends
+    rvctl inspect metrics [--raw] [--filter PATTERN]
     rvctl cluster status
     rvctl drain <backend_id>
+    rvctl backend add --id <id> --ip <ip> --port <port> [--weight <w>] [--priority <p>]
+    rvctl backend update --id <id> [--weight <w>] [--priority <p>]
+    rvctl backend delete --id <id>
     rvctl route add --backend <id> --content "prompt text"
     rvctl route add --backend <id> --stdin < file.txt
+    rvctl route delete --backend <id>
+    rvctl keys reload
+    rvctl health
+    rvctl top
+    rvctl wait [--healthy] [--quorum] [--backend ID --status STATUS] [--timeout SECS]
+    rvctl profile list
+    rvctl profile add <name> --url <url> [--admin-key <key>] [--metrics-url <url>]
+    rvctl profile use <name>
+    rvctl profile show [<name>]
+    rvctl profile delete <name>
+    rvctl export [--file <path>]
+    rvctl import [--file <path>] [--stdin]
+    rvctl completion {bash,zsh,fish}
 
 Authentication:
     Set RANVIER_ADMIN_KEY environment variable or use --admin-key flag.
+
+Configuration:
+    rvctl loads defaults from config file (JSON format):
+    - ~/.config/rvctl/config.json (preferred)
+    - ~/.rvctl.json (fallback)
+
+    Example config:
+    {
+        "url": "http://ranvier.example.com:8080",
+        "admin_key": "your-api-key",
+        "metrics_url": "http://ranvier.example.com:9180",
+        "timeout": 60,
+        "output": "json"
+    }
+
+    Priority: CLI args > environment variables > config file > defaults
+
+Global Options:
+    --url, -u          Admin API URL (default: http://localhost:8080)
+    --admin-key, -k    Admin API key (or set RANVIER_ADMIN_KEY)
+    --timeout, -t      Request timeout in seconds (default: 30)
+    --output, -o       Output format: text (default) or json
+    --watch, -w        Watch mode: continuously refresh output
+    --interval         Watch refresh interval in seconds (default: 2.0)
+    --quiet, -q        Suppress output (exit code only)
+    --metrics-url      Metrics endpoint URL (or set RANVIER_METRICS_URL)
+    --metrics-port     Metrics port override (default: 9180)
+    --verbose, -v      Enable verbose output
 
 Examples:
     # Inspect all routes across shards
@@ -26,30 +71,144 @@ Examples:
     # Show backend health status
     rvctl inspect backends
 
+    # Show Prometheus metrics summary
+    rvctl inspect metrics
+
+    # Show raw Prometheus metrics
+    rvctl inspect metrics --raw
+
+    # Filter metrics by pattern
+    rvctl inspect metrics --filter "backend_latency"
+
+    # Use custom metrics URL (for Docker port mapping)
+    rvctl --metrics-url http://localhost:19180 inspect metrics
+
     # Show cluster/quorum status
     rvctl cluster status
 
     # Drain a specific backend
     rvctl drain 1
 
+    # Register a new backend
+    rvctl backend add --id 1 --ip 192.168.1.100 --port 8000
+
+    # Register a backend with weight and priority
+    rvctl backend add --id 2 --ip gpu-server.local --port 8000 --weight 200 --priority 1
+
+    # Update backend weight (for load balancing adjustments)
+    rvctl backend update --id 1 --weight 200
+
+    # Update backend priority
+    rvctl backend update --id 1 --priority 1
+
+    # Remove a backend
+    rvctl backend delete --id 1
+
     # Add a route for a backend (content from argument)
     rvctl route add --backend 1 --content "You are a helpful assistant."
 
     # Add a route for a backend (content from stdin)
     echo "System prompt here" | rvctl route add --backend 1 --stdin
+
+    # Delete all routes for a backend
+    rvctl route delete --backend 1
+
+    # Hot-reload API keys from disk
+    rvctl keys reload
+
+    # Quick health check (no auth required)
+    rvctl health
+
+    # Real-time dashboard showing cluster health, backends, and metrics
+    rvctl top
+
+    # Dashboard with 1-second refresh interval
+    rvctl top --interval 1
+
+    # Wait for server to become healthy (useful in scripts)
+    rvctl wait --healthy
+
+    # Wait for server to be healthy with 60-second timeout
+    rvctl wait --healthy --timeout 60
+
+    # Wait for quorum to be established
+    rvctl wait --quorum
+
+    # Wait for a specific backend to be healthy
+    rvctl wait --backend 1 --status healthy
+
+    # Wait for backend to finish draining
+    rvctl wait --backend 1 --status drained
+
+    # Create a profile for production environment
+    rvctl profile add prod --url https://ranvier.prod.example.com --admin-key $PROD_KEY
+
+    # Create a profile for staging
+    rvctl profile add staging --url https://ranvier.staging.example.com
+
+    # Switch to production profile
+    rvctl profile use prod
+
+    # List all profiles
+    rvctl profile list
+
+    # Show current profile details
+    rvctl profile show
+
+    # Export current backends and routes to a file
+    rvctl export --file backup.json
+
+    # Export to stdout (for piping)
+    rvctl export > backup.json
+
+    # Import configuration from a file
+    rvctl import --file backup.json
+
+    # Import from stdin
+    cat backup.json | rvctl import --stdin
+
+    # Clone configuration between environments
+    rvctl --url $PROD export | rvctl --url $STAGING import --stdin
+
+    # Use shorter timeout for faster failure detection
+    rvctl --timeout 5 backend add --id 1 --ip 192.168.1.100 --port 8000
+
+    # Output as JSON for scripting
+    rvctl --output json inspect backends | jq '.backends[].id'
+
+    # Watch backend status with 1-second refresh
+    rvctl --watch --interval 1 inspect backends
+
+    # Watch health continuously
+    rvctl -w health
+
+    # Enable shell completions (bash)
+    eval "$(rvctl completion bash)"
+
+    # Enable shell completions (zsh)
+    eval "$(rvctl completion zsh)"
+
+    # Enable shell completions (fish)
+    rvctl completion fish > ~/.config/fish/completions/rvctl.fish
 """
 
 import argparse
 import json
 import os
+import re
 import sys
+import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 
-# ANSI color codes for terminal output
+# =============================================================================
+# SECTION: Constants & Terminal Colors
+# =============================================================================
+
 class Colors:
     RESET = '\033[0m'
     BOLD = '\033[1m'
@@ -80,9 +239,14 @@ if not sys.stdout.isatty():
     Colors.disable()
 
 
+# =============================================================================
+# SECTION: HTTP Client & API Utilities
+# =============================================================================
+
 def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
                  data: Optional[bytes] = None,
-                 content_type: str = 'application/json') -> Dict[str, Any]:
+                 content_type: str = 'application/json',
+                 timeout: int = 30) -> Dict[str, Any]:
     """Make an HTTP request to the Ranvier Admin API."""
     headers = {
         'Content-Type': content_type,
@@ -95,7 +259,7 @@ def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
     req = urllib.request.Request(url, method=method, headers=headers, data=data)
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             body = response.read().decode('utf-8')
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
@@ -108,11 +272,149 @@ def make_request(url: str, method: str = 'GET', admin_key: Optional[str] = None,
         print(f"{Colors.RED}Error:{Colors.RESET} HTTP {e.code}: {error_msg}", file=sys.stderr)
         sys.exit(1)
     except urllib.error.URLError as e:
-        print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        if 'timed out' in str(e.reason):
+            print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+            print(f"  Hint: Use --timeout to increase timeout, or check if the server is responding", file=sys.stderr)
+        else:
+            print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+        print(f"  Hint: Use --timeout to increase timeout, or check if the server is responding", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def fetch_metrics_text(url: str, timeout: int = 30) -> str:
+    """Fetch raw Prometheus metrics text from the metrics endpoint."""
+    headers = {
+        'Accept': 'text/plain',
+    }
+
+    req = urllib.request.Request(url, method='GET', headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.read().decode('utf-8')
+    except urllib.error.HTTPError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} HTTP {e.code}: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        if 'timed out' in str(e.reason):
+            print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+            print(f"  Hint: Use --timeout to increase timeout", file=sys.stderr)
+        else:
+            print(f"{Colors.RED}Error:{Colors.RESET} Connection failed: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print(f"{Colors.RED}Error:{Colors.RESET} Request timed out after {timeout}s", file=sys.stderr)
+        print(f"  Hint: Use --timeout to increase timeout", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_prometheus_metrics(text: str) -> Dict[str, Any]:
+    """Parse Prometheus text format into structured data.
+
+    Returns a dict with:
+      - metrics: dict of metric_name -> list of (labels_dict, value)
+      - help: dict of metric_name -> help text
+      - type: dict of metric_name -> metric type (counter, gauge, histogram, etc.)
+    """
+    metrics: Dict[str, List[Tuple[Dict[str, str], float]]] = {}
+    help_text: Dict[str, str] = {}
+    metric_type: Dict[str, str] = {}
+
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # Parse HELP lines
+        if line.startswith('# HELP '):
+            parts = line[7:].split(' ', 1)
+            if len(parts) == 2:
+                help_text[parts[0]] = parts[1]
+            continue
+
+        # Parse TYPE lines
+        if line.startswith('# TYPE '):
+            parts = line[7:].split(' ', 1)
+            if len(parts) == 2:
+                metric_type[parts[0]] = parts[1]
+            continue
+
+        # Skip other comments
+        if line.startswith('#'):
+            continue
+
+        # Parse metric lines: name{labels} value or name value
+        match = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}\s+(.+)$', line)
+        if match:
+            name, labels_str, value_str = match.groups()
+            # Parse labels
+            labels = {}
+            for label_match in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"', labels_str):
+                labels[label_match.group(1)] = label_match.group(2)
+            try:
+                value = float(value_str.split()[0])  # Handle optional timestamp
+            except ValueError:
+                continue
+            if name not in metrics:
+                metrics[name] = []
+            metrics[name].append((labels, value))
+        else:
+            # No labels
+            match = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(.+)$', line)
+            if match:
+                name, value_str = match.groups()
+                try:
+                    value = float(value_str.split()[0])
+                except ValueError:
+                    continue
+                if name not in metrics:
+                    metrics[name] = []
+                metrics[name].append(({}, value))
+
+    return {
+        'metrics': metrics,
+        'help': help_text,
+        'type': metric_type,
+    }
+
+
+def get_metric_value(parsed: Dict[str, Any], name: str, labels: Optional[Dict[str, str]] = None) -> Optional[float]:
+    """Get a single metric value, optionally filtered by labels."""
+    metrics = parsed['metrics'].get(name, [])
+    for metric_labels, value in metrics:
+        if labels is None:
+            return value
+        if all(metric_labels.get(k) == v for k, v in labels.items()):
+            return value
+    return None
+
+
+# =============================================================================
+# SECTION: Formatting Utilities
+# =============================================================================
+
+def format_number(value: float) -> str:
+    """Format a number for display."""
+    if value == 0:
+        return "0"
+    if abs(value) >= 1_000_000:
+        return f"{value/1_000_000:.2f}M"
+    if abs(value) >= 1_000:
+        return f"{value/1_000:.2f}K"
+    if abs(value) < 0.01:
+        return f"{value:.6f}"
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.2f}"
 
 
 def format_timestamp(ms: int) -> str:
@@ -224,6 +526,10 @@ class TreePrinter:
                            True, child_path)
 
 
+# =============================================================================
+# SECTION: Command Implementations - Inspect
+# =============================================================================
+
 def cmd_inspect_routes(args):
     """Handle 'inspect routes' command."""
     base_url = args.url.rstrip('/')
@@ -233,10 +539,15 @@ def cmd_inspect_routes(args):
     if args.prefix:
         url += f"?prefix={args.prefix}"
 
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
     print(f"{Colors.BOLD}Fetching routes from {args.url}...{Colors.RESET}")
     print()
-
-    data = make_request(url, admin_key=args.admin_key)
 
     shard_id = data.get('shard_id', 0)
     tree = data.get('tree')
@@ -282,10 +593,15 @@ def cmd_inspect_backends(args):
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/dump/backends"
 
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
     print(f"{Colors.BOLD}Fetching backends from {args.url}...{Colors.RESET}")
     print()
-
-    data = make_request(url, admin_key=args.admin_key)
 
     shard_id = data.get('shard_id', 0)
     backends = data.get('backends', [])
@@ -347,15 +663,24 @@ def cmd_inspect_backends(args):
           f"{Colors.RED}Dead:{Colors.RESET} {dead}")
 
 
+# =============================================================================
+# SECTION: Command Implementations - Cluster
+# =============================================================================
+
 def cmd_cluster_status(args):
     """Handle 'cluster status' command."""
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/dump/cluster"
 
+    data = make_request(url, admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
     print(f"{Colors.BOLD}Fetching cluster status from {args.url}...{Colors.RESET}")
     print()
-
-    data = make_request(url, admin_key=args.admin_key)
 
     cluster_enabled = data.get('cluster_enabled', False)
 
@@ -418,15 +743,30 @@ def cmd_cluster_status(args):
             print(f"  {address:^25} │ {status:^10} │ {last_seen:^15}{backend_str}")
 
 
+# =============================================================================
+# SECTION: Command Implementations - Drain
+# =============================================================================
+
 def cmd_drain(args):
     """Handle 'drain' command."""
     backend_id = args.backend_id
     base_url = args.url.rstrip('/')
     url = f"{base_url}/admin/drain?backend_id={backend_id}"
 
-    print(f"{Colors.BOLD}Initiating drain for backend {backend_id}...{Colors.RESET}")
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would drain backend {backend_id}")
+        print(f"  POST {url}")
+        return
 
-    data = make_request(url, method='POST', admin_key=args.admin_key)
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        return
+
+    print(f"{Colors.BOLD}Initiating drain for backend {backend_id}...{Colors.RESET}")
 
     status = data.get('status', 'unknown')
     action = data.get('action', 'unknown')
@@ -443,6 +783,10 @@ def cmd_drain(args):
             print(f"  {message}")
 
 
+# =============================================================================
+# SECTION: Command Implementations - Routes
+# =============================================================================
+
 def cmd_route_add(args):
     """Handle 'route add' command."""
     backend_id = args.backend
@@ -453,13 +797,22 @@ def cmd_route_add(args):
     if args.stdin:
         content = sys.stdin.read()
         if not content:
-            print(f"{Colors.RED}Error:{Colors.RESET} No content provided on stdin", file=sys.stderr)
+            print(f"{Colors.RED}Error:{Colors.RESET} No content provided via stdin", file=sys.stderr)
             sys.exit(1)
     elif args.content:
         content = args.content
     else:
-        print(f"{Colors.RED}Error:{Colors.RESET} Must provide --content or --stdin", file=sys.stderr)
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify --content or --stdin", file=sys.stderr)
         sys.exit(1)
+
+    # Dry-run mode
+    if args.dry_run:
+        content_preview = content[:50] + "..." if len(content) > 50 else content
+        content_preview = content_preview.replace('\n', '\\n')
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would add route for backend {backend_id}")
+        print(f"  POST {url}")
+        print(f"  Content: \"{content_preview}\"")
+        return
 
     content = content.strip()
     if not content:
@@ -476,8 +829,16 @@ def cmd_route_add(args):
         method='POST',
         admin_key=args.admin_key,
         data=content.encode('utf-8'),
-        content_type='text/plain'
+        content_type='text/plain',
+        timeout=args.timeout
     )
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
 
     status = data.get('status', 'unknown')
 
@@ -500,21 +861,2055 @@ def cmd_route_add(args):
         sys.exit(1)
 
 
+def cmd_route_delete(args):
+    """Handle 'route delete' command."""
+    backend_id = args.backend
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/routes?backend_id={backend_id}"
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would delete routes for backend {backend_id}")
+        print(f"  DELETE {url}")
+        return
+
+    data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Deleting routes for backend {backend_id}...{Colors.RESET}")
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        routes_deleted = data.get('routes_deleted', 0)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Routes deleted for backend {backend_id}")
+        print(f"  Routes removed: {routes_deleted}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
+# =============================================================================
+# SECTION: Command Implementations - Keys
+# =============================================================================
+
+def cmd_keys_reload(args):
+    """Handle 'keys reload' command."""
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/keys/reload"
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would reload API keys")
+        print(f"  POST {url}")
+        return
+
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Reloading API keys...{Colors.RESET}")
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        keys_loaded = data.get('keys_loaded', 0)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} API keys reloaded")
+        print(f"  Keys loaded: {keys_loaded}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
+def make_request_safe(url: str, method: str = 'GET', admin_key: Optional[str] = None,
+                      timeout: int = 30) -> Optional[Dict[str, Any]]:
+    """Make an HTTP request, returning None on error instead of exiting."""
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    }
+    if admin_key:
+        headers['Authorization'] = f'Bearer {admin_key}'
+
+    req = urllib.request.Request(url, method=method, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode('utf-8')
+            return json.loads(body) if body else {}
+    except Exception:
+        return None
+
+
+def fetch_metrics_text_safe(url: str, timeout: int = 30) -> Optional[str]:
+    """Fetch raw Prometheus metrics text, returning None on error."""
+    headers = {'Accept': 'text/plain'}
+    req = urllib.request.Request(url, method='GET', headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.read().decode('utf-8')
+    except Exception:
+        return None
+
+
+# =============================================================================
+# SECTION: Command Implementations - Health, Top, Wait
+# =============================================================================
+
+def cmd_health(args):
+    """Handle 'health' command."""
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/health"
+
+    # Health endpoint is public, no auth required
+    data = make_request(url, method='GET', timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        status = data.get('status', 'unknown')
+        if status not in ('healthy', 'ok', 'draining'):
+            sys.exit(1)
+        return
+
+    status = data.get('status', 'unknown')
+    is_draining = data.get('draining', False)
+
+    # Health endpoint returns status: "healthy" or "draining" or other values
+    is_healthy = status in ('healthy', 'ok', 'draining')
+
+    if is_healthy:
+        if is_draining or status == 'draining':
+            print(f"{Colors.YELLOW}DRAINING{Colors.RESET}")
+            print(f"  Server is healthy but draining (not accepting new connections)")
+        else:
+            print(f"{Colors.GREEN}HEALTHY{Colors.RESET}")
+
+        # Show additional info if available
+        quorum = data.get('quorum_healthy')
+        if quorum is not None:
+            quorum_str = f"{Colors.GREEN}healthy{Colors.RESET}" if quorum else f"{Colors.RED}degraded{Colors.RESET}"
+            print(f"  Quorum: {quorum_str}")
+    else:
+        print(f"{Colors.RED}UNHEALTHY{Colors.RESET}")
+        print(f"  Status: {status}")
+        sys.exit(1)
+
+
+def cmd_top(args):
+    """Handle 'top' command - real-time dashboard."""
+    base_url = args.url.rstrip('/')
+    interval = args.interval
+
+    # Determine metrics URL
+    if args.metrics_url:
+        metrics_url = args.metrics_url.rstrip('/')
+    elif os.environ.get('RANVIER_METRICS_URL'):
+        metrics_url = os.environ.get('RANVIER_METRICS_URL').rstrip('/')
+    else:
+        parsed = urllib.parse.urlparse(args.url)
+        metrics_port = args.metrics_port or 9180
+        metrics_url = f"{parsed.scheme}://{parsed.hostname}:{metrics_port}"
+
+    # Track previous metrics for rate calculation
+    prev_total = None
+    prev_success = None
+    prev_failed = None
+    prev_time = None
+
+    try:
+        while True:
+            # Clear screen
+            print('\033[2J\033[H', end='')
+
+            # Header
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"{Colors.BOLD}rvctl top{Colors.RESET} - {args.url}")
+            print(f"{Colors.GRAY}Updated: {timestamp} | Refresh: {interval}s | Press Ctrl+C to exit{Colors.RESET}")
+            print()
+
+            # Fetch data concurrently (well, sequentially in Python stdlib)
+            health_data = make_request_safe(f"{base_url}/health", timeout=args.timeout)
+            backends_data = make_request_safe(f"{base_url}/admin/dump/backends",
+                                               admin_key=args.admin_key, timeout=args.timeout)
+            metrics_text = fetch_metrics_text_safe(f"{metrics_url}/metrics", timeout=args.timeout)
+
+            # Parse metrics if available
+            metrics = None
+            if metrics_text:
+                metrics = parse_prometheus_metrics(metrics_text)
+
+            # === HEALTH STATUS ===
+            print(f"{Colors.BOLD}Health{Colors.RESET}")
+            print("─" * 60)
+            if health_data:
+                status = health_data.get('status', 'unknown')
+                is_draining = health_data.get('draining', False)
+                quorum_healthy = health_data.get('quorum_healthy')
+
+                if status in ('healthy', 'ok'):
+                    if is_draining:
+                        status_str = f"{Colors.YELLOW}DRAINING{Colors.RESET}"
+                    else:
+                        status_str = f"{Colors.GREEN}HEALTHY{Colors.RESET}"
+                elif status == 'draining':
+                    status_str = f"{Colors.YELLOW}DRAINING{Colors.RESET}"
+                else:
+                    status_str = f"{Colors.RED}{status.upper()}{Colors.RESET}"
+
+                quorum_str = ""
+                if quorum_healthy is not None:
+                    if quorum_healthy:
+                        quorum_str = f"  Quorum: {Colors.GREEN}healthy{Colors.RESET}"
+                    else:
+                        quorum_str = f"  Quorum: {Colors.RED}degraded{Colors.RESET}"
+
+                print(f"  Status: {status_str}{quorum_str}")
+            else:
+                print(f"  {Colors.RED}Unable to fetch health status{Colors.RESET}")
+
+            print()
+
+            # === BACKENDS ===
+            print(f"{Colors.BOLD}Backends{Colors.RESET}")
+            print("─" * 60)
+            if backends_data:
+                backends = backends_data.get('backends', [])
+                if backends:
+                    # Summary counts
+                    healthy_count = sum(1 for b in backends if not b.get('is_draining') and not b.get('is_dead'))
+                    draining_count = sum(1 for b in backends if b.get('is_draining'))
+                    dead_count = sum(1 for b in backends if b.get('is_dead'))
+
+                    print(f"  Total: {len(backends)}  "
+                          f"{Colors.GREEN}Healthy: {healthy_count}{Colors.RESET}  "
+                          f"{Colors.YELLOW}Draining: {draining_count}{Colors.RESET}  "
+                          f"{Colors.RED}Dead: {dead_count}{Colors.RESET}")
+                    print()
+
+                    # Backend table (compact)
+                    print(f"  {'ID':>3} {'Address':<22} {'W':>4} {'P':>2} {'Status':<10}")
+                    print(f"  {'─'*3} {'─'*22} {'─'*4} {'─'*2} {'─'*10}")
+                    for b in backends[:10]:  # Show top 10
+                        bid = b.get('id', 0)
+                        address = f"{b.get('address', '?')}:{b.get('port', 0)}"[:22]
+                        weight = b.get('weight', 100)
+                        priority = b.get('priority', 0)
+                        is_draining = b.get('is_draining', False)
+                        is_dead = b.get('is_dead', False)
+
+                        if is_dead:
+                            status_str = f"{Colors.RED}DEAD{Colors.RESET}"
+                        elif is_draining:
+                            status_str = f"{Colors.YELLOW}DRAINING{Colors.RESET}"
+                        else:
+                            status_str = f"{Colors.GREEN}HEALTHY{Colors.RESET}"
+
+                        print(f"  {bid:>3} {address:<22} {weight:>4} {priority:>2} {status_str:<10}")
+
+                    if len(backends) > 10:
+                        print(f"  {Colors.GRAY}... and {len(backends) - 10} more{Colors.RESET}")
+                else:
+                    print(f"  {Colors.GRAY}(no backends registered){Colors.RESET}")
+            else:
+                print(f"  {Colors.RED}Unable to fetch backends{Colors.RESET}")
+
+            print()
+
+            # === METRICS ===
+            print(f"{Colors.BOLD}Requests{Colors.RESET}")
+            print("─" * 60)
+            if metrics:
+                total = get_metric_value(metrics, 'ranvier_http_requests_total') or 0
+                success = get_metric_value(metrics, 'ranvier_http_requests_success') or 0
+                failed = get_metric_value(metrics, 'ranvier_http_requests_failed') or 0
+                timeout_count = get_metric_value(metrics, 'ranvier_http_requests_timeout') or 0
+                rate_limited = get_metric_value(metrics, 'ranvier_http_requests_rate_limited') or 0
+                active = get_metric_value(metrics, 'ranvier_active_proxy_requests') or 0
+
+                # Calculate request rates
+                current_time = time.time()
+                req_rate = None
+                success_rate_per_sec = None
+                fail_rate_per_sec = None
+
+                if prev_total is not None and prev_time is not None:
+                    time_delta = current_time - prev_time
+                    if time_delta > 0:
+                        req_rate = (total - prev_total) / time_delta
+                        success_rate_per_sec = (success - prev_success) / time_delta
+                        fail_rate_per_sec = (failed - prev_failed) / time_delta
+
+                # Update previous values for next iteration
+                prev_total = total
+                prev_success = success
+                prev_failed = failed
+                prev_time = current_time
+
+                success_pct = (success / total * 100) if total > 0 else 0
+                pct_color = Colors.GREEN if success_pct >= 99 else (Colors.YELLOW if success_pct >= 95 else Colors.RED)
+
+                # Build rate string
+                if req_rate is not None:
+                    rate_str = f"  Rate: {Colors.CYAN}{req_rate:.1f}/s{Colors.RESET}"
+                    if success_rate_per_sec is not None and success_rate_per_sec > 0:
+                        rate_str += f" ({Colors.GREEN}+{success_rate_per_sec:.1f}{Colors.RESET}"
+                    if fail_rate_per_sec is not None and fail_rate_per_sec > 0:
+                        rate_str += f" {Colors.RED}-{fail_rate_per_sec:.1f}{Colors.RESET}"
+                    if success_rate_per_sec is not None and success_rate_per_sec > 0:
+                        rate_str += ")"
+                else:
+                    rate_str = f"  Rate: {Colors.GRAY}calculating...{Colors.RESET}"
+
+                print(f"  Total: {format_number(total)}  "
+                      f"{Colors.GREEN}OK: {format_number(success)}{Colors.RESET}  "
+                      f"{Colors.RED}Fail: {format_number(failed)}{Colors.RESET}  "
+                      f"{Colors.YELLOW}Timeout: {format_number(timeout_count)}{Colors.RESET}  "
+                      f"RateLimit: {format_number(rate_limited)}")
+                print(f"  Active: {format_number(active)}  "
+                      f"Success: {pct_color}{success_pct:.1f}%{Colors.RESET}{rate_str}")
+            else:
+                print(f"  {Colors.RED}Unable to fetch metrics{Colors.RESET}")
+
+            print()
+
+            # === CACHE ===
+            print(f"{Colors.BOLD}Cache{Colors.RESET}")
+            print("─" * 60)
+            if metrics:
+                cache_ratio = get_metric_value(metrics, 'ranvier_cache_hit_ratio')
+                tree_hits = get_metric_value(metrics, 'ranvier_radix_tree_lookup_hits_total')
+                tree_misses = get_metric_value(metrics, 'ranvier_radix_tree_lookup_misses_total')
+                avg_skip = get_metric_value(metrics, 'ranvier_radix_tree_average_prefix_skip_length')
+
+                parts = []
+                if cache_ratio is not None:
+                    pct = cache_ratio * 100
+                    color = Colors.GREEN if pct >= 80 else (Colors.YELLOW if pct >= 50 else Colors.RED)
+                    parts.append(f"Hit Ratio: {color}{pct:.1f}%{Colors.RESET}")
+
+                if tree_hits is not None and tree_misses is not None:
+                    tree_total = tree_hits + tree_misses
+                    if tree_total > 0:
+                        tree_hit_pct = tree_hits / tree_total * 100
+                        parts.append(f"Tree Hits: {format_number(tree_hits)} ({tree_hit_pct:.0f}%)")
+
+                if avg_skip is not None:
+                    parts.append(f"Avg Skip: {avg_skip:.1f} tokens")
+
+                if parts:
+                    print(f"  {' │ '.join(parts)}")
+                else:
+                    print(f"  {Colors.GRAY}(no cache metrics){Colors.RESET}")
+            else:
+                print(f"  {Colors.GRAY}(metrics unavailable){Colors.RESET}")
+
+            print()
+
+            # === PER-BACKEND LATENCY (if available) ===
+            if metrics:
+                backend_latencies = metrics['metrics'].get('ranvier_backend_latency_seconds_sum', [])
+                backend_counts = {labels.get('backend_id'): value
+                                  for labels, value in metrics['metrics'].get('ranvier_backend_latency_seconds_count', [])}
+
+                if backend_latencies:
+                    print(f"{Colors.BOLD}Backend Latency{Colors.RESET}")
+                    print("─" * 60)
+                    latency_items = []
+                    for labels, sum_val in backend_latencies:
+                        if 'backend_id' in labels:
+                            backend_id = labels.get('backend_id', '?')
+                            count = backend_counts.get(backend_id, 1)
+                            avg_ms = (sum_val / count) * 1000 if count > 0 else 0
+                            latency_items.append((backend_id, avg_ms, count))
+
+                    # Sort by backend ID and show up to 8
+                    latency_items.sort(key=lambda x: x[0])
+                    for backend_id, avg_ms, count in latency_items[:8]:
+                        color = Colors.GREEN if avg_ms < 100 else (Colors.YELLOW if avg_ms < 500 else Colors.RED)
+                        bar_len = min(int(avg_ms / 50), 20)  # Scale: 50ms per char, max 20 chars
+                        bar = "█" * bar_len
+                        print(f"  {backend_id:>3}: {color}{avg_ms:>6.1f}ms{Colors.RESET} {Colors.GRAY}{bar}{Colors.RESET}")
+
+                    if len(latency_items) > 8:
+                        print(f"  {Colors.GRAY}... and {len(latency_items) - 8} more{Colors.RESET}")
+                    print()
+
+            # Wait for next refresh
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print(f"\n{Colors.GRAY}Dashboard stopped.{Colors.RESET}")
+        sys.exit(0)
+
+
+def cmd_wait(args):
+    """Handle 'wait' command - wait for a condition to be met."""
+    base_url = args.url.rstrip('/')
+    wait_timeout = args.wait_timeout
+    poll_interval = 1.0  # Check every second
+
+    # Validate arguments
+    has_condition = args.healthy or args.quorum or args.backend is not None
+    if not has_condition:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify at least one condition: --healthy, --quorum, or --backend with --status",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.backend is not None and not args.status:
+        print(f"{Colors.RED}Error:{Colors.RESET} --backend requires --status", file=sys.stderr)
+        sys.exit(1)
+
+    if args.status and args.backend is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} --status requires --backend", file=sys.stderr)
+        sys.exit(1)
+
+    # Build condition description
+    conditions = []
+    if args.healthy:
+        conditions.append("server healthy")
+    if args.quorum:
+        conditions.append("quorum established")
+    if args.backend is not None:
+        conditions.append(f"backend {args.backend} {args.status}")
+
+    condition_desc = " and ".join(conditions)
+
+    if not args.quiet:
+        timeout_str = f" (timeout: {wait_timeout}s)" if wait_timeout else ""
+        print(f"{Colors.BOLD}Waiting for:{Colors.RESET} {condition_desc}{timeout_str}")
+
+    start_time = time.time()
+
+    try:
+        while True:
+            elapsed = time.time() - start_time
+
+            # Check timeout
+            if wait_timeout and elapsed >= wait_timeout:
+                if not args.quiet:
+                    print(f"\n{Colors.RED}Timeout:{Colors.RESET} Condition not met after {wait_timeout}s")
+                sys.exit(1)
+
+            all_conditions_met = True
+            status_parts = []
+
+            # Check --healthy condition
+            if args.healthy:
+                health_data = make_request_safe(f"{base_url}/health", timeout=args.timeout)
+                if health_data:
+                    status = health_data.get('status', 'unknown')
+                    is_healthy = status in ('healthy', 'ok')
+                    if is_healthy:
+                        status_parts.append(f"{Colors.GREEN}healthy{Colors.RESET}")
+                    else:
+                        status_parts.append(f"{Colors.YELLOW}{status}{Colors.RESET}")
+                        all_conditions_met = False
+                else:
+                    status_parts.append(f"{Colors.RED}unreachable{Colors.RESET}")
+                    all_conditions_met = False
+
+            # Check --quorum condition
+            if args.quorum:
+                health_data = make_request_safe(f"{base_url}/health", timeout=args.timeout)
+                if health_data:
+                    quorum_healthy = health_data.get('quorum_healthy')
+                    if quorum_healthy is True:
+                        status_parts.append(f"quorum:{Colors.GREEN}ok{Colors.RESET}")
+                    elif quorum_healthy is False:
+                        status_parts.append(f"quorum:{Colors.YELLOW}degraded{Colors.RESET}")
+                        all_conditions_met = False
+                    else:
+                        # quorum_healthy not in response - maybe not clustered
+                        status_parts.append(f"quorum:{Colors.GRAY}n/a{Colors.RESET}")
+                        # Consider this met if clustering isn't enabled
+                else:
+                    status_parts.append(f"quorum:{Colors.RED}unreachable{Colors.RESET}")
+                    all_conditions_met = False
+
+            # Check --backend --status condition
+            if args.backend is not None:
+                backends_data = make_request_safe(f"{base_url}/admin/dump/backends",
+                                                   admin_key=args.admin_key, timeout=args.timeout)
+                backend_found = False
+                backend_status = "unknown"
+
+                if backends_data:
+                    backends = backends_data.get('backends', [])
+                    for b in backends:
+                        if b.get('id') == args.backend:
+                            backend_found = True
+                            is_dead = b.get('is_dead', False)
+                            is_draining = b.get('is_draining', False)
+
+                            if is_dead:
+                                backend_status = "dead"
+                            elif is_draining:
+                                backend_status = "draining"
+                            else:
+                                backend_status = "healthy"
+                            break
+
+                # Determine if condition is met
+                target_status = args.status.lower()
+                condition_met = False
+
+                if target_status == 'healthy':
+                    condition_met = backend_found and backend_status == 'healthy'
+                elif target_status == 'draining':
+                    condition_met = backend_found and backend_status == 'draining'
+                elif target_status == 'dead':
+                    condition_met = backend_found and backend_status == 'dead'
+                elif target_status == 'drained':
+                    # "drained" means backend is gone or dead (fully drained)
+                    condition_met = not backend_found or backend_status == 'dead'
+                elif target_status == 'gone' or target_status == 'removed':
+                    condition_met = not backend_found
+                else:
+                    print(f"{Colors.RED}Error:{Colors.RESET} Unknown status '{args.status}'. "
+                          f"Valid: healthy, draining, dead, drained, gone", file=sys.stderr)
+                    sys.exit(1)
+
+                if backend_found:
+                    color = Colors.GREEN if condition_met else Colors.YELLOW
+                    status_parts.append(f"backend {args.backend}:{color}{backend_status}{Colors.RESET}")
+                else:
+                    if target_status in ('drained', 'gone', 'removed'):
+                        status_parts.append(f"backend {args.backend}:{Colors.GREEN}gone{Colors.RESET}")
+                    else:
+                        status_parts.append(f"backend {args.backend}:{Colors.GRAY}not found{Colors.RESET}")
+
+                if not condition_met:
+                    all_conditions_met = False
+
+            # Print progress (overwrite line)
+            if not args.quiet:
+                elapsed_str = f"{elapsed:.0f}s"
+                status_str = " | ".join(status_parts)
+                print(f"\r  [{elapsed_str}] {status_str}    ", end='', flush=True)
+
+            # Check if all conditions met
+            if all_conditions_met:
+                if not args.quiet:
+                    print(f"\n{Colors.GREEN}Success:{Colors.RESET} All conditions met after {elapsed:.1f}s")
+                sys.exit(0)
+
+            # Wait before next check
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        if not args.quiet:
+            print(f"\n{Colors.YELLOW}Cancelled{Colors.RESET}")
+        sys.exit(130)  # Standard exit code for Ctrl+C
+
+
+# =============================================================================
+# SECTION: Command Implementations - Backend Management
+# =============================================================================
+
+def cmd_backend_add(args):
+    """Handle 'backend add' command."""
+    base_url = args.url.rstrip('/')
+
+    # Build query parameters
+    params = [
+        f"id={args.id}",
+        f"ip={args.ip}",
+        f"port={args.port}",
+    ]
+
+    if args.weight is not None:
+        params.append(f"weight={args.weight}")
+    if args.priority is not None:
+        params.append(f"priority={args.priority}")
+
+    url = f"{base_url}/admin/backends?{'&'.join(params)}"
+
+    # Dry-run mode
+    if args.dry_run:
+        weight = args.weight if args.weight is not None else 100
+        priority = args.priority if args.priority is not None else 0
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would add backend {args.id}")
+        print(f"  POST {url}")
+        print(f"  Address:  {args.ip}:{args.port}")
+        print(f"  Weight:   {weight}")
+        print(f"  Priority: {priority}")
+        return
+
+    data = make_request(url, method='POST', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Registering backend {args.id}...{Colors.RESET}")
+    if args.verbose:
+        print(f"  Address: {args.ip}:{args.port}")
+        if args.weight is not None:
+            print(f"  Weight: {args.weight}")
+        if args.priority is not None:
+            print(f"  Priority: {args.priority}")
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        weight = data.get('weight', args.weight or 100)
+        priority = data.get('priority', args.priority or 0)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Backend {args.id} registered")
+        print(f"  Address:  {args.ip}:{args.port}")
+        print(f"  Weight:   {weight}")
+        print(f"  Priority: {priority}")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
+def cmd_backend_delete(args):
+    """Handle 'backend delete' command."""
+    base_url = args.url.rstrip('/')
+    url = f"{base_url}/admin/backends?id={args.id}"
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would delete backend {args.id}")
+        print(f"  DELETE {url}")
+        print(f"  All associated routes would be removed.")
+        return
+
+    data = make_request(url, method='DELETE', admin_key=args.admin_key, timeout=args.timeout)
+
+    # JSON output mode
+    if args.output == 'json':
+        print(json.dumps(data, indent=2))
+        if data.get('status') != 'ok':
+            sys.exit(1)
+        return
+
+    print(f"{Colors.BOLD}Deleting backend {args.id}...{Colors.RESET}")
+
+    status = data.get('status', 'unknown')
+
+    if status == 'ok':
+        deleted_id = data.get('backend_deleted', args.id)
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Backend {deleted_id} deleted")
+        print(f"  All associated routes have been removed.")
+    else:
+        error = data.get('error', 'Unknown error')
+        print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+        sys.exit(1)
+
+
+def cmd_backend_update(args):
+    """Handle 'backend update' command."""
+    base_url = args.url.rstrip('/')
+
+    # Check that at least one update field is specified
+    if args.weight is None and args.priority is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify --weight and/or --priority to update",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # First, get current backend info
+    backends_url = f"{base_url}/admin/dump/backends"
+    backends_data = make_request_safe(backends_url, admin_key=args.admin_key, timeout=args.timeout)
+
+    if backends_data is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to fetch backends", file=sys.stderr)
+        sys.exit(1)
+
+    # Find the target backend
+    backends = backends_data.get('backends', [])
+    target_backend = None
+    for b in backends:
+        if b.get('id') == args.id:
+            target_backend = b
+            break
+
+    if target_backend is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Backend {args.id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Build update parameters (use current values as defaults)
+    current_weight = target_backend.get('weight', 100)
+    current_priority = target_backend.get('priority', 0)
+    address = target_backend.get('address')
+    port = target_backend.get('port')
+
+    new_weight = args.weight if args.weight is not None else current_weight
+    new_priority = args.priority if args.priority is not None else current_priority
+
+    # Dry-run mode
+    if args.dry_run:
+        print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would update backend {args.id}")
+        print(f"  Address:  {address}:{port}")
+        if args.weight is not None:
+            print(f"  Weight:   {current_weight} -> {new_weight}")
+        if args.priority is not None:
+            print(f"  Priority: {current_priority} -> {new_priority}")
+        return
+
+    # Delete and re-add with new values (Ranvier API doesn't have a direct update)
+    # First delete
+    delete_url = f"{base_url}/admin/backends?id={args.id}"
+    delete_result = make_request_safe(delete_url, method='DELETE',
+                                       admin_key=args.admin_key, timeout=args.timeout)
+
+    if delete_result is None or delete_result.get('status') != 'ok':
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to update backend (delete step failed)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Then re-add with new values
+    params = [
+        f"id={args.id}",
+        f"ip={address}",
+        f"port={port}",
+        f"weight={new_weight}",
+        f"priority={new_priority}"
+    ]
+    add_url = f"{base_url}/admin/backends?{'&'.join(params)}"
+    add_result = make_request_safe(add_url, method='POST',
+                                    admin_key=args.admin_key, timeout=args.timeout)
+
+    if add_result is None or add_result.get('status') != 'ok':
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to update backend (add step failed)",
+              file=sys.stderr)
+        print(f"{Colors.YELLOW}Warning:{Colors.RESET} Backend may be in an inconsistent state!",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # JSON output mode
+    if args.output == 'json':
+        output = {
+            'status': 'ok',
+            'id': args.id,
+            'address': address,
+            'port': port,
+            'weight': new_weight,
+            'priority': new_priority,
+            'previous_weight': current_weight,
+            'previous_priority': current_priority
+        }
+        print(json.dumps(output, indent=2))
+        return
+
+    # Text output
+    print(f"{Colors.GREEN}Success:{Colors.RESET} Backend {args.id} updated")
+    print(f"  Address:  {address}:{port}")
+
+    if args.weight is not None:
+        print(f"  Weight:   {current_weight} -> {new_weight}")
+    else:
+        print(f"  Weight:   {new_weight}")
+
+    if args.priority is not None:
+        print(f"  Priority: {current_priority} -> {new_priority}")
+    else:
+        print(f"  Priority: {new_priority}")
+
+
+# =============================================================================
+# SECTION: Command Implementations - Metrics
+# =============================================================================
+
+def cmd_inspect_metrics(args):
+    """Handle 'inspect metrics' command."""
+    # Determine metrics URL
+    # Priority: --metrics-url > RANVIER_METRICS_URL > derive from --url with --metrics-port
+    if args.metrics_url:
+        metrics_url = args.metrics_url.rstrip('/')
+    elif os.environ.get('RANVIER_METRICS_URL'):
+        metrics_url = os.environ.get('RANVIER_METRICS_URL').rstrip('/')
+    else:
+        # Derive from --url, replacing the port
+        parsed = urllib.parse.urlparse(args.url)
+        metrics_port = args.metrics_port or 9180
+        metrics_url = f"{parsed.scheme}://{parsed.hostname}:{metrics_port}"
+
+    url = f"{metrics_url}/metrics"
+
+    if args.verbose:
+        print(f"{Colors.BOLD}Fetching metrics from {url}...{Colors.RESET}")
+        print()
+
+    raw_text = fetch_metrics_text(url, timeout=args.timeout)
+
+    # If --raw flag, just print the raw output (with optional filter)
+    if args.raw:
+        if args.filter:
+            pattern = re.compile(args.filter, re.IGNORECASE)
+            lines = []
+            current_metric = None
+            for line in raw_text.split('\n'):
+                if line.startswith('# HELP ') or line.startswith('# TYPE '):
+                    metric_name = line.split()[2] if len(line.split()) > 2 else ''
+                    current_metric = metric_name
+                    if pattern.search(metric_name):
+                        lines.append(line)
+                elif line.startswith('#'):
+                    continue
+                elif line.strip():
+                    metric_name = line.split('{')[0].split()[0] if line else ''
+                    if pattern.search(metric_name):
+                        lines.append(line)
+            print('\n'.join(lines))
+        else:
+            print(raw_text)
+        return
+
+    # Parse and display formatted metrics
+    parsed = parse_prometheus_metrics(raw_text)
+
+    # JSON output mode
+    if args.output == 'json':
+        # Convert parsed metrics to JSON-friendly format
+        output = {
+            'metrics': {},
+            'help': parsed.get('help', {}),
+            'type': parsed.get('type', {})
+        }
+        for name, values in parsed['metrics'].items():
+            if args.filter and not re.search(args.filter, name, re.IGNORECASE):
+                continue
+            output['metrics'][name] = [
+                {'labels': labels, 'value': value}
+                for labels, value in values
+            ]
+        print(json.dumps(output, indent=2))
+        return
+
+    metrics = parsed['metrics']
+
+    # If filter specified, show filtered metrics
+    if args.filter:
+        pattern = re.compile(args.filter, re.IGNORECASE)
+        filtered = {k: v for k, v in metrics.items() if pattern.search(k)}
+
+        print(f"{Colors.BOLD}Filtered Metrics{Colors.RESET} (pattern: {args.filter})")
+        print("=" * 70)
+
+        if not filtered:
+            print(f"{Colors.GRAY}(no metrics match filter){Colors.RESET}")
+            return
+
+        for name in sorted(filtered.keys()):
+            values = filtered[name]
+            mtype = parsed['type'].get(name, 'unknown')
+            print(f"\n{Colors.CYAN}{name}{Colors.RESET} ({mtype})")
+            for labels, value in values:
+                if labels:
+                    label_str = ', '.join(f'{k}="{v}"' for k, v in labels.items())
+                    print(f"  {{{label_str}}}: {format_number(value)}")
+                else:
+                    print(f"  {format_number(value)}")
+        return
+
+    # Display formatted summary
+    print(f"{Colors.BOLD}Ranvier Metrics Summary{Colors.RESET}")
+    print("=" * 70)
+
+    # Request Counters
+    print(f"\n{Colors.BOLD}Request Counters{Colors.RESET}")
+    print("─" * 40)
+
+    total = get_metric_value(parsed, 'ranvier_http_requests_total') or 0
+    success = get_metric_value(parsed, 'ranvier_http_requests_success') or 0
+    failed = get_metric_value(parsed, 'ranvier_http_requests_failed') or 0
+    timeout = get_metric_value(parsed, 'ranvier_http_requests_timeout') or 0
+    rate_limited = get_metric_value(parsed, 'ranvier_http_requests_rate_limited') or 0
+    backpressure = get_metric_value(parsed, 'ranvier_http_requests_backpressure_rejected') or 0
+
+    print(f"  Total Requests:     {format_number(total)}")
+    print(f"  {Colors.GREEN}Successful:{Colors.RESET}         {format_number(success)}")
+    print(f"  {Colors.RED}Failed:{Colors.RESET}             {format_number(failed)}")
+    print(f"  {Colors.YELLOW}Timeout:{Colors.RESET}            {format_number(timeout)}")
+    print(f"  {Colors.YELLOW}Rate Limited:{Colors.RESET}       {format_number(rate_limited)}")
+    print(f"  {Colors.YELLOW}Backpressure:{Colors.RESET}       {format_number(backpressure)}")
+
+    if total > 0:
+        success_rate = (success / total) * 100
+        color = Colors.GREEN if success_rate >= 99 else (Colors.YELLOW if success_rate >= 95 else Colors.RED)
+        print(f"  {Colors.BOLD}Success Rate:{Colors.RESET}       {color}{success_rate:.2f}%{Colors.RESET}")
+
+    # Active Requests
+    active = get_metric_value(parsed, 'ranvier_active_proxy_requests')
+    if active is not None:
+        print(f"  Active Requests:    {format_number(active)}")
+
+    # Cache Performance
+    print(f"\n{Colors.BOLD}Cache Performance{Colors.RESET}")
+    print("─" * 40)
+
+    cache_ratio = get_metric_value(parsed, 'ranvier_cache_hit_ratio')
+    if cache_ratio is not None:
+        pct = cache_ratio * 100
+        color = Colors.GREEN if pct >= 80 else (Colors.YELLOW if pct >= 50 else Colors.RED)
+        print(f"  Cache Hit Ratio:    {color}{pct:.1f}%{Colors.RESET}")
+
+    avg_skip = get_metric_value(parsed, 'ranvier_radix_tree_average_prefix_skip_length')
+    if avg_skip is not None:
+        print(f"  Avg Prefix Skip:    {avg_skip:.1f} tokens")
+
+    # Radix Tree Stats
+    tree_hits = get_metric_value(parsed, 'ranvier_radix_tree_lookup_hits_total')
+    tree_misses = get_metric_value(parsed, 'ranvier_radix_tree_lookup_misses_total')
+    if tree_hits is not None and tree_misses is not None:
+        tree_total = tree_hits + tree_misses
+        if tree_total > 0:
+            hit_rate = (tree_hits / tree_total) * 100
+            print(f"  Tree Lookup Hits:   {format_number(tree_hits)} ({hit_rate:.1f}%)")
+            print(f"  Tree Lookup Misses: {format_number(tree_misses)}")
+
+    # Slab utilization
+    slab_util = get_metric_value(parsed, 'ranvier_radix_tree_slab_utilization_ratio')
+    if slab_util is not None:
+        print(f"  Slab Utilization:   {slab_util*100:.1f}%")
+
+    # Circuit Breaker
+    print(f"\n{Colors.BOLD}Circuit Breaker{Colors.RESET}")
+    print("─" * 40)
+
+    cb_opens = get_metric_value(parsed, 'ranvier_circuit_breaker_opens') or 0
+    fallbacks = get_metric_value(parsed, 'ranvier_fallback_attempts') or 0
+
+    if cb_opens > 0:
+        print(f"  {Colors.RED}Circuit Opens:{Colors.RESET}      {format_number(cb_opens)}")
+    else:
+        print(f"  Circuit Opens:      {format_number(cb_opens)}")
+    print(f"  Fallback Attempts:  {format_number(fallbacks)}")
+
+    # Tokenizer Stats
+    print(f"\n{Colors.BOLD}Tokenizer{Colors.RESET}")
+    print("─" * 40)
+
+    tok_errors = get_metric_value(parsed, 'ranvier_tokenizer_errors') or 0
+    tok_skipped = get_metric_value(parsed, 'ranvier_tokenization_skipped') or 0
+    prefix_used = get_metric_value(parsed, 'ranvier_prefix_boundary_used') or 0
+    prefix_client = get_metric_value(parsed, 'ranvier_prefix_boundary_client') or 0
+
+    if tok_errors > 0:
+        print(f"  {Colors.RED}Tokenizer Errors:{Colors.RESET}   {format_number(tok_errors)}")
+    else:
+        print(f"  Tokenizer Errors:   {format_number(tok_errors)}")
+    print(f"  Tokenization Skip:  {format_number(tok_skipped)}")
+    print(f"  Prefix Boundary:    {format_number(prefix_used)} (client: {format_number(prefix_client)})")
+
+    # Cross-shard dispatch
+    cross_shard = get_metric_value(parsed, 'ranvier_tokenizer_cross_shard_dispatches')
+    if cross_shard is not None:
+        print(f"  Cross-Shard Dispatch: {format_number(cross_shard)}")
+
+    # Per-Backend Latencies (if any)
+    backend_latencies = [(labels, value) for labels, value in metrics.get('ranvier_backend_latency_seconds_sum', [])
+                         if 'backend_id' in labels]
+    backend_counts = {labels.get('backend_id'): value
+                      for labels, value in metrics.get('ranvier_backend_latency_seconds_count', [])}
+
+    if backend_latencies:
+        print(f"\n{Colors.BOLD}Per-Backend Latency (avg){Colors.RESET}")
+        print("─" * 40)
+        for labels, sum_val in sorted(backend_latencies, key=lambda x: x[0].get('backend_id', '')):
+            backend_id = labels.get('backend_id', '?')
+            count = backend_counts.get(backend_id, 1)
+            avg_ms = (sum_val / count) * 1000 if count > 0 else 0
+            color = Colors.GREEN if avg_ms < 100 else (Colors.YELLOW if avg_ms < 500 else Colors.RED)
+            print(f"  Backend {backend_id:>3}: {color}{avg_ms:.1f}ms{Colors.RESET} (n={format_number(count)})")
+
+    # Cluster Stats (if available)
+    peers_alive = get_metric_value(parsed, 'ranvier_cluster_peers_alive')
+    if peers_alive is not None:
+        print(f"\n{Colors.BOLD}Cluster{Colors.RESET}")
+        print("─" * 40)
+        print(f"  Peers Alive:        {format_number(peers_alive)}")
+
+        gossip_sent = get_metric_value(parsed, 'ranvier_cluster_gossip_messages_sent')
+        gossip_recv = get_metric_value(parsed, 'ranvier_cluster_gossip_messages_received')
+        if gossip_sent is not None:
+            print(f"  Gossip Sent:        {format_number(gossip_sent)}")
+        if gossip_recv is not None:
+            print(f"  Gossip Received:    {format_number(gossip_recv)}")
+
+    print()
+    print(f"{Colors.GRAY}Use --raw for full Prometheus output, --filter <pattern> to search{Colors.RESET}")
+
+
+# =============================================================================
+# SECTION: Shell Completion Scripts
+# =============================================================================
+
+def print_completion_script(shell: str):
+    """Print shell completion script for the specified shell."""
+    if shell == 'bash':
+        print(BASH_COMPLETION)
+    elif shell == 'zsh':
+        print(ZSH_COMPLETION)
+    elif shell == 'fish':
+        print(FISH_COMPLETION)
+
+
+BASH_COMPLETION = r'''# rvctl bash completion
+# Add to ~/.bashrc: eval "$(rvctl completion bash)"
+# Or save to /etc/bash_completion.d/rvctl
+
+_rvctl_completions() {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="inspect cluster drain backend route keys health top wait profile export import logs completion"
+    local global_opts="--url -u --admin-key -k --timeout -t --output -o --watch -w --interval --quiet -q --metrics-url --metrics-port --verbose -v --dry-run --help -h"
+
+    # Determine command position (skip global options)
+    local cmd=""
+    local cmd_index=0
+    for ((i=1; i < cword; i++)); do
+        case "${words[i]}" in
+            --url|-u|--admin-key|-k|--timeout|-t|--output|-o|--interval|--metrics-url|--metrics-port)
+                ((i++))  # skip option value
+                ;;
+            --watch|-w|--quiet|-q|--verbose|-v|--dry-run|--help|-h)
+                ;;  # flag only
+            -*)
+                ;;  # unknown option
+            *)
+                if [[ -z "$cmd" ]]; then
+                    cmd="${words[i]}"
+                    cmd_index=$i
+                fi
+                ;;
+        esac
+    done
+
+    case "$cmd" in
+        inspect)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "routes backends metrics" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "routes" ]]; then
+                COMPREPLY=($(compgen -W "--prefix -p --shard -s" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "metrics" ]]; then
+                COMPREPLY=($(compgen -W "--raw -r --filter -f" -- "$cur"))
+            fi
+            ;;
+        cluster)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "status" -- "$cur"))
+            fi
+            ;;
+        backend)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "add update delete" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
+                COMPREPLY=($(compgen -W "--id --ip --port --weight --priority" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "update" ]]; then
+                COMPREPLY=($(compgen -W "--id --weight --priority" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "delete" ]]; then
+                COMPREPLY=($(compgen -W "--id" -- "$cur"))
+            fi
+            ;;
+        route)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "add delete" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
+                COMPREPLY=($(compgen -W "--backend -b --content -c --stdin -i" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "delete" ]]; then
+                COMPREPLY=($(compgen -W "--backend -b" -- "$cur"))
+            fi
+            ;;
+        keys)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "reload" -- "$cur"))
+            fi
+            ;;
+        completion)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            fi
+            ;;
+        drain|health|top)
+            # No subcommands
+            ;;
+        wait)
+            COMPREPLY=($(compgen -W "--healthy --quorum --backend --status --wait-timeout" -- "$cur"))
+            ;;
+        profile)
+            if [[ $cword -eq $((cmd_index + 1)) ]]; then
+                COMPREPLY=($(compgen -W "list add use show delete" -- "$cur"))
+            elif [[ "${words[cmd_index + 1]}" == "add" ]]; then
+                COMPREPLY=($(compgen -W "--url --admin-key --metrics-url --metrics-port --timeout --force" -- "$cur"))
+            fi
+            ;;
+        export)
+            COMPREPLY=($(compgen -W "--file -f" -- "$cur"))
+            ;;
+        import)
+            COMPREPLY=($(compgen -W "--file -f --stdin" -- "$cur"))
+            ;;
+        logs)
+            COMPREPLY=($(compgen -W "--follow -f --lines -n --filter -g --ignore-case -i --no-color" -- "$cur"))
+            ;;
+        "")
+            # No command yet - suggest commands and global options
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "$global_opts" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+            fi
+            ;;
+    esac
+
+    # Handle option value completions
+    case "$prev" in
+        --output|-o)
+            COMPREPLY=($(compgen -W "text json" -- "$cur"))
+            ;;
+        --status)
+            COMPREPLY=($(compgen -W "healthy draining dead drained gone" -- "$cur"))
+            ;;
+        --url|-u|--admin-key|-k|--metrics-url)
+            # No completion for URLs/keys
+            ;;
+    esac
+}
+
+complete -F _rvctl_completions rvctl
+'''
+
+ZSH_COMPLETION = r'''#compdef rvctl
+# rvctl zsh completion
+# Add to ~/.zshrc: eval "$(rvctl completion zsh)"
+# Or save to a file in your $fpath
+
+_rvctl() {
+    local -a commands global_opts
+
+    commands=(
+        'inspect:Inspect Ranvier state'
+        'cluster:Cluster operations'
+        'drain:Drain a backend'
+        'backend:Backend management'
+        'route:Route management'
+        'keys:API key management'
+        'health:Quick health check'
+        'top:Real-time dashboard'
+        'wait:Wait for a condition'
+        'profile:Manage server profiles'
+        'export:Export backends and routes'
+        'import:Import backends and routes'
+        'logs:Tail server logs'
+        'completion:Generate shell completion scripts'
+    )
+
+    global_opts=(
+        '(-u --url)'{-u,--url}'[Ranvier Admin API URL]:url'
+        '(-k --admin-key)'{-k,--admin-key}'[Admin API key]:key'
+        '(-t --timeout)'{-t,--timeout}'[Request timeout in seconds]:seconds'
+        '(-o --output)'{-o,--output}'[Output format]:format:(text json)'
+        '(-w --watch)'{-w,--watch}'[Watch mode]'
+        '--interval[Watch refresh interval]:seconds'
+        '--metrics-url[Metrics endpoint URL]:url'
+        '--metrics-port[Metrics port]:port'
+        '(-v --verbose)'{-v,--verbose}'[Enable verbose output]'
+        '(-q --quiet)'{-q,--quiet}'[Suppress output (exit code only)]'
+        '--dry-run[Show what would be done without making changes]'
+    )
+
+    _arguments -C \
+        $global_opts \
+        '1:command:->command' \
+        '*::arg:->args'
+
+    case "$state" in
+        command)
+            _describe -t commands 'rvctl commands' commands
+            ;;
+        args)
+            case "$words[1]" in
+                inspect)
+                    local -a inspect_targets
+                    inspect_targets=(
+                        'routes:Inspect radix tree routes'
+                        'backends:Inspect backend status'
+                        'metrics:Inspect Prometheus metrics'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t targets 'inspect targets' inspect_targets
+                    else
+                        case "$words[2]" in
+                            routes)
+                                _arguments \
+                                    '(-p --prefix)'{-p,--prefix}'[Filter by prefix]:prefix' \
+                                    '(-s --shard)'{-s,--shard}'[Query specific shard]:shard'
+                                ;;
+                            metrics)
+                                _arguments \
+                                    '(-r --raw)'{-r,--raw}'[Output raw Prometheus format]' \
+                                    '(-f --filter)'{-f,--filter}'[Filter metrics by pattern]:pattern'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                cluster)
+                    local -a cluster_actions
+                    cluster_actions=('status:Show cluster status')
+                    _describe -t actions 'cluster actions' cluster_actions
+                    ;;
+                backend)
+                    local -a backend_actions
+                    backend_actions=(
+                        'add:Register a new backend'
+                        'update:Update backend settings'
+                        'delete:Remove a backend'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t actions 'backend actions' backend_actions
+                    else
+                        case "$words[2]" in
+                            add)
+                                _arguments \
+                                    '--id[Backend ID]:id' \
+                                    '--ip[Backend IP/hostname]:ip' \
+                                    '--port[Backend port]:port' \
+                                    '--weight[Load balancing weight]:weight' \
+                                    '--priority[Routing priority]:priority'
+                                ;;
+                            update)
+                                _arguments \
+                                    '--id[Backend ID]:id' \
+                                    '--weight[New load balancing weight]:weight' \
+                                    '--priority[New routing priority]:priority'
+                                ;;
+                            delete)
+                                _arguments '--id[Backend ID]:id'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                route)
+                    local -a route_actions
+                    route_actions=(
+                        'add:Add a route for a backend'
+                        'delete:Delete routes for a backend'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t actions 'route actions' route_actions
+                    else
+                        case "$words[2]" in
+                            add)
+                                _arguments \
+                                    '(-b --backend)'{-b,--backend}'[Backend ID]:id' \
+                                    '(-c --content)'{-c,--content}'[Content/prompt]:content' \
+                                    '(-i --stdin)'{-i,--stdin}'[Read content from stdin]'
+                                ;;
+                            delete)
+                                _arguments '(-b --backend)'{-b,--backend}'[Backend ID]:id'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                keys)
+                    local -a keys_actions
+                    keys_actions=('reload:Hot-reload API keys from disk')
+                    _describe -t actions 'keys actions' keys_actions
+                    ;;
+                completion)
+                    _arguments '1:shell:(bash zsh fish)'
+                    ;;
+                drain)
+                    _arguments '1:backend_id'
+                    ;;
+                wait)
+                    _arguments \
+                        '--healthy[Wait for server to be healthy]' \
+                        '--quorum[Wait for quorum to be established]' \
+                        '--backend[Backend ID to wait for]:id' \
+                        '--status[Target backend status]:status:(healthy draining dead drained gone)' \
+                        '--wait-timeout[Maximum wait time in seconds]:seconds'
+                    ;;
+                profile)
+                    local -a profile_actions
+                    profile_actions=(
+                        'list:List all profiles'
+                        'add:Add a new profile'
+                        'use:Switch to a profile'
+                        'show:Show profile details'
+                        'delete:Delete a profile'
+                    )
+                    if [[ $CURRENT -eq 2 ]]; then
+                        _describe -t actions 'profile actions' profile_actions
+                    else
+                        case "$words[2]" in
+                            add)
+                                _arguments \
+                                    '1:profile name' \
+                                    '--url[Ranvier Admin API URL]:url' \
+                                    '--admin-key[Admin API key]:key' \
+                                    '--metrics-url[Metrics endpoint URL]:url' \
+                                    '--metrics-port[Metrics port]:port' \
+                                    '--timeout[Default timeout]:seconds' \
+                                    '(-f --force)'{-f,--force}'[Overwrite existing profile]'
+                                ;;
+                            use|show|delete)
+                                _arguments '1:profile name'
+                                ;;
+                        esac
+                    fi
+                    ;;
+                export)
+                    _arguments '(-f --file)'{-f,--file}'[Output file]:file:_files'
+                    ;;
+                import)
+                    _arguments \
+                        '(-f --file)'{-f,--file}'[Input file]:file:_files' \
+                        '--stdin[Read from stdin]'
+                    ;;
+                logs)
+                    _arguments \
+                        '1::log file:_files' \
+                        '(-f --follow)'{-f,--follow}'[Follow log output]' \
+                        '(-n --lines)'{-n,--lines}'[Number of lines to show]:lines' \
+                        '(-g --filter)'{-g,--filter}'[Filter by regex pattern]:pattern' \
+                        '(-i --ignore-case)'{-i,--ignore-case}'[Case insensitive filter]' \
+                        '--no-color[Disable colorization]'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+compdef _rvctl rvctl
+'''
+
+FISH_COMPLETION = r'''# rvctl fish completion
+# Add to ~/.config/fish/completions/rvctl.fish
+# Or run: rvctl completion fish > ~/.config/fish/completions/rvctl.fish
+
+# Disable file completion by default
+complete -c rvctl -f
+
+# Global options
+complete -c rvctl -s u -l url -d 'Ranvier Admin API URL'
+complete -c rvctl -s k -l admin-key -d 'Admin API key'
+complete -c rvctl -s t -l timeout -d 'Request timeout in seconds'
+complete -c rvctl -s o -l output -d 'Output format' -xa 'text json'
+complete -c rvctl -s w -l watch -d 'Watch mode'
+complete -c rvctl -l interval -d 'Watch refresh interval in seconds'
+complete -c rvctl -l metrics-url -d 'Metrics endpoint URL'
+complete -c rvctl -l metrics-port -d 'Metrics port'
+complete -c rvctl -s v -l verbose -d 'Enable verbose output'
+complete -c rvctl -s q -l quiet -d 'Suppress output (exit code only)'
+complete -c rvctl -l dry-run -d 'Show what would be done without making changes'
+
+# Commands (only when no command is specified yet)
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a inspect -d 'Inspect Ranvier state'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a cluster -d 'Cluster operations'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a drain -d 'Drain a backend'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a backend -d 'Backend management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a route -d 'Route management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a keys -d 'API key management'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a health -d 'Quick health check'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a top -d 'Real-time dashboard'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a wait -d 'Wait for a condition'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a profile -d 'Manage server profiles'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a export -d 'Export backends and routes'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a import -d 'Import backends and routes'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a logs -d 'Tail server logs'
+complete -c rvctl -n "not __fish_seen_subcommand_from inspect cluster drain backend route keys health top wait profile export import logs completion" -a completion -d 'Generate shell completion scripts'
+
+# inspect subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a routes -d 'Inspect radix tree routes'
+complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a backends -d 'Inspect backend status'
+complete -c rvctl -n "__fish_seen_subcommand_from inspect; and not __fish_seen_subcommand_from routes backends metrics" -a metrics -d 'Inspect Prometheus metrics'
+
+# inspect routes options
+complete -c rvctl -n "__fish_seen_subcommand_from routes" -s p -l prefix -d 'Filter by prefix'
+complete -c rvctl -n "__fish_seen_subcommand_from routes" -s s -l shard -d 'Query specific shard'
+
+# inspect metrics options
+complete -c rvctl -n "__fish_seen_subcommand_from metrics" -s r -l raw -d 'Output raw Prometheus format'
+complete -c rvctl -n "__fish_seen_subcommand_from metrics" -s f -l filter -d 'Filter metrics by pattern'
+
+# cluster subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from cluster; and not __fish_seen_subcommand_from status" -a status -d 'Show cluster status'
+
+# backend subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add update delete" -a add -d 'Register a new backend'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add update delete" -a update -d 'Update backend settings'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and not __fish_seen_subcommand_from add update delete" -a delete -d 'Remove a backend'
+
+# backend add options
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l id -d 'Backend ID'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l ip -d 'Backend IP/hostname'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l port -d 'Backend port'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l weight -d 'Load balancing weight'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from add" -l priority -d 'Routing priority'
+
+# backend update options
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from update" -l id -d 'Backend ID'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from update" -l weight -d 'New load balancing weight'
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from update" -l priority -d 'New routing priority'
+
+# backend delete options
+complete -c rvctl -n "__fish_seen_subcommand_from backend; and __fish_seen_subcommand_from delete" -l id -d 'Backend ID'
+
+# route subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from route; and not __fish_seen_subcommand_from add delete" -a add -d 'Add a route for a backend'
+complete -c rvctl -n "__fish_seen_subcommand_from route; and not __fish_seen_subcommand_from add delete" -a delete -d 'Delete routes for a backend'
+
+# route add options
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from add" -s b -l backend -d 'Backend ID'
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from add" -s c -l content -d 'Content/prompt'
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from add" -s i -l stdin -d 'Read content from stdin'
+
+# route delete options
+complete -c rvctl -n "__fish_seen_subcommand_from route; and __fish_seen_subcommand_from delete" -s b -l backend -d 'Backend ID'
+
+# keys subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from keys; and not __fish_seen_subcommand_from reload" -a reload -d 'Hot-reload API keys from disk'
+
+# completion subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from completion" -a "bash zsh fish" -d 'Shell type'
+
+# wait options
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l healthy -d 'Wait for server to be healthy'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l quorum -d 'Wait for quorum to be established'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l backend -d 'Backend ID to wait for'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l status -d 'Target backend status' -xa 'healthy draining dead drained gone'
+complete -c rvctl -n "__fish_seen_subcommand_from wait" -l wait-timeout -d 'Maximum wait time in seconds'
+
+# profile subcommands
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a list -d 'List all profiles'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a add -d 'Add a new profile'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a use -d 'Switch to a profile'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a show -d 'Show profile details'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and not __fish_seen_subcommand_from list add use show delete" -a delete -d 'Delete a profile'
+
+# profile add options
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l url -d 'Ranvier Admin API URL'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l admin-key -d 'Admin API key'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l metrics-url -d 'Metrics endpoint URL'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l metrics-port -d 'Metrics port'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -l timeout -d 'Default timeout'
+complete -c rvctl -n "__fish_seen_subcommand_from profile; and __fish_seen_subcommand_from add" -s f -l force -d 'Overwrite existing profile'
+
+# export options
+complete -c rvctl -n "__fish_seen_subcommand_from export" -s f -l file -d 'Output file' -r
+
+# import options
+complete -c rvctl -n "__fish_seen_subcommand_from import" -s f -l file -d 'Input file' -r
+complete -c rvctl -n "__fish_seen_subcommand_from import" -l stdin -d 'Read from stdin'
+
+# logs options
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s f -l follow -d 'Follow log output'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s n -l lines -d 'Number of lines to show'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s g -l filter -d 'Filter by regex pattern'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -s i -l ignore-case -d 'Case insensitive filter'
+complete -c rvctl -n "__fish_seen_subcommand_from logs" -l no-color -d 'Disable colorization'
+'''
+
+
+# =============================================================================
+# SECTION: Configuration & Profile Management
+# =============================================================================
+
+def get_config_path() -> str:
+    """Get the path to the config file, creating directory if needed."""
+    config_dir = os.path.expanduser('~/.config/rvctl')
+    config_path = os.path.join(config_dir, 'config.json')
+
+    # Also check legacy path
+    legacy_path = os.path.expanduser('~/.rvctl.json')
+    if os.path.exists(legacy_path) and not os.path.exists(config_path):
+        return legacy_path
+
+    return config_path
+
+
+def load_config() -> Dict[str, Any]:
+    """Load configuration from config file.
+
+    Searches for config in order:
+    1. ~/.config/rvctl/config.json
+    2. ~/.rvctl.json
+
+    Returns empty dict if no config file found.
+    """
+    config_paths = [
+        os.path.expanduser('~/.config/rvctl/config.json'),
+        os.path.expanduser('~/.rvctl.json'),
+    ]
+
+    for path in config_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"{Colors.YELLOW}Warning:{Colors.RESET} Failed to load config from {path}: {e}",
+                      file=sys.stderr)
+                return {}
+
+    return {}
+
+
+def save_config(config: Dict[str, Any]) -> bool:
+    """Save configuration to config file."""
+    config_path = get_config_path()
+    config_dir = os.path.dirname(config_path)
+
+    try:
+        # Create config directory if it doesn't exist
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir, mode=0o700)
+
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        return True
+    except IOError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to save config to {config_path}: {e}",
+              file=sys.stderr)
+        return False
+
+
+def get_active_profile(config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Get the currently active profile settings."""
+    active_name = config.get('active_profile')
+    if not active_name:
+        return None
+
+    profiles = config.get('profiles', {})
+    return profiles.get(active_name)
+
+
+def get_effective_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Get effective configuration, merging active profile with base config."""
+    # Start with base config (excluding profiles metadata)
+    effective = {k: v for k, v in config.items()
+                 if k not in ('profiles', 'active_profile')}
+
+    # Overlay active profile settings
+    active_profile = get_active_profile(config)
+    if active_profile:
+        effective.update(active_profile)
+
+    return effective
+
+
+def cmd_profile_list(args, config: Dict[str, Any]):
+    """Handle 'profile list' command."""
+    profiles = config.get('profiles', {})
+    active_name = config.get('active_profile')
+
+    if args.output == 'json':
+        output = {
+            'profiles': list(profiles.keys()),
+            'active': active_name
+        }
+        print(json.dumps(output, indent=2))
+        return
+
+    if not profiles:
+        print(f"{Colors.GRAY}(no profiles configured){Colors.RESET}")
+        print()
+        print(f"Create a profile with: rvctl profile add <name> --url <url>")
+        return
+
+    print(f"{Colors.BOLD}Profiles{Colors.RESET}")
+    print("─" * 50)
+
+    for name, profile in sorted(profiles.items()):
+        if name == active_name:
+            marker = f"{Colors.GREEN}*{Colors.RESET}"
+            name_display = f"{Colors.GREEN}{name}{Colors.RESET}"
+        else:
+            marker = " "
+            name_display = name
+
+        url = profile.get('url', '(no url)')
+        print(f"  {marker} {name_display:<15} {url}")
+
+    print()
+    if active_name:
+        print(f"Active profile: {Colors.GREEN}{active_name}{Colors.RESET}")
+    else:
+        print(f"No active profile. Use: rvctl profile use <name>")
+
+
+def cmd_profile_add(args, config: Dict[str, Any]):
+    """Handle 'profile add' command."""
+    name = args.profile_name
+
+    # Initialize profiles dict if needed
+    if 'profiles' not in config:
+        config['profiles'] = {}
+
+    # Check if profile already exists
+    if name in config['profiles'] and not args.force:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' already exists. Use --force to overwrite.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Build profile settings
+    profile = {}
+    if args.profile_url:
+        profile['url'] = args.profile_url
+    if args.profile_admin_key:
+        profile['admin_key'] = args.profile_admin_key
+    if args.profile_metrics_url:
+        profile['metrics_url'] = args.profile_metrics_url
+    if args.profile_metrics_port:
+        profile['metrics_port'] = args.profile_metrics_port
+    if args.profile_timeout:
+        profile['timeout'] = args.profile_timeout
+
+    if not profile:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify at least --url for the profile",
+              file=sys.stderr)
+        sys.exit(1)
+
+    config['profiles'][name] = profile
+
+    if save_config(config):
+        action = "Updated" if name in config.get('profiles', {}) else "Created"
+        print(f"{Colors.GREEN}Success:{Colors.RESET} {action} profile '{name}'")
+
+        # Offer to activate if no active profile
+        if not config.get('active_profile'):
+            print(f"  Tip: Use 'rvctl profile use {name}' to activate this profile")
+    else:
+        sys.exit(1)
+
+
+def cmd_profile_use(args, config: Dict[str, Any]):
+    """Handle 'profile use' command."""
+    name = args.profile_name
+    profiles = config.get('profiles', {})
+
+    if name not in profiles:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' not found", file=sys.stderr)
+        if profiles:
+            print(f"  Available profiles: {', '.join(sorted(profiles.keys()))}", file=sys.stderr)
+        sys.exit(1)
+
+    config['active_profile'] = name
+
+    if save_config(config):
+        profile = profiles[name]
+        url = profile.get('url', '(no url)')
+        print(f"{Colors.GREEN}Switched to profile '{name}'{Colors.RESET}")
+        print(f"  URL: {url}")
+
+
+def cmd_profile_show(args, config: Dict[str, Any]):
+    """Handle 'profile show' command."""
+    profiles = config.get('profiles', {})
+    active_name = config.get('active_profile')
+
+    # Determine which profile to show
+    name = args.profile_name if args.profile_name else active_name
+
+    if not name:
+        print(f"{Colors.YELLOW}No active profile.{Colors.RESET}")
+        print(f"  Use 'rvctl profile use <name>' to activate a profile")
+        print(f"  Or specify a profile: rvctl profile show <name>")
+        return
+
+    if name not in profiles:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    profile = profiles[name]
+
+    if args.output == 'json':
+        output = {'name': name, 'active': name == active_name, **profile}
+        print(json.dumps(output, indent=2))
+        return
+
+    is_active = " (active)" if name == active_name else ""
+    print(f"{Colors.BOLD}Profile: {name}{Colors.RESET}{Colors.GREEN}{is_active}{Colors.RESET}")
+    print("─" * 40)
+
+    for key, value in sorted(profile.items()):
+        # Mask admin_key for security
+        if key == 'admin_key' and value:
+            display_value = value[:4] + '...' + value[-4:] if len(value) > 12 else '****'
+        else:
+            display_value = value
+        print(f"  {key}: {display_value}")
+
+
+def cmd_profile_delete(args, config: Dict[str, Any]):
+    """Handle 'profile delete' command."""
+    name = args.profile_name
+    profiles = config.get('profiles', {})
+
+    if name not in profiles:
+        print(f"{Colors.RED}Error:{Colors.RESET} Profile '{name}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Remove profile
+    del config['profiles'][name]
+
+    # Clear active profile if it was the deleted one
+    if config.get('active_profile') == name:
+        config['active_profile'] = None
+
+    if save_config(config):
+        print(f"{Colors.GREEN}Success:{Colors.RESET} Deleted profile '{name}'")
+
+
+# =============================================================================
+# SECTION: Command Implementations - Export/Import
+# =============================================================================
+
+def cmd_export(args):
+    """Handle 'export' command - export backends and routes."""
+    base_url = args.url.rstrip('/')
+
+    # Fetch backends
+    backends_data = make_request_safe(
+        f"{base_url}/admin/dump/backends",
+        admin_key=args.admin_key,
+        timeout=args.timeout
+    )
+
+    if backends_data is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to fetch backends", file=sys.stderr)
+        sys.exit(1)
+
+    # Fetch routes (tree)
+    routes_data = make_request_safe(
+        f"{base_url}/admin/dump/tree",
+        admin_key=args.admin_key,
+        timeout=args.timeout
+    )
+
+    if routes_data is None:
+        print(f"{Colors.RED}Error:{Colors.RESET} Failed to fetch routes", file=sys.stderr)
+        sys.exit(1)
+
+    # Build export data
+    export_data = {
+        'version': 1,
+        'exported_at': datetime.now().isoformat(),
+        'source_url': args.url,
+        'backends': backends_data.get('backends', []),
+        'routes': routes_data
+    }
+
+    output_json = json.dumps(export_data, indent=2)
+
+    # Write to file or stdout
+    if args.export_file:
+        try:
+            with open(args.export_file, 'w') as f:
+                f.write(output_json)
+            if not args.quiet:
+                backend_count = len(export_data['backends'])
+                print(f"{Colors.GREEN}Success:{Colors.RESET} Exported {backend_count} backends to {args.export_file}")
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to write to {args.export_file}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(output_json)
+
+
+def cmd_import(args):
+    """Handle 'import' command - import backends and routes."""
+    base_url = args.url.rstrip('/')
+
+    # Read import data
+    if args.import_stdin:
+        import_text = sys.stdin.read()
+    elif args.import_file:
+        try:
+            with open(args.import_file, 'r') as f:
+                import_text = f.read()
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to read {args.import_file}: {e}",
+                  file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"{Colors.RED}Error:{Colors.RESET} Must specify --file or --stdin", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse JSON
+    try:
+        import_data = json.loads(import_text)
+    except json.JSONDecodeError as e:
+        print(f"{Colors.RED}Error:{Colors.RESET} Invalid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate format
+    if 'backends' not in import_data:
+        print(f"{Colors.RED}Error:{Colors.RESET} Invalid export format: missing 'backends' key",
+              file=sys.stderr)
+        sys.exit(1)
+
+    backends = import_data.get('backends', [])
+
+    if not args.quiet:
+        print(f"{Colors.BOLD}Importing configuration...{Colors.RESET}")
+        if import_data.get('source_url'):
+            print(f"  Source: {import_data['source_url']}")
+        if import_data.get('exported_at'):
+            print(f"  Exported: {import_data['exported_at']}")
+        print(f"  Backends: {len(backends)}")
+        print()
+
+    # Import backends
+    imported_count = 0
+    failed_count = 0
+
+    for backend in backends:
+        bid = backend.get('id')
+        address = backend.get('address')
+        port = backend.get('port')
+        weight = backend.get('weight', 100)
+        priority = backend.get('priority', 0)
+
+        if bid is None or address is None or port is None:
+            if not args.quiet:
+                print(f"  {Colors.YELLOW}Skipping:{Colors.RESET} Invalid backend (missing id/address/port)")
+            failed_count += 1
+            continue
+
+        # Build URL for backend add
+        params = [
+            f"id={bid}",
+            f"ip={address}",
+            f"port={port}",
+            f"weight={weight}",
+            f"priority={priority}"
+        ]
+        url = f"{base_url}/admin/backends?{'&'.join(params)}"
+
+        # Dry-run mode
+        if args.dry_run:
+            imported_count += 1
+            if not args.quiet:
+                print(f"  {Colors.CYAN}[dry-run]{Colors.RESET} Would import backend {bid}: {address}:{port} (weight={weight}, priority={priority})")
+            continue
+
+        result = make_request_safe(url, method='POST', admin_key=args.admin_key,
+                                    timeout=args.timeout)
+
+        if result and result.get('status') == 'ok':
+            imported_count += 1
+            if not args.quiet:
+                print(f"  {Colors.GREEN}✓{Colors.RESET} Backend {bid}: {address}:{port}")
+        else:
+            failed_count += 1
+            if not args.quiet:
+                error = result.get('error', 'unknown error') if result else 'connection failed'
+                print(f"  {Colors.RED}✗{Colors.RESET} Backend {bid}: {error}")
+
+    # Summary
+    if not args.quiet:
+        print()
+        if args.dry_run:
+            print(f"{Colors.CYAN}[dry-run]{Colors.RESET} Would import {imported_count} backends")
+        elif failed_count == 0:
+            print(f"{Colors.GREEN}Success:{Colors.RESET} Imported {imported_count} backends")
+        else:
+            print(f"{Colors.YELLOW}Completed:{Colors.RESET} {imported_count} imported, {failed_count} failed")
+
+    if failed_count > 0:
+        sys.exit(1)
+
+
+# =============================================================================
+# SECTION: Command Implementations - Logs
+# =============================================================================
+
+def cmd_logs(args):
+    """Handle 'logs' command - tail server logs."""
+    import re as regex
+
+    # Determine log file path
+    log_file = args.log_file or 'ranvier.log'
+
+    # Check if file exists
+    if not os.path.exists(log_file):
+        print(f"{Colors.RED}Error:{Colors.RESET} Log file not found: {log_file}", file=sys.stderr)
+        sys.exit(1)
+
+    # Compile filter pattern if provided
+    filter_pattern = None
+    if args.filter:
+        try:
+            filter_pattern = regex.compile(args.filter, regex.IGNORECASE if args.ignore_case else 0)
+        except regex.error as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Invalid regex pattern: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def matches_filter(line: str) -> bool:
+        """Check if line matches the filter pattern."""
+        if filter_pattern is None:
+            return True
+        return filter_pattern.search(line) is not None
+
+    def colorize_log_line(line: str) -> str:
+        """Add color to log line based on level."""
+        line = line.rstrip()
+        if not line:
+            return line
+
+        # Common log level patterns
+        if 'ERROR' in line or 'error' in line.lower()[:50]:
+            return f"{Colors.RED}{line}{Colors.RESET}"
+        elif 'WARN' in line or 'warn' in line.lower()[:50]:
+            return f"{Colors.YELLOW}{line}{Colors.RESET}"
+        elif 'DEBUG' in line:
+            return f"{Colors.GRAY}{line}{Colors.RESET}"
+        elif 'INFO' in line:
+            return f"{Colors.CYAN}{line}{Colors.RESET}"
+        return line
+
+    def read_last_n_lines(filepath: str, n: int) -> List[str]:
+        """Read the last n lines from a file efficiently."""
+        lines = []
+        try:
+            with open(filepath, 'rb') as f:
+                # Seek to end
+                f.seek(0, 2)
+                file_size = f.tell()
+
+                # Read chunks from end
+                buffer = b''
+                chunk_size = 8192
+                pos = file_size
+
+                while pos > 0 and len(lines) <= n:
+                    read_size = min(chunk_size, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    buffer = f.read(read_size) + buffer
+
+                    # Count newlines
+                    lines = buffer.decode('utf-8', errors='replace').splitlines()
+
+                # If file is smaller than n lines, read all
+                if pos == 0:
+                    f.seek(0)
+                    lines = f.read().decode('utf-8', errors='replace').splitlines()
+
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to read log file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        return lines[-n:] if len(lines) > n else lines
+
+    def tail_follow(filepath: str):
+        """Follow a file like tail -f."""
+        try:
+            with open(filepath, 'r') as f:
+                # Seek to end
+                f.seek(0, 2)
+
+                while True:
+                    line = f.readline()
+                    if line:
+                        if matches_filter(line):
+                            if args.no_color:
+                                print(line.rstrip())
+                            else:
+                                print(colorize_log_line(line))
+                    else:
+                        time.sleep(0.1)  # Small delay before checking again
+        except KeyboardInterrupt:
+            print()  # Clean exit on Ctrl+C
+        except IOError as e:
+            print(f"{Colors.RED}Error:{Colors.RESET} Failed to read log file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Show header unless quiet
+    if not args.quiet:
+        if args.follow:
+            print(f"{Colors.BOLD}Tailing {log_file}...{Colors.RESET} (Ctrl+C to exit)")
+            if filter_pattern:
+                print(f"{Colors.DIM}Filter: {args.filter}{Colors.RESET}")
+            print()
+
+    # Read and display initial lines
+    lines = read_last_n_lines(log_file, args.lines)
+
+    for line in lines:
+        if matches_filter(line):
+            if args.no_color:
+                print(line.rstrip() if line else '')
+            else:
+                print(colorize_log_line(line) if line else '')
+
+    # Follow mode
+    if args.follow:
+        tail_follow(log_file)
+
+
+# =============================================================================
+# SECTION: Main Entry Point & Argument Parsing
+# =============================================================================
+
 def main():
+    # Load config file (priority: CLI args > env vars > active profile > base config > defaults)
+    raw_config = load_config()
+    config = get_effective_config(raw_config)
+
     parser = argparse.ArgumentParser(
         description='Ranvier Control CLI - Inspect and manage Ranvier instances',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
 
+    # Determine defaults: env var > effective config > built-in default
+    default_url = os.environ.get('RANVIER_URL', config.get('url', 'http://localhost:8080'))
+    default_admin_key = os.environ.get('RANVIER_ADMIN_KEY', config.get('admin_key'))
+    default_metrics_url = os.environ.get('RANVIER_METRICS_URL', config.get('metrics_url'))
+    default_metrics_port = config.get('metrics_port')
+    default_timeout = config.get('timeout', 30)
+    default_output = config.get('output', 'text')
+    default_interval = config.get('interval', 2.0)
+
     # Global options
-    parser.add_argument('--url', '-u', default='http://localhost:8080',
+    parser.add_argument('--url', '-u', default=default_url,
                         help='Ranvier Admin API URL (default: http://localhost:8080)')
-    parser.add_argument('--admin-key', '-k',
-                        default=os.environ.get('RANVIER_ADMIN_KEY'),
+    parser.add_argument('--admin-key', '-k', default=default_admin_key,
                         help='Admin API key (or set RANVIER_ADMIN_KEY env var)')
+    parser.add_argument('--metrics-url', default=default_metrics_url,
+                        help='Metrics endpoint URL (or set RANVIER_METRICS_URL env var)')
+    parser.add_argument('--metrics-port', type=int, default=default_metrics_port,
+                        help='Metrics port (default: 9180, used with --url host)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable verbose output')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='Suppress output (exit code only)')
+    parser.add_argument('--timeout', '-t', type=int, default=default_timeout,
+                        help='Request timeout in seconds (default: 30)')
+    parser.add_argument('--output', '-o', choices=['text', 'json'], default=default_output,
+                        help='Output format: text (default) or json')
+    parser.add_argument('--watch', '-w', action='store_true',
+                        help='Watch mode: continuously refresh output')
+    parser.add_argument('--interval', type=float, default=default_interval,
+                        help='Watch refresh interval in seconds (default: 2.0)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be done without making changes')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -532,6 +2927,13 @@ def main():
     # inspect backends
     backends_parser = inspect_subparsers.add_parser('backends', help='Inspect backend status')
 
+    # inspect metrics
+    metrics_parser = inspect_subparsers.add_parser('metrics', help='Inspect Prometheus metrics')
+    metrics_parser.add_argument('--raw', '-r', action='store_true',
+                                 help='Output raw Prometheus format')
+    metrics_parser.add_argument('--filter', '-f',
+                                 help='Filter metrics by name pattern (regex)')
+
     # cluster command
     cluster_parser = subparsers.add_parser('cluster', help='Cluster operations')
     cluster_subparsers = cluster_parser.add_subparsers(dest='cluster_action', help='Cluster action')
@@ -542,6 +2944,37 @@ def main():
     # drain command
     drain_parser = subparsers.add_parser('drain', help='Drain a backend')
     drain_parser.add_argument('backend_id', type=int, help='Backend ID to drain')
+
+    # backend command
+    backend_parser = subparsers.add_parser('backend', help='Backend management')
+    backend_subparsers = backend_parser.add_subparsers(dest='backend_action', help='Backend action')
+
+    # backend add
+    backend_add_parser = backend_subparsers.add_parser('add', help='Register a new backend')
+    backend_add_parser.add_argument('--id', type=int, required=True,
+                                     help='Unique backend identifier')
+    backend_add_parser.add_argument('--ip', required=True,
+                                     help='Backend IP address or hostname')
+    backend_add_parser.add_argument('--port', type=int, required=True,
+                                     help='Backend port')
+    backend_add_parser.add_argument('--weight', type=int,
+                                     help='Load balancing weight (default: 100)')
+    backend_add_parser.add_argument('--priority', type=int,
+                                     help='Routing priority (default: 0, lower = preferred)')
+
+    # backend update
+    backend_update_parser = backend_subparsers.add_parser('update', help='Update backend settings')
+    backend_update_parser.add_argument('--id', type=int, required=True,
+                                        help='Backend ID to update')
+    backend_update_parser.add_argument('--weight', type=int,
+                                        help='New load balancing weight')
+    backend_update_parser.add_argument('--priority', type=int,
+                                        help='New routing priority')
+
+    # backend delete
+    backend_delete_parser = backend_subparsers.add_parser('delete', help='Remove a backend')
+    backend_delete_parser.add_argument('--id', type=int, required=True,
+                                        help='Backend ID to delete')
 
     # route command
     route_parser = subparsers.add_parser('route', help='Route management')
@@ -556,11 +2989,118 @@ def main():
     route_add_parser.add_argument('--stdin', '-i', action='store_true',
                                    help='Read content from stdin')
 
+    # route delete
+    route_delete_parser = route_subparsers.add_parser('delete', help='Delete routes for a backend')
+    route_delete_parser.add_argument('--backend', '-b', type=int, required=True,
+                                      help='Backend ID to delete routes for')
+
+    # keys command
+    keys_parser = subparsers.add_parser('keys', help='API key management')
+    keys_subparsers = keys_parser.add_subparsers(dest='keys_action', help='Keys action')
+
+    # keys reload
+    keys_reload_parser = keys_subparsers.add_parser('reload', help='Hot-reload API keys from disk')
+
+    # health command (top-level, no subcommand)
+    health_parser = subparsers.add_parser('health', help='Quick health check (no auth required)')
+
+    # top command (real-time dashboard)
+    top_parser = subparsers.add_parser('top', help='Real-time dashboard showing health, backends, and metrics')
+
+    # wait command
+    wait_parser = subparsers.add_parser('wait', help='Wait for a condition to be met')
+    wait_parser.add_argument('--healthy', action='store_true',
+                              help='Wait for server to be healthy')
+    wait_parser.add_argument('--quorum', action='store_true',
+                              help='Wait for quorum to be established')
+    wait_parser.add_argument('--backend', type=int,
+                              help='Backend ID to wait for (requires --status)')
+    wait_parser.add_argument('--status', choices=['healthy', 'draining', 'dead', 'drained', 'gone'],
+                              help='Target backend status (requires --backend)')
+    wait_parser.add_argument('--wait-timeout', type=int, default=None,
+                              help='Maximum time to wait in seconds (default: wait forever)')
+
+    # profile command
+    profile_parser = subparsers.add_parser('profile', help='Manage server profiles')
+    profile_subparsers = profile_parser.add_subparsers(dest='profile_action', help='Profile action')
+
+    # profile list
+    profile_list_parser = profile_subparsers.add_parser('list', help='List all profiles')
+
+    # profile add
+    profile_add_parser = profile_subparsers.add_parser('add', help='Add a new profile')
+    profile_add_parser.add_argument('profile_name', help='Profile name')
+    profile_add_parser.add_argument('--url', dest='profile_url',
+                                     help='Ranvier Admin API URL')
+    profile_add_parser.add_argument('--admin-key', dest='profile_admin_key',
+                                     help='Admin API key')
+    profile_add_parser.add_argument('--metrics-url', dest='profile_metrics_url',
+                                     help='Metrics endpoint URL')
+    profile_add_parser.add_argument('--metrics-port', dest='profile_metrics_port', type=int,
+                                     help='Metrics port')
+    profile_add_parser.add_argument('--timeout', dest='profile_timeout', type=int,
+                                     help='Default timeout')
+    profile_add_parser.add_argument('--force', '-f', action='store_true',
+                                     help='Overwrite existing profile')
+
+    # profile use
+    profile_use_parser = profile_subparsers.add_parser('use', help='Switch to a profile')
+    profile_use_parser.add_argument('profile_name', help='Profile name to activate')
+
+    # profile show
+    profile_show_parser = profile_subparsers.add_parser('show', help='Show profile details')
+    profile_show_parser.add_argument('profile_name', nargs='?', default=None,
+                                      help='Profile name (default: active profile)')
+
+    # profile delete
+    profile_delete_parser = profile_subparsers.add_parser('delete', help='Delete a profile')
+    profile_delete_parser.add_argument('profile_name', help='Profile name to delete')
+
+    # export command
+    export_parser = subparsers.add_parser('export', help='Export backends and routes to JSON')
+    export_parser.add_argument('--file', '-f', dest='export_file',
+                                help='Output file (default: stdout)')
+
+    # import command
+    import_parser = subparsers.add_parser('import', help='Import backends and routes from JSON')
+    import_parser.add_argument('--file', '-f', dest='import_file',
+                                help='Input file')
+    import_parser.add_argument('--stdin', dest='import_stdin', action='store_true',
+                                help='Read from stdin')
+
+    # logs command
+    logs_parser = subparsers.add_parser('logs', help='Tail server logs')
+    logs_parser.add_argument('log_file', nargs='?', default=None,
+                              help='Log file path (default: ranvier.log)')
+    logs_parser.add_argument('--follow', '-f', action='store_true',
+                              help='Follow log output (like tail -f)')
+    logs_parser.add_argument('--lines', '-n', type=int, default=10,
+                              help='Number of lines to show (default: 10)')
+    logs_parser.add_argument('--filter', '-g',
+                              help='Filter log lines by regex pattern')
+    logs_parser.add_argument('--ignore-case', '-i', action='store_true',
+                              help='Case insensitive filter matching')
+    logs_parser.add_argument('--no-color', action='store_true',
+                              help='Disable log level colorization')
+
+    # completion command
+    completion_parser = subparsers.add_parser('completion', help='Generate shell completion scripts')
+    completion_parser.add_argument('shell', choices=['bash', 'zsh', 'fish'],
+                                    help='Shell type for completion script')
+
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Quiet mode: redirect stdout to devnull (errors still go to stderr)
+    if args.quiet:
+        sys.stdout = open(os.devnull, 'w')
+
+    # Determine the command function and whether it supports watch mode
+    cmd_func = None
+    supports_watch = False
 
     # Handle inspect command
     if args.command == 'inspect':
@@ -569,9 +3109,14 @@ def main():
             sys.exit(1)
 
         if args.inspect_target == 'routes':
-            cmd_inspect_routes(args)
+            cmd_func = cmd_inspect_routes
+            supports_watch = True
         elif args.inspect_target == 'backends':
-            cmd_inspect_backends(args)
+            cmd_func = cmd_inspect_backends
+            supports_watch = True
+        elif args.inspect_target == 'metrics':
+            cmd_func = cmd_inspect_metrics
+            supports_watch = True
         else:
             print(f"Unknown inspect target: {args.inspect_target}", file=sys.stderr)
             sys.exit(1)
@@ -583,14 +3128,35 @@ def main():
             sys.exit(1)
 
         if args.cluster_action == 'status':
-            cmd_cluster_status(args)
+            cmd_func = cmd_cluster_status
+            supports_watch = True
         else:
             print(f"Unknown cluster action: {args.cluster_action}", file=sys.stderr)
             sys.exit(1)
 
-    # Handle drain command
+    # Handle drain command (mutation - no watch)
     elif args.command == 'drain':
-        cmd_drain(args)
+        cmd_func = cmd_drain
+        supports_watch = False
+
+    # Handle backend command
+    elif args.command == 'backend':
+        if not args.backend_action:
+            backend_parser.print_help()
+            sys.exit(1)
+
+        if args.backend_action == 'add':
+            cmd_func = cmd_backend_add
+            supports_watch = False  # mutation
+        elif args.backend_action == 'update':
+            cmd_func = cmd_backend_update
+            supports_watch = False  # mutation
+        elif args.backend_action == 'delete':
+            cmd_func = cmd_backend_delete
+            supports_watch = False  # mutation
+        else:
+            print(f"Unknown backend action: {args.backend_action}", file=sys.stderr)
+            sys.exit(1)
 
     # Handle route command
     elif args.command == 'route':
@@ -599,14 +3165,136 @@ def main():
             sys.exit(1)
 
         if args.route_action == 'add':
-            cmd_route_add(args)
+            cmd_func = cmd_route_add
+            supports_watch = False  # mutation
+        elif args.route_action == 'delete':
+            cmd_func = cmd_route_delete
+            supports_watch = False  # mutation
         else:
             print(f"Unknown route action: {args.route_action}", file=sys.stderr)
             sys.exit(1)
 
+    # Handle keys command
+    elif args.command == 'keys':
+        if not args.keys_action:
+            keys_parser.print_help()
+            sys.exit(1)
+
+        if args.keys_action == 'reload':
+            cmd_func = cmd_keys_reload
+            supports_watch = False  # mutation
+        else:
+            print(f"Unknown keys action: {args.keys_action}", file=sys.stderr)
+            sys.exit(1)
+
+    # Handle health command
+    elif args.command == 'health':
+        cmd_func = cmd_health
+        supports_watch = True
+
+    # Handle top command (has its own internal loop, so skip watch logic)
+    elif args.command == 'top':
+        cmd_top(args)
+        sys.exit(0)
+
+    # Handle wait command (has its own loop, so skip watch logic)
+    elif args.command == 'wait':
+        cmd_wait(args)
+        sys.exit(0)
+
+    # Handle profile command (manages config, so uses raw_config)
+    elif args.command == 'profile':
+        if not args.profile_action:
+            profile_parser.print_help()
+            sys.exit(1)
+
+        if args.profile_action == 'list':
+            cmd_profile_list(args, raw_config)
+        elif args.profile_action == 'add':
+            cmd_profile_add(args, raw_config)
+        elif args.profile_action == 'use':
+            cmd_profile_use(args, raw_config)
+        elif args.profile_action == 'show':
+            cmd_profile_show(args, raw_config)
+        elif args.profile_action == 'delete':
+            cmd_profile_delete(args, raw_config)
+        else:
+            print(f"Unknown profile action: {args.profile_action}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    # Handle export command
+    elif args.command == 'export':
+        cmd_export(args)
+        sys.exit(0)
+
+    # Handle import command
+    elif args.command == 'import':
+        cmd_import(args)
+        sys.exit(0)
+
+    # Handle logs command (special case - doesn't need server connection)
+    elif args.command == 'logs':
+        cmd_logs(args)
+        sys.exit(0)
+
+    # Handle completion command (special case - just print and exit)
+    elif args.command == 'completion':
+        print_completion_script(args.shell)
+        sys.exit(0)
+
     else:
         print(f"Unknown command: {args.command}", file=sys.stderr)
         sys.exit(1)
+
+    # Check watch mode compatibility
+    if args.watch and not supports_watch:
+        print(f"{Colors.RED}Error:{Colors.RESET} --watch is not supported for mutation commands", file=sys.stderr)
+        sys.exit(1)
+
+    # Execute command (with optional watch loop)
+    if args.watch:
+        run_watch_loop(cmd_func, args)
+    else:
+        cmd_func(args)
+
+
+def run_watch_loop(cmd_func, args):
+    """Run a command repeatedly in watch mode."""
+    interval = args.interval
+    iteration = 0
+
+    try:
+        while True:
+            iteration += 1
+
+            # Clear screen (ANSI escape code)
+            print('\033[2J\033[H', end='')
+
+            # Print header with timestamp
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cmd_desc = f"{args.command}"
+            if hasattr(args, 'inspect_target') and args.inspect_target:
+                cmd_desc += f" {args.inspect_target}"
+            elif hasattr(args, 'cluster_action') and args.cluster_action:
+                cmd_desc += f" {args.cluster_action}"
+
+            print(f"{Colors.GRAY}Every {interval}s: rvctl {cmd_desc} | {timestamp}{Colors.RESET}")
+            print()
+
+            try:
+                cmd_func(args)
+            except SystemExit:
+                # Command called sys.exit() on error - continue watching
+                pass
+
+            # Wait for next iteration
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        # Clean exit on Ctrl+C
+        print(f"\n{Colors.GRAY}Watch stopped.{Colors.RESET}")
+        sys.exit(0)
 
 
 if __name__ == '__main__':
