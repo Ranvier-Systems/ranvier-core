@@ -55,7 +55,15 @@ test-integration:
 		pip3 install --user requests || pip install --user requests; \
 	fi
 	@echo "Starting integration tests..."
+	@echo ""
+	@echo "=== Test Suite 1/3: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
+	@echo ""
+	@echo "=== Test Suite 2/3: Prefix Routing ==="
+	@python3 tests/integration/test_prefix_routing.py
+	@echo ""
+	@echo "=== Test Suite 3/3: Graceful Shutdown ==="
+	@python3 tests/integration/test_graceful_shutdown.py
 
 # Helper to detect docker compose command
 DOCKER_COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; fi)
