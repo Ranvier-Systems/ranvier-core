@@ -1056,11 +1056,11 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
 
 ---
 
-## 8. Strategic Assessment (2026-01-19)
+## 8. Strategic Assessment (2026-01-31)
 
 > **External CTO/Lead Architect Review**
-> Generated: 2026-01-19
-> Scope: Full codebase analysis (~20,500 LOC across 33 files) against stated goal of "Layer 7+ Load Balancer with Prefix Caching"
+> Generated: 2026-01-19 | Updated: 2026-01-31
+> Scope: Full codebase analysis (~23,000 LOC across 52 files) against stated goal of "Layer 7+ Load Balancer with Prefix Caching"
 
 ### 8.0 State of the Project Scorecard
 
@@ -1181,6 +1181,19 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
   _Files:_ `src/radix_tree.hpp`
   _Complexity:_ Low
 
+- [ ] **[P2] Add inline Hard Rule documentation to router_service.cpp**
+  _Description:_ Add explicit Hard Rule comments to load-bearing code paths in RouterService (route_request, learn_route_global, get_backend_for_prefix). Currently only 1 reference despite being second most critical file.
+  _Rationale:_ Knowledge preservation for future maintainers. RouterService orchestrates all routing decisions; undocumented constraints risk silent regressions.
+  _Files:_ `src/router_service.cpp`
+  _Complexity:_ Low
+
+- [ ] **[P3] Track config.hpp complexity - split when >2000 LOC**
+  _Description:_ Monitor `config.hpp` (currently 1,510 LOC). When exceeding 2000 LOC, split into `config_schema.hpp` (type definitions) and `config_loader.cpp` (YAML parsing logic).
+  _Rationale:_ Prevent config.hpp from becoming the next "sprawling module". Current growth trajectory suggests split needed within 2-3 feature additions.
+  _Files:_ `src/config.hpp` → `src/config_schema.hpp` (new), `src/config_loader.cpp` (new)
+  _Complexity:_ Medium
+  _Trigger:_ >2000 LOC or >50 config fields
+
 ---
 
 ## Priority Matrix
@@ -1231,6 +1244,12 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P3 - Low** | DX | rvctl: Add `--output json` flag | Low | ✅ Done |
 | **P3 - Low** | DX | rvctl: Add `--watch` mode | Medium | ✅ Done |
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
+| **P0 - Critical** | Testing | E2E prefix routing test suite | Medium | |
+| **P0 - Critical** | Testing | Graceful shutdown test suite | Medium | |
+| **P1 - High** | DX | Consolidate gossip debug metrics behind compile flag | Low | |
+| **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
+| **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | |
+| **P3 - Low** | DX | Split config.hpp when >2000 LOC | Medium | |
 
 ---
 
