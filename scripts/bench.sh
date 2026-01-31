@@ -48,6 +48,7 @@ DEFAULT_OUTPUT_DIR="benchmark-reports"
 DEFAULT_WARMUP_DURATION="1m"
 DEFAULT_WARMUP_USERS="2"
 DEFAULT_STOP_TIMEOUT="90"
+GHCR_IMAGE="ghcr.io/ranvier-systems/ranvier:latest"
 
 # Colors
 RED='\033[0;31m'
@@ -588,12 +589,22 @@ if [[ "$SETUP_ONLY" = true ]]; then
     fi
 
     # Pre-build Docker images
-    if [[ -f "Dockerfile.production" ]]; then
-        BUILD_TYPE_ARG=""
-        [[ "${DEBUG_BUILD:-}" == "true" ]] && BUILD_TYPE_ARG="--build-arg BUILD_TYPE=Debug"
-        log_info "Pre-building Ranvier Docker image${DEBUG_BUILD:+ (Debug mode)}..."
-        docker build $BUILD_TYPE_ARG -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
-            log_ok "Ranvier image built" || log_warn "Could not build Ranvier image"
+    if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
+        # Debug builds must be built locally
+        log_info "Building Ranvier Docker image (Debug mode)..."
+        docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
+            log_ok "Ranvier image built (Debug)" || log_warn "Could not build Ranvier image"
+    else
+        # Try to pull from GHCR first (much faster), fall back to local build
+        log_info "Pulling Ranvier image from GHCR..."
+        if docker pull "$GHCR_IMAGE" > /dev/null 2>&1; then
+            docker tag "$GHCR_IMAGE" ranvier:latest
+            log_ok "Ranvier image pulled from GHCR"
+        elif [[ -f "Dockerfile.production" ]]; then
+            log_warn "GHCR pull failed, building locally (this may take a while)..."
+            docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
+                log_ok "Ranvier image built" || log_warn "Could not build Ranvier image"
+        fi
     fi
 
     if [[ -f "tests/integration/Dockerfile.locust" ]]; then
@@ -933,17 +944,23 @@ done
 
 log_header "Starting Ranvier Cluster"
 
-# Build Ranvier image if needed
-BUILD_TYPE_ARG=""
+# Get Ranvier image if needed
 if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
-    BUILD_TYPE_ARG="--build-arg BUILD_TYPE=Debug"
-    log_info "Debug build requested - will include debug symbols"
-fi
-
-if ! docker image inspect ranvier:latest &> /dev/null || [[ "${DEBUG_BUILD:-}" == "true" ]]; then
-    log_info "Building Ranvier image${DEBUG_BUILD:+ (Debug mode)}..."
-    docker build $BUILD_TYPE_ARG -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
-    log_ok "Ranvier image built"
+    # Debug builds must be built locally
+    log_info "Debug build requested - building with debug symbols..."
+    docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+    log_ok "Ranvier image built (Debug)"
+elif ! docker image inspect ranvier:latest &> /dev/null; then
+    # Try to pull from GHCR first (much faster), fall back to local build
+    log_info "Pulling Ranvier image from GHCR..."
+    if docker pull "$GHCR_IMAGE" > /dev/null 2>&1; then
+        docker tag "$GHCR_IMAGE" ranvier:latest
+        log_ok "Ranvier image pulled from GHCR"
+    else
+        log_warn "GHCR pull failed, building locally..."
+        docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+        log_ok "Ranvier image built"
+    fi
 fi
 
 # Build locust image if needed
