@@ -47,6 +47,7 @@ DEFAULT_PREFIX_RATIO="0.9"
 DEFAULT_OUTPUT_DIR="benchmark-reports"
 DEFAULT_WARMUP_DURATION="1m"
 DEFAULT_WARMUP_USERS="2"
+DEFAULT_STOP_TIMEOUT="90"
 
 # Colors
 RED='\033[0;31m'
@@ -179,6 +180,8 @@ BENCHMARK OPTIONS:
                         conversation continuations and branching scenarios.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
+    --stop-timeout N    Seconds to wait for in-flight requests at benchmark end (default: 90)
+                        Increase for large models or high load to reduce incomplete requests
 
 EXTERNAL VLLM OPTIONS:
     --skip-vllm             Don't start vLLM (use existing endpoints)
@@ -328,6 +331,7 @@ LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
 MULTI_DEPTH=false
 PROMPT_FILE=""
+STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -354,6 +358,7 @@ while [[ $# -gt 0 ]]; do
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --multi-depth)    MULTI_DEPTH=true; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
+        --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -689,6 +694,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Log All:         $LOG_ALL"
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
     echo "  Multi-Depth:     $MULTI_DEPTH"
+    echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -1112,7 +1118,7 @@ run_benchmark() {
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
         --run-time "${LOCUST_RUN_TIME_SECS}s" \
-        --stop-timeout 30 \
+        --stop-timeout "$STOP_TIMEOUT" \
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log" /dev/stderr > /dev/null
@@ -1199,7 +1205,7 @@ if [[ "$WARMUP" = true ]]; then
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
         --run-time "$(parse_duration "$DURATION")s" \
-        --stop-timeout 30 \
+        --stop-timeout "$STOP_TIMEOUT" \
         2>&1 | tee "$WARMUP_DIR/warmup.log"
 
     log_ok "Warm-up complete"
