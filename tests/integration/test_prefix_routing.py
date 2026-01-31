@@ -651,20 +651,20 @@ class PrefixRoutingTest(unittest.TestCase):
         # (Note: exact increment depends on implementation details)
         print(f"  PASSED: Route learned and cache entry created")
 
-    def test_03_radix_tree_hits_increase_with_repeated_requests(self):
-        """Verify that radix tree lookup hits increase with repeated similar requests.
+    def test_03_router_cache_hits_increase_with_repeated_requests(self):
+        """Verify that router cache hits increase with repeated similar requests.
 
-        As we send more requests with the same prefix, the ART lookup hits should increase.
+        As we send more requests with the same prefix, cache hits should increase.
         """
-        print("\nTest: Radix tree hits increase with repeated requests")
+        print("\nTest: Router cache hits increase with repeated requests")
 
         api_url = NODES["node1"]["api"]
         metrics_url = NODES["node1"]["metrics"]
 
-        # Get initial metrics (with debug to see available metrics)
-        initial_metrics = get_cache_metrics(metrics_url, debug=True)
-        initial_hits = initial_metrics.get("radix_tree_lookup_hits", 0)
-        print(f"  Initial radix tree hits: {initial_hits}")
+        # Get initial metrics
+        initial_metrics = get_cache_metrics(metrics_url)
+        initial_hits = initial_metrics.get("router_cache_hits", 0)
+        print(f"  Initial router cache hits: {initial_hits}")
 
         # Send multiple requests with same prefix
         prompt = SHARED_PREFIX_PROMPTS[1]  # Use a different prompt from test_01
@@ -676,17 +676,17 @@ class PrefixRoutingTest(unittest.TestCase):
 
         # Get final metrics
         final_metrics = get_cache_metrics(metrics_url)
-        final_hits = final_metrics.get("radix_tree_lookup_hits", 0)
-        print(f"  Final radix tree hits: {final_hits}")
+        final_hits = final_metrics.get("router_cache_hits", 0)
+        print(f"  Final router cache hits: {final_hits}")
 
-        # Radix tree lookup hits should have increased
+        # Router cache hits should have increased
         # First request is a miss (no route learned yet), but subsequent 9 should be hits
         self.assertGreater(
             final_hits, initial_hits,
-            f"Radix tree hits should increase after repeated requests: {initial_hits} -> {final_hits}"
+            f"Router cache hits should increase after repeated requests: {initial_hits} -> {final_hits}"
         )
 
-        print(f"  PASSED: Radix tree hits increased from {initial_hits} to {final_hits}")
+        print(f"  PASSED: Router cache hits increased from {initial_hits} to {final_hits}")
 
     def test_04_different_prefixes_can_route_differently(self):
         """Verify that requests with different prefixes can route to different backends.
@@ -804,7 +804,7 @@ class PrefixRoutingTest(unittest.TestCase):
     def test_07_metrics_reflect_routing_behavior(self):
         """Verify that Prometheus metrics accurately reflect routing behavior.
 
-        Check that radix tree lookup metrics are exposed and increment appropriately.
+        Check that router cache metrics are exposed and increment appropriately.
         """
         print("\nTest: Metrics reflect routing behavior")
 
@@ -832,14 +832,14 @@ class PrefixRoutingTest(unittest.TestCase):
         final = get_cache_metrics(metrics_url)
         print(f"  Final metrics: {final}")
 
-        # Verify radix tree metrics are being recorded
-        # The radix_tree_lookup_hits should increase after the second request
-        initial_lookups = initial.get("radix_tree_lookup_hits", 0) + initial.get("radix_tree_lookup_misses", 0)
-        final_lookups = final.get("radix_tree_lookup_hits", 0) + final.get("radix_tree_lookup_misses", 0)
+        # Verify router cache metrics are being recorded
+        # Total activity (hits + misses) should increase after requests
+        initial_activity = initial.get("router_cache_hits", 0) + initial.get("router_cache_misses", 0)
+        final_activity = final.get("router_cache_hits", 0) + final.get("router_cache_misses", 0)
 
         self.assertGreater(
-            final_lookups, initial_lookups,
-            f"Radix tree lookup metrics should increase after requests: initial={initial_lookups}, final={final_lookups}"
+            final_activity, initial_activity,
+            f"Router cache metrics should increase after requests: initial={initial_activity}, final={final_activity}"
         )
 
         print(f"  PASSED: Metrics are being recorded correctly")
