@@ -1262,7 +1262,26 @@ if [[ "$COMPARE" = true ]]; then
     echo "  Round-Robin:  $REPORT_RR"
     echo "  Prefix-Aware: $REPORT_PREFIX"
     echo ""
-    log_info "Compare TTFT improvements in the benchmark logs"
+
+    # Run automatic comparison analysis
+    COMPARE_OUTPUT="${OUTPUT_DIR}/compare_$(date +%Y%m%d_%H%M%S).txt"
+    if [[ -f "tests/integration/results_parser.py" ]]; then
+        log_info "Running comparison analysis..."
+        if python3 tests/integration/results_parser.py compare \
+            "${REPORT_RR}/benchmark.log" \
+            "${REPORT_PREFIX}/benchmark.log" \
+            > "$COMPARE_OUTPUT" 2>&1; then
+            # Print comparison to terminal
+            cat "$COMPARE_OUTPUT"
+            echo ""
+            log_ok "Comparison saved to: $COMPARE_OUTPUT"
+        else
+            log_warn "Comparison analysis failed - check logs manually"
+            cat "$COMPARE_OUTPUT" 2>/dev/null || true
+        fi
+    else
+        log_info "Compare TTFT improvements in the benchmark logs"
+    fi
 else
     run_benchmark "prefix" "Prefix-Aware Routing"
 fi
