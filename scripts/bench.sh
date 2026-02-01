@@ -47,6 +47,8 @@ DEFAULT_PREFIX_RATIO="0.9"
 DEFAULT_OUTPUT_DIR="benchmark-reports"
 DEFAULT_WARMUP_DURATION="1m"
 DEFAULT_WARMUP_USERS="2"
+DEFAULT_STOP_TIMEOUT="90"
+GHCR_IMAGE="ghcr.io/ranvier-systems/ranvier:latest"
 
 # Colors
 RED='\033[0;31m'
@@ -191,6 +193,8 @@ BENCHMARK OPTIONS:
                         conversation continuations and branching scenarios.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
+    --stop-timeout N    Seconds to wait for in-flight requests at benchmark end (default: 90)
+                        Increase for large models or high load to reduce incomplete requests
 
 EXTERNAL VLLM OPTIONS:
     --skip-vllm             Don't start vLLM (use existing endpoints)
@@ -340,6 +344,7 @@ LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
 MULTI_DEPTH=false
 PROMPT_FILE=""
+STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -366,6 +371,7 @@ while [[ $# -gt 0 ]]; do
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --multi-depth)    MULTI_DEPTH=true; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
+        --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -594,16 +600,29 @@ if [[ "$SETUP_ONLY" = true ]]; then
         log_ok "tokenizers already installed"
     fi
 
-    # Pre-build Docker images
-    if [[ -f "Dockerfile.production" ]]; then
-        BUILD_TYPE_ARG=""
-        [[ "${DEBUG_BUILD:-}" == "true" ]] && BUILD_TYPE_ARG="--build-arg BUILD_TYPE=Debug"
-        log_info "Pre-building Ranvier Docker image${DEBUG_BUILD:+ (Debug mode)}..."
-        docker build $BUILD_TYPE_ARG -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
-            log_ok "Ranvier image built" || log_warn "Could not build Ranvier image"
+    # Pre-build Docker images (only if docker is accessible)
+    if ! docker ps &> /dev/null; then
+        log_warn "Docker not accessible - skipping image builds"
+        log_info "After running 'newgrp docker', re-run: ./scripts/bench.sh --setup"
+    elif [[ "${DEBUG_BUILD:-}" == "true" ]]; then
+        # Debug builds must be built locally
+        log_info "Building Ranvier Docker image (Debug mode)..."
+        docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
+            log_ok "Ranvier image built (Debug)" || log_warn "Could not build Ranvier image"
+    else
+        # Try to pull from GHCR first (much faster), fall back to local build
+        log_info "Pulling Ranvier image from GHCR..."
+        if docker pull "$GHCR_IMAGE" > /dev/null 2>&1; then
+            docker tag "$GHCR_IMAGE" ranvier:latest
+            log_ok "Ranvier image pulled from GHCR"
+        elif [[ -f "Dockerfile.production" ]]; then
+            log_warn "GHCR pull failed, building locally (this may take a while)..."
+            docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
+                log_ok "Ranvier image built" || log_warn "Could not build Ranvier image"
+        fi
     fi
 
-    if [[ -f "tests/integration/Dockerfile.locust" ]]; then
+    if docker ps &> /dev/null && [[ -f "tests/integration/Dockerfile.locust" ]]; then
         log_info "Pre-building Locust Docker image..."
         docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1 && \
             log_ok "Locust image built" || log_warn "Could not build Locust image"
@@ -701,6 +720,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Log All:         $LOG_ALL"
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
     echo "  Multi-Depth:     $MULTI_DEPTH"
+    echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -939,17 +959,23 @@ done
 
 log_header "Starting Ranvier Cluster"
 
-# Build Ranvier image if needed
-BUILD_TYPE_ARG=""
+# Get Ranvier image if needed
 if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
-    BUILD_TYPE_ARG="--build-arg BUILD_TYPE=Debug"
-    log_info "Debug build requested - will include debug symbols"
-fi
-
-if ! docker image inspect ranvier:latest &> /dev/null || [[ "${DEBUG_BUILD:-}" == "true" ]]; then
-    log_info "Building Ranvier image${DEBUG_BUILD:+ (Debug mode)}..."
-    docker build $BUILD_TYPE_ARG -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
-    log_ok "Ranvier image built"
+    # Debug builds must be built locally
+    log_info "Debug build requested - building with debug symbols..."
+    docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+    log_ok "Ranvier image built (Debug)"
+elif ! docker image inspect ranvier:latest &> /dev/null; then
+    # Try to pull from GHCR first (much faster), fall back to local build
+    log_info "Pulling Ranvier image from GHCR..."
+    if docker pull "$GHCR_IMAGE" > /dev/null 2>&1; then
+        docker tag "$GHCR_IMAGE" ranvier:latest
+        log_ok "Ranvier image pulled from GHCR"
+    else
+        log_warn "GHCR pull failed, building locally..."
+        docker build -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1
+        log_ok "Ranvier image built"
+    fi
 fi
 
 # Build locust image if needed
@@ -1141,7 +1167,7 @@ run_benchmark() {
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
         --run-time "${LOCUST_RUN_TIME_SECS}s" \
-        --stop-timeout 30 \
+        --stop-timeout "$STOP_TIMEOUT" \
         --csv "/mnt/locust/output/results" \
         --html "/mnt/locust/output/report.html" \
         2>&1 | tee "$REPORT_DIR/benchmark.log" /dev/stderr > /dev/null
@@ -1238,7 +1264,7 @@ if [[ "$WARMUP" = true ]]; then
         --users "$USERS" \
         --spawn-rate "$SPAWN_RATE" \
         --run-time "$(parse_duration "$DURATION")s" \
-        --stop-timeout 30 \
+        --stop-timeout "$STOP_TIMEOUT" \
         2>&1 | tee "$WARMUP_DIR/warmup.log"
 
     log_ok "Warm-up complete"
@@ -1278,7 +1304,26 @@ if [[ "$COMPARE" = true ]]; then
     echo "  Round-Robin:  $REPORT_RR"
     echo "  Prefix-Aware: $REPORT_PREFIX"
     echo ""
-    log_info "Compare TTFT improvements in the benchmark logs"
+
+    # Run automatic comparison analysis
+    COMPARE_OUTPUT="${OUTPUT_DIR}/compare_$(date +%Y%m%d_%H%M%S).txt"
+    if [[ -f "tests/integration/results_parser.py" ]]; then
+        log_info "Running comparison analysis..."
+        if python3 tests/integration/results_parser.py compare \
+            "${REPORT_RR}/benchmark.log" \
+            "${REPORT_PREFIX}/benchmark.log" \
+            > "$COMPARE_OUTPUT" 2>&1; then
+            # Print comparison to terminal
+            cat "$COMPARE_OUTPUT"
+            echo ""
+            log_ok "Comparison saved to: $COMPARE_OUTPUT"
+        else
+            log_warn "Comparison analysis failed - check logs manually"
+            cat "$COMPARE_OUTPUT" 2>/dev/null || true
+        fi
+    else
+        log_info "Compare TTFT improvements in the benchmark logs"
+    fi
 else
     run_benchmark "prefix" "Prefix-Aware Routing"
 fi
