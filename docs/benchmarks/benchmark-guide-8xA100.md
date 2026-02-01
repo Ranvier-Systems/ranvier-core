@@ -2,6 +2,32 @@
 
 This guide provides specific test scenarios, expected results, and validation criteria for benchmarking Ranvier on a Lambda Labs 8x A100 instance.
 
+## TL;DR Results
+
+Prefix-aware routing vs round-robin baseline (30-minute validated runs):
+
+| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency |
+|-------|----------------|------------------------|-------------|
+| CodeLlama-13b | 12% → **98%** | **39%** faster | **-80%** |
+| Llama-3.1-8B | 12% → **98%** | **44%** faster | **-77%** |
+
+**Key wins:**
+- **8x more cache hits** — Requests routed to backends with cached KV data
+- **39-44% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
+- **77-80% lower tail latency** — P99 response times improve dramatically
+
+**Works across prefix sharing levels:**
+
+| Prefix Sharing | Cache Hit Rate | Improvement |
+|----------------|----------------|-------------|
+| 90% | 98% | 39% |
+| 70% | 93% | 42% |
+| 50% | 90% | 41% |
+
+*Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes.*
+
+---
+
 ## Hardware Configuration
 
 | Component | Specification |
