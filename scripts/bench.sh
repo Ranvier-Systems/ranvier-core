@@ -115,6 +115,18 @@ cleanup() {
     echo ""
     log_header "Cleaning up"
 
+    # Stop memory sampler if running
+    if [[ -n "${MEM_SAMPLER_PID:-}" ]] && kill -0 "$MEM_SAMPLER_PID" 2>/dev/null; then
+        kill "$MEM_SAMPLER_PID" 2>/dev/null
+        wait "$MEM_SAMPLER_PID" 2>/dev/null || true
+        # Final memory capture
+        if [[ -n "${MEM_LOG:-}" ]]; then
+            echo "# END $(date -Iseconds)" >> "$MEM_LOG"
+            docker stats --no-stream --format '{{.Name}},{{.MemUsage}}' 2>/dev/null | grep ranvier >> "$MEM_LOG" || true
+        fi
+        log_ok "Memory sampler stopped"
+    fi
+
     # Kill vLLM processes
     if [ ${#VLLM_PIDS[@]} -gt 0 ]; then
         log_info "Stopping vLLM processes..."
@@ -1120,6 +1132,23 @@ run_benchmark() {
     log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)" >&2
     BENCHMARK_START_TS=$(date +%s)
 
+    # Start memory sampler (captures docker stats every 30s)
+    MEM_LOG="$REPORT_DIR/memory_stats.csv"
+    echo "# Memory stats for benchmark: $LABEL" > "$MEM_LOG"
+    echo "# Started: $(date -Iseconds)" >> "$MEM_LOG"
+    echo "# Format: container_name,mem_usage" >> "$MEM_LOG"
+    echo "# START $(date -Iseconds)" >> "$MEM_LOG"
+    docker stats --no-stream --format '{{.Name}},{{.MemUsage}}' 2>/dev/null | grep ranvier >> "$MEM_LOG" || true
+    (
+        while true; do
+            sleep 30
+            echo "# SAMPLE $(date -Iseconds)" >> "$MEM_LOG"
+            docker stats --no-stream --format '{{.Name}},{{.MemUsage}}' 2>/dev/null | grep ranvier >> "$MEM_LOG" || true
+        done
+    ) &
+    MEM_SAMPLER_PID=$!
+    log_info "Memory sampler started (PID: $MEM_SAMPLER_PID, log: $MEM_LOG)" >&2
+
     # Note: Output to stderr (via tee /dev/stderr) so it displays when run_benchmark is called with $()
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1150,6 +1179,16 @@ run_benchmark() {
     log_info "Benchmark timing: expected=${EXPECTED_DURATION}s, actual=${ACTUAL_DURATION}s, diff=${DURATION_DIFF}s" >&2
     if [[ $DURATION_DIFF -gt 60 ]]; then
         log_warn "Benchmark ran ${DURATION_DIFF}s longer than expected (>1min overhead)" >&2
+    fi
+
+    # Stop memory sampler and capture final state
+    if [[ -n "${MEM_SAMPLER_PID:-}" ]] && kill -0 "$MEM_SAMPLER_PID" 2>/dev/null; then
+        kill "$MEM_SAMPLER_PID" 2>/dev/null
+        wait "$MEM_SAMPLER_PID" 2>/dev/null || true
+        echo "# END $(date -Iseconds)" >> "$MEM_LOG"
+        docker stats --no-stream --format '{{.Name}},{{.MemUsage}}' 2>/dev/null | grep ranvier >> "$MEM_LOG" || true
+        log_info "Memory stats saved to: $MEM_LOG" >&2
+        unset MEM_SAMPLER_PID  # Clear so cleanup doesn't try again
     fi
 
     log_ok "Results saved to: $REPORT_DIR/" >&2
