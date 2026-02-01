@@ -141,8 +141,16 @@ void TokenizerWorker::process_job(TokenizationJob& job, seastar::alien::instance
     std::vector<int32_t> tokens;
     bool success = false;
 
+    // CRITICAL: Reallocate the string buffer on the worker thread.
+    // The job.text was allocated on a Seastar reactor shard, but this worker
+    // thread runs outside Seastar's shard allocators. The Rust tokenizer (via FFI)
+    // may have issues with memory allocated by a different allocator.
+    // Creating a local copy ensures the string buffer is allocated by this
+    // thread's allocator before passing to the Rust FFI.
+    std::string local_text(job.text.data(), job.text.size());
+
     try {
-        tokens = _tokenizer->Encode(job.text);
+        tokens = _tokenizer->Encode(local_text);
         success = true;
     } catch (const std::exception& e) {
         log_thread_pool.warn("Worker tokenization failed on shard {}: {}",
@@ -158,7 +166,15 @@ void TokenizerWorker::process_job(TokenizationJob& job, seastar::alien::instance
         seastar::alien::run_on(alien_instance, target_shard,
             [job_id, tokens = std::move(tokens), success]() noexcept {
                 if (auto* callback = get_thread_pool_completion_callback()) {
-                    (*callback)(job_id, std::move(tokens), success);
+                    // CRITICAL: Reallocate tokens on the reactor thread.
+                    // The tokens vector was allocated on the worker thread (which uses
+                    // Seastar's global malloc - tracked as foreign_mallocs). If we pass
+                    // it directly, the reactor will eventually free foreign-allocated
+                    // memory, causing corruption via do_foreign_free.
+                    // Creating a local copy ensures the vector is allocated by THIS
+                    // shard's allocator.
+                    std::vector<int32_t> local_tokens(tokens.begin(), tokens.end());
+                    (*callback)(job_id, std::move(local_tokens), success);
                 }
             });
     } catch (const std::exception& e) {

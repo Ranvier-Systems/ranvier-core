@@ -72,6 +72,25 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Priority:_ P3 (disabled by default; benchmark to enable)
   _Completed:_ 2026-01-31
 
+- [ ] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator**
+  _Justification:_ Seastar replaces `malloc` globally with its per-shard allocator. When Rust FFI code (tokenizers library) runs on worker threads or processes cross-shard data, allocations are tracked as `foreign_mallocs`. The interaction between Seastar's `do_foreign_free` and Rust's internal allocator patterns causes memory corruption under stress (SIGSEGV with corrupted pointers). Current workaround requires defensive reallocation at every FFI boundary (Rule #15), adding copy overhead and code complexity.
+  _Approach:_ Rebuild the `tokenizers-cpp` Rust library with a statically-linked allocator (jemalloc or mimalloc) that bypasses Seastar's malloc interception entirely:
+  ```toml
+  # Cargo.toml
+  [dependencies]
+  tikv-jemallocator = "0.5"
+
+  # lib.rs
+  #[global_allocator]
+  static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+  ```
+  _Benefits:_ Complete memory isolation between Rust and Seastar allocators. Eliminates need for defensive copies at FFI boundaries. Simpler, more maintainable code. No risk of subtle memory corruption from allocator interactions.
+  _Trade-offs:_ Larger binary (~300KB for jemalloc). Two allocators in process (potential memory fragmentation). Requires maintaining a fork or patch of tokenizers-cpp.
+  _Location:_ External dependency (`tokenizers-cpp`), CMake configuration
+  _Complexity:_ Medium
+  _Priority:_ P2 (prevents production crashes; current workaround is fragile)
+  _Related:_ Rule #15 in `.dev-context/claude-context.md`
+
 - [x] **Use Seastar async file I/O for tokenizer loading** ✓
   _Justification:_ Tokenizer loading used blocking `std::ifstream` during startup, blocking the reactor thread. This is an architectural hazard in Seastar that could cause stalls on slow storage.
   _Approach:_ Replaced `std::ifstream` with Seastar's non-blocking DMA file I/O (`seastar::open_file_dma`, `seastar::make_file_input_stream`). Added validation for empty files, max file size (100MB), and proper stream cleanup via `finally()`. Method now returns `seastar::future<>` for proper async chaining in startup sequence.

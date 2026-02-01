@@ -233,10 +233,17 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
     return seastar::smp::submit_to(target_shard,
         [tokenizer_sharded, text_copy = std::move(text_copy), target_shard]() mutable
             -> std::pair<std::vector<int32_t>, bool> {
+            // CRITICAL: Reallocate the string buffer on THIS shard.
+            // The moved text_copy has its buffer allocated on the calling shard,
+            // which causes memory corruption when the Rust tokenizer (via FFI)
+            // processes it - Seastar's do_foreign_free doesn't play well with
+            // allocations that cross into Rust code.
+            std::string local_text(text_copy.data(), text_copy.size());
+
             // On target shard: get local TokenizerService and check cache
             auto& target_tokenizer = tokenizer_sharded->local();
 
-            const auto* target_cached = target_tokenizer._cache.lookup(text_copy);
+            const auto* target_cached = target_tokenizer._cache.lookup(local_text);
             if (target_cached) {
                 // Target cache hit - return copy of cached tokens
                 return {*target_cached, true};
@@ -249,7 +256,7 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
 
             std::vector<int32_t> tokens;
             try {
-                tokens = target_tokenizer._impl->Encode(text_copy);
+                tokens = target_tokenizer._impl->Encode(local_text);
             } catch (const std::exception& e) {
                 log_tokenizer.warn("Cross-shard tokenization failed on shard {}: {}",
                                   target_shard, e.what());
@@ -257,7 +264,7 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
             }
 
             // Cache on target shard for future cross-shard requests
-            target_tokenizer._cache.insert(text_copy, tokens);
+            target_tokenizer._cache.insert(local_text, tokens);
 
             return {std::move(tokens), false};
         })
@@ -266,7 +273,12 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
             // Back on calling shard: package result and cache locally
 
             TokenizationResult result;
-            result.tokens = std::move(remote_result.first);
+            // CRITICAL: Reallocate tokens on THIS shard.
+            // The remote_result.first vector was allocated on the target shard.
+            // Moving it here would leave the buffer allocated on the wrong shard,
+            // causing memory corruption when eventually freed via do_foreign_free.
+            result.tokens = std::vector<int32_t>(
+                remote_result.first.begin(), remote_result.first.end());
             result.cache_hit = remote_result.second;  // Was it a cache hit on target?
             result.cross_shard = true;
             result.source_shard = target_shard;
