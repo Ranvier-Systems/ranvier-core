@@ -87,6 +87,7 @@ The `--warmup` flag runs a short preliminary benchmark before the main test:
 | `--prompt-dist` | stress | Prompt size distribution (see below) |
 | `--prefix-ratio` | 0.9 | Ratio of requests sharing prefixes (0.0-1.0) |
 | `--model` | Llama-3.1-8B | Model to benchmark |
+| `--client-tokenize` | off | Tokenize on client side (see [Client Tokenization](#client-tokenization)) |
 | `--debug` | off | Build with debug symbols for crash investigation |
 
 ### Prompt Distribution (`--prompt-dist`)
@@ -187,6 +188,62 @@ tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
 # Validate before use
 python3 tests/integration/prompt_loader.py prefixes tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
 python3 tests/integration/prompt_loader.py stats tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+```
+
+---
+
+## Client Tokenization
+
+The `--client-tokenize` flag moves tokenization from Ranvier to the benchmark client. This simulates production deployments where clients send pre-tokenized requests.
+
+### Trade-offs
+
+| Metric | Server Tokenize | Client Tokenize | Difference |
+|--------|-----------------|-----------------|------------|
+| Routing overhead | ~17ms | ~0.4ms | **44x lower** |
+| Throughput (req/s) | 25.4 | 31.1 | **+22%** |
+| Total requests (30m) | 11,973 | 14,553 | **+22%** |
+| P99 TTFT | 1200ms | 1100ms | **-8%** |
+| XLarge Improvement % | 38.9% | 4.1% | See below |
+
+### Why XLarge Improvement % Drops
+
+The "XLarge Improvement" metric measures the relative benefit of cache hits vs misses:
+
+```
+Improvement = (miss_latency - hit_latency) / miss_latency
+```
+
+With client tokenization, **cache misses also get faster** because the server skips tokenization:
+
+| Metric | Server Tokenize | Client Tokenize |
+|--------|-----------------|-----------------|
+| XLarge Hit P50 | 886ms | 733ms |
+| XLarge Miss P50 | 1451ms | 764ms |
+| Improvement % | 38.9% | 4.1% |
+
+The **absolute latencies are better** with client tokenization—both hits and misses are faster. The relative improvement shrinks because the denominator (miss latency) dropped significantly.
+
+### When to Use
+
+**Use `--client-tokenize` when:**
+- Simulating production deployments with pre-tokenized requests
+- Maximizing throughput is the priority
+- You want to measure Ranvier's pure routing overhead
+
+**Use server tokenization (default) when:**
+- Measuring the benefit of prefix-aware routing vs round-robin
+- Clients send raw text (Ranvier handles tokenization)
+- You want higher "improvement %" numbers for comparison
+
+### Example
+
+```bash
+# Server tokenization (default) - measures routing benefit
+./scripts/bench.sh --compare --duration 30m --users 20
+
+# Client tokenization - measures production throughput
+./scripts/bench.sh --compare --client-tokenize --duration 30m --users 20
 ```
 
 ---
