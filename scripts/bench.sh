@@ -588,8 +588,11 @@ if [[ "$SETUP_ONLY" = true ]]; then
         log_ok "tokenizers already installed"
     fi
 
-    # Pre-build Docker images
-    if [[ "${DEBUG_BUILD:-}" == "true" ]]; then
+    # Pre-build Docker images (only if docker is accessible)
+    if ! docker ps &> /dev/null; then
+        log_warn "Docker not accessible - skipping image builds"
+        log_info "After running 'newgrp docker', re-run: ./scripts/bench.sh --setup"
+    elif [[ "${DEBUG_BUILD:-}" == "true" ]]; then
         # Debug builds must be built locally
         log_info "Building Ranvier Docker image (Debug mode)..."
         docker build --build-arg BUILD_TYPE=Debug -t ranvier:latest -f Dockerfile.production . > /dev/null 2>&1 && \
@@ -607,7 +610,7 @@ if [[ "$SETUP_ONLY" = true ]]; then
         fi
     fi
 
-    if [[ -f "tests/integration/Dockerfile.locust" ]]; then
+    if docker ps &> /dev/null && [[ -f "tests/integration/Dockerfile.locust" ]]; then
         log_info "Pre-building Locust Docker image..."
         docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1 && \
             log_ok "Locust image built" || log_warn "Could not build Locust image"
