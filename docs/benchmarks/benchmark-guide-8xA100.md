@@ -666,6 +666,30 @@ Not all workloads have 90% prefix sharing. These tests show how improvement scal
 
 This demonstrates prefix-aware routing benefits workloads even when prefix sharing is moderate—you don't need 90%+ sharing to see real gains.
 
+#### When Prefix-Aware Routing Helps (and When It Doesn't)
+
+Tested with real LMSYS conversation data (natural short-to-medium prompts, 3 shared prefixes):
+
+| Metric | Round-Robin | Prefix-Aware | Notes |
+|--------|-------------|--------------|-------|
+| Cache Hit Rate | 12.9% | **99.8%** | Excellent with only 3 prefixes |
+| P50 TTFT | 410ms | 460ms | +12% worse |
+| Incomplete Rate | 35.1% | **15.2%** | Much better load handling |
+
+**Why TTFT got worse:** The LMSYS conversations have **shorter prefixes** than RAG/system-prompt workloads. With short prompts, the routing overhead (~3ms) exceeds the cache benefit.
+
+**When prefix-aware routing helps:**
+- RAG with large context documents (2K-8K tokens)
+- Long system prompts (few-shot examples, detailed instructions)
+- Workloads where prefill dominates latency
+
+**When it doesn't help much:**
+- General chat with short prompts (<500 tokens)
+- Highly unique requests with no prefix sharing
+- Small models (1B) where prefill is already fast
+
+The cache hit rate will always improve with prefix-aware routing. The TTFT benefit depends on prefix size.
+
 ---
 
 ## Cleanup & Restarts
