@@ -2,6 +2,32 @@
 
 This guide provides specific test scenarios, expected results, and validation criteria for benchmarking Ranvier on a Lambda Labs 8x A100 instance.
 
+## TL;DR Results
+
+Prefix-aware routing vs round-robin baseline (30-minute validated runs):
+
+| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency |
+|-------|----------------|------------------------|-------------|
+| CodeLlama-13b | 12% → **98%** | **39%** faster | **-80%** |
+| Llama-3.1-8B | 12% → **98%** | **44%** faster | **-77%** |
+
+**Key wins:**
+- **8x more cache hits** — Requests routed to backends with cached KV data
+- **39-44% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
+- **77-80% lower tail latency** — P99 response times improve dramatically
+
+**Works across prefix sharing levels:**
+
+| Prefix Sharing | Cache Hit Rate | Improvement |
+|----------------|----------------|-------------|
+| 90% | 98% | 39% |
+| 70% | 93% | 42% |
+| 50% | 90% | 41% |
+
+*Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes.*
+
+---
+
 ## Hardware Configuration
 
 | Component | Specification |
@@ -87,6 +113,7 @@ The `--warmup` flag runs a short preliminary benchmark before the main test:
 | `--prompt-dist` | stress | Prompt size distribution (see below) |
 | `--prefix-ratio` | 0.9 | Ratio of requests sharing prefixes (0.0-1.0) |
 | `--model` | Llama-3.1-8B | Model to benchmark |
+| `--client-tokenize` | off | Tokenize on client side (see [Client Tokenization](#client-tokenization)) |
 | `--debug` | off | Build with debug symbols for crash investigation |
 
 ### Prompt Distribution (`--prompt-dist`)
@@ -187,6 +214,70 @@ tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
 # Validate before use
 python3 tests/integration/prompt_loader.py prefixes tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
 python3 tests/integration/prompt_loader.py stats tests/integration/data/lmsys/lmsys_10k_shared_prefix.jsonl
+```
+
+---
+
+## Client Tokenization
+
+The `--client-tokenize` flag moves tokenization from Ranvier to the benchmark client. This simulates production deployments where clients send pre-tokenized requests.
+
+### Trade-offs by Model Size
+
+Results from 30-minute benchmarks at 20 users:
+
+#### CodeLlama-13b
+
+| Metric | Server Tokenize | Client Tokenize | Difference |
+|--------|-----------------|-----------------|------------|
+| Routing overhead | ~17ms | ~0.4ms | **44x lower** |
+| Throughput (req/s) | 25.4 | 31.1 | **+22%** |
+| XLarge Improvement % | 38.9% | 4.1% | See below |
+| XLarge Hit P50 | 886ms | 733ms | -17% |
+| XLarge Miss P50 | 1451ms | 764ms | -47% |
+
+#### Llama-3.1-8B
+
+| Metric | Server Tokenize | Client Tokenize | Difference |
+|--------|-----------------|-----------------|------------|
+| Routing overhead | ~16ms | ~0.4ms | **40x lower** |
+| Throughput (req/s) | 33.1 | 32.8 | ~same |
+| XLarge Improvement % | 43.7% | 36.0% | See below |
+| XLarge Hit P50 | 453ms | 451ms | ~same |
+| XLarge Miss P50 | 804ms | 705ms | -12% |
+
+**Why throughput differs by model:** The 8B model is faster overall (~450ms vs ~900ms for 13B), so the 15-17ms tokenization overhead is a smaller percentage of total request time. For slower models, client tokenization provides a bigger throughput boost.
+
+### Why XLarge Improvement % Drops
+
+The "XLarge Improvement" metric measures the relative benefit of cache hits vs misses:
+
+```
+Improvement = (miss_latency - hit_latency) / miss_latency
+```
+
+With client tokenization, **cache misses also get faster** because the server skips tokenization. The **absolute latencies are better**—both hits and misses are faster. The relative improvement shrinks because the denominator (miss latency) dropped significantly.
+
+### When to Use
+
+**Use `--client-tokenize` when:**
+- Simulating production deployments with pre-tokenized requests
+- Benchmarking larger/slower models where throughput gains are significant
+- You want to measure Ranvier's pure routing overhead
+
+**Use server tokenization (default) when:**
+- Measuring the benefit of prefix-aware routing vs round-robin
+- Clients send raw text (Ranvier handles tokenization)
+- You want higher "improvement %" numbers for comparison
+
+### Example
+
+```bash
+# Server tokenization (default) - measures routing benefit
+./scripts/bench.sh --compare --duration 30m --users 20
+
+# Client tokenization - measures production throughput
+./scripts/bench.sh --compare --client-tokenize --duration 30m --users 20
 ```
 
 ---
@@ -467,16 +558,20 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | Model | Users | Prefix Size | Cache Miss | Cache Hit | Improvement |
 |-------|-------|-------------|------------|-----------|-------------|
 | 1B | 30 | XLarge (4-8K tokens) | ~130ms | ~130ms | **~0%** |
-| 8B | 30 | XLarge (4-8K tokens) | ~655ms | ~499ms | **~24%** |
+| 8B | 30 | XLarge (4-8K tokens) | ~655ms | ~499ms | **~26%** |
+| 8B | 20 | XLarge (4-8K tokens) | ~804ms | ~453ms | **~44%** |
 | 8B | 10 | XLarge (4-8K tokens) | ~580ms | ~333ms | **~43%** |
+| **13B** | 30 | XLarge (4-8K tokens) | ~1800ms | ~1030ms | **~43%** |
+| **13B** | 20 | XLarge (4-8K tokens) | ~1451ms | ~886ms | **~39%** |
 | **13B** | 10 | XLarge (4-8K tokens) | ~1575ms | ~816ms | **~48%** |
 | 70B | - | XLarge (4-8K tokens) | TBD | TBD | Expected 50-60% |
 
 **Key insights:**
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
 - **Small prefixes have overhead** — Routing cost exceeds cache benefit
-- **Large prefixes (4K+ tokens) show real improvement** — 24-48% TTFT reduction
-- **Larger models amplify benefits** — 13B shows 48% vs 43% for 8B under same load
+- **Large prefixes (4K+ tokens) show real improvement** — 26-48% TTFT reduction
+- **Larger models amplify benefits** — 13B shows 39-48% vs 26-44% for 8B
+- **Tail latency is the big win** — P99 TTFT drops 77-80% with prefix-aware routing
 
 ### Cache Hit Rate
 
@@ -540,19 +635,60 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Performance by Model Size and Load
 
-| Model | Load | Users | XLarge TTFT Improvement | Cache Hit Rate |
-|-------|------|-------|-------------------------|----------------|
-| **CodeLlama-13b** | Normal | 10 | **48.2%** | 96.4% |
-| Llama-3.1-8B | Normal | 10 | 42.7% | 95.6% |
-| Llama-3.1-8B | Heavy | 30 | 23.7% | 98.0% |
+| Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate |
+|-------|------|-------|----------|-------------------------|----------------|
+| **CodeLlama-13b** | Moderate | 20 | 30m | **38.9%** | 97.6% |
+| **CodeLlama-13b** | Normal | 10 | 10m | **48.2%** | 96.4% |
+| CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% |
+| Llama-3.1-8B | Moderate | 20 | 30m | 43.7% | 97.8% |
+| Llama-3.1-8B | Normal | 10 | 10m | 42.7% | 95.6% |
+| Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% |
 
 **Why larger models benefit more:** Prefill computation scales with model parameters. A 13B model has ~1.6x the compute per prefill token compared to 8B, so cache hits save proportionally more time.
 
 **Key takeaways:**
-- **Larger models** see bigger improvements (48% for 13B vs 43% for 8B)
-- **Well-provisioned systems** (1-2 req/GPU): Best results
-- **Overloaded systems** (3+ req/GPU): Still significant improvement despite queuing
-- **Cache hit rate** is excellent (95%+) regardless of load or model size
+- **Larger models** see bigger improvements (39-48% for 13B vs 26-44% for 8B)
+- **P99 tail latency** drops 77-80% — worst-case response times improve dramatically
+- **Throughput increases** ~28% with prefix-aware routing under load
+- **Cache hit rate** is excellent (97%+) regardless of load or model size
+
+#### Impact of Prefix Sharing Ratio
+
+Not all workloads have 90% prefix sharing. These tests show how improvement scales:
+
+| Prefix Ratio | Cache Hit Rate | XLarge Improvement | P99 TTFT | Notes |
+|--------------|----------------|-------------------|----------|-------|
+| 0.9 (90%) | 97.6% | 38.9% | 1200ms | High sharing (single system prompt) |
+| 0.7 (70%) | 93.2% | 41.5% | — | Moderate sharing |
+| 0.5 (50%) | 89.9% | 40.9% | 970ms | Low sharing (many system prompts) |
+
+**Key finding:** Improvement holds up remarkably well across prefix ratios. Even at 50% sharing, the system delivers 90% cache hit rate and 41% XLarge improvement. The 0.5 and 0.7 tests show *higher* improvement than 0.9 because they had 0% incomplete rate (less system load).
+
+This demonstrates prefix-aware routing benefits workloads even when prefix sharing is moderate—you don't need 90%+ sharing to see real gains.
+
+#### When Prefix-Aware Routing Helps (and When It Doesn't)
+
+Tested with real LMSYS conversation data (natural short-to-medium prompts, 3 shared prefixes):
+
+| Metric | Round-Robin | Prefix-Aware | Notes |
+|--------|-------------|--------------|-------|
+| Cache Hit Rate | 12.9% | **99.8%** | Excellent with only 3 prefixes |
+| P50 TTFT | 410ms | 460ms | +12% worse |
+| Incomplete Rate | 35.1% | **15.2%** | Much better load handling |
+
+**Why TTFT got worse:** The LMSYS conversations have **shorter prefixes** than RAG/system-prompt workloads. With short prompts, the routing overhead (~3ms) exceeds the cache benefit.
+
+**When prefix-aware routing helps:**
+- RAG with large context documents (2K-8K tokens)
+- Long system prompts (few-shot examples, detailed instructions)
+- Workloads where prefill dominates latency
+
+**When it doesn't help much:**
+- General chat with short prompts (<500 tokens)
+- Highly unique requests with no prefix sharing
+- Small models (1B) where prefill is already fast
+
+The cache hit rate will always improve with prefix-aware routing. The TTFT benefit depends on prefix size.
 
 ---
 

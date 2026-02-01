@@ -18,6 +18,8 @@ This document identifies missing features and optimizations required to promote 
 6. [Integration Tests (End-to-End Validation)](#6-integration-tests-end-to-end-validation)
 7. [Security Audit Findings](#7-security-audit-findings-adversarial-system-audit)
 8. [Strategic Assessment (2026-01-19)](#8-strategic-assessment-2026-01-19)
+9. [Benchmark Extensions](#9-benchmark-extensions)
+10. [Load-Aware Prefix Routing](#10-load-aware-prefix-routing)
 
 ---
 
@@ -71,6 +73,17 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Complexity:_ High
   _Priority:_ P3 (disabled by default; benchmark to enable)
   _Completed:_ 2026-01-31
+
+- [x] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator** ✓
+  _Justification:_ Seastar replaces `malloc` globally with its per-shard allocator. When Rust FFI code (tokenizers library) runs on worker threads or processes cross-shard data, allocations are tracked as `foreign_mallocs`. The interaction between Seastar's `do_foreign_free` and Rust's internal allocator patterns causes memory corruption under stress (SIGSEGV with corrupted pointers). Current workaround requires defensive reallocation at every FFI boundary (Rule #15), adding copy overhead and code complexity.
+  _Approach:_ CMake and Dockerfile patches inject `tikv-jemallocator = "0.6"` into `rust/Cargo.toml` and add `#[global_allocator] static GLOBAL: Jemalloc` to `rust/src/lib.rs` after FetchContent/git clone. This gives Rust its own memory allocator that bypasses Seastar entirely.
+  _Benefits:_ Complete memory isolation between Rust and Seastar allocators. Eliminates need for defensive copies at FFI boundaries. Simpler, more maintainable code. No risk of subtle memory corruption from allocator interactions.
+  _Trade-offs:_ Larger binary (~300KB for jemalloc). Two allocators in process (potential memory fragmentation). Inline patching instead of fork - simpler to maintain.
+  _Location:_ `CMakeLists.txt` (lines 158-214), `Dockerfile.base` (lines 59-82)
+  _Complexity:_ Medium
+  _Priority:_ P2 (prevents production crashes; current workaround is fragile)
+  _Related:_ Rule #15 in `.dev-context/claude-context.md`
+  _Completed:_ 2026-02-01
 
 - [x] **Use Seastar async file I/O for tokenizer loading** ✓
   _Justification:_ Tokenizer loading used blocking `std::ifstream` during startup, blocking the reactor thread. This is an architectural hazard in Seastar that could cause stalls on slow storage.
@@ -1198,6 +1211,122 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 
 ---
 
+## 9. Benchmark Extensions
+
+Extend benchmarking to make it more realistic with production traces, cache pressure scenarios, larger models, and traffic variability.
+
+### 9.1 Production Prompt Traces
+
+- [ ] **Define trace format (JSON/JSONL) for production prompt patterns**
+  _Justification:_ Synthetic prompts don't capture real-world prompt distribution. Production traces enable realistic performance validation.
+  _Deliverables:_
+  - Define schema capturing prompt content, timestamps, user sessions
+  - Support prefix annotation for shared system messages
+  - Include metadata: model, temperature, max_tokens
+  _Location:_ `tests/integration/data/traces/` (new), schema doc
+  _Complexity:_ Low
+
+- [ ] **Modify locustfile_real.py to load and replay traces**
+  _Justification:_ Current Locust test uses synthetic prompts with fixed distributions. Trace replay enables historical traffic patterns.
+  _Approach:_ Add `TraceLoader` class, `--trace-file` parameter, timestamp-based replay scheduling
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add --trace-file option to bench.sh**
+  _Justification:_ Simplify trace-based benchmarking via CLI.
+  _Location:_ `scripts/bench.sh`
+  _Complexity:_ Low
+
+- [ ] **Create tool to anonymize/sanitize production logs into trace format**
+  _Justification:_ Production logs contain sensitive data. Anonymization tool enables safe trace collection.
+  _Approach:_ PII detection, content hashing, prefix preservation, configurable anonymization rules
+  _Location:_ `scripts/anonymize_traces.py` (new)
+  _Complexity:_ Medium
+
+### 9.2 Cache Pressure Scenarios
+
+- [ ] **Add --unique-prefixes N option to control prefix diversity**
+  _Justification:_ Current benchmarks use 5 unique prefixes. Real deployments may have thousands. Need to test cache behavior at scale.
+  _Location:_ `tests/integration/locustfile_real.py`, `scripts/bench.sh`
+  _Complexity:_ Low
+
+- [ ] **Create "cache-pressure" prompt distribution**
+  _Justification:_ Test behavior when unique prefixes exceed KV cache capacity. Validates eviction policies and degraded performance.
+  _Approach:_ Generate N unique prefixes > vLLM block capacity, measure cache hit rate degradation curve
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add metrics to detect cache evictions (if vLLM exposes this)**
+  _Justification:_ Understanding cache eviction rate helps tune cache size and routing policy.
+  _Approach:_ Query vLLM `/metrics` for `vllm:cache_evictions_total` or similar, add to benchmark report
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Low
+
+- [ ] **Document expected behavior when cache overflows**
+  _Justification:_ Operators need guidance on capacity planning and expected degradation.
+  _Location:_ `docs/benchmarks/benchmark-guide-8xA100.md`
+  _Complexity:_ Low
+
+### 9.3 Larger Models
+
+- [ ] **Update bench.sh to support tensor-parallel vLLM across multiple GPUs**
+  _Justification:_ 70B+ models require tensor parallelism. Current bench.sh assumes single-GPU vLLM instances.
+  _Approach:_ Add `--tensor-parallel N` flag, adjust vLLM launch command, GPU allocation logic
+  _Location:_ `scripts/bench.sh`
+  _Complexity:_ Medium
+
+- [ ] **Add recommended configurations for 70B (8x A100) and 405B (multi-node)**
+  _Justification:_ Users need reference configurations for large model deployments.
+  _Deliverables:_ Sample configs, memory requirements, expected TTFT ranges
+  _Location:_ `docs/benchmarks/benchmark-guide-8xA100.md`, `docs/benchmarks/benchmark-guide-405B.md` (new)
+  _Complexity:_ Medium
+
+- [ ] **Adjust expected TTFT thresholds based on model size**
+  _Justification:_ Current thresholds calibrated for 8B-13B models. Larger models have different latency profiles.
+  _Location:_ `tests/integration/locustfile_real.py`, benchmark documentation
+  _Complexity:_ Low
+
+- [ ] **Document memory requirements and GPU configurations**
+  _Justification:_ Operators need clear guidance on hardware requirements per model size.
+  _Location:_ `docs/deployment/hardware-requirements.md` (new)
+  _Complexity:_ Low
+
+### 9.4 Traffic Variability
+
+- [ ] **Add traffic shapes to locustfile: ramp-up, spikes, diurnal patterns**
+  _Justification:_ Real traffic is not steady-state. Bursty traffic tests cache warm-up and backpressure behavior.
+  _Approach:_ Custom `LoadTestShape` classes for different patterns
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add --traffic-pattern option (steady, bursty, ramp, spike)**
+  _Justification:_ CLI option to select traffic shape without code changes.
+  _Location:_ `scripts/bench.sh`, `tests/integration/locustfile_real.py`
+  _Complexity:_ Low
+
+- [ ] **Measure cold-start impact when traffic spikes after idle periods**
+  _Justification:_ Production systems experience traffic spikes after quiet periods. Cache is cold, need to measure warm-up time.
+  _Approach:_ Add idle period before spike, track cache hit rate over time, report warm-up duration
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add metrics for cache warm-up time and hit rate over time**
+  _Justification:_ Time-series cache metrics help operators understand warm-up behavior and set appropriate scaling policies.
+  _Approach:_ Periodic cache hit rate sampling (every 10s), export as CSV alongside benchmark report
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+### 9.5 Tokenizer Performance
+
+- [x] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator** ✓
+  _Justification:_ Cross-shard dispatch revealed memory allocation overhead in Rust tokenizer. jemalloc provides better performance for multi-threaded allocations and avoids glibc malloc contention.
+  _Approach:_ CMake and Dockerfile patches inject `tikv-jemallocator` into tokenizers-cpp Rust code. Gives Rust complete memory isolation from Seastar, eliminating allocator interaction bugs.
+  _Location:_ `CMakeLists.txt` (lines 158-214), `Dockerfile.base` (lines 59-82)
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-01 (PR #204)
+
+---
+
 ## Priority Matrix
 
 | Priority | Category | Item | Effort | Status |
@@ -1252,6 +1381,295 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
 | **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | |
 | **P3 - Low** | DX | Split config.hpp when >2000 LOC | Medium | |
+| **P2 - Medium** | Benchmark | Production prompt traces - trace format definition | Low | |
+| **P2 - Medium** | Benchmark | Production prompt traces - locustfile trace replay | Medium | |
+| **P2 - Medium** | Benchmark | Production prompt traces - anonymization tool | Medium | |
+| **P2 - Medium** | Benchmark | Cache pressure - unique prefixes option | Low | |
+| **P2 - Medium** | Benchmark | Cache pressure - cache-pressure distribution | Medium | |
+| **P3 - Low** | Benchmark | Cache pressure - eviction metrics | Low | |
+| **P2 - Medium** | Benchmark | Larger models - tensor-parallel vLLM support | Medium | |
+| **P2 - Medium** | Benchmark | Larger models - 70B/405B configurations | Medium | |
+| **P3 - Low** | Benchmark | Larger models - TTFT threshold adjustments | Low | |
+| **P2 - Medium** | Benchmark | Traffic variability - traffic shape classes | Medium | |
+| **P3 - Low** | Benchmark | Traffic variability - traffic pattern option | Low | |
+| **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
+| **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
+| **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | ✅ Done |
+| **P1 - High** | Performance | Load-aware prefix routing - backend load tracking | Medium | |
+| **P1 - High** | Performance | Load-aware prefix routing - load-aware selection | Medium | |
+| **P1 - High** | Performance | Load-aware prefix routing - metrics and config | Low | |
+
+---
+
+## 10. Load-Aware Prefix Routing
+
+> **Feature: Load-aware prefix routing to reduce queuing under heavy load**
+> Created: 2026-02-01
+> Priority: P1 - High
+> Labels: enhancement, routing, performance
+
+### 10.0 Problem Statement
+
+Current prefix-aware routing uses a simple `hash(prefix) → backend` mapping that doesn't consider backend load. Under heavy load, this causes request queuing on popular-prefix backends while other backends sit underutilized.
+
+**Current Behavior:**
+```
+Prefix A (popular) → GPU-1: [req1] [req2] [req3] [req4] [req5] ← queue builds
+Prefix B (rare)    → GPU-2: [req1]                             ← underutilized
+Prefix C (popular) → GPU-1: [req6] [req7]                      ← more queuing
+```
+
+**Target Behavior:**
+- When a backend's queue exceeds threshold, route new requests to less-loaded backends
+- Accept temporary cache miss to avoid latency spike from queuing
+- Maintain prefix affinity under normal load for KV cache reuse
+
+**Success Criteria:**
+- [ ] Heavy load (30 users) achieves >35% TTFT improvement (vs current 24%)
+- [ ] Normal load performance unchanged
+- [ ] Configurable thresholds for different workloads
+- [ ] Metrics exposed for observability
+
+### 10.1 Prerequisites
+
+- [ ] Review existing `ShardLoadMetrics` for patterns (already tracks per-shard active requests)
+- [ ] Verify `BackendInfo` struct extension is compatible with cluster gossip serialization
+- [ ] Confirm vLLM `/metrics` endpoint exposes queue depth (optional enhancement)
+
+### Implementation Steps
+
+#### Step 1: Add Per-Backend Load Tracking Infrastructure
+
+- **Files:**
+  - `src/router_service.cpp` (modify `BackendInfo` struct, add to `ShardLocalState`)
+  - `src/router_service.hpp` (add new types if needed for public API)
+- **Description:** Extend `BackendInfo` with atomic counters for in-flight requests. Add RAII guard class (`BackendRequestGuard`) for automatic increment/decrement. Track `active_requests` per backend across all shards.
+- **Details:**
+  ```cpp
+  // In BackendInfo struct
+  std::atomic<uint64_t> active_requests{0};  // In-flight requests to this backend
+
+  // RAII guard for tracking
+  class BackendRequestGuard {
+      BackendId _backend_id;
+  public:
+      explicit BackendRequestGuard(BackendId id);
+      ~BackendRequestGuard();
+  };
+  ```
+- **Concerns:**
+  - [ ] Uses `std::atomic<uint64_t>` with relaxed memory order (lock-free, Rule #1 compliant)
+  - [ ] Per-shard counters avoid cross-shard synchronization
+  - [ ] Must aggregate across shards for global view (use `smp::submit_to` for metrics collection)
+- **Status:** [ ] Pending
+
+#### Step 2: Integrate Load Tracking into Request Flow
+
+- **Files:**
+  - `src/http_controller.cpp` (create guard on backend selection, destroy on response complete)
+- **Description:** Instantiate `BackendRequestGuard` when request is dispatched to backend, destructor decrements when response completes (success or failure). Guard must survive SSE streaming duration.
+- **Details:**
+  - Create guard after `route_request()` returns a backend
+  - Store in request context (`CrossShardRequestContext` or local scope with `do_with`)
+  - Ensure proper cleanup on all exit paths (success, timeout, error)
+- **Concerns:**
+  - [ ] Guard lifetime spans entire request (including streaming)
+  - [ ] No new async flow - guard is synchronous RAII
+  - [ ] Handle cross-shard dispatch case (guard on dispatched shard, not originating shard)
+- **Status:** [ ] Pending
+
+#### Step 3: Add Load-Aware Configuration Options
+
+- **Files:**
+  - `src/config.hpp` (add to `RoutingConfig` struct)
+  - YAML schema documentation
+- **Description:** Add configuration parameters for load-aware routing thresholds.
+- **Details:**
+  ```cpp
+  // In RoutingConfig struct
+  bool load_aware_routing = true;              // Enable load-aware backend selection
+  uint64_t queue_depth_threshold = 4;          // Max in-flight before considering alternatives
+  uint64_t queue_diff_threshold = 2;           // Min difference to justify cache miss
+  double load_aware_headroom = 0.2;            // Prefer less-loaded if within 20% of preferred
+  ```
+- **Concerns:**
+  - [ ] Default values conservative (enabled but high thresholds)
+  - [ ] Hot-reload via `update_routing_config()` (existing pattern)
+  - [ ] Validation in config loading (sensible ranges)
+- **Status:** [ ] Pending
+
+#### Step 4: Implement Load-Aware Backend Selection
+
+- **Files:**
+  - `src/router_service.cpp` (modify `get_backend_for_prefix()`)
+- **Description:** Core algorithm: check preferred backend's load, fall back to least-loaded if threshold exceeded.
+- **Details:**
+  ```cpp
+  std::optional<BackendId> RouterService::get_backend_for_prefix(...) {
+      // ... existing ART lookup / hash fallback to get preferred_backend ...
+
+      if (!state.config.load_aware_routing) {
+          return preferred_backend;  // Disabled, use current behavior
+      }
+
+      uint64_t preferred_load = get_backend_load(preferred_backend);
+      if (preferred_load <= state.config.queue_depth_threshold) {
+          return preferred_backend;  // Normal prefix routing
+      }
+
+      // Backend overloaded - find alternative
+      auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
+
+      if (preferred_load - least_load > state.config.queue_diff_threshold) {
+          state.stats.cache_miss_due_to_load++;
+          return least_loaded_id;  // Accept cache miss to avoid queue
+      }
+
+      return preferred_backend;  // Difference not significant enough
+  }
+  ```
+- **Concerns:**
+  - [ ] `get_backend_load()` reads local shard's counter only (no cross-shard query in hot path)
+  - [ ] `get_least_loaded_backend()` iterates `live_backends` vector (O(n) but n is small, typically <10)
+  - [ ] No new containers (operates on existing `live_backends`)
+  - [ ] Maintains sorted determinism for backends with equal load
+- **Status:** [ ] Pending
+
+**Mermaid Diagram - Load-Aware Selection Flow:**
+```mermaid
+flowchart TD
+    A[route_request] --> B{ART lookup}
+    B -->|hit| C[preferred = ART result]
+    B -->|miss| D[preferred = hash fallback]
+    C --> E{load_aware_routing?}
+    D --> E
+    E -->|no| F[return preferred]
+    E -->|yes| G{preferred.load <= threshold?}
+    G -->|yes| F
+    G -->|no| H[find least_loaded backend]
+    H --> I{load_diff > diff_threshold?}
+    I -->|yes| J[stats.cache_miss_due_to_load++]
+    J --> K[return least_loaded]
+    I -->|no| F
+```
+
+#### Step 5: Add Prometheus Metrics for Observability
+
+- **Files:**
+  - `src/metrics_service.hpp` (add gauge/counter definitions)
+  - `src/router_service.cpp` (register metrics in constructor)
+- **Description:** Expose load-aware routing metrics for monitoring and tuning.
+- **Details:**
+  ```cpp
+  // Counters
+  ranvier_routing_cache_miss_due_to_load_total    // Times we skipped cache for load
+  ranvier_routing_load_aware_decisions_total      // Load-aware routing activations
+  ranvier_routing_load_aware_fallbacks_total      // Times fallback to least-loaded
+
+  // Gauges (per-backend)
+  ranvier_backend_active_requests{backend_id="N"} // Current in-flight requests
+  ranvier_backend_queue_depth{backend_id="N"}     // Alias/same as above
+  ```
+- **Concerns:**
+  - [ ] Per-backend gauges need bounded registry (Rule #4: MAX_TRACKED_BACKENDS exists)
+  - [ ] Metrics lambdas must be deregistered in `stop()` (Rule #6)
+  - [ ] Use relaxed memory order for metric reads
+- **Status:** [ ] Pending
+
+#### Step 6: Unit Tests for Load-Aware Routing Logic
+
+- **Files:**
+  - `tests/unit/load_aware_routing_test.cpp` (new)
+- **Description:** Test load-aware routing decisions in isolation.
+- **Test Cases:**
+  1. Load below threshold → returns preferred backend
+  2. Load above threshold, no alternative → returns preferred
+  3. Load above threshold, alternative available → returns least-loaded
+  4. Load difference below diff_threshold → returns preferred (marginal improvement)
+  5. Multiple backends at same load → deterministic selection (sorted order)
+  6. Backend goes from overloaded to normal → routing recovers
+  7. Config disabled → always returns preferred
+- **Concerns:**
+  - [ ] Use `reset_shard_state_for_testing()` between tests
+  - [ ] Mock backend load values directly
+- **Status:** [ ] Pending
+
+#### Step 7: Integration Test for Heavy Load Behavior
+
+- **Files:**
+  - `tests/integration/test_load_aware_routing.py` (new)
+- **Description:** E2E test validating TTFT improvement under heavy load.
+- **Test Cases:**
+  1. Baseline: disabled load-aware routing, measure TTFT under 30 users
+  2. Enabled: load-aware routing, measure TTFT under 30 users
+  3. Verify metrics `cache_miss_due_to_load` increments when expected
+  4. Verify per-backend `active_requests` gauge reflects actual load
+  5. Verify normal load (5 users) shows no routing changes
+- **Concerns:**
+  - [ ] Requires multi-backend test setup (at least 2 vLLM instances)
+  - [ ] May need mock backends for deterministic load control
+  - [ ] Use Locust or similar for concurrent load generation
+- **Status:** [ ] Pending
+
+#### Step 8: Documentation Updates
+
+- **Files:**
+  - `docs/internals/prefix-affinity-routing.md` (update with load-aware section)
+  - `docs/configuration.md` (add new config options)
+- **Description:** Document the load-aware routing feature, configuration, and operational guidance.
+- **Contents:**
+  - Feature overview and motivation
+  - Configuration options with recommended values
+  - Metrics explanation and alerting guidance
+  - Trade-offs: cache hit rate vs latency under load
+  - Tuning guide for different workloads
+- **Status:** [ ] Pending
+
+### 10.2 Dependency Graph
+
+```
+Step 1 (Load Tracking) ─┬─► Step 2 (Request Flow Integration)
+                        │
+                        └─► Step 4 (Load-Aware Selection)
+                                    │
+Step 3 (Config) ────────────────────┘
+                                    │
+                                    ├─► Step 5 (Metrics)
+                                    │
+                                    └─► Step 6 (Unit Tests) ──► Step 7 (Integration Tests)
+
+Step 8 (Documentation) - can proceed in parallel
+```
+
+### 10.3 Architectural Concerns Summary
+
+| Step | Cross-Shard Communication | New Async Flow | New Container | Timer/Callback |
+|------|---------------------------|----------------|---------------|----------------|
+| 1    | No (per-shard atomics)    | No             | No (extends BackendInfo) | No |
+| 2    | Maybe (cross-shard dispatch) | No (RAII guard) | No           | No |
+| 3    | No                        | No             | No            | No |
+| 4    | No (shard-local reads)    | No             | No            | No |
+| 5    | Yes (`smp::submit_to` for aggregate metrics) | No | No (uses existing) | No |
+| 6    | N/A (test)                | N/A            | N/A           | N/A |
+| 7    | N/A (test)                | N/A            | N/A           | N/A |
+| 8    | N/A (docs)                | N/A            | N/A           | N/A |
+
+### 10.4 Post-Implementation Checklist
+
+- [ ] Run `validation/validate_v1.sh` (reactor stall detection)
+- [ ] Run `tests/integration/test_load_aware_routing.py`
+- [ ] Run benchmark: `scripts/bench.sh --users 30` (verify >35% TTFT improvement)
+- [ ] Update BACKLOG.md with completion status
+- [ ] Consider follow-up: hot prefix replication (Option 2 from issue)
+
+### 10.5 Future Extensions (Out of Scope)
+
+These are NOT part of this implementation but documented for future reference:
+
+1. **Option 2: Prefix Replication** - Learn hot prefixes on multiple backends, load-balance between them
+2. **Option 3: Adaptive Mode** - Simple threshold-based fallback to round-robin under system-wide heavy load
+3. **vLLM Queue Polling** - Query vLLM `/metrics` for actual inference queue depth (more accurate than in-flight count)
+4. **Latency-Based Estimation** - Infer queue depth from recent response times
 
 ---
 

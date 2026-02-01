@@ -547,6 +547,12 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         if json_stats.get("failed_requests") is not None and results.failed_requests == 0:
             results.failed_requests = json_stats["failed_requests"]
 
+        # Incomplete requests (always from JSON, not in Locust aggregated stats)
+        if json_stats.get("incomplete_requests") is not None:
+            results.incomplete_requests = json_stats["incomplete_requests"]
+        if json_stats.get("incomplete_rate_pct") is not None:
+            results.incomplete_rate_pct = json_stats["incomplete_rate_pct"]
+
         # Recalculate failure rate if we have valid counts but rate is 0
         if results.total_requests > 0 and results.failure_rate_pct == 0.0 and results.failed_requests > 0:
             results.failure_rate_pct = (results.failed_requests / results.total_requests) * 100

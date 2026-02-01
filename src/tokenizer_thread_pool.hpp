@@ -104,7 +104,11 @@ struct TokenizationJobResult {
  * Memory safety:
  * - Job text is copied into queue (owned string)
  * - Results are copied back via alien::run_on()
- * - Worker thread uses default allocator (not Seastar's per-shard allocator)
+ * - IMPORTANT: Seastar replaces malloc globally, so worker threads DO use
+ *   Seastar's allocator (allocations tracked as foreign_mallocs). To avoid
+ *   memory corruption from do_foreign_free:
+ *   1. Input: Reallocate strings locally before FFI (process_job local_text)
+ *   2. Output: Reallocate tokens on reactor in alien::run_on callback
  *
  * Lifecycle:
  * - start() spawns the worker thread
