@@ -525,7 +525,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 |-------|-------|-------------|------------|-----------|-------------|
 | 1B | 30 | XLarge (4-8K tokens) | ~130ms | ~130ms | **~0%** |
 | 8B | 30 | XLarge (4-8K tokens) | ~655ms | ~499ms | **~26%** |
-| 8B | 20 | XLarge (4-8K tokens) | ~600ms | ~336ms | **~44%** |
+| 8B | 20 | XLarge (4-8K tokens) | ~804ms | ~453ms | **~44%** |
 | 8B | 10 | XLarge (4-8K tokens) | ~580ms | ~333ms | **~43%** |
 | **13B** | 30 | XLarge (4-8K tokens) | ~1800ms | ~1030ms | **~43%** |
 | **13B** | 20 | XLarge (4-8K tokens) | ~1451ms | ~886ms | **~39%** |
@@ -606,7 +606,7 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 | **CodeLlama-13b** | Moderate | 20 | 30m | **38.9%** | 97.6% |
 | **CodeLlama-13b** | Normal | 10 | 10m | **48.2%** | 96.4% |
 | CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% |
-| Llama-3.1-8B | Moderate | 20 | 10m | 44.0% | 97.4% |
+| Llama-3.1-8B | Moderate | 20 | 30m | 43.7% | 97.8% |
 | Llama-3.1-8B | Normal | 10 | 10m | 42.7% | 95.6% |
 | Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% |
 
