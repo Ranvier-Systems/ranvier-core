@@ -626,6 +626,19 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 - **Throughput increases** ~28% with prefix-aware routing under load
 - **Cache hit rate** is excellent (97%+) regardless of load or model size
 
+#### Impact of Prefix Sharing Ratio
+
+Not all workloads have 90% prefix sharing. This test shows improvement at 70% sharing:
+
+| Prefix Ratio | Cache Hit Rate | XLarge Improvement | Notes |
+|--------------|----------------|-------------------|-------|
+| 0.9 (90%) | 97.6% | 38.9% | High sharing (single system prompt) |
+| 0.7 (70%) | 93.2% | 41.5% | Moderate sharing (multiple system prompts) |
+
+**Key finding:** Improvement holds up well at lower prefix ratios. The 70% test actually shows *higher* improvement (41.5% vs 38.9%) because the system was less loaded (0% incomplete rate vs 29% at 0.9 ratio).
+
+This demonstrates prefix-aware routing benefits workloads even when prefix sharing is moderate—you don't need 90%+ sharing to see real gains.
+
 ---
 
 ## Cleanup & Restarts
