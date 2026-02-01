@@ -2099,13 +2099,97 @@ class _FilePromptsProxy:
 _file_prompts = _FilePromptsProxy()
 
 
+# ============================================================================
+# FNV-1a Hash for Backend Prediction
+# ============================================================================
+# Replicates Ranvier's hash_prefix() logic from src/router_service.cpp
+# Used to predict backend routing when X-Backend-ID header is missing
+
+FNV_OFFSET_BASIS = 14695981039346656037
+FNV_PRIME = 1099511628211
+DEFAULT_BLOCK_ALIGNMENT = 16
+DEFAULT_PREFIX_TOKEN_LENGTH = 128
+
+
+def fnv1a_hash_tokens(token_ids: List[int], prefix_len: int,
+                      block_alignment: int = DEFAULT_BLOCK_ALIGNMENT) -> int:
+    """Compute FNV-1a hash on prefix tokens, matching Ranvier's hash_prefix().
+
+    This replicates the exact hash computation from src/router_service.cpp:244
+    to predict which backend the server would route to.
+
+    Args:
+        token_ids: List of token IDs (int32)
+        prefix_len: Number of tokens to hash
+        block_alignment: Align to this boundary (default: 16, matches server)
+
+    Returns:
+        64-bit hash value
+    """
+    import struct
+
+    # Align to block_alignment boundary (matches server logic)
+    aligned_len = (prefix_len // block_alignment) * block_alignment
+    if aligned_len == 0:
+        aligned_len = prefix_len
+
+    # Clamp to actual token count
+    aligned_len = min(aligned_len, len(token_ids))
+    if aligned_len == 0:
+        return FNV_OFFSET_BASIS
+
+    # Convert tokens to bytes (int32, little-endian to match x86)
+    token_bytes = b''.join(struct.pack('<i', t) for t in token_ids[:aligned_len])
+
+    # FNV-1a hash
+    hash_val = FNV_OFFSET_BASIS
+    for byte in token_bytes:
+        hash_val ^= byte
+        hash_val *= FNV_PRIME
+        hash_val &= 0xFFFFFFFFFFFFFFFF  # Keep 64-bit
+
+    return hash_val
+
+
+def predict_backend_from_hash(token_ids: List[int], num_backends: int,
+                              prefix_token_count: Optional[int] = None) -> int:
+    """Predict which backend the server would route to using consistent hash.
+
+    This replicates Ranvier's hash fallback logic for when X-Backend-ID is missing.
+    Only accurate when BENCHMARK_MODE is 'prefix' or 'hash' (not 'random').
+
+    Args:
+        token_ids: Full list of token IDs for the request
+        num_backends: Number of registered backends
+        prefix_token_count: Optional prefix boundary (e.g., system message token count).
+                           If provided, hash is computed on tokens[0:prefix_token_count].
+                           Otherwise, uses DEFAULT_PREFIX_TOKEN_LENGTH (128).
+
+    Returns:
+        Predicted backend ID (1-indexed)
+    """
+    if not token_ids or num_backends <= 0:
+        return 1  # Fallback to first backend
+
+    # Determine prefix length (matches server logic in get_backend_for_prefix)
+    if prefix_token_count and prefix_token_count > 0:
+        prefix_len = min(prefix_token_count, len(token_ids))
+    else:
+        prefix_len = min(DEFAULT_PREFIX_TOKEN_LENGTH, len(token_ids))
+
+    prefix_hash = fnv1a_hash_tokens(token_ids, prefix_len)
+    return (prefix_hash % num_backends) + 1  # Backend IDs are 1-indexed
+
+
 def estimate_tokens(text: str) -> int:
     """Estimate token count from text length.
 
-    Rough estimation: ~4 characters per token on average.
-    This is a simplification; real tokenization varies by model.
+    Uses 3.5 chars/token as a balanced approximation for mixed content:
+    - Pure English prose: ~4.5 chars/token
+    - Code/technical docs: ~3.0 chars/token
+    - Mixed (RAG docs): ~3.5 chars/token
     """
-    return len(text) // 4
+    return max(1, int(len(text) / 3.5))
 
 
 def generate_large_prefix(
@@ -2292,7 +2376,8 @@ class BenchmarkStats:
                 self.requests_by_bucket[bucket] += 1
 
             # Track cache hits based on prefix routing
-            if metrics.prompt_prefix_hash:
+            # Skip cache tracking if backend_id is unknown (can't determine hit/miss)
+            if metrics.prompt_prefix_hash and metrics.backend_id is not None:
                 expected_backend = self.prefix_to_backend.get(metrics.prompt_prefix_hash)
 
                 if expected_backend is None:
@@ -2394,12 +2479,24 @@ class BenchmarkStats:
             return summary
 
     def _percentile(self, data: List[float], p: float) -> Optional[float]:
-        """Calculate percentile of data."""
+        """Calculate percentile using linear interpolation (matches numpy).
+
+        For P99 with 100 samples: (100-1) * 0.99 = 98.01 -> interpolate between index 98 and 99
+        This avoids the issue where int() truncation returns the max value for P99.
+        """
         if not data:
             return None
         sorted_data = sorted(data)
-        idx = int(len(sorted_data) * p)
-        return sorted_data[min(idx, len(sorted_data) - 1)]
+        n = len(sorted_data)
+
+        # Calculate interpolated index
+        idx = (n - 1) * p
+        lower = int(idx)
+        upper = min(lower + 1, n - 1)
+
+        # Linear interpolation between adjacent values
+        weight = idx - lower
+        return sorted_data[lower] * (1 - weight) + sorted_data[upper] * weight
 
     def _calculate_improvement(self, baseline: Optional[float], improved: Optional[float]) -> Optional[float]:
         """Calculate percentage improvement (positive = faster)."""
@@ -3394,11 +3491,23 @@ class RealBackendUser(HttpUser):
                 if SINGLE_BACKEND_MODE:
                     # Single backend mode: all requests go to backend 1
                     metrics.backend_id = "1"
+                elif BENCHMARK_MODE == "random":
+                    # Random mode: can't predict backend - exclude from cache tracking
+                    logger.warning("X-Backend-ID header missing in random mode - "
+                                  "excluding from cache hit tracking")
+                    # metrics.backend_id remains None
+                elif token_ids is not None:
+                    # CLIENT_TOKENIZE enabled - predict backend using hash
+                    # This replicates Ranvier's consistent hash fallback logic
+                    ptc = request_body.get("prefix_token_count")
+                    predicted = predict_backend_from_hash(token_ids, NUM_BACKENDS, ptc)
+                    metrics.backend_id = str(predicted)
+                    logger.debug(f"X-Backend-ID missing - predicted backend {predicted} from hash")
                 else:
-                    # Fallback: infer from node index (inaccurate for prefix routing)
-                    # This means X-Backend-ID header is missing - cache tracking will be wrong
-                    logger.warning("X-Backend-ID header missing - cache tracking may be inaccurate")
-                    metrics.backend_id = str((node_index % len(BACKENDS)) + 1)
+                    # No tokens available (CLIENT_TOKENIZE disabled) - can't predict
+                    logger.warning("X-Backend-ID header missing and CLIENT_TOKENIZE disabled - "
+                                  "excluding from cache hit tracking")
+                    # metrics.backend_id remains None
 
             if resp.status_code != 200:
                 events.request.fire(
