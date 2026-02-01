@@ -19,6 +19,7 @@ This document identifies missing features and optimizations required to promote 
 7. [Security Audit Findings](#7-security-audit-findings-adversarial-system-audit)
 8. [Strategic Assessment (2026-01-19)](#8-strategic-assessment-2026-01-19)
 9. [Benchmark Extensions](#9-benchmark-extensions)
+10. [Load-Aware Prefix Routing](#10-load-aware-prefix-routing)
 
 ---
 
@@ -1394,6 +1395,281 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
 | **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
 | **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | ✅ Done |
+| **P1 - High** | Performance | Load-aware prefix routing - backend load tracking | Medium | |
+| **P1 - High** | Performance | Load-aware prefix routing - load-aware selection | Medium | |
+| **P1 - High** | Performance | Load-aware prefix routing - metrics and config | Low | |
+
+---
+
+## 10. Load-Aware Prefix Routing
+
+> **Feature: Load-aware prefix routing to reduce queuing under heavy load**
+> Created: 2026-02-01
+> Priority: P1 - High
+> Labels: enhancement, routing, performance
+
+### 10.0 Problem Statement
+
+Current prefix-aware routing uses a simple `hash(prefix) → backend` mapping that doesn't consider backend load. Under heavy load, this causes request queuing on popular-prefix backends while other backends sit underutilized.
+
+**Current Behavior:**
+```
+Prefix A (popular) → GPU-1: [req1] [req2] [req3] [req4] [req5] ← queue builds
+Prefix B (rare)    → GPU-2: [req1]                             ← underutilized
+Prefix C (popular) → GPU-1: [req6] [req7]                      ← more queuing
+```
+
+**Target Behavior:**
+- When a backend's queue exceeds threshold, route new requests to less-loaded backends
+- Accept temporary cache miss to avoid latency spike from queuing
+- Maintain prefix affinity under normal load for KV cache reuse
+
+**Success Criteria:**
+- [ ] Heavy load (30 users) achieves >35% TTFT improvement (vs current 24%)
+- [ ] Normal load performance unchanged
+- [ ] Configurable thresholds for different workloads
+- [ ] Metrics exposed for observability
+
+### 10.1 Prerequisites
+
+- [ ] Review existing `ShardLoadMetrics` for patterns (already tracks per-shard active requests)
+- [ ] Verify `BackendInfo` struct extension is compatible with cluster gossip serialization
+- [ ] Confirm vLLM `/metrics` endpoint exposes queue depth (optional enhancement)
+
+### Implementation Steps
+
+#### Step 1: Add Per-Backend Load Tracking Infrastructure
+
+- **Files:**
+  - `src/router_service.cpp` (modify `BackendInfo` struct, add to `ShardLocalState`)
+  - `src/router_service.hpp` (add new types if needed for public API)
+- **Description:** Extend `BackendInfo` with atomic counters for in-flight requests. Add RAII guard class (`BackendRequestGuard`) for automatic increment/decrement. Track `active_requests` per backend across all shards.
+- **Details:**
+  ```cpp
+  // In BackendInfo struct
+  std::atomic<uint64_t> active_requests{0};  // In-flight requests to this backend
+
+  // RAII guard for tracking
+  class BackendRequestGuard {
+      BackendId _backend_id;
+  public:
+      explicit BackendRequestGuard(BackendId id);
+      ~BackendRequestGuard();
+  };
+  ```
+- **Concerns:**
+  - [ ] Uses `std::atomic<uint64_t>` with relaxed memory order (lock-free, Rule #1 compliant)
+  - [ ] Per-shard counters avoid cross-shard synchronization
+  - [ ] Must aggregate across shards for global view (use `smp::submit_to` for metrics collection)
+- **Status:** [ ] Pending
+
+#### Step 2: Integrate Load Tracking into Request Flow
+
+- **Files:**
+  - `src/http_controller.cpp` (create guard on backend selection, destroy on response complete)
+- **Description:** Instantiate `BackendRequestGuard` when request is dispatched to backend, destructor decrements when response completes (success or failure). Guard must survive SSE streaming duration.
+- **Details:**
+  - Create guard after `route_request()` returns a backend
+  - Store in request context (`CrossShardRequestContext` or local scope with `do_with`)
+  - Ensure proper cleanup on all exit paths (success, timeout, error)
+- **Concerns:**
+  - [ ] Guard lifetime spans entire request (including streaming)
+  - [ ] No new async flow - guard is synchronous RAII
+  - [ ] Handle cross-shard dispatch case (guard on dispatched shard, not originating shard)
+- **Status:** [ ] Pending
+
+#### Step 3: Add Load-Aware Configuration Options
+
+- **Files:**
+  - `src/config.hpp` (add to `RoutingConfig` struct)
+  - YAML schema documentation
+- **Description:** Add configuration parameters for load-aware routing thresholds.
+- **Details:**
+  ```cpp
+  // In RoutingConfig struct
+  bool load_aware_routing = true;              // Enable load-aware backend selection
+  uint64_t queue_depth_threshold = 4;          // Max in-flight before considering alternatives
+  uint64_t queue_diff_threshold = 2;           // Min difference to justify cache miss
+  double load_aware_headroom = 0.2;            // Prefer less-loaded if within 20% of preferred
+  ```
+- **Concerns:**
+  - [ ] Default values conservative (enabled but high thresholds)
+  - [ ] Hot-reload via `update_routing_config()` (existing pattern)
+  - [ ] Validation in config loading (sensible ranges)
+- **Status:** [ ] Pending
+
+#### Step 4: Implement Load-Aware Backend Selection
+
+- **Files:**
+  - `src/router_service.cpp` (modify `get_backend_for_prefix()`)
+- **Description:** Core algorithm: check preferred backend's load, fall back to least-loaded if threshold exceeded.
+- **Details:**
+  ```cpp
+  std::optional<BackendId> RouterService::get_backend_for_prefix(...) {
+      // ... existing ART lookup / hash fallback to get preferred_backend ...
+
+      if (!state.config.load_aware_routing) {
+          return preferred_backend;  // Disabled, use current behavior
+      }
+
+      uint64_t preferred_load = get_backend_load(preferred_backend);
+      if (preferred_load <= state.config.queue_depth_threshold) {
+          return preferred_backend;  // Normal prefix routing
+      }
+
+      // Backend overloaded - find alternative
+      auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
+
+      if (preferred_load - least_load > state.config.queue_diff_threshold) {
+          state.stats.cache_miss_due_to_load++;
+          return least_loaded_id;  // Accept cache miss to avoid queue
+      }
+
+      return preferred_backend;  // Difference not significant enough
+  }
+  ```
+- **Concerns:**
+  - [ ] `get_backend_load()` reads local shard's counter only (no cross-shard query in hot path)
+  - [ ] `get_least_loaded_backend()` iterates `live_backends` vector (O(n) but n is small, typically <10)
+  - [ ] No new containers (operates on existing `live_backends`)
+  - [ ] Maintains sorted determinism for backends with equal load
+- **Status:** [ ] Pending
+
+**Mermaid Diagram - Load-Aware Selection Flow:**
+```mermaid
+flowchart TD
+    A[route_request] --> B{ART lookup}
+    B -->|hit| C[preferred = ART result]
+    B -->|miss| D[preferred = hash fallback]
+    C --> E{load_aware_routing?}
+    D --> E
+    E -->|no| F[return preferred]
+    E -->|yes| G{preferred.load <= threshold?}
+    G -->|yes| F
+    G -->|no| H[find least_loaded backend]
+    H --> I{load_diff > diff_threshold?}
+    I -->|yes| J[stats.cache_miss_due_to_load++]
+    J --> K[return least_loaded]
+    I -->|no| F
+```
+
+#### Step 5: Add Prometheus Metrics for Observability
+
+- **Files:**
+  - `src/metrics_service.hpp` (add gauge/counter definitions)
+  - `src/router_service.cpp` (register metrics in constructor)
+- **Description:** Expose load-aware routing metrics for monitoring and tuning.
+- **Details:**
+  ```cpp
+  // Counters
+  ranvier_routing_cache_miss_due_to_load_total    // Times we skipped cache for load
+  ranvier_routing_load_aware_decisions_total      // Load-aware routing activations
+  ranvier_routing_load_aware_fallbacks_total      // Times fallback to least-loaded
+
+  // Gauges (per-backend)
+  ranvier_backend_active_requests{backend_id="N"} // Current in-flight requests
+  ranvier_backend_queue_depth{backend_id="N"}     // Alias/same as above
+  ```
+- **Concerns:**
+  - [ ] Per-backend gauges need bounded registry (Rule #4: MAX_TRACKED_BACKENDS exists)
+  - [ ] Metrics lambdas must be deregistered in `stop()` (Rule #6)
+  - [ ] Use relaxed memory order for metric reads
+- **Status:** [ ] Pending
+
+#### Step 6: Unit Tests for Load-Aware Routing Logic
+
+- **Files:**
+  - `tests/unit/load_aware_routing_test.cpp` (new)
+- **Description:** Test load-aware routing decisions in isolation.
+- **Test Cases:**
+  1. Load below threshold → returns preferred backend
+  2. Load above threshold, no alternative → returns preferred
+  3. Load above threshold, alternative available → returns least-loaded
+  4. Load difference below diff_threshold → returns preferred (marginal improvement)
+  5. Multiple backends at same load → deterministic selection (sorted order)
+  6. Backend goes from overloaded to normal → routing recovers
+  7. Config disabled → always returns preferred
+- **Concerns:**
+  - [ ] Use `reset_shard_state_for_testing()` between tests
+  - [ ] Mock backend load values directly
+- **Status:** [ ] Pending
+
+#### Step 7: Integration Test for Heavy Load Behavior
+
+- **Files:**
+  - `tests/integration/test_load_aware_routing.py` (new)
+- **Description:** E2E test validating TTFT improvement under heavy load.
+- **Test Cases:**
+  1. Baseline: disabled load-aware routing, measure TTFT under 30 users
+  2. Enabled: load-aware routing, measure TTFT under 30 users
+  3. Verify metrics `cache_miss_due_to_load` increments when expected
+  4. Verify per-backend `active_requests` gauge reflects actual load
+  5. Verify normal load (5 users) shows no routing changes
+- **Concerns:**
+  - [ ] Requires multi-backend test setup (at least 2 vLLM instances)
+  - [ ] May need mock backends for deterministic load control
+  - [ ] Use Locust or similar for concurrent load generation
+- **Status:** [ ] Pending
+
+#### Step 8: Documentation Updates
+
+- **Files:**
+  - `docs/internals/prefix-affinity-routing.md` (update with load-aware section)
+  - `docs/configuration.md` (add new config options)
+- **Description:** Document the load-aware routing feature, configuration, and operational guidance.
+- **Contents:**
+  - Feature overview and motivation
+  - Configuration options with recommended values
+  - Metrics explanation and alerting guidance
+  - Trade-offs: cache hit rate vs latency under load
+  - Tuning guide for different workloads
+- **Status:** [ ] Pending
+
+### 10.2 Dependency Graph
+
+```
+Step 1 (Load Tracking) ─┬─► Step 2 (Request Flow Integration)
+                        │
+                        └─► Step 4 (Load-Aware Selection)
+                                    │
+Step 3 (Config) ────────────────────┘
+                                    │
+                                    ├─► Step 5 (Metrics)
+                                    │
+                                    └─► Step 6 (Unit Tests) ──► Step 7 (Integration Tests)
+
+Step 8 (Documentation) - can proceed in parallel
+```
+
+### 10.3 Architectural Concerns Summary
+
+| Step | Cross-Shard Communication | New Async Flow | New Container | Timer/Callback |
+|------|---------------------------|----------------|---------------|----------------|
+| 1    | No (per-shard atomics)    | No             | No (extends BackendInfo) | No |
+| 2    | Maybe (cross-shard dispatch) | No (RAII guard) | No           | No |
+| 3    | No                        | No             | No            | No |
+| 4    | No (shard-local reads)    | No             | No            | No |
+| 5    | Yes (`smp::submit_to` for aggregate metrics) | No | No (uses existing) | No |
+| 6    | N/A (test)                | N/A            | N/A           | N/A |
+| 7    | N/A (test)                | N/A            | N/A           | N/A |
+| 8    | N/A (docs)                | N/A            | N/A           | N/A |
+
+### 10.4 Post-Implementation Checklist
+
+- [ ] Run `validation/validate_v1.sh` (reactor stall detection)
+- [ ] Run `tests/integration/test_load_aware_routing.py`
+- [ ] Run benchmark: `scripts/bench.sh --users 30` (verify >35% TTFT improvement)
+- [ ] Update BACKLOG.md with completion status
+- [ ] Consider follow-up: hot prefix replication (Option 2 from issue)
+
+### 10.5 Future Extensions (Out of Scope)
+
+These are NOT part of this implementation but documented for future reference:
+
+1. **Option 2: Prefix Replication** - Learn hot prefixes on multiple backends, load-balance between them
+2. **Option 3: Adaptive Mode** - Simple threshold-based fallback to round-robin under system-wide heavy load
+3. **vLLM Queue Polling** - Query vLLM `/metrics` for actual inference queue depth (more accurate than in-flight count)
+4. **Latency-Based Estimation** - Infer queue depth from recent response times
 
 ---
 
