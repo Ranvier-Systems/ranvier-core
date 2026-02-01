@@ -628,14 +628,15 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Impact of Prefix Sharing Ratio
 
-Not all workloads have 90% prefix sharing. This test shows improvement at 70% sharing:
+Not all workloads have 90% prefix sharing. These tests show how improvement scales:
 
-| Prefix Ratio | Cache Hit Rate | XLarge Improvement | Notes |
-|--------------|----------------|-------------------|-------|
-| 0.9 (90%) | 97.6% | 38.9% | High sharing (single system prompt) |
-| 0.7 (70%) | 93.2% | 41.5% | Moderate sharing (multiple system prompts) |
+| Prefix Ratio | Cache Hit Rate | XLarge Improvement | P99 TTFT | Notes |
+|--------------|----------------|-------------------|----------|-------|
+| 0.9 (90%) | 97.6% | 38.9% | 1200ms | High sharing (single system prompt) |
+| 0.7 (70%) | 93.2% | 41.5% | — | Moderate sharing |
+| 0.5 (50%) | 89.9% | 40.9% | 970ms | Low sharing (many system prompts) |
 
-**Key finding:** Improvement holds up well at lower prefix ratios. The 70% test actually shows *higher* improvement (41.5% vs 38.9%) because the system was less loaded (0% incomplete rate vs 29% at 0.9 ratio).
+**Key finding:** Improvement holds up remarkably well across prefix ratios. Even at 50% sharing, the system delivers 90% cache hit rate and 41% XLarge improvement. The 0.5 and 0.7 tests show *higher* improvement than 0.9 because they had 0% incomplete rate (less system load).
 
 This demonstrates prefix-aware routing benefits workloads even when prefix sharing is moderate—you don't need 90%+ sharing to see real gains.
 
