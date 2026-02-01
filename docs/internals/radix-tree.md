@@ -55,33 +55,46 @@ flowchart TB
 ### Source Location
 
 ```
-src/radix_tree.hpp    # Complete implementation (~820 lines)
+src/radix_tree.hpp    # Complete implementation (~1600 lines)
+src/node_slab.hpp     # Slab allocator interface and NodePtr type alias
+src/node_slab.cpp     # Slab allocator implementation
 src/router_service.cpp # Integration with Seastar shards
 ```
 
-### Ownership Model: `unique_ptr` for Seastar
+### Ownership Model: `NodePtr` with Slab Allocator
 
-The RadixTree uses `std::unique_ptr<Node>` for all child ownership, optimized for Seastar's shared-nothing architecture:
-
-| Aspect | `shared_ptr` (Before) | `unique_ptr` (After) |
-|--------|----------------------|---------------------|
-| **Reference counting** | Atomic `lock xadd` per copy | None |
-| **Memory overhead** | +16 bytes control block | 0 bytes |
-| **Thread safety** | Required for cross-thread | Not needed (thread-local) |
-| **Ownership model** | Shared, unclear lifetime | Exclusive, clear hierarchy |
-
-**Why `unique_ptr` fits Seastar:**
-
-1. **Thread-local trees**: Each Seastar shard has its own `RadixTree` instance. Nodes are never shared across threads.
-
-2. **No atomic overhead**: `shared_ptr` uses atomic reference counting (`lock xadd` on x86), adding ~20 cycles per copy/destroy. With `unique_ptr`, ownership transfer is a simple pointer swap.
-
-3. **Clear ownership hierarchy**: Parent nodes exclusively own their children. When a parent is destroyed, children are automatically cleaned up.
-
-4. **Move semantics for mutations**: Node growth and splitting use `std::move()` to transfer ownership without copying:
+The RadixTree uses `NodePtr` for all child ownership—a `std::unique_ptr` with a custom deleter that returns memory to the slab allocator:
 
 ```cpp
-// Growth: move ownership to new parent
+// Defined in node_slab.hpp
+using NodePtr = std::unique_ptr<Node, SlabNodeDeleter>;
+```
+
+This design optimizes for Seastar's shared-nothing architecture while providing O(1) allocation/deallocation:
+
+| Aspect | `shared_ptr` | `NodePtr` (Current) |
+|--------|-------------|---------------------|
+| **Reference counting** | Atomic `lock xadd` per copy | None |
+| **Memory overhead** | +16 bytes control block | +8 bytes SlabHeader |
+| **Allocation cost** | `malloc()` per node | O(1) free-list pop |
+| **Deallocation cost** | `free()` per node | O(1) free-list push |
+| **Thread safety** | Required for cross-thread | Not needed (thread-local slab) |
+| **Ownership model** | Shared, unclear lifetime | Exclusive, clear hierarchy |
+
+**Why `NodePtr` with custom deleter:**
+
+1. **Thread-local trees**: Each Seastar shard has its own `RadixTree` instance and `NodeSlab`. Nodes are never shared across threads.
+
+2. **O(1) memory operations**: The `SlabNodeDeleter` returns memory to the slab's intrusive free list instead of calling `delete`, eliminating heap operations on hot paths.
+
+3. **No atomic overhead**: Unlike `shared_ptr`, ownership transfer is a simple pointer swap with no atomic reference counting.
+
+4. **Clear ownership hierarchy**: Parent nodes exclusively own their children. When a parent is destroyed, children are automatically cleaned up via the custom deleter.
+
+5. **Move semantics for mutations**: Node growth and splitting use `std::move()` to transfer ownership without copying:
+
+```cpp
+// Growth: move ownership to new parent (slab-allocated)
 n16->children.push_back(std::move(child));
 
 // Splitting: extract child ownership temporarily
@@ -89,7 +102,7 @@ auto extracted = extract_child(node, key);
 add_child(new_parent, key, std::move(extracted));
 ```
 
-**Raw pointers for traversal**: `find_child()` returns raw `Node*` for read-only traversal. The parent's `unique_ptr` maintains ownership throughout.
+**Raw pointers for traversal**: `find_child()` returns raw `Node*` for read-only traversal. The parent's `NodePtr` maintains ownership throughout.
 
 ### Slab Allocator: O(1) Node Allocation
 
@@ -100,8 +113,9 @@ The `NodeSlab` class provides a custom slab allocator for RadixTree nodes, elimi
 │                              2MB Chunk (Node4 Pool)                        │
 ├────────┬────────┬────────┬────────┬────────┬────────┬────────┬─────────────┤
 │ Header │ Node4  │ Header │ Node4  │ Header │ Node4  │  ...   │   (free)    │
-│ 8 bytes│128 bytes│8 bytes│128 bytes│8 bytes│128 bytes│        │             │
+│ 8 bytes│184 bytes│8 bytes│184 bytes│8 bytes│184 bytes│       │             │
 └────────┴────────┴────────┴────────┴────────┴────────┴────────┴─────────────┘
+        └── 192 byte slot ──┘
 ```
 
 **Key Features:**
@@ -114,30 +128,50 @@ The `NodeSlab` class provides a custom slab allocator for RadixTree nodes, elimi
 | **Per-Shard Isolation** | `thread_local` storage, no synchronization |
 | **Four Size Classes** | One pool per node type (Node4→Node256) |
 
+**Slot Sizes (from `node_slab.hpp`):**
+
+| Node Type | Slot Size | Slots per 2MB Chunk |
+|-----------|-----------|---------------------|
+| Node4 | 192 bytes | 10,922 |
+| Node16 | 192 bytes | 10,922 |
+| Node48 | 448 bytes | 4,681 |
+| Node256 | 3,200 bytes | 655 |
+
+> **Note:** Node256 slot size is larger than a naive calculation (256 × 8 = 2048 bytes) because it includes an additional `std::array<TokenId, 256> keys` array for hash collision handling.
+
 **Memory Layout:**
 
 Each allocation slot contains:
 1. **SlabHeader (8 bytes)**: Pool index for deallocation routing
-2. **Node storage**: Sized per node type (192B→2240B)
+2. **Node storage**: Sized per node type (up to 3,192 bytes for Node256)
 
 **Custom Deleter:**
 
 The `NodePtr` type alias uses a custom deleter (`SlabNodeDeleter`) that returns memory to the slab instead of calling `delete`:
 
 ```cpp
+// Defined in node_slab.hpp
 using NodePtr = std::unique_ptr<Node, SlabNodeDeleter>;
 
-// Deallocation is O(1) - just push to intrusive list
+// Implementation in node_slab.cpp - O(1) deallocation
 void SlabNodeDeleter::operator()(Node* ptr) const noexcept {
-    ptr->~Node();  // Virtual destructor call
-    slab->deallocate(ptr);  // Returns to pool's free list
+    if (!ptr) return;
+
+    // Invoke destructor manually (correct destructor via virtual dispatch)
+    ptr->~Node();
+
+    // Return memory to slab's free list
+    NodeSlab* slab = get_node_slab();
+    if (slab) {
+        slab->deallocate(ptr);  // O(1) push to intrusive list
+    }
 }
 ```
 
 **Source Location:**
 
 ```
-src/node_slab.hpp  # Class definition and pool configuration
+src/node_slab.hpp  # Class definition, NodePtr alias, pool configuration
 src/node_slab.cpp  # Implementation with intrusive free list
 ```
 
@@ -181,8 +215,13 @@ struct Node {
 
 ```cpp
 struct Node4 : public Node {
-    std::vector<TokenId> keys;                  // Up to 4 keys
-    std::vector<std::unique_ptr<Node>> children; // Corresponding children (exclusive ownership)
+    std::vector<TokenId> keys;      // Up to 4 keys
+    std::vector<NodePtr> children;  // Corresponding children (slab-allocated)
+
+    Node4() : Node(NodeType::Node4) {
+        keys.reserve(4);
+        children.reserve(4);
+    }
 };
 ```
 
@@ -208,8 +247,13 @@ struct Node4 : public Node {
 
 ```cpp
 struct Node16 : public Node {
-    std::vector<TokenId> keys;                  // Up to 16 keys
-    std::vector<std::unique_ptr<Node>> children; // Exclusive ownership
+    std::vector<TokenId> keys;      // Up to 16 keys
+    std::vector<NodePtr> children;  // Slab-allocated
+
+    Node16() : Node(NodeType::Node16) {
+        keys.reserve(16);
+        children.reserve(16);
+    }
 };
 ```
 
@@ -223,7 +267,7 @@ struct Node16 : public Node {
 │ ████████████████████████████████████████████████████    │
 │              ↑ SIMD-aligned for AVX2 comparison         │
 ├─────────────────────────────────────────────────────────┤
-│ children[0..15] (16 × unique_ptr)                       │
+│ children[0..15] (16 × NodePtr)                          │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -237,9 +281,15 @@ struct Node16 : public Node {
 struct Node48 : public Node {
     static constexpr uint8_t EMPTY_MARKER = 255;
 
-    std::array<uint8_t, 256> index;             // Maps key byte → child position
-    std::vector<std::unique_ptr<Node>> children; // Up to 48 children (exclusive ownership)
-    std::vector<TokenId> keys;                   // Original keys for iteration
+    std::array<uint8_t, 256> index;  // Maps key byte → child position
+    std::vector<NodePtr> children;   // Up to 48 children (slab-allocated)
+    std::vector<TokenId> keys;       // Original keys for iteration
+
+    Node48() : Node(NodeType::Node48) {
+        index.fill(EMPTY_MARKER);
+        children.reserve(48);
+        keys.reserve(48);
+    }
 };
 ```
 
@@ -261,29 +311,50 @@ struct Node48 : public Node {
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Lookup Algorithm:**
+**Lookup Algorithm (with collision handling):**
 
 ```cpp
-Node* find_child(TokenId key) {
+Node* find_child(TokenId key) const {
     uint8_t idx = index[key_byte(key)];  // O(1) array access
-    if (idx != EMPTY_MARKER) {
-        return children[idx].get();       // O(1) pointer lookup (raw pointer for traversal)
+
+    // Fast path: index valid AND key matches
+    if (idx != EMPTY_MARKER && keys[idx] == key) [[likely]] {
+        return children[idx].get();
+    }
+
+    // Collision case: index points to different key, or was overwritten
+    // Fall back to linear search through keys
+    for (size_t i = 0; i < keys.size(); i++) {
+        if (keys[i] == key) {
+            return children[i].get();
+        }
     }
     return nullptr;
 }
 ```
 
-**Lookup Complexity:** O(1) via index indirection.
+**Lookup Complexity:** O(1) in the common case (index hit), O(n) fallback for collisions.
 
 **Use Case:** High-branching nodes where different token sequences diverge significantly.
 
-#### Node256: Direct Access Node
+#### Node256: Direct Access Node with Collision Handling
 
 ```cpp
 struct Node256 : public Node {
-    std::array<std::unique_ptr<Node>, 256> children;  // Direct mapping (exclusive ownership)
+    // CRITICAL: Must store full token IDs because key_byte() only uses lower 8 bits.
+    // Token IDs like 0, 256, 512 all map to index 0 - we need to verify the actual key.
+    static constexpr TokenId EMPTY_KEY = -1;  // Sentinel value for empty slots
+
+    std::array<NodePtr, 256> children;     // Direct mapping (slab-allocated)
+    std::array<TokenId, 256> keys;         // Full token IDs at each slot
+
+    Node256() : Node(NodeType::Node256) {
+        keys.fill(EMPTY_KEY);
+    }
 };
 ```
+
+> **Why the `keys` array?** The `key_byte()` function extracts only the lower 8 bits of a `TokenId` for array indexing. This means token IDs `0`, `256`, `512`, `768`, etc. all hash to index `0`. The `keys` array stores the full token ID to detect and handle these collisions.
 
 **Memory Layout:**
 
@@ -291,27 +362,48 @@ struct Node256 : public Node {
 ┌─────────────────────────────────────────────────────────┐
 │ Node Header                                              │
 ├─────────────────────────────────────────────────────────┤
-│ children[0..255] (256 × unique_ptr = 2KB on 64-bit)     │
+│ children[0..255] (256 × NodePtr = 2KB on 64-bit)        │
 │ ┌────┬────┬────┬────┬─────────────────────┬────┬────┐   │
 │ │ p0 │ p1 │null│ p3 │ ...                 │p254│p255│   │
 │ └────┴────┴────┴────┴─────────────────────┴────┴────┘   │
-│   ↑ Direct index by key_byte(token)                     │
+├─────────────────────────────────────────────────────────┤
+│ keys[0..255] (256 × TokenId = 1KB on 32-bit TokenId)    │
+│ ┌────┬────┬────┬────┬─────────────────────┬────┬────┐   │
+│ │ k0 │ k1 │ -1 │ k3 │ ...                 │k254│k255│   │
+│ └────┴────┴────┴────┴─────────────────────┴────┴────┘   │
+│   ↑ Full token ID (or EMPTY_KEY=-1 for empty slots)     │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Lookup Algorithm:**
+**Lookup Algorithm (with collision handling):**
 
 ```cpp
-Node* find_child(TokenId key) {
-    return children[key_byte(key)].get();  // Single array access (raw pointer for traversal)
+Node* find_child(TokenId key) const {
+    uint8_t idx = key_byte(key);
+
+    // Fast path: preferred slot matches
+    if (keys[idx] == key) [[likely]] {
+        return children[idx].get();
+    }
+
+    // Collision case: key_byte matches but full key differs
+    // Fall back to linear search for the correct entry
+    if (keys[idx] != EMPTY_KEY) {
+        for (int i = 0; i < 256; i++) {
+            if (keys[i] == key) {
+                return children[i].get();
+            }
+        }
+    }
+    return nullptr;
 }
 ```
 
-**Lookup Complexity:** O(1) direct array indexing.
+**Lookup Complexity:** O(1) in the common case (no collisions), O(n) worst case with collisions.
 
 **Use Case:** Maximum branching scenarios, rare in practice due to path compression.
 
-> **Note on Pointer Types:** The `find_child()` functions return raw `Node*` pointers for traversal efficiency. Ownership remains with the parent node's `unique_ptr`. This is safe because traversal operations don't transfer ownership.
+> **Note on Pointer Types:** The `find_child()` functions return raw `Node*` pointers for traversal efficiency. Ownership remains with the parent node's `NodePtr`. This is safe because traversal operations don't transfer ownership.
 
 ### Node Growth Transitions
 
@@ -340,16 +432,15 @@ sequenceDiagram
 **Growth Implementation (Node4 → Node16):**
 
 ```cpp
-std::unique_ptr<Node> grow_node4_to_node16(
-    std::unique_ptr<Node> parent, TokenId key, std::unique_ptr<Node> child)
-{
+NodePtr grow_to_node16(NodePtr parent, TokenId key, NodePtr child) {
     auto* n4 = static_cast<Node4*>(parent.get());
-    auto n16 = std::make_unique<Node16>();
+    auto n16_ptr = make_node<Node16>();  // Slab-allocated
+    auto* n16 = static_cast<Node16*>(n16_ptr.get());
 
     // Migrate metadata (preserves path compression)
-    copy_node_metadata(n4, n16.get());
+    copy_node_metadata(n16, n4);
 
-    // Migrate existing children (zero-copy move of unique_ptrs)
+    // Migrate existing children (zero-copy move of NodePtrs)
     n16->keys = std::move(n4->keys);
     n16->children = std::move(n4->children);
 
@@ -357,20 +448,20 @@ std::unique_ptr<Node> grow_node4_to_node16(
     n16->keys.push_back(key);
     n16->children.push_back(std::move(child));  // Transfer ownership
 
-    return n16;
+    return n16_ptr;
 }
 ```
 
-> **Ownership Transfer:** When growing nodes, `std::move()` transfers ownership of child `unique_ptr`s to the new parent. The old node's children vector becomes empty after the move.
+> **Ownership Transfer:** When growing nodes, `std::move()` transfers ownership of child `NodePtr`s to the new parent. The old node's children vector becomes empty after the move. The old node itself is automatically returned to the slab when its `NodePtr` goes out of scope.
 
 ### Memory Efficiency Analysis
 
-| Node Type | Keys Storage | Children Storage | Overhead | Density |
-|-----------|--------------|------------------|----------|---------|
-| Node4 | 16 bytes | 32 bytes | Low | 1-4 children |
-| Node16 | 64 bytes | 128 bytes | Medium | 5-16 children |
-| Node48 | 256 bytes + 192 bytes | 384 bytes | Medium | 17-48 children |
-| Node256 | Implicit | 2048 bytes | High | 49-256 children |
+| Node Type | Slab Slot Size | Keys Storage | Children Storage | Density |
+|-----------|----------------|--------------|------------------|---------|
+| Node4 | 192 bytes | 16 bytes (4 × 4B) | 32 bytes (4 × 8B) | 1-4 children |
+| Node16 | 192 bytes | 64 bytes (16 × 4B) | 128 bytes (16 × 8B) | 5-16 children |
+| Node48 | 448 bytes | 192 bytes + 256B index | 384 bytes (48 × 8B) | 17-48 children |
+| Node256 | 3,200 bytes | 1,024 bytes (256 × 4B) | 2,048 bytes (256 × 8B) | 49-256 children |
 
 The adaptive design ensures that:
 - **Sparse trees** (common in LLM routing) use primarily Node4/Node16
@@ -664,7 +755,7 @@ gantt
    ```cpp
    struct Node16 : public Node {
        alignas(32) std::array<TokenId, 16> keys;  // Fixed-size, aligned
-       std::array<std::unique_ptr<Node>, 16> children;
+       std::array<NodePtr, 16> children;           // Slab-allocated
        uint8_t count;  // Actual number of keys
    };
    ```
