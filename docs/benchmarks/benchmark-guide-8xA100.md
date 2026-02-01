@@ -196,15 +196,31 @@ python3 tests/integration/prompt_loader.py stats tests/integration/data/lmsys/lm
 
 The `--client-tokenize` flag moves tokenization from Ranvier to the benchmark client. This simulates production deployments where clients send pre-tokenized requests.
 
-### Trade-offs
+### Trade-offs by Model Size
+
+Results from 30-minute benchmarks at 20 users:
+
+#### CodeLlama-13b
 
 | Metric | Server Tokenize | Client Tokenize | Difference |
 |--------|-----------------|-----------------|------------|
 | Routing overhead | ~17ms | ~0.4ms | **44x lower** |
 | Throughput (req/s) | 25.4 | 31.1 | **+22%** |
-| Total requests (30m) | 11,973 | 14,553 | **+22%** |
-| P99 TTFT | 1200ms | 1100ms | **-8%** |
 | XLarge Improvement % | 38.9% | 4.1% | See below |
+| XLarge Hit P50 | 886ms | 733ms | -17% |
+| XLarge Miss P50 | 1451ms | 764ms | -47% |
+
+#### Llama-3.1-8B
+
+| Metric | Server Tokenize | Client Tokenize | Difference |
+|--------|-----------------|-----------------|------------|
+| Routing overhead | ~16ms | ~0.4ms | **40x lower** |
+| Throughput (req/s) | 33.1 | 32.8 | ~same |
+| XLarge Improvement % | 43.7% | 36.0% | See below |
+| XLarge Hit P50 | 453ms | 451ms | ~same |
+| XLarge Miss P50 | 804ms | 705ms | -12% |
+
+**Why throughput differs by model:** The 8B model is faster overall (~450ms vs ~900ms for 13B), so the 15-17ms tokenization overhead is a smaller percentage of total request time. For slower models, client tokenization provides a bigger throughput boost.
 
 ### Why XLarge Improvement % Drops
 
@@ -214,21 +230,13 @@ The "XLarge Improvement" metric measures the relative benefit of cache hits vs m
 Improvement = (miss_latency - hit_latency) / miss_latency
 ```
 
-With client tokenization, **cache misses also get faster** because the server skips tokenization:
-
-| Metric | Server Tokenize | Client Tokenize |
-|--------|-----------------|-----------------|
-| XLarge Hit P50 | 886ms | 733ms |
-| XLarge Miss P50 | 1451ms | 764ms |
-| Improvement % | 38.9% | 4.1% |
-
-The **absolute latencies are better** with client tokenization—both hits and misses are faster. The relative improvement shrinks because the denominator (miss latency) dropped significantly.
+With client tokenization, **cache misses also get faster** because the server skips tokenization. The **absolute latencies are better**—both hits and misses are faster. The relative improvement shrinks because the denominator (miss latency) dropped significantly.
 
 ### When to Use
 
 **Use `--client-tokenize` when:**
 - Simulating production deployments with pre-tokenized requests
-- Maximizing throughput is the priority
+- Benchmarking larger/slower models where throughput gains are significant
 - You want to measure Ranvier's pure routing overhead
 
 **Use server tokenization (default) when:**
