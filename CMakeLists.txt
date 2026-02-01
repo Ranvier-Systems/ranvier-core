@@ -155,6 +155,64 @@ if(Seastar_FOUND)
     )
     FetchContent_MakeAvailable(tokenizers_cpp)
 
+    # ==========================================================================
+    # Patch tokenizers-cpp to use jemalloc as Rust's global allocator
+    # ==========================================================================
+    # WHY: Seastar replaces malloc globally with its per-shard allocator. When Rust
+    # FFI code runs on worker threads, allocations are tracked as foreign_mallocs.
+    # The interaction between Seastar's do_foreign_free and Rust's internal allocator
+    # causes memory corruption under stress (SIGSEGV with corrupted pointers).
+    #
+    # SOLUTION: Build tokenizers-cpp with tikv-jemallocator as the global allocator.
+    # This gives Rust its own memory allocator that bypasses Seastar entirely.
+    #
+    # See: Rule #15 in .dev-context/claude-context.md
+    # See: BACKLOG.md "Rebuild tokenizers-cpp with statically-linked jemalloc"
+    # ==========================================================================
+
+    set(TOKENIZERS_CARGO_TOML "${tokenizers_cpp_SOURCE_DIR}/rust/Cargo.toml")
+    set(TOKENIZERS_LIB_RS "${tokenizers_cpp_SOURCE_DIR}/rust/src/lib.rs")
+
+    # Check if patches have already been applied (idempotent patching)
+    file(READ "${TOKENIZERS_CARGO_TOML}" CARGO_TOML_CONTENT)
+    string(FIND "${CARGO_TOML_CONTENT}" "tikv-jemallocator" JEMALLOC_FOUND)
+
+    if(JEMALLOC_FOUND EQUAL -1)
+        message(STATUS "Patching tokenizers-cpp to use jemalloc allocator...")
+
+        # Patch Cargo.toml: Add tikv-jemallocator dependency
+        string(REPLACE
+            "[dependencies]"
+            "[dependencies]\ntikv-jemallocator = \"0.6\""
+            CARGO_TOML_PATCHED
+            "${CARGO_TOML_CONTENT}"
+        )
+        file(WRITE "${TOKENIZERS_CARGO_TOML}" "${CARGO_TOML_PATCHED}")
+        message(STATUS "  - Added tikv-jemallocator to Cargo.toml")
+
+        # Patch lib.rs: Add global allocator declaration at the top
+        file(READ "${TOKENIZERS_LIB_RS}" LIB_RS_CONTENT)
+        set(JEMALLOC_DECLARATION
+"// =============================================================================
+// PATCHED BY RANVIER: Use jemalloc as global allocator for Seastar compatibility
+// Seastar replaces malloc globally. Without this, Rust FFI causes memory corruption.
+// See: Rule #15 in ranvier-core/.dev-context/claude-context.md
+// =============================================================================
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+")
+        set(LIB_RS_PATCHED "${JEMALLOC_DECLARATION}${LIB_RS_CONTENT}")
+        file(WRITE "${TOKENIZERS_LIB_RS}" "${LIB_RS_PATCHED}")
+        message(STATUS "  - Added #[global_allocator] to lib.rs")
+
+        message(STATUS "Tokenizers-cpp jemalloc patch complete")
+    else()
+        message(STATUS "Tokenizers-cpp jemalloc patch already applied (skipping)")
+    endif()
+
     # Limit the Noise
     add_compile_options(-fmax-errors=3)
 
