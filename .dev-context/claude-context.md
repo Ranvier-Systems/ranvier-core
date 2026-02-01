@@ -276,7 +276,60 @@ do_with(std::move(data), [](auto& data) {
 
 ---
 
-### Quick Reference: The 15 Hard Rules
+#### 15. The FFI Cross-Boundary Memory Anti-Pattern
+
+**THE PATTERN:** Passing heap-allocated data (strings, vectors) across shard or thread boundaries to FFI code (Rust, C libraries):
+```cpp
+// Cross-shard FFI call
+smp::submit_to(target_shard, [text = std::move(text)]() {
+    rust_tokenizer->Encode(text);  // BUG: text's buffer allocated on calling shard
+});
+
+// Cross-thread FFI call (std::thread worker)
+void worker_thread(Job& job) {
+    rust_library->process(job.text);  // BUG: job.text allocated on reactor thread
+}
+```
+
+**THE CONSEQUENCE:** While Seastar's `do_foreign_free` mechanism can handle cross-shard C++ allocations, **FFI allocators don't participate in Seastar's memory tracking**:
+- Rust uses jemalloc (or system allocator) independently
+- C libraries call `malloc`/`free` directly
+- When FFI code operates on foreign-shard memory, it may reallocate, cache pointers, or interact with the buffer in ways that corrupt Seastar's per-shard allocator state
+
+Real-world symptom: Under stress testing (100 users, 30 minutes), SIGSEGV crashes with corrupted pointers (`si_addr=0x5`) in the Rust tokenizer FFI.
+
+**THE LESSON:** *Hard Rule: Always reallocate locally before passing data to FFI across shard/thread boundaries.*
+```cpp
+// Cross-shard: reallocate at start of submit_to lambda
+smp::submit_to(target_shard, [text_copy = std::move(text)]() {
+    std::string local_text(text_copy.data(), text_copy.size());  // Local allocation
+    rust_tokenizer->Encode(local_text);  // FFI sees locally-allocated memory
+});
+
+// Cross-thread: reallocate before FFI call
+void worker_thread(Job& job) {
+    std::string local_text(job.text.data(), job.text.size());  // Local allocation
+    rust_library->process(local_text);
+}
+```
+
+**THIS APPLIES TO:**
+- Rust libraries via C FFI (tokenizers, regex, simd-json, etc.)
+- C libraries that may reallocate or cache buffers (SQLite, zlib, etc.)
+- Any `std::thread` workers processing data from Seastar reactors
+- Any external code outside Seastar's allocator control
+
+**RED FLAGS TO AUDIT:**
+- `smp::submit_to` lambdas that pass strings/vectors directly to FFI functions
+- `seastar::alien::run_on` callbacks passing data to/from worker threads
+- Worker threads (std::thread) calling FFI with reactor-allocated data
+- Any FFI call in code that could run on a different shard than allocation
+
+**PROMPT GUARD:** "Before passing strings, vectors, or any heap-allocated data to FFI code across shard or thread boundaries, always create a local copy: `std::string local(foreign.data(), foreign.size())`. FFI allocators don't participate in Seastar's cross-shard memory tracking."
+
+---
+
+### Quick Reference: The 16 Hard Rules
 
 | # | Rule | Violation |
 |---|------|-----------|
@@ -295,3 +348,4 @@ do_with(std::move(data), [](auto& data) {
 | 12 | Use Seastar file I/O APIs | `std::ifstream/ofstream` in Seastar code |
 | 13 | Thread-local raw new needs destroy function | `thread_local T* = new T()` without cleanup |
 | 14 | Force local allocation for cross-shard data | Moving `vector`/`string` via `submit_to` |
+| 15 | Reallocate locally before FFI across boundaries | Passing shard-allocated data to Rust/C FFI |
