@@ -471,16 +471,16 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 8B | 20 | XLarge (4-8K tokens) | ~600ms | ~336ms | **~44%** |
 | 8B | 10 | XLarge (4-8K tokens) | ~580ms | ~333ms | **~43%** |
 | **13B** | 30 | XLarge (4-8K tokens) | ~1800ms | ~1030ms | **~43%** |
-| **13B** | 20 | XLarge (4-8K tokens) | ~1650ms | ~56ms | **~97%** |
+| **13B** | 20 | XLarge (4-8K tokens) | ~1451ms | ~886ms | **~39%** |
 | **13B** | 10 | XLarge (4-8K tokens) | ~1575ms | ~816ms | **~48%** |
 | 70B | - | XLarge (4-8K tokens) | TBD | TBD | Expected 50-60% |
 
 **Key insights:**
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
 - **Small prefixes have overhead** — Routing cost exceeds cache benefit
-- **Large prefixes (4K+ tokens) show real improvement** — 26-97% TTFT reduction
-- **Larger models amplify benefits** — 13B shows up to 97% improvement at moderate load
-- **Load matters** — Moderate load (20 users) often outperforms both light (10) and heavy (30) load
+- **Large prefixes (4K+ tokens) show real improvement** — 26-48% TTFT reduction
+- **Larger models amplify benefits** — 13B shows 39-48% vs 26-44% for 8B
+- **Tail latency is the big win** — P99 TTFT drops 77-80% with prefix-aware routing
 
 ### Cache Hit Rate
 
@@ -544,21 +544,21 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Performance by Model Size and Load
 
-| Model | Load | Users | XLarge TTFT Improvement | Cache Hit Rate |
-|-------|------|-------|-------------------------|----------------|
-| **CodeLlama-13b** | Moderate | 20 | **96.6%** | 97.6% |
-| **CodeLlama-13b** | Normal | 10 | **48.2%** | 96.4% |
-| CodeLlama-13b | Heavy | 30 | 42.9% | 97.5% |
-| Llama-3.1-8B | Moderate | 20 | 44.0% | 97.4% |
-| Llama-3.1-8B | Normal | 10 | 42.7% | 95.6% |
-| Llama-3.1-8B | Heavy | 30 | 25.9% | 97.8% |
+| Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate |
+|-------|------|-------|----------|-------------------------|----------------|
+| **CodeLlama-13b** | Moderate | 20 | 30m | **38.9%** | 97.6% |
+| **CodeLlama-13b** | Normal | 10 | 10m | **48.2%** | 96.4% |
+| CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% |
+| Llama-3.1-8B | Moderate | 20 | 10m | 44.0% | 97.4% |
+| Llama-3.1-8B | Normal | 10 | 10m | 42.7% | 95.6% |
+| Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% |
 
 **Why larger models benefit more:** Prefill computation scales with model parameters. A 13B model has ~1.6x the compute per prefill token compared to 8B, so cache hits save proportionally more time.
 
 **Key takeaways:**
-- **Larger models** see bigger improvements (up to 97% for 13B vs 44% for 8B at 20 users)
-- **Moderate load is optimal** (20 users / ~2.5 req/GPU): Best improvement (97% for 13B, 44% for 8B)
-- **Heavy load still helps** (30 users / ~3.75 req/GPU): 43% for 13B, 26% for 8B despite queuing
+- **Larger models** see bigger improvements (39-48% for 13B vs 26-44% for 8B)
+- **P99 tail latency** drops 77-80% — worst-case response times improve dramatically
+- **Throughput increases** ~28% with prefix-aware routing under load
 - **Cache hit rate** is excellent (97%+) regardless of load or model size
 
 ---
