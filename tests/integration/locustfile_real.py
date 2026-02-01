@@ -3343,6 +3343,7 @@ class RealBackendUser(HttpUser):
                 "prompt": messages_to_prompt(messages),
                 "prompt_token_ids": token_ids,
                 "stream": True,
+                "stream_options": {"include_usage": True},
                 "max_tokens": 100,  # Limit output for benchmarking
             }
 
@@ -3358,6 +3359,7 @@ class RealBackendUser(HttpUser):
                 "model": os.environ.get("VLLM_MODEL", "default"),
                 "messages": messages,
                 "stream": True,
+                "stream_options": {"include_usage": True},
                 "max_tokens": 100,  # Limit output for benchmarking
             }
 
