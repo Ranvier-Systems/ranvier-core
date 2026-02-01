@@ -298,34 +298,50 @@ void worker_thread(Job& job) {
 
 Real-world symptom: Under stress testing (100 users, 30 minutes), SIGSEGV crashes with corrupted pointers (`si_addr=0x5`) in the Rust tokenizer FFI.
 
-**THE LESSON:** *Hard Rule: Always reallocate locally before passing data to FFI across shard/thread boundaries.*
+**THE LESSON:** *Hard Rule: Always reallocate locally when data crosses shard/thread boundaries with FFI involved.*
+
+This is **bidirectional**:
+1. **INPUT to FFI:** Reallocate before passing to FFI functions
+2. **OUTPUT from workers:** Reallocate when returning data to reactor threads
+
 ```cpp
-// Cross-shard: reallocate at start of submit_to lambda
+// Cross-shard INPUT: reallocate at start of submit_to lambda
 smp::submit_to(target_shard, [text_copy = std::move(text)]() {
     std::string local_text(text_copy.data(), text_copy.size());  // Local allocation
     rust_tokenizer->Encode(local_text);  // FFI sees locally-allocated memory
 });
 
-// Cross-thread: reallocate before FFI call
+// Cross-thread INPUT: reallocate before FFI call
 void worker_thread(Job& job) {
     std::string local_text(job.text.data(), job.text.size());  // Local allocation
-    rust_library->process(local_text);
+    auto tokens = rust_library->process(local_text);
+
+    // Cross-thread OUTPUT: reallocate in reactor callback
+    alien::run_on(reactor, shard, [tokens = std::move(tokens)]() {
+        // tokens was allocated by worker (foreign_malloc) - reallocate on reactor
+        std::vector<int32_t> local_tokens(tokens.begin(), tokens.end());
+        use(local_tokens);  // Reactor uses locally-allocated copy
+    });
 }
 ```
+
+**IMPORTANT:** Seastar replaces `malloc` globally. Worker threads (std::thread) DO use Seastar's allocator - their allocations are tracked as `foreign_mallocs`. When the reactor frees worker-allocated memory, `do_foreign_free` is triggered, which can cause corruption with FFI code.
 
 **THIS APPLIES TO:**
 - Rust libraries via C FFI (tokenizers, regex, simd-json, etc.)
 - C libraries that may reallocate or cache buffers (SQLite, zlib, etc.)
 - Any `std::thread` workers processing data from Seastar reactors
+- Data returned FROM worker threads TO reactor threads (bidirectional!)
 - Any external code outside Seastar's allocator control
 
 **RED FLAGS TO AUDIT:**
 - `smp::submit_to` lambdas that pass strings/vectors directly to FFI functions
 - `seastar::alien::run_on` callbacks passing data to/from worker threads
 - Worker threads (std::thread) calling FFI with reactor-allocated data
+- **Worker threads returning heap data to reactors via alien::run_on** (bidirectional!)
 - Any FFI call in code that could run on a different shard than allocation
 
-**PROMPT GUARD:** "Before passing strings, vectors, or any heap-allocated data to FFI code across shard or thread boundaries, always create a local copy: `std::string local(foreign.data(), foreign.size())`. FFI allocators don't participate in Seastar's cross-shard memory tracking."
+**PROMPT GUARD:** "When data crosses shard/thread boundaries with FFI involved, reallocate in BOTH directions: (1) reallocate input before FFI calls, (2) reallocate output when returning from worker threads to reactors. Seastar's global malloc means worker allocations are foreign_mallocs that cause corruption on reactor free."
 
 ---
 

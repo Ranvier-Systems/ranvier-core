@@ -166,7 +166,15 @@ void TokenizerWorker::process_job(TokenizationJob& job, seastar::alien::instance
         seastar::alien::run_on(alien_instance, target_shard,
             [job_id, tokens = std::move(tokens), success]() noexcept {
                 if (auto* callback = get_thread_pool_completion_callback()) {
-                    (*callback)(job_id, std::move(tokens), success);
+                    // CRITICAL: Reallocate tokens on the reactor thread.
+                    // The tokens vector was allocated on the worker thread (which uses
+                    // Seastar's global malloc - tracked as foreign_mallocs). If we pass
+                    // it directly, the reactor will eventually free foreign-allocated
+                    // memory, causing corruption via do_foreign_free.
+                    // Creating a local copy ensures the vector is allocated by THIS
+                    // shard's allocator.
+                    std::vector<int32_t> local_tokens(tokens.begin(), tokens.end());
+                    (*callback)(job_id, std::move(local_tokens), success);
                 }
             });
     } catch (const std::exception& e) {
