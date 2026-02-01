@@ -141,8 +141,16 @@ void TokenizerWorker::process_job(TokenizationJob& job, seastar::alien::instance
     std::vector<int32_t> tokens;
     bool success = false;
 
+    // CRITICAL: Reallocate the string buffer on the worker thread.
+    // The job.text was allocated on a Seastar reactor shard, but this worker
+    // thread runs outside Seastar's shard allocators. The Rust tokenizer (via FFI)
+    // may have issues with memory allocated by a different allocator.
+    // Creating a local copy ensures the string buffer is allocated by this
+    // thread's allocator before passing to the Rust FFI.
+    std::string local_text(job.text.data(), job.text.size());
+
     try {
-        tokens = _tokenizer->Encode(job.text);
+        tokens = _tokenizer->Encode(local_text);
         success = true;
     } catch (const std::exception& e) {
         log_thread_pool.warn("Worker tokenization failed on shard {}: {}",
