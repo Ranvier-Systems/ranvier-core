@@ -18,6 +18,7 @@ This document identifies missing features and optimizations required to promote 
 6. [Integration Tests (End-to-End Validation)](#6-integration-tests-end-to-end-validation)
 7. [Security Audit Findings](#7-security-audit-findings-adversarial-system-audit)
 8. [Strategic Assessment (2026-01-19)](#8-strategic-assessment-2026-01-19)
+9. [Benchmark Extensions](#9-benchmark-extensions)
 
 ---
 
@@ -1198,6 +1199,122 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 
 ---
 
+## 9. Benchmark Extensions
+
+Extend benchmarking to make it more realistic with production traces, cache pressure scenarios, larger models, and traffic variability.
+
+### 9.1 Production Prompt Traces
+
+- [ ] **Define trace format (JSON/JSONL) for production prompt patterns**
+  _Justification:_ Synthetic prompts don't capture real-world prompt distribution. Production traces enable realistic performance validation.
+  _Deliverables:_
+  - Define schema capturing prompt content, timestamps, user sessions
+  - Support prefix annotation for shared system messages
+  - Include metadata: model, temperature, max_tokens
+  _Location:_ `tests/integration/data/traces/` (new), schema doc
+  _Complexity:_ Low
+
+- [ ] **Modify locustfile_real.py to load and replay traces**
+  _Justification:_ Current Locust test uses synthetic prompts with fixed distributions. Trace replay enables historical traffic patterns.
+  _Approach:_ Add `TraceLoader` class, `--trace-file` parameter, timestamp-based replay scheduling
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add --trace-file option to bench.sh**
+  _Justification:_ Simplify trace-based benchmarking via CLI.
+  _Location:_ `scripts/bench.sh`
+  _Complexity:_ Low
+
+- [ ] **Create tool to anonymize/sanitize production logs into trace format**
+  _Justification:_ Production logs contain sensitive data. Anonymization tool enables safe trace collection.
+  _Approach:_ PII detection, content hashing, prefix preservation, configurable anonymization rules
+  _Location:_ `scripts/anonymize_traces.py` (new)
+  _Complexity:_ Medium
+
+### 9.2 Cache Pressure Scenarios
+
+- [ ] **Add --unique-prefixes N option to control prefix diversity**
+  _Justification:_ Current benchmarks use 5 unique prefixes. Real deployments may have thousands. Need to test cache behavior at scale.
+  _Location:_ `tests/integration/locustfile_real.py`, `scripts/bench.sh`
+  _Complexity:_ Low
+
+- [ ] **Create "cache-pressure" prompt distribution**
+  _Justification:_ Test behavior when unique prefixes exceed KV cache capacity. Validates eviction policies and degraded performance.
+  _Approach:_ Generate N unique prefixes > vLLM block capacity, measure cache hit rate degradation curve
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add metrics to detect cache evictions (if vLLM exposes this)**
+  _Justification:_ Understanding cache eviction rate helps tune cache size and routing policy.
+  _Approach:_ Query vLLM `/metrics` for `vllm:cache_evictions_total` or similar, add to benchmark report
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Low
+
+- [ ] **Document expected behavior when cache overflows**
+  _Justification:_ Operators need guidance on capacity planning and expected degradation.
+  _Location:_ `docs/benchmarks/benchmark-guide-8xA100.md`
+  _Complexity:_ Low
+
+### 9.3 Larger Models
+
+- [ ] **Update bench.sh to support tensor-parallel vLLM across multiple GPUs**
+  _Justification:_ 70B+ models require tensor parallelism. Current bench.sh assumes single-GPU vLLM instances.
+  _Approach:_ Add `--tensor-parallel N` flag, adjust vLLM launch command, GPU allocation logic
+  _Location:_ `scripts/bench.sh`
+  _Complexity:_ Medium
+
+- [ ] **Add recommended configurations for 70B (8x A100) and 405B (multi-node)**
+  _Justification:_ Users need reference configurations for large model deployments.
+  _Deliverables:_ Sample configs, memory requirements, expected TTFT ranges
+  _Location:_ `docs/benchmarks/benchmark-guide-8xA100.md`, `docs/benchmarks/benchmark-guide-405B.md` (new)
+  _Complexity:_ Medium
+
+- [ ] **Adjust expected TTFT thresholds based on model size**
+  _Justification:_ Current thresholds calibrated for 8B-13B models. Larger models have different latency profiles.
+  _Location:_ `tests/integration/locustfile_real.py`, benchmark documentation
+  _Complexity:_ Low
+
+- [ ] **Document memory requirements and GPU configurations**
+  _Justification:_ Operators need clear guidance on hardware requirements per model size.
+  _Location:_ `docs/deployment/hardware-requirements.md` (new)
+  _Complexity:_ Low
+
+### 9.4 Traffic Variability
+
+- [ ] **Add traffic shapes to locustfile: ramp-up, spikes, diurnal patterns**
+  _Justification:_ Real traffic is not steady-state. Bursty traffic tests cache warm-up and backpressure behavior.
+  _Approach:_ Custom `LoadTestShape` classes for different patterns
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add --traffic-pattern option (steady, bursty, ramp, spike)**
+  _Justification:_ CLI option to select traffic shape without code changes.
+  _Location:_ `scripts/bench.sh`, `tests/integration/locustfile_real.py`
+  _Complexity:_ Low
+
+- [ ] **Measure cold-start impact when traffic spikes after idle periods**
+  _Justification:_ Production systems experience traffic spikes after quiet periods. Cache is cold, need to measure warm-up time.
+  _Approach:_ Add idle period before spike, track cache hit rate over time, report warm-up duration
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+- [ ] **Add metrics for cache warm-up time and hit rate over time**
+  _Justification:_ Time-series cache metrics help operators understand warm-up behavior and set appropriate scaling policies.
+  _Approach:_ Periodic cache hit rate sampling (every 10s), export as CSV alongside benchmark report
+  _Location:_ `tests/integration/locustfile_real.py`
+  _Complexity:_ Medium
+
+### 9.5 Tokenizer Performance
+
+- [ ] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator**
+  _Justification:_ Cross-shard dispatch revealed memory allocation overhead in Rust tokenizer. jemalloc provides better performance for multi-threaded allocations and avoids glibc malloc contention.
+  _Approach:_ Update tokenizers-cpp build to link jemalloc statically, benchmark allocation overhead reduction
+  _Location:_ `tokenizers-cpp/CMakeLists.txt`
+  _Complexity:_ Medium
+  _Note:_ Added 2026-02-01 after debugging cross-shard memory crash
+
+---
+
 ## Priority Matrix
 
 | Priority | Category | Item | Effort | Status |
@@ -1252,6 +1369,20 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
 | **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
 | **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | |
 | **P3 - Low** | DX | Split config.hpp when >2000 LOC | Medium | |
+| **P2 - Medium** | Benchmark | Production prompt traces - trace format definition | Low | |
+| **P2 - Medium** | Benchmark | Production prompt traces - locustfile trace replay | Medium | |
+| **P2 - Medium** | Benchmark | Production prompt traces - anonymization tool | Medium | |
+| **P2 - Medium** | Benchmark | Cache pressure - unique prefixes option | Low | |
+| **P2 - Medium** | Benchmark | Cache pressure - cache-pressure distribution | Medium | |
+| **P3 - Low** | Benchmark | Cache pressure - eviction metrics | Low | |
+| **P2 - Medium** | Benchmark | Larger models - tensor-parallel vLLM support | Medium | |
+| **P2 - Medium** | Benchmark | Larger models - 70B/405B configurations | Medium | |
+| **P3 - Low** | Benchmark | Larger models - TTFT threshold adjustments | Low | |
+| **P2 - Medium** | Benchmark | Traffic variability - traffic shape classes | Medium | |
+| **P3 - Low** | Benchmark | Traffic variability - traffic pattern option | Low | |
+| **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
+| **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
+| **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | |
 
 ---
 
