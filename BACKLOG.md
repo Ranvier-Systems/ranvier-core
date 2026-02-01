@@ -1317,12 +1317,12 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 
 ### 9.5 Tokenizer Performance
 
-- [ ] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator**
+- [x] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator** ✓
   _Justification:_ Cross-shard dispatch revealed memory allocation overhead in Rust tokenizer. jemalloc provides better performance for multi-threaded allocations and avoids glibc malloc contention.
-  _Approach:_ Update tokenizers-cpp build to link jemalloc statically, benchmark allocation overhead reduction
-  _Location:_ `tokenizers-cpp/CMakeLists.txt`
+  _Approach:_ CMake and Dockerfile patches inject `tikv-jemallocator` into tokenizers-cpp Rust code. Gives Rust complete memory isolation from Seastar, eliminating allocator interaction bugs.
+  _Location:_ `CMakeLists.txt` (lines 158-214), `Dockerfile.base` (lines 59-82)
   _Complexity:_ Medium
-  _Note:_ Added 2026-02-01 after debugging cross-shard memory crash
+  _Completed:_ 2026-02-01 (PR #204)
 
 ---
 
@@ -1393,7 +1393,7 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P3 - Low** | Benchmark | Traffic variability - traffic pattern option | Low | |
 | **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
 | **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
-| **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | |
+| **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | ✅ Done |
 
 ---
 
