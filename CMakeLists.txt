@@ -225,6 +225,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/main.cpp
       src/application.cpp
       src/async_persistence.cpp
+      src/config_loader.cpp
       src/crypto_offloader.cpp
       src/dtls_context.cpp
       src/gossip_consensus.cpp
@@ -334,6 +335,7 @@ gtest_discover_tests(persistence_test)
 # Config Unit Tests (Pure C++, no Seastar dependency)
 add_executable(config_test
   tests/unit/config_test.cpp
+  src/config_loader.cpp
 )
 target_include_directories(config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(config_test
@@ -435,6 +437,7 @@ gtest_discover_tests(circuit_breaker_test)
 if(Seastar_FOUND)
     add_executable(sharded_config_test
       tests/unit/sharded_config_test.cpp
+      src/config_loader.cpp
     )
     target_include_directories(sharded_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(sharded_config_test
@@ -493,6 +496,7 @@ if(Seastar_FOUND)
     add_executable(application_test
       tests/unit/application_test.cpp
       src/application.cpp
+      src/config_loader.cpp
       src/crypto_offloader.cpp
       src/gossip_consensus.cpp
       src/gossip_protocol.cpp
