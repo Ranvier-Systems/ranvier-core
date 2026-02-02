@@ -1,8 +1,6 @@
 #include "health_service.hpp"
 #include "logging.hpp"
 
-#include <iostream>
-
 #include <seastar/core/sleep.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
@@ -57,8 +55,15 @@ future<> HealthService::run_loop() {
             // 5. Sleep for configured interval
             co_await seastar::sleep(_config.check_interval);
         }
+    } catch (const seastar::gate_closed_exception&) {
+        // Expected during shutdown - gate closed while loop was running
+        log_health.debug("Health check loop exiting: gate closed during shutdown");
+    } catch (const std::exception& e) {
+        // Rule #9: Log unexpected exceptions at warn level
+        log_health.warn("Health check loop exiting unexpectedly: {}", e.what());
     } catch (...) {
-        // Gate closed exception is normal on shutdown
+        // Rule #9: Log unknown exceptions at warn level
+        log_health.warn("Health check loop exiting: unknown exception");
     }
 }
 

@@ -1254,12 +1254,28 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
+            // Rule #9: Log cleanup failures at debug level (not warn) because:
+            // 1. We're already in an error path - the real failure will be logged when rethrown
+            // 2. Cleanup failures are expected when streams are already broken
+            // 3. Warn-level would create noisy duplicate warnings for single failure events
             try {
                 co_await bundle.close();
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                log_proxy.debug("[{}] Cleanup: backend connection close failed: {}",
+                               ctx->request_id, e.what());
+            } catch (...) {
+                log_proxy.debug("[{}] Cleanup: backend connection close failed: unknown error",
+                               ctx->request_id);
+            }
             try {
                 co_await client_out.close();
-            } catch (...) {}
+            } catch (const std::exception& e) {
+                log_proxy.debug("[{}] Cleanup: client output close failed: {}",
+                               ctx->request_id, e.what());
+            } catch (...) {
+                log_proxy.debug("[{}] Cleanup: client output close failed: unknown error",
+                               ctx->request_id);
+            }
             std::rethrow_exception(streaming_exception);
         }
 
