@@ -41,13 +41,6 @@ std::optional<T> RanvierConfig::get_env_as(const char* name) {
     return std::nullopt;
 }
 
-// Explicit template instantiations for common types
-template std::optional<int> RanvierConfig::get_env_as<int>(const char* name);
-template std::optional<uint16_t> RanvierConfig::get_env_as<uint16_t>(const char* name);
-template std::optional<uint32_t> RanvierConfig::get_env_as<uint32_t>(const char* name);
-template std::optional<int32_t> RanvierConfig::get_env_as<int32_t>(const char* name);
-template std::optional<size_t> RanvierConfig::get_env_as<size_t>(const char* name);
-
 // =============================================================================
 // Environment Variable Overrides
 // =============================================================================
