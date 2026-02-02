@@ -40,7 +40,8 @@ GossipService::GossipService(const ClusterConfig& config)
 }
 
 void GossipService::register_metrics() {
-    // Register all metrics using accessors from modules
+    // Register operational metrics (always enabled)
+    // These ~23 metrics are essential for production monitoring
     _metrics.add_group("ranvier", {
         // Protocol metrics (packet counts)
         seastar::metrics::make_counter("router_cluster_sync_sent",
@@ -104,12 +105,6 @@ void GossipService::register_metrics() {
         seastar::metrics::make_counter("cluster_max_retries_exceeded",
             [this] { return _protocol->max_retries_exceeded(); },
             seastar::metrics::description("Total number of route announcements that exceeded max retries")),
-        seastar::metrics::make_counter("cluster_dedup_peers_overflow",
-            [this] { return _protocol->dedup_peers_overflow(); },
-            seastar::metrics::description("Times dedup peer limit was reached (Rule #4)")),
-        seastar::metrics::make_counter("cluster_pending_acks_overflow",
-            [this] { return _protocol->pending_acks_overflow(); },
-            seastar::metrics::description("Times pending acks limit was reached (Rule #4)")),
         seastar::metrics::make_gauge("cluster_pending_acks_count",
             [this] { return _protocol->pending_acks_count(); },
             seastar::metrics::description("Current number of pending ACKs awaiting response")),
@@ -136,14 +131,17 @@ void GossipService::register_metrics() {
         seastar::metrics::make_counter("cluster_dtls_packets_decrypted",
             [this] { return _transport->dtls_packets_decrypted(); },
             seastar::metrics::description("Total number of packets decrypted with DTLS")),
-        seastar::metrics::make_counter("cluster_dtls_cert_reloads",
-            [this] { return _transport->dtls_cert_reloads(); },
-            seastar::metrics::description("Total number of certificate hot-reloads")),
         seastar::metrics::make_counter("cluster_dtls_lockdown_drops",
             [this] { return _transport->dtls_lockdown_drops(); },
-            seastar::metrics::description("Total packets dropped due to mTLS lockdown")),
+            seastar::metrics::description("Total packets dropped due to mTLS lockdown"))
+    });
 
-        // Transport metrics (crypto offloading)
+#ifdef RANVIER_DEBUG_METRICS
+    // Debug metrics (optional, enabled via -DRANVIER_DEBUG_METRICS=ON)
+    // These 8 metrics add scrape overhead and are primarily useful for development.
+    // See BACKLOG.md Section 8.5 for rationale.
+    _metrics.add_group("ranvier", {
+        // Crypto offload debugging
         seastar::metrics::make_counter("cluster_crypto_stall_warnings",
             [this] { return _transport->crypto_stall_warnings(); },
             seastar::metrics::description("Total crypto operations exceeding stall threshold")),
@@ -158,8 +156,20 @@ void GossipService::register_metrics() {
             seastar::metrics::description("Total reactor stalls avoided via crypto offloading")),
         seastar::metrics::make_counter("cluster_crypto_handshakes_offloaded",
             [this] { return _transport->crypto_handshakes_offloaded(); },
-            seastar::metrics::description("Total DTLS handshakes offloaded to thread pool"))
+            seastar::metrics::description("Total DTLS handshakes offloaded to thread pool")),
+        seastar::metrics::make_counter("cluster_dtls_cert_reloads",
+            [this] { return _transport->dtls_cert_reloads(); },
+            seastar::metrics::description("Total number of certificate hot-reloads")),
+
+        // Overflow counters (Rule #4 debugging)
+        seastar::metrics::make_counter("cluster_dedup_peers_overflow",
+            [this] { return _protocol->dedup_peers_overflow(); },
+            seastar::metrics::description("Times dedup peer limit was reached (Rule #4)")),
+        seastar::metrics::make_counter("cluster_pending_acks_overflow",
+            [this] { return _protocol->pending_acks_overflow(); },
+            seastar::metrics::description("Times pending acks limit was reached (Rule #4)"))
     });
+#endif
 }
 
 seastar::future<> GossipService::start() {
