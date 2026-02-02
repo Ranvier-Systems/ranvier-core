@@ -19,6 +19,40 @@
 #include <chrono>
 #include <sstream>
 
+// ============================================================================
+// RouterService: Central Routing Orchestration
+// ============================================================================
+//
+// This file is the #2 load-bearing file in the codebase (per Strategic Assessment).
+// It orchestrates all routing decisions and manages cross-shard state propagation.
+//
+// HARD RULES APPLICABLE TO THIS FILE:
+// ───────────────────────────────────────────────────────────────────────────────
+//
+// Rule #1 (No Blocking on Hot Path):
+//   - route_request(), get_backend_for_prefix(), lookup() are HOT PATH functions
+//   - They run on every incoming request and MUST be lock-free
+//   - Use only thread_local g_shard_state (no cross-shard access on hot path)
+//   - All data structures are lock-free (absl::flat_hash_*, RadixTree)
+//
+// Rule #5 (Timer Ownership):
+//   - _ttl_timer, _batch_flush_timer, _draining_reaper_timer capture `this`
+//   - stop() MUST cancel all timers before member destruction
+//   - Timer callbacks check g_shard_state != nullptr as defense-in-depth
+//
+// Rule #6 (Metrics Deregistration):
+//   - Metrics lambdas capture `this` and access g_shard_state
+//   - stop() calls _metrics.clear() FIRST, before any other cleanup
+//   - This prevents Prometheus scrapes during shutdown
+//
+// Rule #14 (Cross-Shard Dispatch):
+//   - learn_route_global(), flush_route_batch() broadcast to all shards
+//   - Uses foreign_ptr pattern: wrap in foreign_ptr → submit_to → local copy
+//   - NEVER move heap-owning types directly across shards
+//
+// See .dev-context/claude-context.md for full Hard Rules documentation.
+// ============================================================================
+
 namespace ranvier {
 
 // Backend info including weight, priority, and draining state
@@ -459,6 +493,28 @@ seastar::future<> RouterService::initialize_shards() {
         });
 }
 
+// ============================================================================
+// TTL Timer Management
+// ============================================================================
+//
+// HARD RULE #5 (Timer Ownership):
+// Timer callbacks capture `this`, creating a use-after-free risk if the timer
+// fires after RouterService destruction begins. Safety is ensured by:
+//
+//   1. stop() is called before destruction (Seastar service lifecycle)
+//   2. stop() calls stop_ttl_timer() which cancels the timer
+//   3. Timer cancellation prevents NEW callbacks from being scheduled
+//
+// IMPORTANT: If a callback is already queued when cancel() is called, it may
+// still execute. The run_ttl_cleanup() callback is safe because:
+//   - It checks g_shard_state before accessing shard-local data
+//   - parallel_for_each + submit_to are async and don't block
+//   - No member variables of RouterService are accessed in the callback body
+//
+// For stricter safety (e.g., if callbacks accessed `this` members), a gate guard
+// pattern would be required: callback acquires _timer_gate.hold(), stop() closes
+// gate first, then cancels timer.
+//
 void RouterService::start_ttl_timer() {
     // Set up the timer to fire every 60 seconds
     _ttl_timer.set_callback([this] { run_ttl_cleanup(); });
@@ -539,6 +595,19 @@ void RouterService::run_ttl_cleanup() {
     });
 }
 
+// ============================================================================
+// lookup() - Prefix Cache Lookup (HOT PATH)
+// ============================================================================
+//
+// HARD RULE #1 (No Blocking on Hot Path):
+// This function runs on every incoming request. It MUST remain lock-free:
+//   - Uses only thread_local g_shard_state (no cross-shard access)
+//   - RadixTree::lookup() is O(key_length), no allocations on hit
+//   - dead_backends check uses absl::flat_hash_set (lock-free lookup)
+//   - No co_await, no mutex, no blocking I/O
+//
+// If this function ever blocks, it stalls ALL requests on this shard.
+//
 std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& tokens,
                                                  const std::string& request_id) {
     if (!g_shard_state) return std::nullopt;
@@ -606,6 +675,24 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
     return result;
 }
 
+// ============================================================================
+// route_request() - Main Routing Entry Point (HOT PATH)
+// ============================================================================
+//
+// HARD RULE #1 (No Blocking on Hot Path):
+// This is the primary entry point for all routing decisions. It MUST be lock-free:
+//   - Synchronous execution (no co_await)
+//   - Uses only shard-local state via g_shard_state
+//   - Delegates to get_backend_for_prefix() or get_random_backend() (both lock-free)
+//   - All data structures (backends map, dead_backends set) are SIMD-accelerated
+//     absl containers with O(1) average lookup
+//
+// The function extracts the routing mode from shard-local config (hot-reloadable
+// via update_routing_config) and dispatches to the appropriate strategy:
+//   - PREFIX: ART lookup + consistent hash fallback (learns routes)
+//   - HASH: Consistent hash only (baseline comparison)
+//   - RANDOM: Weighted random (no affinity)
+//
 RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
                                          const std::string& request_id,
                                          size_t prefix_boundary) {
@@ -759,6 +846,25 @@ std::optional<BackendId> RouterService::get_random_backend() {
     return candidates.back().first;
 }
 
+// ============================================================================
+// get_backend_for_prefix() - ART Lookup + Hash Fallback (HOT PATH)
+// ============================================================================
+//
+// HARD RULE #1 (No Blocking on Hot Path):
+// This function performs the core prefix-affinity routing. It MUST be lock-free:
+//   - RadixTree::lookup() traverses the ART in O(key_length) without locks
+//   - Backend filtering uses shard-local vectors and sets (no cross-shard access)
+//   - Hash computation (FNV-1a) is pure CPU with no allocations
+//   - std::sort on live_backends is O(n log n) but n is typically small (<100)
+//
+// Two-phase routing strategy:
+//   1. ART lookup for longest prefix match (cache hit = route to learned backend)
+//   2. Consistent hash fallback for cache miss (deterministic, will be learned)
+//
+// The prefix_boundary parameter enables system-message-aware routing: when set,
+// routes are stored/looked up at the shared prefix boundary rather than the
+// full token sequence, improving KV-cache reuse for multi-turn conversations.
+//
 std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
                                                                  const std::string& request_id,
                                                                  size_t prefix_boundary) {
@@ -927,6 +1033,30 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
     return selected;
 }
 
+// ============================================================================
+// learn_route_global() - Cross-Shard Route Propagation
+// ============================================================================
+//
+// HARD RULE #14 (Cross-Shard Dispatch):
+// This function broadcasts a learned route to ALL shards using smp::submit_to.
+// Cross-shard memory safety is critical:
+//
+//   - The `tokens` vector is allocated on the calling shard
+//   - Moving it directly to another shard would cause wrong-shard deallocation
+//   - We use foreign_ptr to wrap copies for safe cross-shard transfer:
+//     1. Create std::unique_ptr<vector> with copy of tokens
+//     2. Wrap in seastar::make_foreign() - tracks home shard
+//     3. Pass foreign_ptr to target shard via submit_to
+//     4. Target shard reads from foreign_ptr, creates LOCAL allocation
+//     5. When foreign_ptr destructs, cleanup returns to home shard
+//
+// This pattern is used twice:
+//   1. Gossip broadcast to shard 0 (GossipService only exists there)
+//   2. Parallel broadcast to all local shards for ART insertion
+//
+// The function is async (returns future<>) because smp::submit_to is non-blocking
+// but the caller may want to wait for propagation to complete.
+//
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                                        const std::string& request_id,
                                                        size_t prefix_boundary) {
@@ -1238,6 +1368,21 @@ seastar::future<> RouterService::stop_gossip() {
     });
 }
 
+// ============================================================================
+// Batch Flush Timer
+// ============================================================================
+//
+// HARD RULE #5 (Timer Ownership):
+// This timer callback captures `this` to access _pending_remote_routes and call
+// flush_route_batch(). Safety is ensured by the shutdown sequence in stop_gossip():
+//
+//   1. _batch_flush_timer.cancel() - prevents new callbacks
+//   2. _gossip->stop() - stops incoming routes
+//   3. flush_route_batch() - drains any remaining buffered routes
+//
+// The callback uses fire-and-forget pattern ((void)future) because timer callbacks
+// cannot return futures. Exceptions are caught and logged per Rule #9.
+//
 void RouterService::start_batch_flush_timer() {
     _batch_flush_timer.set_callback([this] {
         // Timer callbacks can't return futures, so handle errors inline
@@ -1257,6 +1402,25 @@ void RouterService::start_batch_flush_timer() {
                     RouteBatchConfig::MAX_BUFFER_SIZE);
 }
 
+// ============================================================================
+// flush_route_batch() - Batched Cross-Shard Route Distribution
+// ============================================================================
+//
+// HARD RULE #14 (Cross-Shard Dispatch):
+// This function broadcasts a batch of routes to all shards. It reduces SMP message
+// overhead from O(routes × shards) to O(batches × shards) by batching.
+//
+// Memory safety follows the same foreign_ptr pattern as learn_route_global():
+//   1. Batch is allocated on shard 0 (where GossipService runs)
+//   2. Each shard receives a foreign_ptr-wrapped copy
+//   3. Target shard creates LOCAL allocations from foreign_ptr data
+//   4. foreign_ptr destructor returns to shard 0 for cleanup
+//
+// The double-copy (batch → foreign_ptr → local_batch) is intentional:
+//   - First copy: Wrap in foreign_ptr for safe cross-shard transfer
+//   - Second copy: Create shard-local allocation for ART insertion
+//   - This ensures all memory operations happen on the correct shard's allocator
+//
 seastar::future<> RouterService::flush_route_batch() {
     if (_pending_remote_routes.empty()) {
         return seastar::make_ready_future<>();
@@ -1542,6 +1706,20 @@ void RouterService::set_pool_cleanup_callback(PoolCleanupCallback callback) {
     _pool_cleanup_callback = std::move(callback);
 }
 
+// ============================================================================
+// Draining Reaper Timer
+// ============================================================================
+//
+// HARD RULE #5 (Timer Ownership):
+// This timer callback captures `this` to access backend state and call
+// unregister_backend_global(). Safety is ensured by stop() calling
+// stop_draining_reaper() before any member destruction.
+//
+// The callback accesses:
+//   - g_shard_state (thread-local, safe)
+//   - _config.backend_drain_timeout (member, safe because stop() cancels first)
+//   - _pool_cleanup_callback (member, safe because stop() cancels first)
+//
 void RouterService::start_draining_reaper() {
     // Run the draining reaper every 5 seconds
     _draining_reaper_timer.set_callback([this] { run_draining_reaper(); });

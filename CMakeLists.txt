@@ -78,6 +78,10 @@ target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}
 # Option to disable OpenTelemetry (avoids static initialization that can block)
 option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
 
+# Option to enable debug metrics (adds scrape overhead, use for development only)
+# See BACKLOG.md Section 8.5 for rationale
+option(RANVIER_DEBUG_METRICS "Enable gossip debug metrics (crypto offload stats, overflow counters)" OFF)
+
 if(WITH_TELEMETRY)
     # OpenTelemetry C++ SDK Configuration
     # Provides distributed tracing with Zipkin HTTP export support
@@ -221,6 +225,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/main.cpp
       src/application.cpp
       src/async_persistence.cpp
+      src/config_loader.cpp
       src/crypto_offloader.cpp
       src/dtls_context.cpp
       src/gossip_consensus.cpp
@@ -240,6 +245,13 @@ static GLOBAL: Jemalloc = Jemalloc;
     )
 
     target_include_directories(ranvier_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
+
+    # Debug metrics configuration (optional)
+    # Enables 8 additional gossip metrics for crypto offload debugging
+    if(RANVIER_DEBUG_METRICS)
+        target_compile_definitions(ranvier_server PRIVATE RANVIER_DEBUG_METRICS)
+        message(STATUS "Gossip debug metrics enabled")
+    endif()
 
     # OpenTelemetry configuration (optional)
     # Note: We always use the Zipkin exporter because the OTLP exporter (which uses
@@ -323,6 +335,7 @@ gtest_discover_tests(persistence_test)
 # Config Unit Tests (Pure C++, no Seastar dependency)
 add_executable(config_test
   tests/unit/config_test.cpp
+  src/config_loader.cpp
 )
 target_include_directories(config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(config_test
@@ -424,6 +437,7 @@ gtest_discover_tests(circuit_breaker_test)
 if(Seastar_FOUND)
     add_executable(sharded_config_test
       tests/unit/sharded_config_test.cpp
+      src/config_loader.cpp
     )
     target_include_directories(sharded_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(sharded_config_test
@@ -482,6 +496,7 @@ if(Seastar_FOUND)
     add_executable(application_test
       tests/unit/application_test.cpp
       src/application.cpp
+      src/config_loader.cpp
       src/crypto_offloader.cpp
       src/gossip_consensus.cpp
       src/gossip_protocol.cpp
@@ -503,6 +518,9 @@ if(Seastar_FOUND)
     target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
     if(NOT WITH_TELEMETRY)
         target_compile_definitions(application_test PRIVATE RANVIER_NO_TELEMETRY)
+    endif()
+    if(RANVIER_DEBUG_METRICS)
+        target_compile_definitions(application_test PRIVATE RANVIER_DEBUG_METRICS)
     endif()
     target_link_libraries(application_test
       PRIVATE
