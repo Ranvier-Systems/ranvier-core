@@ -14,6 +14,43 @@
 #include "types.hpp"
 #include "node_slab.hpp"
 
+// ============================================================================
+// RadixTree: Adaptive Radix Tree (ART) for Prefix-Based Routing
+// ============================================================================
+//
+// This file is the #1 load-bearing file in the codebase (per Strategic Assessment).
+// It provides the core data structure for prefix cache lookups on every request.
+//
+// HARD RULES APPLICABLE TO THIS FILE:
+// ───────────────────────────────────────────────────────────────────────────────
+//
+// Rule #1 (No Blocking on Hot Path):
+//   - lookup(), lookup_instrumented(), find_child() are HOT PATH functions
+//   - They run on every incoming request and MUST be lock-free
+//   - O(key_length) traversal with no heap allocations on cache hit
+//   - All node access is via raw pointers (no atomic refcounting)
+//
+// Rule #4 (Bounded Memory via Slab Allocator):
+//   - All nodes allocated via NodeSlab (shard-local free-list allocator)
+//   - insert() triggers LRU eviction when route_count >= max_routes
+//   - evict_oldest() / evict_oldest_remote() implement LRU policy
+//   - compact() reclaims memory from tombstoned nodes periodically
+//   - Node transitions (Node4→Node16→Node48→Node256) use slab, not heap
+//
+// Rule #9 (Per-Shard Data Structures):
+//   - RadixTree instances are shard-local (via g_shard_state->tree)
+//   - NodeSlab is thread_local (accessed via get_node_slab())
+//   - No cross-shard pointers - all nodes belong to the owning shard
+//   - std::unique_ptr ownership prevents accidental cross-shard sharing
+//
+// Rule #14 (Cross-Shard Dispatch Safety):
+//   - Data inserted into the tree MUST be locally allocated on this shard
+//   - RouterService handles foreign_ptr unwrapping before calling insert()
+//   - Never pass heap-owning types (vector, string) directly across shards
+//
+// See .dev-context/claude-context.md for full Hard Rules documentation.
+// ============================================================================
+
 /*
 Adaptive Radix Tree (ART) Implementation
 
@@ -177,6 +214,26 @@ public:
     // Public API
     // -------------------------------------------------------------------------
 
+    // =========================================================================
+    // insert() - Route Insertion with Slab Allocation
+    // =========================================================================
+    //
+    // HARD RULE #4 (Bounded Memory via Slab Allocator):
+    // All node allocations go through NodeSlab (shard-local free-list):
+    //   - make_node<NodeT>() allocates from pre-allocated pools
+    //   - Node transitions (Node4→Node16→Node48→Node256) use slab
+    //   - No direct heap allocation (std::make_unique bypassed)
+    //
+    // HARD RULE #14 (Cross-Shard Dispatch Safety):
+    // The tokens span MUST reference locally-allocated memory:
+    //   - RouterService unwraps foreign_ptr and creates local copy
+    //   - Never pass heap-owning types directly from other shards
+    //   - The span itself is safe (just a view, no ownership)
+    //
+    // LRU eviction is handled by the caller (RouterService) before insert:
+    //   - Caller checks: if (route_count() >= max_routes) evict_oldest()
+    //   - This keeps eviction policy in the service layer
+    //
     void insert(std::span<const TokenId> tokens, BackendId backend,
                 RouteOrigin origin = RouteOrigin::LOCAL) {
         size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
@@ -190,8 +247,22 @@ public:
         return lookup_recursive(root_.get(), tokens);
     }
 
-    // Instrumented lookup that returns performance metrics alongside the result
-    // Use this variant when you need to track prefix skip lengths for metrics
+    // =========================================================================
+    // lookup_instrumented() - Prefix Cache Lookup (HOT PATH)
+    // =========================================================================
+    //
+    // HARD RULE #1 (No Blocking on Hot Path):
+    // This function runs on every incoming request. It MUST remain lock-free:
+    //   - O(key_length) traversal via iterative loop (no recursion overhead)
+    //   - No heap allocations on cache hit (span is a view, not a copy)
+    //   - No mutex, no atomics, no cross-shard access
+    //   - LRU timestamp update is the only write (single steady_clock::now())
+    //
+    // Returns LookupResult with:
+    //   - backend: The matched BackendId (if found)
+    //   - prefix_tokens_skipped: Tokens matched via path compression
+    //   - nodes_traversed: Number of nodes visited (for metrics)
+    //
     LookupResult lookup_instrumented(std::span<const TokenId> tokens) {
         return lookup_with_stats(root_.get(), tokens);
     }
@@ -313,6 +384,24 @@ public:
         return removed;
     }
 
+    // =========================================================================
+    // evict_oldest() / evict_oldest_remote() - LRU Eviction Policy
+    // =========================================================================
+    //
+    // HARD RULE #4 (Bounded Memory):
+    // These methods enforce the LRU eviction policy to prevent unbounded growth:
+    //   - evict_oldest(): Evicts the least-recently-accessed route (any origin)
+    //   - evict_oldest_remote(): Prefers evicting REMOTE routes first
+    //
+    // Eviction strategy:
+    //   1. Find leaf with oldest last_accessed timestamp
+    //   2. Clear leaf_value (tombstone the route)
+    //   3. Decrement route_count_
+    //   4. compact() later reclaims empty nodes and returns memory to slab
+    //
+    // Called by RouterService before insert() when at capacity:
+    //   while (tree->route_count() >= max_routes) tree->evict_oldest();
+    //
     bool evict_oldest() {
         Node* oldest = find_oldest_leaf(root_.get(), std::nullopt);
         if (oldest && oldest->leaf_value.has_value()) {
@@ -343,6 +432,19 @@ public:
     // =========================================================================
     // Tree Compaction - Reclaims memory from tombstoned nodes
     // =========================================================================
+    //
+    // HARD RULE #4 (Bounded Memory):
+    // compact() is the second phase of memory management (after LRU eviction):
+    //   - Phase 1: evict_oldest() tombstones routes (clears leaf_value)
+    //   - Phase 2: compact() reclaims empty nodes and shrinks oversized nodes
+    //
+    // Compaction returns memory to NodeSlab free lists:
+    //   - Empty nodes (no leaf, no children) → deleted via SlabNodeDeleter
+    //   - Oversized nodes (e.g., Node256 with 4 children) → shrunk to smaller type
+    //   - Shrinking creates new node via slab, old node returned to slab
+    //
+    // Called periodically by RouterService TTL timer (every 60s).
+    //
 
     // Compact the tree by removing empty nodes and optionally shrinking oversized nodes.
     // Call periodically (e.g., every 60s) to reclaim memory after route deletions.
@@ -366,6 +468,19 @@ private:
     // -------------------------------------------------------------------------
     // Slab Allocator Access
     // -------------------------------------------------------------------------
+    //
+    // HARD RULE #9 (Per-Shard Data Structures):
+    // NodeSlab is thread_local - each shard has its own allocator:
+    //   - get_node_slab() returns the shard-local slab instance
+    //   - Initialized by ShardLocalState::init() in RouterService
+    //   - No cross-shard sharing of slab or nodes
+    //
+    // HARD RULE #4 (Bounded Memory):
+    // Slab provides bounded, predictable memory allocation:
+    //   - Pre-allocated pools per node type (Node4/16/48/256)
+    //   - Free-list recycling (no fragmentation)
+    //   - SlabNodeDeleter returns nodes to free list on destruction
+    //
 
     // Get the thread-local slab allocator
     NodeSlab* slab() const {
@@ -448,8 +563,16 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Child Access Operations
+    // Child Access Operations (HOT PATH)
     // -------------------------------------------------------------------------
+    //
+    // HARD RULE #1 (No Blocking on Hot Path):
+    // find_child() is called on every tree traversal step. It MUST be lock-free:
+    //   - Node4/Node16: O(n) linear scan (n <= 16, cache-friendly)
+    //   - Node48: O(1) index lookup with collision fallback
+    //   - Node256: O(1) direct array access with key verification
+    //   - No heap allocations, no atomics, no cross-shard access
+    //
 
     // Find child by key - hot path, optimized for common cases
     Node* find_child(Node* node, TokenId key) const {
@@ -623,8 +746,26 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Node Growth Operations
+    // Node Growth Operations (Node4 → Node16 → Node48 → Node256)
     // -------------------------------------------------------------------------
+    //
+    // HARD RULE #4 (Bounded Memory via Slab Allocator):
+    // Node transitions allocate larger nodes via make_node<NodeT>():
+    //   - grow_to_node16(): Node4 full (4 children) → Node16
+    //   - grow_to_node48(): Node16 full (16 children) → Node48
+    //   - grow_to_node256(): Node48 full (48 children) → Node256
+    //
+    // All allocations use NodeSlab (shard-local free-list):
+    //   - Pre-allocated pools per node type
+    //   - O(1) allocation from free list (no malloc on hot path)
+    //   - Old node returned to slab when unique_ptr destructs
+    //
+    // HARD RULE #9 (Per-Shard Data Structures):
+    // Nodes are shard-local - never shared across shards:
+    //   - std::unique_ptr ensures single ownership
+    //   - SlabNodeDeleter returns nodes to THIS shard's free list
+    //   - No atomic refcounting (unlike std::shared_ptr)
+    //
 
     static void copy_node_metadata(Node* dest, Node* src) {
         dest->prefix = std::move(src->prefix);
@@ -1013,8 +1154,16 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Instrumented Lookup Implementation
+    // Instrumented Lookup Implementation (HOT PATH)
     // -------------------------------------------------------------------------
+    //
+    // HARD RULE #1 (No Blocking on Hot Path):
+    // lookup_with_stats() implements the core traversal algorithm:
+    //   - Iterative (not recursive) to avoid stack overhead
+    //   - O(key_length) complexity, bounded by input size
+    //   - Only writes: LRU timestamp update (single steady_clock::now())
+    //   - No heap allocations during traversal
+    //
 
     // Lookup with performance instrumentation
     // Returns LookupResult with prefix_tokens_skipped and nodes_traversed
@@ -1134,8 +1283,15 @@ private:
     }
 
     // -------------------------------------------------------------------------
-    // Lookup Implementation
+    // Lookup Implementation (HOT PATH)
     // -------------------------------------------------------------------------
+    //
+    // HARD RULE #1 (No Blocking on Hot Path):
+    // lookup_recursive() is the non-instrumented fast path:
+    //   - Same guarantees as lookup_with_stats() but without metrics
+    //   - Iterative despite the name (optimized from original recursive impl)
+    //   - Used when metrics overhead is not needed
+    //
 
     // Iterative lookup for better performance (no recursion overhead)
     std::optional<BackendId> lookup_recursive(Node* node, std::span<const TokenId> tokens) {
