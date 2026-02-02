@@ -37,4 +37,4 @@ private:
     seastar::future<bool> check_backend(seastar::socket_address addr);
 };
 
-}
+}  // namespace ranvier
