@@ -2,7 +2,9 @@
 
 > **48% faster Time-To-First-Token** through intelligent prefix-aware routing.
 >
-> A high-performance LLM traffic controller that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
+> *Named for the Nodes of Ranvier—enabling signals to jump gaps, just as Ranvier enables inference to skip redundant computation.*
+
+A high-performance LLM traffic controller that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
 
 ```bash
 # Quick start (requires Docker)
@@ -251,3 +253,7 @@ See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed co
   - [Gossip Protocol](docs/internals/gossip-protocol.md)
   - [Radix Tree](docs/internals/radix-tree.md)
   - [Prefix Affinity Routing](docs/internals/prefix-affinity-routing.md)
+
+---
+
+Ranvier is a project of Minds Aspire, LLC.
