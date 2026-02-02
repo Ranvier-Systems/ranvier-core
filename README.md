@@ -6,6 +6,8 @@
 
 A high-performance LLM traffic controller that reduces GPU cache thrashing by routing requests based on **Token Prefixes** rather than connection availability.
 
+**Best for:** RAG, multi-turn chat with system prompts, few-shot learning. **Less benefit for:** short prompts (<500 tokens), small models (<8B).
+
 ```bash
 # Quick start (requires Docker)
 docker run -p 8080:8080 ghcr.io/ranvier-systems/ranvier:latest
