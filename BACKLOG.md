@@ -20,6 +20,7 @@ This document identifies missing features and optimizations required to promote 
 8. [Strategic Assessment (2026-01-19)](#8-strategic-assessment-2026-01-19)
 9. [Benchmark Extensions](#9-benchmark-extensions)
 10. [Load-Aware Prefix Routing](#10-load-aware-prefix-routing)
+11. [System Architecture Audit (2026-02-02)](#11-system-architecture-audit-2026-02-02)
 
 ---
 
@@ -1670,6 +1671,146 @@ These are NOT part of this implementation but documented for future reference:
 2. **Option 3: Adaptive Mode** - Simple threshold-based fallback to round-robin under system-wide heavy load
 3. **vLLM Queue Polling** - Query vLLM `/metrics` for actual inference queue depth (more accurate than in-flight count)
 4. **Latency-Based Estimation** - Infer queue depth from recent response times
+
+---
+
+## 11. System Architecture Audit (2026-02-02)
+
+> **Audit Date:** 2026-02-02
+> **Scope:** Holistic system audit covering architecture layers, Hard Rules (0-15), and async integrity
+
+### 11.1 Audit Summary
+
+| Category | Status | Issues |
+|----------|--------|--------|
+| Architecture Layers | ✓ Compliant | 0 violations |
+| Hard Rules 0-7 | ⚠ Violations | 7 issues |
+| Hard Rules 8-15 | ⚠ Violations | 27+ issues |
+| Async Integrity | ⚠ Mixed | 3 issues |
+
+### 11.2 Hard Rules Compliance Matrix
+
+```
+[X] Compliant: Rules #1, #3, #4, #6, #7, #8, #11, #13, #14, #15
+[!] Violations Found: Rules #0, #2, #5, #9, #10, #12
+[?] Not Applicable: (none)
+```
+
+### 11.3 Critical Violations (Requiring Immediate Attention)
+
+#### Rule #5: Timer callbacks with [this] must acquire gate guards
+
+- [ ] **[CRITICAL] RouterService TTL timer missing gate guard**
+  _File:Line:_ `src/router_service.cpp:520-523`
+  _Issue:_ Timer callback `[this] { run_ttl_cleanup(); }` does not acquire gate holder
+  _Fix:_ Add `seastar::gate::holder holder = _timer_gate.hold();` at start of `run_ttl_cleanup()` (line 562)
+
+- [ ] **[CRITICAL] RouterService batch flush timer missing gate guard**
+  _File:Line:_ `src/router_service.cpp:1387-1398`
+  _Issue:_ Timer callback `[this] { flush_route_batch()... }` does not acquire gate holder
+  _Fix:_ Add gate holder acquisition at start of `flush_route_batch()` (line 1424)
+
+- [ ] **[CRITICAL] RouterService draining reaper timer missing gate guard**
+  _File:Line:_ `src/router_service.cpp:1725-1729`
+  _Issue:_ Timer callback `[this] { run_draining_reaper(); }` does not acquire gate holder
+  _Fix:_ Add gate holder acquisition at start of `run_draining_reaper()` (line 1736)
+
+- [ ] **[HIGH] K8sDiscoveryService poll timer uses boolean instead of gate**
+  _File:Line:_ `src/k8s_discovery_service.cpp:146-154`
+  _Issue:_ Timer callback checks `_running` boolean instead of acquiring gate holder
+  _Fix:_ Replace `if (_running)` check with gate holder pattern (try_with_gate or hold())
+
+#### Rule #9: Every catch block must log at warn level
+
+- [ ] **[CRITICAL] 11 silent catch blocks missing warn-level logging**
+  _Locations:_
+  - `src/config_loader.cpp:243-245` - Silent catch
+  - `src/config_loader.cpp:340-342` - Silent catch
+  - `src/config_loader.cpp:428-430` - Silent catch
+  - `src/http_controller.cpp:53-55` - Silent catch
+  - `src/http_controller.cpp:327-333` - Debug logging, should be warn
+  - `src/http_controller.cpp:1245-1248` - Exception captured but not logged
+  - `src/http_controller.cpp:1475-1478` - Silent catch
+  - `src/application.cpp:832-834` - Silent catch
+  - `src/application.cpp:844-846` - Silent catch
+  - `src/k8s_discovery_service.cpp:356-358` - Silent catch
+  - `src/k8s_discovery_service.cpp:188-190` - Debug logging, should be warn
+  _Fix:_ Add `log_*.warn("Operation failed: {}", ex.what())` with context in each catch block
+
+#### Rule #10: No bare std::stoi/stol/stof on external input
+
+- [ ] **[CRITICAL] 16 bare std::stoi/stoul calls on external input**
+  _Locations:_
+  - `src/http_controller.cpp:1354, 1445, 1446, 1451, 1454, 1542, 1577, 1840, 2006` - HTTP request parsing
+  - `src/k8s_discovery_service.cpp:58, 551, 949, 974` - K8s API parsing
+  - `src/gossip_consensus.cpp:422` - Peer address parsing
+  - `src/gossip_protocol.cpp:857` - Peer address parsing
+  - `src/router_service.cpp:1566` - Backend address parsing
+  _Fix:_ Create validating helpers (e.g., `parse_port()`, `parse_int()`) returning `std::optional<T>` using `std::from_chars`
+
+### 11.4 Medium Severity Violations
+
+#### Rule #0: Prefer unique_ptr over shared_ptr
+
+- [ ] **[MEDIUM] std::shared_ptr in Application**
+  _File:Line:_ `src/application.hpp:144`
+  _Issue:_ `std::shared_ptr<seastar::promise<>> _stop_signal;`
+  _Fix:_ Evaluate if `unique_ptr` or `lw_shared_ptr` can replace
+
+- [ ] **[MEDIUM] std::shared_ptr in TracingService (OpenTelemetry)**
+  _File:Line:_ `src/tracing_service.cpp:139`
+  _Issue:_ `static std::shared_ptr<sdk_trace::TracerProvider> g_provider;`
+  _Note:_ Required by OpenTelemetry API - document as known exception
+
+#### Rule #2: No co_await inside loops over external resources
+
+- [ ] **[HIGH] Sequential co_await in K8s endpoint removal loop**
+  _File:Line:_ `src/k8s_discovery_service.cpp:640-648`
+  _Issue:_ `for (...) { co_await handle_endpoint_removed(...); }` - O(n) latency
+  _Fix:_ Replace with `seastar::max_concurrent_for_each()` pattern
+
+#### Rule #12: No std::ifstream/ofstream in Seastar code
+
+- [ ] **[MEDIUM] Blocking std::ifstream during startup**
+  _Locations:_
+  - `src/main.cpp:45` - Config file reading
+  - `src/main.cpp:70` - Tokenizer file validation
+  - `src/main.cpp:180` - Config check
+  - `src/config_loader.cpp:460` - Config loading
+  _Note:_ These occur during startup before reactor starts. Document as acceptable startup exception.
+
+### 11.5 Async Integrity Issues
+
+#### Sequential Health Checks (Rule #2 Related)
+
+- [ ] **[HIGH] Health service sequential backend checks**
+  _File:Line:_ `src/health_service.cpp:41-52`
+  _Issue:_ Sequential `for (auto id : ids) { co_await check_backend(...); }` blocks health cycle
+  _Impact:_ N backends × 3s timeout = N×3 seconds per cycle (100 backends = 5 minutes)
+  _Fix:_ Replace with `seastar::max_concurrent_for_each(ids, 16, [this](auto id) {...})`
+
+#### Fire-and-Forget Loop Lifecycle
+
+- [ ] **[HIGH] Health service run_loop() not properly tracked**
+  _File:Line:_ `src/health_service.cpp:18-22`
+  _Issue:_ `(void)run_loop();` casts future to void; gate holder created per-iteration not per-loop
+  _Fix:_ Either co_await run_loop() in start() or maintain gate holder across entire loop lifetime
+
+### 11.6 Architecture Compliance (PASSED)
+
+The codebase maintains excellent layer separation:
+- **Controller Layer** (http_controller.cpp): Only calls services, no direct persistence access ✓
+- **Service Layer** (router_service, tokenizer_service, gossip_service): Contains all business logic ✓
+- **Persistence Layer** (sqlite_persistence, async_persistence): Only stores/retrieves data ✓
+- **Gossip Layer**: Uses callback pattern, no direct persistence calls ✓
+
+### 11.7 Positive Patterns Observed
+
+1. ✓ FFI boundary reallocations (Rule #15) properly implemented in tokenizer_thread_pool.cpp
+2. ✓ Cross-shard data transfer uses foreign_ptr (Rule #14) in router_service.cpp
+3. ✓ Metrics deregistration in stop() (Rule #6) across all services
+4. ✓ Bounded containers with MAX_SIZE checks (Rule #4) in gossip_protocol.cpp
+5. ✓ Null-guard helper for SQLite (Rule #3) in sqlite_persistence.cpp
 
 ---
 
