@@ -1758,10 +1758,11 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Rule #0: Prefer unique_ptr over shared_ptr
 
-- [ ] **[MEDIUM] std::shared_ptr in Application**
+- [x] **[MEDIUM] std::shared_ptr in Application**
   _File:Line:_ `src/application.hpp:144`
   _Issue:_ `std::shared_ptr<seastar::promise<>> _stop_signal;`
   _Fix:_ Evaluate if `unique_ptr` or `lw_shared_ptr` can replace
+  _Completed:_ 2026-02-03. Changed to `std::unique_ptr` - no shared ownership needed, all access is through `this` pointer in lambdas.
 
 - [ ] **[MEDIUM] std::shared_ptr in TracingService (OpenTelemetry)**
   _File:Line:_ `src/tracing_service.cpp:139`
