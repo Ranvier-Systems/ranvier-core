@@ -1779,13 +1779,13 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Rule #12: No std::ifstream/ofstream in Seastar code
 
-- [ ] **[MEDIUM] Blocking std::ifstream during startup**
+- [x] **[MEDIUM] Blocking std::ifstream during startup**
   _Locations:_
-  - `src/main.cpp:45` - Config file reading
-  - `src/main.cpp:70` - Tokenizer file validation
-  - `src/main.cpp:180` - Config check
-  - `src/config_loader.cpp:460` - Config loading
-  _Note:_ These occur during startup before reactor starts. Document as acceptable startup exception.
+  - `src/main.cpp:45` - Config file reading in `run_dry_run_validation()`
+  - `src/main.cpp:70` - Tokenizer file validation in `run_dry_run_validation()`
+  - `src/main.cpp:180` - Config check in `print_config_summary()`
+  - `src/config_loader.cpp:467` - Config loading in `RanvierConfig::load()`
+  _Resolution:_ Known exception - all usages occur before `app.run()` (line 373) in the pre-reactor startup phase. Configuration must be loaded before the Seastar reactor can be configured. Blocking I/O is acceptable and necessary here.
 
 ### 11.5 Async Integrity Issues
 
