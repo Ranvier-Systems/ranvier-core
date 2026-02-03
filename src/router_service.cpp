@@ -3,6 +3,7 @@
 #include "logging.hpp"
 #include "metrics_service.hpp"
 #include "node_slab.hpp"
+#include "parse_utils.hpp"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/sharded.hh>
@@ -1596,11 +1597,8 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
                                          (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
                 if (is_port_separator) {
                     bs.address = addr_str.substr(0, colon_pos);
-                    try {
-                        bs.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
-                    } catch (const std::exception&) {
-                        bs.port = 0;  // Failed to parse port
-                    }
+                    auto port_opt = parse_port(std::string_view(addr_str).substr(colon_pos + 1));
+                    bs.port = port_opt.value_or(0);
                 } else {
                     bs.address = addr_str;
                     bs.port = 0;
