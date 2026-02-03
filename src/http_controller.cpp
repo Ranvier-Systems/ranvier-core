@@ -1,5 +1,6 @@
 #include "http_controller.hpp"
 #include "logging.hpp"
+#include "parse_utils.hpp"
 #include "request_rewriter.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"
@@ -1359,15 +1360,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id;
-    try {
-        backend_id = std::stoi(std::string(id_str));
-    } catch (const std::exception& e) {
-        log_control.warn("POST /admin/routes: invalid backend_id '{}': {}", id_str, e.what());
+    auto backend_id_opt = parse_backend_id(std::string_view(id_str));
+    if (!backend_id_opt) {
+        log_control.warn("POST /admin/routes: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
+    int backend_id = *backend_id_opt;
 
     std::vector<int32_t> tokens;
     // Use string_view for zero-copy tokenization
@@ -1447,28 +1447,42 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         co_return std::move(rep);
     }
 
-    int id, port;
+    auto id_opt = parse_int32(std::string_view(id_str));
+    auto port_opt = parse_port(std::string_view(port_str));
+
+    if (!id_opt || !port_opt) {
+        log_control.warn("POST /admin/backends: invalid parameter (id={}, port={})",
+            id_str, port_str);
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"Invalid parameter: id must be integer, port must be 1-65535\"}");
+        co_return std::move(rep);
+    }
+
+    int id = *id_opt;
+    uint16_t port = *port_opt;
     uint32_t weight = 100;
     uint32_t priority = 0;
 
-    try {
-        id = std::stoi(std::string(id_str));
-        port = std::stoi(std::string(port_str));
-        if (port < 1 || port > 65535) {
-            throw std::out_of_range("port out of range");
+    if (!weight_str.empty()) {
+        auto weight_opt = parse_uint32(std::string_view(weight_str));
+        if (!weight_opt) {
+            log_control.warn("POST /admin/backends: invalid weight '{}'", weight_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid weight: must be a non-negative integer\"}");
+            co_return std::move(rep);
         }
-        if (!weight_str.empty()) {
-            weight = static_cast<uint32_t>(std::stoi(std::string(weight_str)));
+        weight = *weight_opt;
+    }
+
+    if (!priority_str.empty()) {
+        auto priority_opt = parse_uint32(std::string_view(priority_str));
+        if (!priority_opt) {
+            log_control.warn("POST /admin/backends: invalid priority '{}'", priority_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid priority: must be a non-negative integer\"}");
+            co_return std::move(rep);
         }
-        if (!priority_str.empty()) {
-            priority = static_cast<uint32_t>(std::stoi(std::string(priority_str)));
-        }
-    } catch (const std::exception& e) {
-        log_control.warn("POST /admin/backends: invalid parameter (id={}, port={}, weight={}, priority={}): {}",
-            id_str, port_str, weight_str, priority_str, e.what());
-        rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->write_body("json", "{\"error\": \"Invalid parameter: id, port, weight, and priority must be valid integers\"}");
-        co_return std::move(rep);
+        priority = *priority_opt;
     }
 
     // Resolve address: supports both direct IP addresses and hostnames
@@ -1480,7 +1494,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     try {
         auto ip_string = std::string(ip_str);
         seastar::net::inet_address parsed_addr{ip_string};
-        addr = seastar::socket_address(parsed_addr, static_cast<uint16_t>(port));
+        addr = seastar::socket_address(parsed_addr, port);
         resolved_ip = ip_string;
     } catch (const std::exception& e) {
         // Not a valid IP address - this is expected flow for hostnames, not an error.
@@ -1504,7 +1518,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
                 co_return std::move(rep);
             }
 
-            addr = seastar::socket_address(hostent.addr_list[0], static_cast<uint16_t>(port));
+            addr = seastar::socket_address(hostent.addr_list[0], port);
             // Convert resolved address back to string for logging/persistence
             std::ostringstream oss;
             oss << hostent.addr_list[0];
@@ -1523,7 +1537,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
     // Queue backend for async persistence (fire-and-forget, non-blocking)
     // Store the resolved IP, not the hostname, for persistence
     if (_persistence) {
-        _persistence->queue_save_backend(id, resolved_ip, static_cast<uint16_t>(port), weight, priority);
+        _persistence->queue_save_backend(id, resolved_ip, port, weight, priority);
     }
 
     co_await _router.register_backend_global(id, addr, weight, priority);
@@ -1550,15 +1564,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int id;
-    try {
-        id = std::stoi(std::string(id_str));
-    } catch (const std::exception& e) {
-        log_control.warn("DELETE /admin/backends: invalid id '{}': {}", id_str, e.what());
+    auto id_opt = parse_int32(std::string_view(id_str));
+    if (!id_opt) {
+        log_control.warn("DELETE /admin/backends: invalid id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
+    int id = *id_opt;
 
     // Queue removal for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
@@ -1585,15 +1598,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id;
-    try {
-        backend_id = std::stoi(std::string(id_str));
-    } catch (const std::exception& e) {
-        log_control.warn("DELETE /admin/routes: invalid backend_id '{}': {}", id_str, e.what());
+    auto backend_id_opt = parse_backend_id(std::string_view(id_str));
+    if (!backend_id_opt) {
+        log_control.warn("DELETE /admin/routes: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
+    int backend_id = *backend_id_opt;
 
     // Queue routes removal for async persistence (fire-and-forget, non-blocking)
     if (_persistence) {
@@ -1849,14 +1861,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_tree(
         std::istringstream iss{prefix_string};
         std::string token_str;
         while (std::getline(iss, token_str, ',')) {
-            try {
-                prefix_filter.push_back(std::stoi(token_str));
-            } catch (const std::exception& e) {
+            auto token_opt = parse_token_id(std::string_view(token_str));
+            if (!token_opt) {
                 log_control.warn("GET /admin/dump/tree: invalid prefix token '{}'", token_str);
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->write_body("json", "{\"error\": \"Invalid prefix token ID\"}");
                 return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
             }
+            prefix_filter.push_back(*token_opt);
         }
     }
 
@@ -2014,15 +2026,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_back
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
 
-    int backend_id;
-    try {
-        backend_id = std::stoi(std::string(id_str));
-    } catch (const std::exception& e) {
-        log_control.warn("POST /admin/drain: invalid backend_id '{}': {}", id_str, e.what());
+    auto backend_id_opt = parse_backend_id(std::string_view(id_str));
+    if (!backend_id_opt) {
+        log_control.warn("POST /admin/drain: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
     }
+    int backend_id = *backend_id_opt;
 
     log_control.info("POST /admin/drain: initiating drain for backend {}", backend_id);
 

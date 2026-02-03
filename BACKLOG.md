@@ -1746,12 +1746,13 @@ These are NOT part of this implementation but documented for future reference:
 
 - [ ] **[CRITICAL] 16 bare std::stoi/stoul calls on external input**
   _Locations:_
-  - `src/http_controller.cpp:1354, 1445, 1446, 1451, 1454, 1542, 1577, 1840, 2006` - HTTP request parsing
+  - ~~`src/http_controller.cpp:1354, 1445, 1446, 1451, 1454, 1542, 1577, 1840, 2006` - HTTP request parsing~~ ✓ Fixed 2026-02-03
   - `src/k8s_discovery_service.cpp:58, 551, 949, 974` - K8s API parsing
   - `src/gossip_consensus.cpp:422` - Peer address parsing
   - `src/gossip_protocol.cpp:857` - Peer address parsing
   - `src/router_service.cpp:1566` - Backend address parsing
   _Fix:_ Create validating helpers (e.g., `parse_port()`, `parse_int()`) returning `std::optional<T>` using `std::from_chars`
+  _Progress:_ Created `src/parse_utils.hpp` with `parse_int32()`, `parse_uint32()`, `parse_port()`, `parse_token_id()`, `parse_backend_id()` using `std::from_chars`. HTTP controller (9 locations) fixed 2026-02-03.
 
 ### 11.4 Medium Severity Violations
 
