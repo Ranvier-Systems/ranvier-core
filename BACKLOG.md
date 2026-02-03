@@ -1764,10 +1764,10 @@ These are NOT part of this implementation but documented for future reference:
   _Fix:_ Evaluate if `unique_ptr` or `lw_shared_ptr` can replace
   _Completed:_ 2026-02-03. Changed to `std::unique_ptr` - no shared ownership needed, all access is through `this` pointer in lambdas.
 
-- [ ] **[MEDIUM] std::shared_ptr in TracingService (OpenTelemetry)**
+- [x] **[MEDIUM] std::shared_ptr in TracingService (OpenTelemetry)**
   _File:Line:_ `src/tracing_service.cpp:139`
   _Issue:_ `static std::shared_ptr<sdk_trace::TracerProvider> g_provider;`
-  _Note:_ Required by OpenTelemetry API - document as known exception
+  _Resolution:_ Known exception - OpenTelemetry C++ SDK requires `shared_ptr<TracerProvider>` for `opentelemetry::trace::Provider::SetTracerProvider()`. Cannot use unique_ptr without forking the SDK.
 
 #### Rule #2: No co_await inside loops over external resources
 
