@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -240,8 +241,10 @@ void RanvierConfig::apply_env_overrides() {
             backpressure.persistence_queue_threshold = std::stod(*v);
             if (backpressure.persistence_queue_threshold < 0.0) backpressure.persistence_queue_threshold = 0.0;
             if (backpressure.persistence_queue_threshold > 1.0) backpressure.persistence_queue_threshold = 1.0;
-        } catch (...) {
-            // Ignore invalid values
+        } catch (const std::exception& e) {
+            // Rule #9: Log at warn level (pre-Seastar, use std::cerr)
+            std::cerr << "[WARN] Invalid RANVIER_BACKPRESSURE_PERSISTENCE_THRESHOLD value '"
+                      << *v << "': " << e.what() << " - using default\n";
         }
     }
     if (auto v = get_env_as<uint32_t>("RANVIER_BACKPRESSURE_RETRY_AFTER")) {
@@ -337,8 +340,10 @@ void RanvierConfig::apply_env_overrides() {
             cluster.quorum_threshold = std::stod(*v);
             if (cluster.quorum_threshold < 0.0) cluster.quorum_threshold = 0.0;
             if (cluster.quorum_threshold > 1.0) cluster.quorum_threshold = 1.0;
-        } catch (...) {
-            // Ignore invalid values
+        } catch (const std::exception& e) {
+            // Rule #9: Log at warn level (pre-Seastar, use std::cerr)
+            std::cerr << "[WARN] Invalid RANVIER_CLUSTER_QUORUM_THRESHOLD value '"
+                      << *v << "': " << e.what() << " - using default\n";
         }
     }
     if (auto v = get_env("RANVIER_CLUSTER_REJECT_ROUTES_ON_QUORUM_LOSS")) {
@@ -425,8 +430,10 @@ void RanvierConfig::apply_env_overrides() {
             telemetry.sample_rate = std::stod(*v);
             if (telemetry.sample_rate < 0.0) telemetry.sample_rate = 0.0;
             if (telemetry.sample_rate > 1.0) telemetry.sample_rate = 1.0;
-        } catch (...) {
-            // Ignore invalid values
+        } catch (const std::exception& e) {
+            // Rule #9: Log at warn level (pre-Seastar, use std::cerr)
+            std::cerr << "[WARN] Invalid RANVIER_TELEMETRY_SAMPLE_RATE value '"
+                      << *v << "': " << e.what() << " - using default\n";
         }
     }
     if (auto v = get_env_as<int>("RANVIER_TELEMETRY_EXPORT_INTERVAL_MS")) {

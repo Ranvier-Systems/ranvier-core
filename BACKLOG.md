@@ -1726,11 +1726,11 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Rule #9: Every catch block must log at warn level
 
-- [ ] **[CRITICAL] 11 silent catch blocks missing warn-level logging**
+- [ ] **[CRITICAL] 11 silent catch blocks missing warn-level logging** (3/11 fixed)
   _Locations:_
-  - `src/config_loader.cpp:243-245` - Silent catch
-  - `src/config_loader.cpp:340-342` - Silent catch
-  - `src/config_loader.cpp:428-430` - Silent catch
+  - ~~`src/config_loader.cpp:243-245` - Silent catch~~ ✓ Fixed 2026-02-03 (uses std::cerr for pre-Seastar logging)
+  - ~~`src/config_loader.cpp:340-342` - Silent catch~~ ✓ Fixed 2026-02-03
+  - ~~`src/config_loader.cpp:428-430` - Silent catch~~ ✓ Fixed 2026-02-03
   - `src/http_controller.cpp:53-55` - Silent catch
   - `src/http_controller.cpp:327-333` - Debug logging, should be warn
   - `src/http_controller.cpp:1245-1248` - Exception captured but not logged
