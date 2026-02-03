@@ -548,49 +548,72 @@ seastar::future<> RouterService::stop() {
     log_main.info("RouterService stopping: deregistering metrics");
     _metrics.clear();  // Deregister all metrics lambdas - prevents use-after-free
 
-    // Now safe to stop timers (no metrics can observe partially-destroyed state)
-    stop_ttl_timer();
-    stop_draining_reaper();
+    // ==========================================================================
+    // Rule #5: Close timer gate before cancelling timers
+    // ==========================================================================
+    //
+    // Timer callbacks capture 'this'. If a callback is already queued when we
+    // cancel the timer, it may still execute with a dangling pointer. The gate
+    // ensures we wait for any in-flight callbacks to complete before proceeding.
+    //
+    return _timer_gate.close().then([this] {
+        // Gate closed - no in-flight TTL callbacks, safe to cancel timer
+        stop_ttl_timer();
+        stop_draining_reaper();
 
-    // Stop gossip last (returns future, may have pending operations)
-    return stop_gossip().then([] {
+        // Stop gossip last (returns future, may have pending operations)
+        return stop_gossip();
+    }).then([] {
         log_main.info("RouterService stopped");
         return seastar::make_ready_future<>();
     });
 }
 
 void RouterService::run_ttl_cleanup() {
+    // Rule #5: Acquire gate holder to prevent use-after-free during shutdown.
+    // If gate is closed (service stopping), skip cleanup gracefully.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        // Expected during shutdown - gate closed before timer cancelled
+        log_main.debug("TTL cleanup skipped: service is stopping");
+        return;
+    }
+
     auto cutoff = std::chrono::steady_clock::now() - shard_state().config.ttl_seconds;
 
-    // Run cleanup and compaction on all shards
-    (void)seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
-        return seastar::smp::submit_to(shard_id, [cutoff] {
-            if (!g_shard_state) return seastar::make_ready_future<>();
-            auto& state = shard_state();
-            RadixTree* tree = state.tree.get();
-            if (tree) {
-                // Phase 1: Expire old routes (marks leaves as empty)
-                size_t removed = tree->remove_expired(cutoff);
-                if (removed > 0) {
-                    state.stats.routes_expired += removed;
-                    log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
-                }
+    // Keep gate holder alive for duration of async work via do_with
+    (void)seastar::do_with(std::move(holder), [cutoff](seastar::gate::holder&) {
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [cutoff] {
+                if (!g_shard_state) return seastar::make_ready_future<>();
+                auto& state = shard_state();
+                RadixTree* tree = state.tree.get();
+                if (tree) {
+                    // Phase 1: Expire old routes (marks leaves as empty)
+                    size_t removed = tree->remove_expired(cutoff);
+                    if (removed > 0) {
+                        state.stats.routes_expired += removed;
+                        log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
+                    }
 
-                // Phase 2: Compact tree (reclaims empty nodes, shrinks oversized nodes)
-                auto compact_stats = tree->compact();
-                state.stats.compaction_runs++;
-                state.stats.compaction_nodes_removed += compact_stats.nodes_removed;
-                state.stats.compaction_nodes_shrunk += compact_stats.nodes_shrunk;
-                state.stats.compaction_bytes_reclaimed += compact_stats.bytes_reclaimed;
-                if (compact_stats.nodes_removed > 0 || compact_stats.nodes_shrunk > 0) {
-                    log_main.debug("Shard {}: Compaction removed {} nodes, shrunk {} nodes, reclaimed {} bytes",
-                                   seastar::this_shard_id(),
-                                   compact_stats.nodes_removed,
-                                   compact_stats.nodes_shrunk,
-                                   compact_stats.bytes_reclaimed);
+                    // Phase 2: Compact tree (reclaims empty nodes, shrinks oversized nodes)
+                    auto compact_stats = tree->compact();
+                    state.stats.compaction_runs++;
+                    state.stats.compaction_nodes_removed += compact_stats.nodes_removed;
+                    state.stats.compaction_nodes_shrunk += compact_stats.nodes_shrunk;
+                    state.stats.compaction_bytes_reclaimed += compact_stats.bytes_reclaimed;
+                    if (compact_stats.nodes_removed > 0 || compact_stats.nodes_shrunk > 0) {
+                        log_main.debug("Shard {}: Compaction removed {} nodes, shrunk {} nodes, reclaimed {} bytes",
+                                       seastar::this_shard_id(),
+                                       compact_stats.nodes_removed,
+                                       compact_stats.nodes_shrunk,
+                                       compact_stats.bytes_reclaimed);
+                    }
                 }
-            }
-            return seastar::make_ready_future<>();
+                return seastar::make_ready_future<>();
+            });
         });
     });
 }

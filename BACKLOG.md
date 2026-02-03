@@ -1700,10 +1700,11 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Rule #5: Timer callbacks with [this] must acquire gate guards
 
-- [ ] **[CRITICAL] RouterService TTL timer missing gate guard**
+- [x] **[CRITICAL] RouterService TTL timer missing gate guard** ✓
   _File:Line:_ `src/router_service.cpp:520-523`
   _Issue:_ Timer callback `[this] { run_ttl_cleanup(); }` does not acquire gate holder
   _Fix:_ Add `seastar::gate::holder holder = _timer_gate.hold();` at start of `run_ttl_cleanup()` (line 562)
+  _Completed:_ 2026-02-03. Added `_timer_gate` member, gate holder acquisition in `run_ttl_cleanup()`, and gate closure in `stop()`.
 
 - [ ] **[CRITICAL] RouterService batch flush timer missing gate guard**
   _File:Line:_ `src/router_service.cpp:1387-1398`
