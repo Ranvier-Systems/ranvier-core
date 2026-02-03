@@ -637,15 +637,22 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
         });
 
     // Garbage collect endpoints no longer present in K8s
-    for (auto it = _endpoints.begin(); it != _endpoints.end(); ) {
-        if (current_uids.find(it->first) == current_uids.end()) {
-            std::string uid_to_remove = it->first;
-            it++;
-            co_await handle_endpoint_removed(uid_to_remove);
-        } else {
-            it++;
+    // Collect UIDs first, then remove in parallel (Rule #2: no co_await in loops)
+    std::vector<std::string> uids_to_remove;
+    for (const auto& [uid, ep] : _endpoints) {
+        if (current_uids.find(uid) == current_uids.end()) {
+            uids_to_remove.push_back(uid);
         }
     }
+
+    co_await seastar::max_concurrent_for_each(uids_to_remove, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+        [this](const std::string& uid) -> seastar::future<> {
+            try {
+                co_await handle_endpoint_removed(uid);
+            } catch (const std::exception& e) {
+                log_k8s.warn("Failed to remove stale endpoint {}: {}", uid, e.what());
+            }
+        });
 }
 
 seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discovered) {

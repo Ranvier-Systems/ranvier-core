@@ -1771,10 +1771,11 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Rule #2: No co_await inside loops over external resources
 
-- [ ] **[HIGH] Sequential co_await in K8s endpoint removal loop**
+- [x] **[HIGH] Sequential co_await in K8s endpoint removal loop**
   _File:Line:_ `src/k8s_discovery_service.cpp:640-648`
   _Issue:_ `for (...) { co_await handle_endpoint_removed(...); }` - O(n) latency
   _Fix:_ Replace with `seastar::max_concurrent_for_each()` pattern
+  _Completed:_ 2026-02-03. Refactored to collect UIDs first, then process with `max_concurrent_for_each()` using `K8S_MAX_CONCURRENT_ENDPOINT_OPS` concurrency limit.
 
 #### Rule #12: No std::ifstream/ofstream in Seastar code
 
