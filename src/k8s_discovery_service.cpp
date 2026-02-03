@@ -198,27 +198,30 @@ seastar::future<> K8sDiscoveryService::resync() {
 }
 
 seastar::future<> K8sDiscoveryService::load_service_account_token() {
-    return seastar::file_exists(_config.token_path).then([this](bool exists) {
-        if (!exists) {
-            log_k8s.warn("Token file not found at {} - continuing without auth", _config.token_path);
-            return seastar::make_ready_future<>();
-        }
+    bool exists = co_await seastar::file_exists(_config.token_path);
+    if (!exists) {
+        log_k8s.warn("Token file not found at {} - continuing without auth", _config.token_path);
+        co_return;
+    }
 
-        return seastar::open_file_dma(_config.token_path, seastar::open_flags::ro)
-            .then([](seastar::file f) {
-                return seastar::make_file_input_stream(f).read_exactly(4096); // Tokens are usually small
-            }).then([this](seastar::temporary_buffer<char> buf) {
-                _bearer_token = std::string(buf.get(), buf.size());
+    try {
+        auto file = co_await seastar::open_file_dma(_config.token_path, seastar::open_flags::ro);
+        auto stream = seastar::make_file_input_stream(file);
+        auto buf = co_await stream.read_exactly(4096);  // Tokens are usually small
 
-                // Trim whitespace
-                _bearer_token.erase(_bearer_token.find_last_not_of(" \n\r\t") + 1);
-                _bearer_token.erase(0, _bearer_token.find_first_not_of(" \n\r\t"));
+        _bearer_token = std::string(buf.get(), buf.size());
 
-                log_k8s.debug("Loaded service account token ({} bytes)", _bearer_token.size());
-            });
-    }).handle_exception([this](auto ep) {
-        log_k8s.warn("Could not load service account token: {} - continuing without auth", ep);
-    });
+        // Trim whitespace
+        _bearer_token.erase(_bearer_token.find_last_not_of(" \n\r\t") + 1);
+        _bearer_token.erase(0, _bearer_token.find_first_not_of(" \n\r\t"));
+
+        log_k8s.debug("Loaded service account token ({} bytes)", _bearer_token.size());
+
+        co_await stream.close();
+        co_await file.close();
+    } catch (const std::exception& e) {
+        log_k8s.warn("Could not load service account token: {} - continuing without auth", e.what());
+    }
 }
 
 seastar::future<std::string> K8sDiscoveryService::load_ca_cert(const std::string& path) {
