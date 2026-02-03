@@ -1,0 +1,35 @@
+{
+  "version": "1.0.0",
+  "description": "Benchmark baseline for Ranvier Core CI regression testing",
+  "updated_at": "2025-02-03T00:00:00Z",
+  "updated_by": "initial",
+  "test_config": {
+    "users": 100,
+    "duration_seconds": 60,
+    "spawn_rate": 10,
+    "environment": "docker-compose.test.yml (mock backends)"
+  },
+  "metrics": {
+    "p50_latency_ms": 15.0,
+    "p90_latency_ms": 35.0,
+    "p99_latency_ms": 75.0,
+    "avg_latency_ms": 20.0,
+    "min_latency_ms": 5.0,
+    "max_latency_ms": 150.0,
+    "throughput_rps": 450.0,
+    "total_requests": 27000,
+    "failure_rate_percent": 0.1,
+    "success_rate_percent": 99.9
+  },
+  "thresholds": {
+    "p99_regression_percent": 10,
+    "throughput_regression_percent": 5,
+    "max_failure_rate_percent": 1.0
+  },
+  "notes": [
+    "Baseline established with mock vLLM backends (docker-compose.test.yml)",
+    "Mock backends have minimal latency compared to real vLLM inference",
+    "P99 latency target: <100ms for mock backend tests",
+    "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
+  ]
+}
