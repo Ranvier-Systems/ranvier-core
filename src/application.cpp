@@ -829,8 +829,10 @@ void Application::signal_shutdown() {
             // Always signal stop, even on error - we must not hang
             try {
                 _stop_signal->set_value();
-            } catch (...) {
-                // Promise may already be fulfilled - ignore
+            } catch (const std::exception& e) {
+                // Rule #9: Promise may already be fulfilled - debug level since this is
+                // expected during shutdown race conditions, not an error condition
+                log_main.debug("Stop signal already set during shutdown: {}", e.what());
             }
         });
 
@@ -841,8 +843,10 @@ void Application::signal_shutdown() {
                           _config.shutdown.shutdown_timeout.count());
             try {
                 _stop_signal->set_value();
-            } catch (...) {
-                // Promise may already be fulfilled
+            } catch (const std::exception& e) {
+                // Rule #9: Promise may already be fulfilled - debug level since this is
+                // expected during shutdown timeout handling
+                log_main.debug("Stop signal already set during timeout handler: {}", e.what());
             }
         });
 }

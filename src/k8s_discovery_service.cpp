@@ -200,8 +200,12 @@ seastar::future<> K8sDiscoveryService::stop() {
     // Wait for watch to complete
     try {
         co_await std::move(_watch_future);
+    } catch (const std::exception& e) {
+        // Rule #9: Log at warn level with exception details. This can occur when the
+        // watch connection is interrupted during shutdown - expected but worth noting.
+        log_k8s.warn("Watch future completed with exception during shutdown: {}", e.what());
     } catch (...) {
-        log_k8s.debug("Watch future completed during shutdown");
+        log_k8s.warn("Watch future completed with unknown exception during shutdown");
     }
 
     log_k8s.info("K8s discovery service stopped");
@@ -371,8 +375,10 @@ seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server
         // Cache successful resolution for graceful degradation
         _cached_api_server_addr = addr;
         co_return addr;
-    } catch (...) {
-        // Not a valid IP, proceed with DNS resolution
+    } catch (const std::exception& e) {
+        // Not a valid IP - this is expected flow for hostnames, triggers DNS resolution below.
+        // Rule #9 note: Debug level since this is flow control, not an error condition.
+        log_k8s.debug("API server '{}' is not a direct IP ({}), will use DNS resolution", host, e.what());
     }
 
     // DNS resolution with retry and exponential backoff
