@@ -21,25 +21,28 @@ HealthService::HealthService(RouterService& router, HealthServiceConfig config)
 
 void HealthService::start() {
     _running = true;
-    // Launch the loop in the background (fire and forget, but tracked by gate)
-    (void)run_loop();
+    // Store the loop future for clean shutdown tracking (Rule #5)
+    _loop_future = run_loop();
 }
 
 future<> HealthService::stop() {
     _running = false;
-    return _gate.close(); // Wait for current checks to finish
+    // First close the gate (signals loop to exit and waits for in-flight checks)
+    co_await _gate.close();
+    // Then await the loop future to ensure clean exit
+    co_await std::move(_loop_future);
 }
 
 future<> HealthService::run_loop() {
     // Only run on Core 0 to avoid DDOSing backends
     if (this_shard_id() != 0) co_return;
 
+    // Hold gate for entire loop lifetime (Rule #5: proper lifecycle tracking)
+    auto holder = _gate.hold();
+
     try {
         while (_running) {
-            // 1. Enter Gate (So we don't crash on shutdown)
-            auto holder = _gate.hold();
-
-            // 2. Get list of backends and resolve addresses
+            // 1. Get list of backends and resolve addresses
             auto ids = _router.get_all_backend_ids();
 
             // Collect backends with valid addresses (Rule #2: no co_await in loops)

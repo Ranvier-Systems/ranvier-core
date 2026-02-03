@@ -1800,10 +1800,11 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Fire-and-Forget Loop Lifecycle
 
-- [ ] **[HIGH] Health service run_loop() not properly tracked**
+- [x] **[HIGH] Health service run_loop() not properly tracked**
   _File:Line:_ `src/health_service.cpp:18-22`
   _Issue:_ `(void)run_loop();` casts future to void; gate holder created per-iteration not per-loop
   _Fix:_ Either co_await run_loop() in start() or maintain gate holder across entire loop lifetime
+  _Completed:_ 2026-02-03. Store loop future in `_loop_future` member, hold gate for entire loop lifetime, and `co_await` both gate close and loop future in `stop()` for clean shutdown.
 
 ### 11.6 Architecture Compliance (PASSED)
 
