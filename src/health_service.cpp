@@ -3,6 +3,7 @@
 
 #include <seastar/core/sleep.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/with_timeout.hh>
@@ -11,6 +12,9 @@
 using namespace seastar;
 
 namespace ranvier {
+
+// Maximum concurrent health checks to prevent overwhelming backends/network
+constexpr size_t HEALTH_MAX_CONCURRENT_CHECKS = 16;
 
 HealthService::HealthService(RouterService& router, HealthServiceConfig config)
     : _router(router), _config(config) {}
@@ -35,22 +39,31 @@ future<> HealthService::run_loop() {
             // 1. Enter Gate (So we don't crash on shutdown)
             auto holder = _gate.hold();
 
-            // 2. Get list of backends
+            // 2. Get list of backends and resolve addresses
             auto ids = _router.get_all_backend_ids();
 
+            // Collect backends with valid addresses (Rule #2: no co_await in loops)
+            std::vector<std::pair<BackendId, socket_address>> backends_to_check;
             for (auto id : ids) {
-                // We must use the Router to resolve the IP (RouterService is thread-safe for reads)
                 auto addr_opt = _router.get_backend_address(id);
-                if (!addr_opt.has_value()) continue; // Already marked dead or missing?
-
-                // 3. Check Health (TCP Connect)
-                bool is_alive = co_await check_backend(addr_opt.value());
-
-                // 4. Update State (Broadcasts to all cores)
-                // Note: In a real system, you'd only broadcast on CHANGE.
-                // For simplicity/logging, we update blindly or let Router dedup.
-                co_await _router.set_backend_status_global(id, is_alive);
+                if (addr_opt.has_value()) {
+                    backends_to_check.emplace_back(id, addr_opt.value());
+                }
             }
+
+            // 3. Check health in parallel with concurrency limit
+            co_await seastar::max_concurrent_for_each(
+                backends_to_check, HEALTH_MAX_CONCURRENT_CHECKS,
+                [this](const std::pair<BackendId, socket_address>& backend) -> future<> {
+                    auto [id, addr] = backend;
+                    try {
+                        bool is_alive = co_await check_backend(addr);
+                        // 4. Update State (Broadcasts to all cores)
+                        co_await _router.set_backend_status_global(id, is_alive);
+                    } catch (const std::exception& e) {
+                        log_health.warn("Health check failed for backend {}: {}", id, e.what());
+                    }
+                });
 
             // 5. Sleep for configured interval
             co_await seastar::sleep(_config.check_interval);

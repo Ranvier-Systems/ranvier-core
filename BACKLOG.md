@@ -1791,11 +1791,12 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Sequential Health Checks (Rule #2 Related)
 
-- [ ] **[HIGH] Health service sequential backend checks**
+- [x] **[HIGH] Health service sequential backend checks**
   _File:Line:_ `src/health_service.cpp:41-52`
   _Issue:_ Sequential `for (auto id : ids) { co_await check_backend(...); }` blocks health cycle
   _Impact:_ N backends × 3s timeout = N×3 seconds per cycle (100 backends = 5 minutes)
   _Fix:_ Replace with `seastar::max_concurrent_for_each(ids, 16, [this](auto id) {...})`
+  _Completed:_ 2026-02-03. Refactored to collect backends first, then check with `max_concurrent_for_each()` using 16-way concurrency. Added per-check try/catch for resilience.
 
 #### Fire-and-Forget Loop Lifecycle
 
