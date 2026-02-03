@@ -51,7 +51,10 @@ inline ConnectionErrorType classify_connection_error(std::exception_ptr ep) {
             return ConnectionErrorType::CONNECTION_RESET;
         }
     } catch (...) {
-        // Not a system_error, not a connection error we handle specially
+        // Not a system_error - this is intentional: classify_connection_error is a classifier
+        // function, not an error handler. Non-system_error exceptions return NONE, meaning
+        // "not a connection error we handle specially". No logging here because this is
+        // called in hot paths and non-connection exceptions are handled by callers.
     }
     return ConnectionErrorType::NONE;
 }
@@ -325,10 +328,15 @@ future<> HttpController::write_client_error(
         co_await client_out.write(msg);
         co_await client_out.flush();
     } catch (...) {
-        // Client may have disconnected, ignore write errors
+        // Client may have disconnected - classify to determine severity
         auto err_type = classify_connection_error(std::current_exception());
-        if (err_type == ConnectionErrorType::NONE) {
-            log_proxy.debug("Failed to send error to client: {}", error_msg);
+        if (err_type != ConnectionErrorType::NONE) {
+            // Connection error (EPIPE, ECONNRESET) - expected when client disconnects
+            log_proxy.debug("Client disconnected while sending error: {} ({})",
+                           error_msg, connection_error_to_string(err_type));
+        } else {
+            // Rule #9: Unknown error type - log at warn level
+            log_proxy.warn("Failed to send error to client (unexpected exception): {}", error_msg);
         }
     }
 }
@@ -1243,7 +1251,9 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
         try {
             co_await stream_backend_response(*ctx, bundle, client_out);
         } catch (...) {
-            // Capture exception - co_await not allowed in catch blocks
+            // Capture exception - co_await not allowed in catch blocks.
+            // Rule #9 note: This exception is rethrown after cleanup below, ensuring
+            // proper logging at the call site. We capture here to allow async cleanup.
             streaming_exception = std::current_exception();
         }
 
@@ -1472,8 +1482,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         seastar::net::inet_address parsed_addr{ip_string};
         addr = seastar::socket_address(parsed_addr, static_cast<uint16_t>(port));
         resolved_ip = ip_string;
-    } catch (...) {
-        // Not a valid IP address, will need DNS resolution
+    } catch (const std::exception& e) {
+        // Not a valid IP address - this is expected flow for hostnames, not an error.
+        // Rule #9 note: Debug level is appropriate since this triggers DNS resolution below.
+        log_control.debug("POST /admin/backends: '{}' is not a valid IP ({}), will try DNS",
+                         ip_str, e.what());
         needs_dns_resolution = true;
     }
 

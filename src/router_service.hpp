@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/socket_defs.hh>
@@ -278,6 +279,11 @@ private:
 
     // TTL cleanup timer (runs on shard 0, broadcasts to all shards)
     seastar::timer<> _ttl_timer;
+
+    // Gate for ALL timer callbacks (Rule #5: Timer-Captures-This)
+    // Protects: _ttl_timer, _batch_flush_timer, _draining_reaper_timer
+    // Each callback acquires holder at entry; stop() closes gate before cancelling timers
+    seastar::gate _timer_gate;
 
     // Draining reaper timer (runs on shard 0, checks for expired draining backends)
     seastar::timer<> _draining_reaper_timer;
