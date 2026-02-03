@@ -3,8 +3,10 @@
 // Implements watching K8s EndpointSlices and syncing with RouterService
 
 #include "k8s_discovery_service.hpp"
+#include "parse_utils.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cstring>
 #include <optional>
@@ -34,38 +36,7 @@ namespace ranvier {
 // Maximum concurrent endpoint operations to prevent overwhelming backends
 constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
 
-// Parse a port string and validate it's in the valid range (1-65535).
-// Returns std::nullopt for invalid input (empty, non-numeric, out of range).
-static std::optional<uint16_t> parse_port(const std::string& port_str) {
-    if (port_str.empty()) {
-        return std::nullopt;
-    }
-
-    // Reject strings with leading/trailing whitespace or non-digit characters
-    for (size_t i = 0; i < port_str.size(); ++i) {
-        char c = port_str[i];
-        // Allow leading minus for negative number detection
-        if (i == 0 && c == '-') {
-            // Negative numbers are invalid ports, but let stoi parse to give clear error
-            continue;
-        }
-        if (!std::isdigit(static_cast<unsigned char>(c))) {
-            return std::nullopt;
-        }
-    }
-
-    try {
-        int port_int = std::stoi(port_str);
-        if (port_int < 1 || port_int > 65535) {
-            return std::nullopt;
-        }
-        return static_cast<uint16_t>(port_int);
-    } catch (const std::invalid_argument&) {
-        return std::nullopt;
-    } catch (const std::out_of_range&) {
-        return std::nullopt;
-    }
-}
+// Note: parse_port() is now provided by parse_utils.hpp using std::from_chars
 
 // Generate a stable BackendId from endpoint UID
 BackendId K8sEndpoint::to_backend_id() const {
@@ -572,7 +543,12 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
 
                     // Handle potential chunk extensions by finding the first non-hex char
                     size_t ext_pos = size_line.find_first_not_of("0123456789abcdefABCDEF");
-                    size_t chunk_size = std::stoul(size_line.substr(0, ext_pos), nullptr, 16);
+                    std::string_view hex_part(size_line.data(), ext_pos == std::string::npos ? size_line.size() : ext_pos);
+                    size_t chunk_size = 0;
+                    auto [ptr, ec] = std::from_chars(hex_part.data(), hex_part.data() + hex_part.size(), chunk_size, 16);
+                    if (ec != std::errc{} || ptr != hex_part.data() + hex_part.size()) {
+                        throw std::runtime_error("Invalid chunk size in chunked encoding");
+                    }
 
                     if (chunk_size == 0) break; // End of stream
 
@@ -661,15 +637,22 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
         });
 
     // Garbage collect endpoints no longer present in K8s
-    for (auto it = _endpoints.begin(); it != _endpoints.end(); ) {
-        if (current_uids.find(it->first) == current_uids.end()) {
-            std::string uid_to_remove = it->first;
-            it++;
-            co_await handle_endpoint_removed(uid_to_remove);
-        } else {
-            it++;
+    // Collect UIDs first, then remove in parallel (Rule #2: no co_await in loops)
+    std::vector<std::string> uids_to_remove;
+    for (const auto& [uid, ep] : _endpoints) {
+        if (current_uids.find(uid) == current_uids.end()) {
+            uids_to_remove.push_back(uid);
         }
     }
+
+    co_await seastar::max_concurrent_for_each(uids_to_remove, K8S_MAX_CONCURRENT_ENDPOINT_OPS,
+        [this](const std::string& uid) -> seastar::future<> {
+            try {
+                co_await handle_endpoint_removed(uid);
+            } catch (const std::exception& e) {
+                log_k8s.warn("Failed to remove stale endpoint {}: {}", uid, e.what());
+            }
+        });
 }
 
 seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discovered) {
@@ -964,52 +947,34 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
             const auto& ann = meta["annotations"];
             if (ann.HasMember(K8S_ANNOTATION_WEIGHT) && ann[K8S_ANNOTATION_WEIGHT].IsString()) {
                 const char* weight_str = ann[K8S_ANNOTATION_WEIGHT].GetString();
-                try {
-                    // Reject negative values (stoul wraps them)
-                    if (weight_str[0] == '-') {
-                        throw std::invalid_argument("negative value not allowed");
-                    }
-                    size_t pos = 0;
-                    unsigned long parsed = std::stoul(weight_str, &pos);
-                    // Ensure entire string was consumed (no trailing garbage like "1O0")
-                    if (pos != std::strlen(weight_str)) {
-                        throw std::invalid_argument("contains non-numeric characters");
-                    }
-                    if (parsed > K8S_MAX_WEIGHT) {
+                auto weight_opt = parse_uint32(std::string_view(weight_str));
+                if (weight_opt) {
+                    if (*weight_opt > K8S_MAX_WEIGHT) {
                         log_k8s.warn("Annotation '{}' value '{}' exceeds maximum {} - clamping to max",
                                      K8S_ANNOTATION_WEIGHT, weight_str, K8S_MAX_WEIGHT);
                         base_weight = K8S_MAX_WEIGHT;
                     } else {
-                        base_weight = static_cast<uint32_t>(parsed);
+                        base_weight = *weight_opt;
                     }
-                } catch (const std::exception& e) {
-                    log_k8s.warn("Invalid '{}' annotation value '{}': {} - using default {}",
-                                 K8S_ANNOTATION_WEIGHT, weight_str, e.what(), base_weight);
+                } else {
+                    log_k8s.warn("Invalid '{}' annotation value '{}' - using default {}",
+                                 K8S_ANNOTATION_WEIGHT, weight_str, base_weight);
                 }
             }
             if (ann.HasMember(K8S_ANNOTATION_PRIORITY) && ann[K8S_ANNOTATION_PRIORITY].IsString()) {
                 const char* priority_str = ann[K8S_ANNOTATION_PRIORITY].GetString();
-                try {
-                    // Reject negative values (stoul wraps them)
-                    if (priority_str[0] == '-') {
-                        throw std::invalid_argument("negative value not allowed");
-                    }
-                    size_t pos = 0;
-                    unsigned long parsed = std::stoul(priority_str, &pos);
-                    // Ensure entire string was consumed (no trailing garbage)
-                    if (pos != std::strlen(priority_str)) {
-                        throw std::invalid_argument("contains non-numeric characters");
-                    }
-                    if (parsed > K8S_MAX_PRIORITY) {
+                auto priority_opt = parse_uint32(std::string_view(priority_str));
+                if (priority_opt) {
+                    if (*priority_opt > K8S_MAX_PRIORITY) {
                         log_k8s.warn("Annotation '{}' value '{}' exceeds maximum {} - clamping to max",
                                      K8S_ANNOTATION_PRIORITY, priority_str, K8S_MAX_PRIORITY);
                         base_priority = K8S_MAX_PRIORITY;
                     } else {
-                        base_priority = static_cast<uint32_t>(parsed);
+                        base_priority = *priority_opt;
                     }
-                } catch (const std::exception& e) {
-                    log_k8s.warn("Invalid '{}' annotation value '{}': {} - using default {}",
-                                 K8S_ANNOTATION_PRIORITY, priority_str, e.what(), base_priority);
+                } else {
+                    log_k8s.warn("Invalid '{}' annotation value '{}' - using default {}",
+                                 K8S_ANNOTATION_PRIORITY, priority_str, base_priority);
                 }
             }
         }

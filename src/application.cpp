@@ -28,7 +28,7 @@ Application::Application(RanvierConfig config, std::string config_path)
     : _config(std::move(config))
     , _config_path(std::move(config_path))
     , _state(ApplicationState::CREATED)
-    , _stop_signal(std::make_shared<seastar::promise<>>()) {
+    , _stop_signal(std::make_unique<seastar::promise<>>()) {
 }
 
 // Destructor defined here where GossipService is complete (via gossip_service.hpp)

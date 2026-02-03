@@ -3,6 +3,7 @@
 // Manages message handling, reliable delivery, and DNS discovery.
 
 #include "gossip_protocol.hpp"
+#include "parse_utils.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -851,12 +852,17 @@ std::optional<seastar::socket_address> GossipProtocol::parse_peer_address(const 
     }
 
     std::string host = peer.substr(0, colon_pos);
-    std::string port_str = peer.substr(colon_pos + 1);
+    std::string_view port_str(peer.data() + colon_pos + 1, peer.size() - colon_pos - 1);
+
+    auto port_opt = parse_port(port_str);
+    if (!port_opt) {
+        log_gossip_protocol().debug("Failed to parse peer '{}': invalid port", peer);
+        return std::nullopt;
+    }
 
     try {
-        uint16_t port = static_cast<uint16_t>(std::stoi(port_str));
         seastar::net::inet_address addr(host);
-        return seastar::socket_address(addr, port);
+        return seastar::socket_address(addr, *port_opt);
     } catch (const std::exception& e) {
         log_gossip_protocol().debug("Failed to parse peer '{}': {}", peer, e.what());
         return std::nullopt;

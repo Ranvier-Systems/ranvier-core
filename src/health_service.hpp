@@ -30,6 +30,9 @@ private:
     seastar::gate _gate; // Prevents shutdown while checking
     bool _running = false;
 
+    // Track the background loop future for clean shutdown (Rule #5)
+    seastar::future<> _loop_future = seastar::make_ready_future<>();
+
     // The main loop
     seastar::future<> run_loop();
 

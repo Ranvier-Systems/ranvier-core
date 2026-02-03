@@ -1744,62 +1744,67 @@ These are NOT part of this implementation but documented for future reference:
 
 #### Rule #10: No bare std::stoi/stol/stof on external input
 
-- [ ] **[CRITICAL] 16 bare std::stoi/stoul calls on external input**
+- [x] **[CRITICAL] 16 bare std::stoi/stoul calls on external input**
   _Locations:_
-  - `src/http_controller.cpp:1354, 1445, 1446, 1451, 1454, 1542, 1577, 1840, 2006` - HTTP request parsing
-  - `src/k8s_discovery_service.cpp:58, 551, 949, 974` - K8s API parsing
-  - `src/gossip_consensus.cpp:422` - Peer address parsing
-  - `src/gossip_protocol.cpp:857` - Peer address parsing
-  - `src/router_service.cpp:1566` - Backend address parsing
+  - ~~`src/http_controller.cpp:1354, 1445, 1446, 1451, 1454, 1542, 1577, 1840, 2006` - HTTP request parsing~~ ✓ Fixed 2026-02-03
+  - ~~`src/k8s_discovery_service.cpp:58, 551, 949, 974` - K8s API parsing~~ ✓ Fixed 2026-02-03
+  - ~~`src/gossip_consensus.cpp:422` - Peer address parsing~~ ✓ Fixed 2026-02-03
+  - ~~`src/gossip_protocol.cpp:857` - Peer address parsing~~ ✓ Fixed 2026-02-03
+  - ~~`src/router_service.cpp:1566` - Backend address parsing~~ ✓ Fixed 2026-02-03
   _Fix:_ Create validating helpers (e.g., `parse_port()`, `parse_int()`) returning `std::optional<T>` using `std::from_chars`
+  _Completed:_ 2026-02-03. Created `src/parse_utils.hpp` with `parse_int32()`, `parse_uint32()`, `parse_port()`, `parse_token_id()`, `parse_backend_id()` using `std::from_chars`. All 16 locations across 5 files fixed.
 
 ### 11.4 Medium Severity Violations
 
 #### Rule #0: Prefer unique_ptr over shared_ptr
 
-- [ ] **[MEDIUM] std::shared_ptr in Application**
+- [x] **[MEDIUM] std::shared_ptr in Application**
   _File:Line:_ `src/application.hpp:144`
   _Issue:_ `std::shared_ptr<seastar::promise<>> _stop_signal;`
   _Fix:_ Evaluate if `unique_ptr` or `lw_shared_ptr` can replace
+  _Completed:_ 2026-02-03. Changed to `std::unique_ptr` - no shared ownership needed, all access is through `this` pointer in lambdas.
 
-- [ ] **[MEDIUM] std::shared_ptr in TracingService (OpenTelemetry)**
+- [x] **[MEDIUM] std::shared_ptr in TracingService (OpenTelemetry)**
   _File:Line:_ `src/tracing_service.cpp:139`
   _Issue:_ `static std::shared_ptr<sdk_trace::TracerProvider> g_provider;`
-  _Note:_ Required by OpenTelemetry API - document as known exception
+  _Resolution:_ Known exception - OpenTelemetry C++ SDK requires `shared_ptr<TracerProvider>` for `opentelemetry::trace::Provider::SetTracerProvider()`. Cannot use unique_ptr without forking the SDK.
 
 #### Rule #2: No co_await inside loops over external resources
 
-- [ ] **[HIGH] Sequential co_await in K8s endpoint removal loop**
+- [x] **[HIGH] Sequential co_await in K8s endpoint removal loop**
   _File:Line:_ `src/k8s_discovery_service.cpp:640-648`
   _Issue:_ `for (...) { co_await handle_endpoint_removed(...); }` - O(n) latency
   _Fix:_ Replace with `seastar::max_concurrent_for_each()` pattern
+  _Completed:_ 2026-02-03. Refactored to collect UIDs first, then process with `max_concurrent_for_each()` using `K8S_MAX_CONCURRENT_ENDPOINT_OPS` concurrency limit.
 
 #### Rule #12: No std::ifstream/ofstream in Seastar code
 
-- [ ] **[MEDIUM] Blocking std::ifstream during startup**
+- [x] **[MEDIUM] Blocking std::ifstream during startup**
   _Locations:_
-  - `src/main.cpp:45` - Config file reading
-  - `src/main.cpp:70` - Tokenizer file validation
-  - `src/main.cpp:180` - Config check
-  - `src/config_loader.cpp:460` - Config loading
-  _Note:_ These occur during startup before reactor starts. Document as acceptable startup exception.
+  - `src/main.cpp:45` - Config file reading in `run_dry_run_validation()`
+  - `src/main.cpp:70` - Tokenizer file validation in `run_dry_run_validation()`
+  - `src/main.cpp:180` - Config check in `print_config_summary()`
+  - `src/config_loader.cpp:467` - Config loading in `RanvierConfig::load()`
+  _Resolution:_ Known exception - all usages occur before `app.run()` (line 373) in the pre-reactor startup phase. Configuration must be loaded before the Seastar reactor can be configured. Blocking I/O is acceptable and necessary here.
 
 ### 11.5 Async Integrity Issues
 
 #### Sequential Health Checks (Rule #2 Related)
 
-- [ ] **[HIGH] Health service sequential backend checks**
+- [x] **[HIGH] Health service sequential backend checks**
   _File:Line:_ `src/health_service.cpp:41-52`
   _Issue:_ Sequential `for (auto id : ids) { co_await check_backend(...); }` blocks health cycle
   _Impact:_ N backends × 3s timeout = N×3 seconds per cycle (100 backends = 5 minutes)
   _Fix:_ Replace with `seastar::max_concurrent_for_each(ids, 16, [this](auto id) {...})`
+  _Completed:_ 2026-02-03. Refactored to collect backends first, then check with `max_concurrent_for_each()` using 16-way concurrency. Added per-check try/catch for resilience.
 
 #### Fire-and-Forget Loop Lifecycle
 
-- [ ] **[HIGH] Health service run_loop() not properly tracked**
+- [x] **[HIGH] Health service run_loop() not properly tracked**
   _File:Line:_ `src/health_service.cpp:18-22`
   _Issue:_ `(void)run_loop();` casts future to void; gate holder created per-iteration not per-loop
   _Fix:_ Either co_await run_loop() in start() or maintain gate holder across entire loop lifetime
+  _Completed:_ 2026-02-03. Store loop future in `_loop_future` member, hold gate for entire loop lifetime, and `co_await` both gate close and loop future in `stop()` for clean shutdown.
 
 ### 11.6 Architecture Compliance (PASSED)
 

@@ -3,6 +3,7 @@
 // Manages cluster quorum and peer liveness tracking.
 
 #include "gossip_consensus.hpp"
+#include "parse_utils.hpp"
 
 #include <cmath>
 #include <sstream>
@@ -418,11 +419,8 @@ ClusterState GossipConsensus::get_cluster_state() const {
                                          (addr_str.find('[') == std::string::npos);
                 if (is_port_separator) {
                     info.address = addr_str.substr(0, colon_pos);
-                    try {
-                        info.port = static_cast<uint16_t>(std::stoi(addr_str.substr(colon_pos + 1)));
-                    } catch (const std::exception&) {
-                        info.port = 0;
-                    }
+                    auto port_opt = parse_port(std::string_view(addr_str).substr(colon_pos + 1));
+                    info.port = port_opt.value_or(0);
                 } else {
                     info.address = addr_str;
                     info.port = 0;

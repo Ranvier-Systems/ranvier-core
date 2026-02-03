@@ -140,8 +140,8 @@ private:
     // Gate to ensure startup completes before shutdown
     seastar::gate _lifecycle_gate;
 
-    // Promise/future for signaling shutdown
-    std::shared_ptr<seastar::promise<>> _stop_signal;
+    // Promise/future for signaling shutdown (unique_ptr: single owner, no sharing needed)
+    std::unique_ptr<seastar::promise<>> _stop_signal;
 
     // Counter for SIGINT signals - second SIGINT triggers hard kill.
     // Atomic for robustness, though Seastar signals run on shard 0.
