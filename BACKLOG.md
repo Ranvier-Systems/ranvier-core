@@ -1718,10 +1718,11 @@ These are NOT part of this implementation but documented for future reference:
   _Fix:_ Add gate holder acquisition at start of `run_draining_reaper()` (line 1736)
   _Completed:_ 2026-02-03. Shares `_timer_gate` with TTL and batch flush timers.
 
-- [ ] **[HIGH] K8sDiscoveryService poll timer uses boolean instead of gate**
+- [x] **[HIGH] K8sDiscoveryService poll timer uses boolean instead of gate** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:146-154`
   _Issue:_ Timer callback checks `_running` boolean instead of acquiring gate holder
   _Fix:_ Replace `if (_running)` check with gate holder pattern (try_with_gate or hold())
+  _Completed:_ 2026-02-03. Reuses existing `_gate` member; holder kept alive via `do_with`. Updated `stop()` to close gate before cancelling timer.
 
 #### Rule #9: Every catch block must log at warn level
 

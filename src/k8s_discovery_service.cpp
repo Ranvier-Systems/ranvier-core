@@ -144,13 +144,26 @@ seastar::future<> K8sDiscoveryService::start() {
         // Start the periodic resync timer
         // This ensures state consistency even if the watch misses an event
         _poll_timer.set_callback([this] {
-            // We launch this into the background and don't wait for it
-            // but we use a gate or check _running to stay safe
-            if (_running) {
-                (void)sync_endpoints().handle_exception([](auto ep) {
+            // Rule #5: Acquire gate holder for shutdown safety.
+            // This prevents use-after-free if callback executes after stop() begins.
+            seastar::gate::holder holder;
+            try {
+                holder = _gate.hold();
+            } catch (const seastar::gate_closed_exception&) {
+                log_k8s.debug("Periodic resync skipped: service is stopping");
+                return;
+            }
+
+            if (!_running) {
+                return;  // Logical check: service not in running state
+            }
+
+            // Keep gate holder alive for duration of async work via do_with
+            (void)seastar::do_with(std::move(holder), [this](seastar::gate::holder&) {
+                return sync_endpoints().handle_exception([](auto ep) {
                     log_k8s.warn("Periodic resync failed: {}", ep);
                 });
-            }
+            });
         });
 
         // Use the interval from config, or default to 60s
@@ -176,11 +189,13 @@ seastar::future<> K8sDiscoveryService::stop() {
     // Prometheus scrapes that arrive after shutdown begins.
     _metrics.clear();
 
-    // Stop the poll timer
-    _poll_timer.cancel();
-
-    // Wait for any in-flight operations
+    // Rule #5: Close gate BEFORE cancelling timer.
+    // This waits for any in-flight poll timer callbacks and k8s_get operations.
+    // New callbacks will fail to acquire gate holder and return early.
     co_await _gate.close();
+
+    // Now safe to cancel timer (no in-flight callbacks)
+    _poll_timer.cancel();
 
     // Wait for watch to complete
     try {
