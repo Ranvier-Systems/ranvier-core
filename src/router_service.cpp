@@ -1445,6 +1445,15 @@ void RouterService::start_batch_flush_timer() {
 //   - This ensures all memory operations happen on the correct shard's allocator
 //
 seastar::future<> RouterService::flush_route_batch() {
+    // Rule #5: Acquire gate holder to prevent use-after-free during shutdown.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_main.debug("Route batch flush skipped: service is stopping");
+        return seastar::make_ready_future<>();
+    }
+
     if (_pending_remote_routes.empty()) {
         return seastar::make_ready_future<>();
     }
@@ -1465,7 +1474,9 @@ seastar::future<> RouterService::flush_route_batch() {
     // 3. Read from foreign_ptr on target shard and create LOCAL allocations
     //
     // Pattern: Create N copies on shard 0, wrap each in foreign_ptr, send to target shards.
-    return seastar::do_with(std::move(batch), [](std::vector<PendingRemoteRoute>& batch) {
+    // Note: Gate holder is kept alive via do_with for duration of async work.
+    return seastar::do_with(std::move(holder), std::move(batch),
+        [](seastar::gate::holder&, std::vector<PendingRemoteRoute>& batch) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [&batch](unsigned shard_id) {
                 // Create a copy wrapped in foreign_ptr for this shard
@@ -1757,6 +1768,15 @@ void RouterService::stop_draining_reaper() {
 }
 
 void RouterService::run_draining_reaper() {
+    // Rule #5: Acquire gate holder to prevent use-after-free during shutdown.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_main.debug("Draining reaper skipped: service is stopping");
+        return;
+    }
+
     if (!g_shard_state) return;
     auto& shard = shard_state();
     auto now = std::chrono::steady_clock::now();
