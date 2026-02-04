@@ -141,8 +141,9 @@ jobs:
           echo "  Duration: $BENCHMARK_DURATION"
           echo "  Spawn rate: $BENCHMARK_SPAWN_RATE"
 
-          # Create output directory
+          # Create output directory with write permissions for locust user (non-root)
           mkdir -p benchmark-results
+          chmod 777 benchmark-results
 
           # Run Locust in headless mode with CSV output
           # Note: locust service uses locustio/locust image with ENTRYPOINT ["locust"]
