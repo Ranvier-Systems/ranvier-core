@@ -1186,23 +1186,26 @@ Refactoring completed with Rule #14 compliant cross-shard dispatch and robustnes
   _Complexity:_ High
   _Completed:_ 2026-01-19. GossipService reduced to thin orchestrator (~350 LOC). Three extracted modules: GossipConsensus (quorum/peer liveness, ~430 LOC), GossipTransport (UDP/DTLS, ~540 LOC), GossipProtocol (message handling/reliability, ~870 LOC). All 27 Prometheus metrics preserved. Rule #14 compliant cross-shard token dispatch using `seastar::do_with`. Added robustness fixes: proper gate holder scoping, exception handling for fire-and-forget futures, defensive null checks.
 
-- [ ] **[P1] Consolidate gossip debug metrics behind compile flag**
+- [x] **[P1] Consolidate gossip debug metrics behind compile flag** ✓
   _Description:_ Move 8 debugging-oriented gossip metrics behind `RANVIER_DEBUG_METRICS` compile flag. Keep ~15 operationally-relevant metrics always enabled.
   _Rationale:_ 27 metrics per gossip service adds scrape overhead. Debug metrics (`crypto_stalls_avoided`, `cert_reloads`, etc.) provide value during development, not production.
   _Files:_ `src/gossip_service.cpp`
   _Complexity:_ Low
+  _Completed:_ 2026-02-01 (PR #209)
 
-- [ ] **[P2] Add inline Hard Rule documentation to radix_tree.hpp**
+- [x] **[P2] Add inline Hard Rule documentation to radix_tree.hpp** ✓
   _Description:_ Add explicit Hard Rule comments to load-bearing code paths in RadixTree (lookup, insert, eviction). Currently only 1 reference despite being most critical file.
   _Rationale:_ Knowledge preservation for future maintainers. Explicit documentation prevents accidental rule violations during optimization work.
   _Files:_ `src/radix_tree.hpp`
   _Complexity:_ Low
+  _Completed:_ 2026-02-01 (PR #212)
 
-- [ ] **[P2] Add inline Hard Rule documentation to router_service.cpp**
+- [x] **[P2] Add inline Hard Rule documentation to router_service.cpp** ✓
   _Description:_ Add explicit Hard Rule comments to load-bearing code paths in RouterService (route_request, learn_route_global, get_backend_for_prefix). Currently only 1 reference despite being second most critical file.
   _Rationale:_ Knowledge preservation for future maintainers. RouterService orchestrates all routing decisions; undocumented constraints risk silent regressions.
   _Files:_ `src/router_service.cpp`
   _Complexity:_ Low
+  _Completed:_ 2026-02-01 (PR #208)
 
 - [ ] **[P3] Track config.hpp complexity - split when >2000 LOC**
   _Description:_ Monitor `config.hpp` (currently 1,510 LOC). When exceeding 2000 LOC, split into `config_schema.hpp` (type definitions) and `config_loader.cpp` (YAML parsing logic).
@@ -1379,9 +1382,9 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P2 - Medium** | Reliability | Add DNS resolution timeout in backend registration | Low | |
 | **P0 - Critical** | Testing | E2E prefix routing test suite | Medium | ✅ Done |
 | **P0 - Critical** | Testing | Graceful shutdown test suite | Medium | ✅ Done |
-| **P1 - High** | DX | Consolidate gossip debug metrics behind compile flag | Low | |
-| **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | |
-| **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | |
+| **P1 - High** | DX | Consolidate gossip debug metrics behind compile flag | Low | ✅ Done |
+| **P2 - Medium** | DX | Add Hard Rule documentation to radix_tree.hpp | Low | ✅ Done |
+| **P2 - Medium** | DX | Add Hard Rule documentation to router_service.cpp | Low | ✅ Done |
 | **P3 - Low** | DX | Split config.hpp when >2000 LOC | Medium | |
 | **P2 - Medium** | Benchmark | Production prompt traces - trace format definition | Low | |
 | **P2 - Medium** | Benchmark | Production prompt traces - locustfile trace replay | Medium | |
@@ -1831,6 +1834,9 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-01 | **[DX]** Add inline Hard Rule documentation to radix_tree.hpp. Comprehensive documentation for Rules #1, #4, #9, #14 covering lookup, insert, eviction, and slab allocation code paths. | #212 |
+| 2026-02-01 | **[DX]** Add inline Hard Rule documentation to router_service.cpp. Documentation for Rules #1, #5, #6, #14 covering route_request, learn_route_global, get_backend_for_prefix, and timer callbacks. | #208 |
+| 2026-02-01 | **[DX]** Consolidate 8 gossip debug metrics behind RANVIER_DEBUG_METRICS compile flag. Reduces Prometheus scrape overhead in production. | #209 |
 | 2026-02-04 | **[DX]** Automated benchmark regression testing. GitHub Actions workflow runs Locust (100 users, 60s) against docker-compose.test.yml with pre-built GHCR image. Compares P99 latency (≤10% regression) and throughput (≤5% drop) against baseline. Posts results as PR comment. Manual trigger to update baseline. | - |
 | 2026-01-31 | **[Testing]** E2E prefix routing test suite. Created `tests/integration/test_prefix_routing.py` with 8 comprehensive tests validating core value proposition: cache affinity, route learning, metrics verification, cluster propagation. | - |
 | 2026-01-31 | **[Performance]** Offload tokenizer FFI via dedicated thread pool. Added `TokenizerWorker` and `TokenizerThreadPool` classes using `boost::lockfree::spsc_queue` and `seastar::alien::run_on()` for non-blocking tokenization. Per-shard worker threads with dedicated tokenizer instances. `encode_threaded_async()` API with priority fallback (cache → thread pool → cross-shard → local). Disabled by default (P3). Unit tests added. | - |
