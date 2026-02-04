@@ -117,6 +117,9 @@ struct ShardLocalState {
         uint64_t compaction_nodes_shrunk = 0;
         uint64_t compaction_bytes_reclaimed = 0;
         uint64_t compaction_runs = 0;
+        // Load-aware routing stats
+        uint64_t load_aware_fallbacks = 0;       // Times we chose non-preferred backend due to load
+        uint64_t cache_miss_due_to_load = 0;     // Routes diverted due to backend load (same as fallbacks)
 
         void reset() {
             cache_hits = 0;
@@ -132,6 +135,8 @@ struct ShardLocalState {
             compaction_nodes_shrunk = 0;
             compaction_bytes_reclaimed = 0;
             compaction_runs = 0;
+            load_aware_fallbacks = 0;
+            cache_miss_due_to_load = 0;
         }
     } stats;
 
@@ -146,6 +151,10 @@ struct ShardLocalState {
         RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;
         size_t prefix_token_length = 128;
         uint32_t block_alignment = 16;
+        // Load-aware routing configuration
+        bool load_aware_routing = true;           // Enable load-aware backend selection
+        uint64_t queue_depth_threshold = 4;       // Max in-flight before considering alternatives
+        uint64_t queue_diff_threshold = 2;        // Min load difference to justify cache miss
     } config;
 
     // ========================================================================
@@ -178,6 +187,10 @@ struct ShardLocalState {
         config.routing_mode = cfg.routing_mode;
         config.prefix_token_length = cfg.prefix_token_length;
         config.block_alignment = cfg.block_alignment;
+        // Load-aware routing configuration
+        config.load_aware_routing = cfg.load_aware_routing;
+        config.queue_depth_threshold = cfg.queue_depth_threshold;
+        config.queue_diff_threshold = cfg.queue_diff_threshold;
 
         // Seed RNG with random device and time for better entropy
         std::random_device rd;
@@ -194,6 +207,10 @@ struct ShardLocalState {
         config.routing_mode = cfg.routing_mode;
         config.prefix_token_length = cfg.prefix_token_length;
         config.block_alignment = cfg.block_alignment;
+        // Load-aware routing configuration
+        config.load_aware_routing = cfg.load_aware_routing;
+        config.queue_depth_threshold = cfg.queue_depth_threshold;
+        config.queue_diff_threshold = cfg.queue_diff_threshold;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -593,7 +610,21 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("Total bytes reclaimed by compaction")),
         seastar::metrics::make_counter("radix_tree_compaction_runs_total",
             [] { return g_shard_state ? g_shard_state->stats.compaction_runs : 0UL; },
-            seastar::metrics::description("Total number of compaction cycles executed"))
+            seastar::metrics::description("Total number of compaction cycles executed")),
+
+        // ====================================================================
+        // Load-Aware Routing Metrics
+        // ====================================================================
+
+        // Counter: requests diverted to less-loaded backends
+        seastar::metrics::make_counter("router_load_aware_fallbacks_total",
+            [] { return g_shard_state ? g_shard_state->stats.load_aware_fallbacks : 0UL; },
+            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth")),
+
+        // Counter: cache misses accepted for load balancing
+        seastar::metrics::make_counter("router_cache_miss_due_to_load_total",
+            [] { return g_shard_state ? g_shard_state->stats.cache_miss_due_to_load : 0UL; },
+            seastar::metrics::description("Total number of cache misses accepted to avoid routing to overloaded backends"))
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
     });
@@ -1082,14 +1113,40 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
             // Verify the backend is still live
             if (std::find(live_backends.begin(), live_backends.end(), art_backend) != live_backends.end()) {
                 // ART cache hit - route to learned backend
-                if (!request_id.empty()) {
-                    log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
-                                     request_id, tokens.size(), art_backend);
-                }
                 state.stats.cache_hits++;
                 state.stats.prefix_affinity_routes++;
                 if (g_metrics) {
                     metrics().record_cache_hit();
+                }
+
+                // Load-aware check: divert to less-loaded backend if preferred is overloaded
+                // Rule #1: Lock-free - uses atomic reads with relaxed ordering only
+                if (state.config.load_aware_routing) {
+                    uint64_t preferred_load = get_backend_load(art_backend);
+
+                    if (preferred_load > state.config.queue_depth_threshold) {
+                        // Preferred backend overloaded - find alternative
+                        auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
+
+                        if (least_loaded_id != 0 && preferred_load - least_load > state.config.queue_diff_threshold) {
+                            // Significant difference - accept cache miss for lower latency
+                            state.stats.cache_miss_due_to_load++;
+                            state.stats.load_aware_fallbacks++;
+                            if (g_metrics) {
+                                metrics().record_load_aware_fallback();
+                            }
+                            log_router.debug("[{}] Load-aware routing: ART preferred backend {} has {} in-flight, "
+                                           "routing to {} with {} in-flight",
+                                           request_id, art_backend, preferred_load,
+                                           least_loaded_id, least_load);
+                            return least_loaded_id;
+                        }
+                    }
+                }
+
+                if (!request_id.empty()) {
+                    log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
+                                     request_id, tokens.size(), art_backend);
                 }
                 return art_backend;
             }
@@ -1106,16 +1163,41 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     size_t index = prefix_hash % live_backends.size();
     BackendId selected = live_backends[index];
 
-    if (!request_id.empty()) {
-        log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
-                         request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
-    }
-
     // This is a cache miss - the route will be learned after successful response
     state.stats.cache_misses++;
     state.stats.prefix_affinity_routes++;
     if (g_metrics) {
         metrics().record_cache_miss();
+    }
+
+    // Load-aware check: divert to less-loaded backend if hash-selected is overloaded
+    // Rule #1: Lock-free - uses atomic reads with relaxed ordering only
+    if (state.config.load_aware_routing) {
+        uint64_t preferred_load = get_backend_load(selected);
+
+        if (preferred_load > state.config.queue_depth_threshold) {
+            // Hash-selected backend overloaded - find alternative
+            auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
+
+            if (least_loaded_id != 0 && preferred_load - least_load > state.config.queue_diff_threshold) {
+                // Significant difference - route to less-loaded backend
+                state.stats.cache_miss_due_to_load++;
+                state.stats.load_aware_fallbacks++;
+                if (g_metrics) {
+                    metrics().record_load_aware_fallback();
+                }
+                log_router.debug("[{}] Load-aware routing: hash preferred backend {} has {} in-flight, "
+                               "routing to {} with {} in-flight",
+                               request_id, selected, preferred_load,
+                               least_loaded_id, least_load);
+                return least_loaded_id;
+            }
+        }
+    }
+
+    if (!request_id.empty()) {
+        log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
+                         request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
     }
 
     return selected;
