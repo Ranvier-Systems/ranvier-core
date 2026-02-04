@@ -1,0 +1,279 @@
+# Automated benchmark regression testing for Ranvier Core
+# Runs Locust load tests against Docker Compose test environment
+# Compares P99 latency and throughput against stored baseline
+#
+# Triggers:
+#   - Push to main branch
+#   - Pull requests to main
+#   - Manual trigger (with option to update baseline)
+#
+# Fail conditions:
+#   - P99 latency regresses >10%
+#   - Throughput drops >5%
+#
+# NOTE: Uses pre-built ranvier image from GHCR to avoid long C++ compile times.
+# Only the lightweight mock-backend and locust images are built locally.
+name: Benchmark Regression Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'tests/integration/**'
+      - 'docker-compose.test.yml'
+      - '.github/workflows/benchmark.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'tests/integration/**'
+      - 'docker-compose.test.yml'
+      - '.github/workflows/benchmark.yml'
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: 'Update baseline after intentional performance changes'
+        required: false
+        type: boolean
+        default: false
+      benchmark_users:
+        description: 'Number of concurrent users'
+        required: false
+        type: number
+        default: 100
+      benchmark_duration:
+        description: 'Test duration (e.g., 60s, 2m)'
+        required: false
+        type: string
+        default: '60s'
+
+env:
+  REGISTRY: ghcr.io
+  RANVIER_IMAGE: ghcr.io/ranvier-systems/ranvier:latest
+  BENCHMARK_USERS: ${{ inputs.benchmark_users || 100 }}
+  BENCHMARK_DURATION: ${{ inputs.benchmark_duration || '60s' }}
+  BENCHMARK_SPAWN_RATE: 10
+  # Regression thresholds
+  P99_REGRESSION_THRESHOLD: 10
+  THROUGHPUT_REGRESSION_THRESHOLD: 5
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built Ranvier image
+        run: |
+          echo "Pulling pre-built Ranvier image from GHCR..."
+          echo "This avoids the ~15 minute C++ compile time."
+
+          if docker pull ${{ env.RANVIER_IMAGE }}; then
+            echo "Successfully pulled ${{ env.RANVIER_IMAGE }}"
+            # Tag as ranvier:latest for docker-compose.test.yml
+            docker tag ${{ env.RANVIER_IMAGE }} ranvier:latest
+            echo "Tagged as ranvier:latest"
+          else
+            echo "::error::Failed to pull pre-built image. Ensure docker-publish.yml has run."
+            echo ""
+            echo "The benchmark workflow requires a pre-built ranvier image."
+            echo "Run 'Docker Publish' workflow first, or build locally with:"
+            echo "  make docker-build"
+            exit 1
+          fi
+
+      - name: Build supporting images
+        run: |
+          echo "Building mock-backend and locust images (lightweight Python)..."
+          # Build only the test infrastructure images, not ranvier itself
+          docker build -t ranvier-mock-backend:latest -f tests/integration/Dockerfile.mock-backend tests/integration/
+          docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/
+
+      - name: Start test environment
+        run: |
+          echo "Starting Ranvier test cluster with mock backends..."
+          # Don't use --build since we already have the images
+          docker compose -f docker-compose.test.yml up -d --wait
+
+          # Wait for services to be healthy
+          echo "Waiting for services to be ready..."
+          sleep 10
+
+          # Verify services are running
+          docker compose -f docker-compose.test.yml ps
+
+          # Check Ranvier nodes are responding
+          for i in 1 2 3; do
+            echo "Checking ranvier$i health..."
+            timeout 30 bash -c "until curl -sf http://172.28.2.$i:8080/health > /dev/null 2>&1; do sleep 1; done" || {
+              echo "::error::ranvier$i failed health check"
+              docker compose -f docker-compose.test.yml logs ranvier$i
+              exit 1
+            }
+            echo "ranvier$i is healthy"
+          done
+
+      - name: Run Locust benchmark
+        id: benchmark
+        run: |
+          echo "Running Locust benchmark..."
+          echo "  Users: $BENCHMARK_USERS"
+          echo "  Duration: $BENCHMARK_DURATION"
+          echo "  Spawn rate: $BENCHMARK_SPAWN_RATE"
+
+          # Create output directory with write permissions for locust user (non-root)
+          mkdir -p benchmark-results
+          chmod 777 benchmark-results
+
+          # Run Locust in headless mode with CSV output
+          # Note: locust service uses locustio/locust image with ENTRYPOINT ["locust"]
+          # so we only pass arguments, not the command itself
+          # CI mode uses shorter wait times (0.1-0.5s) vs default (1-3s) for higher throughput
+          docker compose -f docker-compose.test.yml run --rm \
+            -e RANVIER_NODE1=http://172.28.2.1:8080 \
+            -e RANVIER_NODE2=http://172.28.2.2:8080 \
+            -e RANVIER_NODE3=http://172.28.2.3:8080 \
+            -e RANVIER_METRICS1=http://172.28.2.1:9180 \
+            -e RANVIER_METRICS2=http://172.28.2.2:9180 \
+            -e RANVIER_METRICS3=http://172.28.2.3:9180 \
+            -e BACKEND_IP=172.28.1.10 \
+            -e BACKEND_PORT=8000 \
+            -e LOCUST_WAIT_MIN=0.1 \
+            -e LOCUST_WAIT_MAX=0.5 \
+            -v $(pwd)/benchmark-results:/mnt/results \
+            locust \
+              -f /mnt/locust/locustfile.py \
+              --headless \
+              -u $BENCHMARK_USERS \
+              -r $BENCHMARK_SPAWN_RATE \
+              -t $BENCHMARK_DURATION \
+              --stop-timeout 10 \
+              --csv=/mnt/results/benchmark \
+              2>&1 | tee benchmark-results/benchmark.log
+
+          # Capture exit code
+          LOCUST_EXIT=${PIPESTATUS[0]}
+          echo "locust_exit_code=$LOCUST_EXIT" >> $GITHUB_OUTPUT
+
+          # Parse results even if Locust reports threshold failures
+          # (we do our own regression comparison)
+          if [ ! -f benchmark-results/benchmark_stats.csv ]; then
+            echo "::error::Locust did not produce results"
+            exit 1
+          fi
+
+      - name: Compare against baseline
+        id: compare
+        run: |
+          chmod +x tests/integration/run-benchmark.sh
+
+          # Run comparison script
+          if tests/integration/run-benchmark.sh \
+            --results-dir benchmark-results \
+            --baseline tests/integration/benchmark-baseline.json \
+            --p99-threshold $P99_REGRESSION_THRESHOLD \
+            --throughput-threshold $THROUGHPUT_REGRESSION_THRESHOLD; then
+            echo "regression_detected=false" >> $GITHUB_OUTPUT
+            echo "## Benchmark Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "regression_detected=true" >> $GITHUB_OUTPUT
+            echo "## Benchmark Failed - Regression Detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Append detailed results to summary
+          if [ -f benchmark-results/comparison.md ]; then
+            cat benchmark-results/comparison.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Update baseline (if requested)
+        if: github.event.inputs.update_baseline == 'true' && steps.compare.outputs.regression_detected == 'false'
+        run: |
+          echo "Updating baseline with current results..."
+
+          # Generate new baseline from current results
+          tests/integration/run-benchmark.sh \
+            --results-dir benchmark-results \
+            --generate-baseline tests/integration/benchmark-baseline.json
+
+          # Commit and push updated baseline
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tests/integration/benchmark-baseline.json
+          git commit -m "chore(benchmark): update baseline metrics
+
+          Updated via manual workflow trigger.
+
+          https://claude.ai/code/session_0152aFGzofS7KBrjDWmQjKCJ"
+          git push
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: benchmark-results/
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f docker-compose.test.yml down -v --remove-orphans
+
+      - name: Fail on regression
+        if: steps.compare.outputs.regression_detected == 'true'
+        run: |
+          echo "::error::Performance regression detected. See benchmark results for details."
+          exit 1
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## Benchmark Results\n\n';
+
+            const regressionDetected = '${{ steps.compare.outputs.regression_detected }}' === 'true';
+
+            if (regressionDetected) {
+              body += '**Status:** :x: Regression Detected\n\n';
+            } else {
+              body += '**Status:** :white_check_mark: Passed\n\n';
+            }
+
+            // Add comparison details if available
+            try {
+              const comparison = fs.readFileSync('benchmark-results/comparison.md', 'utf8');
+              body += comparison;
+            } catch (e) {
+              body += '_Detailed comparison not available_\n';
+            }
+
+            body += '\n\n---\n_Benchmark run with ' + process.env.BENCHMARK_USERS + ' users for ' + process.env.BENCHMARK_DURATION + '_';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
