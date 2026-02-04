@@ -466,11 +466,12 @@ Tooling, testing, and documentation improvements for contributors and operators.
   _Location:_ `validation/validate_v1.sh`, `validation/stall_watchdog.sh`, `validation/disk_stress.sh`, `validation/gossip_storm.py`, `validation/atomic_audit.sh`
   _Complexity:_ Medium
 
-- [ ] **Add automated benchmark regression testing**
+- [x] **Add automated benchmark regression testing** ✓
   _Justification:_ Performance regressions detected manually. Add CI job that fails if P99 latency increases >10%.
-  _Approach:_ Run Locust benchmark in CI, compare against baseline.
-  _Location:_ `.github/workflows/`, `tests/integration/`
+  _Approach:_ GitHub Actions workflow pulls pre-built image from GHCR, runs Locust benchmark (100 users, 60s) against docker-compose.test.yml, compares P99 latency and throughput against `benchmark-baseline.json`. Fails if P99 regresses >10% or throughput drops >5%. Manual trigger option to update baseline. Posts results as PR comment.
+  _Location:_ `.github/workflows/benchmark.yml`, `tests/integration/benchmark-baseline.json`, `tests/integration/run-benchmark.sh`
   _Complexity:_ Medium
+  _Fixed:_ Post-merge regression detection. Uses pre-built GHCR image to avoid 15min C++ compile.
 
 - [ ] **Add fuzzing for gossip protocol parser**
   _Justification:_ Gossip deserialization handles untrusted input. Fuzzing detects buffer overflows and parsing bugs.
@@ -1349,7 +1350,7 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P2 - Medium** | Performance | SIMD Node16 optimization | Medium | |
 | **P2 - Medium** | Performance | Node pooling for Radix Tree | High | ✅ Done |
 | **P2 - Medium** | Performance | Tree compaction for memory reclamation | Medium | ✅ Done |
-| **P2 - Medium** | DX | Benchmark regression CI | Medium | |
+| **P2 - Medium** | DX | Benchmark regression CI | Medium | ✅ Done |
 | **P2 - Medium** | DX | Helm chart | Medium | ✅ Done |
 | **P3 - Low** | Performance | Memory-mapped tokenizer | Low | |
 | **P3 - Low** | DX | OpenAPI specification | Low | ✅ Done |
@@ -1830,6 +1831,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-04 | **[DX]** Automated benchmark regression testing. GitHub Actions workflow runs Locust (100 users, 60s) against docker-compose.test.yml with pre-built GHCR image. Compares P99 latency (≤10% regression) and throughput (≤5% drop) against baseline. Posts results as PR comment. Manual trigger to update baseline. | - |
 | 2026-01-31 | **[Testing]** E2E prefix routing test suite. Created `tests/integration/test_prefix_routing.py` with 8 comprehensive tests validating core value proposition: cache affinity, route learning, metrics verification, cluster propagation. | - |
 | 2026-01-31 | **[Performance]** Offload tokenizer FFI via dedicated thread pool. Added `TokenizerWorker` and `TokenizerThreadPool` classes using `boost::lockfree::spsc_queue` and `seastar::alien::run_on()` for non-blocking tokenization. Per-shard worker threads with dedicated tokenizer instances. `encode_threaded_async()` API with priority fallback (cache → thread pool → cross-shard → local). Disabled by default (P3). Unit tests added. | - |
 | 2026-01-29 | **[Performance]** Offload tokenizer FFI via cross-shard dispatch. Added `encode_cached_async()` with round-robin shard selection. On cache miss, dispatches tokenization to different shard via `smp::submit_to`, freeing calling reactor. Rule #14 compliant (text copied, sharded pointer captured). Prometheus metrics for dispatch tracking. | - |
