@@ -168,6 +168,11 @@ def on_test_start(environment, **kwargs):
     logger.info("=" * 60)
     logger.info("Starting Ranvier Load Test")
     logger.info(f"P99 Latency Threshold: {P99_LATENCY_THRESHOLD_MS}ms")
+
+    # Log wait_time configuration for debugging
+    wait_min = os.environ.get('LOCUST_WAIT_MIN', '1')
+    wait_max = os.environ.get('LOCUST_WAIT_MAX', '3')
+    logger.info(f"Wait time: LOCUST_WAIT_MIN={wait_min}s, LOCUST_WAIT_MAX={wait_max}s")
     logger.info("=" * 60)
 
     # Register backends
