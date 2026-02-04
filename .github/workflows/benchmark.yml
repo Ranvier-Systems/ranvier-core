@@ -10,6 +10,9 @@
 # Fail conditions:
 #   - P99 latency regresses >10%
 #   - Throughput drops >5%
+#
+# NOTE: Uses pre-built ranvier image from GHCR to avoid long C++ compile times.
+# Only the lightweight mock-backend and locust images are built locally.
 name: Benchmark Regression Test
 
 on:
@@ -48,6 +51,8 @@ on:
         default: '60s'
 
 env:
+  REGISTRY: ghcr.io
+  RANVIER_IMAGE: ghcr.io/ranvier-systems/ranvier:latest
   BENCHMARK_USERS: ${{ inputs.benchmark_users || 100 }}
   BENCHMARK_DURATION: ${{ inputs.benchmark_duration || '60s' }}
   BENCHMARK_SPAWN_RATE: 10
@@ -62,6 +67,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      packages: read
 
     steps:
       - name: Checkout repository
@@ -70,14 +76,44 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Create Docker network
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built Ranvier image
         run: |
-          docker network create --subnet=172.28.0.0/16 ranvier-test-net || true
+          echo "Pulling pre-built Ranvier image from GHCR..."
+          echo "This avoids the ~15 minute C++ compile time."
+
+          if docker pull ${{ env.RANVIER_IMAGE }}; then
+            echo "Successfully pulled ${{ env.RANVIER_IMAGE }}"
+            # Tag as ranvier:latest for docker-compose.test.yml
+            docker tag ${{ env.RANVIER_IMAGE }} ranvier:latest
+            echo "Tagged as ranvier:latest"
+          else
+            echo "::error::Failed to pull pre-built image. Ensure docker-publish.yml has run."
+            echo ""
+            echo "The benchmark workflow requires a pre-built ranvier image."
+            echo "Run 'Docker Publish' workflow first, or build locally with:"
+            echo "  make docker-build"
+            exit 1
+          fi
+
+      - name: Build supporting images
+        run: |
+          echo "Building mock-backend and locust images (lightweight Python)..."
+          # Build only the test infrastructure images, not ranvier itself
+          docker build -t ranvier-mock-backend:latest -f tests/integration/Dockerfile.mock-backend tests/integration/
+          docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/
 
       - name: Start test environment
         run: |
           echo "Starting Ranvier test cluster with mock backends..."
-          docker compose -f docker-compose.test.yml up -d --build --wait
+          # Don't use --build since we already have the images
+          docker compose -f docker-compose.test.yml up -d --wait
 
           # Wait for services to be healthy
           echo "Waiting for services to be ready..."
@@ -88,13 +124,13 @@ jobs:
 
           # Check Ranvier nodes are responding
           for i in 1 2 3; do
-            echo "Checking ranvier-node$i health..."
+            echo "Checking ranvier$i health..."
             timeout 30 bash -c "until curl -sf http://172.28.2.$i:8080/health > /dev/null 2>&1; do sleep 1; done" || {
-              echo "::error::ranvier-node$i failed health check"
-              docker compose -f docker-compose.test.yml logs ranvier-node$i
+              echo "::error::ranvier$i failed health check"
+              docker compose -f docker-compose.test.yml logs ranvier$i
               exit 1
             }
-            echo "ranvier-node$i is healthy"
+            echo "ranvier$i is healthy"
           done
 
       - name: Run Locust benchmark
