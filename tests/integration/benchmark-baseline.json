@@ -1,8 +1,8 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Benchmark baseline for Ranvier Core CI regression testing",
-  "updated_at": "2026-02-04T01:00:00Z",
-  "updated_by": "configurable wait_time update",
+  "updated_at": "2026-02-04T01:30:00Z",
+  "updated_by": "calibrated from CI run (115f17a)",
   "test_config": {
     "users": 100,
     "duration_seconds": 60,
@@ -12,14 +12,14 @@
     "environment": "docker-compose.test.yml (mock backends)"
   },
   "metrics": {
-    "p50_latency_ms": 45.0,
-    "p90_latency_ms": 50.0,
-    "p99_latency_ms": 60.0,
-    "avg_latency_ms": 35.0,
+    "p50_latency_ms": 48.0,
+    "p90_latency_ms": 55.0,
+    "p99_latency_ms": 65.0,
+    "avg_latency_ms": 40.0,
     "min_latency_ms": 5.0,
     "max_latency_ms": 200.0,
-    "throughput_rps": 200.0,
-    "total_requests": 12000,
+    "throughput_rps": 380.0,
+    "total_requests": 22000,
     "failure_rate_percent": 0.0,
     "success_rate_percent": 100.0
   },
@@ -29,9 +29,9 @@
     "max_failure_rate_percent": 1.0
   },
   "notes": [
-    "Baseline established with mock vLLM backends (docker-compose.test.yml)",
+    "Baseline calibrated from actual CI run: P99=63ms, throughput=407 req/s",
+    "Values set ~7% conservative to allow for runner variance",
     "CI mode uses LOCUST_WAIT_MIN=0.1 LOCUST_WAIT_MAX=0.5 for higher throughput",
-    "Default wait (1-3s) gives ~67 req/s; CI wait (0.1-0.5s) gives ~250+ req/s",
     "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
   ]
 }
