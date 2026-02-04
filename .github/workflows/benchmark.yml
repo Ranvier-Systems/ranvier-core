@@ -144,7 +144,9 @@ jobs:
           # Create output directory
           mkdir -p benchmark-results
 
-          # Run Locust in headless mode with JSON output
+          # Run Locust in headless mode with CSV output
+          # Note: locust service uses locustio/locust image with ENTRYPOINT ["locust"]
+          # so we only pass arguments, not the command itself
           docker compose -f docker-compose.test.yml run --rm \
             -e RANVIER_NODE1=http://172.28.2.1:8080 \
             -e RANVIER_NODE2=http://172.28.2.2:8080 \
@@ -156,14 +158,13 @@ jobs:
             -e BACKEND_PORT=8000 \
             -v $(pwd)/benchmark-results:/mnt/results \
             locust \
-            locust \
               -f /mnt/locust/locustfile.py \
               --headless \
               -u $BENCHMARK_USERS \
               -r $BENCHMARK_SPAWN_RATE \
               -t $BENCHMARK_DURATION \
               --csv=/mnt/results/benchmark \
-              --json 2>&1 | tee benchmark-results/benchmark.log
+              2>&1 | tee benchmark-results/benchmark.log
 
           # Capture exit code
           LOCUST_EXIT=${PIPESTATUS[0]}
