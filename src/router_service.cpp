@@ -15,9 +15,11 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <map>
 #include <random>
-#include <chrono>
 #include <sstream>
 
 // ============================================================================
@@ -56,13 +58,18 @@
 
 namespace ranvier {
 
-// Backend info including weight, priority, and draining state
+// Backend info including weight, priority, draining state, and load tracking
 struct BackendInfo {
     seastar::socket_address addr;
     uint32_t weight = 100;
     uint32_t priority = 0;
     bool is_draining = false;
     std::chrono::steady_clock::time_point drain_start_time;
+
+    // Load tracking: in-flight requests to this backend (Rule #1: lock-free atomic)
+    // Incremented by BackendRequestGuard on construction, decremented on destruction.
+    // Uses relaxed ordering - we only need eventual visibility, not strict ordering.
+    std::atomic<uint64_t> active_requests{0};
 };
 
 // ============================================================================
@@ -238,6 +245,120 @@ static ShardLocalState& shard_state() {
 // Convenience accessor for RadixTree (returns nullptr if not initialized)
 static RadixTree* local_tree() {
     return g_shard_state ? g_shard_state->tree.get() : nullptr;
+}
+
+// ============================================================================
+// BackendRequestGuard Implementation
+// ============================================================================
+//
+// RAII guard for tracking in-flight requests per backend.
+// Rule #1: Uses atomic with relaxed ordering for lock-free operation.
+//
+
+BackendRequestGuard::BackendRequestGuard(BackendId id) : _backend_id(id), _active(false) {
+    if (!g_shard_state) {
+        return;  // Shard not initialized, guard remains inactive
+    }
+
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) {
+        return;  // Backend not found, guard remains inactive
+    }
+
+    // Increment active requests (Rule #1: relaxed ordering for lock-free counter)
+    it->second.active_requests.fetch_add(1, std::memory_order_relaxed);
+    _active = true;
+}
+
+BackendRequestGuard::~BackendRequestGuard() {
+    if (!_active) {
+        return;  // Nothing to decrement
+    }
+
+    if (!g_shard_state) {
+        return;  // Shard state destroyed (shouldn't happen in normal operation)
+    }
+
+    auto it = g_shard_state->backends.find(_backend_id);
+    if (it == g_shard_state->backends.end()) {
+        return;  // Backend was removed while request was in-flight
+    }
+
+    // Decrement active requests (Rule #1: relaxed ordering)
+    it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+}
+
+BackendRequestGuard::BackendRequestGuard(BackendRequestGuard&& other) noexcept
+    : _backend_id(other._backend_id), _active(other._active) {
+    // Transfer ownership: source becomes inactive
+    other._active = false;
+}
+
+BackendRequestGuard& BackendRequestGuard::operator=(BackendRequestGuard&& other) noexcept {
+    if (this != &other) {
+        // Decrement our current count if active
+        if (_active && g_shard_state) {
+            auto it = g_shard_state->backends.find(_backend_id);
+            if (it != g_shard_state->backends.end()) {
+                it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+
+        // Take ownership from other
+        _backend_id = other._backend_id;
+        _active = other._active;
+        other._active = false;
+    }
+    return *this;
+}
+
+// ============================================================================
+// Load Tracking Helper Functions
+// ============================================================================
+
+uint64_t get_backend_load(BackendId id) {
+    if (!g_shard_state) {
+        return 0;
+    }
+
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) {
+        return 0;
+    }
+
+    return it->second.active_requests.load(std::memory_order_relaxed);
+}
+
+std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates) {
+    if (!g_shard_state || candidates.empty()) {
+        return {0, UINT64_MAX};
+    }
+
+    BackendId best_id = 0;
+    uint64_t best_load = UINT64_MAX;
+
+    for (BackendId id : candidates) {
+        auto it = g_shard_state->backends.find(id);
+        if (it == g_shard_state->backends.end()) {
+            continue;  // Skip unknown backends
+        }
+
+        // Skip draining or dead backends
+        if (it->second.is_draining) {
+            continue;
+        }
+        if (g_shard_state->dead_backends.contains(id)) {
+            continue;
+        }
+
+        uint64_t load = it->second.active_requests.load(std::memory_order_relaxed);
+        if (load < best_load) {
+            best_load = load;
+            best_id = id;
+        }
+    }
+
+    return {best_id, best_load};
 }
 
 // ============================================================================
