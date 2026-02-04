@@ -148,6 +148,7 @@ jobs:
           # Run Locust in headless mode with CSV output
           # Note: locust service uses locustio/locust image with ENTRYPOINT ["locust"]
           # so we only pass arguments, not the command itself
+          # CI mode uses shorter wait times (0.1-0.5s) vs default (1-3s) for higher throughput
           docker compose -f docker-compose.test.yml run --rm \
             -e RANVIER_NODE1=http://172.28.2.1:8080 \
             -e RANVIER_NODE2=http://172.28.2.2:8080 \
@@ -157,6 +158,8 @@ jobs:
             -e RANVIER_METRICS3=http://172.28.2.3:9180 \
             -e BACKEND_IP=172.28.1.10 \
             -e BACKEND_PORT=8000 \
+            -e LOCUST_WAIT_MIN=0.1 \
+            -e LOCUST_WAIT_MAX=0.5 \
             -v $(pwd)/benchmark-results:/mnt/results \
             locust \
               -f /mnt/locust/locustfile.py \

@@ -251,8 +251,13 @@ def on_test_stop(environment, **kwargs):
 class ChatCompletionUser(HttpUser):
     """Simulates users sending chat completion requests to the cluster."""
 
-    # Wait 1-3 seconds between requests
-    wait_time = between(1, 3)
+    # Wait between requests (configurable via env for CI testing)
+    # Default: 1-3s for realistic user simulation
+    # CI mode: Set LOCUST_WAIT_MIN=0.1 LOCUST_WAIT_MAX=0.5 for higher throughput
+    wait_time = between(
+        float(os.environ.get('LOCUST_WAIT_MIN', '1')),
+        float(os.environ.get('LOCUST_WAIT_MAX', '3'))
+    )
 
     # Sample prompts for variety
     PROMPTS = [
