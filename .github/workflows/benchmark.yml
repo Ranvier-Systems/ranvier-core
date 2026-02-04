@@ -167,6 +167,7 @@ jobs:
               -u $BENCHMARK_USERS \
               -r $BENCHMARK_SPAWN_RATE \
               -t $BENCHMARK_DURATION \
+              --stop-timeout 10 \
               --csv=/mnt/results/benchmark \
               2>&1 | tee benchmark-results/benchmark.log
 

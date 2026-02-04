@@ -306,12 +306,13 @@ class ChatCompletionUser(HttpUser):
 
         try:
             # Use requests library directly for proper SSE streaming support
+            # Timeout: (connect, read) - shorter for mock backends in CI
             resp = requests.post(
                 f"{target_url}/v1/chat/completions",
                 json=request_body,
                 headers={"Content-Type": "application/json"},
                 stream=True,
-                timeout=30,
+                timeout=(5, 10),
             )
 
             if resp.status_code != 200:
