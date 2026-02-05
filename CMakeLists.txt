@@ -408,6 +408,18 @@ target_link_libraries(prefix_affinity_test
 )
 gtest_discover_tests(prefix_affinity_test)
 
+# Load-Aware Routing Unit Tests (Pure C++, no Seastar dependency)
+# Tests for load-aware backend selection algorithm and BackendRequestGuard
+add_executable(load_aware_routing_test
+  tests/unit/load_aware_routing_test.cpp
+)
+target_include_directories(load_aware_routing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(load_aware_routing_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(load_aware_routing_test)
+
 # Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
 # Tests for quorum calculation and state transitions
 add_executable(quorum_test
