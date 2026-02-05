@@ -441,6 +441,10 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
         if (load < best_load) {
             best_load = load;
             best_id = id;
+            // Early exit: 0 is the minimum possible load, can't do better
+            if (load == 0) {
+                break;
+            }
         }
     }
 
@@ -458,41 +462,43 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
 //   source: Description for logging ("ART" or "hash")
 //
 // Rule #1: Lock-free - all reads use atomic with relaxed ordering
+//
+// Performance notes:
+// - Early exits minimize work in the common case (not overloaded)
+// - Config values cached in shard-local state (no cross-shard access)
+// - Atomic reads use relaxed ordering (no memory barriers)
 static BackendId apply_load_aware_selection(
     BackendId preferred_id,
     const std::vector<BackendId>& live_backends,
     const std::string& request_id,
     const char* source)
 {
-    if (!g_shard_state) {
-        return preferred_id;
-    }
-    auto& state = shard_state();
-
-    if (!state.config.load_aware_routing) {
+    // Fast path: check if load-aware routing is enabled before any other work
+    if (!g_shard_state || !g_shard_state->config.load_aware_routing) {
         return preferred_id;
     }
 
+    // Cache config values locally to avoid repeated struct access
+    const uint64_t queue_threshold = g_shard_state->config.queue_depth_threshold;
+    const uint64_t diff_threshold = g_shard_state->config.queue_diff_threshold;
+
+    // Check preferred backend's load (single atomic read)
     uint64_t preferred_load = get_backend_load(preferred_id);
-
-    if (preferred_load <= state.config.queue_depth_threshold) {
-        return preferred_id;  // Not overloaded
+    if (preferred_load <= queue_threshold) {
+        return preferred_id;  // Not overloaded - fast path
     }
 
     // Preferred backend overloaded - find alternative
     auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
 
-    if (least_loaded_id == 0) {
-        return preferred_id;  // No valid alternative found
-    }
-
-    if (preferred_load - least_load <= state.config.queue_diff_threshold) {
-        return preferred_id;  // Difference not significant enough
+    // Validate we found a viable alternative with significant load difference
+    if (least_loaded_id == 0 || preferred_load - least_load <= diff_threshold) {
+        return preferred_id;
     }
 
     // Significant difference - divert to less-loaded backend
-    state.stats.cache_miss_due_to_load++;
-    state.stats.load_aware_fallbacks++;
+    g_shard_state->stats.cache_miss_due_to_load++;
+    g_shard_state->stats.load_aware_fallbacks++;
     if (g_metrics) {
         metrics().record_load_aware_fallback();
     }
