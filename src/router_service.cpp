@@ -74,6 +74,15 @@ struct BackendInfo {
     // Default constructor
     BackendInfo() = default;
 
+    // Constructor for common initialization pattern
+    BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_)
+        : addr(std::move(addr_))
+        , weight(weight_)
+        , priority(priority_)
+        , is_draining(false)
+        , drain_start_time()
+        , active_requests(0) {}
+
     // Copy constructor: atomics aren't copyable, so load the value explicitly
     BackendInfo(const BackendInfo& other)
         : addr(other.addr)
