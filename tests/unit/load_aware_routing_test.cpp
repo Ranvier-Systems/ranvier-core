@@ -43,11 +43,39 @@ struct TestBackendInfo {
     TestBackendInfo(uint64_t load, bool draining = false, bool dead = false)
         : active_requests(load), is_draining(draining), is_dead(dead) {}
 
-    // Copy constructor for atomics
+    // Copy constructor: atomics aren't copyable, so load the value explicitly
     TestBackendInfo(const TestBackendInfo& other)
         : active_requests(other.active_requests.load(std::memory_order_relaxed))
         , is_draining(other.is_draining)
         , is_dead(other.is_dead) {}
+
+    // Move constructor: atomics aren't movable, so load the value explicitly
+    TestBackendInfo(TestBackendInfo&& other) noexcept
+        : active_requests(other.active_requests.load(std::memory_order_relaxed))
+        , is_draining(other.is_draining)
+        , is_dead(other.is_dead) {}
+
+    // Copy assignment
+    TestBackendInfo& operator=(const TestBackendInfo& other) {
+        if (this != &other) {
+            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            is_draining = other.is_draining;
+            is_dead = other.is_dead;
+        }
+        return *this;
+    }
+
+    // Move assignment
+    TestBackendInfo& operator=(TestBackendInfo&& other) noexcept {
+        if (this != &other) {
+            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+            is_draining = other.is_draining;
+            is_dead = other.is_dead;
+        }
+        return *this;
+    }
 };
 
 // Simulated config for testing
