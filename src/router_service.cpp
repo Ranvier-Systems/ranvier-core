@@ -360,7 +360,15 @@ BackendRequestGuard::~BackendRequestGuard() {
     }
 
     // Decrement active requests (Rule #1: relaxed ordering)
-    it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+    // Guard against underflow: if backend was removed and re-registered while request
+    // was in-flight, the counter would be 0 (never incremented by this guard).
+    // Decrementing 0 would wrap to UINT64_MAX, causing incorrect load readings.
+    // In Seastar's cooperative model, no co_await between load and fetch_sub means
+    // this check is safe without additional synchronization.
+    uint64_t current = it->second.active_requests.load(std::memory_order_relaxed);
+    if (current > 0) {
+        it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+    }
 }
 
 BackendRequestGuard::BackendRequestGuard(BackendRequestGuard&& other) noexcept
@@ -371,11 +379,14 @@ BackendRequestGuard::BackendRequestGuard(BackendRequestGuard&& other) noexcept
 
 BackendRequestGuard& BackendRequestGuard::operator=(BackendRequestGuard&& other) noexcept {
     if (this != &other) {
-        // Decrement our current count if active
+        // Decrement our current count if active (with underflow guard)
         if (_active && g_shard_state) {
             auto it = g_shard_state->backends.find(_backend_id);
             if (it != g_shard_state->backends.end()) {
-                it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+                uint64_t current = it->second.active_requests.load(std::memory_order_relaxed);
+                if (current > 0) {
+                    it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+                }
             }
         }
 
