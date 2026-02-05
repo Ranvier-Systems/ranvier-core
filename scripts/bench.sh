@@ -191,6 +191,9 @@ BENCHMARK OPTIONS:
     --multi-depth       Enable multi-depth route storage (Option C). Stores routes at
                         each message boundary, not just system message. Useful for
                         conversation continuations and branching scenarios.
+    --no-load-aware     Disable load-aware backend selection. Routes always go to the
+                        cached backend regardless of queue depth. Useful for A/B testing
+                        cache hit rates vs load balancing trade-offs.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
     --stop-timeout N    Seconds to wait for in-flight requests at benchmark end (default: 90)
@@ -343,6 +346,7 @@ WARMUP=false
 LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
 MULTI_DEPTH=false
+LOAD_AWARE=true
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 
@@ -370,6 +374,7 @@ while [[ $# -gt 0 ]]; do
         --no-log)         LOG_ALL=false; shift ;;
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --multi-depth)    MULTI_DEPTH=true; shift ;;
+        --no-load-aware)  LOAD_AWARE=false; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
@@ -720,6 +725,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Log All:         $LOG_ALL"
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
     echo "  Multi-Depth:     $MULTI_DEPTH"
+    echo "  Load-Aware:      $LOAD_AWARE"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
@@ -989,6 +995,12 @@ fi
 if [[ "$MULTI_DEPTH" = true ]]; then
     export RANVIER_ENABLE_MULTI_DEPTH_ROUTING=true
     log_info "Multi-depth routing enabled (Option C)"
+fi
+
+# Export load-aware routing setting for docker-compose
+if [[ "$LOAD_AWARE" = false ]]; then
+    export RANVIER_LOAD_AWARE_ROUTING=false
+    log_info "Load-aware routing disabled (pure affinity mode)"
 fi
 
 # Start Ranvier nodes

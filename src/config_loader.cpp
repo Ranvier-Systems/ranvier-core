@@ -141,6 +141,16 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_ENABLE_MULTI_DEPTH_ROUTING")) {
         routing.enable_multi_depth_routing = (*v == "1" || *v == "true" || *v == "yes");
     }
+    // Load-aware routing configuration
+    if (auto v = get_env("RANVIER_LOAD_AWARE_ROUTING")) {
+        routing.load_aware_routing = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint64_t>("RANVIER_QUEUE_DEPTH_THRESHOLD")) {
+        routing.queue_depth_threshold = *v;
+    }
+    if (auto v = get_env_as<uint64_t>("RANVIER_QUEUE_DIFF_THRESHOLD")) {
+        routing.queue_diff_threshold = *v;
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -591,6 +601,16 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["enable_multi_depth_routing"]) {
                 config.routing.enable_multi_depth_routing = r["enable_multi_depth_routing"].as<bool>();
+            }
+            // Load-aware routing
+            if (r["load_aware_routing"]) {
+                config.routing.load_aware_routing = r["load_aware_routing"].as<bool>();
+            }
+            if (r["queue_depth_threshold"]) {
+                config.routing.queue_depth_threshold = r["queue_depth_threshold"].as<uint64_t>();
+            }
+            if (r["queue_diff_threshold"]) {
+                config.routing.queue_diff_threshold = r["queue_diff_threshold"].as<uint64_t>();
             }
         }
 
