@@ -447,6 +447,64 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
     return {best_id, best_load};
 }
 
+// Check if preferred backend is overloaded and find a less-loaded alternative.
+// Returns the backend to use: either the preferred backend or a less-loaded alternative.
+// Updates stats and metrics if diversion occurs.
+//
+// Parameters:
+//   preferred_id: The backend selected by ART or hash
+//   live_backends: List of available backends to consider
+//   request_id: For logging (can be empty)
+//   source: Description for logging ("ART" or "hash")
+//
+// Rule #1: Lock-free - all reads use atomic with relaxed ordering
+static BackendId apply_load_aware_selection(
+    BackendId preferred_id,
+    const std::vector<BackendId>& live_backends,
+    const std::string& request_id,
+    const char* source)
+{
+    if (!g_shard_state) {
+        return preferred_id;
+    }
+    auto& state = shard_state();
+
+    if (!state.config.load_aware_routing) {
+        return preferred_id;
+    }
+
+    uint64_t preferred_load = get_backend_load(preferred_id);
+
+    if (preferred_load <= state.config.queue_depth_threshold) {
+        return preferred_id;  // Not overloaded
+    }
+
+    // Preferred backend overloaded - find alternative
+    auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
+
+    if (least_loaded_id == 0) {
+        return preferred_id;  // No valid alternative found
+    }
+
+    if (preferred_load - least_load <= state.config.queue_diff_threshold) {
+        return preferred_id;  // Difference not significant enough
+    }
+
+    // Significant difference - divert to less-loaded backend
+    state.stats.cache_miss_due_to_load++;
+    state.stats.load_aware_fallbacks++;
+    if (g_metrics) {
+        metrics().record_load_aware_fallback();
+    }
+
+    log_router.debug("[{}] Load-aware routing: {} preferred backend {} has {} in-flight, "
+                     "routing to {} with {} in-flight",
+                     request_id, source, preferred_id, preferred_load,
+                     least_loaded_id, least_load);
+
+    return least_loaded_id;
+}
+
 // ============================================================================
 // Route Batching Helpers
 // ============================================================================
@@ -1188,36 +1246,15 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                     metrics().record_cache_hit();
                 }
 
-                // Load-aware check: divert to less-loaded backend if preferred is overloaded
-                // Rule #1: Lock-free - uses atomic reads with relaxed ordering only
-                if (state.config.load_aware_routing) {
-                    uint64_t preferred_load = get_backend_load(art_backend);
+                // Apply load-aware selection (may divert to less-loaded backend)
+                BackendId final_backend = apply_load_aware_selection(
+                    art_backend, live_backends, request_id, "ART");
 
-                    if (preferred_load > state.config.queue_depth_threshold) {
-                        // Preferred backend overloaded - find alternative
-                        auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
-
-                        if (least_loaded_id != 0 && preferred_load - least_load > state.config.queue_diff_threshold) {
-                            // Significant difference - accept cache miss for lower latency
-                            state.stats.cache_miss_due_to_load++;
-                            state.stats.load_aware_fallbacks++;
-                            if (g_metrics) {
-                                metrics().record_load_aware_fallback();
-                            }
-                            log_router.debug("[{}] Load-aware routing: ART preferred backend {} has {} in-flight, "
-                                           "routing to {} with {} in-flight",
-                                           request_id, art_backend, preferred_load,
-                                           least_loaded_id, least_load);
-                            return least_loaded_id;
-                        }
-                    }
-                }
-
-                if (!request_id.empty()) {
+                if (!request_id.empty() && final_backend == art_backend) {
                     log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
                                      request_id, tokens.size(), art_backend);
                 }
-                return art_backend;
+                return final_backend;
             }
             // Backend is dead/draining, fall through to hash-based selection
             log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
@@ -1239,37 +1276,16 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
         metrics().record_cache_miss();
     }
 
-    // Load-aware check: divert to less-loaded backend if hash-selected is overloaded
-    // Rule #1: Lock-free - uses atomic reads with relaxed ordering only
-    if (state.config.load_aware_routing) {
-        uint64_t preferred_load = get_backend_load(selected);
+    // Apply load-aware selection (may divert to less-loaded backend)
+    BackendId final_backend = apply_load_aware_selection(
+        selected, live_backends, request_id, "hash");
 
-        if (preferred_load > state.config.queue_depth_threshold) {
-            // Hash-selected backend overloaded - find alternative
-            auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
-
-            if (least_loaded_id != 0 && preferred_load - least_load > state.config.queue_diff_threshold) {
-                // Significant difference - route to less-loaded backend
-                state.stats.cache_miss_due_to_load++;
-                state.stats.load_aware_fallbacks++;
-                if (g_metrics) {
-                    metrics().record_load_aware_fallback();
-                }
-                log_router.debug("[{}] Load-aware routing: hash preferred backend {} has {} in-flight, "
-                               "routing to {} with {} in-flight",
-                               request_id, selected, preferred_load,
-                               least_loaded_id, least_load);
-                return least_loaded_id;
-            }
-        }
-    }
-
-    if (!request_id.empty()) {
+    if (!request_id.empty() && final_backend == selected) {
         log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
                          request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
     }
 
-    return selected;
+    return final_backend;
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
