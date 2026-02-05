@@ -70,6 +70,55 @@ struct BackendInfo {
     // Incremented by BackendRequestGuard on construction, decremented on destruction.
     // Uses relaxed ordering - we only need eventual visibility, not strict ordering.
     std::atomic<uint64_t> active_requests{0};
+
+    // Default constructor
+    BackendInfo() = default;
+
+    // Copy constructor: atomics aren't copyable, so load the value explicitly
+    BackendInfo(const BackendInfo& other)
+        : addr(other.addr)
+        , weight(other.weight)
+        , priority(other.priority)
+        , is_draining(other.is_draining)
+        , drain_start_time(other.drain_start_time)
+        , active_requests(other.active_requests.load(std::memory_order_relaxed)) {}
+
+    // Move constructor: atomics aren't movable, so load the value explicitly
+    BackendInfo(BackendInfo&& other) noexcept
+        : addr(std::move(other.addr))
+        , weight(other.weight)
+        , priority(other.priority)
+        , is_draining(other.is_draining)
+        , drain_start_time(other.drain_start_time)
+        , active_requests(other.active_requests.load(std::memory_order_relaxed)) {}
+
+    // Copy assignment
+    BackendInfo& operator=(const BackendInfo& other) {
+        if (this != &other) {
+            addr = other.addr;
+            weight = other.weight;
+            priority = other.priority;
+            is_draining = other.is_draining;
+            drain_start_time = other.drain_start_time;
+            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+    // Move assignment
+    BackendInfo& operator=(BackendInfo&& other) noexcept {
+        if (this != &other) {
+            addr = std::move(other.addr);
+            weight = other.weight;
+            priority = other.priority;
+            is_draining = other.is_draining;
+            drain_start_time = other.drain_start_time;
+            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+        }
+        return *this;
+    }
 };
 
 // ============================================================================
