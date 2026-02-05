@@ -4,10 +4,12 @@
 #include "config.hpp"
 #include "gossip_service.hpp"  // For NodeState
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -64,6 +66,67 @@ struct RouteResult {
     bool cache_hit = false;               // True if route was found in cache (ART or prefix affinity)
     std::string error_message;            // Non-empty if backend_id is nullopt
 };
+
+// ============================================================================
+// BackendRequestGuard: RAII guard for tracking in-flight requests per backend
+// ============================================================================
+//
+// Create when a request is routed to a backend. The destructor decrements the
+// counter on ANY exit path (success, error, timeout, exception).
+//
+// Usage (future PR - not yet integrated):
+//   auto guard = BackendRequestGuard(backend_id);
+//   co_return co_await seastar::do_with(std::move(guard), [...](auto& g) {
+//       // proxy request to backend
+//   });
+//
+// Design:
+//   - Move-only for safe ownership transfer through do_with chains
+//   - Shard-local operation only (accesses thread_local g_shard_state)
+//   - Lock-free: uses atomic increment/decrement with relaxed ordering
+//
+class BackendRequestGuard {
+public:
+    // Construct guard and increment active_requests for the backend.
+    // If backend_id is invalid (not in shard state), guard is inactive (no-op).
+    explicit BackendRequestGuard(BackendId id);
+
+    // Decrement active_requests if guard is active
+    ~BackendRequestGuard();
+
+    // Move constructor: transfer ownership (source becomes inactive)
+    BackendRequestGuard(BackendRequestGuard&& other) noexcept;
+
+    // Move assignment: transfer ownership (source becomes inactive)
+    BackendRequestGuard& operator=(BackendRequestGuard&& other) noexcept;
+
+    // Non-copyable (prevent double-decrement)
+    BackendRequestGuard(const BackendRequestGuard&) = delete;
+    BackendRequestGuard& operator=(const BackendRequestGuard&) = delete;
+
+    // Accessor for the backend this guard is tracking
+    BackendId backend_id() const { return _backend_id; }
+
+    // Check if guard is active (owns the increment)
+    bool is_active() const { return _active; }
+
+private:
+    BackendId _backend_id{0};
+    bool _active{false};  // True if we own the increment
+};
+
+// ============================================================================
+// Load Tracking Helper Functions (shard-local, lock-free)
+// ============================================================================
+
+// Get current in-flight request count for a backend (shard-local read)
+// Returns 0 if backend not found in shard state
+uint64_t get_backend_load(BackendId id);
+
+// Find the least loaded backend from a list of candidates
+// Returns pair of (backend_id, load). Returns (0, UINT64_MAX) if no candidates found.
+// O(n) scan where n is typically <10 backends
+std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates);
 
 class RouterService {
 public:

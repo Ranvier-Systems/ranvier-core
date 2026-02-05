@@ -16,6 +16,10 @@
 
 namespace ranvier {
 
+// Forward declaration for load-aware routing metrics
+// Defined in router_service.cpp - reads shard-local BackendInfo::active_requests
+uint64_t get_backend_load(BackendId id);
+
 // Histogram bucket boundaries for latency measurements (in seconds)
 // Covers range from 1ms to 5 minutes for LLM inference workloads
 inline std::vector<double> latency_buckets() {
@@ -211,6 +215,13 @@ public:
             seastar::metrics::make_counter("prefix_boundary_client", _prefix_boundary_client,
                 seastar::metrics::description("Total number of requests where client-provided prefix_token_count was used for routing")),
 
+            // Load-aware routing metrics
+            seastar::metrics::make_counter("routing_load_aware_fallbacks_total", _load_aware_fallbacks,
+                seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth exceeding threshold")),
+
+            seastar::metrics::make_counter("routing_cache_miss_due_to_load_total", _cache_miss_due_to_load,
+                seastar::metrics::description("Total number of cache misses accepted to avoid routing to overloaded backends")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -352,6 +363,15 @@ public:
     void record_prefix_boundary_skipped() { _prefix_boundary_skipped++; }
     void record_prefix_boundary_client() { _prefix_boundary_client++; }
 
+    // Load-aware routing metrics
+    // Records when a request is diverted to a less-loaded backend
+    void record_load_aware_fallback() {
+        _load_aware_fallbacks++;
+        _cache_miss_due_to_load++;
+    }
+    uint64_t get_load_aware_fallbacks() const { return _load_aware_fallbacks; }
+    uint64_t get_cache_miss_due_to_load() const { return _cache_miss_due_to_load; }
+
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
 
@@ -453,6 +473,10 @@ private:
     uint64_t _prefix_boundary_skipped = 0;  // Prefix boundary skipped (no system messages, too short, disabled)
     uint64_t _prefix_boundary_client = 0;  // Client-provided prefix_token_count was used
 
+    // Load-aware routing counters
+    uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
+    uint64_t _cache_miss_due_to_load = 0;  // Cache misses accepted for load balancing
+
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance
     uint64_t _cache_hits = 0;
@@ -523,7 +547,14 @@ private:
             seastar::metrics::make_histogram("backend_first_byte_latency_seconds",
                 seastar::metrics::description("Time to first byte from backend in seconds, segmented by backend_id."),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return metrics.first_byte_latency.data; })
+                [&metrics] { return metrics.first_byte_latency.data; }),
+
+            // Per-backend active requests gauge for load-aware routing observability
+            // Shows current in-flight requests to each backend (Rule #1: lock-free atomic read)
+            seastar::metrics::make_gauge("backend_active_requests",
+                seastar::metrics::description("Current number of in-flight requests to backend. Use for load-aware routing observability."),
+                {{"backend_id", backend_id_str}},
+                [backend_id] { return static_cast<double>(get_backend_load(backend_id)); })
         });
 
         metrics.registered = true;

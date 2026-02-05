@@ -1150,6 +1150,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     socket_address target_addr = target_addr_opt.value();
     log_proxy.info("[{}] Routing to backend {} at {}", request_id, target_id, target_addr);
 
+    // Create BackendRequestGuard to track in-flight requests per backend
+    // This RAII guard increments active_requests on construction and decrements on destruction.
+    // The guard will be captured in the streaming lambda to survive the entire request lifecycle.
+    // Rule #1: Lock-free - uses atomic increment/decrement with relaxed ordering.
+    BackendRequestGuard backend_guard(target_id);
+
     // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
     // Capture config for the lambda
     auto connect_timeout = _config.connect_timeout;
@@ -1207,9 +1213,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
     ctx->shard_metrics_active = shard_metrics_active;
     ctx->request_deadline = lowres_clock::now() + request_timeout;
 
-    // Move gate_holder and semaphore_units into the lambda to keep them alive during streaming.
-    // This ensures the gate stays held and the semaphore slot is occupied until streaming completes.
-    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units)](output_stream<char> client_out) mutable -> future<> {
+    // Move gate_holder, semaphore_units, and backend_guard into the lambda to keep them alive during streaming.
+    // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
+    // is properly maintained until streaming completes.
+    // BackendRequestGuard destructor will decrement active_requests when the lambda completes.
+    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units), backend_guard = std::move(backend_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(*ctx);

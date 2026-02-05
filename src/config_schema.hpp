@@ -110,6 +110,16 @@ struct RoutingConfig {
     // breakpoint (end of system message, end of user turn, etc.)
     bool enable_multi_depth_routing = false;  // Store routes at multiple depths
 
+    // =========================================================================
+    // Load-Aware Routing
+    // =========================================================================
+    // When enabled, considers backend queue depth before routing to the
+    // prefix-preferred backend. If the preferred backend is overloaded,
+    // routes to a less-loaded alternative (accepting potential cache miss).
+    bool load_aware_routing = true;           // Enable load-aware backend selection
+    uint64_t queue_depth_threshold = 4;       // Max in-flight before considering alternatives
+    uint64_t queue_diff_threshold = 2;        // Min load difference to justify cache miss
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }
