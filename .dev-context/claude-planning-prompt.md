@@ -1,16 +1,7 @@
 I am STARTING A PLANNING SESSION for the following feature:
 <INSERT_FEATURE_DESCRIPTION>
 
----
-
-1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /docs or /assets folders.
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
 
 ---
 
@@ -40,10 +31,10 @@ Step 1: [description]
 
 ### 3. Flag Architectural Concerns
 For each step, check:
-- [ ] Requires cross-shard communication? (Note: use `smp::submit_to`)
-- [ ] Introduces new async flow? (Note: will need Mermaid diagram)
-- [ ] Adds new container? (Note: needs MAX_SIZE)
-- [ ] Adds timer/callback? (Note: needs gate guard)
+- [ ] Requires cross-shard communication? (use `smp::submit_to`)
+- [ ] Introduces new async flow? (will need Mermaid diagram)
+- [ ] Adds new container? (needs MAX_SIZE)
+- [ ] Adds timer/callback? (needs gate guard)
 
 ### 4. Identify Dependencies
 Which steps depend on others? Create a dependency graph if complex.
@@ -78,4 +69,3 @@ Which steps depend on others? Create a dependency graph if complex.
 ```
 
 Save output to BACKLOG.md under a new feature section.
-

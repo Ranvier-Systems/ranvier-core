@@ -1,15 +1,12 @@
 I am requesting an ADVERSARIAL SYSTEM AUDIT of the source files under src/
 
----
-
-1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
-2. Run /compact if the conversation exceeds 4 turns.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
 
 ---
 
 ## PERSONA
 
-Act as a **cynical Staff Engineer and Security Auditor**. Do not look for "small issues"—look for **structural failures**. Assume the code will be attacked by malicious actors and stressed by 100x traffic.
+Act as a **cynical Staff Engineer and Security Auditor**. Do not look for "small issues"--look for **structural failures**. Assume the code will be attacked by malicious actors and stressed by 100x traffic.
 
 ---
 
@@ -27,10 +24,10 @@ Scan for violations of Seastar's reactor model:
 
 ### 2. THE "EDGE-CASE CRASH" LENS
 If external inputs fail, where does this code break?
-- Network call returns error → unhandled exception?
-- SQLite returns NULL → null pointer dereference?
-- Input string is empty/malformed → crash in parser?
-- External service timeout → cascade failure?
+- Network call returns error -> unhandled exception?
+- SQLite returns NULL -> null pointer dereference?
+- Input string is empty/malformed -> crash in parser?
+- External service timeout -> cascade failure?
 
 **Flag:** Point to specific lines with unhandled failure modes.
 
@@ -39,17 +36,15 @@ Does this code respect our layered architecture?
 - Controller calling persistence directly (bypassing service)?
 - Business validation in persistence layer?
 - Utility files accumulating business logic?
-- Cross-cutting concerns scattered instead of centralized?
 
 **Flag:** Identify any layer boundary violations.
 
 ### 4. THE "SCALE & LEAK" LENS
 Will this hold up at 100x scale?
-- Containers growing without bounds → OOM risk?
+- Containers growing without bounds -> OOM risk?
 - O(n) or O(n^2) algorithms on unbounded data?
-- Event listeners/callbacks added without cleanup → memory leak?
-- Timers scheduled without cancellation on shutdown → use-after-free?
-- `std::shared_ptr` preventing timely destruction?
+- Event listeners/callbacks added without cleanup -> memory leak?
+- Timers scheduled without cancellation on shutdown -> use-after-free?
 
 **Flag:** Identify resource exhaustion and leak vectors.
 
@@ -69,7 +64,6 @@ Will this hold up at 100x scale?
 | Severity | File:Line | Issue | Recommendation |
 |----------|-----------|-------|----------------|
 | HIGH | `src/foo.cc:42` | Sequential await in loop | Use `parallel_for_each` |
-| ... | ... | ... | ... |
 
 #### Edge-Case Crashes
 ...
@@ -89,4 +83,3 @@ Will this hold up at 100x scale?
 
 ### Anti-Pattern Candidates
 If any issues are systemic, flag them for `claude-pattern-extractor-prompt.md` to formalize into the Hard Rules.
-

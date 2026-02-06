@@ -5,16 +5,7 @@ I am REFACTORING:
 
 **Constraint:** NO behavioral changes. Existing tests must pass unchanged.
 
----
-
-1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /docs or /assets folders.
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
 
 ---
 
@@ -41,11 +32,9 @@ Build Constraints:
 ## SEASTAR-SPECIFIC CONCERNS
 
 ### Async Boundary Preservation
-When refactoring async code, verify:
 - [ ] `co_await` points remain at same logical positions
 - [ ] No new blocking calls introduced
 - [ ] Future chain semantics identical (same error propagation)
-- [ ] Coroutine vs callback style not mixed inappropriately
 
 ### Shard Affinity
 - [ ] No new cross-shard data access without `smp::submit_to`
@@ -73,10 +62,7 @@ Async Behavior: [future semantics, shard interactions]
 ```
 
 ### Step 2: Plan the Changes
-List each mechanical transformation:
-1. [transformation 1]
-2. [transformation 2]
-...
+List each mechanical transformation.
 
 ### Step 3: Execute with Verification
 After each transformation:
@@ -91,11 +77,9 @@ After each transformation:
 | File | Change Type | Description |
 |------|-------------|-------------|
 | `src/foo.cc` | Extract | Pull `validate_input()` into helper |
-| `src/foo.hh` | Rename | `process()` → `process_request()` |
-| ... | ... | ... |
+| `src/foo.hh` | Rename | `process()` -> `process_request()` |
 
 ### Behavioral Equivalence Proof
-For each changed function:
 ```
 Function: [name]
 Before: [behavior description]
@@ -107,11 +91,3 @@ Why Equivalent: [mechanical transformation / logic preserved because...]
 - [ ] **Low risk** - Mechanical transformation only
 - [ ] **Medium risk** - Logic restructuring, needs careful review
 - [ ] **High risk** - Async flow changes, needs thorough testing
-
-### Hard Rules Check
-Verify refactoring doesn't introduce violations:
-- [ ] No new `std::shared_ptr`
-- [ ] No new `std::mutex`
-- [ ] No new sequential `co_await` loops
-- [ ] All existing patterns preserved
-
