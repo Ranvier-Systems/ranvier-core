@@ -319,6 +319,17 @@ target_link_libraries(text_validator_test
 )
 gtest_discover_tests(text_validator_test)
 
+# ParseUtils Unit Tests (Pure C++, header-only)
+add_executable(parse_utils_test
+  tests/unit/parse_utils_test.cpp
+)
+target_include_directories(parse_utils_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(parse_utils_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(parse_utils_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
