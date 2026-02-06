@@ -1914,7 +1914,6 @@ _Move completed items here with completion date and PR reference._
 
 > **Analysis:** 851 unit tests across 20 files, 4 integration suites, 5 validation scripts.
 > **Finding:** 14 source files (25%) have zero unit tests. 5 systematic weaknesses affect all tests.
-> **Full report:** [`TEST_COVERAGE_ANALYSIS.md`](./TEST_COVERAGE_ANALYSIS.md)
 >
 > **Conventions for all test tasks below:**
 > - Read `CLAUDE.md` and `.dev-context/claude-context.md` first (coding conventions, 16 Hard Rules).
