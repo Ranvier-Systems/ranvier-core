@@ -21,6 +21,7 @@ This document identifies missing features and optimizations required to promote 
 9. [Benchmark Extensions](#9-benchmark-extensions)
 10. [Load-Aware Prefix Routing](#10-load-aware-prefix-routing)
 11. [System Architecture Audit (2026-02-02)](#11-system-architecture-audit-2026-02-02)
+12. [Test Coverage Gaps (2026-02-06)](#12-test-coverage-gaps-2026-02-06)
 
 ---
 
@@ -1906,6 +1907,109 @@ _Move completed items here with completion date and PR reference._
 | 2024-12-XX | Abseil high-performance containers | #48 |
 | 2024-12-XX | Multi-node integration tests | #47 |
 | 2024-12-XX | Request rewriting for token forwarding | #46 |
+
+---
+
+## 12. Test Coverage Gaps (2026-02-06)
+
+> **Analysis:** 851 unit tests across 20 files, 4 integration suites, 5 validation scripts.
+> **Finding:** 14 source files (25%) have zero unit tests. 5 systematic weaknesses affect all tests.
+> **Full report:** [`TEST_COVERAGE_ANALYSIS.md`](./TEST_COVERAGE_ANALYSIS.md)
+
+### 12.1 P0 — New Unit Tests for Untested Pure-Function Files
+
+- [ ] **Add `parse_utils_test.cpp`**
+  _Justification:_ `parse_utils.hpp` contains `parse_int32`, `parse_uint32`, `parse_port` used across the codebase. Zero tests today. Pure functions — no Seastar dependency.
+  _Test cases:_ Valid integers (positive, negative, zero, INT32_MIN/MAX), overflow/underflow, trailing garbage rejection, empty/whitespace input, port range validation (0, 1, 65535, 65536), negative values rejected for unsigned parse.
+  _Complexity:_ Low
+  _Priority:_ P0
+
+- [ ] **Add `logging_test.cpp`**
+  _Justification:_ `logging.hpp` contains `generate_request_id()` and header extraction helpers used on every request. No tests today. Pure functions — no Seastar dependency.
+  _Test cases:_ Request ID format (`{shard}-{timestamp}-{seq}`), monotonically increasing sequence, `extract_request_id_view` prefers X-Request-ID over X-Correlation-ID, `extract_traceparent_view` case-insensitive lookup, missing/empty headers return empty string_view.
+  _Complexity:_ Low
+  _Priority:_ P0
+
+- [ ] **Add `shard_load_metrics_test.cpp`**
+  _Justification:_ `shard_load_metrics.hpp` owns atomics and RAII guards used by load-aware routing. No tests today. Self-contained — testable without Seastar.
+  _Test cases:_ `ActiveRequestGuard` increments on construction / decrements on destruction, `QueuedRequestGuard` same semantics, `load_score()` = active × 2.0 + queued, `ShardLoadSnapshot` captures point-in-time values, move semantics (no double-decrement), underflow protection.
+  _Complexity:_ Low
+  _Priority:_ P0
+
+### 12.2 P1 — New Unit Tests for Core Infrastructure
+
+- [ ] **Add `metrics_service_test.cpp`**
+  _Justification:_ `metrics_service.hpp` (~200 LOC) has histogram bucket logic and bounded container enforcement (Rule #4: max 10K backends). No tests today.
+  _Test cases:_ Histogram bucket correctness, bounded container limits, cache-hit-ratio divide-by-zero protection, metric recording and reset.
+  _Complexity:_ Medium
+  _Priority:_ P1
+
+- [ ] **Add `node_slab_test.cpp`**
+  _Justification:_ `node_slab.hpp/cpp` (~250 LOC) is the per-shard memory pool for RadixTree nodes. Allocator bugs cause silent corruption. No tests today.
+  _Test cases:_ Allocate/free round-trips, free-list integrity after allocate→free→reallocate cycles, peak tracking, pool exhaustion behavior.
+  _Complexity:_ Medium
+  _Priority:_ P1
+
+- [ ] **Add `cross_shard_request_test.cpp`**
+  _Justification:_ `cross_shard_request.hpp` (~180 LOC) has validation functions (body size limit 128MB, token count limit 128K, string length limit 4KB) and `force_local_allocation()`. Pure functions — testable without Seastar.
+  _Test cases:_ Body size at/over 128 MB limit, token count at/over 128K limit, string length at/over 4 KB limit, `force_local_allocation()` copy behavior.
+  _Complexity:_ Medium
+  _Priority:_ P1
+
+- [ ] **Add `tracing_service_test.cpp` (W3C parsing only)**
+  _Justification:_ W3C traceparent parsing (`version-traceid-spanid-flags`) in `tracing_service.hpp/cpp` is pure string logic. No tests today.
+  _Test cases:_ Valid/invalid traceparent formats, hex validation, field length enforcement, flag parsing, version 00 vs unknown versions.
+  _Complexity:_ Medium
+  _Priority:_ P1
+
+### 12.3 P2 — Strengthen Existing Tests
+
+- [ ] **Introduce clock injection for time-dependent tests**
+  _Justification:_ `rate_limiter`, `circuit_breaker`, `gossip_consensus`, and `connection_pool` all have time-sensitive behavior tested with no time control (0 of 20 test files have timing tests).
+  _Approach:_ Introduce a `TestClock` abstraction (template parameter or `std::function<steady_clock::time_point()>` injection). Retrofit into rate_limiter (refill rate), circuit_breaker (OPEN→HALF_OPEN timeout), quorum (peer liveness window).
+  _Complexity:_ Medium
+  _Priority:_ P2
+
+- [ ] **Adopt Google Mock (`gmock`) for dependency isolation**
+  _Justification:_ Only 1 of 20 test files uses mocks (hand-rolled). Without mocking, components with external dependencies (network, filesystem, timers) cannot be tested in isolation.
+  _Approach:_ Replace hand-rolled mock in `async_persistence_test.cpp` with gmock. Add mock interfaces for `PersistenceStore`, `ConnectionPool`, `HealthChecker`, `UdpChannel`.
+  _Complexity:_ Medium
+  _Priority:_ P2
+
+- [ ] **Add negative-path integration tests**
+  _Justification:_ All 4 Docker Compose suites cover happy-path scenarios only. No tests for failure recovery, split-brain, or overload.
+  _Test cases:_
+  - Split-brain: Partition network between nodes, verify quorum detection and recovery
+  - Backend flap: Rapidly start/stop mock backends, verify circuit breaker engages
+  - Config reload: Send SIGHUP with invalid config, verify old config preserved
+  - Rate limit: Send concurrent requests exceeding rate limits, verify 429 responses
+  - Oversized request: Send bodies exceeding max size, verify rejection
+  _Complexity:_ High
+  _Priority:_ P2
+
+### 12.4 P3 — Longer-Term Test Infrastructure
+
+- [ ] **Add `connection_pool_test.cpp`**
+  _Justification:_ `connection_pool.hpp` (~300 LOC) manages upstream connections with per-host limits, global limits, idle timeout, and max-age TTL. Zero tests today. Requires extracting pool logic behind a testable interface.
+  _Complexity:_ High
+  _Priority:_ P3
+
+- [ ] **Add router service integration tests (Seastar-dependent)**
+  _Justification:_ `router_service.hpp/cpp` (~700 LOC) is the core routing brain. No dedicated tests — only tested transitively through integration suites.
+  _Test cases:_ Route learning from proxied requests, route TTL expiration, cross-shard broadcast, backend registration/deregistration with route cleanup, draining mode.
+  _Complexity:_ High
+  _Priority:_ P3
+
+- [ ] **Extract and test HTTP controller proxy logic**
+  _Justification:_ The retry/fallback state machine (`ProxyContext`) in `http_controller.cpp` (~1200 LOC) is the most complex untested code in the codebase.
+  _Approach:_ Extract retry/backoff logic into a testable pure function. Test admin API endpoints in isolation. Test backpressure semaphore behavior.
+  _Complexity:_ High
+  _Priority:_ P3
+
+- [ ] **Add concurrency stress tests for cross-shard components**
+  _Justification:_ 0 of 20 test files exercise concurrent access. Components crossing shard boundaries (`shard_load_metrics` atomics, `async_persistence` queue, `tokenizer_thread_pool` submission, `rate_limiter` buckets) need thread-safety validation.
+  _Complexity:_ High
+  _Priority:_ P3
 
 ---
 
