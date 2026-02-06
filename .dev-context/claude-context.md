@@ -1,22 +1,275 @@
 # Ranvier Core: Context & Constraints
 
 ## Project Essence
-Layer 7+ load balancer for LLM inference using **Prefix Caching** to prevent KV-cache thrashing.
+
+Ranvier Core is a high-performance **Layer 7+ LLM traffic controller** built in **C++20** on the **Seastar** framework. It reduces GPU KV-cache thrashing by routing inference requests based on token prefixes rather than connection availability, achieving ~48% faster Time-To-First-Token for RAG, multi-turn chat, and few-shot workloads.
+
+**License:** Apache 2.0
+
+## Build Constraints
+
+- **Static analysis only.** Do not attempt to run `cmake`, `make`, or build. Seastar dependencies are too heavy for the sandbox.
+- **API verification:** Verify syntax against Seastar documentation logic.
+- **Manual verification:** The developer builds in their Docker container and provides logs if it fails.
+- **Do NOT read** the full `/docs` or `/assets` folders (large token-heavy files).
+
+## Pre-Code Checklist
+
+Before writing any code, verify:
+- [ ] Have I read the relevant file(s) I'm about to modify?
+- [ ] Does this touch cross-shard communication? Use `seastar::smp::submit_to`
+- [ ] Is there a MAX_SIZE for any new container?
+- [ ] Any new timer/callback? Needs gate guard
+- [ ] Any new metrics lambda capturing `this`? Deregister in `stop()`
+- [ ] Any C API string returns? Null-guard required
 
 ## Architecture Reference
-- **Tech Stack:** C++20, Seastar (shared-nothing architecture), SQLite (WAL mode).
-- **Data Flow:** HttpController → TokenizerService (GPT-2) → RouterService → RadixTree (ART) → ConnectionPool → GPU Backend.
-- **Sharding:** Every CPU core has its own shard. RouterService broadcasts updates across shards.
+
+### Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Language | C++20 (ISO standard) |
+| Async Framework | Seastar (shared-nothing, thread-per-core) |
+| Build System | CMake 3.24+ with FetchContent |
+| Persistence | SQLite (WAL mode) |
+| Testing | Google Test (unit), Python + Docker Compose (integration), Locust (load) |
+| Tokenization | HuggingFace tokenizers via Rust FFI (tokenizers-cpp) |
+| Cluster Sync | UDP gossip protocol with DTLS encryption |
+
+### Data Flow
+
+```
+HTTP Request (:8080)
+  -> HttpController (sharded, one per core)
+  -> TokenizerService (BPE encoding with LRU cache)
+  -> RouterService
+     -> RadixTree (Adaptive Radix Tree - O(k) prefix lookup)
+     -> Fallback: consistent hash or weighted random
+  -> CircuitBreaker check
+  -> ConnectionPool -> GPU Backend
+  -> [Async] Learn route + persist + gossip broadcast
+```
+
+### Source Code Layout
+
+```
+src/
+  main.cpp                    # Seastar reactor entry point
+  application.{hpp,cpp}       # Service lifecycle orchestration (CREATED->RUNNING->DRAINING->STOPPED)
+
+  # Routing Core
+  router_service.{hpp,cpp}    # Unified routing interface (prefix/hash/random modes)
+  radix_tree.hpp              # Adaptive Radix Tree (Node4/16/48/256, slab-allocated)
+  node_slab.{hpp,cpp}         # O(1) slab allocator for ART nodes
+
+  # HTTP Layer
+  http_controller.{hpp,cpp}   # Request handling, proxy, SSE streaming
+  connection_pool.hpp         # LRU + TTL connection management
+  circuit_breaker.hpp         # Backend health state machine (CLOSED/OPEN/HALF_OPEN)
+  rate_limiter.hpp            # Request throttling
+  stream_parser.{hpp,cpp}     # SSE stream parsing
+  request_rewriter.hpp        # Token ID injection into requests
+
+  # Tokenization
+  tokenizer_service.{hpp,cpp} # HuggingFace BPE via Rust FFI (sharded, one per core)
+  tokenizer_thread_pool.{hpp,cpp} # Thread pool for FFI calls (5-13ms each)
+
+  # Clustering
+  gossip_service.{hpp,cpp}    # Cluster state sync coordinator (shard 0 only)
+  gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery, DNS discovery
+  gossip_transport.{hpp,cpp}  # UDP channel, DTLS encryption
+  gossip_consensus.{hpp,cpp}  # Peer table, quorum, split-brain detection
+  crypto_offloader.{hpp,cpp}  # DTLS crypto on worker threads
+  dtls_context.{hpp,cpp}      # OpenSSL DTLS session management
+
+  # Configuration
+  config.hpp                  # Facade header (includes schema + loader)
+  config_schema.hpp           # All config structs (RanvierConfig, RoutingConfig, etc.)
+  config_loader.{hpp,cpp}     # YAML parsing + env var overrides
+  sharded_config.hpp          # Lock-free per-shard config distribution
+
+  # Persistence
+  persistence.hpp             # Interface definition
+  sqlite_persistence.{hpp,cpp} # SQLite WAL-mode backend
+  async_persistence.{hpp,cpp} # Fire-and-forget queue with batch writes
+
+  # Infrastructure
+  health_service.{hpp,cpp}    # Backend liveness monitoring
+  k8s_discovery_service.{hpp,cpp} # Kubernetes EndpointSlice watching
+  metrics_service.hpp         # Prometheus metrics (:9180)
+  tracing_service.{hpp,cpp}   # OpenTelemetry (optional, Zipkin exporter)
+  shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch
+  shard_load_metrics.hpp      # Per-shard load tracking
+  cross_shard_request.hpp     # Safe cross-shard pointer passing
+
+  # Utilities
+  types.hpp                   # Core type aliases (TokenId, BackendId)
+  logging.hpp                 # Structured logging
+  parse_utils.hpp             # Safe string-to-number conversion
+  text_validator.hpp          # Input validation
+
+tests/
+  unit/                       # 24+ Google Test files
+  integration/                # Python tests + Locust load testing
+
+deploy/helm/ranvier/          # Kubernetes Helm chart
+
+.dev-context/                 # Workflow prompts, audit findings, cheatsheet
+```
+
+### Key Types
+
+```cpp
+using TokenId = int32_t;     // BPE token identifier
+using BackendId = int32_t;   // GPU pool identifier
+
+struct RouteResult {
+    std::optional<BackendId> backend_id;
+    std::string routing_mode;  // "prefix" | "hash" | "random"
+    bool cache_hit = false;
+    std::string error_message;
+};
+
+enum class RoutingMode { PREFIX, HASH, RANDOM };
+enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
+```
 
 ## Critical Constraints for Coding
+
 1. **NO LOCKS:** This is a Seastar project. Never use `std::mutex` or atomics. Use `seastar::smp::submit_to` for cross-core communication.
 2. **Async Only:** All I/O and cross-shard calls must return `seastar::future<>`.
 3. **Prefix Logic:** Routing is based on the Adaptive Radix Tree (ART) lookup of token sequences.
-4. **Visualize the FutureChain** Since Seastar relies heavily on Future/Promise chains, "Visualize the Future Chain" in ASCII or Mermaid diagrams before writing the code to prevent "Future Leaks" or blocking the reactor.
+4. **Visualize the FutureChain:** Since Seastar relies heavily on Future/Promise chains, "Visualize the Future Chain" in ASCII or Mermaid diagrams before writing the code to prevent "Future Leaks" or blocking the reactor.
+
+## Coding Conventions
+
+### Naming
+
+- **Private members:** `_snake_case` prefix (`_config`, `_router`)
+- **Functions:** `snake_case` (`route_request()`, `learn_route_global()`)
+- **Enums:** `PascalCase` (`RoutingMode`, `CircuitState`)
+- **Type aliases:** `PascalCase` (`TokenId`, `BackendId`, `NodePtr`)
+- **Constants:** `kPascalCase` or `SCREAMING_SNAKE_CASE`
+- **Namespace:** `ranvier`
+
+### File Organization
+
+- `foo.hpp` - Public interface with leading comments
+- `foo.cpp` - Implementation
+- `*_schema.hpp` - Data structures only
+- `*_loader.hpp` - Loading/parsing logic
+- `*_service.{hpp,cpp}` - Service orchestration
+
+### Error Handling
+
+- No exceptions on hot paths
+- Return `std::optional<T>` for missing data
+- Return structs with error_message fields for routing failures
+- Seastar futures propagate exceptions for async failures
+- Every catch block must log at warn level minimum (Rule #9)
+
+### Metrics
+
+```cpp
+namespace sm = seastar::metrics;
+_metrics.add_group("ranvier_router", {
+    sm::make_counter("routes_learned", _routes_learned),
+    sm::make_gauge("cache_size", [this] { return _tree.size(); }),
+});
+```
+
+Deregister metrics first in `stop()` before any other cleanup (Rule #6).
+
+### Critical Seastar Patterns
+
+**Cross-shard communication:** Always use `seastar::smp::submit_to()`. Never locks or atomics.
+
+**Cross-shard data transfer:** Use `foreign_ptr` + local reallocation:
+```cpp
+auto ptr = std::make_unique<std::vector<T>>(data);
+auto foreign = seastar::make_foreign(std::move(ptr));
+smp::submit_to(target, [foreign = std::move(foreign)]() mutable {
+    std::vector<T> local(foreign->begin(), foreign->end());  // Local alloc
+    process(local);
+});
+```
+
+**FFI safety:** Reallocate in BOTH directions when crossing shard/thread boundaries with Rust/C FFI. Seastar replaces `malloc` globally; FFI allocators don't participate in Seastar's per-shard memory tracking.
+
+**Async-only I/O:** All file I/O must use `seastar::open_file_dma()` + `seastar::make_file_input_stream()`. Never `std::ifstream`.
+
+**Bounded containers:** Every `push_back` must have a size check or the container must be bounded by design.
+
+## Dependencies
+
+| Library | Version | Purpose |
+|---------|---------|---------|
+| Seastar | system | Async I/O framework (shared-nothing) |
+| GTest | 1.14.0 | Unit testing |
+| yaml-cpp | 0.8.0 | YAML config parsing |
+| Abseil | 20240116.1 | `flat_hash_map`/`flat_hash_set` |
+| RapidJSON | 1.1.0 | JSON parsing (header-only) |
+| SQLite3 | 3.45.0 | Persistent state (built from source if needed) |
+| tokenizers-cpp | main | Rust FFI for BPE tokenization |
+| OpenTelemetry | 1.14.2 | Distributed tracing (optional: `WITH_TELEMETRY=ON`) |
+| OpenSSL | system | DTLS encryption for gossip |
+
+Dependencies are resolved via system packages first, with CMake FetchContent as fallback.
+
+## Build System
+
+**CMake 3.24+** with C++20 standard. Key CMake options:
+
+- `CMAKE_BUILD_TYPE=Release` (default) or `Debug`
+- `WITH_TELEMETRY=ON/OFF` - Enable OpenTelemetry tracing
+- `CMAKE_EXPORT_COMPILE_COMMANDS=ON` - Always on, for IDE support and clang-tidy
+
+The full server binary (`ranvier_server`) requires Seastar installed on the system. Unit tests can be built and run without Seastar -- they test individual components in isolation.
 
 ## Documentation Map
+
 - **API:** Admin on `:8080`, Data on `:8080`, Metrics on `:9180`.
 - **Persistence:** SQLite tracks backends and routes.
+- **Configuration:** YAML (default: `ranvier.yaml`) with env var overrides (e.g., `RANVIER_ROUTING_MAX_ROUTES=50000`). Hot-reload via SIGHUP (rate-limited to once per 10 seconds, atomic across all shards). See `ranvier.yaml.example`.
+
+## CI/CD
+
+GitHub Actions workflows in `.github/workflows/`:
+
+| Workflow | Purpose |
+|----------|---------|
+| `docker-publish.yml` | Multi-arch Docker images (amd64/arm64) to GHCR on push to main/tags |
+| `docker-base.yml` | Base image with Seastar + build tools (manual trigger, ~30min) |
+| `benchmark.yml` | Locust load test regression on PRs and pushes to main |
+
+## Deployment
+
+- **Docker:** `ghcr.io/ranvier-systems/ranvier:latest` (requires `--cap-add=IPC_LOCK`)
+- **Kubernetes:** Helm chart in `deploy/helm/ranvier/` (StatefulSet, HPA, service discovery)
+- **Local development:** Docker Compose via `docker-compose.test.yml` (3 nodes + 2 backends)
+
+## Workflow Prompts
+
+The `.dev-context/` directory contains specialized prompt templates for different workflows:
+
+| Prompt | Use When |
+|--------|----------|
+| `claude-prompt.md` | Starting any general task |
+| `claude-impl-prompt.md` | Implementing a feature (staged: plan, code, optimize) |
+| `claude-review-prompt.md` | Self-reviewing code against the 16 Hard Rules |
+| `claude-debug-prompt.md` | Triaging a build/runtime failure |
+| `claude-doc-prompt.md` | Writing tests and updating docs post-implementation |
+| `claude-planning-prompt.md` | Decomposing a feature into atomic steps |
+| `claude-refactor-prompt.md` | Refactoring without behavioral changes |
+| `claude-audit-prompt.md` | Holistic system audit for architecture drift |
+| `claude-adversarial-audit-prompt.md` | Security-focused adversarial audit |
+| `claude-perf-prompt.md` | Performance investigation and optimization |
+| `claude-incident-prompt.md` | Incident response and root cause analysis |
+| `claude-pattern-extractor-prompt.md` | Formalizing new anti-patterns into Hard Rules |
+| `claude-strategic-alignment-prompt.md` | Strategic project assessment |
+
+---
 
 ## Anti-Patterns & Lessons Learned
 
@@ -30,11 +283,11 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Using `std::shared_ptr<T>` for objects that live within a Seastar service, assuming "shared ownership" is always safe.
 
-**THE CONSEQUENCE:** `std::shared_ptr` uses atomic reference counting. When the last reference is released on a different CPU core than where the object was allocated, the destructor runs on the "wrong" shard—violating Seastar's shared-nothing model. This causes subtle data races, memory corruption, or crashes when the destructor accesses shard-local state.
+**THE CONSEQUENCE:** `std::shared_ptr` uses atomic reference counting. When the last reference is released on a different CPU core than where the object was allocated, the destructor runs on the "wrong" shard--violating Seastar's shared-nothing model. This causes subtle data races, memory corruption, or crashes when the destructor accesses shard-local state.
 
 **THE LESSON:** *Hard Rule: For shard-local objects, prefer `std::unique_ptr`.* When shared ownership is truly needed within a single shard, use `seastar::lw_shared_ptr` (lightweight, non-atomic). Only use `seastar::shared_ptr` (with atomic refcount) when the pointer genuinely crosses shard boundaries via `seastar::foreign_ptr`.
 
-**PROMPT GUARD:** "Never use std::shared_ptr in Seastar code—use unique_ptr for single ownership, seastar::lw_shared_ptr for shard-local sharing, or foreign_ptr<shared_ptr<T>> for cross-shard transfer."
+**PROMPT GUARD:** "Never use std::shared_ptr in Seastar code--use unique_ptr for single ownership, seastar::lw_shared_ptr for shard-local sharing, or foreign_ptr<shared_ptr<T>> for cross-shard transfer."
 
 ---
 
@@ -42,11 +295,11 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Using `std::lock_guard<std::mutex>` to provide thread-safe read access in a metrics/query method (e.g., `queue_depth()`).
 
-**THE CONSEQUENCE:** Metrics collection runs on the Seastar reactor thread. A mutex lock—even briefly—blocks the entire event loop. With Prometheus scraping every 15s across 64 shards, you get 64 stalls per scrape cycle. Under load, this causes cascading latency spikes.
+**THE CONSEQUENCE:** Metrics collection runs on the Seastar reactor thread. A mutex lock--even briefly--blocks the entire event loop. With Prometheus scraping every 15s across 64 shards, you get 64 stalls per scrape cycle. Under load, this causes cascading latency spikes.
 
 **THE LESSON:** *Hard Rule: Metrics accessors must be lock-free.* Use `std::atomic<T>` with relaxed memory ordering for counters/gauges. Maintain atomic shadow variables updated alongside the protected data structure.
 
-**PROMPT GUARD:** "Never use std::mutex in any method that could be called from the reactor thread—especially metrics, health checks, or status queries."
+**PROMPT GUARD:** "Never use std::mutex in any method that could be called from the reactor thread--especially metrics, health checks, or status queries."
 
 ---
 
@@ -54,7 +307,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Writing `for (auto& item : items) { co_await process(item); }` to iterate over a collection of async operations.
 
-**THE CONSEQUENCE:** O(n) latency instead of O(1). If processing 100 K8s endpoints takes 10ms each, the loop takes 1000ms—blocking the reactor for the entire second. Seastar's event loop cannot multiplex; it waits for each await.
+**THE CONSEQUENCE:** O(n) latency instead of O(1). If processing 100 K8s endpoints takes 10ms each, the loop takes 1000ms--blocking the reactor for the entire second. Seastar's event loop cannot multiplex; it waits for each await.
 
 **THE LESSON:** *Hard Rule: Replace sequential awaits with `seastar::parallel_for_each` or `max_concurrent_for_each`.* Batch concurrent operations with a semaphore (e.g., 16 in-flight) to bound parallelism without serializing.
 
@@ -66,7 +319,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Directly casting C library return values: `record.ip = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));`
 
-**THE CONSEQUENCE:** `sqlite3_column_text()` returns NULL for SQL NULL values. Constructing `std::string` from a null pointer is undefined behavior—typically a segfault. This only surfaces when real data has NULLs, often weeks after deployment.
+**THE CONSEQUENCE:** `sqlite3_column_text()` returns NULL for SQL NULL values. Constructing `std::string` from a null pointer is undefined behavior--typically a segfault. This only surfaces when real data has NULLs, often weeks after deployment.
 
 **THE LESSON:** *Hard Rule: Wrap all C string returns in a null-guard helper.* Create `safe_column_text()` that returns empty string for NULL. Skip records with NULL in required fields.
 
@@ -90,9 +343,9 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Scheduling a timer callback with `[this] { this->on_timer(); }` and cancelling in the destructor.
 
-**THE CONSEQUENCE:** Race condition: (1) Timer fires, callback queued on reactor. (2) `stop()` cancels timer (but callback already queued). (3) `stop()` returns, destructor runs. (4) Queued callback executes with dangling `this` → use-after-free.
+**THE CONSEQUENCE:** Race condition: (1) Timer fires, callback queued on reactor. (2) `stop()` cancels timer (but callback already queued). (3) `stop()` returns, destructor runs. (4) Queued callback executes with dangling `this` -> use-after-free.
 
-**THE LESSON:** *Hard Rule: Timer callbacks require RAII gate guards.* Add a `seastar::gate _timer_gate`. Callbacks acquire `_timer_gate.hold()` at entry—fails if closed. `stop()` closes the gate *first* (waiting for in-flight callbacks), *then* cancels timers.
+**THE LESSON:** *Hard Rule: Timer callbacks require RAII gate guards.* Add a `seastar::gate _timer_gate`. Callbacks acquire `_timer_gate.hold()` at entry--fails if closed. `stop()` closes the gate *first* (waiting for in-flight callbacks), *then* cancels timers.
 
 **PROMPT GUARD:** "Any lambda capturing 'this' for a timer or async callback must acquire a gate holder at entry and the owning class must close that gate before cancelling the timer."
 
@@ -114,11 +367,11 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Placing validation rules (e.g., "max token count", "valid port range") inside the persistence/storage layer because "it has access to the data."
 
-**THE CONSEQUENCE:** Architecture drift—the persistence layer accumulates business rules. Testing requires database setup. Changes to validation require touching storage code. The "layered architecture" becomes a lie.
+**THE CONSEQUENCE:** Architecture drift--the persistence layer accumulates business rules. Testing requires database setup. Changes to validation require touching storage code. The "layered architecture" becomes a lie.
 
 **THE LESSON:** *Hard Rule: Persistence layers only transform and store.* Validation belongs in the service/business layer. Persistence accepts already-validated data and returns raw data for the service layer to interpret.
 
-**PROMPT GUARD:** "Never add validation, transformation, or business rules to persistence/storage code—only the service layer validates."
+**PROMPT GUARD:** "Never add validation, transformation, or business rules to persistence/storage code--only the service layer validates."
 
 ---
 
@@ -126,11 +379,11 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Declaring 10+ `thread_local` variables at file scope for per-shard state: `thread_local RadixTree* g_tree; thread_local Stats g_stats; ...`
 
-**THE CONSEQUENCE:** State management becomes fragile—no clear initialization order, no single point for reset/cleanup, difficult to test. In a 12k LOC codebase, scattered thread_locals are invisible coupling.
+**THE CONSEQUENCE:** State management becomes fragile--no clear initialization order, no single point for reset/cleanup, difficult to test. In a 12k LOC codebase, scattered thread_locals are invisible coupling.
 
 **THE LESSON:** *Hard Rule: Consolidate per-shard state into a single `ShardLocalState` struct.* Provides explicit lifecycle (`init()`, `reset()`), single point of truth, and `reset_for_testing()` capability.
 
-**PROMPT GUARD:** "Never declare standalone thread_local variables—group all per-shard state into a single ShardLocalState struct with explicit lifecycle methods."
+**PROMPT GUARD:** "Never declare standalone thread_local variables--group all per-shard state into a single ShardLocalState struct with explicit lifecycle methods."
 
 ---
 
@@ -142,7 +395,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE LESSON:** *Hard Rule: Every catch block must log at warn level minimum.* Include the exception message, context (what operation failed), and any relevant identifiers. Consider adding a counter metric for exception rate.
 
-**PROMPT GUARD:** "Never write an empty catch block—always log the exception at warn level with context about what operation failed."
+**PROMPT GUARD:** "Never write an empty catch block--always log the exception at warn level with context about what operation failed."
 
 ---
 
@@ -154,7 +407,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE LESSON:** *Hard Rule: Use `std::from_chars` or wrap in a validating helper.* Create `parse_port()`, `parse_int()` helpers that return `std::optional<T>` or `expected<T, Error>`. Validate ranges explicitly.
 
-**PROMPT GUARD:** "Never use std::stoi/stol/stof on external input—use std::from_chars with explicit error handling and range validation."
+**PROMPT GUARD:** "Never use std::stoi/stol/stof on external input--use std::from_chars with explicit error handling and range validation."
 
 ---
 
@@ -166,7 +419,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE LESSON:** *Hard Rule: Use `std::call_once` for one-time initialization.* For boolean flags, use `std::atomic<bool>`. For complex state, either make it per-shard (thread_local) or protect with proper synchronization.
 
-**PROMPT GUARD:** "Never use bare global statics for runtime state—use std::call_once for init, std::atomic for flags, or thread_local for per-shard state."
+**PROMPT GUARD:** "Never use bare global statics for runtime state--use std::call_once for init, std::atomic for flags, or thread_local for per-shard state."
 
 ---
 
@@ -174,11 +427,11 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE PATTERN:** Using `std::ifstream` or `std::ofstream` inside a coroutine or Seastar method: `std::ifstream file(path); buffer << file.rdbuf();`
 
-**THE CONSEQUENCE:** `std::ifstream` performs blocking I/O. In Seastar, this stalls the reactor thread—stopping all network I/O, timer callbacks, and request processing on that shard. A 10ms disk read becomes 10ms of zero throughput.
+**THE CONSEQUENCE:** `std::ifstream` performs blocking I/O. In Seastar, this stalls the reactor thread--stopping all network I/O, timer callbacks, and request processing on that shard. A 10ms disk read becomes 10ms of zero throughput.
 
 **THE LESSON:** *Hard Rule: Use Seastar file I/O APIs.* Use `seastar::open_file_dma()` + `seastar::make_file_input_stream()` for async file reads. For small files during startup only, document the blocking nature explicitly.
 
-**PROMPT GUARD:** "Never use std::ifstream/ofstream in Seastar code—use seastar::open_file_dma and seastar::make_file_input_stream for async file I/O."
+**PROMPT GUARD:** "Never use std::ifstream/ofstream in Seastar code--use seastar::open_file_dma and seastar::make_file_input_stream for async file I/O."
 
 ---
 
@@ -190,7 +443,7 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE LESSON:** *Hard Rule: Use `thread_local std::unique_ptr<T>` or add explicit destroy function.* Alternatively, use Seastar's `seastar::sharded<T>` service pattern which handles per-shard lifecycle correctly.
 
-**PROMPT GUARD:** "Never use raw 'new' with thread_local pointers—use unique_ptr or add an explicit destroy/cleanup function called during shutdown."
+**PROMPT GUARD:** "Never use raw 'new' with thread_local pointers--use unique_ptr or add an explicit destroy/cleanup function called during shutdown."
 
 ---
 
@@ -234,7 +487,7 @@ parallel_for_each(shards, [callback](unsigned shard_id) {
     });
 });
 ```
-This is particularly insidious because: (1) the callback looks innocent, (2) the broadcast looks correct, but (3) the combination causes multiple shards to simultaneously access shard 0's state without synchronization—a data race.
+This is particularly insidious because: (1) the callback looks innocent, (2) the broadcast looks correct, but (3) the combination causes multiple shards to simultaneously access shard 0's state without synchronization--a data race.
 
 **THE CONSEQUENCE:** Bug #1 causes allocator corruption and delayed crashes. Bug #2 causes data corruption, null pointers, or SIGSEGV during reads. Bug #3 causes data races with corrupted containers, lost updates, or crashes. All three can manifest long after the bug occurs, making debugging extremely difficult.
 
@@ -272,7 +525,7 @@ do_with(std::move(data), [](auto& data) {
 - **Callbacks that capture `this` being broadcast to multiple shards** (Bug #3)
 - `parallel_for_each` + `submit_to` patterns where the callback accesses member variables
 
-**PROMPT GUARD:** "For cross-shard data: (1) Never capture references to outer-scope data in submit_to lambdas. (2) Never move heap-owning types directly—use foreign_ptr and create local allocations on the target shard. (3) Never broadcast a callback that captures `this` to multiple shards—either run the callback only on the owning shard, or ensure it only accesses shard-local state."
+**PROMPT GUARD:** "For cross-shard data: (1) Never capture references to outer-scope data in submit_to lambdas. (2) Never move heap-owning types directly--use foreign_ptr and create local allocations on the target shard. (3) Never broadcast a callback that captures `this` to multiple shards--either run the callback only on the owning shard, or ensure it only accesses shard-local state."
 
 ---
 
