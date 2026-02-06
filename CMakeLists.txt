@@ -405,6 +405,19 @@ target_link_libraries(cross_shard_request_test
 )
 gtest_discover_tests(cross_shard_request_test)
 
+# TracingService Unit Tests (W3C traceparent parsing only, no OTel)
+# Compiled with RANVIER_NO_TELEMETRY; real parse logic provided in test file.
+add_executable(tracing_service_test
+  tests/unit/tracing_service_test.cpp
+)
+target_compile_definitions(tracing_service_test PRIVATE RANVIER_NO_TELEMETRY)
+target_include_directories(tracing_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(tracing_service_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(tracing_service_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
