@@ -360,6 +360,22 @@ target_link_libraries(shard_load_metrics_test
 )
 gtest_discover_tests(shard_load_metrics_test)
 
+# MetricsService Unit Tests (Pure C++, uses stubs for Seastar metrics)
+# Tests histogram buckets, bounded containers (Rule #4), cache-hit-ratio,
+# prefix skip averaging, and counter recording.
+add_executable(metrics_service_test
+  tests/unit/metrics_service_test.cpp
+)
+target_include_directories(metrics_service_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(metrics_service_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(metrics_service_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
