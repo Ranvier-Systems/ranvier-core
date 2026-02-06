@@ -1,32 +1,19 @@
 I have written code for:
 <INSERT_TASK_NAME>
 
----
-
-1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
-2. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
 
 ---
 
 ## SELF-REVIEW (before commit)
 
-Run through each of the Hard Rules listed in .dev-context/claude-context.md. For each rule, provide one of:
+Run through each of the Hard Rules. For each rule, provide one of:
 - `[N/A]` - Not applicable to this change
 - `[OK]` - Compliant because: [brief reason]
 - `[FIX]` - Violation found at [file:line]: [description]
 
----
-
 ## COMPLIANCE TABLE
 
-Verify compliance with the list of Hard Rules outlined in .dev-context/claude-context.md
-
-For example:
 | # | Rule | Status | Notes |
 |---|------|--------|-------|
 | 0 | No `std::shared_ptr` in Seastar code | | |
@@ -43,8 +30,8 @@ For example:
 | 11 | Global state uses `call_once`/`atomic` | | |
 | 12 | Use Seastar file I/O (no `std::ifstream`) | | |
 | 13 | Thread-local raw new has destroy function | | |
-
----
+| 14 | Force local allocation for cross-shard data | | |
+| 15 | Reallocate locally before FFI across boundaries | | |
 
 ## ADDITIONAL CHECKS
 
@@ -86,16 +73,5 @@ Rule #2 - src/services/router.cc:156
 - `[YES]` - All rules pass, ready for commit
 - `[NO]` - Fixes required (list above)
 
----
-
-## POST-REVIEW ACTIONS
-
-If violations found:
-1. Fix all violations
-2. Re-run this review
-3. Only commit when all checks pass
-
-If all checks pass:
-1. Proceed to commit
-2. Run `claude-doc-prompt.md` for tests and documentation
-
+If violations found, fix and re-run this review. Only commit when all checks pass.
+Then run `claude-doc-prompt.md` for tests and documentation.

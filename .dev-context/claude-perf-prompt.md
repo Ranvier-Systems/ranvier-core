@@ -10,22 +10,13 @@
 
 **Suspected hot path:**
 - `<FILE:FUNCTION>`
-- `<FILE:FUNCTION>`
 
 **Evidence:**
 - [ ] Profiler data available
 - [ ] Metrics showing bottleneck
 - [ ] Anecdotal observation
 
----
-1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /docs or /assets folders.
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
 
 ---
 
@@ -40,10 +31,7 @@ Build Constraints:
 | **Memory-bound** | Cache misses, allocation overhead | Check data structures |
 | **Contention-bound** | Variable latency, cross-shard calls | Check shard distribution |
 
-Current bottleneck type: [ ]
-
 ### Step 2: Measure Before Optimizing
-Establish baseline metrics:
 ```
 Metric: [what we're measuring]
 Current Value: [number]
@@ -56,20 +44,18 @@ Measurement Method: [how we measured]
 
 | Technique | When to Use | Trade-off | Gains |
 |-----------|-------------|-----------|-------|
-| `parallel_for_each` | Sequential `co_await` in loops | Memory ↑ | Latency ↓↓ |
-| `max_concurrent_for_each` | Need bounded parallelism | Complexity ↑ | Controlled concurrency |
-| Batching | Many small I/O operations | Latency ↑ | Throughput ↑↑ |
-| Shard-local caching | Repeated cross-shard reads | Memory ↑ | Latency ↓↓ |
-| `lw_shared_ptr` | Frequent intra-shard sharing | Complexity ↑ | Allocation ↓ |
-| Object pooling | Frequent alloc/dealloc | Memory ↑ | Allocation ↓↓ |
-| Continuation passing | Deep coroutine stacks | Readability ↓ | Stack usage ↓ |
+| `parallel_for_each` | Sequential `co_await` in loops | Memory up | Latency down |
+| `max_concurrent_for_each` | Need bounded parallelism | Complexity up | Controlled concurrency |
+| Batching | Many small I/O operations | Latency up | Throughput up |
+| Shard-local caching | Repeated cross-shard reads | Memory up | Latency down |
+| Object pooling | Frequent alloc/dealloc | Memory up | Allocation down |
 
 #### Algorithmic Optimizations
 
 | Current | Optimized | When Applicable |
 |---------|-----------|-----------------|
 | O(n) search | O(1) hash lookup | Known key space |
-| O(n²) nested loop | O(n log n) sort + scan | Sortable data |
+| O(n^2) nested loop | O(n log n) sort + scan | Sortable data |
 | String copying | String views | Read-only access |
 | Dynamic allocation | Stack allocation | Small, fixed size |
 
@@ -77,16 +63,12 @@ Measurement Method: [how we measured]
 
 ## ANTI-OPTIMIZATIONS (AVOID)
 
-These "optimizations" violate Seastar principles:
-
 | Anti-Pattern | Why It Fails | Rule # |
 |--------------|--------------|--------|
 | Add `std::mutex` for "thread safety" | Blocks reactor | #1 |
-| Use `std::atomic` everywhere | Often unnecessary in single-shard | - |
 | Over-parallelize (unbounded futures) | Memory exhaustion | #4 |
 | Cache with `std::shared_ptr` | Cross-shard ref counting | #0 |
-| Busy-wait polling loops | Blocks reactor | #1 |
-| Synchronous file I/O | Blocks reactor | #1 |
+| Synchronous file I/O | Blocks reactor | #12 |
 
 ---
 
@@ -103,44 +85,20 @@ Root Cause:        [why it's slow]
 ### Proposed Optimization
 ```cpp
 // Before (showing why it's slow)
-// Complexity: O(n) per request, blocks on each await
-for (auto& item : items) {
-    co_await process(item);  // Sequential!
-}
+[code]
 
 // After (with explanation)
-// Complexity: O(1) wall-clock, parallel execution
-co_await seastar::parallel_for_each(items, [](auto& item) {
-    return process(item);
-});
+[code]
 ```
 
 ### Expected Improvement
 | Metric | Before | After (Expected) | Confidence |
 |--------|--------|------------------|------------|
 | Throughput | X req/s | Y req/s | [High/Medium/Low] |
-| Latency p50 | X ms | Y ms | [High/Medium/Low] |
 | Latency p99 | X ms | Y ms | [High/Medium/Low] |
 
-### Trade-offs
-| Gain | Cost |
-|------|------|
-| [what improves] | [what we give up] |
-
-### Verification Plan
-1. [How to measure improvement]
-2. [What load test to run]
-3. [How to detect regressions]
-
----
-
-## POST-OPTIMIZATION CHECKLIST
-
+### Post-Optimization Checklist
 - [ ] Baseline metrics documented
-- [ ] Optimization doesn't violate the list of Hard Rules
+- [ ] Optimization doesn't violate Hard Rules
 - [ ] Trade-offs are acceptable
-- [ ] Improvement is measurable
-- [ ] No new failure modes introduced
 - [ ] Tests still pass
-- [ ] Consider adding performance regression test
-
