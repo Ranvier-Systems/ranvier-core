@@ -345,6 +345,21 @@ target_link_libraries(logging_test
 )
 gtest_discover_tests(logging_test)
 
+# ShardLoadMetrics Unit Tests (Pure C++, uses stubs for Seastar)
+# Tests RAII guards, atomic counters, load scoring, and snapshot semantics.
+add_executable(shard_load_metrics_test
+  tests/unit/shard_load_metrics_test.cpp
+)
+target_include_directories(shard_load_metrics_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(shard_load_metrics_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(shard_load_metrics_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
