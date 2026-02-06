@@ -390,6 +390,21 @@ target_link_libraries(node_slab_test
 )
 gtest_discover_tests(node_slab_test)
 
+# CrossShardRequest Unit Tests (Pure C++, uses stubs for Seastar)
+# Tests validation limits, force_local_allocation, and result factories.
+add_executable(cross_shard_request_test
+  tests/unit/cross_shard_request_test.cpp
+)
+target_include_directories(cross_shard_request_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(cross_shard_request_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(cross_shard_request_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
