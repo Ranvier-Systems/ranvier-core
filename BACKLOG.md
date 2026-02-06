@@ -1914,7 +1914,6 @@ _Move completed items here with completion date and PR reference._
 
 > **Analysis:** 851 unit tests across 20 files, 4 integration suites, 5 validation scripts.
 > **Finding:** 14 source files (25%) have zero unit tests. 5 systematic weaknesses affect all tests.
-> **Full report:** [`TEST_COVERAGE_ANALYSIS.md`](./TEST_COVERAGE_ANALYSIS.md)
 >
 > **Conventions for all test tasks below:**
 > - Read `CLAUDE.md` and `.dev-context/claude-context.md` first (coding conventions, 16 Hard Rules).
@@ -1925,49 +1924,56 @@ _Move completed items here with completion date and PR reference._
 
 ### 12.1 P0 — New Unit Tests for Untested Pure-Function Files
 
-- [ ] **Add `parse_utils_test.cpp`**
+- [x] **Add `parse_utils_test.cpp`** ✓
   _Source:_ `src/parse_utils.hpp` — contains `parse_int32`, `parse_uint32`, `parse_port` using `std::from_chars`. Header-only, no Seastar dependency, no `.cpp` to compile.
   _Test cases:_ Valid integers (positive, negative, zero, INT32_MIN/MAX), overflow/underflow for int32 and uint32, trailing garbage rejection ("123abc"), empty string, whitespace-only input, port range validation (0, 1, 65535, 65536), negative values rejected for unsigned parse.
   _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `text_validator_test` block in `CMakeLists.txt`.
   _Complexity:_ Low
+  _Completed:_ 2026-02-06. 5 fixture classes, ~40 test cases covering `parse_int32`, `parse_uint32`, `parse_port`, `parse_token_id`, `parse_backend_id`.
 
-- [ ] **Add `logging_test.cpp`**
+- [x] **Add `logging_test.cpp`** ✓
   _Source:_ `src/logging.hpp` — contains `generate_request_id()` and header extraction helpers (`extract_request_id_view`, `extract_traceparent_view`). Header-only, no Seastar dependency.
   _Test cases:_ Request ID format (`{shard}-{timestamp}-{seq}` structure), monotonically increasing sequence numbers, `extract_request_id_view` prefers X-Request-ID over X-Correlation-ID, `extract_traceparent_view` case-insensitive header lookup, missing headers return empty `string_view`, empty header values handled correctly.
   _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `text_validator_test`.
   _Complexity:_ Low
+  _Completed:_ 2026-02-06. 3 fixture classes, ~25 test cases. Introduced `tests/stubs/` directory with minimal Seastar/fmt stubs for headers with lightweight Seastar deps.
 
-- [ ] **Add `shard_load_metrics_test.cpp`**
+- [x] **Add `shard_load_metrics_test.cpp`** ✓
   _Source:_ `src/shard_load_metrics.hpp` — atomic counters and RAII guards (`ActiveRequestGuard`, `QueuedRequestGuard`) used by load-aware routing. Header-only, no Seastar dependency.
   _Test cases:_ `ActiveRequestGuard` increments on construction / decrements on destruction, `QueuedRequestGuard` same RAII semantics, `load_score()` = active × 2.0 + queued, `ShardLoadSnapshot` captures point-in-time values, move semantics of guards (no double-decrement), underflow protection (decrement below zero).
   _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `load_aware_routing_test`.
   _Complexity:_ Low
+  _Completed:_ 2026-02-06. 5 fixture classes, ~25 test cases covering RAII guards, load scoring, snapshot semantics, lifecycle, and type traits.
 
 ### 12.2 P1 — New Unit Tests for Core Infrastructure
 
-- [ ] **Add `metrics_service_test.cpp`**
+- [x] **Add `metrics_service_test.cpp`** ✓
   _Source:_ `src/metrics_service.hpp` (~200 LOC) — histogram bucket logic, bounded container enforcement (Rule #4: max 10K backends), cache-hit-ratio computation. Header-only, no Seastar dependency (uses Seastar types only as forward declarations behind `#ifdef`).
   _Test cases:_ Histogram bucket correctness, bounded container limits, cache-hit-ratio divide-by-zero protection, metric recording and reset. Read the header to determine which structs/functions are testable without Seastar — test those only.
   _CMake:_ Add as pure-C++ test. May need conditional compilation — check `#ifdef HAVE_SEASTAR` guards in header.
   _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 7 fixture classes, ~30 test cases. Added `seastar/core/metrics.hh` and `metrics_registration.hh` stubs with histogram types and labeled metric overloads.
 
-- [ ] **Add `node_slab_test.cpp`**
+- [x] **Add `node_slab_test.cpp`** ✓
   _Source:_ `src/node_slab.hpp` + `src/node_slab.cpp` (~250 LOC) — per-shard memory pool for RadixTree nodes. Note: `radix_tree_test.cpp` already compiles `src/node_slab.cpp` so allocation works — but there are no dedicated slab tests.
   _Test cases:_ Allocate/free round-trips, free-list integrity after allocate→free→reallocate cycles, peak usage tracking, pool exhaustion behavior (what happens when slab is full).
   _CMake:_ Add with `src/node_slab.cpp` as source. Model after `radix_tree_test` block.
   _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 7 fixture classes, ~30 test cases covering allocate/deallocate, free-list LIFO, peak tracking, auto-growth, make_node factories, and thread-local accessors.
 
-- [ ] **Add `cross_shard_request_test.cpp`**
+- [x] **Add `cross_shard_request_test.cpp`** ✓
   _Source:_ `src/cross_shard_request.hpp` (~180 LOC) — validation functions for body size (128 MB limit), token count (128K limit), string length (4 KB limit), and `force_local_allocation()`. Read the header to identify which functions are pure (no Seastar runtime required) and test those.
   _Test cases:_ Body size at/over 128 MB limit, token count at/over 128K limit, string length at/over 4 KB limit, `force_local_allocation()` copy behavior, boundary values.
   _CMake:_ Add as pure-C++ test if validation functions are constexpr/inline. If they depend on Seastar types, add under the `if(Seastar_FOUND)` block.
   _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 8 fixture classes, ~35 test cases. Added `temporary_buffer`, `shared_ptr`/`foreign_ptr`, `http::request`/`reply` stubs. Updated `future.hh` and `smp.hh` stubs.
 
-- [ ] **Add `tracing_service_test.cpp` (W3C traceparent parsing only)**
+- [x] **Add `tracing_service_test.cpp` (W3C traceparent parsing only)** ✓
   _Source:_ `src/tracing_service.hpp` + `src/tracing_service.cpp` (~250 LOC). The W3C traceparent parsing (`version-traceid-spanid-flags`) is pure string logic. Read the source to identify which functions can be tested without OpenTelemetry/Seastar runtime.
   _Test cases:_ Valid traceparent format (`00-<32hex>-<16hex>-<2hex>`), invalid formats (wrong length, non-hex chars, wrong version), field length enforcement, flag parsing, version 00 vs unknown versions.
   _CMake:_ Add with `src/tracing_service.cpp` as source. May need conditional compilation — check `#ifdef WITH_TELEMETRY` guards.
   _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 7 fixture classes, ~35 test cases. Compiled with `RANVIER_NO_TELEMETRY`; W3C parse logic provided directly in test (no OTel dependency).
 
 ### 12.3 P2 — Strengthen Existing Tests
 
