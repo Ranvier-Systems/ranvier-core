@@ -330,6 +330,21 @@ target_link_libraries(parse_utils_test
 )
 gtest_discover_tests(parse_utils_test)
 
+# Logging Unit Tests (Pure C++, uses stubs for Seastar/fmt)
+# Tests generate_request_id format and header extraction helpers.
+add_executable(logging_test
+  tests/unit/logging_test.cpp
+)
+target_include_directories(logging_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(logging_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(logging_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
