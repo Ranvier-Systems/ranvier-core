@@ -376,6 +376,20 @@ target_link_libraries(metrics_service_test
 )
 gtest_discover_tests(metrics_service_test)
 
+# NodeSlab Unit Tests (Pure C++, no Seastar dependency)
+# Tests slab allocator: allocate/free round-trips, free-list integrity,
+# peak tracking, auto-growth, and make_node factory methods.
+add_executable(node_slab_test
+  tests/unit/node_slab_test.cpp
+  src/node_slab.cpp
+)
+target_include_directories(node_slab_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(node_slab_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(node_slab_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
