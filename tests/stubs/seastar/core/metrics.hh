@@ -28,6 +28,9 @@ struct description {
     explicit description(const std::string&) {}
 };
 
+// Label key-value pair for per-backend metrics
+using label_instance = std::pair<std::string, std::string>;
+
 // Stub metric definition — all make_* functions return this
 struct metric_definition {};
 
@@ -39,6 +42,16 @@ inline metric_definition make_histogram(Args&&...) { return {}; }
 
 template<typename... Args>
 inline metric_definition make_gauge(Args&&...) { return {}; }
+
+// Explicit overloads for labeled metrics — braced-init-lists like
+// {{"backend_id", id}} cannot be deduced by variadic templates.
+template<typename... Args>
+inline metric_definition make_histogram(const char*, description,
+    std::initializer_list<label_instance>, Args&&...) { return {}; }
+
+template<typename... Args>
+inline metric_definition make_gauge(const char*, description,
+    std::initializer_list<label_instance>, Args&&...) { return {}; }
 
 } // namespace metrics
 } // namespace seastar
