@@ -1915,101 +1915,106 @@ _Move completed items here with completion date and PR reference._
 > **Analysis:** 851 unit tests across 20 files, 4 integration suites, 5 validation scripts.
 > **Finding:** 14 source files (25%) have zero unit tests. 5 systematic weaknesses affect all tests.
 > **Full report:** [`TEST_COVERAGE_ANALYSIS.md`](./TEST_COVERAGE_ANALYSIS.md)
+>
+> **Conventions for all test tasks below:**
+> - Read `CLAUDE.md` and `.dev-context/claude-context.md` first (coding conventions, 16 Hard Rules).
+> - **Do not build.** Static analysis only — Seastar deps are too heavy for sandbox.
+> - Tests go in `tests/unit/<name>_test.cpp`. Use Google Test (`gtest`). Follow the pattern in `tests/unit/text_validator_test.cpp` (include header, `using namespace ranvier;`, `TEST_F` with fixture classes).
+> - Wire the new test into `CMakeLists.txt` following the pattern of nearby pure-C++ tests (e.g., `text_validator_test`): `add_executable`, `target_include_directories(... PRIVATE ${CMAKE_SOURCE_DIR}/src)`, `target_link_libraries(... GTest::gtest_main)`, `gtest_discover_tests(...)`. Add `.cpp` source files from `src/` only if the header under test is not header-only.
+> - Namespace is `ranvier`. All source headers are in `src/`.
 
 ### 12.1 P0 — New Unit Tests for Untested Pure-Function Files
 
 - [ ] **Add `parse_utils_test.cpp`**
-  _Justification:_ `parse_utils.hpp` contains `parse_int32`, `parse_uint32`, `parse_port` used across the codebase. Zero tests today. Pure functions — no Seastar dependency.
-  _Test cases:_ Valid integers (positive, negative, zero, INT32_MIN/MAX), overflow/underflow, trailing garbage rejection, empty/whitespace input, port range validation (0, 1, 65535, 65536), negative values rejected for unsigned parse.
+  _Source:_ `src/parse_utils.hpp` — contains `parse_int32`, `parse_uint32`, `parse_port` using `std::from_chars`. Header-only, no Seastar dependency, no `.cpp` to compile.
+  _Test cases:_ Valid integers (positive, negative, zero, INT32_MIN/MAX), overflow/underflow for int32 and uint32, trailing garbage rejection ("123abc"), empty string, whitespace-only input, port range validation (0, 1, 65535, 65536), negative values rejected for unsigned parse.
+  _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `text_validator_test` block in `CMakeLists.txt`.
   _Complexity:_ Low
-  _Priority:_ P0
 
 - [ ] **Add `logging_test.cpp`**
-  _Justification:_ `logging.hpp` contains `generate_request_id()` and header extraction helpers used on every request. No tests today. Pure functions — no Seastar dependency.
-  _Test cases:_ Request ID format (`{shard}-{timestamp}-{seq}`), monotonically increasing sequence, `extract_request_id_view` prefers X-Request-ID over X-Correlation-ID, `extract_traceparent_view` case-insensitive lookup, missing/empty headers return empty string_view.
+  _Source:_ `src/logging.hpp` — contains `generate_request_id()` and header extraction helpers (`extract_request_id_view`, `extract_traceparent_view`). Header-only, no Seastar dependency.
+  _Test cases:_ Request ID format (`{shard}-{timestamp}-{seq}` structure), monotonically increasing sequence numbers, `extract_request_id_view` prefers X-Request-ID over X-Correlation-ID, `extract_traceparent_view` case-insensitive header lookup, missing headers return empty `string_view`, empty header values handled correctly.
+  _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `text_validator_test`.
   _Complexity:_ Low
-  _Priority:_ P0
 
 - [ ] **Add `shard_load_metrics_test.cpp`**
-  _Justification:_ `shard_load_metrics.hpp` owns atomics and RAII guards used by load-aware routing. No tests today. Self-contained — testable without Seastar.
-  _Test cases:_ `ActiveRequestGuard` increments on construction / decrements on destruction, `QueuedRequestGuard` same semantics, `load_score()` = active × 2.0 + queued, `ShardLoadSnapshot` captures point-in-time values, move semantics (no double-decrement), underflow protection.
+  _Source:_ `src/shard_load_metrics.hpp` — atomic counters and RAII guards (`ActiveRequestGuard`, `QueuedRequestGuard`) used by load-aware routing. Header-only, no Seastar dependency.
+  _Test cases:_ `ActiveRequestGuard` increments on construction / decrements on destruction, `QueuedRequestGuard` same RAII semantics, `load_score()` = active × 2.0 + queued, `ShardLoadSnapshot` captures point-in-time values, move semantics of guards (no double-decrement), underflow protection (decrement below zero).
+  _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `load_aware_routing_test`.
   _Complexity:_ Low
-  _Priority:_ P0
 
 ### 12.2 P1 — New Unit Tests for Core Infrastructure
 
 - [ ] **Add `metrics_service_test.cpp`**
-  _Justification:_ `metrics_service.hpp` (~200 LOC) has histogram bucket logic and bounded container enforcement (Rule #4: max 10K backends). No tests today.
-  _Test cases:_ Histogram bucket correctness, bounded container limits, cache-hit-ratio divide-by-zero protection, metric recording and reset.
+  _Source:_ `src/metrics_service.hpp` (~200 LOC) — histogram bucket logic, bounded container enforcement (Rule #4: max 10K backends), cache-hit-ratio computation. Header-only, no Seastar dependency (uses Seastar types only as forward declarations behind `#ifdef`).
+  _Test cases:_ Histogram bucket correctness, bounded container limits, cache-hit-ratio divide-by-zero protection, metric recording and reset. Read the header to determine which structs/functions are testable without Seastar — test those only.
+  _CMake:_ Add as pure-C++ test. May need conditional compilation — check `#ifdef HAVE_SEASTAR` guards in header.
   _Complexity:_ Medium
-  _Priority:_ P1
 
 - [ ] **Add `node_slab_test.cpp`**
-  _Justification:_ `node_slab.hpp/cpp` (~250 LOC) is the per-shard memory pool for RadixTree nodes. Allocator bugs cause silent corruption. No tests today.
-  _Test cases:_ Allocate/free round-trips, free-list integrity after allocate→free→reallocate cycles, peak tracking, pool exhaustion behavior.
+  _Source:_ `src/node_slab.hpp` + `src/node_slab.cpp` (~250 LOC) — per-shard memory pool for RadixTree nodes. Note: `radix_tree_test.cpp` already compiles `src/node_slab.cpp` so allocation works — but there are no dedicated slab tests.
+  _Test cases:_ Allocate/free round-trips, free-list integrity after allocate→free→reallocate cycles, peak usage tracking, pool exhaustion behavior (what happens when slab is full).
+  _CMake:_ Add with `src/node_slab.cpp` as source. Model after `radix_tree_test` block.
   _Complexity:_ Medium
-  _Priority:_ P1
 
 - [ ] **Add `cross_shard_request_test.cpp`**
-  _Justification:_ `cross_shard_request.hpp` (~180 LOC) has validation functions (body size limit 128MB, token count limit 128K, string length limit 4KB) and `force_local_allocation()`. Pure functions — testable without Seastar.
-  _Test cases:_ Body size at/over 128 MB limit, token count at/over 128K limit, string length at/over 4 KB limit, `force_local_allocation()` copy behavior.
+  _Source:_ `src/cross_shard_request.hpp` (~180 LOC) — validation functions for body size (128 MB limit), token count (128K limit), string length (4 KB limit), and `force_local_allocation()`. Read the header to identify which functions are pure (no Seastar runtime required) and test those.
+  _Test cases:_ Body size at/over 128 MB limit, token count at/over 128K limit, string length at/over 4 KB limit, `force_local_allocation()` copy behavior, boundary values.
+  _CMake:_ Add as pure-C++ test if validation functions are constexpr/inline. If they depend on Seastar types, add under the `if(Seastar_FOUND)` block.
   _Complexity:_ Medium
-  _Priority:_ P1
 
-- [ ] **Add `tracing_service_test.cpp` (W3C parsing only)**
-  _Justification:_ W3C traceparent parsing (`version-traceid-spanid-flags`) in `tracing_service.hpp/cpp` is pure string logic. No tests today.
-  _Test cases:_ Valid/invalid traceparent formats, hex validation, field length enforcement, flag parsing, version 00 vs unknown versions.
+- [ ] **Add `tracing_service_test.cpp` (W3C traceparent parsing only)**
+  _Source:_ `src/tracing_service.hpp` + `src/tracing_service.cpp` (~250 LOC). The W3C traceparent parsing (`version-traceid-spanid-flags`) is pure string logic. Read the source to identify which functions can be tested without OpenTelemetry/Seastar runtime.
+  _Test cases:_ Valid traceparent format (`00-<32hex>-<16hex>-<2hex>`), invalid formats (wrong length, non-hex chars, wrong version), field length enforcement, flag parsing, version 00 vs unknown versions.
+  _CMake:_ Add with `src/tracing_service.cpp` as source. May need conditional compilation — check `#ifdef WITH_TELEMETRY` guards.
   _Complexity:_ Medium
-  _Priority:_ P1
 
 ### 12.3 P2 — Strengthen Existing Tests
 
 - [ ] **Introduce clock injection for time-dependent tests**
-  _Justification:_ `rate_limiter`, `circuit_breaker`, `gossip_consensus`, and `connection_pool` all have time-sensitive behavior tested with no time control (0 of 20 test files have timing tests).
-  _Approach:_ Introduce a `TestClock` abstraction (template parameter or `std::function<steady_clock::time_point()>` injection). Retrofit into rate_limiter (refill rate), circuit_breaker (OPEN→HALF_OPEN timeout), quorum (peer liveness window).
+  _Context:_ 0 of 20 test files have deterministic timing tests. `src/rate_limiter.hpp`, `src/circuit_breaker.hpp`, and `src/gossip_consensus.hpp` all have time-sensitive behavior tested with no time control.
+  _Approach:_ Add a template parameter or `std::function<steady_clock::time_point()>` to each component's clock source. Introduce a `TestClock` helper in `tests/unit/` that allows manual time advancement. Retrofit into: rate_limiter (test token refill over simulated time), circuit_breaker (test OPEN→HALF_OPEN after exact timeout), quorum (test peer liveness window expiration). Update existing tests in `tests/unit/rate_limiter_test.cpp`, `tests/unit/circuit_breaker_test.cpp`, `tests/unit/quorum_test.cpp` to use the new clock. Ensure production code defaults to `steady_clock` with no overhead.
   _Complexity:_ Medium
-  _Priority:_ P2
 
 - [ ] **Adopt Google Mock (`gmock`) for dependency isolation**
-  _Justification:_ Only 1 of 20 test files uses mocks (hand-rolled). Without mocking, components with external dependencies (network, filesystem, timers) cannot be tested in isolation.
-  _Approach:_ Replace hand-rolled mock in `async_persistence_test.cpp` with gmock. Add mock interfaces for `PersistenceStore`, `ConnectionPool`, `HealthChecker`, `UdpChannel`.
+  _Context:_ Only `tests/unit/async_persistence_test.cpp` uses mocks (hand-rolled `MockPersistenceStore`). GTest is already a dependency (`GTest::gtest_main` in `CMakeLists.txt`) and gmock ships with it — just link `GTest::gmock`.
+  _Approach:_ Replace hand-rolled mock in `tests/unit/async_persistence_test.cpp` with `gmock` (`MOCK_METHOD`). Add mock interfaces for: `PersistenceStore` (interface in `src/persistence.hpp`), `HealthChecker`, `UdpChannel`. Update `CMakeLists.txt` to link `GTest::gmock` for tests that need it.
   _Complexity:_ Medium
-  _Priority:_ P2
 
 - [ ] **Add negative-path integration tests**
-  _Justification:_ All 4 Docker Compose suites cover happy-path scenarios only. No tests for failure recovery, split-brain, or overload.
+  _Context:_ All 4 integration suites in `tests/integration/` are happy-path only. They use Docker Compose (`docker-compose.test.yml`) with a 3-node cluster and mock backends (`tests/integration/mock_backend.py`). Follow the same pattern (Python unittest, `requests` library, Docker Compose lifecycle in setUp/tearDown).
   _Test cases:_
-  - Split-brain: Partition network between nodes, verify quorum detection and recovery
-  - Backend flap: Rapidly start/stop mock backends, verify circuit breaker engages
-  - Config reload: Send SIGHUP with invalid config, verify old config preserved
-  - Rate limit: Send concurrent requests exceeding rate limits, verify 429 responses
-  - Oversized request: Send bodies exceeding max size, verify rejection
+  - Split-brain: Use `docker network disconnect` to partition nodes, verify quorum detection via `/admin/cluster` endpoint, reconnect and verify recovery
+  - Backend flap: Rapidly `docker stop`/`docker start` mock backend containers, verify circuit breaker engages via metrics endpoint (`ranvier_circuit_open`)
+  - Config reload: Send `docker kill -s HUP` with invalid YAML, verify old config preserved via `/admin/config`
+  - Rate limit: Send concurrent requests exceeding configured rate limits, verify 429 responses with `Retry-After` header
+  - Oversized request: Send request body exceeding `max_request_body_size`, verify 413 rejection
+  _Location:_ Add as `tests/integration/test_negative_paths.py`. No CMake changes needed (Python tests).
   _Complexity:_ High
-  _Priority:_ P2
 
 ### 12.4 P3 — Longer-Term Test Infrastructure
 
 - [ ] **Add `connection_pool_test.cpp`**
-  _Justification:_ `connection_pool.hpp` (~300 LOC) manages upstream connections with per-host limits, global limits, idle timeout, and max-age TTL. Zero tests today. Requires extracting pool logic behind a testable interface.
+  _Source:_ `src/connection_pool.hpp` (~300 LOC) — manages upstream connections with per-host limits, global limits, idle timeout, and max-age TTL. Tightly coupled to Seastar networking (`seastar::connected_socket`).
+  _Approach:_ Extract pool management logic (eviction, TTL, limits) behind a policy interface that can be tested without real sockets. Test: per-host connection limits, global connection limits, idle timeout eviction, max-age TTL enforcement, half-open connection detection.
+  _CMake:_ Add under `if(Seastar_FOUND)` block. Model after `stream_parser_test`.
   _Complexity:_ High
-  _Priority:_ P3
 
 - [ ] **Add router service integration tests (Seastar-dependent)**
-  _Justification:_ `router_service.hpp/cpp` (~700 LOC) is the core routing brain. No dedicated tests — only tested transitively through integration suites.
-  _Test cases:_ Route learning from proxied requests, route TTL expiration, cross-shard broadcast, backend registration/deregistration with route cleanup, draining mode.
+  _Source:_ `src/router_service.hpp` + `src/router_service.cpp` (~700 LOC) — the core routing brain. Currently only tested transitively through Docker Compose integration suites. Depends on Seastar sharding, RadixTree, and shard_load_balancer.
+  _Test cases:_ Route learning from proxied requests, route TTL expiration and cleanup, cross-shard route broadcast, backend registration/deregistration with route cleanup, draining mode with timeout.
+  _CMake:_ Add under `if(Seastar_FOUND)` block. Will need multiple `src/*.cpp` files. Model after `application_test`.
   _Complexity:_ High
-  _Priority:_ P3
 
 - [ ] **Extract and test HTTP controller proxy logic**
-  _Justification:_ The retry/fallback state machine (`ProxyContext`) in `http_controller.cpp` (~1200 LOC) is the most complex untested code in the codebase.
-  _Approach:_ Extract retry/backoff logic into a testable pure function. Test admin API endpoints in isolation. Test backpressure semaphore behavior.
+  _Source:_ `src/http_controller.cpp` (~1200 LOC) — the retry/fallback state machine (`ProxyContext`) is the most complex untested code. Tightly coupled to Seastar HTTP and ConnectionPool.
+  _Approach:_ Extract retry/backoff decision logic into a pure function or policy class in a new header. Test retry counts, backoff intervals, fallback backend selection, timeout handling. Separately test admin API endpoint handlers. Test backpressure semaphore acquire/release behavior.
   _Complexity:_ High
-  _Priority:_ P3
 
 - [ ] **Add concurrency stress tests for cross-shard components**
-  _Justification:_ 0 of 20 test files exercise concurrent access. Components crossing shard boundaries (`shard_load_metrics` atomics, `async_persistence` queue, `tokenizer_thread_pool` submission, `rate_limiter` buckets) need thread-safety validation.
+  _Context:_ 0 of 20 test files exercise concurrent access. Several components cross shard boundaries or use shared-state primitives.
+  _Approach:_ Use `std::thread` + `std::latch`/`std::barrier` (C++20) to test concurrent operations on: `shard_load_metrics` atomics (concurrent increment/decrement), `async_persistence` queue (concurrent enqueue from multiple threads), `tokenizer_thread_pool` (concurrent job submission), `rate_limiter` buckets (concurrent `try_consume` from same client). Add as separate `tests/unit/*_concurrency_test.cpp` files.
   _Complexity:_ High
-  _Priority:_ P3
 
 ---
 
