@@ -6,29 +6,22 @@ Ranvier Core is a high-performance **Layer 7+ LLM traffic controller** built in 
 
 **License:** Apache 2.0
 
-## Quick Reference
+## Build Constraints
 
-```bash
-# Build
-make build             # Release build (-O3)
-make build-debug       # Debug build with symbols
-make clean             # Remove build directory
+- **Static analysis only.** Do not attempt to run `cmake`, `make`, or build. Seastar dependencies are too heavy for the sandbox.
+- **API verification:** Verify syntax against Seastar documentation logic.
+- **Manual verification:** The developer builds in their Docker container and provides logs if it fails.
+- **Do NOT read** the full `/docs` or `/assets` folders (large token-heavy files).
 
-# Test
-make test              # Unit tests (builds first)
-cd build && ctest --output-on-failure   # Run tests directly
+## Pre-Code Checklist
 
-# Integration tests (requires Docker)
-make test-integration  # 3-node cluster + 2 mock backends
-
-# Code quality
-make format            # clang-format on src/ and tests/
-make lint              # clang-tidy (requires build first)
-
-# Benchmarks
-make benchmark         # Locust load test with mock backends
-make bench             # Lambda Labs GPU benchmark (auto-detects GPUs)
-```
+Before writing any code, verify:
+- [ ] Have I read the relevant file(s) I'm about to modify?
+- [ ] Does this touch cross-shard communication? Use `seastar::smp::submit_to`
+- [ ] Is there a MAX_SIZE for any new container?
+- [ ] Any new timer/callback? Needs gate guard
+- [ ] Any new metrics lambda capturing `this`? Deregister in `stop()`
+- [ ] Any C API string returns? Null-guard required
 
 ## Architecture
 
@@ -120,15 +113,9 @@ tests/
   unit/                       # 24+ Google Test files
   integration/                # Python tests + Locust load testing
 
-docs/
-  architecture/               # VISION.md, system-design.md
-  internals/                  # radix-tree.md, gossip-protocol.md
-  api/                        # reference.md
-  deployment/                 # kubernetes.md, performance.md
-
 deploy/helm/ranvier/          # Kubernetes Helm chart
 
-.dev-context/                 # Extended AI assistant guides (16 hard rules, audit findings)
+.dev-context/                 # Workflow prompts, audit findings, cheatsheet
 ```
 
 ### Key Types
@@ -147,22 +134,6 @@ struct RouteResult {
 enum class RoutingMode { PREFIX, HASH, RANDOM };
 enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
 ```
-
-## Dependencies
-
-| Library | Version | Purpose |
-|---------|---------|---------|
-| Seastar | system | Async I/O framework (shared-nothing) |
-| GTest | 1.14.0 | Unit testing |
-| yaml-cpp | 0.8.0 | YAML config parsing |
-| Abseil | 20240116.1 | `flat_hash_map`/`flat_hash_set` |
-| RapidJSON | 1.1.0 | JSON parsing (header-only) |
-| SQLite3 | 3.45.0 | Persistent state (built from source if needed) |
-| tokenizers-cpp | main | Rust FFI for BPE tokenization |
-| OpenTelemetry | 1.14.2 | Distributed tracing (optional: `WITH_TELEMETRY=ON`) |
-| OpenSSL | system | DTLS encryption for gossip |
-
-Dependencies are resolved via system packages first, with CMake FetchContent as fallback.
 
 ## Coding Conventions
 
@@ -205,7 +176,7 @@ Deregister metrics first in `stop()` before any other cleanup (Rule #6).
 
 ## The 16 Hard Rules
 
-These rules are **mandatory** for all code changes. Violations cause crashes, data corruption, or security issues in production. See `.dev-context/claude-context.md` for full explanations with code examples.
+These rules are **mandatory** for all code changes. Violations cause crashes, data corruption, or security issues in production.
 
 | # | Rule | What NOT to Do |
 |---|------|----------------|
@@ -246,7 +217,67 @@ smp::submit_to(target, [foreign = std::move(foreign)]() mutable {
 
 **Bounded containers:** Every `push_back` must have a size check or the container must be bounded by design.
 
-## Build System Details
+### Cross-Shard Memory Bugs (Rule #14 Detail)
+
+Three distinct failure modes:
+
+1. **Cross-shard FREE:** Moving heap-owning types via `submit_to` causes wrong-shard deallocation (SIGSEGV).
+2. **Cross-shard READ:** Capturing `&references` to shard-0 memory in `submit_to` lambdas is a data race.
+3. **Cross-shard callback state:** Broadcasting a callback that captures `this` to multiple shards causes concurrent access to one shard's state.
+
+**Correct pattern:** Wrap in `foreign_ptr`, read on target shard, create local copy:
+```cpp
+do_with(std::move(data), [](auto& data) {
+    return parallel_for_each(shards, [&data](unsigned shard_id) {
+        auto ptr = std::make_unique<std::vector<T>>(data);
+        auto foreign = seastar::make_foreign(std::move(ptr));
+        return smp::submit_to(shard_id, [foreign = std::move(foreign)]() mutable {
+            std::vector<T> local(foreign->begin(), foreign->end());
+            process(local);
+        });
+    });
+});
+```
+
+**Red flags:** `submit_to` lambdas capturing `&reference`, `vector`/`string` by value, or `this` being broadcast to all shards.
+
+### FFI Memory Safety (Rule #15 Detail)
+
+Reallocate in **both** directions when FFI is involved:
+
+```cpp
+// INPUT to FFI: reallocate before calling
+smp::submit_to(target_shard, [text_copy = std::move(text)]() {
+    std::string local_text(text_copy.data(), text_copy.size());
+    rust_tokenizer->Encode(local_text);
+});
+
+// OUTPUT from workers: reallocate when returning to reactor
+alien::run_on(reactor, shard, [tokens = std::move(tokens)]() {
+    std::vector<int32_t> local_tokens(tokens.begin(), tokens.end());
+    use(local_tokens);
+});
+```
+
+Seastar replaces `malloc` globally. Worker thread allocations are `foreign_mallocs` that cause corruption when freed on reactor threads with FFI code involved.
+
+## Dependencies
+
+| Library | Version | Purpose |
+|---------|---------|---------|
+| Seastar | system | Async I/O framework (shared-nothing) |
+| GTest | 1.14.0 | Unit testing |
+| yaml-cpp | 0.8.0 | YAML config parsing |
+| Abseil | 20240116.1 | `flat_hash_map`/`flat_hash_set` |
+| RapidJSON | 1.1.0 | JSON parsing (header-only) |
+| SQLite3 | 3.45.0 | Persistent state (built from source if needed) |
+| tokenizers-cpp | main | Rust FFI for BPE tokenization |
+| OpenTelemetry | 1.14.2 | Distributed tracing (optional: `WITH_TELEMETRY=ON`) |
+| OpenSSL | system | DTLS encryption for gossip |
+
+Dependencies are resolved via system packages first, with CMake FetchContent as fallback.
+
+## Build System
 
 **CMake 3.24+** with C++20 standard. Key CMake options:
 
@@ -254,9 +285,13 @@ smp::submit_to(target, [foreign = std::move(foreign)]() mutable {
 - `WITH_TELEMETRY=ON/OFF` - Enable OpenTelemetry tracing
 - `CMAKE_EXPORT_COMPILE_COMMANDS=ON` - Always on, for IDE support and clang-tidy
 
-The build produces test binaries under `build/` that are run via `ctest`.
+The full server binary (`ranvier_server`) requires Seastar installed on the system. Unit tests can be built and run without Seastar -- they test individual components in isolation.
 
-**Note:** The full server binary (`ranvier_server`) requires Seastar installed on the system. Unit tests can be built and run without Seastar - they test individual components in isolation.
+## Configuration
+
+Configuration is loaded from YAML (default: `ranvier.yaml`) with environment variable overrides (e.g., `RANVIER_ROUTING_MAX_ROUTES=50000`). Hot-reload via SIGHUP is supported (rate-limited to once per 10 seconds, atomic across all shards).
+
+See `ranvier.yaml.example` for the full configuration template.
 
 ## CI/CD
 
@@ -268,23 +303,28 @@ GitHub Actions workflows in `.github/workflows/`:
 | `docker-base.yml` | Base image with Seastar + build tools (manual trigger, ~30min) |
 | `benchmark.yml` | Locust load test regression on PRs and pushes to main |
 
-## Configuration
-
-Configuration is loaded from YAML (default: `ranvier.yaml`) with environment variable overrides (e.g., `RANVIER_ROUTING_MAX_ROUTES=50000`). Hot-reload via SIGHUP is supported (rate-limited to once per 10 seconds, atomic across all shards).
-
-See `ranvier.yaml.example` for the full configuration template.
-
 ## Deployment
 
 - **Docker:** `ghcr.io/ranvier-systems/ranvier:latest` (requires `--cap-add=IPC_LOCK`)
 - **Kubernetes:** Helm chart in `deploy/helm/ranvier/` (StatefulSet, HPA, service discovery)
 - **Local development:** Docker Compose via `docker-compose.test.yml` (3 nodes + 2 backends)
 
-## Extended Context
+## Workflow Prompts
 
-For detailed anti-pattern explanations with code examples, security audit findings, and implementation patterns, see:
+The `.dev-context/` directory contains specialized prompt templates for different workflows. These are designed to be used as conversation starters:
 
-- `.dev-context/claude-context.md` - 16 Hard Rules with full rationale
-- `.dev-context/cheatsheet.md` - Quick-reference patterns and troubleshooting
-- `docs/architecture/` - System design and vision documents
-- `docs/internals/` - Radix tree, gossip protocol, tokenization internals
+| Prompt | Use When |
+|--------|----------|
+| `claude-prompt.md` | Starting any general task |
+| `claude-impl-prompt.md` | Implementing a feature (staged: plan, code, optimize) |
+| `claude-review-prompt.md` | Self-reviewing code against the 16 Hard Rules |
+| `claude-debug-prompt.md` | Triaging a build/runtime failure |
+| `claude-doc-prompt.md` | Writing tests and updating docs post-implementation |
+| `claude-planning-prompt.md` | Decomposing a feature into atomic steps |
+| `claude-refactor-prompt.md` | Refactoring without behavioral changes |
+| `claude-audit-prompt.md` | Holistic system audit for architecture drift |
+| `claude-adversarial-audit-prompt.md` | Security-focused adversarial audit |
+| `claude-perf-prompt.md` | Performance investigation and optimization |
+| `claude-incident-prompt.md` | Incident response and root cause analysis |
+| `claude-pattern-extractor-prompt.md` | Formalizing new anti-patterns into Hard Rules |
+| `claude-strategic-alignment-prompt.md` | Strategic project assessment |
