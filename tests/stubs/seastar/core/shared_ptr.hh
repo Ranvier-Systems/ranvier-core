@@ -4,8 +4,10 @@
 // Provides foreign_ptr and make_foreign for cross-shard pointer semantics.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace seastar {
 
