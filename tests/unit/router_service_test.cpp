@@ -49,7 +49,9 @@ protected:
         cfg_.max_routes = 1000;
         cfg_.ttl_seconds = std::chrono::seconds(3600);
         cfg_.prefix_token_length = 128;
-        cfg_.block_alignment = 16;
+        // Use block_alignment=1 so small token vectors work with RadixTree.
+        // RadixTree::insert truncates to (tokens.size()/alignment)*alignment.
+        cfg_.block_alignment = 1;
         cfg_.backend_drain_timeout = std::chrono::seconds(2);
         cfg_.load_aware_routing = false;  // Deterministic tests
 
@@ -57,8 +59,19 @@ protected:
     }
 
     void TearDown() override {
-        RouterService::reset_shard_state_for_testing(nullptr);
+        // Destroy router first to deregister metrics before clearing shard state
         router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+
+    // Helper: destroy existing router before creating a new one.
+    // Prevents Seastar metric name collisions (old metrics must be
+    // deregistered before new ones with the same names are registered).
+    template<typename... Args>
+    void recreate_router(Args&&... args) {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+        router_ = std::make_unique<RouterService>(std::forward<Args>(args)...);
     }
 
     void register_two_backends() {
@@ -441,7 +454,7 @@ TEST_F(RouterServiceTest, PrefixModeRoutesViaART) {
 TEST_F(RouterServiceTest, HashModeIgnoresART) {
     RoutingConfig hash_cfg = cfg_;
     hash_cfg.routing_mode = RoutingConfig::RoutingMode::HASH;
-    router_ = std::make_unique<RouterService>(hash_cfg);
+    recreate_router(hash_cfg);
     register_two_backends();
 
     // Insert a route — hash mode should NOT use it
@@ -456,7 +469,7 @@ TEST_F(RouterServiceTest, HashModeIgnoresART) {
 TEST_F(RouterServiceTest, RandomModeReturnsAnyBackend) {
     RoutingConfig random_cfg = cfg_;
     random_cfg.routing_mode = RoutingConfig::RoutingMode::RANDOM;
-    router_ = std::make_unique<RouterService>(random_cfg);
+    recreate_router(random_cfg);
     register_two_backends();
 
     auto result = router_->route_request({1, 2, 3});
@@ -468,7 +481,7 @@ TEST_F(RouterServiceTest, RandomModeReturnsAnyBackend) {
 TEST_F(RouterServiceTest, HashModeNoBackendsError) {
     RoutingConfig hash_cfg = cfg_;
     hash_cfg.routing_mode = RoutingConfig::RoutingMode::HASH;
-    router_ = std::make_unique<RouterService>(hash_cfg);
+    recreate_router(hash_cfg);
 
     auto result = router_->route_request({1, 2, 3});
     EXPECT_EQ(result.routing_mode, "hash");
@@ -479,7 +492,7 @@ TEST_F(RouterServiceTest, HashModeNoBackendsError) {
 TEST_F(RouterServiceTest, RandomModeNoBackendsError) {
     RoutingConfig random_cfg = cfg_;
     random_cfg.routing_mode = RoutingConfig::RoutingMode::RANDOM;
-    router_ = std::make_unique<RouterService>(random_cfg);
+    recreate_router(random_cfg);
 
     auto result = router_->route_request({1, 2, 3});
     EXPECT_EQ(result.routing_mode, "random");
@@ -672,6 +685,8 @@ TEST_F(RouterServiceTest, GetLeastLoadedEmptyCandidates) {
 // =============================================================================
 
 TEST_F(RouterServiceTest, DefaultConstructor) {
+    // Destroy existing router first to avoid metric name collision
+    router_.reset();
     RouterService::reset_shard_state_for_testing(nullptr);
     RouterService router;
 
@@ -683,6 +698,8 @@ TEST_F(RouterServiceTest, ConstructWithDisabledCluster) {
     ClusterConfig cluster_cfg;
     cluster_cfg.enabled = false;
 
+    // Destroy existing router first to avoid metric name collision
+    router_.reset();
     RouterService::reset_shard_state_for_testing(nullptr);
     RouterService router(cfg_, cluster_cfg);
 
@@ -696,7 +713,7 @@ TEST_F(RouterServiceTest, ConstructWithDisabledCluster) {
 TEST_F(RouterServiceTest, ConfigChangeViaReset) {
     RoutingConfig new_cfg = cfg_;
     new_cfg.routing_mode = RoutingConfig::RoutingMode::RANDOM;
-    router_ = std::make_unique<RouterService>(new_cfg);
+    recreate_router(new_cfg);
 
     auto result = router_->route_request({1, 2, 3});
     EXPECT_EQ(result.routing_mode, "random");
