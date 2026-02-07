@@ -561,12 +561,13 @@ TEST_F(RateLimiterTimingTest, MultipleClientsRefillIndependently) {
     limiter.allow("client_b");
     EXPECT_FALSE(limiter.allow("client_b"));
 
-    // client_a should still not have enough (0.5 tokens)
+    // client_a should still not have enough (0.5 tokens, needs 1.0)
+    // Note: this allow() call updates last_refill to t=500ms and keeps tokens=0.5
     EXPECT_FALSE(limiter.allow("client_a"));
 
-    // Advance another 600ms -> client_a: +0.6 from last check,
-    // client_b: +0.6 from 600ms ago
-    TestClock::advance(std::chrono::milliseconds(600));
+    // Advance 1000ms -> client_a: 0.5 + 1.0 = 1.5 tokens (enough)
+    //                   client_b: 0.0 + 1.0 = 1.0 tokens (exactly enough)
+    TestClock::advance(std::chrono::milliseconds(1000));
     EXPECT_TRUE(limiter.allow("client_a"));
     EXPECT_TRUE(limiter.allow("client_b"));
 }
