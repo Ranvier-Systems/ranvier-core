@@ -2188,4 +2188,58 @@ void RouterService::set_circuit_cleanup_callback(CircuitCleanupCallback callback
     }
 }
 
+void RouterService::register_backend_for_testing(BackendId id, seastar::socket_address addr,
+                                                   uint32_t weight, uint32_t priority) {
+    if (!g_shard_state) return;
+    auto& state = *g_shard_state;
+    state.backends[id] = BackendInfo{addr, weight, priority};
+
+    bool exists = false;
+    for (auto existing : state.backend_ids) {
+        if (existing == id) { exists = true; break; }
+    }
+    if (!exists) {
+        state.backend_ids.push_back(id);
+    }
+}
+
+void RouterService::insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend) {
+    if (!g_shard_state) return;
+    RadixTree* tree = g_shard_state->tree.get();
+    if (!tree) return;
+    tree->insert(tokens, backend, RouteOrigin::LOCAL);
+}
+
+void RouterService::set_backend_draining_for_testing(BackendId id) {
+    if (!g_shard_state) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it != g_shard_state->backends.end()) {
+        it->second.is_draining = true;
+        it->second.drain_start_time = std::chrono::steady_clock::now();
+    }
+}
+
+void RouterService::mark_backend_dead_for_testing(BackendId id) {
+    if (!g_shard_state) return;
+    g_shard_state->dead_backends.insert(id);
+}
+
+void RouterService::unregister_backend_for_testing(BackendId id) {
+    if (!g_shard_state) return;
+    auto& state = *g_shard_state;
+    state.backends.erase(id);
+    auto it = std::find(state.backend_ids.begin(), state.backend_ids.end(), id);
+    if (it != state.backend_ids.end()) {
+        state.backend_ids.erase(it);
+    }
+    state.dead_backends.erase(id);
+}
+
+size_t RouterService::get_route_count_for_testing() {
+    if (!g_shard_state) return 0;
+    RadixTree* tree = g_shard_state->tree.get();
+    if (!tree) return 0;
+    return tree->route_count();
+}
+
 } // namespace ranvier

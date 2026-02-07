@@ -323,8 +323,28 @@ public:
     // including backends, routes, and statistics. If a config is provided, the
     // state will be reinitialized with that configuration.
     //
-    // IMPORTANT: Only call this in test code, not in production.
+    // IMPORTANT: Only call these in test code, not in production.
     static void reset_shard_state_for_testing(const RoutingConfig* cfg = nullptr);
+
+    // Register a backend in shard-local state (bypasses async cross-shard broadcast).
+    // Allows unit tests to set up backend state without a running Seastar reactor.
+    static void register_backend_for_testing(BackendId id, seastar::socket_address addr,
+                                              uint32_t weight = 100, uint32_t priority = 0);
+
+    // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
+    static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);
+
+    // Mark a backend as draining in shard-local state.
+    static void set_backend_draining_for_testing(BackendId id);
+
+    // Mark a backend as dead (circuit-breaker quarantine) in shard-local state.
+    static void mark_backend_dead_for_testing(BackendId id);
+
+    // Remove a backend from shard-local state (bypasses async cross-shard broadcast).
+    static void unregister_backend_for_testing(BackendId id);
+
+    // Get the number of routes in the shard-local RadixTree.
+    static size_t get_route_count_for_testing();
 
 private:
     // Thread-local metrics group
