@@ -724,4 +724,30 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(tokenizer_thread_pool_test)
+
+    # RouterService Integration Tests (Seastar-dependent)
+    # Tests the core routing brain: route learning, TTL, backend lifecycle, draining mode.
+    # Links against multiple src/*.cpp files for full RouterService + GossipService compilation.
+    add_executable(router_service_test
+      tests/unit/router_service_test.cpp
+      src/router_service.cpp
+      src/node_slab.cpp
+      src/gossip_service.cpp
+      src/gossip_protocol.cpp
+      src/gossip_consensus.cpp
+      src/gossip_transport.cpp
+      src/crypto_offloader.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(router_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(router_service_test
+      PRIVATE
+      Seastar::seastar
+      absl::flat_hash_map
+      absl::flat_hash_set
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(router_service_test)
 endif()
