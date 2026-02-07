@@ -652,6 +652,9 @@ if(Seastar_FOUND)
       src/tracing_service.cpp
     )
     target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    # Enable Seastar integration in rate_limiter.hpp (timer, gate, metrics, logger).
+    # Required for any target compiling http_controller.cpp which includes rate_limiter.hpp.
+    target_compile_definitions(application_test PRIVATE RANVIER_HAS_SEASTAR)
     if(NOT WITH_TELEMETRY)
         target_compile_definitions(application_test PRIVATE RANVIER_NO_TELEMETRY)
     endif()
