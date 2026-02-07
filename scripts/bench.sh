@@ -59,6 +59,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Capture original command for logging (before arg parsing shifts $@)
+ORIGINAL_CMD="$0 $*"
+
 # State
 VLLM_PIDS=()
 CLEANUP_DONE=false
@@ -502,6 +505,7 @@ if [[ "$LOG_ALL" = true ]]; then
     echo "Host: $(hostname)"
     echo "User: $(whoami)"
     echo "PWD: $(pwd)"
+    echo "Command: $ORIGINAL_CMD"
     echo "============================================="
     echo ""
 fi
@@ -1319,12 +1323,15 @@ if [[ "$COMPARE" = true ]]; then
 
     # Run automatic comparison analysis
     COMPARE_OUTPUT="${OUTPUT_DIR}/compare_$(date +%Y%m%d_%H%M%S).txt"
+    # Log the original command at the top of the compare file for reproducibility
+    echo "Command: $ORIGINAL_CMD" > "$COMPARE_OUTPUT"
+    echo "" >> "$COMPARE_OUTPUT"
     if [[ -f "tests/integration/results_parser.py" ]]; then
         log_info "Running comparison analysis..."
         if python3 tests/integration/results_parser.py compare \
             "${REPORT_RR}/benchmark.log" \
             "${REPORT_PREFIX}/benchmark.log" \
-            > "$COMPARE_OUTPUT" 2>&1; then
+            >> "$COMPARE_OUTPUT" 2>&1; then
             # Print comparison to terminal
             cat "$COMPARE_OUTPUT"
             echo ""
