@@ -13,7 +13,7 @@ All tests use Docker Compose (docker-compose.test.yml) with a 3-node cluster
 and mock backends, following the same pattern as the existing happy-path suites.
 
 Usage:
-    python tests/integration/test_negative_paths.py
+    python3 tests/integration/test_negative_paths.py
 
 Requirements:
     - Docker and docker-compose installed
@@ -796,34 +796,9 @@ class NegativePathTest(unittest.TestCase):
             capture_output=True, text=True, timeout=10
         )
 
-        # Use python inside the container to do a proper YAML rewrite:
-        # Read the existing config, set rate_limit fields, write it back.
-        # The container has a minimal image so use sed with proper line targeting.
-        # Strategy: replace the entire rate_limit section using a heredoc approach.
+        # Replace the rate_limit block via sed: set enabled to true, rps to 2, burst to 1.
+        # Use targeted sed with address range to only modify fields under rate_limit:.
         print("  Rewriting config to enable rate limiting (2 rps, burst 1)...")
-        rewrite_script = (
-            "import sys\\n"
-            "lines = open('/app/ranvier.yaml').readlines()\\n"
-            "out = []\\n"
-            "skip = False\\n"
-            "for line in lines:\\n"
-            "    if line.strip().startswith('rate_limit:'):\\n"
-            "        out.append('rate_limit:\\\\n')\\n"
-            "        out.append('  enabled: true\\\\n')\\n"
-            "        out.append('  requests_per_second: 2\\\\n')\\n"
-            "        out.append('  burst_size: 1\\\\n')\\n"
-            "        skip = True\\n"
-            "        continue\\n"
-            "    if skip:\\n"
-            "        if line.startswith('  ') and not line.startswith('   '):\\n"
-            "            continue\\n"
-            "        skip = False\\n"
-            "    out.append(line)\\n"
-            "open('/app/ranvier.yaml','w').writelines(out)\\n"
-        )
-        # The production container likely doesn't have python, so use sed instead.
-        # Replace the rate_limit block: set enabled to true, rps to 2, burst to 1.
-        # Use multiple targeted sed commands on specific field values.
         update_result = subprocess.run(
             ["docker", "exec", container, "sh", "-c",
              # Target the rate_limit section specifically:
