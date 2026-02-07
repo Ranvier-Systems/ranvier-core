@@ -285,6 +285,7 @@ that verify distributed behavior using a Docker Compose cluster.
 | `test_cluster.py` | Gossip, peer discovery, route propagation | 7 | ~45s |
 | `test_prefix_routing.py` | Prefix caching core value proposition | 8 | ~40s |
 | `test_graceful_shutdown.py` | Shutdown lifecycle guards | 6 | ~30s |
+| `test_negative_paths.py` | Failure handling and resilience | 5 | ~110s |
 
 ### Running Integration Tests
 
@@ -296,6 +297,7 @@ make test-integration
 python3 tests/integration/test_cluster.py
 python3 tests/integration/test_prefix_routing.py
 python3 tests/integration/test_graceful_shutdown.py
+python3 tests/integration/test_negative_paths.py
 
 # Start test cluster for debugging (keeps running)
 make integration-up
@@ -322,6 +324,13 @@ make integration-down
 - Metrics remain accessible during shutdown (no dangling pointers)
 - Requests rejected with 503 + Retry-After header
 - Cluster maintains quorum during single node shutdown
+
+**test_negative_paths.py** — Failure handling and resilience:
+- Split-brain detection via network partition and quorum recovery
+- Circuit breaker engagement when all backends are unreachable
+- Config reload rejection for invalid YAML (old config preserved)
+- Rate limiting enforcement with 503 + Retry-After responses
+- Oversized/malformed request body handling without crash
 
 ### Related Documentation
 

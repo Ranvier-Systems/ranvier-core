@@ -56,14 +56,17 @@ test-integration:
 	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/3: Cluster Behavior ==="
+	@echo "=== Test Suite 1/4: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/3: Prefix Routing ==="
+	@echo "=== Test Suite 2/4: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/3: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/4: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
+	@echo ""
+	@echo "=== Test Suite 4/4: Negative Paths ==="
+	@python3 tests/integration/test_negative_paths.py
 
 # Helper to detect docker compose command
 DOCKER_COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; fi)
