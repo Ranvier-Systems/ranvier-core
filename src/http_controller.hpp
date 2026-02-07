@@ -58,9 +58,6 @@ struct LoadBalancingSettings {
     uint64_t snapshot_refresh_interval_us = 1000;     // Snapshot cache refresh interval (microseconds)
 };
 
-// Forward declaration for connection bundle
-struct ConnectionBundle;
-
 // Context struct for proxy request state - reduces parameter passing and improves readability
 // This bundles all state that flows through the proxy request lifecycle
 struct ProxyContext {

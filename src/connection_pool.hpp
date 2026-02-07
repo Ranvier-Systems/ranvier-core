@@ -31,20 +31,24 @@ struct ConnectionPoolConfig {
 };
 
 // A bundle representing an active connection with timestamp tracking
-struct ConnectionBundle {
+//
+// Clock injection: Template parameter defaults to std::chrono::steady_clock
+// for zero-overhead production use. Tests use TestClock for deterministic timing.
+template<typename Clock = std::chrono::steady_clock>
+struct BasicConnectionBundle {
     seastar::connected_socket fd;
     seastar::input_stream<char> in;
     seastar::output_stream<char> out;
     seastar::socket_address addr;
     bool is_valid = true;
-    std::chrono::steady_clock::time_point created_at;
-    std::chrono::steady_clock::time_point last_used;
+    typename Clock::time_point created_at;
+    typename Clock::time_point last_used;
 
-    ConnectionBundle()
-        : created_at(std::chrono::steady_clock::now())
-        , last_used(std::chrono::steady_clock::now()) {}
+    BasicConnectionBundle()
+        : created_at(Clock::now())
+        , last_used(Clock::now()) {}
 
-    ConnectionBundle(seastar::connected_socket&& socket,
+    BasicConnectionBundle(seastar::connected_socket&& socket,
                      seastar::input_stream<char>&& input,
                      seastar::output_stream<char>&& output,
                      seastar::socket_address address)
@@ -53,8 +57,8 @@ struct ConnectionBundle {
         , out(std::move(output))
         , addr(address)
         , is_valid(true)
-        , created_at(std::chrono::steady_clock::now())
-        , last_used(std::chrono::steady_clock::now()) {}
+        , created_at(Clock::now())
+        , last_used(Clock::now()) {}
 
     // Close the connection
     seastar::future<> close() {
@@ -67,20 +71,20 @@ struct ConnectionBundle {
 
     // Check if connection has been idle too long
     bool is_expired(std::chrono::seconds timeout) const {
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
         return (now - last_used) > timeout;
     }
 
     // Check if connection has exceeded its maximum age (TTL)
     // Returns true if connection should be closed regardless of recent activity
     bool is_too_old(std::chrono::seconds max_age) const {
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
         return (now - created_at) > max_age;
     }
 
     // Update last used timestamp
     void touch() {
-        last_used = std::chrono::steady_clock::now();
+        last_used = Clock::now();
     }
 
     // Check if connection received FIN from backend (half-open detection)
@@ -92,9 +96,19 @@ struct ConnectionBundle {
     }
 };
 
-class ConnectionPool {
+// Backward-compatible alias: production code uses ConnectionBundle unchanged
+using ConnectionBundle = BasicConnectionBundle<>;
+
+// Connection pool with LRU + TTL connection management
+//
+// Clock injection: Template parameter defaults to std::chrono::steady_clock
+// for zero-overhead production use. Tests use TestClock for deterministic timing.
+template<typename Clock = std::chrono::steady_clock>
+class BasicConnectionPool {
 public:
-    explicit ConnectionPool(ConnectionPoolConfig config = {})
+    using Bundle = BasicConnectionBundle<Clock>;
+
+    explicit BasicConnectionPool(ConnectionPoolConfig config = {})
         : _config(config)
         , _reaper_timer([this] { reap_dead_connections(); })
     {
@@ -104,7 +118,7 @@ public:
         }
     }
 
-    ~ConnectionPool() {
+    ~BasicConnectionPool() {
         // Note: stop() should be called before destruction to properly wait
         // for in-flight timer callbacks. Destructor cancels as a safety net.
         _reaper_timer.cancel();
@@ -128,7 +142,7 @@ public:
     // GET: Reuse existing or create new connection
     // request_id: Optional request ID for tracing (empty string if not tracing)
     // Performs liveness checks on pooled connections before returning them
-    seastar::future<ConnectionBundle> get(seastar::socket_address addr,
+    seastar::future<Bundle> get(seastar::socket_address addr,
                                            const std::string& request_id = "") {
         auto& pool = _pools[addr];
 
@@ -180,7 +194,7 @@ public:
                 log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
             }
             bundle.touch();
-            return seastar::make_ready_future<ConnectionBundle>(std::move(bundle));
+            return seastar::make_ready_future<Bundle>(std::move(bundle));
         }
 
         // No pooled connection available, create new one
@@ -217,13 +231,13 @@ public:
 
             auto in = fd.input();
             auto out = fd.output();
-            return ConnectionBundle{std::move(fd), std::move(in), std::move(out), addr};
+            return Bundle{std::move(fd), std::move(in), std::move(out), addr};
         });
     }
 
     // PUT: Return connection to pool
     // request_id: Optional request ID for tracing (empty string if not tracing)
-    void put(ConnectionBundle&& bundle, const std::string& request_id = "") {
+    void put(Bundle&& bundle, const std::string& request_id = "") {
         if (!bundle.is_valid) {
             if (!request_id.empty()) {
                 log_pool.debug("[{}] Closing invalid connection to {}",
@@ -378,7 +392,7 @@ public:
 
 private:
     ConnectionPoolConfig _config;
-    std::unordered_map<seastar::socket_address, std::deque<ConnectionBundle>> _pools;
+    std::unordered_map<seastar::socket_address, std::deque<Bundle>> _pools;
     size_t _total_idle_connections = 0;
     size_t _dead_connections_reaped = 0;
     size_t _connections_reaped_max_age = 0;
@@ -426,7 +440,7 @@ private:
     // Evict the oldest connection across all pools
     void evict_oldest_global() {
         seastar::socket_address* oldest_addr = nullptr;
-        std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::now();
+        typename Clock::time_point oldest_time = Clock::now();
 
         for (auto& [addr, pool] : _pools) {
             if (!pool.empty() && pool.front().last_used < oldest_time) {
@@ -449,9 +463,9 @@ private:
     // Close a connection bundle asynchronously, keeping it alive until close completes.
     // This prevents the Seastar output_stream assertion failure that occurs when
     // a stream is destroyed while still in batch mode.
-    static void close_bundle_async(ConnectionBundle&& bundle) {
+    static void close_bundle_async(Bundle&& bundle) {
         // Move bundle to heap so it outlives this scope
-        auto ptr = std::make_unique<ConnectionBundle>(std::move(bundle));
+        auto ptr = std::make_unique<Bundle>(std::move(bundle));
         auto* raw_ptr = ptr.get();
         // Start close and destroy bundle after completion
         (void)raw_ptr->close().finally([p = std::move(ptr)] {
@@ -459,5 +473,8 @@ private:
         });
     }
 };
+
+// Backward-compatible alias: production code uses ConnectionPool unchanged
+using ConnectionPool = BasicConnectionPool<>;
 
 } // namespace ranvier

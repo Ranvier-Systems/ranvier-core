@@ -2003,11 +2003,12 @@ _Move completed items here with completion date and PR reference._
 
 ### 12.4 P3 — Longer-Term Test Infrastructure
 
-- [ ] **Add `connection_pool_test.cpp`**
+- [x] **Add `connection_pool_test.cpp`**
   _Source:_ `src/connection_pool.hpp` (~300 LOC) — manages upstream connections with per-host limits, global limits, idle timeout, and max-age TTL. Tightly coupled to Seastar networking (`seastar::connected_socket`).
   _Approach:_ Extract pool management logic (eviction, TTL, limits) behind a policy interface that can be tested without real sockets. Test: per-host connection limits, global connection limits, idle timeout eviction, max-age TTL enforcement, half-open connection detection.
   _CMake:_ Add under `if(Seastar_FOUND)` block. Model after `stream_parser_test`.
   _Complexity:_ High
+  _Completed:_ 2026-02-07. Templatized `ConnectionBundle` and `ConnectionPool` on `Clock` parameter (same pattern as `BasicCircuitBreaker<Clock>` and `BasicRateLimiter<Clock>`) with backward-compatible `using` aliases. Created `tests/unit/connection_pool_test.cpp` with 35 tests across 10 fixture classes: `ConnectionPoolConfigTest` (defaults, customization), `ConnectionBundleTest` (timestamps, expiry, TTL, touch semantics), `ConnectionPoolPerHostLimitTest` (per-host limit enforcement, independent host limits), `ConnectionPoolGlobalLimitTest` (global eviction across hosts), `ConnectionPoolIdleTimeoutTest` (deterministic expiry with TestClock, boundary conditions), `ConnectionPoolMaxAgeTest` (TTL enforcement independent of idle, counter accumulation), `ConnectionPoolHalfOpenTest` (non-half-open survival, invalid rejection), `ConnectionPoolStatsTest` (counter tracking), `ConnectionPoolClearPoolTest` (backend removal), `ConnectionPoolMapCleanupTest` (Rule #4 empty map entry removal), `ConnectionPoolEvictionOrderTest` (FIFO eviction semantics), `ConnectionPoolMixedTest` (multi-round cleanup, put-after-clear). Default-constructed Seastar streams have `close()` returning ready futures, enabling testing without a reactor. Wired into CMakeLists.txt under `if(Seastar_FOUND)` with `Seastar::seastar` and `GTest::gtest_main`.
 
 - [ ] **Add router service integration tests (Seastar-dependent)**
   _Source:_ `src/router_service.hpp` + `src/router_service.cpp` (~700 LOC) — the core routing brain. Currently only tested transitively through Docker Compose integration suites. Depends on Seastar sharding, RadixTree, and shard_load_balancer.
