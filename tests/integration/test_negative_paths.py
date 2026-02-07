@@ -24,10 +24,12 @@ import concurrent.futures
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
 import unittest
+import urllib.parse
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -47,7 +49,6 @@ PROJECT_NAME = "ranvier-negative-path-test"
 
 def get_docker_host() -> str:
     """Get the hostname to reach Docker-exposed ports."""
-    import socket
     try:
         socket.gethostbyname("host.docker.internal")
         return "host.docker.internal"
@@ -206,6 +207,26 @@ def docker_network_connect(network: str, container: str, ip: str = None) -> bool
         return False
 
 
+def get_docker_network_name() -> str:
+    """Get the actual Docker network name for the test project.
+
+    Docker Compose creates networks with the project name prefix.
+    The network defined in docker-compose.test.yml is 'ranvier-test',
+    so the full name is '{PROJECT_NAME}_ranvier-test'.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "network", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        for line in result.stdout.strip().split("\n"):
+            if PROJECT_NAME in line and "ranvier-test" in line:
+                return line.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return f"{PROJECT_NAME}_ranvier-test"
+
+
 # =============================================================================
 # Metrics Helpers
 # =============================================================================
@@ -302,27 +323,6 @@ def send_chat_request(
 
     except requests.exceptions.RequestException as e:
         return -1, str(e), {}
-
-
-def get_docker_network_name() -> str:
-    """Get the actual Docker network name for the test project.
-
-    Docker Compose creates networks with the project name prefix.
-    The network defined in docker-compose.test.yml is 'ranvier-test',
-    so the full name is '{PROJECT_NAME}_ranvier-test'.
-    """
-    try:
-        result = subprocess.run(
-            ["docker", "network", "ls", "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=10
-        )
-        for line in result.stdout.strip().split("\n"):
-            if PROJECT_NAME in line and "ranvier-test" in line:
-                return line.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    # Fallback to the expected name
-    return f"{PROJECT_NAME}_ranvier-test"
 
 
 # =============================================================================
@@ -690,16 +690,13 @@ class NegativePathTest(unittest.TestCase):
         pre_reload_peers = get_metric_value(node1_metrics, "cluster_peers_alive")
         print(f"  Pre-reload cluster_peers_alive: {pre_reload_peers}")
 
-        # Write invalid YAML to a temporary config file inside the container
-        # The server reads its config from the config path specified at startup.
-        # We write invalid YAML there, send SIGHUP, then restore.
+        # Write invalid YAML to /app/ranvier.yaml inside the container.
+        # The container has no config file by default (config from env vars),
+        # so we create one, send SIGHUP, then remove it in the finally block.
         invalid_yaml = "{{{{invalid: yaml: [unterminated"
 
         print("  Writing invalid YAML to container config...")
-        # First, find the config file path by checking the container's command
-        # The test config is typically at /app/ranvier.yaml or similar
-        # Use a more robust approach: write to a known path and use env override
-        write_result = subprocess.run(
+        subprocess.run(
             ["docker", "exec", container, "sh", "-c",
              "cp /app/ranvier.yaml /app/ranvier.yaml.bak 2>/dev/null; "
              f"echo '{invalid_yaml}' > /app/ranvier.yaml"],
@@ -748,7 +745,8 @@ class NegativePathTest(unittest.TestCase):
             subprocess.run(
                 ["docker", "exec", container, "sh", "-c",
                  "if [ -f /app/ranvier.yaml.bak ]; then "
-                 "  cp /app/ranvier.yaml.bak /app/ranvier.yaml; "
+                 "  cp /app/ranvier.yaml.bak /app/ranvier.yaml && "
+                 "  rm -f /app/ranvier.yaml.bak; "
                  "else "
                  "  rm -f /app/ranvier.yaml; "
                  "fi"],
@@ -792,7 +790,7 @@ class NegativePathTest(unittest.TestCase):
             "  requests_per_second: 2\n"
             "  burst_size: 1\n"
         )
-        write_result = subprocess.run(
+        subprocess.run(
             ["docker", "exec", container, "sh", "-c",
              f"cat > /app/ranvier.yaml << 'RATEEOF'\n{rate_limit_yaml}RATEEOF"],
             capture_output=True, text=True, timeout=10
@@ -951,10 +949,6 @@ class NegativePathTest(unittest.TestCase):
         print("\nTest: Oversized request body handling")
 
         node1_api = NODES["node1"]["api"]
-
-        import socket as sock
-        import urllib.parse
-
         parsed = urllib.parse.urlparse(node1_api)
         host = parsed.hostname
         port = parsed.port
@@ -979,7 +973,7 @@ class NegativePathTest(unittest.TestCase):
 
         server_handled_gracefully = False
         try:
-            s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5)
             s.connect((host, port))
             s.sendall(raw_request.encode())
@@ -992,11 +986,11 @@ class NegativePathTest(unittest.TestCase):
                     resp_str = response.decode("utf-8", errors="replace")
                     print(f"    Server response (first 200 chars): {resp_str[:200]}")
                     server_handled_gracefully = True
-            except sock.timeout:
+            except socket.timeout:
                 print("    Server timed out waiting for body (expected)")
                 server_handled_gracefully = True
             s.close()
-        except (sock.error, OSError) as e:
+        except (socket.error, OSError) as e:
             print(f"    Socket error (expected for abusive request): {e}")
             server_handled_gracefully = True
 
