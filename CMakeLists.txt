@@ -246,6 +246,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 
     target_include_directories(ranvier_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
 
+    # Enable Seastar integration in headers (timer, gate, metrics, logger).
+    # Pure-logic unit tests compile without this define.
+    target_compile_definitions(ranvier_server PRIVATE RANVIER_HAS_SEASTAR)
+
     # Debug metrics configuration (optional)
     # Enables 8 additional gossip metrics for crypto offload debugging
     if(RANVIER_DEBUG_METRICS)

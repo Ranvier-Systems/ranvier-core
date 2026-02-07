@@ -6,9 +6,8 @@
 #include "rate_limiter.hpp"
 #include "test_clock.hpp"
 #include <gtest/gtest.h>
-#include <string>
-#include <thread>
 #include <chrono>
+#include <string>
 
 using namespace ranvier;
 
@@ -331,9 +330,10 @@ TEST(RateLimiterTypeTraitsTest, TokenBucketIsCopyable) {
     EXPECT_TRUE(std::is_copy_assignable_v<TokenBucket>);
 }
 
-TEST(RateLimiterTypeTraitsTest, RateLimiterIsMovable) {
-    EXPECT_TRUE(std::is_move_constructible_v<RateLimiter>);
-    EXPECT_TRUE(std::is_move_assignable_v<RateLimiter>);
+TEST(RateLimiterTypeTraitsTest, RateLimiterNotCopyable) {
+    // Contains std::atomic members, so not copyable or movable
+    EXPECT_FALSE(std::is_copy_constructible_v<RateLimiter>);
+    EXPECT_FALSE(std::is_copy_assignable_v<RateLimiter>);
 }
 
 // =============================================================================

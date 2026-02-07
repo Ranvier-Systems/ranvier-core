@@ -6,6 +6,10 @@
 // Clock injection: Template parameter defaults to std::chrono::steady_clock
 // for zero-overhead production use. Tests use TestClock for deterministic timing.
 //
+// Seastar integration: Timer, gate, metrics, and logger are compiled only when
+// RANVIER_HAS_SEASTAR is defined (set automatically by CMake for Seastar targets).
+// Pure-logic unit tests compile without Seastar by omitting that define.
+//
 // Hard Rule #4 compliance: MAX_BUCKETS bounds the _buckets map to prevent
 // memory exhaustion from attackers generating requests from unique source IPs.
 // When at capacity, fail-open (allow request) to maintain availability.
@@ -21,16 +25,20 @@
 #include <string>
 #include <unordered_map>
 
+#ifdef RANVIER_HAS_SEASTAR
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/util/log.hh>
+#endif
 
 namespace ranvier {
 
+#ifdef RANVIER_HAS_SEASTAR
 // Logger for rate limiter warnings
 inline seastar::logger log_rate_limiter("ranvier.rate_limiter");
+#endif
 
 struct RateLimiterConfig {
     bool enabled = false;
@@ -70,6 +78,7 @@ public:
         , _overflow_count(0)
         , _buckets_cleaned_total(0) {}
 
+#ifdef RANVIER_HAS_SEASTAR
     // Start the cleanup timer (call after construction, before serving requests)
     // Hard Rule #5: Timer uses gate guard pattern for safe shutdown
     void start() {
@@ -98,6 +107,7 @@ public:
             log_rate_limiter.info("Rate limiter cleanup timer stopped");
         });
     }
+#endif  // RANVIER_HAS_SEASTAR
 
     // Check if request is allowed and consume a token if so
     // Returns true if allowed, false if rate limited
@@ -115,6 +125,7 @@ public:
                 // Fail-open: allow request without creating bucket
                 _overflow_count.fetch_add(1, std::memory_order_relaxed);
 
+#ifdef RANVIER_HAS_SEASTAR
                 // Log warning once per process lifetime
                 std::call_once(_overflow_logged, [] {
                     log_rate_limiter.warn(
@@ -122,6 +133,7 @@ public:
                         "Failing open for new clients. This may indicate an attack "
                         "or misconfiguration.", MAX_BUCKETS);
                 });
+#endif
 
                 return true;
             }
@@ -187,6 +199,7 @@ public:
         return _buckets_cleaned_total.load(std::memory_order_relaxed);
     }
 
+#ifdef RANVIER_HAS_SEASTAR
     // Register Prometheus metrics
     void register_metrics() {
         namespace sm = seastar::metrics;
@@ -210,6 +223,7 @@ public:
     void clear_metrics() {
         _metrics.clear();
     }
+#endif  // RANVIER_HAS_SEASTAR
 
     // Hot-reload: Update configuration at runtime
     void update_config(const RateLimiterConfig& config) {
@@ -220,6 +234,7 @@ public:
     }
 
 private:
+#ifdef RANVIER_HAS_SEASTAR
     // Timer callback - invoked by Seastar reactor
     // Hard Rule #5: Must acquire gate holder before accessing any member state
     void on_cleanup_timer() {
@@ -250,24 +265,31 @@ private:
         // This happens while gate holder is still valid
         _cleanup_timer.arm(_cleanup_interval);
     }
+#endif  // RANVIER_HAS_SEASTAR
 
     RateLimiterConfig _config;
     std::unordered_map<std::string, BasicTokenBucket<Clock>> _buckets;
 
+#ifdef RANVIER_HAS_SEASTAR
     // Cleanup timer (Hard Rule #5: uses gate guard pattern)
     seastar::timer<> _cleanup_timer;
     seastar::gate _timer_gate;
+#endif
     std::chrono::seconds _cleanup_interval;
 
     // Overflow tracking (Rule #4: bounded container overflow detection)
     std::atomic<size_t> _overflow_count;
+#ifdef RANVIER_HAS_SEASTAR
     inline static std::once_flag _overflow_logged;  // Log once per process
+#endif
 
     // Cleanup tracking (Rule #1: lock-free counter for metrics)
     std::atomic<size_t> _buckets_cleaned_total;
 
+#ifdef RANVIER_HAS_SEASTAR
     // Prometheus metrics (Rule #6: clear in stop() before gate close)
     seastar::metrics::metric_groups _metrics;
+#endif
 };
 
 // Backward-compatible alias: production code uses RateLimiter unchanged
