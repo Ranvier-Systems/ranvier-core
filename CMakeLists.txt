@@ -594,6 +594,23 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(crypto_offloader_test)
 
+# ConnectionPool Unit Tests (Requires Seastar types)
+    # Tests pool management logic: per-host limits, global limits, idle timeout
+    # eviction, max-age TTL enforcement, and half-open detection with TestClock.
+    add_executable(connection_pool_test
+      tests/unit/connection_pool_test.cpp
+    )
+    target_include_directories(connection_pool_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/tests/unit
+    )
+    target_link_libraries(connection_pool_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest_main
+    )
+    gtest_discover_tests(connection_pool_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
     add_executable(stream_parser_test
       tests/unit/stream_parser_test.cpp
