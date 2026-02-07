@@ -596,11 +596,20 @@ class NegativePathTest(unittest.TestCase):
         # Also track connection errors and fallback attempts
         initial_conn_errors = get_metric_value(node1_metrics, "http_requests_connection_error") or 0
 
-        # Stop BOTH backends so there is no fallback target
-        print("\n  Stopping both backends...")
-        run_compose(["stop", "backend1"], check=False)
-        run_compose(["stop", "backend2"], check=False)
-        time.sleep(2)
+        # Kill BOTH backends immediately (SIGKILL) so there is no fallback target.
+        # Using 'kill' instead of 'stop' because 'stop' sends SIGTERM and the
+        # Python mock backend continues serving during the 10s grace period.
+        print("\n  Killing both backends (SIGKILL)...")
+        subprocess.run(
+            ["docker", "kill", CONTAINER_NAMES["backend1"]],
+            capture_output=True, text=True, timeout=10
+        )
+        subprocess.run(
+            ["docker", "kill", CONTAINER_NAMES["backend2"]],
+            capture_output=True, text=True, timeout=10
+        )
+        # Wait for TCP connections to fully close and Ranvier to notice
+        time.sleep(3)
 
         try:
             # Send many requests to trigger circuit breaker (failure_threshold=3)
@@ -622,8 +631,8 @@ class NegativePathTest(unittest.TestCase):
             # Now restart one backend and send more requests.
             # Requests hitting an already-open circuit will increment the metric
             # before falling back (to the still-down backend), causing more opens.
-            print("\n  Starting backend1 only, sending more requests...")
-            run_compose(["start", "backend1"], check=False)
+            print("\n  Restarting backend1 only, sending more requests...")
+            run_compose(["up", "-d", "backend1"], check=False)
             time.sleep(3)
 
             for i in range(5):
@@ -631,10 +640,10 @@ class NegativePathTest(unittest.TestCase):
                 time.sleep(0.3)
 
         finally:
-            # Ensure both backends are running for subsequent tests
+            # Ensure both backends are running for subsequent tests.
+            # 'up -d' recreates killed containers (start only works on stopped ones).
             print("\n  Restarting both backends...")
-            run_compose(["start", "backend1"], check=False)
-            run_compose(["start", "backend2"], check=False)
+            run_compose(["up", "-d", "backend1", "backend2"], check=False)
             time.sleep(5)
 
         # Wait for metrics to settle
@@ -754,15 +763,21 @@ class NegativePathTest(unittest.TestCase):
             )
 
         finally:
-            # Restore the original config
-            print("  Restoring original config...")
+            # Restore the original state: if a backup exists, restore it;
+            # otherwise remove the file entirely (it didn't exist before).
+            # The container originally has NO ranvier.yaml (config from env vars).
+            print("  Restoring original config state...")
             subprocess.run(
                 ["docker", "exec", container, "sh", "-c",
-                 "cp /app/ranvier.yaml.bak /app/ranvier.yaml 2>/dev/null || true"],
+                 "if [ -f /app/ranvier.yaml.bak ]; then "
+                 "  cp /app/ranvier.yaml.bak /app/ranvier.yaml; "
+                 "else "
+                 "  rm -f /app/ranvier.yaml; "
+                 "fi"],
                 capture_output=True, text=True, timeout=10
             )
 
-            # Send SIGHUP again to reload the valid config
+            # Send SIGHUP again to reload (will fall back to defaults + env vars)
             subprocess.run(
                 ["docker", "kill", "--signal=HUP", container],
                 capture_output=True, text=True, timeout=10
@@ -788,29 +803,29 @@ class NegativePathTest(unittest.TestCase):
         node1_api = NODES["node1"]["api"]
         container = CONTAINER_NAMES["node1"]
 
-        # Back up the original config file
-        print("  Backing up config...")
-        subprocess.run(
+        # The container has NO ranvier.yaml by default (config is from env vars).
+        # Write a minimal YAML with only the rate_limit section. On SIGHUP,
+        # RanvierConfig::load() parses this file, then applies env var overrides.
+        # Since there's no RANVIER_RATE_LIMIT_ENABLED env var, our YAML values stick.
+        print("  Writing rate limit config to container...")
+        rate_limit_yaml = (
+            "rate_limit:\n"
+            "  enabled: true\n"
+            "  requests_per_second: 2\n"
+            "  burst_size: 1\n"
+        )
+        write_result = subprocess.run(
             ["docker", "exec", container, "sh", "-c",
-             "cp /app/ranvier.yaml /app/ranvier.yaml.bak"],
+             f"cat > /app/ranvier.yaml << 'RATEEOF'\n{rate_limit_yaml}RATEEOF"],
             capture_output=True, text=True, timeout=10
         )
 
-        # Replace the rate_limit block via sed: set enabled to true, rps to 2, burst to 1.
-        # Use targeted sed with address range to only modify fields under rate_limit:.
-        print("  Rewriting config to enable rate limiting (2 rps, burst 1)...")
-        update_result = subprocess.run(
-            ["docker", "exec", container, "sh", "-c",
-             # Target the rate_limit section specifically:
-             # 1. Find 'rate_limit:' line and change 'enabled: false' on next line
-             # 2. Change requests_per_second and burst_size values
-             "sed -i '/^rate_limit:/,/^[^ ]/{s/enabled: false/enabled: true/; "
-             "s/requests_per_second: [0-9]*/requests_per_second: 2/; "
-             "s/burst_size: [0-9]*/burst_size: 1/}' /app/ranvier.yaml && "
-             "cat /app/ranvier.yaml | grep -A3 'rate_limit:'"],
+        # Verify the file was written correctly
+        verify_result = subprocess.run(
+            ["docker", "exec", container, "cat", "/app/ranvier.yaml"],
             capture_output=True, text=True, timeout=10
         )
-        print(f"    Config rate_limit section:\n{update_result.stdout.strip()}")
+        print(f"    Written config:\n{verify_result.stdout.strip()}")
 
         # Send SIGHUP to apply the new config
         print("  Sending SIGHUP to apply rate limit config...")
@@ -818,7 +833,7 @@ class NegativePathTest(unittest.TestCase):
             ["docker", "kill", "--signal=HUP", container],
             capture_output=True, text=True, timeout=10
         )
-        # Wait for reload cooldown (reload_config has 10s cooldown, but fresh start is ok)
+        # Wait for reload to take effect
         time.sleep(5)
 
         try:
@@ -877,11 +892,10 @@ class NegativePathTest(unittest.TestCase):
                 )
 
         finally:
-            # Restore original config (rate limiting disabled)
-            print("\n  Restoring original config (rate limiting disabled)...")
+            # Remove the config file to restore env-var-only config (rate limit disabled)
+            print("\n  Removing config file (restoring env-var-only defaults)...")
             subprocess.run(
-                ["docker", "exec", container, "sh", "-c",
-                 "cp /app/ranvier.yaml.bak /app/ranvier.yaml 2>/dev/null || true"],
+                ["docker", "exec", container, "rm", "-f", "/app/ranvier.yaml"],
                 capture_output=True, text=True, timeout=10
             )
             subprocess.run(
