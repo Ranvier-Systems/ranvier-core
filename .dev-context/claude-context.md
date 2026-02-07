@@ -201,6 +201,24 @@ smp::submit_to(target, [foreign = std::move(foreign)]() mutable {
 
 **Bounded containers:** Every `push_back` must have a size check or the container must be bounded by design.
 
+### Reactor-Free Unit Testing (Seastar Components)
+
+Seastar future continuations (`.then()`, `.finally()`, `.handle_exception()`) call `need_preempt()`, which dereferences the thread-local reactor pointer. **This segfaults without a running reactor — even on ready futures.** `output_stream::close()` chains `.finally()` internally, so even closing a default-constructed stream with a null data sink crashes.
+
+Any code path that touches Seastar futures must be injectable if you want unit tests without a reactor. If it calls `.then()`, it needs a policy seam.
+
+**Pattern 1 — Clock injection:** Template on `Clock` (default `steady_clock`). Tests use `TestClock` (`tests/unit/test_clock.hpp`) for deterministic timing. Backward-compatible alias: `using TypeName = BasicTypeName<>;`.
+```
+Examples: circuit_breaker.hpp, rate_limiter_core.hpp, connection_pool.hpp
+```
+
+**Pattern 2 — ClosePolicy injection:** Template on `ClosePolicy` for any component that closes Seastar streams. Production uses `AsyncClosePolicy` (heap + `.finally()`). Tests use `SyncClosePolicy` (mark invalid, drop).
+```
+Example: connection_pool.hpp
+```
+
+**Test file conventions:** `tests/unit/<name>_test.cpp`, Google Test, `using namespace ranvier;`, `TEST_F` with fixtures. Seastar-dependent tests go under `if(Seastar_FOUND)` in `CMakeLists.txt`.
+
 ## Dependencies
 
 | Library | Version | Purpose |
