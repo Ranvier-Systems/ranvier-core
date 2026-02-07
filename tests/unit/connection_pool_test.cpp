@@ -160,13 +160,6 @@ protected:
     }
 
     ConnectionPoolConfig config;
-
-    // Helper to create a test bundle for a given port
-    TestBundle make_bundle(uint16_t port) {
-        TestBundle bundle;
-        bundle.addr = seastar::socket_address(seastar::ipv4_addr(0x7f000001, port));
-        return bundle;
-    }
 };
 
 TEST_F(ConnectionPoolPerHostLimitTest, AcceptsUpToPerHostLimit) {
@@ -482,9 +475,7 @@ TEST_F(ConnectionPoolMaxAgeTest, ConnectionEvictedAfterMaxAge) {
 }
 
 TEST_F(ConnectionPoolMaxAgeTest, MaxAgeTrackedSeparatelyFromIdleTimeout) {
-    // Set idle_timeout > max_connection_age to verify max-age takes precedence
-    config.idle_timeout = std::chrono::seconds(600);  // 10 min idle
-    config.max_connection_age = std::chrono::seconds(120);  // 2 min max age
+    // Fixture: idle_timeout=600s > max_connection_age=120s, so max-age fires first
     TestPool pool(config);
     auto addr = seastar::socket_address(seastar::ipv4_addr(0x7f000001, 8080));
 
@@ -948,12 +939,7 @@ TEST_F(ConnectionPoolMixedTest, MultipleCleanupRoundsAccumulate) {
     TestClock::advance(std::chrono::seconds(31));
     pool.cleanup_expired();
 
-    // Round 2: max-age expire 1 connection (idle_timeout < advance < max_age
-    // won't work here because idle would trigger first; so advance past max_age
-    // with idle_timeout > max_age to trigger max-age first)
-    config.idle_timeout = std::chrono::seconds(600);
-    // We can't change config on existing pool, so just test accumulation
-    // of dead_connections_reaped counter
+    // Round 2: idle-expire 1 more connection
     TestBundle bundle;
     bundle.addr = addr;
     pool.put(std::move(bundle));
