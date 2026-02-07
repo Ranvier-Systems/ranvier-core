@@ -44,8 +44,6 @@ except ImportError:
 COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.test.yml")
 PROJECT_NAME = "ranvier-negative-path-test"
 
-DOCKER_NETWORK = "ranvier-negative-path-test_ranvier-test"
-
 
 def get_docker_host() -> str:
     """Get the hostname to reach Docker-exposed ports."""
@@ -183,12 +181,6 @@ def wait_for_healthy(url: str, timeout: int = 60, container_name: str = None) ->
     return False
 
 
-def docker_exec(container_name: str, cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    """Execute a command inside a running container."""
-    full_cmd = ["docker", "exec", container_name] + cmd
-    return subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
-
-
 def docker_network_disconnect(network: str, container: str) -> bool:
     """Disconnect a container from a Docker network."""
     try:
@@ -243,29 +235,6 @@ def get_metric_value(metrics_url: str, metric_name: str, retries: int = 3) -> Op
             else:
                 return None
     return None
-
-
-def get_all_metrics(metrics_url: str) -> Dict[str, List[float]]:
-    """Get all metrics from the Prometheus endpoint."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return {}
-
-        metrics = {}
-        for line in resp.text.split("\n"):
-            if line.startswith("#") or not line.strip():
-                continue
-            match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([\d.eE+-]+)", line)
-            if match:
-                name = match.group(1)
-                value = float(match.group(3))
-                if name not in metrics:
-                    metrics[name] = []
-                metrics[name].append(value)
-        return metrics
-    except requests.exceptions.RequestException:
-        return {}
 
 
 # =============================================================================
@@ -878,14 +847,14 @@ class NegativePathTest(unittest.TestCase):
             )
             time.sleep(3)
 
-        # Fail early if probe never detected rate limiting
-        self.assertTrue(
-            rate_limiter_active,
-            "Rate limiter never became active after config reload + SIGHUP. "
-            "The RELOAD_COOLDOWN (10s) may have blocked all reload attempts."
-        )
-
         try:
+            # Fail early if probe never detected rate limiting
+            self.assertTrue(
+                rate_limiter_active,
+                "Rate limiter never became active after config reload + SIGHUP. "
+                "The RELOAD_COOLDOWN (10s) may have blocked all reload attempts."
+            )
+
             # Flood with concurrent requests to exceed the rate limit
             # With 2 rps and burst of 1, almost all concurrent requests should be rejected
             print("  Sending burst of concurrent requests...")
