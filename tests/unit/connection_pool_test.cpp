@@ -454,7 +454,7 @@ protected:
         TestClock::reset();
         config.max_connections_per_host = 10;
         config.max_total_connections = 100;
-        config.idle_timeout = std::chrono::seconds(60);
+        config.idle_timeout = std::chrono::seconds(600);  // High: ensure idle doesn't fire before max-age
         config.max_connection_age = std::chrono::seconds(120);
         config.reaper_interval = std::chrono::seconds(0);
     }
