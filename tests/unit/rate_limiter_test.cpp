@@ -3,13 +3,16 @@
 // Tests for the token bucket rate limiter with MAX_BUCKETS bound (Hard Rule #4).
 // Includes deterministic timing tests using TestClock for token refill verification.
 
-#include "rate_limiter.hpp"
+#include "rate_limiter_core.hpp"
 #include "test_clock.hpp"
 #include <gtest/gtest.h>
 #include <chrono>
 #include <string>
 
 using namespace ranvier;
+
+// Test alias: BasicRateLimiter with default clock (same algorithm as Seastar RateLimiter)
+using RateLimiter = BasicRateLimiter<>;
 
 // =============================================================================
 // RateLimiterConfig Tests
