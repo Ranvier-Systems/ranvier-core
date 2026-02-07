@@ -194,7 +194,10 @@ TEST_F(RateLimiterMaxBucketsTest, BucketCountAccessorWorks) {
 
 class RateLimiterCleanupTest : public ::testing::Test {
 protected:
+    using TestLimiter = BasicRateLimiter<TestClock>;
+
     void SetUp() override {
+        TestClock::reset();
         config.enabled = true;
         config.requests_per_second = 100;
         config.burst_size = 10;
@@ -204,12 +207,15 @@ protected:
 };
 
 TEST_F(RateLimiterCleanupTest, CleanupRemovesIdleBuckets) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
 
     // Create some buckets
     limiter.allow("client_1");
     limiter.allow("client_2");
     EXPECT_EQ(limiter.bucket_count(), 2u);
+
+    // Advance time so buckets become idle (idle > 0s threshold)
+    TestClock::advance(std::chrono::seconds(1));
 
     // Cleanup with 0 seconds idle time should remove all
     size_t removed = limiter.cleanup(std::chrono::seconds(0));
@@ -218,7 +224,7 @@ TEST_F(RateLimiterCleanupTest, CleanupRemovesIdleBuckets) {
 }
 
 TEST_F(RateLimiterCleanupTest, CleanupPreservesRecentBuckets) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
 
     limiter.allow("recent_client");
     EXPECT_EQ(limiter.bucket_count(), 1u);
@@ -230,13 +236,16 @@ TEST_F(RateLimiterCleanupTest, CleanupPreservesRecentBuckets) {
 }
 
 TEST_F(RateLimiterCleanupTest, CleanupReturnsRemovedCount) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
 
     // Create some buckets
     limiter.allow("client_1");
     limiter.allow("client_2");
     limiter.allow("client_3");
     EXPECT_EQ(limiter.bucket_count(), 3u);
+
+    // Advance time so buckets become idle (idle > 0s threshold)
+    TestClock::advance(std::chrono::seconds(1));
 
     // Cleanup with 0 seconds idle time should remove all and return count
     size_t removed = limiter.cleanup(std::chrono::seconds(0));
@@ -245,7 +254,7 @@ TEST_F(RateLimiterCleanupTest, CleanupReturnsRemovedCount) {
 }
 
 TEST_F(RateLimiterCleanupTest, BucketsCleanedTotalStartsAtZero) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
     EXPECT_EQ(limiter.buckets_cleaned_total(), 0u);
 }
 
