@@ -152,7 +152,7 @@ TEST_F(RouterServiceTest, TreeDumpReflectsInsertedRoutes) {
     auto dump = router_->get_tree_dump();
     // After inserting a route, the tree should have content
     // (either the root has children or a backend value)
-    EXPECT_TRUE(dump.backend_id.has_value() || !dump.children.empty());
+    EXPECT_TRUE(dump.backend.has_value() || !dump.children.empty());
 }
 
 TEST_F(RouterServiceTest, ResetClearsAllRoutes) {
@@ -708,7 +708,7 @@ TEST_F(RouterServiceTest, ConfigChangeViaReset) {
 
 TEST_F(RouterServiceTest, TreeDumpEmptyTree) {
     auto dump = router_->get_tree_dump();
-    EXPECT_FALSE(dump.backend_id.has_value());
+    EXPECT_FALSE(dump.backend.has_value());
 }
 
 TEST_F(RouterServiceTest, TreeDumpWithPrefixNotFound) {
@@ -721,7 +721,7 @@ TEST_F(RouterServiceTest, TreeDumpReflectsRoutes) {
     RouterService::insert_route_for_testing({1, 2, 3}, 1);
 
     auto dump = router_->get_tree_dump();
-    EXPECT_TRUE(dump.backend_id.has_value() || !dump.children.empty());
+    EXPECT_TRUE(dump.backend.has_value() || !dump.children.empty());
 }
 
 // =============================================================================
