@@ -45,11 +45,16 @@ enum class QuorumState : uint8_t {
 };
 
 // Peer state tracking for liveness detection
-struct PeerState {
-    seastar::lowres_clock::time_point last_seen;
+// Clock parameter allows injecting a test clock for deterministic timing
+template<typename Clock = seastar::lowres_clock>
+struct BasicPeerState {
+    typename Clock::time_point last_seen;
     bool is_alive = true;
     std::optional<BackendId> associated_backend;  // Track which backend this peer represents
 };
+
+// Backward-compatible alias: production code uses PeerState unchanged
+using PeerState = BasicPeerState<>;
 
 // Peer info for admin API
 struct PeerInfo {

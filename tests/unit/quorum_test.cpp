@@ -1,10 +1,14 @@
 // Ranvier Core - Quorum / Split-Brain Detection Unit Tests
 //
 // Tests for quorum calculation and state transitions.
+// Includes deterministic timing tests using TestClock for peer liveness
+// window expiration verification.
 // These tests don't require Seastar runtime.
 
+#include "test_clock.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -796,6 +800,312 @@ TEST_F(QuorumTest, FailOpen_IndependentFlags) {
     accept_gossip = should_accept_incoming_gossip(true, true, false, QuorumState::DEGRADED);
     EXPECT_FALSE(fail_open_routing);
     EXPECT_FALSE(accept_gossip);
+}
+
+// =============================================================================
+// Deterministic Peer Liveness Tests (TestClock - no sleeps, instant execution)
+// =============================================================================
+// These tests replicate the check_liveness() logic from GossipConsensus using
+// TestClock for deterministic time control. This avoids the Seastar dependency
+// while testing the same timing logic.
+
+using namespace ranvier;
+
+// Clock-aware peer state for deterministic liveness testing
+template<typename Clock>
+struct ClockPeerState {
+    typename Clock::time_point last_seen;
+    bool is_alive = true;
+};
+
+// Replicate GossipConsensus::check_liveness() logic with injectable clock
+template<typename Clock>
+void check_peer_liveness(std::vector<ClockPeerState<Clock>>& peers,
+                          std::chrono::seconds liveness_timeout) {
+    auto now = Clock::now();
+    for (auto& peer : peers) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - peer.last_seen);
+        if (elapsed > liveness_timeout) {
+            peer.is_alive = false;
+        }
+    }
+}
+
+// Count alive peers for quorum calculation
+template<typename Clock>
+size_t count_alive_peers(const std::vector<ClockPeerState<Clock>>& peers) {
+    size_t count = 0;
+    for (const auto& peer : peers) {
+        if (peer.is_alive) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// Count peers seen within a time window (stricter than alive check)
+template<typename Clock>
+size_t count_recently_seen_clock(const std::vector<ClockPeerState<Clock>>& peers,
+                                  std::chrono::seconds window) {
+    auto now = Clock::now();
+    size_t count = 0;
+    for (const auto& peer : peers) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - peer.last_seen);
+        if (elapsed <= window) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+class QuorumLivenessTimingTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        TestClock::reset();
+    }
+};
+
+TEST_F(QuorumLivenessTimingTest, PeerAliveBeforeLivenessTimeout) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+    };
+
+    // Advance to just before timeout (30s)
+    TestClock::advance(std::chrono::seconds(29));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    EXPECT_TRUE(peers[0].is_alive);
+}
+
+TEST_F(QuorumLivenessTimingTest, PeerDeadAfterLivenessTimeout) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+    };
+
+    // Advance past timeout
+    TestClock::advance(std::chrono::seconds(31));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    EXPECT_FALSE(peers[0].is_alive);
+}
+
+TEST_F(QuorumLivenessTimingTest, PeerAliveAtExactTimeout) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+    };
+
+    // Advance to exactly the timeout (not past it)
+    TestClock::advance(std::chrono::seconds(30));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    // At exactly timeout, elapsed == timeout, not > timeout, so still alive
+    EXPECT_TRUE(peers[0].is_alive);
+}
+
+TEST_F(QuorumLivenessTimingTest, HeartbeatRefreshesLiveness) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+    };
+
+    // Advance 20 seconds
+    TestClock::advance(std::chrono::seconds(20));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+    EXPECT_TRUE(peers[0].is_alive);
+
+    // Simulate heartbeat: update last_seen to current time
+    peers[0].last_seen = TestClock::now();
+
+    // Advance another 20 seconds (40 total, but only 20 since heartbeat)
+    TestClock::advance(std::chrono::seconds(20));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    // Should still be alive (only 20s since last heartbeat)
+    EXPECT_TRUE(peers[0].is_alive);
+}
+
+TEST_F(QuorumLivenessTimingTest, MultiplePeersWithDifferentTimestamps) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},                                                    // Peer 0: seen at t=0
+        {start, true},                                                    // Peer 1: seen at t=0
+        {start, true},                                                    // Peer 2: seen at t=0
+    };
+
+    // Advance 10 seconds, peer 1 sends heartbeat
+    TestClock::advance(std::chrono::seconds(10));
+    peers[1].last_seen = TestClock::now();
+
+    // Advance 10 more seconds, peer 2 sends heartbeat
+    TestClock::advance(std::chrono::seconds(10));
+    peers[2].last_seen = TestClock::now();
+
+    // Advance to t=31 (31s since start)
+    TestClock::advance(std::chrono::seconds(11));
+
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    // Peer 0: last_seen at t=0, now at t=31, elapsed=31s > 30s -> DEAD
+    EXPECT_FALSE(peers[0].is_alive);
+
+    // Peer 1: last_seen at t=10, now at t=31, elapsed=21s <= 30s -> ALIVE
+    EXPECT_TRUE(peers[1].is_alive);
+
+    // Peer 2: last_seen at t=20, now at t=31, elapsed=11s <= 30s -> ALIVE
+    EXPECT_TRUE(peers[2].is_alive);
+}
+
+TEST_F(QuorumLivenessTimingTest, LivenessAffectsQuorumState) {
+    auto start = TestClock::now();
+
+    // 5 nodes total (4 peers + self), need 3 for quorum (threshold=0.5)
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+        {start, true},
+        {start, true},
+        {start, true},
+    };
+
+    // All alive: 4 peers + self = 5, need 3 -> HEALTHY
+    size_t alive = count_alive_peers(peers);
+    EXPECT_EQ(alive, 4u);
+    EXPECT_EQ(calculate_quorum_state(alive, 4, 0.5), QuorumState::HEALTHY);
+
+    // Advance 31s - all peers go dead
+    TestClock::advance(std::chrono::seconds(31));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    alive = count_alive_peers(peers);
+    EXPECT_EQ(alive, 0u);
+    EXPECT_EQ(calculate_quorum_state(alive, 4, 0.5), QuorumState::DEGRADED);
+}
+
+TEST_F(QuorumLivenessTimingTest, GradualPeerLossDegradsQuorum) {
+    auto start = TestClock::now();
+
+    // 5 nodes (4 peers + self), need 3 for quorum
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},  // Peer 0: never refreshes
+        {start, true},  // Peer 1: never refreshes
+        {start, true},  // Peer 2: refreshes at t=25
+        {start, true},  // Peer 3: refreshes at t=25
+    };
+
+    // At t=25: refresh peers 2 and 3
+    TestClock::advance(std::chrono::seconds(25));
+    peers[2].last_seen = TestClock::now();
+    peers[3].last_seen = TestClock::now();
+
+    // At t=31: peers 0,1 dead (31s since t=0), peers 2,3 alive (6s since t=25)
+    TestClock::advance(std::chrono::seconds(6));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    size_t alive = count_alive_peers(peers);
+    EXPECT_EQ(alive, 2u);
+    // 2 alive peers + self = 3, need 3 -> HEALTHY (exactly at quorum)
+    EXPECT_EQ(calculate_quorum_state(alive, 4, 0.5), QuorumState::HEALTHY);
+
+    // Advance to t=56: peers 2,3 now dead too (31s since t=25 refresh)
+    TestClock::advance(std::chrono::seconds(25));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+
+    alive = count_alive_peers(peers);
+    EXPECT_EQ(alive, 0u);
+    // 0 alive peers + self = 1, need 3 -> DEGRADED
+    EXPECT_EQ(calculate_quorum_state(alive, 4, 0.5), QuorumState::DEGRADED);
+}
+
+TEST_F(QuorumLivenessTimingTest, RecentlySeenWindowWithTestClock) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+        {start, true},
+        {start, true},
+        {start, true},
+    };
+
+    // Peer 0 refreshes at t=10
+    TestClock::advance(std::chrono::seconds(10));
+    peers[0].last_seen = TestClock::now();
+
+    // Peer 1 refreshes at t=20
+    TestClock::advance(std::chrono::seconds(10));
+    peers[1].last_seen = TestClock::now();
+
+    // Check at t=35: peers 2,3 last seen 35s ago, peer 0 at 25s ago, peer 1 at 15s ago
+    TestClock::advance(std::chrono::seconds(15));
+
+    // With 30s window: peers 0 (25s) and 1 (15s) are recent
+    size_t recent = count_recently_seen_clock<TestClock>(peers, std::chrono::seconds(30));
+    EXPECT_EQ(recent, 2u);
+
+    // With 20s window: only peer 1 (15s) is recent
+    recent = count_recently_seen_clock<TestClock>(peers, std::chrono::seconds(20));
+    EXPECT_EQ(recent, 1u);
+
+    // With 40s window: all peers are recent
+    recent = count_recently_seen_clock<TestClock>(peers, std::chrono::seconds(40));
+    EXPECT_EQ(recent, 4u);
+}
+
+TEST_F(QuorumLivenessTimingTest, ConfigurableLivenessTimeout) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+    };
+
+    // Test with short timeout (5 seconds)
+    TestClock::advance(std::chrono::seconds(4));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(5));
+    EXPECT_TRUE(peers[0].is_alive);
+
+    TestClock::advance(std::chrono::seconds(2));  // Now at 6s
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(5));
+    EXPECT_FALSE(peers[0].is_alive);
+
+    // Reset peer and test with long timeout (60 seconds)
+    peers[0].is_alive = true;
+    peers[0].last_seen = TestClock::now();
+
+    TestClock::advance(std::chrono::seconds(59));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(60));
+    EXPECT_TRUE(peers[0].is_alive);
+
+    TestClock::advance(std::chrono::seconds(2));  // 61s since last seen
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(60));
+    EXPECT_FALSE(peers[0].is_alive);
+}
+
+TEST_F(QuorumLivenessTimingTest, PeerRecoveryAfterDeath) {
+    auto start = TestClock::now();
+
+    std::vector<ClockPeerState<TestClock>> peers = {
+        {start, true},
+    };
+
+    // Peer dies at t=31
+    TestClock::advance(std::chrono::seconds(31));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+    EXPECT_FALSE(peers[0].is_alive);
+
+    // Peer sends heartbeat -> recovers
+    peers[0].last_seen = TestClock::now();
+    peers[0].is_alive = true;
+
+    // Verify still alive after 10 more seconds
+    TestClock::advance(std::chrono::seconds(10));
+    check_peer_liveness<TestClock>(peers, std::chrono::seconds(30));
+    EXPECT_TRUE(peers[0].is_alive);
 }
 
 int main(int argc, char** argv) {

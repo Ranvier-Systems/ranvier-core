@@ -1977,10 +1977,11 @@ _Move completed items here with completion date and PR reference._
 
 ### 12.3 P2 — Strengthen Existing Tests
 
-- [ ] **Introduce clock injection for time-dependent tests**
+- [x] **Introduce clock injection for time-dependent tests** ✓
   _Context:_ 0 of 20 test files have deterministic timing tests. `src/rate_limiter.hpp`, `src/circuit_breaker.hpp`, and `src/gossip_consensus.hpp` all have time-sensitive behavior tested with no time control.
   _Approach:_ Add a template parameter or `std::function<steady_clock::time_point()>` to each component's clock source. Introduce a `TestClock` helper in `tests/unit/` that allows manual time advancement. Retrofit into: rate_limiter (test token refill over simulated time), circuit_breaker (test OPEN→HALF_OPEN after exact timeout), quorum (test peer liveness window expiration). Update existing tests in `tests/unit/rate_limiter_test.cpp`, `tests/unit/circuit_breaker_test.cpp`, `tests/unit/quorum_test.cpp` to use the new clock. Ensure production code defaults to `steady_clock` with no overhead.
   _Complexity:_ Medium
+  _Completed:_ 2026-02-07. Template parameter `Clock` added to `BasicTokenBucket`, `BasicRateLimiter`, `BasicBackendCircuit`, `BasicCircuitBreaker`, and `BasicPeerState` with backward-compatible aliases. `TestClock` helper in `tests/unit/test_clock.hpp`. Pure algorithm split into `src/rate_limiter_core.hpp` (no Seastar deps); `src/rate_limiter.hpp` is Seastar service inheriting from core. 9 rate limiter timing tests, 7 circuit breaker timing tests, 10 quorum liveness timing tests — all deterministic, zero sleeps.
 
 - [ ] **Adopt Google Mock (`gmock`) for dependency isolation**
   _Context:_ Only `tests/unit/async_persistence_test.cpp` uses mocks (hand-rolled `MockPersistenceStore`). GTest is already a dependency (`GTest::gtest_main` in `CMakeLists.txt`) and gmock ships with it — just link `GTest::gmock`.

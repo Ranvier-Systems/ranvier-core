@@ -1,14 +1,18 @@
 // Ranvier Core - Rate Limiter Unit Tests
 //
 // Tests for the token bucket rate limiter with MAX_BUCKETS bound (Hard Rule #4).
+// Includes deterministic timing tests using TestClock for token refill verification.
 
-#include "rate_limiter.hpp"
+#include "rate_limiter_core.hpp"
+#include "test_clock.hpp"
 #include <gtest/gtest.h>
-#include <string>
-#include <thread>
 #include <chrono>
+#include <string>
 
 using namespace ranvier;
+
+// Test alias: BasicRateLimiter with default clock (same algorithm as Seastar RateLimiter)
+using RateLimiter = BasicRateLimiter<>;
 
 // =============================================================================
 // RateLimiterConfig Tests
@@ -190,7 +194,10 @@ TEST_F(RateLimiterMaxBucketsTest, BucketCountAccessorWorks) {
 
 class RateLimiterCleanupTest : public ::testing::Test {
 protected:
+    using TestLimiter = BasicRateLimiter<TestClock>;
+
     void SetUp() override {
+        TestClock::reset();
         config.enabled = true;
         config.requests_per_second = 100;
         config.burst_size = 10;
@@ -200,12 +207,15 @@ protected:
 };
 
 TEST_F(RateLimiterCleanupTest, CleanupRemovesIdleBuckets) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
 
     // Create some buckets
     limiter.allow("client_1");
     limiter.allow("client_2");
     EXPECT_EQ(limiter.bucket_count(), 2u);
+
+    // Advance time so buckets become idle (idle > 0s threshold)
+    TestClock::advance(std::chrono::seconds(1));
 
     // Cleanup with 0 seconds idle time should remove all
     size_t removed = limiter.cleanup(std::chrono::seconds(0));
@@ -214,7 +224,7 @@ TEST_F(RateLimiterCleanupTest, CleanupRemovesIdleBuckets) {
 }
 
 TEST_F(RateLimiterCleanupTest, CleanupPreservesRecentBuckets) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
 
     limiter.allow("recent_client");
     EXPECT_EQ(limiter.bucket_count(), 1u);
@@ -226,13 +236,16 @@ TEST_F(RateLimiterCleanupTest, CleanupPreservesRecentBuckets) {
 }
 
 TEST_F(RateLimiterCleanupTest, CleanupReturnsRemovedCount) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
 
     // Create some buckets
     limiter.allow("client_1");
     limiter.allow("client_2");
     limiter.allow("client_3");
     EXPECT_EQ(limiter.bucket_count(), 3u);
+
+    // Advance time so buckets become idle (idle > 0s threshold)
+    TestClock::advance(std::chrono::seconds(1));
 
     // Cleanup with 0 seconds idle time should remove all and return count
     size_t removed = limiter.cleanup(std::chrono::seconds(0));
@@ -241,7 +254,7 @@ TEST_F(RateLimiterCleanupTest, CleanupReturnsRemovedCount) {
 }
 
 TEST_F(RateLimiterCleanupTest, BucketsCleanedTotalStartsAtZero) {
-    RateLimiter limiter(config);
+    TestLimiter limiter(config);
     EXPECT_EQ(limiter.buckets_cleaned_total(), 0u);
 }
 
@@ -329,9 +342,10 @@ TEST(RateLimiterTypeTraitsTest, TokenBucketIsCopyable) {
     EXPECT_TRUE(std::is_copy_assignable_v<TokenBucket>);
 }
 
-TEST(RateLimiterTypeTraitsTest, RateLimiterIsMovable) {
-    EXPECT_TRUE(std::is_move_constructible_v<RateLimiter>);
-    EXPECT_TRUE(std::is_move_assignable_v<RateLimiter>);
+TEST(RateLimiterTypeTraitsTest, RateLimiterNotCopyable) {
+    // Contains std::atomic members, so not copyable or movable
+    EXPECT_FALSE(std::is_copy_constructible_v<RateLimiter>);
+    EXPECT_FALSE(std::is_copy_assignable_v<RateLimiter>);
 }
 
 // =============================================================================
@@ -370,6 +384,192 @@ TEST(RateLimiterStressTest, DISABLED_FailOpenAtMaxBuckets) {
     }
     // Should be rate limited after burst
     EXPECT_FALSE(limiter.allow("ip_0"));
+}
+
+// =============================================================================
+// Deterministic Timing Tests (TestClock - no sleeps, instant execution)
+// =============================================================================
+
+class RateLimiterTimingTest : public ::testing::Test {
+protected:
+    using TestLimiter = BasicRateLimiter<TestClock>;
+
+    void SetUp() override {
+        TestClock::reset();
+        config.enabled = true;
+        config.requests_per_second = 10;  // 10 tokens/sec = 1 token per 100ms
+        config.burst_size = 5;
+    }
+
+    RateLimiterConfig config;
+};
+
+TEST_F(RateLimiterTimingTest, TokenRefillOverSimulatedTime) {
+    TestLimiter limiter(config);
+
+    // Exhaust all 5 tokens
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_TRUE(limiter.allow("client"));
+    }
+    EXPECT_FALSE(limiter.allow("client"));
+
+    // Advance 100ms -> should refill 1 token (10 tokens/sec * 0.1s = 1.0)
+    TestClock::advance(std::chrono::milliseconds(100));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+
+    // Advance another 200ms -> should refill 2 tokens
+    TestClock::advance(std::chrono::milliseconds(200));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+}
+
+TEST_F(RateLimiterTimingTest, TokenRefillCapsAtBurstSize) {
+    TestLimiter limiter(config);
+
+    // Use 1 token
+    EXPECT_TRUE(limiter.allow("client"));
+
+    // Advance 10 seconds -> would refill 100 tokens, but capped at burst_size=5
+    TestClock::advance(std::chrono::seconds(10));
+
+    // Should have exactly burst_size tokens (5)
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_TRUE(limiter.allow("client"));
+    }
+    EXPECT_FALSE(limiter.allow("client"));
+}
+
+TEST_F(RateLimiterTimingTest, ExactRefillRate) {
+    // Configure for easy math: 1 token per second, burst of 3
+    config.requests_per_second = 1;
+    config.burst_size = 3;
+    TestLimiter limiter(config);
+
+    // Use all 3 tokens
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+
+    // Advance exactly 1 second -> 1 token refilled
+    TestClock::advance(std::chrono::seconds(1));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+
+    // Advance exactly 3 seconds -> 3 tokens refilled (capped at burst_size=3)
+    TestClock::advance(std::chrono::seconds(3));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_TRUE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+}
+
+TEST_F(RateLimiterTimingTest, NoRefillWithNoTimeAdvance) {
+    TestLimiter limiter(config);
+
+    // Exhaust all tokens
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_TRUE(limiter.allow("client"));
+    }
+
+    // Without advancing time, tokens stay exhausted
+    EXPECT_FALSE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+    EXPECT_FALSE(limiter.allow("client"));
+}
+
+TEST_F(RateLimiterTimingTest, PartialTokenRefill) {
+    // 10 tokens/sec, need 50ms for 0.5 tokens (not enough for a whole token)
+    TestLimiter limiter(config);
+
+    // Exhaust tokens
+    for (int i = 0; i < 5; ++i) {
+        limiter.allow("client");
+    }
+    EXPECT_FALSE(limiter.allow("client"));
+
+    // Advance 50ms -> 0.5 tokens, not enough for 1 request
+    TestClock::advance(std::chrono::milliseconds(50));
+    EXPECT_FALSE(limiter.allow("client"));
+
+    // Advance another 50ms -> now 0.5 more (but previous 0.5 was consumed
+    // by the failed allow check that updated last_refill). Actually, after
+    // the failed allow, the bucket has 0.5 tokens and last_refill updated.
+    // Another 50ms gives 0.5 more -> 1.0 total -> should allow
+    TestClock::advance(std::chrono::milliseconds(50));
+    EXPECT_TRUE(limiter.allow("client"));
+}
+
+TEST_F(RateLimiterTimingTest, CleanupRemovesIdleBucketsWithTestClock) {
+    TestLimiter limiter(config);
+
+    // Create buckets
+    limiter.allow("client_old");
+    EXPECT_EQ(limiter.bucket_count(), 1u);
+
+    // Advance time past idle threshold (300s default)
+    TestClock::advance(std::chrono::seconds(301));
+
+    // Add a fresh client
+    limiter.allow("client_new");
+    EXPECT_EQ(limiter.bucket_count(), 2u);
+
+    // Cleanup with default 300s idle threshold
+    size_t removed = limiter.cleanup(std::chrono::seconds(300));
+    EXPECT_EQ(removed, 1u);
+    EXPECT_EQ(limiter.bucket_count(), 1u);
+}
+
+TEST_F(RateLimiterTimingTest, CleanupPreservesActiveBuckets) {
+    TestLimiter limiter(config);
+
+    // Create bucket and keep it active
+    limiter.allow("active_client");
+
+    // Advance 100 seconds
+    TestClock::advance(std::chrono::seconds(100));
+
+    // Touch the bucket (updates last_refill via allow)
+    limiter.allow("active_client");
+
+    // Advance another 100 seconds (200 total, but only 100 since last touch)
+    TestClock::advance(std::chrono::seconds(100));
+
+    // Cleanup with 150s threshold - bucket was active 100s ago, should survive
+    size_t removed = limiter.cleanup(std::chrono::seconds(150));
+    EXPECT_EQ(removed, 0u);
+    EXPECT_EQ(limiter.bucket_count(), 1u);
+}
+
+TEST_F(RateLimiterTimingTest, MultipleClientsRefillIndependently) {
+    config.requests_per_second = 1;
+    config.burst_size = 2;
+    TestLimiter limiter(config);
+
+    // Exhaust client_a
+    limiter.allow("client_a");
+    limiter.allow("client_a");
+    EXPECT_FALSE(limiter.allow("client_a"));
+
+    // Advance 500ms - client_a gets partial refill
+    TestClock::advance(std::chrono::milliseconds(500));
+
+    // Exhaust client_b (just created, full burst)
+    limiter.allow("client_b");
+    limiter.allow("client_b");
+    EXPECT_FALSE(limiter.allow("client_b"));
+
+    // client_a should still not have enough (0.5 tokens, needs 1.0)
+    // Note: this allow() call updates last_refill to t=500ms and keeps tokens=0.5
+    EXPECT_FALSE(limiter.allow("client_a"));
+
+    // Advance 1000ms -> client_a: 0.5 + 1.0 = 1.5 tokens (enough)
+    //                   client_b: 0.0 + 1.0 = 1.0 tokens (exactly enough)
+    TestClock::advance(std::chrono::milliseconds(1000));
+    EXPECT_TRUE(limiter.allow("client_a"));
+    EXPECT_TRUE(limiter.allow("client_b"));
 }
 
 int main(int argc, char** argv) {
