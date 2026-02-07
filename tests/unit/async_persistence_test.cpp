@@ -1,151 +1,14 @@
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include "async_persistence.hpp"
 #include "sqlite_persistence.hpp"
+#include "mocks/mock_persistence_store.hpp"
 #include <filesystem>
 #include <thread>
 #include <chrono>
 
 using namespace ranvier;
-
-// =============================================================================
-// Mock Persistence Store
-// =============================================================================
-// A simple mock that records operations for verification
-
-class MockPersistenceStore : public PersistenceStore {
-public:
-    bool open(const std::string& /*path*/) override {
-        _is_open = true;
-        return true;
-    }
-
-    void close() override {
-        _is_open = false;
-    }
-
-    bool is_open() const override {
-        return _is_open;
-    }
-
-    bool save_backend(BackendId id, const std::string& ip, uint16_t port,
-                      uint32_t weight, uint32_t priority) override {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _backends_saved.push_back({id, ip, port, weight, priority});
-        return true;
-    }
-
-    bool remove_backend(BackendId id) override {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _backends_removed.push_back(id);
-        return true;
-    }
-
-    std::vector<BackendRecord> load_backends() override {
-        return {};
-    }
-
-    bool save_route(std::span<const TokenId> tokens, BackendId backend_id) override {
-        std::lock_guard<std::mutex> lock(_mutex);
-        RouteRecord record;
-        record.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
-        record.backend_id = backend_id;
-        _routes_saved.push_back(std::move(record));
-        return true;
-    }
-
-    bool remove_route(std::span<const TokenId> /*tokens*/) override {
-        return true;
-    }
-
-    bool remove_routes_for_backend(BackendId backend_id) override {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _routes_removed_for_backend.push_back(backend_id);
-        return true;
-    }
-
-    std::vector<RouteRecord> load_routes() override {
-        return {};
-    }
-
-    bool save_routes_batch(const std::vector<RouteRecord>& routes) override {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _batch_save_count++;
-        _total_routes_in_batches += routes.size();
-        for (const auto& r : routes) {
-            _routes_saved.push_back(r);
-        }
-        return true;
-    }
-
-    bool clear_all() override {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _clear_all_count++;
-        return true;
-    }
-
-    size_t route_count() override { return 0; }
-    size_t backend_count() override { return 0; }
-
-    bool checkpoint() override { return true; }
-    bool verify_integrity() override { return true; }
-    size_t last_load_skipped_count() const override { return 0; }
-
-    // Accessors for verification
-    size_t get_routes_saved_count() const {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return _routes_saved.size();
-    }
-
-    size_t get_backends_saved_count() const {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return _backends_saved.size();
-    }
-
-    size_t get_batch_save_count() const {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return _batch_save_count;
-    }
-
-    size_t get_total_routes_in_batches() const {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return _total_routes_in_batches;
-    }
-
-    size_t get_clear_all_count() const {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return _clear_all_count;
-    }
-
-    size_t get_routes_removed_for_backend_count() const {
-        std::lock_guard<std::mutex> lock(_mutex);
-        return _routes_removed_for_backend.size();
-    }
-
-    const std::vector<RouteRecord>& get_routes_saved() const {
-        return _routes_saved;
-    }
-
-private:
-    bool _is_open = false;
-    mutable std::mutex _mutex;
-
-    std::vector<RouteRecord> _routes_saved;
-    std::vector<BackendId> _routes_removed_for_backend;
-    std::vector<BackendId> _backends_removed;
-
-    struct BackendSaveRecord {
-        BackendId id;
-        std::string ip;
-        uint16_t port;
-        uint32_t weight;
-        uint32_t priority;
-    };
-    std::vector<BackendSaveRecord> _backends_saved;
-
-    size_t _batch_save_count = 0;
-    size_t _total_routes_in_batches = 0;
-    size_t _clear_all_count = 0;
-};
+using ::testing::NiceMock;
 
 // =============================================================================
 // Configuration Tests
@@ -267,7 +130,7 @@ TEST_F(AsyncPersistenceQueueTest, QueueWithoutOpenStoreDoesNothing) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
     // Create manager with mock store but don't open it
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     AsyncPersistenceManager manager(config, std::move(store));
     // Note: store is not opened
 
@@ -281,7 +144,7 @@ TEST_F(AsyncPersistenceQueueTest, QueueWithoutOpenStoreDoesNothing) {
 TEST_F(AsyncPersistenceQueueTest, QueueAcceptsOperations) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -305,7 +168,7 @@ TEST_F(AsyncPersistenceQueueTest, QueueAcceptsOperations) {
 TEST_F(AsyncPersistenceQueueTest, BackpressureDropsOperations) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 5;  // Very small queue
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -336,7 +199,7 @@ TEST_F(AsyncPersistenceQueueTest, BackpressureDropsOperations) {
 TEST_F(AsyncPersistenceQueueTest, ClearAllClearsQueue) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -357,7 +220,7 @@ TEST_F(AsyncPersistenceQueueTest, ClearAllClearsQueue) {
 TEST_F(AsyncPersistenceQueueTest, ClearAllBypassesBackpressure) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 5;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -378,7 +241,7 @@ TEST_F(AsyncPersistenceQueueTest, ClearAllBypassesBackpressure) {
 
 TEST_F(AsyncPersistenceQueueTest, IsOpenReflectsStoreState) {
     AsyncPersistenceConfig config;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     auto* store_ptr = store.get();
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -405,7 +268,7 @@ TEST_F(AsyncPersistenceQueueTest, StatisticsInitializedToZero) {
 TEST_F(AsyncPersistenceQueueTest, LargeTokenVectorQueued) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -423,7 +286,7 @@ TEST_F(AsyncPersistenceQueueTest, LargeTokenVectorQueued) {
 TEST_F(AsyncPersistenceQueueTest, EmptyTokenVectorQueued) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -436,7 +299,7 @@ TEST_F(AsyncPersistenceQueueTest, EmptyTokenVectorQueued) {
 TEST_F(AsyncPersistenceQueueTest, SpanToVectorConversion) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -460,7 +323,7 @@ TEST_F(AsyncPersistenceQueueTest, SpanToVectorConversion) {
 TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueOperations) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100000;  // Large enough for test
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -490,7 +353,7 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueOperations) {
 TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;  // Small queue to trigger backpressure
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -527,7 +390,7 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
 TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 10000;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -564,7 +427,7 @@ TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
 TEST_F(AsyncPersistenceQueueTest, MixedOperationTypes) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -668,7 +531,7 @@ TEST(AsyncPersistenceOwnershipTest, ManagerOwnsStoreViaFactory) {
 TEST(AsyncPersistenceOwnershipTest, ManagerOwnsInjectedStore) {
     // Test that manager takes ownership of injected store
     AsyncPersistenceConfig config;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     auto* store_ptr = store.get();
 
     // Manager takes ownership
@@ -716,7 +579,7 @@ TEST(AsyncPersistenceOwnershipTest, OpenAndCloseLifecycle) {
 
 TEST(AsyncPersistenceOwnershipTest, CloseIsIdempotent) {
     AsyncPersistenceConfig config;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -737,7 +600,7 @@ TEST(AsyncPersistenceOwnershipTest, CloseIsIdempotent) {
 
 TEST(AsyncPersistenceOwnershipTest, DelegatedMaintenanceMethods) {
     AsyncPersistenceConfig config;
-    auto store = std::make_unique<MockPersistenceStore>();
+    auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
@@ -778,13 +641,13 @@ TEST(AsyncPersistence, MaxQueueDepthReturnsConfiguredValue) {
     AsyncPersistenceConfig config;
     config.max_queue_depth = 50000;  // Custom value
 
-    AsyncPersistenceManager manager(config, std::make_unique<MockPersistenceStore>());
+    AsyncPersistenceManager manager(config, std::make_unique<NiceMock<MockPersistenceStore>>());
     EXPECT_EQ(manager.max_queue_depth(), 50000);
 }
 
 TEST(AsyncPersistence, MaxQueueDepthReturnsDefaultValue) {
     AsyncPersistenceConfig config;  // Default max_queue_depth = 100000
 
-    AsyncPersistenceManager manager(config, std::make_unique<MockPersistenceStore>());
+    AsyncPersistenceManager manager(config, std::make_unique<NiceMock<MockPersistenceStore>>());
     EXPECT_EQ(manager.max_queue_depth(), 100000);
 }
