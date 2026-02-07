@@ -4,8 +4,8 @@
 // idle timeout eviction, max-age TTL enforcement, and half-open detection.
 //
 // Uses TestClock for deterministic timing (same pattern as circuit_breaker_test
-// and rate_limiter_test). Default-constructed ConnectionBundles have null Seastar
-// streams whose close() returns ready futures without needing a reactor.
+// and rate_limiter_test). Uses SyncClosePolicy to avoid Seastar reactor dependency
+// when evicting default-constructed bundles with null streams.
 //
 // Note: Half-open detection positive tests (verifying that in.eof() == true
 // triggers eviction) require a running Seastar reactor to manipulate stream
@@ -19,9 +19,9 @@
 
 using namespace ranvier;
 
-// Test-specific type aliases with deterministic clock
+// Test-specific type aliases: deterministic clock + sync close (no reactor needed)
 using TestBundle = BasicConnectionBundle<TestClock>;
-using TestPool = BasicConnectionPool<TestClock>;
+using TestPool = BasicConnectionPool<TestClock, SyncClosePolicy>;
 
 // =============================================================================
 // ConnectionPoolConfig Tests
@@ -1000,9 +1000,9 @@ TEST(ConnectionPoolTypeAliasTest, ConnectionBundleAliasExists) {
 }
 
 TEST(ConnectionPoolTypeAliasTest, ConnectionPoolAliasExists) {
-    // Verify backward-compatible alias compiles
-    static_assert(std::is_same_v<ConnectionPool, BasicConnectionPool<std::chrono::steady_clock>>,
-                  "ConnectionPool should be alias for BasicConnectionPool<steady_clock>");
+    // Verify backward-compatible alias compiles (default ClosePolicy is AsyncClosePolicy)
+    static_assert(std::is_same_v<ConnectionPool, BasicConnectionPool<std::chrono::steady_clock, AsyncClosePolicy>>,
+                  "ConnectionPool should be alias for BasicConnectionPool<steady_clock, AsyncClosePolicy>");
 }
 
 int main(int argc, char** argv) {

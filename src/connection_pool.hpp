@@ -99,11 +99,37 @@ struct BasicConnectionBundle {
 // Backward-compatible alias: production code uses ConnectionBundle unchanged
 using ConnectionBundle = BasicConnectionBundle<>;
 
+// Close policy for production: async close keeps bundle alive on heap until
+// Seastar stream close completes, preventing batch-mode assertion failures.
+struct AsyncClosePolicy {
+    template<typename Bundle>
+    static void close(Bundle&& bundle) {
+        auto ptr = std::make_unique<Bundle>(std::move(bundle));
+        auto* raw_ptr = ptr.get();
+        (void)raw_ptr->close().finally([p = std::move(ptr)] {});
+    }
+};
+
+// Close policy for unit tests: synchronous drop without Seastar future operations.
+// Safe for default-constructed bundles whose null streams can be destroyed directly.
+// Avoids reactor dependency (.then()/.finally() call need_preempt() which segfaults
+// without a running Seastar reactor).
+struct SyncClosePolicy {
+    template<typename Bundle>
+    static void close(Bundle&& bundle) {
+        bundle.is_valid = false;
+    }
+};
+
 // Connection pool with LRU + TTL connection management
 //
 // Clock injection: Template parameter defaults to std::chrono::steady_clock
 // for zero-overhead production use. Tests use TestClock for deterministic timing.
-template<typename Clock = std::chrono::steady_clock>
+//
+// ClosePolicy injection: Controls how evicted bundles are closed.
+// Production uses AsyncClosePolicy (heap + .finally() to keep bundle alive).
+// Unit tests use SyncClosePolicy to avoid requiring a Seastar reactor.
+template<typename Clock = std::chrono::steady_clock, typename ClosePolicy = AsyncClosePolicy>
 class BasicConnectionPool {
 public:
     using Bundle = BasicConnectionBundle<Clock>;
@@ -460,17 +486,12 @@ private:
         }
     }
 
-    // Close a connection bundle asynchronously, keeping it alive until close completes.
-    // This prevents the Seastar output_stream assertion failure that occurs when
-    // a stream is destroyed while still in batch mode.
+    // Close a connection bundle via the configured close policy.
+    // Production (AsyncClosePolicy): keeps bundle alive on heap during async close
+    // to prevent Seastar output_stream batch-mode assertion failures.
+    // Tests (SyncClosePolicy): synchronous drop for null streams without reactor.
     static void close_bundle_async(Bundle&& bundle) {
-        // Move bundle to heap so it outlives this scope
-        auto ptr = std::make_unique<Bundle>(std::move(bundle));
-        auto* raw_ptr = ptr.get();
-        // Start close and destroy bundle after completion
-        (void)raw_ptr->close().finally([p = std::move(ptr)] {
-            // unique_ptr releases the bundle here after close completes
-        });
+        ClosePolicy::close(std::move(bundle));
     }
 };
 
