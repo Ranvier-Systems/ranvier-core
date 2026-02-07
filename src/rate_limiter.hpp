@@ -3,6 +3,9 @@
 // Token bucket rate limiter for controlling request rates per client IP.
 // Each client gets a bucket that refills at a configured rate.
 //
+// Clock injection: Template parameter defaults to std::chrono::steady_clock
+// for zero-overhead production use. Tests use TestClock for deterministic timing.
+//
 // Hard Rule #4 compliance: MAX_BUCKETS bounds the _buckets map to prevent
 // memory exhaustion from attackers generating requests from unique source IPs.
 // When at capacity, fail-open (allow request) to maintain availability.
@@ -37,23 +40,31 @@ struct RateLimiterConfig {
 };
 
 // Token bucket for a single client
-struct TokenBucket {
+// Clock parameter allows injecting a test clock for deterministic timing
+template<typename Clock = std::chrono::steady_clock>
+struct BasicTokenBucket {
     double tokens;
-    std::chrono::steady_clock::time_point last_refill;
+    typename Clock::time_point last_refill;
 
-    TokenBucket(uint32_t initial_tokens)
+    BasicTokenBucket(uint32_t initial_tokens)
         : tokens(initial_tokens)
-        , last_refill(std::chrono::steady_clock::now()) {}
+        , last_refill(Clock::now()) {}
 };
 
+// Backward-compatible alias: production code uses TokenBucket unchanged
+using TokenBucket = BasicTokenBucket<>;
+
 // Per-shard rate limiter (no locks needed in Seastar's shared-nothing model)
-class RateLimiter {
+// Clock parameter allows injecting a test clock for deterministic timing.
+// Production default (steady_clock) is resolved at compile time with zero overhead.
+template<typename Clock = std::chrono::steady_clock>
+class BasicRateLimiter {
 public:
     // Hard Rule #4: Every growing container must have an explicit MAX_SIZE
     // 100k buckets * ~56 bytes/bucket ≈ 5.6 MB max memory per shard
     static constexpr size_t MAX_BUCKETS = 100'000;
 
-    explicit RateLimiter(RateLimiterConfig config)
+    explicit BasicRateLimiter(RateLimiterConfig config)
         : _config(config)
         , _cleanup_interval(config.cleanup_interval)
         , _overflow_count(0)
@@ -95,7 +106,7 @@ public:
             return true;
         }
 
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
         auto it = _buckets.find(client_ip);
 
         if (it == _buckets.end()) {
@@ -116,7 +127,7 @@ public:
             }
 
             // New client - create bucket with burst_size tokens
-            _buckets.emplace(client_ip, TokenBucket(_config.burst_size));
+            _buckets.emplace(client_ip, BasicTokenBucket<Clock>(_config.burst_size));
 
             // First request always allowed
             auto iter = _buckets.find(client_ip);
@@ -147,7 +158,7 @@ public:
     // Clean up old entries to prevent memory growth
     // Returns the number of buckets removed
     size_t cleanup(std::chrono::seconds max_idle = std::chrono::seconds(300)) {
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
         size_t removed = 0;
         for (auto it = _buckets.begin(); it != _buckets.end(); ) {
             auto idle = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_refill);
@@ -241,7 +252,7 @@ private:
     }
 
     RateLimiterConfig _config;
-    std::unordered_map<std::string, TokenBucket> _buckets;
+    std::unordered_map<std::string, BasicTokenBucket<Clock>> _buckets;
 
     // Cleanup timer (Hard Rule #5: uses gate guard pattern)
     seastar::timer<> _cleanup_timer;
@@ -258,5 +269,8 @@ private:
     // Prometheus metrics (Rule #6: clear in stop() before gate close)
     seastar::metrics::metric_groups _metrics;
 };
+
+// Backward-compatible alias: production code uses RateLimiter unchanged
+using RateLimiter = BasicRateLimiter<>;
 
 }  // namespace ranvier

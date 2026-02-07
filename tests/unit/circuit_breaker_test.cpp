@@ -1,12 +1,13 @@
 // Ranvier Core - Circuit Breaker Unit Tests
 //
 // Tests for the circuit breaker pattern implementation with MAX_CIRCUITS bound (Hard Rule #4).
-// Includes tests for the new remove_circuit() functionality for cleanup when backends
+// Includes deterministic timing tests using TestClock for OPEN→HALF_OPEN transitions.
+// Includes tests for the remove_circuit() functionality for cleanup when backends
 // are deregistered.
 
 #include "circuit_breaker.hpp"
+#include "test_clock.hpp"
 #include <gtest/gtest.h>
-#include <thread>
 #include <chrono>
 
 using namespace ranvier;
@@ -45,19 +46,22 @@ TEST_F(CircuitBreakerConfigTest, ConfigCanBeCustomized) {
 
 class CircuitBreakerTest : public ::testing::Test {
 protected:
+    using TestCB = BasicCircuitBreaker<TestClock>;
+
     void SetUp() override {
+        TestClock::reset();
         config.failure_threshold = 3;
         config.success_threshold = 2;
         config.recovery_timeout = std::chrono::seconds(1);
         config.enabled = true;
     }
 
-    CircuitBreaker::Config config;
+    TestCB::Config config;
 };
 
 TEST_F(CircuitBreakerTest, DisabledBreakerAlwaysAllows) {
     config.enabled = false;
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     BackendId backend = 1;
 
@@ -72,7 +76,7 @@ TEST_F(CircuitBreakerTest, DisabledBreakerAlwaysAllows) {
 }
 
 TEST_F(CircuitBreakerTest, NewBackendStartsClosed) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     EXPECT_TRUE(cb.allow_request(backend));
@@ -81,7 +85,7 @@ TEST_F(CircuitBreakerTest, NewBackendStartsClosed) {
 }
 
 TEST_F(CircuitBreakerTest, CircuitOpensAfterFailureThreshold) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     // First request creates circuit
@@ -98,7 +102,7 @@ TEST_F(CircuitBreakerTest, CircuitOpensAfterFailureThreshold) {
 }
 
 TEST_F(CircuitBreakerTest, SuccessResetsFailureCount) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     cb.allow_request(backend);
@@ -115,7 +119,7 @@ TEST_F(CircuitBreakerTest, SuccessResetsFailureCount) {
 }
 
 TEST_F(CircuitBreakerTest, CircuitTransitionsToHalfOpenAfterTimeout) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     cb.allow_request(backend);
@@ -126,8 +130,8 @@ TEST_F(CircuitBreakerTest, CircuitTransitionsToHalfOpenAfterTimeout) {
     }
     EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
 
-    // Wait for recovery timeout
-    std::this_thread::sleep_for(config.recovery_timeout + std::chrono::milliseconds(100));
+    // Advance time past recovery timeout (deterministic, no sleep)
+    TestClock::advance(config.recovery_timeout + std::chrono::milliseconds(1));
 
     // Next request should transition to half-open and be allowed
     EXPECT_TRUE(cb.allow_request(backend));
@@ -135,7 +139,7 @@ TEST_F(CircuitBreakerTest, CircuitTransitionsToHalfOpenAfterTimeout) {
 }
 
 TEST_F(CircuitBreakerTest, HalfOpenClosesAfterSuccessThreshold) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     cb.allow_request(backend);
@@ -145,8 +149,8 @@ TEST_F(CircuitBreakerTest, HalfOpenClosesAfterSuccessThreshold) {
         cb.record_failure(backend);
     }
 
-    // Wait and transition to half-open
-    std::this_thread::sleep_for(config.recovery_timeout + std::chrono::milliseconds(100));
+    // Advance past timeout and transition to half-open
+    TestClock::advance(config.recovery_timeout + std::chrono::milliseconds(1));
     cb.allow_request(backend);
     EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
 
@@ -160,7 +164,7 @@ TEST_F(CircuitBreakerTest, HalfOpenClosesAfterSuccessThreshold) {
 }
 
 TEST_F(CircuitBreakerTest, HalfOpenReopensOnFailure) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     cb.allow_request(backend);
@@ -170,8 +174,8 @@ TEST_F(CircuitBreakerTest, HalfOpenReopensOnFailure) {
         cb.record_failure(backend);
     }
 
-    // Wait and transition to half-open
-    std::this_thread::sleep_for(config.recovery_timeout + std::chrono::milliseconds(100));
+    // Advance past timeout and transition to half-open
+    TestClock::advance(config.recovery_timeout + std::chrono::milliseconds(1));
     cb.allow_request(backend);
     EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
 
@@ -185,7 +189,7 @@ TEST_F(CircuitBreakerTest, HalfOpenReopensOnFailure) {
 // =============================================================================
 
 TEST_F(CircuitBreakerTest, ResetClearsCircuit) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 1;
 
     cb.allow_request(backend);
@@ -203,7 +207,7 @@ TEST_F(CircuitBreakerTest, ResetClearsCircuit) {
 }
 
 TEST_F(CircuitBreakerTest, ResetAllClearsAllCircuits) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     // Create multiple circuits
     for (BackendId i = 1; i <= 5; ++i) {
@@ -226,18 +230,21 @@ TEST_F(CircuitBreakerTest, ResetAllClearsAllCircuits) {
 
 class CircuitBreakerRemoveTest : public ::testing::Test {
 protected:
+    using TestCB = BasicCircuitBreaker<TestClock>;
+
     void SetUp() override {
+        TestClock::reset();
         config.failure_threshold = 3;
         config.success_threshold = 2;
         config.recovery_timeout = std::chrono::seconds(30);
         config.enabled = true;
     }
 
-    CircuitBreaker::Config config;
+    TestCB::Config config;
 };
 
 TEST_F(CircuitBreakerRemoveTest, RemoveCircuitDeletesEntry) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 42;
 
     // Create circuit by allowing request
@@ -254,7 +261,7 @@ TEST_F(CircuitBreakerRemoveTest, RemoveCircuitDeletesEntry) {
 }
 
 TEST_F(CircuitBreakerRemoveTest, RemoveCircuitIncrementsCounter) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 42;
 
     EXPECT_EQ(cb.get_circuits_removed(), 0u);
@@ -267,7 +274,7 @@ TEST_F(CircuitBreakerRemoveTest, RemoveCircuitIncrementsCounter) {
 }
 
 TEST_F(CircuitBreakerRemoveTest, RemoveNonExistentCircuitDoesNotIncrementCounter) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 999;
 
     EXPECT_EQ(cb.get_circuits_removed(), 0u);
@@ -280,7 +287,7 @@ TEST_F(CircuitBreakerRemoveTest, RemoveNonExistentCircuitDoesNotIncrementCounter
 }
 
 TEST_F(CircuitBreakerRemoveTest, RemoveOpenCircuit) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
     BackendId backend = 42;
 
     // Create and open circuit
@@ -300,7 +307,7 @@ TEST_F(CircuitBreakerRemoveTest, RemoveOpenCircuit) {
 }
 
 TEST_F(CircuitBreakerRemoveTest, RemoveMultipleCircuits) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     // Create multiple circuits
     for (BackendId i = 1; i <= 5; ++i) {
@@ -323,7 +330,7 @@ TEST_F(CircuitBreakerRemoveTest, RemoveMultipleCircuits) {
 TEST_F(CircuitBreakerRemoveTest, RemoveCircuitFreesSlotForNewCircuit) {
     // This test verifies that removing a circuit frees the slot,
     // allowing a new circuit to be tracked (important for Rule #4 cleanup)
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     BackendId old_backend = 1;
     BackendId new_backend = 2;
@@ -350,7 +357,7 @@ TEST_F(CircuitBreakerRemoveTest, RemoveCircuitFreesSlotForNewCircuit) {
 // =============================================================================
 
 TEST_F(CircuitBreakerRemoveTest, OpenCircuitCountAccurate) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     // Create some open circuits
     for (BackendId i = 1; i <= 3; ++i) {
@@ -368,7 +375,7 @@ TEST_F(CircuitBreakerRemoveTest, OpenCircuitCountAccurate) {
 }
 
 TEST_F(CircuitBreakerRemoveTest, CircuitsRemovedCounterPersistsAcrossOperations) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     // Create and remove circuits multiple times
     for (int round = 0; round < 3; ++round) {
@@ -389,7 +396,7 @@ TEST_F(CircuitBreakerRemoveTest, CircuitsRemovedCounterPersistsAcrossOperations)
 // =============================================================================
 
 TEST_F(CircuitBreakerRemoveTest, UpdateConfigPreservesRemovedCounter) {
-    CircuitBreaker cb(config);
+    TestCB cb(config);
 
     // Remove some circuits
     cb.allow_request(1);
@@ -399,7 +406,7 @@ TEST_F(CircuitBreakerRemoveTest, UpdateConfigPreservesRemovedCounter) {
     EXPECT_EQ(cb.get_circuits_removed(), 2u);
 
     // Update config
-    CircuitBreaker::Config new_config = config;
+    TestCB::Config new_config = config;
     new_config.failure_threshold = 10;
     cb.update_config(new_config);
 
@@ -416,4 +423,188 @@ TEST(CircuitStateStringTest, ConvertsStatesCorrectly) {
     EXPECT_STREQ(circuit_state_to_string(CircuitState::CLOSED), "CLOSED");
     EXPECT_STREQ(circuit_state_to_string(CircuitState::OPEN), "OPEN");
     EXPECT_STREQ(circuit_state_to_string(CircuitState::HALF_OPEN), "HALF_OPEN");
+}
+
+// =============================================================================
+// Deterministic Timing Tests (TestClock - no sleeps, instant execution)
+// =============================================================================
+
+class CircuitBreakerTimingTest : public ::testing::Test {
+protected:
+    using TestCB = BasicCircuitBreaker<TestClock>;
+
+    void SetUp() override {
+        TestClock::reset();
+        config.failure_threshold = 3;
+        config.success_threshold = 2;
+        config.recovery_timeout = std::chrono::seconds(30);
+        config.enabled = true;
+    }
+
+    TestCB::Config config;
+
+    // Helper: open a circuit by recording enough failures
+    void open_circuit(TestCB& cb, BackendId backend) {
+        cb.allow_request(backend);
+        for (uint32_t i = 0; i < config.failure_threshold; ++i) {
+            cb.record_failure(backend);
+        }
+    }
+};
+
+TEST_F(CircuitBreakerTimingTest, OpenToHalfOpenAtExactTimeout) {
+    TestCB cb(config);
+    BackendId backend = 1;
+
+    open_circuit(cb, backend);
+    EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+    // 1ms before timeout: still OPEN
+    TestClock::advance(std::chrono::seconds(30) - std::chrono::milliseconds(1));
+    EXPECT_FALSE(cb.allow_request(backend));
+    EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+    // Exactly at timeout: should transition to HALF_OPEN
+    TestClock::advance(std::chrono::milliseconds(1));
+    EXPECT_TRUE(cb.allow_request(backend));
+    EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+}
+
+TEST_F(CircuitBreakerTimingTest, OpenStaysOpenBeforeTimeout) {
+    TestCB cb(config);
+    BackendId backend = 1;
+
+    open_circuit(cb, backend);
+    EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+    // Advance multiple times within timeout window - should stay OPEN
+    for (int i = 0; i < 29; ++i) {
+        TestClock::advance(std::chrono::seconds(1));
+        EXPECT_FALSE(cb.allow_request(backend));
+        EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+    }
+}
+
+TEST_F(CircuitBreakerTimingTest, HalfOpenToClosedFullCycle) {
+    TestCB cb(config);
+    BackendId backend = 1;
+
+    // Phase 1: CLOSED -> OPEN
+    open_circuit(cb, backend);
+    EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+    // Phase 2: Wait for timeout -> HALF_OPEN
+    TestClock::advance(std::chrono::seconds(31));
+    EXPECT_TRUE(cb.allow_request(backend));
+    EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+
+    // Phase 3: Successes -> CLOSED
+    for (uint32_t i = 0; i < config.success_threshold; ++i) {
+        cb.record_success(backend);
+    }
+    EXPECT_EQ(cb.get_state(backend), CircuitState::CLOSED);
+
+    // Phase 4: Circuit works normally again
+    EXPECT_TRUE(cb.allow_request(backend));
+}
+
+TEST_F(CircuitBreakerTimingTest, HalfOpenFailureResetsTimeout) {
+    TestCB cb(config);
+    BackendId backend = 1;
+
+    open_circuit(cb, backend);
+
+    // Advance past first timeout -> HALF_OPEN
+    TestClock::advance(std::chrono::seconds(31));
+    cb.allow_request(backend);
+    EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+
+    // Failure in HALF_OPEN -> back to OPEN (resets opened_at)
+    cb.record_failure(backend);
+    EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+    // Must wait another full recovery_timeout from NOW
+    TestClock::advance(std::chrono::seconds(29));
+    EXPECT_FALSE(cb.allow_request(backend));  // Still OPEN (29s < 30s)
+
+    TestClock::advance(std::chrono::seconds(2));  // Now 31s past re-open
+    EXPECT_TRUE(cb.allow_request(backend));
+    EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+}
+
+TEST_F(CircuitBreakerTimingTest, DifferentBackendsHaveIndependentTimers) {
+    TestCB cb(config);
+    BackendId backend_a = 1;
+    BackendId backend_b = 2;
+
+    // Open both circuits
+    open_circuit(cb, backend_a);
+
+    TestClock::advance(std::chrono::seconds(10));
+    open_circuit(cb, backend_b);
+
+    // After 20 more seconds: backend_a opened 30s ago, backend_b opened 20s ago
+    TestClock::advance(std::chrono::seconds(20));
+
+    // backend_a should transition to HALF_OPEN (30s elapsed)
+    EXPECT_TRUE(cb.allow_request(backend_a));
+    EXPECT_EQ(cb.get_state(backend_a), CircuitState::HALF_OPEN);
+
+    // backend_b should still be OPEN (only 20s elapsed)
+    EXPECT_FALSE(cb.allow_request(backend_b));
+    EXPECT_EQ(cb.get_state(backend_b), CircuitState::OPEN);
+
+    // Advance 10 more seconds: backend_b now at 30s
+    TestClock::advance(std::chrono::seconds(10));
+    EXPECT_TRUE(cb.allow_request(backend_b));
+    EXPECT_EQ(cb.get_state(backend_b), CircuitState::HALF_OPEN);
+}
+
+TEST_F(CircuitBreakerTimingTest, ConfigurableRecoveryTimeout) {
+    config.recovery_timeout = std::chrono::seconds(5);
+    TestCB cb(config);
+    BackendId backend = 1;
+
+    open_circuit(cb, backend);
+
+    // Should be OPEN at 4 seconds
+    TestClock::advance(std::chrono::seconds(4));
+    EXPECT_FALSE(cb.allow_request(backend));
+    EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+    // Should transition at 5 seconds
+    TestClock::advance(std::chrono::seconds(1));
+    EXPECT_TRUE(cb.allow_request(backend));
+    EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+}
+
+TEST_F(CircuitBreakerTimingTest, MultipleOpenCloseReopenCycles) {
+    config.recovery_timeout = std::chrono::seconds(10);
+    TestCB cb(config);
+    BackendId backend = 1;
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        // Open the circuit
+        open_circuit(cb, backend);
+        EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+
+        // Wait for timeout
+        TestClock::advance(std::chrono::seconds(11));
+        cb.allow_request(backend);
+        EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+
+        // Fail probe -> reopen
+        cb.record_failure(backend);
+        EXPECT_EQ(cb.get_state(backend), CircuitState::OPEN);
+    }
+
+    // Finally succeed
+    TestClock::advance(std::chrono::seconds(11));
+    cb.allow_request(backend);
+    EXPECT_EQ(cb.get_state(backend), CircuitState::HALF_OPEN);
+
+    for (uint32_t i = 0; i < config.success_threshold; ++i) {
+        cb.record_success(backend);
+    }
+    EXPECT_EQ(cb.get_state(backend), CircuitState::CLOSED);
 }

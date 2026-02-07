@@ -520,11 +520,14 @@ target_link_libraries(load_aware_routing_test
 gtest_discover_tests(load_aware_routing_test)
 
 # Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
-# Tests for quorum calculation and state transitions
+# Tests for quorum calculation, state transitions, and peer liveness with TestClock
 add_executable(quorum_test
   tests/unit/quorum_test.cpp
 )
-target_include_directories(quorum_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(quorum_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
 target_link_libraries(quorum_test
   PRIVATE
   GTest::gtest_main
@@ -532,16 +535,34 @@ target_link_libraries(quorum_test
 gtest_discover_tests(quorum_test)
 
 # Circuit Breaker Unit Tests (Pure C++, no Seastar dependency)
-# Tests for circuit breaker pattern and remove_circuit cleanup (Rule #4)
+# Tests for circuit breaker pattern, remove_circuit cleanup (Rule #4), and timing with TestClock
 add_executable(circuit_breaker_test
   tests/unit/circuit_breaker_test.cpp
 )
-target_include_directories(circuit_breaker_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(circuit_breaker_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
 target_link_libraries(circuit_breaker_test
   PRIVATE
   GTest::gtest_main
 )
 gtest_discover_tests(circuit_breaker_test)
+
+# Rate Limiter Unit Tests (Pure C++, no Seastar dependency)
+# Tests for token bucket rate limiter, MAX_BUCKETS bound (Rule #4), and timing with TestClock
+add_executable(rate_limiter_test
+  tests/unit/rate_limiter_test.cpp
+)
+target_include_directories(rate_limiter_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(rate_limiter_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(rate_limiter_test)
 
 # ShardedConfig Unit Tests (Requires Seastar types for header includes)
 # Tests ShardedConfig wrapper class for per-core config distribution
