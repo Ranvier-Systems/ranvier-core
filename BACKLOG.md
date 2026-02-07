@@ -1983,10 +1983,11 @@ _Move completed items here with completion date and PR reference._
   _Complexity:_ Medium
   _Completed:_ 2026-02-07. Template parameter `Clock` added to `BasicTokenBucket`, `BasicRateLimiter`, `BasicBackendCircuit`, `BasicCircuitBreaker`, and `BasicPeerState` with backward-compatible aliases. `TestClock` helper in `tests/unit/test_clock.hpp`. Pure algorithm split into `src/rate_limiter_core.hpp` (no Seastar deps); `src/rate_limiter.hpp` is Seastar service inheriting from core. 9 rate limiter timing tests, 7 circuit breaker timing tests, 10 quorum liveness timing tests — all deterministic, zero sleeps.
 
-- [ ] **Adopt Google Mock (`gmock`) for dependency isolation**
+- [x] **Adopt Google Mock (`gmock`) for dependency isolation** ✓
   _Context:_ Only `tests/unit/async_persistence_test.cpp` uses mocks (hand-rolled `MockPersistenceStore`). GTest is already a dependency (`GTest::gtest_main` in `CMakeLists.txt`) and gmock ships with it — just link `GTest::gmock`.
   _Approach:_ Replace hand-rolled mock in `tests/unit/async_persistence_test.cpp` with `gmock` (`MOCK_METHOD`). Add mock interfaces for: `PersistenceStore` (interface in `src/persistence.hpp`), `HealthChecker`, `UdpChannel`. Update `CMakeLists.txt` to link `GTest::gmock` for tests that need it.
   _Complexity:_ Medium
+  _Completed:_ 2026-02-07. Replaced 148-line hand-rolled `MockPersistenceStore` with gmock `MOCK_METHOD` declarations + `ON_CALL` defaults for open/close state tracking. Created reusable mock headers in `tests/unit/mocks/`: `mock_persistence_store.hpp` (gmock of `PersistenceStore` interface), `mock_health_checker.hpp` (abstract `HealthChecker` interface + gmock mock), `mock_udp_channel.hpp` (abstract `UdpChannel` interface + gmock mock). Linked `GTest::gmock` in `CMakeLists.txt` for `async_persistence_test`. All tests use `NiceMock<MockPersistenceStore>` to suppress uninteresting-call warnings.
 
 - [ ] **Add negative-path integration tests**
   _Context:_ All 4 integration suites in `tests/integration/` are happy-path only. They use Docker Compose (`docker-compose.test.yml`) with a 3-node cluster and mock backends (`tests/integration/mock_backend.py`). Follow the same pattern (Python unittest, `requests` library, Docker Compose lifecycle in setUp/tearDown).

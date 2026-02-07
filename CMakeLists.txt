@@ -609,17 +609,23 @@ if(Seastar_FOUND)
 
     # AsyncPersistence Unit Tests (Requires Seastar types for header includes)
     # Tests queue behavior, backpressure, and configuration without running Seastar event loop
+    # Uses gmock for MockPersistenceStore (dependency isolation)
     add_executable(async_persistence_test
       tests/unit/async_persistence_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
     )
-    target_include_directories(async_persistence_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    target_include_directories(async_persistence_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${SQLITE3_INCLUDE_DIRS}
+    )
     target_link_libraries(async_persistence_test
       PRIVATE
       Seastar::seastar
       ${SQLITE3_LIBRARIES}
       GTest::gtest_main
+      GTest::gmock
     )
     gtest_discover_tests(async_persistence_test)
 
