@@ -1989,7 +1989,7 @@ _Move completed items here with completion date and PR reference._
   _Complexity:_ Medium
   _Completed:_ 2026-02-07. Replaced 148-line hand-rolled `MockPersistenceStore` with gmock `MOCK_METHOD` declarations + `ON_CALL` defaults for open/close state tracking. Created reusable mock headers in `tests/unit/mocks/`: `mock_persistence_store.hpp` (gmock of `PersistenceStore` interface), `mock_health_checker.hpp` (abstract `HealthChecker` interface + gmock mock), `mock_udp_channel.hpp` (abstract `UdpChannel` interface + gmock mock). Linked `GTest::gmock` in `CMakeLists.txt` for `async_persistence_test`. All tests use `NiceMock<MockPersistenceStore>` to suppress uninteresting-call warnings.
 
-- [ ] **Add negative-path integration tests**
+- [x] **Add negative-path integration tests**
   _Context:_ All 4 integration suites in `tests/integration/` are happy-path only. They use Docker Compose (`docker-compose.test.yml`) with a 3-node cluster and mock backends (`tests/integration/mock_backend.py`). Follow the same pattern (Python unittest, `requests` library, Docker Compose lifecycle in setUp/tearDown).
   _Test cases:_
   - Split-brain: Use `docker network disconnect` to partition nodes, verify quorum detection via `/admin/cluster` endpoint, reconnect and verify recovery
@@ -1999,6 +1999,7 @@ _Move completed items here with completion date and PR reference._
   - Oversized request: Send request body exceeding `max_request_body_size`, verify 413 rejection
   _Location:_ Add as `tests/integration/test_negative_paths.py`. No CMake changes needed (Python tests).
   _Complexity:_ High
+  _Completed:_ 2026-02-07. Added `tests/integration/test_negative_paths.py` with 5 test cases: (1) Split-brain partition via `docker network disconnect`, verifying peer count drops and quorum state via `/admin/dump/cluster`, then reconnect and verify recovery. (2) Backend flap via rapid `docker stop`/`start` of mock backend, verifying `circuit_breaker_opens` metric increments. (3) Config reload with invalid YAML via `docker exec` + SIGHUP, verifying old config preserved and server continues operating. (4) Rate limiting by enabling low limits via config reload, flooding with concurrent requests, verifying 503 responses with `Retry-After` header. (5) Oversized request body (~5 MB), verifying rejection with 400/413/500 and server remains healthy. Follows same pattern as existing suites (Python unittest, `requests`, Docker Compose lifecycle).
 
 ### 12.4 P3 — Longer-Term Test Infrastructure
 
