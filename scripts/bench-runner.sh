@@ -1,0 +1,515 @@
+#!/bin/bash
+# =============================================================================
+# Ranvier Benchmark Runner - Multi-Run Orchestrator
+# =============================================================================
+#
+# Runs a series of benchmark configurations sequentially via bench.sh.
+# Tracks progress, captures results, and produces a summary report.
+#
+# Usage:
+#   ./scripts/bench-runner.sh                          # Run default suite
+#   ./scripts/bench-runner.sh --suite high             # High-priority runs only
+#   ./scripts/bench-runner.sh --suite medium            # High + medium priority
+#   ./scripts/bench-runner.sh --suite all               # All runs
+#   ./scripts/bench-runner.sh --suite custom --file runs.txt  # Custom run file
+#   ./scripts/bench-runner.sh --dry-run                # Preview what would run
+#   ./scripts/bench-runner.sh --resume 3               # Resume from run #3
+#
+# Custom run file format (one bench.sh invocation per line):
+#   # Comments start with #
+#   --compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 10m --users 20
+#   --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192
+#
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_SH="${SCRIPT_DIR}/bench.sh"
+RUNNER_OUTPUT_DIR="benchmark-reports"
+PAUSE_BETWEEN_RUNS=60  # seconds between runs for GPU cooldown
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# State
+RESUME_FROM=0
+DRY_RUN=false
+SUITE="high"
+CUSTOM_FILE=""
+STOP_ON_FAILURE=false
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+log_header()  { echo -e "\n${BOLD}${CYAN}$1${NC}"; echo -e "${CYAN}$(printf '═%.0s' {1..60})${NC}"; }
+log_info()    { echo -e "${BLUE}▸${NC} $1"; }
+log_ok()      { echo -e "${GREEN}✓${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}⚠${NC} $1"; }
+log_error()   { echo -e "${RED}✗${NC} $1"; }
+log_run()     { echo -e "${BOLD}${CYAN}[$1/$2]${NC} $3"; }
+
+# Format seconds as Xh Ym Zs
+fmt_duration() {
+    local secs=$1
+    local h=$((secs / 3600))
+    local m=$(( (secs % 3600) / 60 ))
+    local s=$((secs % 60))
+    if [[ $h -gt 0 ]]; then
+        echo "${h}h ${m}m ${s}s"
+    elif [[ $m -gt 0 ]]; then
+        echo "${m}m ${s}s"
+    else
+        echo "${s}s"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Help
+# -----------------------------------------------------------------------------
+
+print_help() {
+    cat << 'EOF'
+Ranvier Benchmark Runner - Multi-Run Orchestrator
+
+Runs a series of benchmark configurations sequentially via bench.sh,
+tracking progress and producing a summary report.
+
+USAGE:
+    ./scripts/bench-runner.sh [OPTIONS]
+
+OPTIONS:
+    --suite LEVEL       Which benchmark suite to run (default: high)
+                          high   - 3 high-priority runs (~45 min)
+                          medium - high + 3 medium-priority runs (~2.5 hours)
+                          all    - all 9 runs (~4+ hours)
+                          custom - use a custom run file (requires --file)
+    --file FILE         Path to custom run file (one bench.sh arg set per line)
+    --dry-run           Preview runs without executing
+    --resume N          Resume from run number N (1-indexed)
+    --pause SECONDS     Pause between runs for GPU cooldown (default: 60)
+    --stop-on-failure   Stop the suite if any run fails (default: continue)
+    --output-dir DIR    Output directory (default: benchmark-reports)
+    -h, --help          Show this help
+
+BUILT-IN SUITES:
+    high (3 runs):
+      1. 13B at 20 users (compare load-aware vs Jan baseline 38.9%)
+      2. 8B at 20 users  (compare load-aware vs Jan baseline 43.7%)
+      3. 13B at 10 users (compare load-aware vs Jan baseline 48.2%)
+
+    medium (adds 3 runs):
+      4. 13B 30-minute validated run at 30 users
+      5. 8B 30-minute validated run at 30 users
+      6. 13B prefix ratio sweep (0.7 and 0.5)
+
+    all (adds 3 more):
+      7. 13B client tokenization comparison
+      8. 8B high concurrency stress test (64 users)
+      9. 70B model test
+
+CUSTOM RUN FILE FORMAT:
+    # One set of bench.sh arguments per line
+    # Lines starting with # are comments, blank lines are skipped
+    --compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 10m --users 20
+    --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192
+
+EXAMPLES:
+    # Preview the default high-priority suite
+    ./scripts/bench-runner.sh --dry-run
+
+    # Run high-priority benchmarks
+    export HF_TOKEN=hf_xxx
+    ./scripts/bench-runner.sh --suite high
+
+    # Run all benchmarks, stop if one fails
+    ./scripts/bench-runner.sh --suite all --stop-on-failure
+
+    # Resume from run #4 after a failure
+    ./scripts/bench-runner.sh --suite all --resume 4
+
+    # Use a custom list of runs
+    ./scripts/bench-runner.sh --suite custom --file my-runs.txt
+
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --suite)            SUITE="$2"; shift 2 ;;
+        --file)             CUSTOM_FILE="$2"; shift 2 ;;
+        --dry-run)          DRY_RUN=true; shift ;;
+        --resume)           RESUME_FROM="$2"; shift 2 ;;
+        --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
+        --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
+        --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
+        -h|--help)          print_help; exit 0 ;;
+        *)                  log_error "Unknown option: $1"; echo "Run with --help for usage."; exit 1 ;;
+    esac
+done
+
+# -----------------------------------------------------------------------------
+# Define benchmark suites
+# -----------------------------------------------------------------------------
+# Each entry is: "LABEL|BENCH_ARGS"
+# LABEL is a short human-readable name for the run.
+# BENCH_ARGS are passed directly to bench.sh.
+
+define_runs() {
+    RUNS=()
+    LABELS=()
+
+    # --- High priority ---
+    if [[ "$SUITE" == "high" || "$SUITE" == "medium" || "$SUITE" == "all" ]]; then
+        LABELS+=("13B moderate load (20 users)")
+        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192")
+
+        LABELS+=("8B moderate load (20 users)")
+        RUNS+=("--compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 10m --users 20")
+
+        LABELS+=("13B low load (10 users)")
+        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192")
+    fi
+
+    # --- Medium priority ---
+    if [[ "$SUITE" == "medium" || "$SUITE" == "all" ]]; then
+        LABELS+=("13B 30min validated (30 users)")
+        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192")
+
+        LABELS+=("8B 30min validated (30 users)")
+        RUNS+=("--compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 30m --users 30")
+
+        LABELS+=("13B prefix ratio 0.7 (20 users)")
+        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --prefix-ratio 0.7 --max-model-len 8192")
+
+        LABELS+=("13B prefix ratio 0.5 (20 users)")
+        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --prefix-ratio 0.5 --max-model-len 8192")
+    fi
+
+    # --- Lower priority ---
+    if [[ "$SUITE" == "all" ]]; then
+        LABELS+=("13B client tokenization (30 users)")
+        RUNS+=("--compare --client-tokenize --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192")
+
+        LABELS+=("8B high concurrency stress (64 users)")
+        RUNS+=("--warmup --duration 15m --users 64 --spawn-rate 4 --model meta-llama/Llama-3.1-8B-Instruct")
+
+        LABELS+=("70B model test (16 users)")
+        RUNS+=("--compare --model meta-llama/Llama-3.1-70B-Instruct --warmup --duration 15m --users 16")
+    fi
+
+    # --- Custom file ---
+    if [[ "$SUITE" == "custom" ]]; then
+        if [[ -z "$CUSTOM_FILE" ]]; then
+            log_error "--suite custom requires --file <path>"
+            exit 1
+        fi
+        if [[ ! -f "$CUSTOM_FILE" ]]; then
+            log_error "Custom run file not found: $CUSTOM_FILE"
+            exit 1
+        fi
+        local line_num=0
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line_num=$((line_num + 1))
+            # Skip comments and blank lines
+            line="$(echo "$line" | sed 's/#.*//' | xargs)"
+            [[ -z "$line" ]] && continue
+            LABELS+=("custom run #${line_num}")
+            RUNS+=("$line")
+        done < "$CUSTOM_FILE"
+    fi
+}
+
+define_runs
+
+TOTAL_RUNS=${#RUNS[@]}
+
+if [[ $TOTAL_RUNS -eq 0 ]]; then
+    log_error "No runs defined for suite '$SUITE'"
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Validate
+# -----------------------------------------------------------------------------
+
+if [[ ! -x "$BENCH_SH" ]]; then
+    log_error "bench.sh not found or not executable at: $BENCH_SH"
+    exit 1
+fi
+
+if [[ $RESUME_FROM -gt $TOTAL_RUNS ]]; then
+    log_error "--resume $RESUME_FROM exceeds total runs ($TOTAL_RUNS)"
+    exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Dry run
+# -----------------------------------------------------------------------------
+
+if [[ "$DRY_RUN" == true ]]; then
+    log_header "Dry Run - Suite: $SUITE ($TOTAL_RUNS runs)"
+    echo ""
+    for ((i=0; i<TOTAL_RUNS; i++)); do
+        local_num=$((i + 1))
+        skip=""
+        if [[ $RESUME_FROM -gt 0 && $local_num -lt $RESUME_FROM ]]; then
+            skip=" ${YELLOW}(skip - before --resume $RESUME_FROM)${NC}"
+        fi
+        echo -e "  ${BOLD}[$local_num/$TOTAL_RUNS]${NC} ${LABELS[$i]}${skip}"
+        echo -e "           ${CYAN}./scripts/bench.sh ${RUNS[$i]}${NC}"
+        echo ""
+    done
+    log_info "Pause between runs: ${PAUSE_BETWEEN_RUNS}s"
+    if [[ "$STOP_ON_FAILURE" == true ]]; then
+        log_info "Will stop on first failure"
+    else
+        log_info "Will continue past failures"
+    fi
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Pre-flight
+# -----------------------------------------------------------------------------
+
+log_header "Ranvier Benchmark Runner"
+log_info "Suite: $SUITE ($TOTAL_RUNS runs)"
+log_info "Output: $RUNNER_OUTPUT_DIR"
+if [[ $RESUME_FROM -gt 0 ]]; then
+    log_info "Resuming from run #$RESUME_FROM"
+fi
+echo ""
+
+# Check HF_TOKEN
+if [[ -z "${HF_TOKEN:-}" ]]; then
+    log_error "HF_TOKEN not set. Export it before running:"
+    log_info "  export HF_TOKEN=hf_your_token_here"
+    exit 1
+fi
+
+# Create output directory and runner log
+mkdir -p "$RUNNER_OUTPUT_DIR"
+RUNNER_LOG="${RUNNER_OUTPUT_DIR}/runner_$(date +%Y%m%d_%H%M%S).log"
+RUNNER_SUMMARY="${RUNNER_OUTPUT_DIR}/runner_summary_$(date +%Y%m%d_%H%M%S).md"
+
+# Log to file and terminal
+exec > >(tee -a "$RUNNER_LOG") 2>&1
+
+echo "============================================="
+echo "Benchmark Runner Log"
+echo "Started: $(date)"
+echo "Host: $(hostname)"
+echo "Suite: $SUITE ($TOTAL_RUNS runs)"
+echo "============================================="
+echo ""
+
+# -----------------------------------------------------------------------------
+# Execute runs
+# -----------------------------------------------------------------------------
+
+RESULTS=()       # "pass" or "fail" per run
+DURATIONS=()     # elapsed seconds per run
+REPORT_DIRS=()   # output directory per run
+RUNNER_START_TS=$(date +%s)
+PASSED=0
+FAILED=0
+SKIPPED=0
+
+for ((i=0; i<TOTAL_RUNS; i++)); do
+    RUN_NUM=$((i + 1))
+
+    # Handle --resume: skip runs before the resume point
+    if [[ $RESUME_FROM -gt 0 && $RUN_NUM -lt $RESUME_FROM ]]; then
+        RESULTS+=("skipped")
+        DURATIONS+=(0)
+        REPORT_DIRS+=("-")
+        SKIPPED=$((SKIPPED + 1))
+        continue
+    fi
+
+    echo ""
+    log_header "Run $RUN_NUM of $TOTAL_RUNS: ${LABELS[$i]}"
+    echo -e "  ${CYAN}./scripts/bench.sh ${RUNS[$i]}${NC}"
+    echo ""
+
+    RUN_START_TS=$(date +%s)
+
+    # Run bench.sh, capturing exit code
+    set +e
+    bash "$BENCH_SH" ${RUNS[$i]} --output-dir "$RUNNER_OUTPUT_DIR"
+    EXIT_CODE=$?
+    set -e
+
+    RUN_END_TS=$(date +%s)
+    RUN_ELAPSED=$((RUN_END_TS - RUN_START_TS))
+    DURATIONS+=($RUN_ELAPSED)
+
+    # Find the most recent report directory created during this run
+    LATEST_DIR=$(ls -td "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | head -1)
+    REPORT_DIRS+=("${LATEST_DIR:-unknown}")
+
+    if [[ $EXIT_CODE -eq 0 ]]; then
+        log_ok "Run $RUN_NUM completed in $(fmt_duration $RUN_ELAPSED)"
+        RESULTS+=("pass")
+        PASSED=$((PASSED + 1))
+    else
+        log_error "Run $RUN_NUM failed (exit code $EXIT_CODE) after $(fmt_duration $RUN_ELAPSED)"
+        RESULTS+=("fail")
+        FAILED=$((FAILED + 1))
+
+        if [[ "$STOP_ON_FAILURE" == true ]]; then
+            log_error "Stopping suite due to --stop-on-failure"
+            # Mark remaining as skipped
+            for ((j=i+1; j<TOTAL_RUNS; j++)); do
+                RESULTS+=("skipped")
+                DURATIONS+=(0)
+                REPORT_DIRS+=("-")
+                SKIPPED=$((SKIPPED + 1))
+            done
+            break
+        fi
+    fi
+
+    # Pause between runs (unless this is the last one)
+    if [[ $((i + 1)) -lt $TOTAL_RUNS ]]; then
+        NEXT_RUN=$((i + 2))
+        # Don't pause if next run will be skipped
+        if [[ $RESUME_FROM -eq 0 || $NEXT_RUN -ge $RESUME_FROM ]]; then
+            log_info "Pausing ${PAUSE_BETWEEN_RUNS}s before next run (GPU cooldown)..."
+            sleep "$PAUSE_BETWEEN_RUNS"
+        fi
+    fi
+done
+
+RUNNER_END_TS=$(date +%s)
+RUNNER_ELAPSED=$((RUNNER_END_TS - RUNNER_START_TS))
+
+# -----------------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------------
+
+echo ""
+log_header "Benchmark Runner Summary"
+echo ""
+echo "Suite:     $SUITE"
+echo "Total:     $TOTAL_RUNS runs"
+echo "Passed:    $PASSED"
+echo "Failed:    $FAILED"
+echo "Skipped:   $SKIPPED"
+echo "Duration:  $(fmt_duration $RUNNER_ELAPSED)"
+echo ""
+
+# Print per-run table
+printf "  %-4s  %-8s  %-10s  %s\n" "#" "Status" "Duration" "Label"
+printf "  %-4s  %-8s  %-10s  %s\n" "---" "------" "--------" "-----"
+for ((i=0; i<TOTAL_RUNS; i++)); do
+    RUN_NUM=$((i + 1))
+    STATUS="${RESULTS[$i]}"
+    DUR="${DURATIONS[$i]}"
+    LABEL="${LABELS[$i]}"
+
+    case "$STATUS" in
+        pass)    STATUS_FMT="${GREEN}pass${NC}" ;;
+        fail)    STATUS_FMT="${RED}FAIL${NC}" ;;
+        skipped) STATUS_FMT="${YELLOW}skip${NC}" ;;
+    esac
+
+    if [[ "$DUR" -eq 0 ]]; then
+        DUR_FMT="-"
+    else
+        DUR_FMT="$(fmt_duration $DUR)"
+    fi
+
+    printf "  %-4s  " "$RUN_NUM"
+    echo -ne "$STATUS_FMT"
+    printf "      %-10s  %s\n" "$DUR_FMT" "$LABEL"
+done
+
+echo ""
+log_info "Runner log: $RUNNER_LOG"
+
+# -----------------------------------------------------------------------------
+# Generate markdown summary
+# -----------------------------------------------------------------------------
+
+{
+    echo "# Benchmark Runner Summary"
+    echo ""
+    echo "- **Date:** $(date)"
+    echo "- **Host:** $(hostname)"
+    echo "- **Suite:** $SUITE ($TOTAL_RUNS runs)"
+    echo "- **Total duration:** $(fmt_duration $RUNNER_ELAPSED)"
+    echo "- **Results:** $PASSED passed, $FAILED failed, $SKIPPED skipped"
+    echo ""
+    echo "## Runs"
+    echo ""
+    echo "| # | Status | Duration | Label | Report Dir |"
+    echo "|---|--------|----------|-------|------------|"
+    for ((i=0; i<TOTAL_RUNS; i++)); do
+        RUN_NUM=$((i + 1))
+        STATUS="${RESULTS[$i]}"
+        DUR="${DURATIONS[$i]}"
+        LABEL="${LABELS[$i]}"
+        RDIR="${REPORT_DIRS[$i]}"
+
+        if [[ "$DUR" -eq 0 ]]; then
+            DUR_FMT="-"
+        else
+            DUR_FMT="$(fmt_duration $DUR)"
+        fi
+
+        echo "| $RUN_NUM | $STATUS | $DUR_FMT | $LABEL | ${RDIR:-—} |"
+    done
+    echo ""
+    echo "## Commands"
+    echo ""
+    for ((i=0; i<TOTAL_RUNS; i++)); do
+        RUN_NUM=$((i + 1))
+        echo "**Run $RUN_NUM — ${LABELS[$i]}:**"
+        echo '```bash'
+        echo "./scripts/bench.sh ${RUNS[$i]}"
+        echo '```'
+        echo ""
+    done
+    echo "---"
+    echo "*Generated by bench-runner.sh*"
+} > "$RUNNER_SUMMARY"
+
+log_ok "Summary report: $RUNNER_SUMMARY"
+
+# Final status
+echo ""
+if [[ $FAILED -eq 0 && $SKIPPED -eq 0 ]]; then
+    log_ok "All $TOTAL_RUNS benchmarks completed successfully"
+elif [[ $FAILED -eq 0 ]]; then
+    log_ok "All executed benchmarks passed ($SKIPPED skipped)"
+else
+    log_warn "$FAILED of $TOTAL_RUNS benchmarks failed"
+fi
+
+# Suggest comparison if we have results
+if [[ $PASSED -ge 2 ]]; then
+    echo ""
+    log_info "To compare results across runs:"
+    echo "  python3 tests/integration/results_parser.py compare \\"
+    echo "    ${RUNNER_OUTPUT_DIR}/*round_robin*/benchmark.log \\"
+    echo "    ${RUNNER_OUTPUT_DIR}/*prefix*/benchmark.log"
+fi
+
+exit $FAILED
