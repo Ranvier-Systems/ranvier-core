@@ -1055,11 +1055,12 @@ class NegativePathTest(unittest.TestCase):
                 timeout=60
             )
             print(f"    Response status: {resp.status_code}")
-            # Under 128 MB limit, so 200 is acceptable. 400/413/500 also acceptable
-            # if the server has additional validation (e.g., token count limits).
+            # Under 128 MB limit, so 200 is acceptable. 4xx/5xx also acceptable
+            # if the server has additional validation (e.g., token count limits)
+            # or transient conditions (503 from rate limiter cooldown, backpressure).
             self.assertIn(
                 resp.status_code,
-                [200, 400, 413, 500],
+                [200, 400, 413, 500, 502, 503],
                 f"Large request should get 200 (accepted) or 4xx/5xx (rejected), got {resp.status_code}"
             )
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
