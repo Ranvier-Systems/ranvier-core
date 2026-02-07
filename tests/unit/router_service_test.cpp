@@ -821,7 +821,7 @@ TEST(RoutingConfigTest, ModeHelpers) {
     cfg.routing_mode = RoutingConfig::RoutingMode::HASH;
     EXPECT_FALSE(cfg.is_prefix_mode());
     EXPECT_TRUE(cfg.is_hash_mode());
-    EXPECT_TRUE(cfg.uses_art() == false);
+    EXPECT_FALSE(cfg.uses_art());
     EXPECT_FALSE(cfg.should_learn_routes());
 
     cfg.routing_mode = RoutingConfig::RoutingMode::RANDOM;
