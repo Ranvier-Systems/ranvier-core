@@ -126,6 +126,76 @@ estimate_run_seconds() {
     echo "$secs"
 }
 
+# Extract and display key metrics from a benchmark.log file.
+# Greps for the BENCHMARK_STATS_JSON line emitted by locustfile_real.py.
+extract_metrics() {
+    local log_file="$1"
+    local label="${2:-}"
+
+    if [[ ! -f "$log_file" ]]; then
+        return
+    fi
+
+    local json_line
+    json_line=$(grep "BENCHMARK_STATS_JSON:" "$log_file" 2>/dev/null | tail -1 | sed 's/.*BENCHMARK_STATS_JSON://')
+    if [[ -z "$json_line" ]]; then
+        # Fall back to grepping individual fields
+        local hit_rate cache_hits ttft_improv
+        hit_rate=$(grep "Cache Hit Rate:" "$log_file" 2>/dev/null | tail -1 | grep -oP '[0-9.]+(?=%)' || echo "")
+        cache_hits=$(grep "Cache Hits:" "$log_file" 2>/dev/null | tail -1 | grep -oP '\d+' || echo "")
+        ttft_improv=$(grep "TTFT Improvement:" "$log_file" 2>/dev/null | tail -1 | grep -oP '\-?[0-9.]+(?=%)' || echo "")
+        if [[ -n "$hit_rate" || -n "$ttft_improv" ]]; then
+            echo -ne "    ${label:+${BOLD}${label}:${NC} }"
+            [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+            [[ -n "$hit_rate" && -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
+            [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
+            echo ""
+        fi
+        return
+    fi
+
+    # Parse JSON with lightweight field extraction (no jq dependency)
+    local hit_rate cache_hits ttft_improv total_reqs failed_reqs tokens_sec
+    hit_rate=$(echo "$json_line" | grep -oP '"cache_hit_rate_pct":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
+    cache_hits=$(echo "$json_line" | grep -oP '"cache_hits":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
+    ttft_improv=$(echo "$json_line" | grep -oP '"ttft_improvement_pct":\s*-?[0-9.]+' | grep -oP '\-?[0-9.]+$' || echo "")
+    total_reqs=$(echo "$json_line" | grep -oP '"total_requests":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
+    failed_reqs=$(echo "$json_line" | grep -oP '"failed_requests":\s*[0-9]+' | grep -oP '[0-9]+$' || echo "")
+    tokens_sec=$(echo "$json_line" | grep -oP '"tokens_per_second":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
+
+    echo -ne "    ${label:+${BOLD}${label}:${NC} }"
+    [[ -n "$hit_rate" ]] && echo -ne "Cache: ${hit_rate}%"
+    [[ -n "$cache_hits" ]] && echo -ne " (${cache_hits} hits)"
+    [[ -n "$ttft_improv" ]] && echo -ne " | TTFT Improv: ${ttft_improv}%"
+    [[ -n "$tokens_sec" ]] && echo -ne " | Tok/s: ${tokens_sec}"
+    [[ -n "$total_reqs" ]] && echo -ne " | Reqs: ${total_reqs}"
+    if [[ -n "$failed_reqs" && "$failed_reqs" != "0" ]]; then
+        echo -ne " | ${RED}Errors: ${failed_reqs}${NC}"
+    fi
+    echo ""
+}
+
+# Extract per-bucket TTFT improvements from a benchmark.log (xlarge is the headline metric)
+extract_bucket_improvement() {
+    local log_file="$1"
+    local label="${2:-}"
+
+    if [[ ! -f "$log_file" ]]; then
+        return
+    fi
+
+    # Look for xlarge bucket line in the per-bucket table
+    local xlarge_line
+    xlarge_line=$(grep -P "^\s*xlarge\s+" "$log_file" 2>/dev/null | tail -1 || echo "")
+    if [[ -n "$xlarge_line" ]]; then
+        local xlarge_improv
+        xlarge_improv=$(echo "$xlarge_line" | grep -oP '\-?[0-9.]+(?=%)' | tail -1 || echo "")
+        if [[ -n "$xlarge_improv" ]]; then
+            echo -e "    ${label:+${BOLD}${label}:${NC} }XLarge TTFT Improvement: ${xlarge_improv}%"
+        fi
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Help
 # -----------------------------------------------------------------------------
@@ -414,13 +484,49 @@ echo ""
 
 RESULTS=()       # "pass" or "fail" per run
 DURATIONS=()     # elapsed seconds per run
-REPORT_DIRS=()   # output directory per run
+REPORT_DIRS=()   # output directory per run (may have multiple for --compare)
+RUN_METRICS=()   # short metric summary per run
 RUNNER_START_TS=$(date +%s)
 PASSED=0
 FAILED=0
 SKIPPED=0
+INTERRUPTED=false
+
+# Adaptive ETA: track cumulative actual vs estimated seconds
+ACTUAL_SUM=0
+ESTIMATED_SUM=0
+
+# SIGINT trap: mark interrupted so we produce a summary with whatever completed
+handle_sigint() {
+    echo ""
+    log_warn "Interrupted (Ctrl+C) — producing summary for completed runs..."
+    INTERRUPTED=true
+
+    # If we're mid-run, mark it as failed
+    if [[ ${#RESULTS[@]} -lt $TOTAL_RUNS ]]; then
+        local remaining=$((TOTAL_RUNS - ${#RESULTS[@]}))
+        for ((j=0; j<remaining; j++)); do
+            if [[ $j -eq 0 ]]; then
+                RESULTS+=("fail")
+                NOW_TS=$(date +%s)
+                DURATIONS+=($((NOW_TS - RUN_START_TS)))
+                REPORT_DIRS+=("-")
+                RUN_METRICS+=("")
+                FAILED=$((FAILED + 1))
+            else
+                RESULTS+=("skipped")
+                DURATIONS+=(0)
+                REPORT_DIRS+=("-")
+                RUN_METRICS+=("")
+                SKIPPED=$((SKIPPED + 1))
+            fi
+        done
+    fi
+}
+trap handle_sigint INT
 
 for ((i=0; i<TOTAL_RUNS; i++)); do
+    [[ "$INTERRUPTED" == true ]] && break
     RUN_NUM=$((i + 1))
 
     # Handle --resume: skip runs before the resume point
@@ -428,6 +534,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
         RESULTS+=("skipped")
         DURATIONS+=(0)
         REPORT_DIRS+=("-")
+        RUN_METRICS+=("")
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
@@ -439,10 +546,22 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     SUITE_ELAPSED=$((NOW_TS - RUNNER_START_TS))
     RUN_EST=$(estimate_run_seconds "${RUNS[$i]}")
 
+    # Apply adaptive scaling if we have prior data
+    if [[ $ESTIMATED_SUM -gt 0 ]]; then
+        # Scale factor: how much longer runs actually take vs estimates
+        # Use integer math: (actual * 100) / estimated, then apply
+        SCALE_100=$((ACTUAL_SUM * 100 / ESTIMATED_SUM))
+        RUN_EST=$((RUN_EST * SCALE_100 / 100))
+    fi
+
     # Calculate remaining estimate: this run + future runs + pauses
     REMAINING_EST=$RUN_EST
     for ((k=i+1; k<TOTAL_RUNS; k++)); do
-        REMAINING_EST=$((REMAINING_EST + $(estimate_run_seconds "${RUNS[$k]}") + PAUSE_BETWEEN_RUNS))
+        FUTURE_EST=$(estimate_run_seconds "${RUNS[$k]}")
+        if [[ $ESTIMATED_SUM -gt 0 ]]; then
+            FUTURE_EST=$((FUTURE_EST * SCALE_100 / 100))
+        fi
+        REMAINING_EST=$((REMAINING_EST + FUTURE_EST + PAUSE_BETWEEN_RUNS))
     done
     ETA_TS=$((NOW_TS + REMAINING_EST))
     ETA_TIME=$(date -d "@$ETA_TS" +%H:%M 2>/dev/null || date -r "$ETA_TS" +%H:%M 2>/dev/null || echo "")
@@ -451,6 +570,9 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     echo -e "  ${CYAN}./scripts/bench.sh ${RUNS[$i]}${NC}"
     echo ""
     log_info "Elapsed: $(fmt_duration $SUITE_ELAPSED) | This run: ~$(fmt_duration $RUN_EST) | Remaining: ~$(fmt_duration $REMAINING_EST)${ETA_TIME:+ | ETA: $ETA_TIME}"
+
+    # Snapshot existing report directories before the run
+    DIRS_BEFORE=$(ls -d "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | sort)
 
     RUN_START_TS=$(date +%s)
 
@@ -464,17 +586,60 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     RUN_ELAPSED=$((RUN_END_TS - RUN_START_TS))
     DURATIONS+=($RUN_ELAPSED)
 
-    # Find the most recent report directory created during this run
-    LATEST_DIR=$(ls -td "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | head -1)
-    REPORT_DIRS+=("${LATEST_DIR:-unknown}")
+    # Update adaptive ETA data
+    RAW_EST=$(estimate_run_seconds "${RUNS[$i]}")
+    ACTUAL_SUM=$((ACTUAL_SUM + RUN_ELAPSED))
+    ESTIMATED_SUM=$((ESTIMATED_SUM + RAW_EST))
+
+    # Find new report directories by diffing before/after snapshots
+    DIRS_AFTER=$(ls -d "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | sort)
+    NEW_DIRS=$(comm -13 <(echo "$DIRS_BEFORE") <(echo "$DIRS_AFTER") 2>/dev/null || echo "")
+    if [[ -n "$NEW_DIRS" ]]; then
+        REPORT_DIRS+=("$(echo "$NEW_DIRS" | tr '\n' ',' | sed 's/,$//')")
+    else
+        REPORT_DIRS+=("-")
+    fi
 
     if [[ $EXIT_CODE -eq 0 ]]; then
         log_ok "Run $RUN_NUM completed in $(fmt_duration $RUN_ELAPSED)"
         RESULTS+=("pass")
         PASSED=$((PASSED + 1))
+
+        # Extract and display key metrics from new benchmark.log(s)
+        METRIC_SUMMARY=""
+        if [[ -n "$NEW_DIRS" ]]; then
+            echo ""
+            while IFS= read -r dir; do
+                [[ -z "$dir" ]] && continue
+                local_log="${dir}benchmark.log"
+                if [[ -f "$local_log" ]]; then
+                    # Derive a label from the directory name (e.g., "round_robin" or "prefix")
+                    dir_base=$(basename "$dir")
+                    mode_label=$(echo "$dir_base" | grep -oP '(round_robin|prefix|random)' || echo "$dir_base")
+                    extract_metrics "$local_log" "$mode_label"
+                    extract_bucket_improvement "$local_log" "$mode_label"
+
+                    # Capture one-line summary for the final table
+                    json_line=$(grep "BENCHMARK_STATS_JSON:" "$local_log" 2>/dev/null | tail -1 | sed 's/.*BENCHMARK_STATS_JSON://' || echo "")
+                    if [[ -n "$json_line" ]]; then
+                        hr=$(echo "$json_line" | grep -oP '"cache_hit_rate_pct":\s*[0-9.]+' | grep -oP '[0-9.]+$' || echo "")
+                        ti=$(echo "$json_line" | grep -oP '"ttft_improvement_pct":\s*-?[0-9.]+' | grep -oP '\-?[0-9.]+$' || echo "")
+                        if [[ -n "$hr" ]]; then
+                            METRIC_SUMMARY+="${mode_label}: ${hr}% hit"
+                            [[ -n "$ti" ]] && METRIC_SUMMARY+=", ${ti}% improv"
+                            METRIC_SUMMARY+=" | "
+                        fi
+                    fi
+                fi
+            done <<< "$NEW_DIRS"
+            # Trim trailing " | "
+            METRIC_SUMMARY="${METRIC_SUMMARY% | }"
+        fi
+        RUN_METRICS+=("$METRIC_SUMMARY")
     else
         log_error "Run $RUN_NUM failed (exit code $EXIT_CODE) after $(fmt_duration $RUN_ELAPSED)"
         RESULTS+=("fail")
+        RUN_METRICS+=("")
         FAILED=$((FAILED + 1))
 
         if [[ "$STOP_ON_FAILURE" == true ]]; then
@@ -484,6 +649,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
                 RESULTS+=("skipped")
                 DURATIONS+=(0)
                 REPORT_DIRS+=("-")
+                RUN_METRICS+=("")
                 SKIPPED=$((SKIPPED + 1))
             done
             break
@@ -491,7 +657,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     fi
 
     # Pause between runs (unless this is the last one)
-    if [[ $((i + 1)) -lt $TOTAL_RUNS ]]; then
+    if [[ $((i + 1)) -lt $TOTAL_RUNS && "$INTERRUPTED" != true ]]; then
         NEXT_RUN=$((i + 2))
         # Don't pause if next run will be skipped
         if [[ $RESUME_FROM -eq 0 || $NEXT_RUN -ge $RESUME_FROM ]]; then
@@ -500,6 +666,9 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
         fi
     fi
 done
+
+# Restore default SIGINT behavior for summary section
+trap - INT
 
 RUNNER_END_TS=$(date +%s)
 RUNNER_ELAPSED=$((RUNNER_END_TS - RUNNER_START_TS))
@@ -520,13 +689,14 @@ echo "Duration:  $(fmt_duration $RUNNER_ELAPSED)"
 echo ""
 
 # Print per-run table
-printf "  %-4s  %-8s  %-10s  %s\n" "#" "Status" "Duration" "Label"
-printf "  %-4s  %-8s  %-10s  %s\n" "---" "------" "--------" "-----"
+printf "  %-4s  %-8s  %-10s  %-40s  %s\n" "#" "Status" "Duration" "Label" "Key Metrics"
+printf "  %-4s  %-8s  %-10s  %-40s  %s\n" "---" "------" "--------" "-----" "-----------"
 for ((i=0; i<TOTAL_RUNS; i++)); do
     RUN_NUM=$((i + 1))
     STATUS="${RESULTS[$i]}"
     DUR="${DURATIONS[$i]}"
     LABEL="${LABELS[$i]}"
+    METRICS="${RUN_METRICS[$i]:-}"
 
     case "$STATUS" in
         pass)    STATUS_FMT="${GREEN}pass${NC}" ;;
@@ -542,7 +712,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
 
     printf "  %-4s  " "$RUN_NUM"
     echo -ne "$STATUS_FMT"
-    printf "      %-10s  %s\n" "$DUR_FMT" "$LABEL"
+    printf "      %-10s  %-40s  %s\n" "$DUR_FMT" "$LABEL" "$METRICS"
 done
 
 echo ""
@@ -564,14 +734,15 @@ log_info "Runner log: $RUNNER_LOG"
     echo ""
     echo "## Runs"
     echo ""
-    echo "| # | Status | Duration | Label | Report Dir |"
-    echo "|---|--------|----------|-------|------------|"
+    echo "| # | Status | Duration | Label | Key Metrics | Report Dir |"
+    echo "|---|--------|----------|-------|-------------|------------|"
     for ((i=0; i<TOTAL_RUNS; i++)); do
         RUN_NUM=$((i + 1))
         STATUS="${RESULTS[$i]}"
         DUR="${DURATIONS[$i]}"
         LABEL="${LABELS[$i]}"
         RDIR="${REPORT_DIRS[$i]}"
+        METRICS="${RUN_METRICS[$i]:-}"
 
         if [[ "$DUR" -eq 0 ]]; then
             DUR_FMT="-"
@@ -579,7 +750,7 @@ log_info "Runner log: $RUNNER_LOG"
             DUR_FMT="$(fmt_duration $DUR)"
         fi
 
-        echo "| $RUN_NUM | $STATUS | $DUR_FMT | $LABEL | ${RDIR:-—} |"
+        echo "| $RUN_NUM | $STATUS | $DUR_FMT | $LABEL | ${METRICS:-—} | ${RDIR:-—} |"
     done
     echo ""
     echo "## Commands"
