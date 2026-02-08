@@ -3628,6 +3628,11 @@ class RealBackendUser(HttpUser):
             # Sub-categorize incomplete: iter_lines() ended without any data: line
             if ttft is None and not stream_timed_out:
                 metrics.incomplete_reason = "no_data"
+                snippet = response_text[:500].replace('\n', '\\n') if response_text else "(empty)"
+                logger.warning(
+                    f"No SSE data received (HTTP 200, {len(response_text)} bytes, "
+                    f"{total_time:.0f}ms): {snippet}"
+                )
 
             # Record to global stats
             _benchmark_stats.record_request(metrics)
