@@ -106,6 +106,59 @@ parse_duration() {
 }
 
 # -----------------------------------------------------------------------------
+# vLLM process management
+# -----------------------------------------------------------------------------
+
+# Patterns that match vLLM processes (parent launcher + renamed children)
+VLLM_PATTERNS=("vllm.entrypoints" "vllm.engine" "VLLM::")
+
+# Detect any running vLLM processes (returns 0 if found, 1 if none)
+detect_vllm_processes() {
+    for pattern in "${VLLM_PATTERNS[@]}"; do
+        if pgrep -f "$pattern" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Kill all vLLM processes (graceful then forced)
+# Usage: kill_vllm_processes [--force-only]
+kill_vllm_processes() {
+    local force_only=false
+    [[ "${1:-}" == "--force-only" ]] && force_only=true
+
+    if ! "$force_only"; then
+        for pattern in "${VLLM_PATTERNS[@]}"; do
+            pkill -f "$pattern" 2>/dev/null || true
+        done
+        sleep 2
+    fi
+
+    # Force kill any survivors
+    for pattern in "${VLLM_PATTERNS[@]}"; do
+        pkill -9 -f "$pattern" 2>/dev/null || true
+    done
+    sleep 1
+
+    # Final check: kill any processes still holding GPUs (nuclear option)
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_pids
+        gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sort -u)
+        if [ -n "$gpu_pids" ]; then
+            for pid in $gpu_pids; do
+                # Only kill if it looks like a vLLM process
+                local cmdline
+                cmdline=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' || true)
+                if echo "$cmdline" | grep -qi "vllm"; then
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+        fi
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Cleanup handler
 # -----------------------------------------------------------------------------
 
@@ -130,7 +183,7 @@ cleanup() {
         log_ok "Memory sampler stopped"
     fi
 
-    # Kill vLLM processes
+    # Kill vLLM processes (stored PIDs first, then broad sweep for children)
     if [ ${#VLLM_PIDS[@]} -gt 0 ]; then
         log_info "Stopping vLLM processes..."
         for pid in "${VLLM_PIDS[@]}"; do
@@ -139,14 +192,19 @@ cleanup() {
             fi
         done
         sleep 2
-        # Force kill if still running
         for pid in "${VLLM_PIDS[@]}"; do
             if kill -0 "$pid" 2>/dev/null; then
                 kill -9 "$pid" 2>/dev/null || true
             fi
         done
-        log_ok "vLLM processes stopped"
     fi
+
+    # Sweep for any remaining vLLM processes (renamed children like VLLM::EngineCore)
+    if detect_vllm_processes; then
+        log_info "Killing remaining vLLM child processes..."
+        kill_vllm_processes --force-only
+    fi
+    log_ok "vLLM processes stopped"
 
     # Stop Docker containers
     if [ -f docker-compose.benchmark-real.yml ]; then
@@ -295,11 +353,9 @@ preflight_check() {
         stale_found=true
     fi
 
-    # Check for existing vLLM processes
-    local vllm_procs
-    vllm_procs=$(pgrep -f "vllm.entrypoints" 2>/dev/null | head -5)
-    if [ -n "$vllm_procs" ]; then
-        log_warn "Found existing vLLM processes: $(echo $vllm_procs | tr '\n' ' ')"
+    # Check for existing vLLM processes (parent + renamed children like VLLM::EngineCore)
+    if detect_vllm_processes; then
+        log_warn "Found existing vLLM processes"
         stale_found=true
     fi
 
@@ -307,14 +363,24 @@ preflight_check() {
         echo ""
         log_info "Cleaning up stale processes from previous run..."
 
-        # Kill vLLM processes
-        pkill -f "vllm.entrypoints" 2>/dev/null || true
-        sleep 1
-        pkill -9 -f "vllm.entrypoints" 2>/dev/null || true
+        # Kill all vLLM processes (handles renamed children and GPU-holding processes)
+        kill_vllm_processes
 
         # Stop containers
         docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
             --profile benchmark down -v --remove-orphans 2>/dev/null || true
+
+        # Verify GPUs are free
+        if command -v nvidia-smi &>/dev/null; then
+            local gpu_pids
+            gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sort -u)
+            if [ -n "$gpu_pids" ]; then
+                log_warn "GPUs still occupied after cleanup (PIDs: $(echo $gpu_pids | tr '\n' ' '))"
+                log_warn "You may need to manually kill these processes"
+            else
+                log_ok "All GPUs are free"
+            fi
+        fi
 
         log_ok "Cleanup complete"
         echo ""
