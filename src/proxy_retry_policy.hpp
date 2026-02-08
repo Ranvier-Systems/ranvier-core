@@ -17,14 +17,12 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <system_error>
 #include <vector>
-
-// EPIPE / ECONNRESET constants
-#include <cerrno>
 
 namespace ranvier {
 
@@ -237,7 +235,6 @@ std::optional<BackendId> select_fallback_backend(
 
 // Backpressure decision logic — pure functions, no Seastar dependency.
 // These model the concurrency-limiting and queue-depth checks from handle_proxy().
-// Uses BackpressureConfig from config_schema.hpp (not redefined here).
 
 // Result of a backpressure check.
 enum class BackpressureDecision {
