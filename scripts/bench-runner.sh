@@ -258,10 +258,11 @@ BUILT-IN SUITES:
       6. 13B prefix ratio 0.7
       7. 13B prefix ratio 0.5
 
-    all (adds 3 more, ~6h total):
+    all (adds 4 more, ~6.5h total):
       8.  13B client tokenization comparison
       9.  8B high concurrency stress test (64 users)
       10. 70B model test
+      11. 8B with 16K max prefix (tests larger-than-default prefixes)
 
 ADDING NEW RUNS:
     Edit define_runs() in this script. Each run is one line:
@@ -396,6 +397,10 @@ define_runs() {
     add_run low "70B model test (16 users)" \
         --compare --model meta-llama/Llama-3.1-70B-Instruct \
         --warmup --duration 15m --users 16
+
+    add_run low "8B 16K prefix test (20 users)" \
+        --compare --model meta-llama/Llama-3.1-8B-Instruct \
+        --warmup --duration 10m --users 20 --prefix-max-tokens 16000
 
     # --- Custom file ----------------------------------------------------------
     if [[ "$SUITE" == "custom" ]]; then

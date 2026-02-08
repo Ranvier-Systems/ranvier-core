@@ -186,6 +186,7 @@ BENCHMARK OPTIONS:
     --prompt-file FILE  Path to JSONL prompt file (ShareGPT/OpenAI format)
                         See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
+    --prefix-max-tokens N  Maximum prefix size in tokens (default: 8000)
     --compare           Run A/B comparison (prefix vs round-robin). Runs TWO benchmarks
                         (each for --duration), so total runtime is ~2x duration + 30s.
     --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
@@ -336,6 +337,7 @@ USERS="$DEFAULT_USERS"
 SPAWN_RATE="$DEFAULT_SPAWN_RATE"
 PROMPT_DIST="$DEFAULT_PROMPT_DIST"
 PREFIX_RATIO="$DEFAULT_PREFIX_RATIO"
+PREFIX_MAX_TOKENS=""
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 COMPARE=false
 SKIP_SETUP=false
@@ -363,6 +365,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-dist)    PROMPT_DIST="$2"; shift 2 ;;
         --prompt-file)    PROMPT_FILE="$2"; shift 2 ;;
         --prefix-ratio)   PREFIX_RATIO="$2"; shift 2 ;;
+        --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
         --output-dir)     OUTPUT_DIR="$2"; shift 2 ;;
         --compare)        COMPARE=true; shift ;;
         --skip-setup)     SKIP_SETUP=true; shift ;;
@@ -723,6 +726,7 @@ if [[ "$DRY_RUN" = true ]]; then
         echo "  Prompt File:     $PROMPT_FILE"
     fi
     echo "  Prefix Ratio:    $PREFIX_RATIO"
+    [[ -n "$PREFIX_MAX_TOKENS" ]] && echo "  Prefix Max Tok:  $PREFIX_MAX_TOKENS"
     echo "  Output Dir:      $OUTPUT_DIR"
     echo "  Compare Mode:    $COMPARE"
     echo "  Warmup:          $WARMUP"
@@ -1091,6 +1095,7 @@ run_benchmark() {
     export RANVIER_ROUTING_MODE="$ROUTING_MODE"
     export PROMPT_DISTRIBUTION="$PROMPT_DIST"
     export SHARED_PREFIX_RATIO="$PREFIX_RATIO"
+    [[ -n "$PREFIX_MAX_TOKENS" ]] && export LARGE_PREFIX_MAX_TOKENS="$PREFIX_MAX_TOKENS"
     [[ -n "$PROMPT_FILE" ]] && export PROMPT_FILE
 
     # Export backend configuration
@@ -1142,6 +1147,9 @@ run_benchmark() {
         PROMPT_FILE_ARGS="-v $PROMPT_FILE_ABS:/mnt/locust/prompts/custom_prompts.jsonl:ro -e PROMPT_FILE=/mnt/locust/prompts/custom_prompts.jsonl"
     fi
 
+    PREFIX_MAX_ARGS=""
+    [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
+
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
@@ -1178,6 +1186,7 @@ run_benchmark() {
         -e HF_TOKEN="${HF_TOKEN:-}" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
+        $PREFIX_MAX_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -1263,6 +1272,9 @@ if [[ "$WARMUP" = true ]]; then
         PROMPT_FILE_ARGS="-v $PROMPT_FILE_ABS:/mnt/locust/prompts/custom_prompts.jsonl:ro -e PROMPT_FILE=/mnt/locust/prompts/custom_prompts.jsonl"
     fi
 
+    PREFIX_MAX_ARGS=""
+    [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
+
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1275,6 +1287,7 @@ if [[ "$WARMUP" = true ]]; then
         -e HF_TOKEN="${HF_TOKEN:-}" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
+        $PREFIX_MAX_ARGS \
         locust \
         --headless \
         --users "$USERS" \

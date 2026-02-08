@@ -116,6 +116,7 @@ The `--warmup` flag runs a short preliminary benchmark before the main test:
 | `--compare` | off | Run both round-robin and prefix modes for A/B comparison |
 | `--prompt-dist` | stress | Prompt size distribution (see below) |
 | `--prefix-ratio` | 0.9 | Ratio of requests sharing prefixes (0.0-1.0) |
+| `--prefix-max-tokens` | 8000 | Maximum prefix size in tokens (increase for longer prefix tests) |
 | `--model` | Llama-3.1-8B | Model to benchmark |
 | `--client-tokenize` | off | Tokenize on client side (see [Client Tokenization](#client-tokenization)) |
 | `--debug` | off | Build with debug symbols for crash investigation |
@@ -867,6 +868,11 @@ done
 # 10. 70B model (still TBD in the docs)
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-70B-Instruct \
   --warmup --duration 15m --users 16
+
+# 11. 8B with 16K prefixes (test scaling with longer prefixes)
+#     8B has headroom (128K context on 40GB A100), 13B is limited to 8192
+./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct \
+  --warmup --duration 10m --users 20 --prefix-max-tokens 16000
 ```
 
 ---
