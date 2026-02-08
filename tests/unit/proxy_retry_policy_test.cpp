@@ -750,7 +750,7 @@ TEST_F(BackpressurePersistenceTest, ThresholdAtOneRejectsFullOnly) {
 }
 
 TEST_F(BackpressurePersistenceTest, ThresholdAtZeroRejectsAlways) {
-    // threshold = 0.0 means always reject (unless empty)
+    // threshold = 0.0 means always reject: ratio 0/100 = 0.0 >= 0.0 is true
     EXPECT_EQ(check_persistence_backpressure(0, 100, 0.0, true),
               BackpressureDecision::REJECT_PERSISTENCE_QUEUE);
     EXPECT_EQ(check_persistence_backpressure(1, 100, 0.0, true),

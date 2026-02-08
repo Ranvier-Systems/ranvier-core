@@ -1,7 +1,6 @@
 #include "http_controller.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
-#include "proxy_retry_policy.hpp"
 #include "request_rewriter.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"

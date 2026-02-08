@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <system_error>
 #include <vector>
