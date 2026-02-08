@@ -238,13 +238,7 @@ std::optional<BackendId> select_fallback_backend(
 
 // Backpressure decision logic — pure functions, no Seastar dependency.
 // These model the concurrency-limiting and queue-depth checks from handle_proxy().
-
-struct BackpressureConfig {
-    size_t max_concurrent_requests = 1000;       // 0 = unlimited
-    bool enable_persistence_backpressure = true;
-    double persistence_queue_threshold = 0.8;    // Start throttling at 80%
-    uint32_t retry_after_seconds = 1;
-};
+// Uses BackpressureConfig from config_schema.hpp (not redefined here).
 
 // Result of a backpressure check.
 enum class BackpressureDecision {
