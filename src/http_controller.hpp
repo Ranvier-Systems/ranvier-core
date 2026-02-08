@@ -6,6 +6,7 @@
 #include "connection_pool.hpp"
 #include "cross_shard_request.hpp"
 #include "metrics_service.hpp"
+#include "proxy_retry_policy.hpp"
 #include "rate_limiter.hpp"
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
