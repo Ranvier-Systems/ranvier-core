@@ -1,18 +1,14 @@
 // Ranvier Core - Rate Limiter Concurrency Stress Tests
 //
-// Exercises concurrent access to BasicRateLimiter's token buckets and
-// atomic counters from multiple threads using C++20 std::latch/std::barrier.
+// Exercises concurrent access to BasicRateLimiter from multiple threads
+// using C++20 std::latch/std::barrier.
 //
 // IMPORTANT: BasicRateLimiter's _buckets map (std::unordered_map) is NOT
 // thread-safe. In production, each Seastar shard has its own rate limiter
-// instance — no cross-shard sharing. These tests validate the atomic
-// counters (overflow_count, buckets_cleaned_total) that ARE safe for
-// concurrent access, plus scenarios where each thread operates on its
-// own rate limiter instance to verify no global state interference.
-//
-// Single-instance concurrent allow() tests use per-thread client IPs
-// to exercise the atomic overflow counter under MAX_BUCKETS pressure
-// without concurrent writes to the same bucket.
+// instance — no cross-shard sharing. Most tests give each thread its own
+// limiter to verify no global state interference. The one shared-instance
+// test (OverflowCountAtomicUnderContention) pre-fills the map so the
+// concurrent phase only reads the map + increments an atomic counter.
 
 #include "rate_limiter_core.hpp"
 #include "test_clock.hpp"
@@ -91,10 +87,8 @@ TEST_F(RateLimiterConcurrencyTest, IndependentLimitersNoInterference) {
 
 TEST_F(RateLimiterConcurrencyTest, OverflowCountAtomicUnderContention) {
     // Pre-fill a rate limiter to MAX_BUCKETS, then have multiple threads
-    // make requests with new IPs. All should increment overflow_count atomically.
-    //
-    // NOTE: Filling 100k buckets is expensive but necessary to test overflow.
-    // We use a smaller custom test to validate the atomic counter pattern.
+    // make requests with new IPs. All hit the overflow path (map read-only,
+    // atomic counter increment). Validates atomic overflow_count accuracy.
     RateLimiterConfig config;
     config.enabled = true;
     config.requests_per_second = 1000;

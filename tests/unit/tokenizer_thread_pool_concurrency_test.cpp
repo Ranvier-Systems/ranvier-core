@@ -1,16 +1,14 @@
 // Ranvier Core - Tokenizer Thread Pool Concurrency Stress Tests
 //
-// Exercises concurrent access to TokenizerWorker's SPSC queue and
-// atomic statistics counters. Since the worker requires Seastar's
-// alien API and a real tokenizer to actually process jobs, these tests
-// focus on the publicly testable concurrent behaviors:
-//   - TokenizerWorker::submit() under concurrent pressure (SPSC queue
-//     is single-producer, so we test the expected single-producer path
-//     plus the atomic counters that are read concurrently)
-//   - Atomic statistics consistency (jobs_processed, jobs_dropped,
-//     queue_full_count) under concurrent reads
-//   - ThreadPoolTokenizationConfig and should_use_thread_pool() are
-//     thread-safe (const, no shared mutable state)
+// Exercises concurrent access to TokenizerWorker's atomic statistics
+// and TokenizerThreadPool's config accessors. The worker requires
+// Seastar's alien API to start (sets _running=true), so without it
+// submit() rejects immediately. These tests focus on:
+//   - Atomic stat reads (jobs_processed, jobs_dropped, queue_full_count)
+//     concurrent with submit() rejection path
+//   - should_use_thread_pool() concurrent access (returns false without
+//     a running worker, but must not crash under contention)
+//   - Config accessor thread safety (const, no shared mutable state)
 
 #include "tokenizer_thread_pool.hpp"
 #include <gtest/gtest.h>
@@ -168,6 +166,8 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ShouldUseThreadPoolIsThreadSafe
 
 TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ConfigAccessorsAreThreadSafe) {
     // All const accessors should be safe to call concurrently.
+    // Accumulate failures per thread instead of asserting in the hot loop
+    // to avoid flooding gtest output on failure (8 threads x 10k iterations).
     ThreadPoolTokenizationConfig config;
     config.enabled = true;
     config.min_text_length = 100;
@@ -176,19 +176,26 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ConfigAccessorsAreThreadSafe) {
     TokenizerThreadPool pool(config);
 
     std::latch start_latch(kNumThreads);
+    std::atomic<int> correct_threads{0};
     std::vector<std::thread> threads;
 
     for (int t = 0; t < kNumThreads; ++t) {
-        threads.emplace_back([&pool, &start_latch]() {
+        threads.emplace_back([&pool, &start_latch, &correct_threads]() {
             start_latch.arrive_and_wait();
+            bool all_ok = true;
             for (int i = 0; i < kOpsPerThread; ++i) {
-                EXPECT_TRUE(pool.enabled());
-                EXPECT_EQ(pool.min_text_length(), 100u);
-                EXPECT_EQ(pool.max_text_length(), 50000u);
-                // Stats should be zero (no jobs submitted)
-                EXPECT_EQ(pool.jobs_submitted(), 0u);
-                EXPECT_EQ(pool.jobs_completed(), 0u);
-                EXPECT_EQ(pool.jobs_fallback(), 0u);
+                if (!pool.enabled() ||
+                    pool.min_text_length() != 100u ||
+                    pool.max_text_length() != 50000u ||
+                    pool.jobs_submitted() != 0u ||
+                    pool.jobs_completed() != 0u ||
+                    pool.jobs_fallback() != 0u) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                correct_threads.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
@@ -196,6 +203,8 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ConfigAccessorsAreThreadSafe) {
     for (auto& thread : threads) {
         thread.join();
     }
+
+    EXPECT_EQ(correct_threads.load(), kNumThreads);
 }
 
 // =============================================================================

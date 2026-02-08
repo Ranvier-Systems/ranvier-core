@@ -267,9 +267,8 @@ TEST_F(ShardLoadMetricsConcurrencyTest, SnapshotDuringConcurrentUpdates) {
         start_latch.arrive_and_wait();
         while (running.load(std::memory_order_relaxed)) {
             auto snap = metrics.snapshot();
-            // Snapshot values should be non-negative (no corruption)
-            // Since these are uint64_t, they're always >= 0, but
-            // load_score() should not produce NaN or inf
+            // load_score() computes a double from uint64_t fields —
+            // verify no NaN or Inf from corrupted counter values
             EXPECT_FALSE(std::isnan(snap.load_score()));
             EXPECT_FALSE(std::isinf(snap.load_score()));
             snapshot_count.fetch_add(1, std::memory_order_relaxed);

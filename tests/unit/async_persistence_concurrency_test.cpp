@@ -205,7 +205,7 @@ TEST_F(AsyncPersistenceConcurrencyTest, ConcurrentQueueDepthReading) {
         });
     }
 
-    // Reader threads: continuously read queue_depth and check monotonicity
+    // Reader threads: continuously read queue_depth and track peak value
     std::atomic<size_t> max_depth_seen{0};
     std::atomic<uint64_t> reads_performed{0};
     for (int r = 0; r < 2; ++r) {
@@ -277,15 +277,10 @@ TEST_F(AsyncPersistenceConcurrencyTest, ClearAllDuringConcurrentEnqueue) {
     }
 
     // After clear + remaining enqueues, the queue state is valid.
-    // The key invariant is no crash and depth + dropped accounts for all ops.
-    size_t depth = manager->queue_depth();
-    size_t dropped = manager->operations_dropped();
     // At least the ClearAllOp should be in the queue
-    EXPECT_GE(depth, 1u);
-    // Total ops accounted for (clear drains the queue, so only post-clear
-    // enqueues + ClearAllOp remain; the rest are neither queued nor dropped
-    // since clear discards them directly). Verify no impossible state.
-    EXPECT_LE(depth, manager->max_queue_depth());
+    EXPECT_GE(manager->queue_depth(), 1u);
+    // Queue depth must not exceed configured limit
+    EXPECT_LE(manager->queue_depth(), manager->max_queue_depth());
 }
 
 // =============================================================================
