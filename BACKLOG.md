@@ -1322,7 +1322,25 @@ Extend benchmarking to make it more realistic with production traces, cache pres
   _Location:_ `tests/integration/locustfile_real.py`
   _Complexity:_ Medium
 
-### 9.5 Tokenizer Performance
+### 9.5 Incomplete Request Rate Investigation
+
+- [ ] **Investigate high incomplete (timeout) rate in benchmarks (~30-37%)**
+  _Justification:_ Benchmark runs consistently show 30-37% incomplete request rate across all configurations and durations (10m and 30m). The rate is constant regardless of run length, meaning these are mid-run streaming timeouts, not end-of-test in-flight requests. At 30 users, roughly 1 in 3 requests is timing out — significant wasted compute.
+  _Investigation areas:_
+  - Determine what counts as "incomplete": check `STREAMING_TIMEOUT_SECONDS` (default 300s), `CONNECT_TIMEOUT`, and locust request failure handling in `locustfile_real.py`
+  - Verify whether the timeout threshold is appropriate for stress distribution (70% large/xlarge prefixes, 4K-8K tokens) with `max_tokens` generation on top of prefill
+  - Check if 30 concurrent users across 8 GPUs (~3.75 users/GPU) causes vLLM queuing and request drops
+  - Evaluate whether `STREAMING_TIMEOUT_SECONDS`, `max_tokens`, or other tunable parameters should be adjusted
+  _Data:_
+  - 8B, 30u, 10m: 36.4% (RR) / 33.1% (prefix)
+  - 8B, 30u, 30m: 36.8% (RR) / 29.9% (prefix)
+  - 8B, 20u, 10m: 37.0% (RR) / 32.4% (prefix)
+  - 13B, 30u, 30m: 39.7% (RR) / 34.4% (prefix)
+  _Location:_ `tests/integration/locustfile_real.py`, `scripts/bench.sh`
+  _Complexity:_ Medium
+  _Priority:_ P2 - Medium
+
+### 9.6 Tokenizer Performance
 
 - [x] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator** ✓
   _Justification:_ Cross-shard dispatch revealed memory allocation overhead in Rust tokenizer. jemalloc provides better performance for multi-threaded allocations and avoids glibc malloc contention.
@@ -1400,6 +1418,7 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P3 - Low** | Benchmark | Traffic variability - traffic pattern option | Low | |
 | **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
 | **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
+| **P2 - Medium** | Benchmark | Incomplete rate investigation - timeout tuning | Medium | |
 | **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | ✅ Done |
 | **P1 - High** | Performance | Load-aware prefix routing - backend load tracking | Medium | ✅ Done (#222) |
 | **P1 - High** | Performance | Load-aware prefix routing - load-aware selection | Medium | ✅ Done (#223) |
