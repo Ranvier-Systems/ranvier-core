@@ -4,20 +4,21 @@ This guide provides specific test scenarios, expected results, and validation cr
 
 ## TL;DR Results
 
-Prefix-aware routing with load-aware fallback vs round-robin baseline:
+Prefix-aware routing with load-aware fallback vs round-robin baseline (30-minute validated runs):
 
 | Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
 |-------|----------------|------------------------|-------------|------------|
-| CodeLlama-13b | 12% → **98%** | **93%** faster | **-76%** | **+17%** |
-| Llama-3.1-8B | 12% → **98%** | **37%** faster | — | ~same |
+| CodeLlama-13b | 12% → **98%** | **35%** faster | **-87%** | **+27%** |
+| Llama-3.1-8B | 12% → **98%** | **31%** faster | — | ~same |
 
-*Results from February 2026 with load-aware routing enabled (10-minute runs, 30 users, 8x A100).*
+*Results from February 2026 with load-aware routing enabled (30-minute validated runs, 30 users, 8x A100).*
 
 **Key wins:**
 - **8x more cache hits** — Requests routed to backends with cached KV data
-- **37-93% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
-- **Up to 76% lower tail latency** — P99 response times improve dramatically
-- **Up to 17% higher throughput** — Load-aware routing prevents backend hotspots
+- **31-43% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
+- **Up to 87% lower tail latency** — P99 response times improve dramatically for 13B
+- **Up to 27% higher throughput** — Load-aware routing prevents backend hotspots
+- **24% fewer timeouts** — Incomplete rate drops consistently
 
 **Works across prefix sharing levels:**
 
@@ -27,7 +28,7 @@ Prefix-aware routing with load-aware fallback vs round-robin baseline:
 | 70% | 93% | 42% |
 | 50% | 90% | 41% |
 
-*Cache efficiency benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes.*
+*Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes. XLarge improvement varies by instance (16-93% observed range); P99/throughput improvements are more consistent.*
 
 ---
 
@@ -165,7 +166,7 @@ The benchmark categorizes prompts into size buckets for analysis:
 | large | 2000-4000 | RAG documents, long system prompts |
 | xlarge | 4000-8000 | Large context windows |
 
-**Key insight:** XLarge prefixes show the most dramatic improvement (37-93% TTFT reduction with load-aware routing) because they save the most KV cache computation.
+**Key insight:** XLarge prefixes show the most improvement (typically 30-43% TTFT reduction) because they save the most KV cache computation.
 
 ### Using Custom Prompt Files (`--prompt-file`)
 
@@ -333,25 +334,24 @@ With client tokenization, **cache misses also get faster** because the server sk
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
 | Cache Hit Rate | ~12% | ~98% | 8x more cache hits |
-| XLarge Improvement | ~0% | **~37%** | Hit vs miss within each run |
-| Large Improvement | ~0% | **~37%** | Consistent across large buckets |
-| Incomplete Rate | ~36% | ~31% | Prefix routing more stable |
+| XLarge Improvement | ~0% | **~16-37%** | Varies by instance |
+| Incomplete Rate | ~37% | ~30-33% | Prefix routing more stable |
 | Throughput | ~57 req/s | ~57 req/s | ~same for 8B |
 
-**For 13B models, expect even larger improvements:**
+**For 13B models, expect larger improvements (especially P99 and throughput):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
-| XLarge Improvement | ~0% | **~93%** | Load-aware prevents queue buildup |
-| Overall P99 TTFT | ~4100ms | ~1000ms | **-76%** tail latency |
-| Throughput | ~41 req/s | ~47 req/s | **+17%** higher |
+| XLarge Improvement | ~0% | **~34-43%** | Instance-dependent |
+| Overall P99 TTFT | ~3500-9200ms | ~940-1200ms | **-69% to -87%** tail latency |
+| Throughput | ~32-42 req/s | ~40-47 req/s | **+7-27%** higher |
 
 **How to interpret:**
-- **Cache hit rate** is the headline metric (12% → 98%)
-- **Per-bucket improvement** shows real benefit (37% for 8B, 93% for 13B)
+- **Cache hit rate** is the headline metric (12% → 98%) — always consistent
+- **P99 tail latency** is the strongest win for 13B — consistently -69% or better
+- **Per-bucket improvement** shows XLarge benefit (~31-35% in validated 30m runs)
 - **Overall TTFT** may look worse for 8B due to small prefix overhead in aggregate
 - Focus on **Large/XLarge buckets** where caching matters most
-- **Larger models benefit dramatically** from load-aware routing under heavy concurrency
 
 ---
 
@@ -481,7 +481,7 @@ tail -f /tmp/vllm_gpu*.log
   --prompt-dist stress
 ```
 
-**Expected:** Much higher cache benefit than 8B (~93% TTFT improvement with load-aware routing at 30 users). Requires `--max-model-len 8192` on 40GB GPUs to fit in memory.
+**Expected:** Higher cache benefit than 8B (~35% XLarge TTFT improvement, up to -87% P99 and +27% throughput at 30 users). Requires `--max-model-len 8192` on 40GB GPUs to fit in memory.
 
 #### 6d. Large Model (70B parameters)
 ```bash
@@ -561,26 +561,29 @@ grep "Cache" benchmark-reports/*/benchmark.log
 
 Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
-| Model | Users | Prefix Size | Cache Miss | Cache Hit | Improvement | Notes |
-|-------|-------|-------------|------------|-----------|-------------|-------|
-| **13B** | 30 | XLarge (4-8K tokens) | ~687ms | **~50ms** | **~93%** | Feb 2026, load-aware |
-| **8B** | 30 | XLarge (4-8K tokens) | ~738ms | ~462ms | **~37%** | Feb 2026, load-aware |
-| 13B | 30 | XLarge (4-8K tokens) | ~1800ms | ~1030ms | ~43% | Jan 2026 |
-| 13B | 20 | XLarge (4-8K tokens) | ~1451ms | ~886ms | ~39% | Jan 2026 |
-| 13B | 10 | XLarge (4-8K tokens) | ~1575ms | ~816ms | ~48% | Jan 2026 |
-| 8B | 30 | XLarge (4-8K tokens) | ~655ms | ~499ms | ~26% | Jan 2026 |
-| 8B | 20 | XLarge (4-8K tokens) | ~804ms | ~453ms | ~44% | Jan 2026 |
-| 8B | 10 | XLarge (4-8K tokens) | ~580ms | ~333ms | ~43% | Jan 2026 |
-| 1B | 30 | XLarge (4-8K tokens) | ~130ms | ~130ms | ~0% | Jan 2026 |
-| 70B | - | XLarge (4-8K tokens) | TBD | TBD | Expected 50-60%+ | |
+| Model | Users | Duration | Prefix Size | Cache Miss | Cache Hit | Improvement | Notes |
+|-------|-------|----------|-------------|------------|-----------|-------------|-------|
+| **13B** | 30 | **30m** | XLarge | ~1525ms | ~992ms | **~35%** | Feb 2026, validated |
+| **8B** | 30 | **30m** | XLarge | ~674ms | ~465ms | **~31%** | Feb 2026, validated |
+| 13B | 20 | 10m | XLarge | ~1158ms | ~769ms | ~34% | Feb 2026 |
+| 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026 |
+| 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026 |
+| 13B | 30 | 10m | XLarge | ~1800ms | ~1030ms | ~43% | Jan 2026 |
+| 13B | 20 | 10m | XLarge | ~1451ms | ~886ms | ~39% | Jan 2026 |
+| 13B | 10 | 10m | XLarge | ~1575ms | ~816ms | ~48% | Jan 2026 |
+| 8B | 30 | 10m | XLarge | ~655ms | ~499ms | ~26% | Jan 2026 |
+| 8B | 20 | 10m | XLarge | ~804ms | ~453ms | ~44% | Jan 2026 |
+| 8B | 10 | 10m | XLarge | ~580ms | ~333ms | ~43% | Jan 2026 |
+| 1B | 30 | 10m | XLarge | ~130ms | ~130ms | ~0% | Jan 2026 |
+| 70B | - | - | XLarge | TBD | TBD | Expected 50-60%+ | |
 
 **Key insights:**
-- **Load-aware routing dramatically improves heavy-load results** — 13B at 30 users jumped from 43% → 93%
+- **P99 tail latency is the strongest win** — up to -87% for 13B under sustained 30-minute load
+- **XLarge improvement typically 30-43%** — varies by instance; use 30m validated runs as reference
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
 - **Small prefixes have overhead** — Routing cost exceeds cache benefit
-- **Large prefixes (4K+ tokens) show real improvement** — 37-93% TTFT reduction with load-aware routing
-- **Larger models amplify benefits** — 13B benefits far more from load-aware routing than 8B
-- **Tail latency is the big win** — P99 TTFT drops up to 76% with prefix + load-aware routing
+- **Larger models amplify benefits** — 13B sees bigger throughput/P99 gains than 8B
+- **Throughput improves for 13B** — up to +27% under sustained heavy load
 
 ### Cache Hit Rate
 
@@ -610,56 +613,82 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 > before routing. If the prefix-preferred backend is overloaded, requests fall back to the
 > least-loaded backend — accepting a cache miss for lower latency.
 
-#### Test Configuration
-```
-Duration:     10 minutes
-Users:        30 concurrent
-Distribution: stress (70% large/xlarge prefixes)
-Prefix Ratio: 0.9
-Warm-up:      yes
-```
+Results collected across two separate Lambda Labs 8x A100 instances. All runs use stress
+distribution (70% large/xlarge prefixes), prefix ratio 0.9, and warmup enabled.
 
-#### CodeLlama-13b (8192 max-model-len)
+#### 30-Minute Validated Runs (Primary Reference)
+
+These longer runs provide the most statistically reliable results.
+
+**CodeLlama-13b (30 users, 30 minutes):**
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
-| Cache Hit Rate | 12.7% | 98.0% | **+85.3%** |
-| Cache Hits | 481 | 4,570 | +850% |
-| Cache Misses | 3,308 | 95 | -97.1% |
-| XLarge Hit P50 | 897.7ms | **50.3ms** | **-94.4%** |
-| XLarge Hit P99 | 4,819ms | 1,045ms | **-78.3%** |
-| XLarge Improvement | -7.2% | **92.7%** | **+99.9pp** |
-| Large Improvement | -2.6% | **43.6%** | **+46.2pp** |
-| Overall P50 TTFT | 800ms | 750ms | **-6.2%** |
-| Overall P99 TTFT | 4,100ms | 1,000ms | **-75.6%** |
-| Throughput (req/s) | 40.6 | 47.3 | **+16.6%** |
-| Incomplete Rate | 35.9% | 25.6% | **-28.8%** |
+| Cache Hit Rate | 11.8% | 97.9% | **+86.1%** |
+| Cache Hits | 1,014 | 10,853 | +970% |
+| XLarge Improvement | -5.0% | **35.0%** | **+40.0pp** |
+| Large Improvement | -13.3% | **18.6%** | **+31.9pp** |
+| Overall P50 TTFT | 1,200ms | 870ms | **-27.5%** |
+| Overall P99 TTFT | 9,200ms | 1,200ms | **-87.0%** |
+| Throughput (req/s) | 31.6 | 40.1 | **+27.1%** |
+| Incomplete Rate | 39.7% | 34.4% | **-13.3%** |
+| Validation | **FAILED** | **PASSED** | |
 | Error Rate | 0% | 0% | — |
 
-The 50.3ms XLarge Hit P50 means the KV cache is doing nearly all the work — prefill
-computation is almost entirely skipped. This is a 94.4% reduction from the round-robin
-baseline.
+Under sustained 30-minute load, round-robin degrades badly (P99 hits 9.2 seconds) while
+prefix-aware stays at 1.2 seconds. The round-robin baseline **fails validation** while
+prefix routing passes.
 
-#### Llama-3.1-8B
+**Llama-3.1-8B (30 users, 30 minutes):**
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
-| Cache Hit Rate | 11.7% | 97.8% | **+86.1%** |
-| Cache Hits | 609 | 5,197 | +753% |
-| Cache Misses | 4,589 | 117 | -97.5% |
-| XLarge Hit P50 | 424.9ms | 462.1ms | +8.8% |
-| XLarge Hit P99 | 465.1ms | 569.9ms | +22.5% |
-| XLarge Improvement | -0.1% | **37.4%** | **+37.5pp** |
-| Large Improvement | -0.6% | **37.4%** | **+38.0pp** |
+| Cache Hit Rate | 12.3% | 98.1% | **+85.8%** |
+| Cache Hits | 1,919 | 15,963 | +732% |
+| XLarge Improvement | -0.4% | **30.9%** | **+31.4pp** |
+| Large Improvement | -0.4% | **30.9%** | **+31.3pp** |
 | Overall P50 TTFT | 420ms | 450ms | +7.1% |
-| Overall P99 TTFT | 490ms | 570ms | +16.3% |
-| Throughput (req/s) | 56.8 | 56.9 | ~same |
-| Incomplete Rate | 36.2% | 30.7% | **-15.4%** |
+| Overall P99 TTFT | 470ms | 520ms | +10.6% |
+| Throughput (req/s) | 57.1 | 58.1 | +1.6% |
+| Incomplete Rate | 36.8% | 29.9% | **-18.9%** |
 | Error Rate | 0% | 0% | — |
 
-The 8B model shows strong per-bucket improvement (37.4%) but modest overall TTFT increase.
-This is expected — the 8B is fast enough that routing overhead is noticeable in aggregate,
-but the per-bucket cache hit vs miss comparison reveals the real benefit.
+The 8B model shows consistent per-bucket improvement (31%) and a significant drop in
+incomplete rate (-19%), but overall TTFT is flat — the model is fast enough that
+routing overhead is noticeable in aggregate.
+
+#### Complete Results Matrix (All Runs)
+
+| Model | Users | Duration | XLarge Improvement | P99 TTFT Change | Throughput | Cache Hit Rate | Instance |
+|-------|-------|----------|-------------------|-----------------|------------|----------------|----------|
+| **13B** | **30** | **30m** | **35.0%** | **-87.0%** | **+27.1%** | 97.9% | 2 |
+| **8B** | **30** | **30m** | **30.9%** | +10.6% | +1.6% | 98.1% | 2 |
+| 13B | 30 | 10m | 92.7% | -75.6% | +16.6% | 98.0% | 1 |
+| 13B | 30 | 10m | -7.4% | -68.6% | +7.1% | 97.8% | 2 |
+| 13B | 20 | 10m | 33.6% | -81.2% | +12.9% | 97.3% | 2 |
+| 13B | 10 | 10m | 43.1% | -68.5% | +1.4% | 96.4% | 2 |
+| 8B | 30 | 10m | 37.4% | +16.3% | ~same | 97.8% | 1 |
+| 8B | 30 | 10m | 15.8% | 0% | +1.2% | 97.5% | 2 |
+| 8B | 20 | 10m | 29.7% | -18.3% | +1.2% | 97.9% | 2 |
+
+#### Instance-to-Instance Variance
+
+The XLarge Improvement metric shows significant variance between instances (e.g., 13B/30u
+ranges from -7.4% to 92.7%). This metric compares cache hit vs miss latency *within* a
+single prefix-aware run, making it sensitive to backend thermal state, GPU clock speeds,
+and transient queuing patterns.
+
+**Metrics that are consistent across instances:**
+- **Cache hit rate**: 96.4-98.1% (always excellent)
+- **13B P99 TTFT improvement**: -69% to -87% (always strong)
+- **13B throughput improvement**: +7% to +27% (always positive)
+- **Incomplete rate improvement**: -9% to -29% (always better)
+- **Error rate**: 0% (always clean)
+
+**Metrics that vary significantly:**
+- **XLarge TTFT Improvement**: 16-93% for 8B/13B (use 30m validated runs as reference)
+
+The 30-minute validated runs are the most reliable because they average out transient effects.
 
 #### Why 13B Benefits More Than 8B
 
@@ -673,7 +702,8 @@ but the per-bucket cache hit vs miss comparison reveals the real benefit.
 
 The 13B model's slower inference creates more backend queuing under 30 concurrent users.
 Load-aware routing prevents pile-up, letting cache hits actually deliver their latency
-benefit instead of waiting in queue.
+benefit instead of waiting in queue. This shows most clearly in the 30-minute run where
+round-robin P99 degrades to 9.2 seconds while prefix stays at 1.2 seconds.
 
 ### January 2026 — Prefix-Aware Only (No Load-Aware)
 
@@ -711,9 +741,9 @@ Prefix Ratio: 0.9
 
 1. **Cache hit rate is the headline**: 12% → 98% means nearly every request benefits from cached KV
 2. **Per-bucket improvement is the real metric**: Overall TTFT can be misleading due to small prefix overhead
-3. **Load-aware routing amplifies benefits for larger models**: 13B went from 42.9% → 92.7% XLarge improvement
-4. **Tail latency is the big win**: P99 drops 76% for 13B under heavy load
-5. **Throughput improves under load**: +16.6% for 13B because requests aren't stuck behind overloaded backends
+3. **P99 tail latency is the strongest win**: -87% under sustained 30-minute load, with round-robin failing validation
+4. **Throughput improves for larger models**: +27% for 13B because requests aren't stuck behind overloaded backends
+5. **XLarge improvement varies by instance**: Use 30-minute validated runs (31-35%) as the reliable reference
 
 ### Value Proposition
 
@@ -721,26 +751,26 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Performance by Model Size and Load
 
-| Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate | Notes |
-|-------|------|-------|----------|-------------------------|----------------|-------|
-| **CodeLlama-13b** | Heavy | 30 | 10m | **92.7%** | 98.0% | Feb 2026, load-aware |
-| **Llama-3.1-8B** | Heavy | 30 | 10m | **37.4%** | 97.8% | Feb 2026, load-aware |
-| CodeLlama-13b | Moderate | 20 | 30m | 38.9% | 97.6% | Jan 2026 |
-| CodeLlama-13b | Normal | 10 | 10m | 48.2% | 96.4% | Jan 2026 |
-| CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% | Jan 2026 |
-| Llama-3.1-8B | Moderate | 20 | 30m | 43.7% | 97.8% | Jan 2026 |
-| Llama-3.1-8B | Normal | 10 | 10m | 42.7% | 95.6% | Jan 2026 |
-| Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% | Jan 2026 |
-
-**Impact of load-aware routing (comparing Heavy/30-user runs):**
-- **CodeLlama-13b**: 42.9% → **92.7%** (+49.8pp) — load-aware eliminates queue-induced latency
-- **Llama-3.1-8B**: 25.9% → **37.4%** (+11.5pp) — moderate improvement, less queuing to begin with
+| Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate | P99 TTFT Change | Notes |
+|-------|------|-------|----------|-------------------------|----------------|-----------------|-------|
+| **CodeLlama-13b** | Heavy | 30 | **30m** | **35.0%** | 97.9% | **-87.0%** | Feb 2026, validated |
+| **Llama-3.1-8B** | Heavy | 30 | **30m** | **30.9%** | 98.1% | +10.6% | Feb 2026, validated |
+| CodeLlama-13b | Moderate | 20 | 10m | 33.6% | 97.3% | -81.2% | Feb 2026 |
+| CodeLlama-13b | Normal | 10 | 10m | 43.1% | 96.4% | -68.5% | Feb 2026 |
+| Llama-3.1-8B | Moderate | 20 | 10m | 29.7% | 97.9% | -18.3% | Feb 2026 |
+| CodeLlama-13b | Moderate | 20 | 30m | 38.9% | 97.6% | — | Jan 2026 |
+| CodeLlama-13b | Normal | 10 | 10m | 48.2% | 96.4% | — | Jan 2026 |
+| CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% | — | Jan 2026 |
+| Llama-3.1-8B | Moderate | 20 | 30m | 43.7% | 97.8% | — | Jan 2026 |
+| Llama-3.1-8B | Normal | 10 | 10m | 42.7% | 95.6% | — | Jan 2026 |
+| Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% | — | Jan 2026 |
 
 **Key takeaways:**
-- **Load-aware routing is a major win for larger models** under heavy load (92.7% for 13B)
-- **P99 tail latency** drops up to 76% — worst-case response times improve dramatically
-- **Throughput increases** up to 17% with load-aware routing preventing backend hotspots
-- **Cache hit rate** is excellent (97%+) regardless of load or model size
+- **P99 tail latency** is the strongest and most consistent win — up to -87% for 13B under sustained load
+- **Throughput increases** up to 27% for larger models under heavy load
+- **Cache hit rate** is excellent (96-98%) regardless of load, model, or instance
+- **XLarge improvement** typically ranges 30-43%, with instance-specific outliers above and below
+- **Incomplete rate** consistently drops 9-29% with prefix routing
 
 #### Impact of Prefix Sharing Ratio
 
@@ -784,11 +814,11 @@ The cache hit rate will always improve with prefix-aware routing. The TTFT benef
 
 ## Recommended Next Benchmarks
 
-The February 2026 results establish a new baseline with load-aware routing for two configurations (8B/30u, 13B/30u). The following benchmarks would fill out the comparison matrix.
+The February 2026 results cover the core matrix with load-aware routing across two instances. The following benchmarks would complete remaining gaps.
 
 ### Running with bench-runner.sh
 
-All of the runs below are built into `scripts/bench-runner.sh` as the `high`, `medium`, and `all` suites. You can run them in one go instead of invoking each manually:
+The benchmark runs below are built into `scripts/bench-runner.sh` as suites. You can run them in one go instead of invoking each manually:
 
 ```bash
 # Preview what will run
@@ -806,47 +836,25 @@ All of the runs below are built into `scripts/bench-runner.sh` as the `high`, `m
 
 The runner produces a `runner_summary_*.md` report and logs to `benchmark-reports/`. See `./scripts/bench-runner.sh --help` for all options.
 
-### High Priority
+### Completed (February 2026)
 
-These re-run previously documented January configurations to measure load-aware routing impact:
+| # | Config | Status | Result |
+|---|--------|--------|--------|
+| 1 | 13B, 20u, 10m | Done | XLarge 33.6%, P99 -81.2% |
+| 2 | 8B, 20u, 10m | Done | XLarge 29.7%, P99 -18.3% |
+| 3 | 13B, 10u, 10m | Done | XLarge 43.1%, P99 -68.5% |
+| 4 | 13B, 30u, 30m (validated) | Done | XLarge 35.0%, P99 -87.0% |
+| 5 | 8B, 30u, 30m (validated) | Done | XLarge 30.9% |
 
-```bash
-# 1. 13B at moderate load (Jan baseline: 38.9%)
-./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-  --warmup --duration 10m --users 20 --max-model-len 8192
-
-# 2. 8B at moderate load (Jan baseline: 43.7%)
-./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct \
-  --warmup --duration 10m --users 20
-
-# 3. 13B at low load (Jan baseline: 48.2%)
-./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-  --warmup --duration 10m --users 10 --max-model-len 8192
-```
-
-### Medium Priority
-
-Longer duration runs for statistical confidence, and prefix ratio variations:
+### Remaining Benchmarks
 
 ```bash
-# 4. 13B 30-minute validated run (for TL;DR "validated runs" claim)
-./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-  --warmup --duration 30m --users 30 --max-model-len 8192
-
-# 5. 8B 30-minute validated run
-./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct \
-  --warmup --duration 30m --users 30
-
-# 6-7. Prefix ratio sweep (update the prefix sharing table)
+# 6-7. Prefix ratio sweep (update the prefix sharing table with load-aware numbers)
 for ratio in 0.7 0.5; do
   ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
     --warmup --duration 10m --users 20 --prefix-ratio $ratio --max-model-len 8192
 done
-```
 
-### Lower Priority
-
-```bash
 # 8. Client tokenization comparison (update client-tokenize section)
 ./scripts/bench.sh --compare --client-tokenize \
   --model meta-llama/CodeLlama-13b-Instruct-hf \
