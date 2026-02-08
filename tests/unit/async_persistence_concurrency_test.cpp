@@ -251,7 +251,6 @@ TEST_F(AsyncPersistenceConcurrencyTest, ClearAllDuringConcurrentEnqueue) {
     // or whatever was enqueued after the clear.
     auto manager = create_manager(100000);
     std::latch start_latch(kNumThreads + 1);
-    std::atomic<bool> writers_done{false};
     std::vector<std::thread> threads;
 
     // Writer threads
@@ -278,13 +277,15 @@ TEST_F(AsyncPersistenceConcurrencyTest, ClearAllDuringConcurrentEnqueue) {
     }
 
     // After clear + remaining enqueues, the queue state is valid.
-    // The key invariant is no crash and queue_depth is consistent.
+    // The key invariant is no crash and depth + dropped accounts for all ops.
     size_t depth = manager->queue_depth();
     size_t dropped = manager->operations_dropped();
-    // depth and dropped should be non-negative (always true for size_t)
-    // The important thing is no crash or data corruption occurred.
-    EXPECT_GE(depth, 0u);
-    EXPECT_GE(dropped, 0u);
+    // At least the ClearAllOp should be in the queue
+    EXPECT_GE(depth, 1u);
+    // Total ops accounted for (clear drains the queue, so only post-clear
+    // enqueues + ClearAllOp remain; the rest are neither queued nor dropped
+    // since clear discards them directly). Verify no impossible state.
+    EXPECT_LE(depth, manager->max_queue_depth());
 }
 
 // =============================================================================

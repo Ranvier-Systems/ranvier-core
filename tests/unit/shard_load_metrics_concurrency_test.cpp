@@ -175,11 +175,6 @@ TEST_F(ShardLoadMetricsConcurrencyTest, ConcurrentMixedCounterOperations) {
     }
 
     // Threads are split across 3 operations (8 threads, ~2-3 per op)
-    uint64_t expected_per_op = 0;
-    for (int t = 0; t < kNumThreads; ++t) {
-        if (t % 3 == 0) expected_per_op++;
-    }
-    // Each group has expected_per_op threads, each doing kOpsPerThread ops
     uint64_t active_threads = 0, queued_threads = 0, total_threads = 0;
     for (int t = 0; t < kNumThreads; ++t) {
         switch (t % 3) {

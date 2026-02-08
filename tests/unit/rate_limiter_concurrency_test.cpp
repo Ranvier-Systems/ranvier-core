@@ -159,7 +159,6 @@ TEST_F(RateLimiterConcurrencyTest, ConcurrentAllowPerThreadLimiters) {
             config.burst_size = 10;
             BasicRateLimiter<> limiter(config);
 
-            bool all_ok = true;
             for (int i = 0; i < kOpsPerThread; ++i) {
                 std::string ip = "client_" + std::to_string(i);
                 limiter.allow(ip);
@@ -211,20 +210,22 @@ TEST_F(RateLimiterConcurrencyTest, ConcurrentCleanupAndOverflowReads) {
     std::latch start_latch(kNumThreads);
     std::vector<std::thread> threads;
 
-    // Reader threads: continuously read atomic counters
+    // Reader threads: continuously read atomic counters only.
+    // NOTE: bucket_count() calls _buckets.size() which is NOT safe to read
+    // concurrently with cleanup's _buckets.erase(). Only the truly atomic
+    // accessors (overflow_count, buckets_cleaned_total) are safe here.
     for (int t = 0; t < kNumThreads - 1; ++t) {
         threads.emplace_back([&limiter, &start_latch, &running]() {
             start_latch.arrive_and_wait();
             while (running.load(std::memory_order_relaxed)) {
                 [[maybe_unused]] auto overflow = limiter.overflow_count();
                 [[maybe_unused]] auto cleaned = limiter.buckets_cleaned_total();
-                [[maybe_unused]] auto count = limiter.bucket_count();
                 [[maybe_unused]] auto enabled = limiter.is_enabled();
             }
         });
     }
 
-    // Cleanup thread: runs cleanup which modifies _buckets
+    // Cleanup thread: runs cleanup which modifies _buckets (not thread-safe)
     threads.emplace_back([&limiter, &start_latch, &running]() {
         start_latch.arrive_and_wait();
         size_t cleaned = limiter.cleanup(std::chrono::seconds(0));
@@ -236,6 +237,7 @@ TEST_F(RateLimiterConcurrencyTest, ConcurrentCleanupAndOverflowReads) {
         thread.join();
     }
 
+    // Safe to read non-atomic accessor after all threads joined
     EXPECT_EQ(limiter.bucket_count(), 0u);
 }
 

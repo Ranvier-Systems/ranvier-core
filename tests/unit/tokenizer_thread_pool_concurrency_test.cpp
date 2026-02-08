@@ -162,8 +162,6 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ShouldUseThreadPoolIsThreadSafe
         thread.join();
     }
 
-    int total = false_count.load();
-    EXPECT_EQ(total, kNumThreads * kOpsPerThread);
     // Worker is not running, so all calls must return false
     EXPECT_EQ(false_count.load(), kNumThreads * kOpsPerThread);
 }
