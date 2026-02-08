@@ -339,3 +339,30 @@ Files changed:
 - `src/config_loader.cpp` — `RANVIER_RETRY_MAX_STALE` env var
 - `src/application.cpp` — Config wiring
 - `tests/unit/proxy_retry_policy_test.cpp` — 10 unit tests for detection predicate
+
+### Verification — **CONFIRMED** (2026-02-08)
+
+Benchmark run: `8B / 30 users / 5m / stress dist / prefix-ratio 0.9`
+
+```
+Total Requests:      3194
+Successful:          3194
+Failed (errors):     0
+Incomplete (total):  0      ← was 30-37%
+  incomplete_no_data:    0  ← was 100% of incompletes
+```
+
+Zero warnings in log. Fix fully eliminates the incomplete rate.
+
+**Rebased TTFT improvement (all requests now hit vLLM):**
+
+| Bucket | Improvement |
+|--------|-------------|
+| Tiny (<512 tok) | 1.9% |
+| Small (512-2K) | -7.3% |
+| Large (2K-4K) | **14.6%** |
+| XLarge (4K-8K) | **16.4%** |
+
+Previous ~48% improvement was inflated by stale connections (30-37% "free" requests
+completing in 3-24ms). Real prefix routing benefit is 14-16% for large prefixes —
+still significant, and the correct number to report.
