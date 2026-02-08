@@ -42,6 +42,9 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+# Capture original command for logging
+ORIGINAL_CMD="$0 $*"
+
 # State
 RESUME_FROM=0
 DRY_RUN=false
@@ -73,6 +76,54 @@ fmt_duration() {
     else
         echo "${s}s"
     fi
+}
+
+# Parse a duration string (e.g., "10m", "1h", "30s") to seconds
+parse_duration() {
+    local duration="$1"
+    local num="${duration%[smhSMH]}"
+    local unit="${duration##*[0-9]}"
+    case "$unit" in
+        s|S) echo "$num" ;;
+        m|M) echo $((num * 60)) ;;
+        h|H) echo $((num * 3600)) ;;
+        *)   echo "$num" ;;
+    esac
+}
+
+# Estimate total benchmark seconds for a set of bench.sh args.
+# Accounts for --duration, --compare (2x), --warmup (+70s), and vLLM startup (~300s).
+estimate_run_seconds() {
+    local args="$1"
+    local duration="5m"  # bench.sh default
+    local has_compare=false
+    local has_warmup=false
+
+    # Parse relevant flags from the arg string
+    set -- $args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --duration)  duration="$2"; shift 2 ;;
+            --compare)   has_compare=true; shift ;;
+            --warmup)    has_warmup=true; shift ;;
+            *)           shift ;;
+        esac
+    done
+
+    local secs
+    secs=$(parse_duration "$duration")
+
+    if [[ "$has_compare" == true ]]; then
+        secs=$((secs * 2 + 30))  # two benchmarks + 30s pause between
+    fi
+    if [[ "$has_warmup" == true ]]; then
+        secs=$((secs + 60 + 10))  # 1m warmup + 10s pause
+    fi
+
+    # Add estimated overhead: vLLM startup (~5min) + Ranvier startup (~30s)
+    secs=$((secs + 330))
+
+    echo "$secs"
 }
 
 # -----------------------------------------------------------------------------
@@ -265,16 +316,32 @@ fi
 if [[ "$DRY_RUN" == true ]]; then
     log_header "Dry Run - Suite: $SUITE ($TOTAL_RUNS runs)"
     echo ""
+    TOTAL_EST=0
     for ((i=0; i<TOTAL_RUNS; i++)); do
         local_num=$((i + 1))
         skip=""
         if [[ $RESUME_FROM -gt 0 && $local_num -lt $RESUME_FROM ]]; then
             skip=" ${YELLOW}(skip - before --resume $RESUME_FROM)${NC}"
         fi
-        echo -e "  ${BOLD}[$local_num/$TOTAL_RUNS]${NC} ${LABELS[$i]}${skip}"
+        EST_SECS=$(estimate_run_seconds "${RUNS[$i]}")
+        echo -e "  ${BOLD}[$local_num/$TOTAL_RUNS]${NC} ${LABELS[$i]}  ${BLUE}~$(fmt_duration $EST_SECS)${NC}${skip}"
         echo -e "           ${CYAN}./scripts/bench.sh ${RUNS[$i]}${NC}"
         echo ""
+        if [[ $RESUME_FROM -eq 0 || $local_num -ge $RESUME_FROM ]]; then
+            TOTAL_EST=$((TOTAL_EST + EST_SECS + PAUSE_BETWEEN_RUNS))
+        fi
     done
+    # Remove trailing pause (none after last run)
+    DRY_SKIP_COUNT=0
+    if [[ $RESUME_FROM -gt 0 ]]; then
+        DRY_SKIP_COUNT=$((RESUME_FROM - 1))
+    fi
+    ACTIVE_RUNS=$((TOTAL_RUNS - DRY_SKIP_COUNT))
+    if [[ $ACTIVE_RUNS -gt 0 ]]; then
+        TOTAL_EST=$((TOTAL_EST - PAUSE_BETWEEN_RUNS))
+    fi
+    echo -e "  ${BOLD}Estimated total time: $(fmt_duration $TOTAL_EST)${NC}"
+    echo ""
     log_info "Pause between runs: ${PAUSE_BETWEEN_RUNS}s"
     if [[ "$STOP_ON_FAILURE" == true ]]; then
         log_info "Will stop on first failure"
@@ -311,11 +378,33 @@ RUNNER_SUMMARY="${RUNNER_OUTPUT_DIR}/runner_summary_$(date +%Y%m%d_%H%M%S).md"
 # Log to file and terminal
 exec > >(tee -a "$RUNNER_LOG") 2>&1
 
+# Compute total estimated time
+TOTAL_EST=0
+for ((idx=0; idx<TOTAL_RUNS; idx++)); do
+    run_n=$((idx + 1))
+    if [[ $RESUME_FROM -gt 0 && $run_n -lt $RESUME_FROM ]]; then
+        continue
+    fi
+    est=$(estimate_run_seconds "${RUNS[$idx]}")
+    TOTAL_EST=$((TOTAL_EST + est + PAUSE_BETWEEN_RUNS))
+done
+# Remove trailing pause
+SKIP_COUNT=0
+if [[ $RESUME_FROM -gt 0 ]]; then
+    SKIP_COUNT=$((RESUME_FROM - 1))
+fi
+ACTIVE_RUNS=$((TOTAL_RUNS - SKIP_COUNT))
+if [[ $ACTIVE_RUNS -gt 0 ]]; then
+    TOTAL_EST=$((TOTAL_EST - PAUSE_BETWEEN_RUNS))
+fi
+
 echo "============================================="
 echo "Benchmark Runner Log"
 echo "Started: $(date)"
 echo "Host: $(hostname)"
+echo "Command: $ORIGINAL_CMD"
 echo "Suite: $SUITE ($TOTAL_RUNS runs)"
+echo "Estimated total time: $(fmt_duration $TOTAL_EST)"
 echo "============================================="
 echo ""
 
@@ -344,9 +433,24 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     fi
 
     echo ""
+
+    # Progress and ETA
+    NOW_TS=$(date +%s)
+    SUITE_ELAPSED=$((NOW_TS - RUNNER_START_TS))
+    RUN_EST=$(estimate_run_seconds "${RUNS[$i]}")
+
+    # Calculate remaining estimate: this run + future runs + pauses
+    REMAINING_EST=$RUN_EST
+    for ((k=i+1; k<TOTAL_RUNS; k++)); do
+        REMAINING_EST=$((REMAINING_EST + $(estimate_run_seconds "${RUNS[$k]}") + PAUSE_BETWEEN_RUNS))
+    done
+    ETA_TS=$((NOW_TS + REMAINING_EST))
+    ETA_TIME=$(date -d "@$ETA_TS" +%H:%M 2>/dev/null || date -r "$ETA_TS" +%H:%M 2>/dev/null || echo "")
+
     log_header "Run $RUN_NUM of $TOTAL_RUNS: ${LABELS[$i]}"
     echo -e "  ${CYAN}./scripts/bench.sh ${RUNS[$i]}${NC}"
     echo ""
+    log_info "Elapsed: $(fmt_duration $SUITE_ELAPSED) | This run: ~$(fmt_duration $RUN_EST) | Remaining: ~$(fmt_duration $REMAINING_EST)${ETA_TIME:+ | ETA: $ETA_TIME}"
 
     RUN_START_TS=$(date +%s)
 
@@ -453,6 +557,7 @@ log_info "Runner log: $RUNNER_LOG"
     echo ""
     echo "- **Date:** $(date)"
     echo "- **Host:** $(hostname)"
+    echo "- **Command:** \`$ORIGINAL_CMD\`"
     echo "- **Suite:** $SUITE ($TOTAL_RUNS runs)"
     echo "- **Total duration:** $(fmt_duration $RUNNER_ELAPSED)"
     echo "- **Results:** $PASSED passed, $FAILED failed, $SKIPPED skipped"
