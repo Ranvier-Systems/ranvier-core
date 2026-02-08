@@ -7,7 +7,8 @@ This test suite validates failure handling and resilience behaviors:
 2. Backend flap: Circuit breaker engagement on rapid backend restarts
 3. Config reload: Invalid YAML rejected, old config preserved on SIGHUP
 4. Rate limit: 503 responses with Retry-After when rate limits exceeded
-5. Oversized request: Rejection of request bodies exceeding max size
+5a. Stale connection retry: Phase 3.5 detects and retries on fresh connection
+5b. Oversized request: Rejection of request bodies exceeding max size
 
 All tests use Docker Compose (docker-compose.test.yml) with a 3-node cluster
 and mock backends, following the same pattern as the existing happy-path suites.
@@ -929,10 +930,146 @@ class NegativePathTest(unittest.TestCase):
         print("  PASSED: Rate limiting enforced with Retry-After header")
 
     # =========================================================================
-    # Test 5: Oversized Request Body
+    # Test 5a: Stale Connection Retry
     # =========================================================================
 
-    def test_05_oversized_request_body(self):
+    def test_05a_stale_connection_retry(self):
+        """Verify Ranvier detects stale pooled connections and retries on fresh ones.
+
+        Scenario:
+        1. Enable keep-alive on mock backends (so Ranvier pools connections)
+        2. Send warmup requests to establish pooled connections
+        3. Restart a backend container (kills TCP connections from backend side,
+           but Ranvier's pool still holds the now-stale connection handles)
+        4. Send requests — Ranvier uses stale connection, gets empty response,
+           Phase 3.5 detects 0 bytes written and retries on a fresh connection
+        5. Assert: requests succeed AND stale_connection_retries_total incremented
+        """
+        print("\nTest: Stale connection retry (Phase 3.5)")
+
+        node1_api = NODES["node1"]["api"]
+        node1_metrics = NODES["node1"]["metrics"]
+
+        # Backend direct endpoints (for admin control, bypassing Ranvier)
+        backend1_direct = f"http://{DOCKER_HOST}:21434"
+        backend2_direct = f"http://{DOCKER_HOST}:21435"
+
+        # Step 1: Enable keep-alive on both backends so Ranvier pools connections
+        print("  Enabling keep-alive on mock backends...")
+        try:
+            r1 = requests.post(f"{backend1_direct}/admin/keepalive?enabled=1", timeout=5)
+            r2 = requests.post(f"{backend2_direct}/admin/keepalive?enabled=1", timeout=5)
+            self.assertEqual(r1.status_code, 200, "Failed to enable keepalive on backend1")
+            self.assertEqual(r2.status_code, 200, "Failed to enable keepalive on backend2")
+            print("    Keep-alive enabled on both backends")
+        except requests.exceptions.RequestException as e:
+            self.fail(f"Could not reach mock backends for admin control: {e}")
+
+        try:
+            # Step 2: Send warmup requests to establish pooled connections
+            print("  Sending warmup requests to establish pooled connections...")
+            for i in range(4):
+                status, body, _ = send_chat_request(node1_api, f"stale-warmup-{i}", timeout=10)
+                self.assertEqual(status, 200, f"Warmup request {i} should succeed, got {status}")
+            time.sleep(1)  # Let connections settle in pool
+
+            # Capture initial retry metric
+            initial_retries = get_metric_value(node1_metrics, "stale_connection_retries") or 0
+            initial_success = get_metric_value(node1_metrics, "http_requests_success") or 0
+            print(f"  Initial stale_connection_retries: {initial_retries}")
+            print(f"  Initial http_requests_success: {initial_success}")
+
+            # Step 3: Restart backend containers to kill TCP connections
+            # Ranvier's pool still holds the now-dead connection handles
+            print("  Restarting backend containers to create stale connections...")
+            for container in [CONTAINER_NAMES["backend1"], CONTAINER_NAMES["backend2"]]:
+                result = subprocess.run(
+                    ["docker", "restart", container],
+                    capture_output=True, text=True, timeout=30
+                )
+                self.assertEqual(result.returncode, 0, f"Failed to restart {container}")
+            print("    Backends restarted")
+
+            # Wait for backends to come back up
+            print("  Waiting for backends to become healthy...")
+            for url in [backend1_direct, backend2_direct]:
+                healthy = False
+                for attempt in range(20):
+                    try:
+                        resp = requests.get(f"{url}/health", timeout=2)
+                        if resp.status_code == 200:
+                            healthy = True
+                            break
+                    except requests.exceptions.RequestException:
+                        pass
+                    time.sleep(0.5)
+                self.assertTrue(healthy, f"Backend at {url} did not recover after restart")
+
+            # Re-enable keep-alive after restart (state is reset)
+            requests.post(f"{backend1_direct}/admin/keepalive?enabled=1", timeout=5)
+            requests.post(f"{backend2_direct}/admin/keepalive?enabled=1", timeout=5)
+
+            # Step 4: Send requests — these should hit stale pooled connections
+            # Phase 3.5 should detect the empty response and retry on fresh connections
+            print("  Sending requests (should trigger stale connection retry)...")
+            success_count = 0
+            for i in range(6):
+                status, body, _ = send_chat_request(node1_api, f"stale-test-{i}", timeout=15)
+                if status == 200 and "backend" in body.lower():
+                    success_count += 1
+                print(f"    Request {i}: status={status}, has_body={'yes' if body else 'no'}")
+
+            # Step 5: Verify results
+            time.sleep(1)  # Let metrics settle
+
+            final_retries = get_metric_value(node1_metrics, "stale_connection_retries") or 0
+            final_success = get_metric_value(node1_metrics, "http_requests_success") or 0
+            retry_delta = final_retries - initial_retries
+            success_delta = final_success - initial_success
+
+            print(f"\n  Results:")
+            print(f"    Successful responses: {success_count}/6")
+            print(f"    stale_connection_retries delta: {retry_delta}")
+            print(f"    http_requests_success delta: {success_delta}")
+
+            # At least some requests should have succeeded
+            self.assertGreater(
+                success_count, 0,
+                "At least some requests should succeed after stale retry"
+            )
+
+            # The stale retry metric should have incremented
+            # (Ranvier detected stale connections and retried)
+            self.assertGreater(
+                retry_delta, 0,
+                f"stale_connection_retries should increment when pooled connections are stale "
+                f"(was {initial_retries}, now {final_retries}). "
+                f"If 0, Ranvier may not have pooled keep-alive connections."
+            )
+
+            print(f"  PASSED: Stale connections detected and retried ({retry_delta} retries, "
+                  f"{success_count}/6 succeeded)")
+
+        finally:
+            # Restore Connection: close mode on backends
+            print("  Restoring Connection: close on backends...")
+            for url in [backend1_direct, backend2_direct]:
+                try:
+                    requests.post(f"{url}/admin/keepalive?enabled=0", timeout=5)
+                except requests.exceptions.RequestException:
+                    pass
+
+            # Verify cluster is healthy after test
+            time.sleep(2)
+            status, _, _ = send_chat_request(node1_api, "post-stale-check", timeout=10)
+            if status != 200:
+                print(f"  Warning: Post-stale-test request returned {status}")
+
+    # =========================================================================
+    # Test 5b: Oversized Request Body
+    # =========================================================================
+
+    def test_05b_oversized_request_body(self):
         """Send an oversized request via raw socket with fraudulent Content-Length
         to verify the server handles it gracefully without crashing.
 
@@ -1063,6 +1200,7 @@ def main():
     print("  - Circuit breaker engagement on backend flapping")
     print("  - Config reload rejection for invalid YAML")
     print("  - Rate limiting enforcement")
+    print("  - Stale pooled connection retry")
     print("  - Oversized request rejection")
     print("")
 
