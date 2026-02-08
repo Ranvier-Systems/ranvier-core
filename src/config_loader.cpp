@@ -712,6 +712,7 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.retry.max_backoff = std::chrono::milliseconds(r["max_backoff_ms"].as<int>());
             }
             if (r["backoff_multiplier"]) config.retry.backoff_multiplier = r["backoff_multiplier"].as<double>();
+            if (r["max_stale_retries"]) config.retry.max_stale_retries = r["max_stale_retries"].as<uint32_t>();
         }
 
         // Circuit breaker section
