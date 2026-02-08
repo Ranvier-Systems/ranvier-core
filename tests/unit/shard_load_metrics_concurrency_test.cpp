@@ -9,6 +9,7 @@
 #include "shard_load_metrics.hpp"
 #include <gtest/gtest.h>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <latch>
 #include <barrier>

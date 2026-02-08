@@ -227,12 +227,11 @@ TEST_F(RateLimiterConcurrencyTest, ConcurrentCleanupAndOverflowReads) {
         });
     }
 
-    // Cleanup thread: runs cleanup which modifies _buckets and updates atomic
+    // Cleanup thread: runs cleanup which modifies _buckets
     threads.emplace_back([&limiter, &start_latch, &running]() {
         start_latch.arrive_and_wait();
         size_t cleaned = limiter.cleanup(std::chrono::seconds(0));
         EXPECT_EQ(cleaned, 1000u);
-        limiter.add_buckets_cleaned(cleaned);
         running.store(false, std::memory_order_relaxed);
     });
 
@@ -241,7 +240,6 @@ TEST_F(RateLimiterConcurrencyTest, ConcurrentCleanupAndOverflowReads) {
     }
 
     EXPECT_EQ(limiter.bucket_count(), 0u);
-    EXPECT_EQ(limiter.buckets_cleaned_total(), 1000u);
 }
 
 // =============================================================================
