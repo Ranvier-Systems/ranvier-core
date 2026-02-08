@@ -31,15 +31,14 @@ protected:
     static constexpr int kSubmitOps = 10'000;
 };
 
-TEST_F(TokenizerWorkerConcurrencyTest, ConcurrentSubmitToFullQueue) {
-    // Single producer submits to a small queue until full.
-    // Multiple readers concurrently check statistics.
-    // The SPSC queue only supports one producer, so we test one writer
-    // plus concurrent stat readers.
+TEST_F(TokenizerWorkerConcurrencyTest, ConcurrentSubmitAndStatReads) {
+    // Single producer submits (all rejected since worker not started).
+    // Multiple readers concurrently check atomic statistics.
+    // Validates no data race between submit rejection path and stat reads.
     constexpr size_t kSmallQueue = 64;
     TokenizerWorker worker(0, kSmallQueue);
-    // Worker is not started (no alien instance), so jobs accumulate
-    // in the queue but are never consumed.
+    // Worker is not started (requires Seastar alien instance), so submit()
+    // returns false immediately (guarded by _running check).
 
     std::atomic<bool> running{true};
     std::latch start_latch(kNumReaders + 1);
@@ -61,10 +60,9 @@ TEST_F(TokenizerWorkerConcurrencyTest, ConcurrentSubmitToFullQueue) {
         });
     }
 
-    // Single producer thread (SPSC queue supports only one producer)
-    uint64_t submitted = 0;
+    // Single producer thread (all submits rejected: worker not running)
     uint64_t rejected = 0;
-    threads.emplace_back([&worker, &start_latch, &running, &submitted, &rejected]() {
+    threads.emplace_back([&worker, &start_latch, &running, &rejected]() {
         start_latch.arrive_and_wait();
         for (int i = 0; i < kSubmitOps; ++i) {
             TokenizationJob job;
@@ -72,9 +70,7 @@ TEST_F(TokenizerWorkerConcurrencyTest, ConcurrentSubmitToFullQueue) {
             job.text = "test text " + std::to_string(i);
             job.source_shard = 0;
 
-            if (worker.submit(std::move(job))) {
-                submitted++;
-            } else {
+            if (!worker.submit(std::move(job))) {
                 rejected++;
             }
         }
@@ -85,10 +81,11 @@ TEST_F(TokenizerWorkerConcurrencyTest, ConcurrentSubmitToFullQueue) {
         thread.join();
     }
 
-    // Queue is bounded, so most should be rejected (worker not consuming)
-    EXPECT_LE(submitted, kSmallQueue);
-    EXPECT_EQ(submitted + rejected, static_cast<uint64_t>(kSubmitOps));
+    // All submits rejected (worker not running)
+    EXPECT_EQ(rejected, static_cast<uint64_t>(kSubmitOps));
     EXPECT_GT(reads_performed.load(), 0u);
+    // Stats remain at zero (no jobs were processed)
+    EXPECT_EQ(worker.jobs_processed(), 0u);
 }
 
 TEST_F(TokenizerWorkerConcurrencyTest, StatisticsAreConsistentUnderContention) {
@@ -136,8 +133,9 @@ protected:
 };
 
 TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ShouldUseThreadPoolIsThreadSafe) {
-    // should_use_thread_pool() is const and accesses only _config fields.
-    // Verify it doesn't crash under concurrent access.
+    // should_use_thread_pool() checks config AND worker readiness.
+    // Without a running worker, it always returns false. We verify it
+    // doesn't crash under concurrent access and returns consistent results.
     ThreadPoolTokenizationConfig config;
     config.enabled = true;
     config.min_text_length = 256;
@@ -145,18 +143,15 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ShouldUseThreadPoolIsThreadSafe
     TokenizerThreadPool pool(config);
 
     std::latch start_latch(kNumThreads);
-    std::atomic<int> true_count{0};
     std::atomic<int> false_count{0};
     std::vector<std::thread> threads;
 
     for (int t = 0; t < kNumThreads; ++t) {
-        threads.emplace_back([&pool, &start_latch, &true_count, &false_count, t]() {
+        threads.emplace_back([&pool, &start_latch, &false_count, t]() {
             start_latch.arrive_and_wait();
             for (int i = 0; i < kOpsPerThread; ++i) {
                 size_t len = (t * kOpsPerThread + i) % 100000;
-                if (pool.should_use_thread_pool(len)) {
-                    true_count.fetch_add(1, std::memory_order_relaxed);
-                } else {
+                if (!pool.should_use_thread_pool(len)) {
                     false_count.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -167,12 +162,10 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ShouldUseThreadPoolIsThreadSafe
         thread.join();
     }
 
-    int total = true_count.load() + false_count.load();
+    int total = false_count.load();
     EXPECT_EQ(total, kNumThreads * kOpsPerThread);
-    // With config enabled and text lengths spanning [0, 100000),
-    // some should qualify and some should not
-    EXPECT_GT(true_count.load(), 0);
-    EXPECT_GT(false_count.load(), 0);
+    // Worker is not running, so all calls must return false
+    EXPECT_EQ(false_count.load(), kNumThreads * kOpsPerThread);
 }
 
 TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ConfigAccessorsAreThreadSafe) {
@@ -211,30 +204,27 @@ TEST_F(TokenizerThreadPoolConfigConcurrencyTest, ConfigAccessorsAreThreadSafe) {
 // TokenizerWorker Queue Boundary Tests Under Contention
 // =============================================================================
 
-TEST_F(TokenizerWorkerConcurrencyTest, SubmitExactlyFillsQueue) {
-    // Submit exactly queue_size items. All should succeed.
+TEST_F(TokenizerWorkerConcurrencyTest, SubmitRejectsWhenNotRunning) {
+    // submit() guards on _running. When worker is not started, all submits
+    // are rejected. This is the expected safety behavior.
     constexpr size_t kQueueSize = 128;
     TokenizerWorker worker(0, kQueueSize);
 
-    uint64_t accepted = 0;
+    // Worker not started - submit must return false
+    EXPECT_FALSE(worker.is_running());
+
+    uint64_t rejected = 0;
     for (size_t i = 0; i < kQueueSize; ++i) {
         TokenizationJob job;
         job.job_id = i;
         job.text = "text";
         job.source_shard = 0;
-        if (worker.submit(std::move(job))) {
-            accepted++;
+        if (!worker.submit(std::move(job))) {
+            rejected++;
         }
     }
 
-    EXPECT_EQ(accepted, kQueueSize);
-
-    // One more should fail
-    TokenizationJob overflow_job;
-    overflow_job.job_id = kQueueSize;
-    overflow_job.text = "overflow";
-    overflow_job.source_shard = 0;
-    EXPECT_FALSE(worker.submit(std::move(overflow_job)));
+    EXPECT_EQ(rejected, kQueueSize);
 }
 
 TEST_F(TokenizerWorkerConcurrencyTest, SubmitAndReadStatsNoCrash) {
