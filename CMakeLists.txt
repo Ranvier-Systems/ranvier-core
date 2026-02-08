@@ -580,6 +580,37 @@ target_link_libraries(proxy_retry_policy_test
 )
 gtest_discover_tests(proxy_retry_policy_test)
 
+# ShardLoadMetrics Concurrency Stress Tests (Pure C++, uses stubs for Seastar)
+# Tests concurrent atomic increment/decrement, RAII guard balance, and snapshot under contention
+add_executable(shard_load_metrics_concurrency_test
+  tests/unit/shard_load_metrics_concurrency_test.cpp
+)
+target_include_directories(shard_load_metrics_concurrency_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(shard_load_metrics_concurrency_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(shard_load_metrics_concurrency_test)
+
+# Rate Limiter Concurrency Stress Tests (Pure C++, no Seastar dependency)
+# Tests atomic overflow counter under MAX_BUCKETS pressure, concurrent allow() with unique IPs,
+# and concurrent cleanup/config reads with TestClock
+add_executable(rate_limiter_concurrency_test
+  tests/unit/rate_limiter_concurrency_test.cpp
+)
+target_include_directories(rate_limiter_concurrency_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(rate_limiter_concurrency_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(rate_limiter_concurrency_test)
+
 # ShardedConfig Unit Tests (Requires Seastar types for header includes)
 # Tests ShardedConfig wrapper class for per-core config distribution
 if(Seastar_FOUND)
@@ -766,4 +797,42 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(router_service_test)
+
+    # AsyncPersistence Concurrency Stress Tests (Requires Seastar types)
+    # Tests concurrent enqueue from multiple threads, backpressure enforcement,
+    # queue depth accounting, and ClearAll under contention
+    add_executable(async_persistence_concurrency_test
+      tests/unit/async_persistence_concurrency_test.cpp
+      src/async_persistence.cpp
+      src/sqlite_persistence.cpp
+    )
+    target_include_directories(async_persistence_concurrency_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${SQLITE3_INCLUDE_DIRS}
+    )
+    target_link_libraries(async_persistence_concurrency_test
+      PRIVATE
+      Seastar::seastar
+      ${SQLITE3_LIBRARIES}
+      GTest::gtest_main
+      GTest::gmock
+    )
+    gtest_discover_tests(async_persistence_concurrency_test)
+
+    # TokenizerThreadPool Concurrency Stress Tests (Requires Seastar types)
+    # Tests concurrent SPSC queue submit and stat reads, config accessor thread safety,
+    # and queue boundary behavior under contention
+    add_executable(tokenizer_thread_pool_concurrency_test
+      tests/unit/tokenizer_thread_pool_concurrency_test.cpp
+      src/tokenizer_thread_pool.cpp
+    )
+    target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(tokenizer_thread_pool_concurrency_test
+      PRIVATE
+      Seastar::seastar
+      tokenizers_cpp
+      GTest::gtest_main
+    )
+    gtest_discover_tests(tokenizer_thread_pool_concurrency_test)
 endif()
