@@ -1340,8 +1340,8 @@ Extend benchmarking to make it more realistic with production traces, cache pres
   - `scripts/bench.sh` — `--max-tokens` flag
   _Investigation report:_ `.dev-context/investigations/benchmark-timeout-investigation.md`
   _Complexity:_ Medium
-  _Status:_ Fix implemented. Awaiting verification in benchmark run (expect incomplete rate to drop to near-zero).
-  _Priority:_ P2 - Medium
+  _Verified:_ 2026-02-08 — 8B/30u/5m/stress benchmark: 3194/3194 successful, 0 incomplete, 0 failed (was 30-37% incomplete). Debug logging (`no_data` warnings) can now be removed.
+  _Priority:_ P2 - Medium (CLOSED)
 
 ### 9.6 Tokenizer Performance
 
