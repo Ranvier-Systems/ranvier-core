@@ -1357,7 +1357,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
             log_proxy.warn("[{}] Backend connection error occurred", ctx->request_id);
             metrics().record_connection_error();
             co_await write_client_error(client_out, "Backend connection lost");
-        } else if (!ctx->connection_failed) {
+        } else if (ctx->connection_failed) {
+            log_proxy.warn("[{}] Backend connection failed during stale retry", ctx->request_id);
+            metrics().record_failure();
+            co_await write_client_error(client_out, "Backend connection failed");
+        } else {
             log_proxy.info("[{}] Request completed successfully", ctx->request_id);
             metrics().record_success();
         }
