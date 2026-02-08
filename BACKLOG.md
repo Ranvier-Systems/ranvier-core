@@ -1324,20 +1324,23 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 
 ### 9.5 Incomplete Request Rate Investigation
 
-- [ ] **Investigate high incomplete (timeout) rate in benchmarks (~30-37%)**
-  _Justification:_ Benchmark runs consistently show 30-37% incomplete request rate across all configurations and durations (10m and 30m). The rate is constant regardless of run length, meaning these are mid-run streaming timeouts, not end-of-test in-flight requests. At 30 users, roughly 1 in 3 requests is timing out — significant wasted compute.
-  _Investigation areas:_
-  - Determine what counts as "incomplete": check `STREAMING_TIMEOUT_SECONDS` (default 300s), `CONNECT_TIMEOUT`, and locust request failure handling in `locustfile_real.py`
-  - Verify whether the timeout threshold is appropriate for stress distribution (70% large/xlarge prefixes, 4K-8K tokens) with `max_tokens` generation on top of prefill
-  - Check if 30 concurrent users across 8 GPUs (~3.75 users/GPU) causes vLLM queuing and request drops
-  - Evaluate whether `STREAMING_TIMEOUT_SECONDS`, `max_tokens`, or other tunable parameters should be adjusted
-  _Data:_
-  - 8B, 30u, 10m: 36.4% (RR) / 33.1% (prefix)
-  - 8B, 30u, 30m: 36.8% (RR) / 29.9% (prefix)
-  - 8B, 20u, 10m: 37.0% (RR) / 32.4% (prefix)
-  - 13B, 30u, 30m: 39.7% (RR) / 34.4% (prefix)
-  _Location:_ `tests/integration/locustfile_real.py`, `scripts/bench.sh`
+- [x] **Investigate high incomplete (timeout) rate in benchmarks (~30-37%)** ✓
+  _Root cause:_ Stale pooled connections. Ranvier's connection pool returned TCP connections where vLLM had already closed its end, but `is_half_open()` didn't detect it. The proxy sent HTTP 200 to the client, forwarded the request on a dead socket, got immediate EOF, and recorded "success" with an empty body. Sub-categorization revealed 100% of incompletes were `no_data` with 3-24ms response times (too fast for vLLM — confirms Ranvier-side issue).
+  _Fix:_ Phase 3.5 stale connection retry in `http_controller.cpp`. After streaming completes with 0 bytes written and no error flags, close the dead connection and retry once on a fresh connection via `ConnectionPool::get_fresh()`. Transparent to client (HTTP 200 already sent, no body data yet).
+  _Changes:_
+  - `src/http_controller.{hpp,cpp}` — Phase 3.5 retry logic, `ProxyContext` tracking fields
+  - `src/connection_pool.hpp` — `get_fresh()` method, `create_connection()` refactor
+  - `src/proxy_retry_policy.hpp` — `should_retry_stale_connection()` pure function
+  - `src/metrics_service.hpp` — `stale_connection_retries_total` counter
+  - `src/config_schema.hpp`, `src/config_loader.cpp`, `src/application.cpp` — config wiring (`RANVIER_RETRY_MAX_STALE` env var, `retry.max_stale_retries` YAML)
+  - `tests/unit/proxy_retry_policy_test.cpp` — 10 unit tests for detection predicate
+  - `tests/integration/test_negative_paths.py` — `test_05a_stale_connection_retry` integration test
+  - `tests/integration/mock_backend.py` — keep-alive admin endpoint for testing
+  - `tests/integration/locustfile_real.py` — incomplete sub-categorization, `MAX_OUTPUT_TOKENS` env var, diagnostic logging
+  - `scripts/bench.sh` — `--max-tokens` flag
+  _Investigation report:_ `.dev-context/investigations/benchmark-timeout-investigation.md`
   _Complexity:_ Medium
+  _Status:_ Fix implemented. Awaiting verification in benchmark run (expect incomplete rate to drop to near-zero).
   _Priority:_ P2 - Medium
 
 ### 9.6 Tokenizer Performance
