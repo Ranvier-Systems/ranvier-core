@@ -569,6 +569,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 13B | 20 | 10m | XLarge | ~1158ms | ~769ms | ~34% | Feb 2026 |
 | 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026 |
 | 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026 |
+| 8B (16K pfx) | 20 | 10m | XLarge | ~817ms | ~461ms | **~44%** | Feb 2026, `--prefix-max-tokens 16000` |
 | 13B | 30 | 10m | XLarge | ~1800ms | ~1030ms | ~43% | Jan 2026 |
 | 13B | 20 | 10m | XLarge | ~1451ms | ~886ms | ~39% | Jan 2026 |
 | 13B | 10 | 10m | XLarge | ~1575ms | ~816ms | ~48% | Jan 2026 |
@@ -671,6 +672,7 @@ routing overhead is noticeable in aggregate.
 | 8B | 30 | 10m | 37.4% | +16.3% | ~same | 97.8% | 1 |
 | 8B | 30 | 10m | 15.8% | 0% | +1.2% | 97.5% | 2 |
 | 8B | 20 | 10m | 29.7% | -18.3% | +1.2% | 97.9% | 2 |
+| 8B (16K pfx) | 20 | 10m | **43.6%** | -24.6% | +0.9% | 97.7% | 2 |
 
 #### Instance-to-Instance Variance
 
@@ -705,6 +707,27 @@ The 13B model's slower inference creates more backend queuing under 30 concurren
 Load-aware routing prevents pile-up, letting cache hits actually deliver their latency
 benefit instead of waiting in queue. This shows most clearly in the 30-minute run where
 round-robin P99 degrades to 9.2 seconds while prefix stays at 1.2 seconds.
+
+#### Impact of Prefix Size (8K vs 16K tokens)
+
+The default benchmark uses prefixes up to 8K tokens. Testing with `--prefix-max-tokens 16000`
+shows that longer prefixes amplify the benefit of prefix-aware routing:
+
+| Max Prefix | XLarge Miss P50 | XLarge Hit P50 | XLarge Improvement | P99 TTFT Change |
+|-----------|-----------------|----------------|-------------------|-----------------|
+| 8K (default) | 638ms | 448ms | 29.7% | -18.3% |
+| **16K** | 817ms | 461ms | **43.6%** | **-24.6%** |
+
+*Both runs: 8B model, 20 users, 10 minutes, Instance 2.*
+
+Cache hits stay fast (~450-460ms) regardless of prefix length — the KV cache eliminates
+prefill computation. But cache misses get slower with longer prefixes (more tokens to
+compute), widening the gap. The +13.9pp improvement demonstrates that **production RAG
+workloads with 16K+ token contexts will see larger benefits than the default benchmarks
+suggest**.
+
+> **Note:** Only the 8B model was tested at 16K because the 13B model is limited to
+> `--max-model-len 8192` on 40GB A100s due to VRAM constraints.
 
 ### January 2026 — Prefix-Aware Only (No Load-Aware)
 
@@ -846,6 +869,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 3 | 13B, 10u, 10m | Done | XLarge 43.1%, P99 -68.5% |
 | 4 | 13B, 30u, 30m (validated) | Done | XLarge 35.0%, P99 -87.0% |
 | 5 | 8B, 30u, 30m (validated) | Done | XLarge 30.9% |
+| 11 | 8B, 20u, 10m, 16K prefix | Done | XLarge 43.6%, P99 -24.6% |
 
 ### Remaining Benchmarks
 
