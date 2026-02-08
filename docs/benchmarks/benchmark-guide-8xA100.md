@@ -20,13 +20,13 @@ Prefix-aware routing with load-aware fallback vs round-robin baseline (30-minute
 - **Up to 27% higher throughput** — Load-aware routing prevents backend hotspots
 - **24% fewer timeouts** — Incomplete rate drops consistently
 
-**Works across prefix sharing levels:**
+**Works across prefix sharing levels (13B, 20 users, 10m):**
 
-| Prefix Sharing | Cache Hit Rate | Improvement |
-|----------------|----------------|-------------|
-| 90% | 98% | 39% |
-| 70% | 93% | 42% |
-| 50% | 90% | 41% |
+| Prefix Sharing | Cache Hit Rate | XLarge Improvement | P99 TTFT |
+|----------------|----------------|--------------------|----------|
+| 90% (default) | 97% | 34% | -81% |
+| 70% | 93% | 33% | -76% |
+| 50% | 90% | 44% | -82% |
 
 *Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes. XLarge improvement varies by instance (16-93% observed range); P99/throughput improvements are more consistent.*
 
@@ -150,10 +150,11 @@ Controls what **percentage of requests share a common system prompt**:
 
 **How it works:** When generating a prompt, there's a 90% chance (at 0.9) it picks from a pool of shared system prompts. This simulates real-world patterns where many users share the same system prompt (e.g., "You are a helpful assistant...") but have different user queries.
 
-**Expected cache hit rates with prefix-aware routing:**
-- `--prefix-ratio 0.5` → ~50% cache hit rate
-- `--prefix-ratio 0.9` → ~90%+ cache hit rate
-- Round-robin baseline → ~12.5% (1/8 chance with 8 backends)
+**Measured cache hit rates with prefix-aware routing (Feb 2026):**
+- `--prefix-ratio 0.5` → ~90% cache hit rate
+- `--prefix-ratio 0.7` → ~93% cache hit rate
+- `--prefix-ratio 0.9` → ~97-98% cache hit rate
+- Round-robin baseline → ~11-13% (1/8 chance with 8 backends)
 
 ### Token Size Buckets
 
@@ -229,19 +230,24 @@ The `--client-tokenize` flag moves tokenization from Ranvier to the benchmark cl
 
 ### Trade-offs by Model Size
 
-Results from 30-minute benchmarks at 20 users:
-
-#### CodeLlama-13b
+#### CodeLlama-13b (February 2026 — 30 users, 10 minutes)
 
 | Metric | Server Tokenize | Client Tokenize | Difference |
 |--------|-----------------|-----------------|------------|
-| Routing overhead | ~17ms | ~0.4ms | **44x lower** |
-| Throughput (req/s) | 25.4 | 31.1 | **+22%** |
-| XLarge Improvement % | 38.9% | 4.1% | See below |
-| XLarge Hit P50 | 886ms | 733ms | -17% |
-| XLarge Miss P50 | 1451ms | 764ms | -47% |
+| Routing overhead | ~10-12ms | ~0.4ms | **25-30x lower** |
+| Throughput (req/s) | 40.1 | 47.8 | **-6.4%** (see note) |
+| XLarge Improvement % | ~35% | 24.8% | Lower (see below) |
+| XLarge Hit P50 | ~992ms | 802ms | -19% |
+| XLarge Miss P50 | ~1525ms | 1065ms | -30% |
+| P99 TTFT Change | **-87%** | -30% | Less P99 benefit |
+| Cache Hit Rate | 97.9% | 97.8% | Same |
 
-#### Llama-3.1-8B
+> **Note on throughput:** The client tokenization run used 30 users and showed 47.8 req/s
+> prefix-aware vs 51.1 req/s round-robin (-6.4%). This is the prefix-aware vs round-robin
+> comparison, not server vs client tokenization. The overhead reduction doesn't offset
+> routing's per-request cost at this concurrency level.
+
+#### Llama-3.1-8B (January 2026 — 20 users, 30 minutes)
 
 | Metric | Server Tokenize | Client Tokenize | Difference |
 |--------|-----------------|-----------------|------------|
@@ -250,8 +256,6 @@ Results from 30-minute benchmarks at 20 users:
 | XLarge Improvement % | 43.7% | 36.0% | See below |
 | XLarge Hit P50 | 453ms | 451ms | ~same |
 | XLarge Miss P50 | 804ms | 705ms | -12% |
-
-**Why throughput differs by model:** The 8B model is faster overall (~450ms vs ~900ms for 13B), so the 15-17ms tokenization overhead is a smaller percentage of total request time. For slower models, client tokenization provides a bigger throughput boost.
 
 ### Why XLarge Improvement % Drops
 
@@ -570,6 +574,9 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026 |
 | 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026 |
 | 8B (16K pfx) | 20 | 10m | XLarge | ~817ms | ~461ms | **~44%** | Feb 2026, `--prefix-max-tokens 16000` |
+| 13B (ratio 0.7) | 20 | 10m | XLarge | ~1123ms | ~748ms | ~33% | Feb 2026, `--prefix-ratio 0.7` |
+| 13B (ratio 0.5) | 20 | 10m | XLarge | ~1523ms | ~861ms | ~44% | Feb 2026, `--prefix-ratio 0.5` |
+| 13B (client tok) | 30 | 10m | XLarge | ~1065ms | ~802ms | ~25% | Feb 2026, `--client-tokenize` |
 | 13B | 30 | 10m | XLarge | ~1800ms | ~1030ms | ~43% | Jan 2026 |
 | 13B | 20 | 10m | XLarge | ~1451ms | ~886ms | ~39% | Jan 2026 |
 | 13B | 10 | 10m | XLarge | ~1575ms | ~816ms | ~48% | Jan 2026 |
@@ -589,12 +596,12 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 ### Cache Hit Rate
 
-| Prefix Ratio | Round-Robin | Prefix-Aware |
-|--------------|-------------|--------------|
-| 0.5 (50% shared) | ~12.5% | ~50% |
-| 0.7 (70% shared) | ~12.5% | ~70% |
-| 0.9 (90% shared) | ~12.5% | ~85% |
-| 0.95 (95% shared) | ~12.5% | ~90% |
+| Prefix Ratio | Round-Robin | Prefix-Aware | Source |
+|--------------|-------------|--------------|--------|
+| 0.5 (50% shared) | ~11% | **~90%** | Feb 2026 measured |
+| 0.7 (70% shared) | ~13% | **~93%** | Feb 2026 measured |
+| 0.9 (90% shared) | ~12% | **~97-98%** | Feb 2026 measured |
+| 0.95 (95% shared) | ~12.5% | ~98%+ | Estimated |
 
 ### Throughput Scaling
 
@@ -673,6 +680,9 @@ routing overhead is noticeable in aggregate.
 | 8B | 30 | 10m | 15.8% | 0% | +1.2% | 97.5% | 2 |
 | 8B | 20 | 10m | 29.7% | -18.3% | +1.2% | 97.9% | 2 |
 | 8B (16K pfx) | 20 | 10m | **43.6%** | -24.6% | +0.9% | 97.7% | 2 |
+| 13B (ratio 0.7) | 20 | 10m | 33.4% | -76.3% | +19.4% | 93.4% | 2 |
+| 13B (ratio 0.5) | 20 | 10m | 43.5% | -81.8% | +17.6% | 89.5% | 2 |
+| 13B (client tok) | 30 | 10m | 24.8% | -30.0% | -6.4% | 97.8% | 2 |
 
 #### Instance-to-Instance Variance
 
@@ -798,17 +808,26 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Impact of Prefix Sharing Ratio
 
-Not all workloads have 90% prefix sharing. These tests show how improvement scales:
+Not all workloads have 90% prefix sharing. These tests show how improvement scales
+(CodeLlama-13b, 20 users, 10 minutes, February 2026):
 
-| Prefix Ratio | Cache Hit Rate | XLarge Improvement | P99 TTFT | Notes |
-|--------------|----------------|-------------------|----------|-------|
-| 0.9 (90%) | 97.6% | 38.9% | 1200ms | High sharing (single system prompt) |
-| 0.7 (70%) | 93.2% | 41.5% | — | Moderate sharing |
-| 0.5 (50%) | 89.9% | 40.9% | 970ms | Low sharing (many system prompts) |
+| Prefix Ratio | Cache Hit Rate | XLarge Improvement | P99 TTFT Change | Throughput | Validation |
+|--------------|----------------|--------------------|-----------------|------------|------------|
+| 0.9 (default) | 97.3% | 33.6% | -81.2% | +12.9% | PASSED |
+| 0.7 | 93.4% | 33.4% | -76.3% | +19.4% | PASSED |
+| 0.5 | 89.5% | 43.5% | -81.8% | +17.6% | FAILED→PASSED |
 
-**Key finding:** Improvement holds up remarkably well across prefix ratios. Even at 50% sharing, the system delivers 90% cache hit rate and 41% XLarge improvement. The 0.5 and 0.7 tests show *higher* improvement than 0.9 because they had 0% incomplete rate (less system load).
+**Key findings:**
+- **Improvement holds up remarkably well** across prefix ratios — even at 50% sharing, the
+  system delivers 90% cache hit rate and 34-44% XLarge improvement
+- **Lower prefix sharing increases miss latency** — at 0.5, XLarge miss P50 is 1523ms vs
+  1123ms at 0.7, which actually widens the hit/miss gap and increases the improvement percentage
+- **P99 tail latency improvement is consistent** — -76% to -82% regardless of prefix ratio
+- **Throughput improves at all levels** — +13% to +19%, slightly better at lower ratios where
+  load-aware routing prevents more backend pile-ups
 
-This demonstrates prefix-aware routing benefits workloads even when prefix sharing is moderate—you don't need 90%+ sharing to see real gains.
+This demonstrates prefix-aware routing benefits workloads even when prefix sharing is
+moderate — you don't need 90%+ sharing to see real gains.
 
 #### When Prefix-Aware Routing Helps (and When It Doesn't)
 
@@ -869,22 +888,14 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 3 | 13B, 10u, 10m | Done | XLarge 43.1%, P99 -68.5% |
 | 4 | 13B, 30u, 30m (validated) | Done | XLarge 35.0%, P99 -87.0% |
 | 5 | 8B, 30u, 30m (validated) | Done | XLarge 30.9% |
+| 6 | 13B, prefix ratio 0.7 | Done | XLarge 33.4%, P99 -76.3% |
+| 7 | 13B, prefix ratio 0.5 | Done | XLarge 43.5%, P99 -81.8% |
+| 8 | 13B, client tokenization | Done | XLarge 24.8%, P99 -30.0% |
 | 11 | 8B, 20u, 10m, 16K prefix | Done | XLarge 43.6%, P99 -24.6% |
 
 ### Remaining Benchmarks
 
 ```bash
-# 6-7. Prefix ratio sweep (update the prefix sharing table with load-aware numbers)
-for ratio in 0.7 0.5; do
-  ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
-    --warmup --duration 10m --users 20 --prefix-ratio $ratio --max-model-len 8192
-done
-
-# 8. Client tokenization comparison (update client-tokenize section)
-./scripts/bench.sh --compare --client-tokenize \
-  --model meta-llama/CodeLlama-13b-Instruct-hf \
-  --warmup --duration 10m --users 30 --max-model-len 8192
-
 # 9. High concurrency stress test (Scenario 3)
 ./scripts/bench.sh --warmup --duration 15m --users 64 --spawn-rate 4 \
   --model meta-llama/Llama-3.1-8B-Instruct
@@ -892,11 +903,6 @@ done
 # 10. 70B model (still TBD in the docs)
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-70B-Instruct \
   --warmup --duration 15m --users 16
-
-# 11. 8B with 16K prefixes (test scaling with longer prefixes)
-#     8B has headroom (128K context on 40GB A100), 13B is limited to 8192
-./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct \
-  --warmup --duration 10m --users 20 --prefix-max-tokens 16000
 ```
 
 ---
@@ -917,11 +923,16 @@ You can run benchmarks multiple times without manual cleanup. The script handles
 If a previous run crashed badly:
 
 ```bash
-# Kill any leftover vLLM processes
-pkill -f "vllm.entrypoints" || true
+# Kill any leftover vLLM processes (parent launcher + renamed children like VLLM::EngineCore)
+pkill -9 -f "vllm.entrypoints" || true
+pkill -9 -f "vllm.engine" || true
+pkill -9 -f "VLLM::" || true
 
 # Remove any leftover containers
 docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real down -v --remove-orphans
+
+# Verify GPUs are free
+nvidia-smi --query-compute-apps=pid --format=csv,noheader
 
 # Clean old benchmark reports (optional)
 rm -rf benchmark-reports/
