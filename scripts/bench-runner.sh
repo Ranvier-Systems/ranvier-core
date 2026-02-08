@@ -158,7 +158,7 @@ extract_metrics() {
     fi
 
     local json_line
-    json_line=$(grep "BENCHMARK_STATS_JSON:" "$log_file" 2>/dev/null | tail -1 | sed 's/.*BENCHMARK_STATS_JSON://')
+    json_line=$(grep "BENCHMARK_STATS_JSON:" "$log_file" 2>/dev/null | tail -1 | sed 's/.*BENCHMARK_STATS_JSON://') || true
     if [[ -z "$json_line" ]]; then
         # Fall back to grepping individual fields
         local hit_rate cache_hits ttft_improv
@@ -638,7 +638,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     log_info "Elapsed: $(fmt_duration $SUITE_ELAPSED) | This run: ~$(fmt_duration $RUN_EST) | Remaining: ~$(fmt_duration $REMAINING_EST)${ETA_TIME:+ | ETA: $ETA_TIME}"
 
     # Snapshot existing report directories before the run
-    DIRS_BEFORE=$(ls -d "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | sort)
+    DIRS_BEFORE=$(ls -d "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | sort) || true
 
     RUN_START_TS=$(date +%s)
 
@@ -658,7 +658,7 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     ESTIMATED_SUM=$((ESTIMATED_SUM + RAW_EST))
 
     # Find new report directories by diffing before/after snapshots
-    DIRS_AFTER=$(ls -d "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | sort)
+    DIRS_AFTER=$(ls -d "${RUNNER_OUTPUT_DIR}"/*/ 2>/dev/null | sort) || true
     NEW_DIRS=$(comm -13 <(echo "$DIRS_BEFORE") <(echo "$DIRS_AFTER") 2>/dev/null || echo "")
     if [[ -n "$NEW_DIRS" ]]; then
         REPORT_DIRS+=("$(echo "$NEW_DIRS" | tr '\n' ',' | sed 's/,$//')")
