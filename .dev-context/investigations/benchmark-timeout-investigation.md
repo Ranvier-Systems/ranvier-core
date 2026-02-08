@@ -287,3 +287,55 @@ To test whether GPU saturation is the root cause, run:
 
 If incomplete rate drops significantly with fewer users or lighter prompts, the root
 cause is confirmed as GPU saturation / vLLM queuing under stress load.
+
+---
+
+## 6. Root Cause Found: Stale Pooled Connections
+
+**Date:** 2026-02-08
+
+### Diagnostic Results
+
+Sub-categorization (recommendation #1) revealed that **100% of incompletes** are
+`no_data` — `iter_lines()` completes normally but receives zero bytes. Key evidence:
+
+```
+No SSE data received (HTTP 200, 0 bytes, 3ms): (empty)
+No SSE data received (HTTP 200, 0 bytes, 15ms): (empty)
+```
+
+The 3-24ms response times rule out vLLM involvement (even trivial prefill takes >100ms).
+**Ranvier's connection pool is returning stale connections** that immediately EOF.
+
+### Mechanism
+
+1. Ranvier sends HTTP 200 to client (correct for SSE streaming)
+2. Gets a pooled connection to vLLM backend
+3. Connection is stale (vLLM closed its end, but `is_half_open()` didn't detect it)
+4. Backend responds with immediate EOF or empty chunked body (`0\r\n\r\n`)
+5. `stream_backend_response()` exits with no error flags and 0 bytes written
+6. Phase 4 completion handler sees "success" — records `record_success()` incorrectly
+7. Client gets HTTP 200 + empty body in 3-24ms
+
+### Fix: Stale Connection Retry (Phase 3.5) — **IMPLEMENTED**
+
+Added detection and single-retry logic between Phase 3 and Phase 4 in the write_body
+lambda (`http_controller.cpp`):
+
+- **Detection:** `should_retry_stale_connection()` pure function checks: no error flags
+  AND 0 bytes written AND retry budget remaining
+- **Recovery:** Close stale connection, create fresh one via `ConnectionPool::get_fresh()`
+  (bypasses cache), re-send request, re-stream response
+- **Transparent to client:** HTTP 200 was already sent with no body data, so the retry
+  is invisible — data from the fresh connection arrives seamlessly
+
+Files changed:
+- `src/http_controller.hpp` — `ProxyContext` fields, `max_stale_retries` config
+- `src/http_controller.cpp` — Phase 3.5 retry logic, `bytes_written_to_client` tracking
+- `src/connection_pool.hpp` — `get_fresh()` method, `create_connection()` refactor
+- `src/proxy_retry_policy.hpp` — `should_retry_stale_connection()` pure function
+- `src/metrics_service.hpp` — `stale_connection_retries_total` Prometheus counter
+- `src/config_schema.hpp` — `RetryConfig::max_stale_retries`
+- `src/config_loader.cpp` — `RANVIER_RETRY_MAX_STALE` env var
+- `src/application.cpp` — Config wiring
+- `tests/unit/proxy_retry_policy_test.cpp` — 10 unit tests for detection predicate

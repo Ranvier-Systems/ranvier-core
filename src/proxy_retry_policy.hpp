@@ -278,4 +278,55 @@ inline BackpressureDecision check_persistence_backpressure(
     return BackpressureDecision::ACCEPT;
 }
 
+// ---------------------------------------------------------------------------
+// Stale Connection Retry Decision
+// ---------------------------------------------------------------------------
+
+// Decision result for stale connection retry.
+struct StaleRetryDecision {
+    bool should_retry;
+    const char* reason;  // Human-readable reason for the decision
+};
+
+// Determine whether to retry on a fresh connection after an empty backend response.
+//
+// Returns should_retry=true when ALL of the following are true:
+//   - No error flags are set (not a timeout, connection error, etc.)
+//   - Zero bytes were written to the client (empty response body)
+//   - Stale retry budget has not been exhausted
+//
+// Pure function — no side effects, no Seastar dependency.
+inline StaleRetryDecision should_retry_stale_connection(
+    bool timed_out,
+    bool connection_error,
+    bool client_disconnected,
+    bool connection_failed,
+    size_t bytes_written_to_client,
+    uint32_t stale_retry_attempt,
+    uint32_t max_stale_retries) {
+
+    if (max_stale_retries == 0) {
+        return {false, "stale retry disabled"};
+    }
+    if (timed_out) {
+        return {false, "request timed out"};
+    }
+    if (connection_error) {
+        return {false, "connection error occurred"};
+    }
+    if (client_disconnected) {
+        return {false, "client disconnected"};
+    }
+    if (connection_failed) {
+        return {false, "connection failed"};
+    }
+    if (bytes_written_to_client > 0) {
+        return {false, "data already written to client"};
+    }
+    if (stale_retry_attempt >= max_stale_retries) {
+        return {false, "stale retry limit reached"};
+    }
+    return {true, "empty response on pooled connection"};
+}
+
 }  // namespace ranvier

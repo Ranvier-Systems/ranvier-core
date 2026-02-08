@@ -227,38 +227,19 @@ public:
         if (!request_id.empty()) {
             log_pool.debug("[{}] Creating new connection to {}", request_id, addr);
         }
-        return seastar::connect(addr).then([this, addr, request_id](seastar::connected_socket fd) {
-            // Disable Nagle's algorithm for lower latency
-            fd.set_nodelay(true);
+        return create_connection(addr, request_id);
+    }
 
-            // Enable TCP keep-alives to detect stale network paths
-            if (_config.tcp_keepalive) {
-                try {
-                    // Initialize the specific TCP parameters struct
-                    seastar::net::tcp_keepalive_params tcp_params;
-                    tcp_params.idle = _config.keepalive_idle;
-                    tcp_params.interval = _config.keepalive_interval;
-                    tcp_params.count = _config.keepalive_count;
-
-                    // Assign the struct to the variant
-                    seastar::net::keepalive_params params = tcp_params;
-
-                    fd.set_keepalive(true);
-                    fd.set_keepalive_parameters(params);
-
-                    if (!request_id.empty()) {
-                        log_pool.trace("[{}] TCP keepalive enabled for connection to {}", request_id, addr);
-                    }
-                } catch (const std::exception& e) {
-                    // Log but don't fail - keepalive is a nice-to-have
-                    log_pool.warn("Failed to set TCP keepalive for {}: {}", addr, e.what());
-                }
-            }
-
-            auto in = fd.input();
-            auto out = fd.output();
-            return Bundle{std::move(fd), std::move(in), std::move(out), addr};
-        });
+    // GET FRESH: Always create a new connection, bypassing pool cache.
+    // Use when a pooled connection was detected as stale after use.
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    seastar::future<Bundle> get_fresh(seastar::socket_address addr,
+                                      const std::string& request_id = "") {
+        if (!request_id.empty()) {
+            log_pool.info("[{}] Creating fresh connection to {} (bypassing pool)",
+                          request_id, addr);
+        }
+        return create_connection(addr, request_id);
     }
 
     // PUT: Return connection to pool
@@ -417,6 +398,39 @@ public:
     }
 
 private:
+    // Create a new TCP connection with nodelay and keepalive configured.
+    // Shared by get() (pool miss) and get_fresh() (bypassing pool).
+    seastar::future<Bundle> create_connection(seastar::socket_address addr,
+                                              const std::string& request_id) {
+        return seastar::connect(addr).then([this, addr, request_id](seastar::connected_socket fd) {
+            fd.set_nodelay(true);
+
+            if (_config.tcp_keepalive) {
+                try {
+                    seastar::net::tcp_keepalive_params tcp_params;
+                    tcp_params.idle = _config.keepalive_idle;
+                    tcp_params.interval = _config.keepalive_interval;
+                    tcp_params.count = _config.keepalive_count;
+
+                    seastar::net::keepalive_params params = tcp_params;
+
+                    fd.set_keepalive(true);
+                    fd.set_keepalive_parameters(params);
+
+                    if (!request_id.empty()) {
+                        log_pool.trace("[{}] TCP keepalive enabled for connection to {}", request_id, addr);
+                    }
+                } catch (const std::exception& e) {
+                    log_pool.warn("Failed to set TCP keepalive for {}: {}", addr, e.what());
+                }
+            }
+
+            auto in = fd.input();
+            auto out = fd.output();
+            return Bundle{std::move(fd), std::move(in), std::move(out), addr};
+        });
+    }
+
     ConnectionPoolConfig _config;
     std::unordered_map<seastar::socket_address, std::deque<Bundle>> _pools;
     size_t _total_idle_connections = 0;

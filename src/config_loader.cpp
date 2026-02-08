@@ -216,6 +216,9 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_RETRY_MAX_BACKOFF_MS")) {
         retry.max_backoff = std::chrono::milliseconds(*v);
     }
+    if (auto v = get_env_as<uint32_t>("RANVIER_RETRY_MAX_STALE")) {
+        retry.max_stale_retries = *v;
+    }
 
     // Circuit breaker overrides
     if (auto v = get_env("RANVIER_CIRCUIT_BREAKER_ENABLED")) {

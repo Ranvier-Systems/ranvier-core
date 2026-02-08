@@ -831,3 +831,83 @@ TEST_F(RetryPolicyConfigTest, ConfigIsAccessible) {
     EXPECT_EQ(c.max_fallback_attempts, 4u);
     EXPECT_FALSE(c.fallback_enabled);
 }
+
+// =============================================================================
+// Stale Connection Retry Decision Tests
+// =============================================================================
+
+class StaleConnectionRetryTest : public ::testing::Test {};
+
+TEST_F(StaleConnectionRetryTest, RetryTriggeredOnEmptyResponse) {
+    // All conditions met: no errors, 0 bytes, budget remaining
+    auto decision = should_retry_stale_connection(
+        /*timed_out=*/false, /*connection_error=*/false,
+        /*client_disconnected=*/false, /*connection_failed=*/false,
+        /*bytes_written=*/0, /*attempt=*/0, /*max_retries=*/1);
+    EXPECT_TRUE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "empty response on pooled connection");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenDisabled) {
+    auto decision = should_retry_stale_connection(
+        false, false, false, false, 0, 0, /*max_retries=*/0);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "stale retry disabled");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenTimedOut) {
+    auto decision = should_retry_stale_connection(
+        /*timed_out=*/true, false, false, false, 0, 0, 1);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "request timed out");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenConnectionError) {
+    auto decision = should_retry_stale_connection(
+        false, /*connection_error=*/true, false, false, 0, 0, 1);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "connection error occurred");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenClientDisconnected) {
+    auto decision = should_retry_stale_connection(
+        false, false, /*client_disconnected=*/true, false, 0, 0, 1);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "client disconnected");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenConnectionFailed) {
+    auto decision = should_retry_stale_connection(
+        false, false, false, /*connection_failed=*/true, 0, 0, 1);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "connection failed");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenDataWritten) {
+    auto decision = should_retry_stale_connection(
+        false, false, false, false, /*bytes_written=*/42, 0, 1);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "data already written to client");
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryWhenBudgetExhausted) {
+    auto decision = should_retry_stale_connection(
+        false, false, false, false, 0, /*attempt=*/1, /*max_retries=*/1);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "stale retry limit reached");
+}
+
+TEST_F(StaleConnectionRetryTest, RetryWithHigherBudget) {
+    // With max_retries=3, attempt 0 should still retry
+    auto decision = should_retry_stale_connection(
+        false, false, false, false, 0, /*attempt=*/2, /*max_retries=*/3);
+    EXPECT_TRUE(decision.should_retry);
+}
+
+TEST_F(StaleConnectionRetryTest, NoRetryAtExactBudgetLimit) {
+    // attempt == max_retries should NOT retry
+    auto decision = should_retry_stale_connection(
+        false, false, false, false, 0, /*attempt=*/3, /*max_retries=*/3);
+    EXPECT_FALSE(decision.should_retry);
+    EXPECT_STREQ(decision.reason, "stale retry limit reached");
+}

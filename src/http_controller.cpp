@@ -463,7 +463,6 @@ future<> HttpController::stream_backend_response(
     output_stream<char>& client_out) {
 
     StreamParser parser;
-    size_t chunks_received = 0;
     std::exception_ptr rethrow_exception;
 
     while (true) {
@@ -534,13 +533,13 @@ future<> HttpController::stream_backend_response(
         // EOF logic
         if (chunk.empty()) {
             log_proxy.info("[{}] Backend response complete (EOF after {} chunks)",
-                          ctx.request_id, chunks_received);
+                          ctx.request_id, ctx.chunks_received);
             bundle.is_valid = false;
             break;
         }
-        chunks_received++;
+        ctx.chunks_received++;
         log_proxy.debug("[{}] Received chunk #{} ({} bytes)",
-                       ctx.request_id, chunks_received, chunk.size());
+                       ctx.request_id, ctx.chunks_received, chunk.size());
 
         auto res = parser.push(std::move(chunk));
 
@@ -602,6 +601,7 @@ future<> HttpController::stream_backend_response(
             try {
                 co_await client_out.write(res.data);
                 co_await client_out.flush();
+                ctx.bytes_written_to_client += res.data.size();
             } catch (...) {
                 auto err_type = classify_connection_error(std::current_exception());
                 if (err_type != ConnectionErrorType::NONE) {
@@ -1258,6 +1258,91 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
                                ctx->request_id);
             }
             std::rethrow_exception(streaming_exception);
+        }
+
+        // Phase 3.5: Stale connection retry
+        // Detect empty backend response: no error flags set, zero bytes written.
+        // This indicates a stale/dead pooled connection. Retry on a fresh connection.
+        {
+            auto decision = should_retry_stale_connection(
+                ctx->timed_out, ctx->connection_error, ctx->client_disconnected,
+                ctx->connection_failed, ctx->bytes_written_to_client,
+                ctx->stale_retry_attempt, _config.max_stale_retries);
+
+            if (decision.should_retry) {
+                ctx->stale_retry_attempt++;
+                metrics().record_stale_connection_retry();
+
+                log_proxy.warn("[{}] Empty backend response detected (0 bytes, {} chunks) "
+                               "- retrying on fresh connection (attempt {}/{})",
+                               ctx->request_id, ctx->chunks_received,
+                               ctx->stale_retry_attempt, _config.max_stale_retries);
+
+                // Close the stale connection (do not return to pool)
+                bundle.is_valid = false;
+                try {
+                    co_await bundle.close();
+                } catch (...) {
+                    log_proxy.trace("[{}] Error closing stale backend connection", ctx->request_id);
+                }
+
+                _circuit_breaker.record_failure(ctx->current_backend);
+
+                // Get a fresh connection (bypass pool cache)
+                bool retry_connected = false;
+                auto retry_connect_deadline = lowres_clock::now() + ctx->connect_timeout;
+                try {
+                    auto retry_future = with_timeout(retry_connect_deadline,
+                        _pool.get_fresh(ctx->current_addr, ctx->request_id));
+                    bundle = co_await std::move(retry_future);
+                    retry_connected = true;
+                } catch (...) {
+                    log_proxy.warn("[{}] Fresh connection failed for stale retry: {}",
+                                   ctx->request_id, std::current_exception());
+                    ctx->connection_failed = true;
+                }
+
+                if (retry_connected) {
+                    // Reset streaming state for retry
+                    ctx->response_latency_recorded = false;
+                    ctx->connection_error = false;
+                    ctx->timed_out = false;
+                    ctx->stream_closed = false;
+                    ctx->chunks_received = 0;
+                    ctx->connect_start = std::chrono::steady_clock::now();
+
+                    // Re-send the HTTP request on fresh connection
+                    bool retry_send_ok = co_await send_backend_request(*ctx, bundle);
+
+                    if (retry_send_ok) {
+                        // Re-stream the response
+                        std::exception_ptr retry_exception;
+                        try {
+                            co_await stream_backend_response(*ctx, bundle, client_out);
+                        } catch (...) {
+                            retry_exception = std::current_exception();
+                        }
+
+                        if (retry_exception) {
+                            metrics().record_failure();
+                            metrics().decrement_active_requests();
+                            if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
+                                shard_load_metrics().decrement_active();
+                            }
+                            try { co_await bundle.close(); } catch (...) {}
+                            try { co_await client_out.close(); } catch (...) {}
+                            std::rethrow_exception(retry_exception);
+                        }
+                        // Fall through to Phase 4 with updated ctx state
+                    } else {
+                        // Send failed on fresh connection
+                        if (!ctx->timed_out) {
+                            ctx->connection_error = true;
+                        }
+                        // Fall through to Phase 4 which handles the error flags
+                    }
+                }
+            }
         }
 
         // Phase 4: Handle completion status and send appropriate client response

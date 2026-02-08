@@ -170,6 +170,9 @@ public:
             seastar::metrics::make_counter("http_requests_connection_error", _requests_connection_error,
                 seastar::metrics::description("Total number of requests failed due to connection errors (broken pipe, reset)")),
 
+            seastar::metrics::make_counter("stale_connection_retries_total", _stale_connection_retries,
+                seastar::metrics::description("Retries triggered by empty backend response on stale pooled connection")),
+
             seastar::metrics::make_counter("circuit_breaker_opens", _circuit_opens,
                 seastar::metrics::description("Total number of circuit breaker opens")),
 
@@ -302,6 +305,7 @@ public:
     void record_timeout() { _requests_timeout++; }
     void record_rate_limited() { _requests_rate_limited++; }
     void record_connection_error() { _requests_connection_error++; }
+    void record_stale_connection_retry() { _stale_connection_retries++; }
 
     // Cache hit/miss tracking for ranvier_cache_hit_ratio gauge
     // These are shard-local (lock-free) for hot path efficiency
@@ -457,6 +461,7 @@ private:
     uint64_t _requests_timeout = 0;
     uint64_t _requests_rate_limited = 0;
     uint64_t _requests_connection_error = 0;
+    uint64_t _stale_connection_retries = 0;
     uint64_t _requests_backpressure = 0;
     uint64_t _circuit_opens = 0;
     uint64_t _circuits_removed = 0;

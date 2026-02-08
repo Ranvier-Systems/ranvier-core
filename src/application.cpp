@@ -140,6 +140,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.retry.initial_backoff = config.retry.initial_backoff;
     cfg.retry.max_backoff = config.retry.max_backoff;
     cfg.retry.backoff_multiplier = config.retry.backoff_multiplier;
+    cfg.max_stale_retries = config.retry.max_stale_retries;
     // Circuit breaker
     cfg.circuit_breaker.enabled = config.circuit_breaker.enabled;
     cfg.circuit_breaker.failure_threshold = config.circuit_breaker.failure_threshold;
