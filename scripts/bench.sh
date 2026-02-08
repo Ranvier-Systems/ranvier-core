@@ -48,6 +48,7 @@ DEFAULT_OUTPUT_DIR="benchmark-reports"
 DEFAULT_WARMUP_DURATION="1m"
 DEFAULT_WARMUP_USERS="2"
 DEFAULT_STOP_TIMEOUT="90"
+DEFAULT_MAX_TOKENS="100"
 GHCR_IMAGE="ghcr.io/ranvier-systems/ranvier:latest"
 
 # Colors
@@ -200,6 +201,9 @@ BENCHMARK OPTIONS:
                         cache hit rates vs load balancing trade-offs.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
+    --max-tokens N      Max tokens to generate per request (default: 100)
+                        Lower values (e.g., 20) reduce GPU contention and incomplete
+                        rates without affecting TTFT. Use 20-50 for TTFT-focused runs.
     --stop-timeout N    Seconds to wait for in-flight requests at benchmark end (default: 90)
                         Increase for large models or high load to reduce incomplete requests
 
@@ -354,6 +358,7 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
+MAX_TOKENS="$DEFAULT_MAX_TOKENS"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -382,6 +387,7 @@ while [[ $# -gt 0 ]]; do
         --multi-depth)    MULTI_DEPTH=true; shift ;;
         --no-load-aware)  LOAD_AWARE=false; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
+        --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
@@ -734,6 +740,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
     echo "  Multi-Depth:     $MULTI_DEPTH"
     echo "  Load-Aware:      $LOAD_AWARE"
+    echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
@@ -1183,6 +1190,7 @@ run_benchmark() {
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
+        -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
@@ -1284,6 +1292,7 @@ if [[ "$WARMUP" = true ]]; then
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
+        -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \

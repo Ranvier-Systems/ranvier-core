@@ -268,7 +268,7 @@ Implementation details:
 | Priority | Action | Impact | Effort |
 |----------|--------|--------|--------|
 | ~~**1**~~ | ~~Sub-categorize incomplete reasons (add logging)~~ **DONE** | Diagnosis | Low |
-| **2** | Make `max_tokens` configurable via env var | Reduce GPU time per request | Low |
+| ~~**2**~~ | ~~Make `max_tokens` configurable via env var~~ **DONE** (`MAX_OUTPUT_TOKENS` env var, `--max-tokens` flag) | Reduce GPU time per request | Low |
 | **3** | Add timeout flags to bench.sh | User convenience | Low |
 | **4** | Default to fewer users for stress dist | Reduce overload | Low |
 | **5** | Log vLLM queue metrics during benchmark | Diagnosis | Medium |

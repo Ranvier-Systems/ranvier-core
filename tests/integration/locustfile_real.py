@@ -41,6 +41,11 @@ Environment Variables:
         SHARED_PREFIX_RATIO   - Ratio of requests sharing prefixes (default: 0.7)
         P99_LATENCY_THRESHOLD_MS - P99 TTFT threshold in ms (default: 5000)
 
+    Generation Configuration:
+        MAX_OUTPUT_TOKENS         - Max tokens to generate per request (default: 100)
+                                    Lower values (e.g., 20) reduce GPU contention and
+                                    incomplete rates without affecting TTFT measurements.
+
     Timeout Configuration:
         CONNECT_TIMEOUT_SECONDS   - TCP connection + headers timeout (default: 30)
         READ_TIMEOUT_SECONDS      - Socket read timeout per chunk (default: 120)
@@ -537,6 +542,11 @@ STREAMING_TIMEOUT_SECONDS = int(os.environ.get("STREAMING_TIMEOUT_SECONDS", "300
 # If no data arrives within READ_TIMEOUT, the request fails with ReadTimeout exception
 CONNECT_TIMEOUT_SECONDS = int(os.environ.get("CONNECT_TIMEOUT_SECONDS", "30"))
 READ_TIMEOUT_SECONDS = int(os.environ.get("READ_TIMEOUT_SECONDS", "120"))  # 2 min per chunk
+
+# Maximum tokens to generate per request
+# Lower values reduce GPU contention and incomplete rates without affecting TTFT.
+# For TTFT-focused benchmarks with high user counts, use 20-50.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "100"))
 
 # ============================================================================
 # Prompt Templates with Shared Prefixes
@@ -3178,7 +3188,8 @@ def on_test_start(environment, **kwargs):
         logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
         logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
 
-    # Log timeout configuration
+    # Log generation and timeout configuration
+    logger.info(f"Max Output Tokens: {MAX_OUTPUT_TOKENS}")
     logger.info(f"Timeouts: connect={CONNECT_TIMEOUT_SECONDS}s, read={READ_TIMEOUT_SECONDS}s/chunk, stream={STREAMING_TIMEOUT_SECONDS}s total")
 
     # Load prompts from file if PROMPT_FILE is set
@@ -3484,7 +3495,7 @@ class RealBackendUser(HttpUser):
                 "prompt_token_ids": token_ids,
                 "stream": True,
                 "stream_options": {"include_usage": True},
-                "max_tokens": 100,  # Limit output for benchmarking
+                "max_tokens": MAX_OUTPUT_TOKENS,
             }
 
             # Calculate and include prefix_token_count for routing hints
@@ -3500,7 +3511,7 @@ class RealBackendUser(HttpUser):
                 "messages": messages,
                 "stream": True,
                 "stream_options": {"include_usage": True},
-                "max_tokens": 100,  # Limit output for benchmarking
+                "max_tokens": MAX_OUTPUT_TOKENS,
             }
 
         # Initialize metrics
