@@ -246,13 +246,20 @@ This could be caused by:
 - **vLLM sending empty response** (200 OK but no SSE data)
 - **Connection reset** during streaming
 
-**Recommendation:** Add sub-categorization of incomplete requests:
+**Recommendation:** ~~Add sub-categorization of incomplete requests~~ **IMPLEMENTED**
+
+Incomplete requests are now sub-categorized by reason in `locustfile_real.py`:
 - `incomplete_streaming_timeout` — explicit STREAMING_TIMEOUT hit
 - `incomplete_read_timeout` — ReadTimeout during iter_lines() after HTTP 200
 - `incomplete_no_data` — iter_lines() loop ended without any data lines
 - `incomplete_connection_reset` — socket error during streaming
 
-This would immediately clarify whether the 30% is dominated by one specific mechanism.
+Implementation details:
+- `RequestMetrics.incomplete_reason` field carries the reason string
+- `BenchmarkStats` has four new counters, routed in `record_request()`
+- Reason is set at each of the four exit points in the streaming loop
+- Summary output shows full breakdown when incompletes are present
+- Warning message now identifies the dominant reason and its percentage
 
 ---
 
@@ -260,7 +267,7 @@ This would immediately clarify whether the 30% is dominated by one specific mech
 
 | Priority | Action | Impact | Effort |
 |----------|--------|--------|--------|
-| **1** | Sub-categorize incomplete reasons (add logging) | Diagnosis | Low |
+| ~~**1**~~ | ~~Sub-categorize incomplete reasons (add logging)~~ **DONE** | Diagnosis | Low |
 | **2** | Make `max_tokens` configurable via env var | Reduce GPU time per request | Low |
 | **3** | Add timeout flags to bench.sh | User convenience | Low |
 | **4** | Default to fewer users for stress dist | Reduce overload | Low |

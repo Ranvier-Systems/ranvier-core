@@ -2312,6 +2312,8 @@ class RequestMetrics:
     estimated_prefix_tokens: int = 0
     # Track whether we received HTTP 200 to distinguish incomplete vs failed
     got_http_ok: bool = False
+    # Sub-category for incomplete requests: streaming_timeout, read_timeout, no_data, connection_reset
+    incomplete_reason: Optional[str] = None
 
 
 @dataclass
@@ -2321,6 +2323,10 @@ class BenchmarkStats:
     successful_requests: int = 0
     failed_requests: int = 0      # Actual errors (non-2xx, parse errors, timeouts)
     incomplete_requests: int = 0  # Got HTTP 200 but terminated before TTFT recorded
+    incomplete_streaming_timeout: int = 0  # STREAMING_TIMEOUT hit during iter_lines()
+    incomplete_read_timeout: int = 0       # ReadTimeout during iter_lines() after HTTP 200
+    incomplete_no_data: int = 0            # iter_lines() ended normally but no data: line
+    incomplete_connection_reset: int = 0   # ConnectionError/socket error after HTTP 200
 
     # Cache hit tracking
     cache_hits: int = 0
@@ -2358,6 +2364,16 @@ class BenchmarkStats:
                 # Failed: HTTP error, connection timeout, or other actual error
                 if metrics.got_http_ok:
                     self.incomplete_requests += 1
+                    # Sub-categorize by reason
+                    reason = metrics.incomplete_reason
+                    if reason == "streaming_timeout":
+                        self.incomplete_streaming_timeout += 1
+                    elif reason == "read_timeout":
+                        self.incomplete_read_timeout += 1
+                    elif reason == "no_data":
+                        self.incomplete_no_data += 1
+                    elif reason == "connection_reset":
+                        self.incomplete_connection_reset += 1
                 else:
                     self.failed_requests += 1
                 return
@@ -2429,6 +2445,10 @@ class BenchmarkStats:
                 "successful_requests": self.successful_requests,
                 "failed_requests": self.failed_requests,
                 "incomplete_requests": self.incomplete_requests,
+                "incomplete_streaming_timeout": self.incomplete_streaming_timeout,
+                "incomplete_read_timeout": self.incomplete_read_timeout,
+                "incomplete_no_data": self.incomplete_no_data,
+                "incomplete_connection_reset": self.incomplete_connection_reset,
                 "incomplete_rate_pct": incomplete_rate_pct,
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
@@ -3309,14 +3329,37 @@ def on_test_stop(environment, **kwargs):
     logger.info(f"  Total Requests:      {summary['total_requests']}")
     logger.info(f"  Successful:          {summary['successful_requests']}")
     logger.info(f"  Failed (errors):     {summary['failed_requests']}")
-    logger.info(f"  Incomplete (timeout): {summary['incomplete_requests']}")
+    logger.info(f"  Incomplete (total):  {summary['incomplete_requests']}")
+    if summary['incomplete_requests'] > 0:
+        logger.info(f"    Streaming timeout: {summary['incomplete_streaming_timeout']}")
+        logger.info(f"    Read timeout:      {summary['incomplete_read_timeout']}")
+        logger.info(f"    No data received:  {summary['incomplete_no_data']}")
+        logger.info(f"    Connection reset:  {summary['incomplete_connection_reset']}")
+        uncategorized = (summary['incomplete_requests']
+                         - summary['incomplete_streaming_timeout']
+                         - summary['incomplete_read_timeout']
+                         - summary['incomplete_no_data']
+                         - summary['incomplete_connection_reset'])
+        if uncategorized > 0:
+            logger.info(f"    Uncategorized:     {uncategorized}")
 
     # Warn if incomplete rate is high (>10%)
     incomplete_rate = summary.get('incomplete_rate_pct', 0)
     if incomplete_rate > 10:
+        reasons = {
+            "streaming timeout": summary['incomplete_streaming_timeout'],
+            "read timeout": summary['incomplete_read_timeout'],
+            "no data received": summary['incomplete_no_data'],
+            "connection reset": summary['incomplete_connection_reset'],
+        }
+        dominant = max(reasons, key=reasons.get) if any(reasons.values()) else "unknown"
+        dominant_count = reasons.get(dominant, 0)
+        dominant_pct = (dominant_count / summary['incomplete_requests'] * 100
+                        if summary['incomplete_requests'] > 0 else 0)
         logger.warning(
             f"High incomplete rate ({incomplete_rate:.1f}%): "
-            f"{summary['incomplete_requests']} requests were terminated before TTFT. "
+            f"{summary['incomplete_requests']} requests terminated before TTFT. "
+            f"Dominant reason: {dominant} ({dominant_pct:.0f}%). "
             "Consider reducing --users or increasing --stop-timeout."
         )
 
@@ -3531,6 +3574,7 @@ class RealBackendUser(HttpUser):
                 elapsed_seconds = time.perf_counter() - start_time
                 if elapsed_seconds > STREAMING_TIMEOUT_SECONDS:
                     stream_timed_out = True
+                    metrics.incomplete_reason = "streaming_timeout"
                     logger.warning(
                         f"Streaming timeout after {elapsed_seconds:.1f}s "
                         f"(limit: {STREAMING_TIMEOUT_SECONDS}s)"
@@ -3569,6 +3613,10 @@ class RealBackendUser(HttpUser):
             metrics.completion_tokens = completion_tokens
             metrics.ttft_ms = ttft
             metrics.total_time_ms = total_time
+
+            # Sub-categorize incomplete: iter_lines() ended without any data: line
+            if ttft is None and not stream_timed_out:
+                metrics.incomplete_reason = "no_data"
 
             # Record to global stats
             _benchmark_stats.record_request(metrics)
@@ -3642,6 +3690,8 @@ class RealBackendUser(HttpUser):
 
         except ReadTimeout as e:
             total_time = (time.perf_counter() - start_time) * 1000
+            if metrics.got_http_ok:
+                metrics.incomplete_reason = "read_timeout"
             error_msg = f"Socket read timeout after {READ_TIMEOUT_SECONDS}s - vLLM may be overloaded or unresponsive"
             events.request.fire(
                 request_type="POST",
@@ -3668,6 +3718,8 @@ class RealBackendUser(HttpUser):
             logger.warning(f"Request to node{node_index + 1} failed: {error_msg}")
         except Exception as e:
             total_time = (time.perf_counter() - start_time) * 1000
+            if metrics.got_http_ok:
+                metrics.incomplete_reason = "connection_reset"
             events.request.fire(
                 request_type="POST",
                 name=f"{endpoint} (node{node_index + 1})",
