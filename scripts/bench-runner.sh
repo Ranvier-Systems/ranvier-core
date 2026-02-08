@@ -51,6 +51,7 @@ DRY_RUN=false
 SUITE="high"
 CUSTOM_FILE=""
 STOP_ON_FAILURE=false
+SKIP_RUNS_RAW=""   # comma-separated list from --skip
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -124,6 +125,26 @@ estimate_run_seconds() {
     secs=$((secs + 330))
 
     echo "$secs"
+}
+
+# Check if a run number should be skipped (via --resume or --skip).
+# Returns 0 (true) if the run should be skipped, 1 (false) if it should execute.
+should_skip() {
+    local run_num=$1
+    # --resume: skip everything before the resume point
+    if [[ $RESUME_FROM -gt 0 && $run_num -lt $RESUME_FROM ]]; then
+        return 0
+    fi
+    # --skip: skip specific run numbers
+    if [[ -n "$SKIP_RUNS_RAW" ]]; then
+        local IFS=','
+        for skip_n in $SKIP_RUNS_RAW; do
+            if [[ "$skip_n" -eq "$run_num" ]] 2>/dev/null; then
+                return 0
+            fi
+        done
+    fi
+    return 1
 }
 
 # Extract and display key metrics from a benchmark.log file.
@@ -218,7 +239,8 @@ OPTIONS:
                           custom - use a custom run file (requires --file)
     --file FILE         Path to custom run file (one bench.sh arg set per line)
     --dry-run           Preview runs without executing
-    --resume N          Resume from run number N (1-indexed)
+    --resume N          Resume from run number N (1-indexed, skips runs before N)
+    --skip LIST         Skip specific runs by number (comma-separated, e.g., --skip 9,10)
     --pause SECONDS     Pause between runs for GPU cooldown (default: 60)
     --stop-on-failure   Stop the suite if any run fails (default: continue)
     --output-dir DIR    Output directory (default: benchmark-reports)
@@ -260,6 +282,12 @@ EXAMPLES:
     # Resume from run #4 after a failure
     ./scripts/bench-runner.sh --suite all --resume 4
 
+    # Skip specific runs (e.g., 70B model not supported yet)
+    ./scripts/bench-runner.sh --suite all --skip 10
+
+    # Skip multiple runs
+    ./scripts/bench-runner.sh --suite all --skip 9,10
+
     # Use a custom list of runs
     ./scripts/bench-runner.sh --suite custom --file my-runs.txt
 
@@ -276,6 +304,7 @@ while [[ $# -gt 0 ]]; do
         --file)             CUSTOM_FILE="$2"; shift 2 ;;
         --dry-run)          DRY_RUN=true; shift ;;
         --resume)           RESUME_FROM="$2"; shift 2 ;;
+        --skip)             SKIP_RUNS_RAW="$2"; shift 2 ;;
         --pause)            PAUSE_BETWEEN_RUNS="$2"; shift 2 ;;
         --stop-on-failure)  STOP_ON_FAILURE=true; shift ;;
         --output-dir)       RUNNER_OUTPUT_DIR="$2"; shift 2 ;;
@@ -387,26 +416,24 @@ if [[ "$DRY_RUN" == true ]]; then
     log_header "Dry Run - Suite: $SUITE ($TOTAL_RUNS runs)"
     echo ""
     TOTAL_EST=0
+    DRY_ACTIVE=0
     for ((i=0; i<TOTAL_RUNS; i++)); do
         local_num=$((i + 1))
         skip=""
-        if [[ $RESUME_FROM -gt 0 && $local_num -lt $RESUME_FROM ]]; then
-            skip=" ${YELLOW}(skip - before --resume $RESUME_FROM)${NC}"
+        if should_skip "$local_num"; then
+            skip=" ${YELLOW}(skip)${NC}"
         fi
         EST_SECS=$(estimate_run_seconds "${RUNS[$i]}")
         echo -e "  ${BOLD}[$local_num/$TOTAL_RUNS]${NC} ${LABELS[$i]}  ${BLUE}~$(fmt_duration $EST_SECS)${NC}${skip}"
         echo -e "           ${CYAN}./scripts/bench.sh ${RUNS[$i]}${NC}"
         echo ""
-        if [[ $RESUME_FROM -eq 0 || $local_num -ge $RESUME_FROM ]]; then
+        if ! should_skip "$local_num"; then
             TOTAL_EST=$((TOTAL_EST + EST_SECS + PAUSE_BETWEEN_RUNS))
+            DRY_ACTIVE=$((DRY_ACTIVE + 1))
         fi
     done
     # Remove trailing pause (none after last run)
-    DRY_SKIP_COUNT=0
-    if [[ $RESUME_FROM -gt 0 ]]; then
-        DRY_SKIP_COUNT=$((RESUME_FROM - 1))
-    fi
-    ACTIVE_RUNS=$((TOTAL_RUNS - DRY_SKIP_COUNT))
+    ACTIVE_RUNS=$DRY_ACTIVE
     if [[ $ACTIVE_RUNS -gt 0 ]]; then
         TOTAL_EST=$((TOTAL_EST - PAUSE_BETWEEN_RUNS))
     fi
@@ -431,6 +458,9 @@ log_info "Output: $RUNNER_OUTPUT_DIR"
 if [[ $RESUME_FROM -gt 0 ]]; then
     log_info "Resuming from run #$RESUME_FROM"
 fi
+if [[ -n "$SKIP_RUNS_RAW" ]]; then
+    log_info "Skipping runs: $SKIP_RUNS_RAW"
+fi
 echo ""
 
 # Check HF_TOKEN
@@ -450,21 +480,18 @@ exec > >(tee -a "$RUNNER_LOG") 2>&1
 
 # Compute total estimated time
 TOTAL_EST=0
+PRE_ACTIVE=0
 for ((idx=0; idx<TOTAL_RUNS; idx++)); do
     run_n=$((idx + 1))
-    if [[ $RESUME_FROM -gt 0 && $run_n -lt $RESUME_FROM ]]; then
+    if should_skip "$run_n"; then
         continue
     fi
     est=$(estimate_run_seconds "${RUNS[$idx]}")
     TOTAL_EST=$((TOTAL_EST + est + PAUSE_BETWEEN_RUNS))
+    PRE_ACTIVE=$((PRE_ACTIVE + 1))
 done
-# Remove trailing pause
-SKIP_COUNT=0
-if [[ $RESUME_FROM -gt 0 ]]; then
-    SKIP_COUNT=$((RESUME_FROM - 1))
-fi
-ACTIVE_RUNS=$((TOTAL_RUNS - SKIP_COUNT))
-if [[ $ACTIVE_RUNS -gt 0 ]]; then
+# Remove trailing pause (none after last active run)
+if [[ $PRE_ACTIVE -gt 0 ]]; then
     TOTAL_EST=$((TOTAL_EST - PAUSE_BETWEEN_RUNS))
 fi
 
@@ -529,8 +556,8 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
     [[ "$INTERRUPTED" == true ]] && break
     RUN_NUM=$((i + 1))
 
-    # Handle --resume: skip runs before the resume point
-    if [[ $RESUME_FROM -gt 0 && $RUN_NUM -lt $RESUME_FROM ]]; then
+    # Handle --resume / --skip
+    if should_skip "$RUN_NUM"; then
         RESULTS+=("skipped")
         DURATIONS+=(0)
         REPORT_DIRS+=("-")
@@ -656,11 +683,17 @@ for ((i=0; i<TOTAL_RUNS; i++)); do
         fi
     fi
 
-    # Pause between runs (unless this is the last one)
+    # Pause between runs (unless this is the last one or next will be skipped)
     if [[ $((i + 1)) -lt $TOTAL_RUNS && "$INTERRUPTED" != true ]]; then
-        NEXT_RUN=$((i + 2))
-        # Don't pause if next run will be skipped
-        if [[ $RESUME_FROM -eq 0 || $NEXT_RUN -ge $RESUME_FROM ]]; then
+        # Find the next run that won't be skipped
+        NEXT_ACTIVE=""
+        for ((na=i+1; na<TOTAL_RUNS; na++)); do
+            if ! should_skip $((na + 1)); then
+                NEXT_ACTIVE=$((na + 1))
+                break
+            fi
+        done
+        if [[ -n "$NEXT_ACTIVE" ]]; then
             log_info "Pausing ${PAUSE_BETWEEN_RUNS}s before next run (GPU cooldown)..."
             sleep "$PAUSE_BETWEEN_RUNS"
         fi
