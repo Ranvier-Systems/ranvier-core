@@ -1,6 +1,7 @@
 #include "http_controller.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
+#include "proxy_retry_policy.hpp"
 #include "request_rewriter.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"
@@ -27,46 +28,8 @@ using namespace seastar;
 
 namespace ranvier {
 
-// Helper to check if an exception is a connection error (broken pipe or connection reset)
-// These errors occur when the backend closes the connection unexpectedly
-enum class ConnectionErrorType {
-    NONE,
-    BROKEN_PIPE,      // EPIPE - write to closed socket
-    CONNECTION_RESET  // ECONNRESET - connection reset by peer
-};
-
-inline ConnectionErrorType classify_connection_error(std::exception_ptr ep) {
-    if (!ep) return ConnectionErrorType::NONE;
-
-    try {
-        std::rethrow_exception(ep);
-    } catch (const std::system_error& e) {
-        // Check for EPIPE (broken pipe) - occurs when writing to a closed socket
-        if (e.code() == std::errc::broken_pipe ||
-            e.code().value() == EPIPE) {
-            return ConnectionErrorType::BROKEN_PIPE;
-        }
-        // Check for ECONNRESET (connection reset by peer)
-        if (e.code() == std::errc::connection_reset ||
-            e.code().value() == ECONNRESET) {
-            return ConnectionErrorType::CONNECTION_RESET;
-        }
-    } catch (...) {
-        // Not a system_error - this is intentional: classify_connection_error is a classifier
-        // function, not an error handler. Non-system_error exceptions return NONE, meaning
-        // "not a connection error we handle specially". No logging here because this is
-        // called in hot paths and non-connection exceptions are handled by callers.
-    }
-    return ConnectionErrorType::NONE;
-}
-
-inline const char* connection_error_to_string(ConnectionErrorType type) {
-    switch (type) {
-        case ConnectionErrorType::BROKEN_PIPE: return "broken pipe (EPIPE)";
-        case ConnectionErrorType::CONNECTION_RESET: return "connection reset (ECONNRESET)";
-        default: return "unknown";
-    }
-}
+// ConnectionErrorType, classify_connection_error, and connection_error_to_string
+// are defined in proxy_retry_policy.hpp (extracted for testability).
 
 // RAII guard for active request counter
 // Ensures decrement happens even if an exception is thrown during request setup

@@ -564,6 +564,22 @@ target_link_libraries(rate_limiter_test
 )
 gtest_discover_tests(rate_limiter_test)
 
+# Proxy Retry Policy Unit Tests (Pure C++, no Seastar dependency)
+# Tests for retry/backoff/fallback decisions, connection error classification,
+# fallback backend selection, and backpressure policy with TestClock
+add_executable(proxy_retry_policy_test
+  tests/unit/proxy_retry_policy_test.cpp
+)
+target_include_directories(proxy_retry_policy_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(proxy_retry_policy_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(proxy_retry_policy_test)
+
 # ShardedConfig Unit Tests (Requires Seastar types for header includes)
 # Tests ShardedConfig wrapper class for per-core config distribution
 if(Seastar_FOUND)
