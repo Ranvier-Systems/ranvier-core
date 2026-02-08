@@ -784,7 +784,27 @@ The cache hit rate will always improve with prefix-aware routing. The TTFT benef
 
 ## Recommended Next Benchmarks
 
-The February 2026 results establish a new baseline with load-aware routing for two configurations (8B/30u, 13B/30u). The following benchmarks would fill out the comparison matrix:
+The February 2026 results establish a new baseline with load-aware routing for two configurations (8B/30u, 13B/30u). The following benchmarks would fill out the comparison matrix.
+
+### Running with bench-runner.sh
+
+All of the runs below are built into `scripts/bench-runner.sh` as the `high`, `medium`, and `all` suites. You can run them in one go instead of invoking each manually:
+
+```bash
+# Preview what will run
+./scripts/bench-runner.sh --dry-run --suite all
+
+# Run high-priority only (~1.5h)
+./scripts/bench-runner.sh --suite high
+
+# Run everything except the 70B test (no 70B support yet)
+./scripts/bench-runner.sh --suite all --skip 10
+
+# Resume from run #4 if something failed
+./scripts/bench-runner.sh --suite all --resume 4
+```
+
+The runner produces a `runner_summary_*.md` report and logs to `benchmark-reports/`. See `./scripts/bench-runner.sh --help` for all options.
 
 ### High Priority
 
@@ -817,7 +837,7 @@ Longer duration runs for statistical confidence, and prefix ratio variations:
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct \
   --warmup --duration 30m --users 30
 
-# 6. Prefix ratio sweep (update the prefix sharing table)
+# 6-7. Prefix ratio sweep (update the prefix sharing table)
 for ratio in 0.7 0.5; do
   ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
     --warmup --duration 10m --users 20 --prefix-ratio $ratio --max-model-len 8192
@@ -827,16 +847,16 @@ done
 ### Lower Priority
 
 ```bash
-# 7. Client tokenization comparison (update client-tokenize section)
+# 8. Client tokenization comparison (update client-tokenize section)
 ./scripts/bench.sh --compare --client-tokenize \
   --model meta-llama/CodeLlama-13b-Instruct-hf \
   --warmup --duration 10m --users 30 --max-model-len 8192
 
-# 8. High concurrency stress test (Scenario 3)
+# 9. High concurrency stress test (Scenario 3)
 ./scripts/bench.sh --warmup --duration 15m --users 64 --spawn-rate 4 \
   --model meta-llama/Llama-3.1-8B-Instruct
 
-# 9. 70B model (still TBD in the docs)
+# 10. 70B model (still TBD in the docs)
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-70B-Instruct \
   --warmup --duration 15m --users 16
 ```
@@ -1266,6 +1286,25 @@ For a complete benchmark session, run tests in this order:
 ```
 
 **Total time:** ~50 minutes + vLLM startup (~5 min per scenario)
+
+### Multi-Run Suites
+
+For running the full benchmark matrix automatically, use `bench-runner.sh`:
+
+```bash
+# Preview what will run, with time estimates
+./scripts/bench-runner.sh --dry-run --suite all
+
+# Run the high-priority suite (~1.5h)
+./scripts/bench-runner.sh --suite high
+
+# Run everything, skip 70B (no support yet)
+./scripts/bench-runner.sh --suite all --skip 10
+```
+
+The runner handles GPU cooldown pauses between runs, tracks per-run metrics
+inline, produces a `runner_summary_*.md` report, and supports `--resume`
+to pick up where you left off after failures. See `--help` for all options.
 
 ---
 

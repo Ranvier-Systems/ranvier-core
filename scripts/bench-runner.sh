@@ -247,20 +247,26 @@ OPTIONS:
     -h, --help          Show this help
 
 BUILT-IN SUITES:
-    high (3 runs):
+    high (3 runs, ~1.5h):
       1. 13B at 20 users (compare load-aware vs Jan baseline 38.9%)
       2. 8B at 20 users  (compare load-aware vs Jan baseline 43.7%)
       3. 13B at 10 users (compare load-aware vs Jan baseline 48.2%)
 
-    medium (adds 3 runs):
+    medium (adds 4 runs, ~4h total):
       4. 13B 30-minute validated run at 30 users
       5. 8B 30-minute validated run at 30 users
-      6. 13B prefix ratio sweep (0.7 and 0.5)
+      6. 13B prefix ratio 0.7
+      7. 13B prefix ratio 0.5
 
-    all (adds 3 more):
-      7. 13B client tokenization comparison
-      8. 8B high concurrency stress test (64 users)
-      9. 70B model test
+    all (adds 3 more, ~6h total):
+      8.  13B client tokenization comparison
+      9.  8B high concurrency stress test (64 users)
+      10. 70B model test
+
+ADDING NEW RUNS:
+    Edit define_runs() in this script. Each run is one line:
+      add_run <priority> "<label>" <bench.sh args...>
+    Use --dry-run to verify numbering after changes.
 
 CUSTOM RUN FILE FORMAT:
     # One set of bench.sh arguments per line
@@ -316,54 +322,82 @@ done
 # -----------------------------------------------------------------------------
 # Define benchmark suites
 # -----------------------------------------------------------------------------
-# Each entry is: "LABEL|BENCH_ARGS"
-# LABEL is a short human-readable name for the run.
-# BENCH_ARGS are passed directly to bench.sh.
+# Each run is defined as:  add_run <priority> <label> <bench.sh args...>
+#
+# Priority levels (cumulative):
+#   high   = runs 1-3       (included in --suite high, medium, all)
+#   medium = runs 4-7       (included in --suite medium, all)
+#   low    = runs 8-10      (included in --suite all only)
+#
+# To add a new benchmark, append an add_run line at the end of the
+# appropriate priority section. Run numbers are assigned in order.
+# Use --dry-run to verify numbering after changes.
+
+add_run() {
+    local priority="$1"
+    local label="$2"
+    shift 2
+    local args="$*"
+
+    case "$SUITE" in
+        high)   [[ "$priority" != "high" ]] && return ;;
+        medium) [[ "$priority" == "low" ]] && return ;;
+        all)    ;;  # include everything
+        *)      return ;;  # custom suite doesn't use add_run
+    esac
+
+    LABELS+=("$label")
+    RUNS+=("$args")
+}
 
 define_runs() {
     RUNS=()
     LABELS=()
 
-    # --- High priority ---
-    if [[ "$SUITE" == "high" || "$SUITE" == "medium" || "$SUITE" == "all" ]]; then
-        LABELS+=("13B moderate load (20 users)")
-        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192")
+    # --- High priority: re-run Jan baselines with load-aware routing ----------
+    add_run high "13B moderate load (20 users)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --max-model-len 8192
 
-        LABELS+=("8B moderate load (20 users)")
-        RUNS+=("--compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 10m --users 20")
+    add_run high "8B moderate load (20 users)" \
+        --compare --model meta-llama/Llama-3.1-8B-Instruct \
+        --warmup --duration 10m --users 20
 
-        LABELS+=("13B low load (10 users)")
-        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192")
-    fi
+    add_run high "13B low load (10 users)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 10 --max-model-len 8192
 
-    # --- Medium priority ---
-    if [[ "$SUITE" == "medium" || "$SUITE" == "all" ]]; then
-        LABELS+=("13B 30min validated (30 users)")
-        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192")
+    # --- Medium priority: long runs and prefix ratio sweep --------------------
+    add_run medium "13B 30min validated (30 users)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 30m --users 30 --max-model-len 8192
 
-        LABELS+=("8B 30min validated (30 users)")
-        RUNS+=("--compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 30m --users 30")
+    add_run medium "8B 30min validated (30 users)" \
+        --compare --model meta-llama/Llama-3.1-8B-Instruct \
+        --warmup --duration 30m --users 30
 
-        LABELS+=("13B prefix ratio 0.7 (20 users)")
-        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --prefix-ratio 0.7 --max-model-len 8192")
+    add_run medium "13B prefix ratio 0.7 (20 users)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --prefix-ratio 0.7 --max-model-len 8192
 
-        LABELS+=("13B prefix ratio 0.5 (20 users)")
-        RUNS+=("--compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --prefix-ratio 0.5 --max-model-len 8192")
-    fi
+    add_run medium "13B prefix ratio 0.5 (20 users)" \
+        --compare --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 20 --prefix-ratio 0.5 --max-model-len 8192
 
-    # --- Lower priority ---
-    if [[ "$SUITE" == "all" ]]; then
-        LABELS+=("13B client tokenization (30 users)")
-        RUNS+=("--compare --client-tokenize --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192")
+    # --- Lower priority: client tokenization, stress, large models ------------
+    add_run low "13B client tokenization (30 users)" \
+        --compare --client-tokenize --model meta-llama/CodeLlama-13b-Instruct-hf \
+        --warmup --duration 10m --users 30 --max-model-len 8192
 
-        LABELS+=("8B high concurrency stress (64 users)")
-        RUNS+=("--warmup --duration 15m --users 64 --spawn-rate 4 --model meta-llama/Llama-3.1-8B-Instruct")
+    add_run low "8B high concurrency stress (64 users)" \
+        --warmup --duration 15m --users 64 --spawn-rate 4 \
+        --model meta-llama/Llama-3.1-8B-Instruct
 
-        LABELS+=("70B model test (16 users)")
-        RUNS+=("--compare --model meta-llama/Llama-3.1-70B-Instruct --warmup --duration 15m --users 16")
-    fi
+    add_run low "70B model test (16 users)" \
+        --compare --model meta-llama/Llama-3.1-70B-Instruct \
+        --warmup --duration 15m --users 16
 
-    # --- Custom file ---
+    # --- Custom file ----------------------------------------------------------
     if [[ "$SUITE" == "custom" ]]; then
         if [[ -z "$CUSTOM_FILE" ]]; then
             log_error "--suite custom requires --file <path>"
