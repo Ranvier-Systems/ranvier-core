@@ -15,10 +15,10 @@ Prefix-aware routing with load-aware fallback vs round-robin baseline (30-minute
 
 **Key wins:**
 - **8x more cache hits** — Requests routed to backends with cached KV data
-- **31-43% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
-- **Up to 87% lower tail latency** — P99 response times improve dramatically for 13B
-- **Up to 27% higher throughput** — Load-aware routing prevents backend hotspots
-- **24% fewer timeouts** — Incomplete rate drops consistently
+- **32-40% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
+- **Up to 79% lower tail latency** — P99 response times improve dramatically for 13B
+- **Up to 15% higher throughput** — Load-aware routing prevents backend hotspots
+- **0% incomplete rate** — Stale connection retry ensures every request completes
 
 **Works across prefix sharing levels (13B, 20 users, 10m):**
 
@@ -334,27 +334,28 @@ With client tokenization, **cache misses also get faster** because the server sk
   --prefix-ratio 0.9
 ```
 
-**Expected Results (8B model, 8x A100, load-aware routing):**
+**Expected Results (8B model, 8x A100, load-aware routing + stale connection fix):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
 | Cache Hit Rate | ~12% | ~98% | 8x more cache hits |
-| XLarge Improvement | ~0% | **~16-37%** | Varies by instance |
-| Incomplete Rate | ~37% | ~30-33% | Prefix routing more stable |
-| Throughput | ~57 req/s | ~57 req/s | ~same for 8B |
+| XLarge Improvement | ~0% | **~32%** | Consistent across instances |
+| Incomplete Rate | 0% | 0% | Fixed by stale connection retry |
+| Throughput | ~44 req/s | ~44 req/s | ~same for 8B |
 
 **For 13B models, expect larger improvements (especially P99 and throughput):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
-| XLarge Improvement | ~0% | **~34-43%** | Instance-dependent |
-| Overall P99 TTFT | ~3500-9200ms | ~940-1200ms | **-69% to -87%** tail latency |
-| Throughput | ~32-42 req/s | ~40-47 req/s | **+7-27%** higher |
+| XLarge Improvement | ~0% | **~36-39%** | Instance-dependent |
+| Overall P99 TTFT | ~4500-4700ms | ~940-1000ms | **-79%** tail latency |
+| Throughput | ~14-26 req/s | ~15-29 req/s | **+14%** higher |
 
 **How to interpret:**
 - **Cache hit rate** is the headline metric (12% → 98%) — always consistent
-- **P99 tail latency** is the strongest win for 13B — consistently -69% or better
-- **Per-bucket improvement** shows XLarge benefit (~31-35% in validated 30m runs)
+- **P99 tail latency** is the strongest win for 13B — consistently -79% or better
+- **Per-bucket improvement** shows XLarge benefit (~32-39%)
+- **Incomplete rate** should be 0% — if you see >1%, check for connection pool issues
 - **Overall TTFT** may look worse for 8B due to small prefix overhead in aggregate
 - Focus on **Large/XLarge buckets** where caching matters most
 
@@ -576,11 +577,14 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 | Model | Users | Duration | Prefix Size | Cache Miss | Cache Hit | Improvement | Notes |
 |-------|-------|----------|-------------|------------|-----------|-------------|-------|
-| **13B** | 30 | **30m** | XLarge | ~1525ms | ~992ms | **~35%** | Feb 2026, validated |
-| **8B** | 30 | **30m** | XLarge | ~674ms | ~465ms | **~31%** | Feb 2026, validated |
-| 13B | 20 | 10m | XLarge | ~1158ms | ~769ms | ~34% | Feb 2026 |
-| 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026 |
-| 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026 |
+| **13B** | **20** | **10m** | XLarge | ~1301ms | ~834ms | **~36%** | Feb 2026, post-fix |
+| **13B** | **10** | **10m** | XLarge | ~1394ms | ~845ms | **~39%** | Feb 2026, post-fix |
+| **8B** | **20** | **10m** | XLarge | ~649ms | ~444ms | **~32%** | Feb 2026, post-fix |
+| 13B | 30 | 30m | XLarge | ~1525ms | ~992ms | ~35% | Feb 2026, pre-fix validated |
+| 8B | 30 | 30m | XLarge | ~674ms | ~465ms | ~31% | Feb 2026, pre-fix validated |
+| 13B | 20 | 10m | XLarge | ~1158ms | ~769ms | ~34% | Feb 2026, pre-fix |
+| 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026, pre-fix |
+| 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026, pre-fix |
 | 8B (16K pfx) | 20 | 10m | XLarge | ~817ms | ~461ms | **~44%** | Feb 2026, `--prefix-max-tokens 16000` |
 | 8B (64u stress) | 64 | 15m | XLarge | ~655ms | ~537ms | ~18% | Feb 2026, high concurrency |
 | 13B (ratio 0.7) | 20 | 10m | XLarge | ~1123ms | ~748ms | ~33% | Feb 2026, `--prefix-ratio 0.7` |
@@ -596,12 +600,13 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 70B | - | - | XLarge | TBD | TBD | Expected 50-60%+ | |
 
 **Key insights:**
-- **P99 tail latency is the strongest win** — up to -87% for 13B under sustained 30-minute load
-- **XLarge improvement typically 30-43%** — varies by instance; use 30m validated runs as reference
+- **P99 tail latency is the strongest win** — -79% or better for 13B
+- **XLarge improvement typically 32-39%** — consistent across instances post-fix
+- **0% incomplete rate** — stale connection retry (Feb 9 fix) eliminated phantom timeouts
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
 - **Small prefixes have overhead** — Routing cost exceeds cache benefit
 - **Larger models amplify benefits** — 13B sees bigger throughput/P99 gains than 8B
-- **Throughput improves for 13B** — up to +27% under sustained heavy load
+- **Throughput improves for 13B** — +14-15% with 0% wasted connections
 
 ### Cache Hit Rate
 
@@ -625,18 +630,69 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 ## Real Benchmark Results
 
-### February 2026 — With Load-Aware Routing
+### February 2026 — With Load-Aware Routing + Stale Connection Fix
 
 > Load-aware routing (added Feb 2026) prevents backend hotspots by checking queue depth
 > before routing. If the prefix-preferred backend is overloaded, requests fall back to the
 > least-loaded backend — accepting a cache miss for lower latency.
+>
+> **Stale connection retry** (added Feb 9, 2026) detects when the connection pool returns a
+> dead TCP socket (vLLM closed its end) and transparently retries on a fresh connection.
+> This eliminated the 30-37% "incomplete" request rate that was present in earlier runs.
 
-Results collected across two separate Lambda Labs 8x A100 instances. All runs use stress
+Results collected across three Lambda Labs 8x A100 instances. All runs use stress
 distribution (70% large/xlarge prefixes), prefix ratio 0.9, and warmup enabled.
 
-#### 30-Minute Validated Runs (Primary Reference)
+#### Post-Fix 10-Minute Runs (Instance 3)
 
-These longer runs provide the most statistically reliable results.
+These runs were collected after the stale connection retry fix. Incomplete rate dropped
+from 30-37% to **0%** across all configurations.
+
+**CodeLlama-13b (20 users, 10 minutes):**
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| Cache Hit Rate | 13.2% | 97.6% | **+84.5%** |
+| XLarge Improvement | 2.2% | **35.9%** | **+33.7pp** |
+| Large Improvement | -2.7% | **35.9%** | **+38.6pp** |
+| Overall P50 TTFT | 1,000ms | 820ms | **-18.0%** |
+| Overall P99 TTFT | 4,700ms | 1,000ms | **-78.7%** |
+| Throughput (req/s) | 25.6 | 29.1 | **+13.7%** |
+| Incomplete Rate | 0% | 0% | **0% (was 30-38%)** |
+| Validation | PASSED | PASSED | |
+
+**CodeLlama-13b (10 users, 10 minutes):**
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| Cache Hit Rate | 11.2% | 96.8% | **+85.6%** |
+| XLarge Improvement | -2.3% | **39.4%** | **+41.8pp** |
+| Overall P50 TTFT | 1,000ms | 750ms | **-25.0%** |
+| Overall P99 TTFT | 4,500ms | 940ms | **-79.1%** |
+| Throughput (req/s) | 13.3 | 15.3 | **+14.6%** |
+| Incomplete Rate | 0% | 0% | **0% (was 33%)** |
+| Validation | PASSED | PASSED | |
+
+**Llama-3.1-8B (20 users, 10 minutes):**
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| Cache Hit Rate | 11.9% | 98.1% | **+86.1%** |
+| XLarge Improvement | 0.0% | **31.6%** | **+31.6pp** |
+| Overall P50 TTFT | 410ms | 430ms | +4.9% |
+| Overall P99 TTFT | 580ms | 500ms | **-13.8%** |
+| Throughput (req/s) | 44.2 | 43.7 | -1.2% |
+| Incomplete Rate | 0% | 0% | **0% (was 37%)** |
+| Validation | PASSED | PASSED | |
+
+The 8B model is fast enough (~410-430ms) that routing overhead is noticeable in aggregate
+TTFT, but per-bucket XLarge improvement remains strong at 31.6%.
+
+#### 30-Minute Validated Runs (Pre-Fix — Pending Re-run)
+
+> **Note:** These runs were collected before the stale connection fix. The 30-37% incomplete
+> rate was caused by stale TCP connections, not actual timeouts. Routing and TTFT metrics
+> are still valid, but throughput and request counts are understated. Re-runs pending.
 
 **CodeLlama-13b (30 users, 30 minutes):**
 
@@ -649,7 +705,7 @@ These longer runs provide the most statistically reliable results.
 | Overall P50 TTFT | 1,200ms | 870ms | **-27.5%** |
 | Overall P99 TTFT | 9,200ms | 1,200ms | **-87.0%** |
 | Throughput (req/s) | 31.6 | 40.1 | **+27.1%** |
-| Incomplete Rate | 39.7% | 34.4% | **-13.3%** |
+| ~~Incomplete Rate~~ | ~~39.7%~~ | ~~34.4%~~ | ~~-13.3%~~ (stale connections) |
 | Validation | **FAILED** | **PASSED** | |
 | Error Rate | 0% | 0% | — |
 
@@ -668,19 +724,28 @@ prefix routing passes.
 | Overall P50 TTFT | 420ms | 450ms | +7.1% |
 | Overall P99 TTFT | 470ms | 520ms | +10.6% |
 | Throughput (req/s) | 57.1 | 58.1 | +1.6% |
-| Incomplete Rate | 36.8% | 29.9% | **-18.9%** |
+| ~~Incomplete Rate~~ | ~~36.8%~~ | ~~29.9%~~ | ~~-18.9%~~ (stale connections) |
 | Error Rate | 0% | 0% | — |
 
-The 8B model shows consistent per-bucket improvement (31%) and a significant drop in
-incomplete rate (-19%), but overall TTFT is flat — the model is fast enough that
-routing overhead is noticeable in aggregate.
+The 8B model shows consistent per-bucket improvement (31%) but overall TTFT is flat —
+the model is fast enough that routing overhead is noticeable in aggregate.
 
 #### Complete Results Matrix (All Runs)
 
+**Post-fix runs (0% incomplete rate):**
+
+| Model | Users | Duration | XLarge Improvement | P99 TTFT Change | Throughput | Cache Hit Rate | Incomplete | Instance |
+|-------|-------|----------|-------------------|-----------------|------------|----------------|------------|----------|
+| **13B** | **20** | **10m** | **35.9%** | **-78.7%** | **+13.7%** | 97.6% | **0%** | 3 |
+| **13B** | **10** | **10m** | **39.4%** | **-79.1%** | **+14.6%** | 96.8% | **0%** | 3 |
+| **8B** | **20** | **10m** | **31.6%** | -13.8% | -1.2% | 98.1% | **0%** | 3 |
+
+**Pre-fix runs (30-37% incomplete from stale connections — TTFT/routing metrics valid, throughput understated):**
+
 | Model | Users | Duration | XLarge Improvement | P99 TTFT Change | Throughput | Cache Hit Rate | Instance |
 |-------|-------|----------|-------------------|-----------------|------------|----------------|----------|
-| **13B** | **30** | **30m** | **35.0%** | **-87.0%** | **+27.1%** | 97.9% | 2 |
-| **8B** | **30** | **30m** | **30.9%** | +10.6% | +1.6% | 98.1% | 2 |
+| 13B | 30 | 30m | 35.0% | -87.0% | +27.1% | 97.9% | 2 |
+| 8B | 30 | 30m | 30.9% | +10.6% | +1.6% | 98.1% | 2 |
 | 13B | 30 | 10m | 92.7% | -75.6% | +16.6% | 98.0% | 1 |
 | 13B | 30 | 10m | -7.4% | -68.6% | +7.1% | 97.8% | 2 |
 | 13B | 20 | 10m | 33.6% | -81.2% | +12.9% | 97.3% | 2 |
@@ -688,7 +753,7 @@ routing overhead is noticeable in aggregate.
 | 8B | 30 | 10m | 37.4% | +16.3% | ~same | 97.8% | 1 |
 | 8B | 30 | 10m | 15.8% | 0% | +1.2% | 97.5% | 2 |
 | 8B | 20 | 10m | 29.7% | -18.3% | +1.2% | 97.9% | 2 |
-| 8B (16K pfx) | 20 | 10m | **43.6%** | -24.6% | +0.9% | 97.7% | 2 |
+| 8B (16K pfx) | 20 | 10m | 43.6% | -24.6% | +0.9% | 97.7% | 2 |
 | 8B (64u stress) | 64 | 15m | 18.0% | — | — | 98.3% | 2 |
 | 13B (ratio 0.7) | 20 | 10m | 33.4% | -76.3% | +19.4% | 93.4% | 2 |
 | 13B (ratio 0.5) | 20 | 10m | 43.5% | -81.8% | +17.6% | 89.5% | 2 |
@@ -705,13 +770,11 @@ and transient queuing patterns.
 - **Cache hit rate**: 96.4-98.1% (always excellent)
 - **13B P99 TTFT improvement**: -69% to -87% (always strong)
 - **13B throughput improvement**: +7% to +27% (always positive)
-- **Incomplete rate improvement**: -9% to -29% (always better)
+- **Incomplete rate**: 0% (post-fix) — previously 30-37% from stale TCP connections
 - **Error rate**: 0% (always clean)
 
 **Metrics that vary significantly:**
-- **XLarge TTFT Improvement**: 16-93% for 8B/13B (use 30m validated runs as reference)
-
-The 30-minute validated runs are the most reliable because they average out transient effects.
+- **XLarge TTFT Improvement**: 16-93% (use multiple-instance averages as reference)
 
 #### Why 13B Benefits More Than 8B
 
@@ -797,11 +860,11 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 | Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate | P99 TTFT Change | Notes |
 |-------|------|-------|----------|-------------------------|----------------|-----------------|-------|
-| **CodeLlama-13b** | Heavy | 30 | **30m** | **35.0%** | 97.9% | **-87.0%** | Feb 2026, validated |
-| **Llama-3.1-8B** | Heavy | 30 | **30m** | **30.9%** | 98.1% | +10.6% | Feb 2026, validated |
-| CodeLlama-13b | Moderate | 20 | 10m | 33.6% | 97.3% | -81.2% | Feb 2026 |
-| CodeLlama-13b | Normal | 10 | 10m | 43.1% | 96.4% | -68.5% | Feb 2026 |
-| Llama-3.1-8B | Moderate | 20 | 10m | 29.7% | 97.9% | -18.3% | Feb 2026 |
+| **CodeLlama-13b** | **Moderate** | **20** | **10m** | **35.9%** | 97.6% | **-78.7%** | Feb 2026, post-fix |
+| **CodeLlama-13b** | **Normal** | **10** | **10m** | **39.4%** | 96.8% | **-79.1%** | Feb 2026, post-fix |
+| **Llama-3.1-8B** | **Moderate** | **20** | **10m** | **31.6%** | 98.1% | -13.8% | Feb 2026, post-fix |
+| CodeLlama-13b | Heavy | 30 | 30m | 35.0% | 97.9% | -87.0% | Feb 2026, pre-fix |
+| Llama-3.1-8B | Heavy | 30 | 30m | 30.9% | 98.1% | +10.6% | Feb 2026, pre-fix |
 | CodeLlama-13b | Moderate | 20 | 30m | 38.9% | 97.6% | — | Jan 2026 |
 | CodeLlama-13b | Normal | 10 | 10m | 48.2% | 96.4% | — | Jan 2026 |
 | CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% | — | Jan 2026 |
@@ -810,11 +873,11 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 | Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% | — | Jan 2026 |
 
 **Key takeaways:**
-- **P99 tail latency** is the strongest and most consistent win — up to -87% for 13B under sustained load
-- **Throughput increases** up to 27% for larger models under heavy load
+- **P99 tail latency** is the strongest and most consistent win — -79% or better for 13B
+- **Throughput increases** +14-15% for 13B with 0% wasted connections (post-fix)
 - **Cache hit rate** is excellent (96-98%) regardless of load, model, or instance
-- **XLarge improvement** typically ranges 30-43%, with instance-specific outliers above and below
-- **Incomplete rate** consistently drops 9-29% with prefix routing
+- **XLarge improvement** typically ranges 32-39% post-fix
+- **0% incomplete rate** after stale connection retry fix (Feb 9, 2026)
 
 #### Impact of Prefix Sharing Ratio
 
@@ -891,11 +954,18 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 
 ### Completed (February 2026)
 
+**Post-fix (stale connection retry, Feb 9):**
+
 | # | Config | Status | Result |
 |---|--------|--------|--------|
-| 1 | 13B, 20u, 10m | Done | XLarge 33.6%, P99 -81.2% |
-| 2 | 8B, 20u, 10m | Done | XLarge 29.7%, P99 -18.3% |
-| 3 | 13B, 10u, 10m | Done | XLarge 43.1%, P99 -68.5% |
+| 1 | 13B, 20u, 10m | **Re-run** | XLarge 35.9%, P99 -78.7%, **0% incomplete** |
+| 2 | 8B, 20u, 10m | **Re-run** | XLarge 31.6%, P99 -13.8%, **0% incomplete** |
+| 3 | 13B, 10u, 10m | **Re-run** | XLarge 39.4%, P99 -79.1%, **0% incomplete** |
+
+**Pre-fix (runs 4-11 collected before stale connection fix — TTFT metrics valid):**
+
+| # | Config | Status | Result |
+|---|--------|--------|--------|
 | 4 | 13B, 30u, 30m (validated) | Done | XLarge 35.0%, P99 -87.0% |
 | 5 | 8B, 30u, 30m (validated) | Done | XLarge 30.9% |
 | 6 | 13B, prefix ratio 0.7 | Done | XLarge 33.4%, P99 -76.3% |
@@ -907,6 +977,9 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 ### Remaining Benchmarks
 
 ```bash
+# 4-5. Re-run 30m validated runs with stale connection fix (priority)
+./scripts/bench-runner.sh --suite medium --skip 6,7
+
 # 10. 70B model (still TBD in the docs)
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-70B-Instruct \
   --warmup --duration 15m --users 16

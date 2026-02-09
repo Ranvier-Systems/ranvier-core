@@ -1421,7 +1421,7 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P3 - Low** | Benchmark | Traffic variability - traffic pattern option | Low | |
 | **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
 | **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
-| **P2 - Medium** | Benchmark | Incomplete rate investigation - timeout tuning | Medium | |
+| **P2 - Medium** | Benchmark | Incomplete rate investigation - timeout tuning | Medium | ✅ Done (stale connection retry) |
 | **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | ✅ Done |
 | **P1 - High** | Performance | Load-aware prefix routing - backend load tracking | Medium | ✅ Done (#222) |
 | **P1 - High** | Performance | Load-aware prefix routing - load-aware selection | Medium | ✅ Done (#223) |
