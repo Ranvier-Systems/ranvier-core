@@ -65,11 +65,12 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health" or parsed.path == "/":
+            body = json.dumps({"status": "ok", "backend_id": BACKEND_ID, "keepalive": _keepalive_enabled}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            response = {"status": "ok", "backend_id": BACKEND_ID, "keepalive": _keepalive_enabled}
-            self.wfile.write(json.dumps(response).encode())
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -97,10 +98,12 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         enabled = params.get("enabled", ["1"])[0]
         _keepalive_enabled = enabled == "1"
         print(f"[Backend {BACKEND_ID}] Keep-alive set to: {_keepalive_enabled}", flush=True)
+        body = json.dumps({"keepalive": _keepalive_enabled}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps({"keepalive": _keepalive_enabled}).encode())
+        self.wfile.write(body)
 
     def _handle_chat_completion(self):
         """Simulate a streaming chat completion response."""
@@ -114,10 +117,12 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         try:
             request_data = json.loads(body) if body else {}
         except json.JSONDecodeError:
+            body = b'{"error": "Invalid JSON"}'
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b'{"error": "Invalid JSON"}')
+            self.wfile.write(body)
             return
 
         # Extract prompt from messages
