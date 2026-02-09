@@ -972,6 +972,27 @@ class NegativePathTest(unittest.TestCase):
             self.fail(f"Could not reach mock backends for admin control: {e}")
 
         try:
+            # Ensure rate limiting from test_04 is cleared (its cleanup SIGHUP
+            # may have been rejected by RELOAD_COOLDOWN)
+            pre_status, _, _ = send_chat_request(node1_api, "stale-precheck", timeout=10)
+            if pre_status != 200:
+                print(f"  Ranvier returning {pre_status}, clearing residual rate limit config...")
+                node1_container = CONTAINER_NAMES["node1"]
+                subprocess.run(
+                    ["docker", "exec", node1_container, "rm", "-f", "/app/ranvier.yaml"],
+                    capture_output=True, text=True, timeout=10
+                )
+                time.sleep(12)  # Wait for RELOAD_COOLDOWN to expire
+                subprocess.run(
+                    ["docker", "kill", "--signal=HUP", node1_container],
+                    capture_output=True, text=True, timeout=10
+                )
+                time.sleep(3)
+                pre_status, _, _ = send_chat_request(node1_api, "stale-precheck-2", timeout=10)
+                self.assertEqual(pre_status, 200,
+                                 f"Ranvier still returning {pre_status} after config reload")
+                print("    Rate limiting cleared")
+
             # Step 2: Send warmup requests to establish pooled connections
             print("  Sending warmup requests to establish pooled connections...")
             for i in range(4):
