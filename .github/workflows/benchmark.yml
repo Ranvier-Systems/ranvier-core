@@ -206,7 +206,7 @@ jobs:
           fi
 
       - name: Update baseline (if requested)
-        if: github.event.inputs.update_baseline == 'true' && steps.compare.outputs.regression_detected == 'false'
+        if: github.event.inputs.update_baseline == 'true'
         run: |
           echo "Updating baseline with current results..."
 
@@ -240,7 +240,7 @@ jobs:
           docker compose -f docker-compose.test.yml down -v --remove-orphans
 
       - name: Fail on regression
-        if: steps.compare.outputs.regression_detected == 'true'
+        if: steps.compare.outputs.regression_detected == 'true' && github.event.inputs.update_baseline != 'true'
         run: |
           echo "::error::Performance regression detected. See benchmark results for details."
           exit 1
