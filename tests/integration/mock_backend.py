@@ -71,6 +71,7 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
         else:
             self.send_response(404)
             self.end_headers()
@@ -104,6 +105,7 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
 
     def _handle_chat_completion(self):
         """Simulate a streaming chat completion response."""
@@ -123,6 +125,7 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
             return
 
         # Extract prompt from messages
