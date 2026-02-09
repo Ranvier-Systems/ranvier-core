@@ -954,11 +954,17 @@ class NegativePathTest(unittest.TestCase):
         backend1_direct = f"http://{DOCKER_HOST}:21434"
         backend2_direct = f"http://{DOCKER_HOST}:21435"
 
+        # Force Connection: close on direct backend calls. The mock backend's
+        # non-streaming HTTP/1.1 responses may remain stuck in Python's
+        # buffered wfile until the connection closes, causing read timeouts
+        # with keep-alive connections.
+        close_hdr = {"Connection": "close"}
+
         # Step 1: Enable keep-alive on both backends so Ranvier pools connections
         print("  Enabling keep-alive on mock backends...")
         try:
-            r1 = requests.post(f"{backend1_direct}/admin/keepalive?enabled=1", timeout=5)
-            r2 = requests.post(f"{backend2_direct}/admin/keepalive?enabled=1", timeout=5)
+            r1 = requests.post(f"{backend1_direct}/admin/keepalive?enabled=1", timeout=5, headers=close_hdr)
+            r2 = requests.post(f"{backend2_direct}/admin/keepalive?enabled=1", timeout=5, headers=close_hdr)
             self.assertEqual(r1.status_code, 200, "Failed to enable keepalive on backend1")
             self.assertEqual(r2.status_code, 200, "Failed to enable keepalive on backend2")
             print("    Keep-alive enabled on both backends")
@@ -966,6 +972,27 @@ class NegativePathTest(unittest.TestCase):
             self.fail(f"Could not reach mock backends for admin control: {e}")
 
         try:
+            # Ensure rate limiting from test_04 is cleared (its cleanup SIGHUP
+            # may have been rejected by RELOAD_COOLDOWN)
+            pre_status, _, _ = send_chat_request(node1_api, "stale-precheck", timeout=10)
+            if pre_status != 200:
+                print(f"  Ranvier returning {pre_status}, clearing residual rate limit config...")
+                node1_container = CONTAINER_NAMES["node1"]
+                subprocess.run(
+                    ["docker", "exec", node1_container, "rm", "-f", "/app/ranvier.yaml"],
+                    capture_output=True, text=True, timeout=10
+                )
+                time.sleep(12)  # Wait for RELOAD_COOLDOWN to expire
+                subprocess.run(
+                    ["docker", "kill", "--signal=HUP", node1_container],
+                    capture_output=True, text=True, timeout=10
+                )
+                time.sleep(3)
+                pre_status, _, _ = send_chat_request(node1_api, "stale-precheck-2", timeout=10)
+                self.assertEqual(pre_status, 200,
+                                 f"Ranvier still returning {pre_status} after config reload")
+                print("    Rate limiting cleared")
+
             # Step 2: Send warmup requests to establish pooled connections
             print("  Sending warmup requests to establish pooled connections...")
             for i in range(4):
@@ -996,7 +1023,7 @@ class NegativePathTest(unittest.TestCase):
                 healthy = False
                 for attempt in range(20):
                     try:
-                        resp = requests.get(f"{url}/health", timeout=2)
+                        resp = requests.get(f"{url}/health", timeout=2, headers=close_hdr)
                         if resp.status_code == 200:
                             healthy = True
                             break
@@ -1006,8 +1033,8 @@ class NegativePathTest(unittest.TestCase):
                 self.assertTrue(healthy, f"Backend at {url} did not recover after restart")
 
             # Re-enable keep-alive after restart (state is reset)
-            requests.post(f"{backend1_direct}/admin/keepalive?enabled=1", timeout=5)
-            requests.post(f"{backend2_direct}/admin/keepalive?enabled=1", timeout=5)
+            requests.post(f"{backend1_direct}/admin/keepalive?enabled=1", timeout=5, headers=close_hdr)
+            requests.post(f"{backend2_direct}/admin/keepalive?enabled=1", timeout=5, headers=close_hdr)
 
             # Step 4: Send requests — these should hit stale pooled connections
             # Phase 3.5 should detect the empty response and retry on fresh connections
@@ -1055,7 +1082,7 @@ class NegativePathTest(unittest.TestCase):
             print("  Restoring Connection: close on backends...")
             for url in [backend1_direct, backend2_direct]:
                 try:
-                    requests.post(f"{url}/admin/keepalive?enabled=0", timeout=5)
+                    requests.post(f"{url}/admin/keepalive?enabled=0", timeout=5, headers=close_hdr)
                 except requests.exceptions.RequestException:
                     pass
 
