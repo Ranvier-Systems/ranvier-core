@@ -230,22 +230,22 @@ The `--client-tokenize` flag moves tokenization from Ranvier to the benchmark cl
 
 ### Trade-offs by Model Size
 
-#### CodeLlama-13b (February 2026 — 30 users, 10 minutes)
+#### CodeLlama-13b (February 2026 — 30 users, 10 minutes, post-fix)
 
 | Metric | Server Tokenize | Client Tokenize | Difference |
 |--------|-----------------|-----------------|------------|
-| Routing overhead | ~10-12ms | ~0.4ms | **25-30x lower** |
-| Throughput (req/s) | 40.1 | 47.8 | **-6.4%** (see note) |
-| XLarge Improvement % | ~35% | 24.8% | Lower (see below) |
-| XLarge Hit P50 | ~992ms | 802ms | -19% |
-| XLarge Miss P50 | ~1525ms | 1065ms | -30% |
-| P99 TTFT Change | **-87%** | -30% | Less P99 benefit |
-| Cache Hit Rate | 97.9% | 97.8% | Same |
+| Routing overhead | ~10ms | ~0.3ms | **32x lower** |
+| Throughput change | +13.7% | **+19.4%** | Better with client tok |
+| XLarge Improvement % | ~36% | 9.6% | Lower (see below) |
+| XLarge Hit P50 | ~890ms | 943ms | ~same |
+| XLarge Miss P50 | ~1300ms | 1043ms | -20% faster misses |
+| P99 TTFT Change | **-79%** | **-83.6%** | Comparable |
+| Cache Hit Rate | 97.6% | 97.4% | Same |
 
-> **Note on throughput:** The client tokenization run used 30 users and showed 47.8 req/s
-> prefix-aware vs 51.1 req/s round-robin (-6.4%). This is the prefix-aware vs round-robin
-> comparison, not server vs client tokenization. The overhead reduction doesn't offset
-> routing's per-request cost at this concurrency level.
+> **Note:** With the stale connection fix, client tokenization now shows its true benefit:
+> **+19.4% throughput** (vs +13.7% server-side) and **-83.6% P99** (vs -79% server-side).
+> Pre-fix data showed -6.4% throughput and -30% P99 due to stale connections disproportionately
+> affecting the prefix-aware side.
 
 #### Llama-3.1-8B (January 2026 — 20 users, 30 minutes)
 
@@ -740,6 +740,7 @@ that this is expected. Throughput is essentially flat.
 | **8B** | **20** | **10m** | **31.6%** | -13.8% | -1.2% | 98.1% | **0%** | 3 |
 | **13B (ratio 0.7)** | **20** | **10m** | n/a† | **-86.9%** | **+31.5%** | 90.0% | **0%** | 3 |
 | **13B (ratio 0.5)** | **20** | **10m** | **37.3%** | **-76.1%** | **+10.0%** | 91.0% | **0%** | 3 |
+| **13B (client tok)** | **30** | **10m** | 9.6% | **-83.6%** | **+19.4%** | 97.4% | **0%** | 3 |
 
 †XLarge metric unreliable at ratio 0.7: only a handful of XLarge misses (P50 64ms from tiny sample).
 
@@ -971,6 +972,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 5 | 8B, 30u, 30m (validated) | **Re-run** | XLarge 40.5%, P99 +6.5%, ~same throughput, **0% incomplete** |
 | 6 | 13B, prefix ratio 0.7 | **Re-run** | P99 -86.9%, +31.5% throughput, **0% incomplete** |
 | 7 | 13B, prefix ratio 0.5 | **Re-run** | XLarge 37.3%, P99 -76.1%, +10.0% throughput, **0% incomplete** |
+| 8 | 13B, client tokenization | **Re-run** | XLarge 9.6%, P99 -83.6%, +19.4% throughput, **0% incomplete** |
 
 **Pre-fix (runs 4-11 collected before stale connection fix — TTFT metrics valid):**
 
@@ -980,7 +982,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | ~~5~~ | ~~8B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 30.9%~~ (re-run above) |
 | ~~6~~ | ~~13B, prefix ratio 0.7~~ | ~~Done~~ | ~~XLarge 33.4%, P99 -76.3%~~ (re-run above) |
 | ~~7~~ | ~~13B, prefix ratio 0.5~~ | ~~Done~~ | ~~XLarge 43.5%, P99 -81.8%~~ (re-run above) |
-| 8 | 13B, client tokenization | Done | XLarge 24.8%, P99 -30.0% |
+| ~~8~~ | ~~13B, client tokenization~~ | ~~Done~~ | ~~XLarge 24.8%, P99 -30.0%~~ (re-run above) |
 | 9 | 8B, 64u, 15m stress test | Done | XLarge 18.0%, 0 errors, PASSED |
 | 11 | 8B, 20u, 10m, 16K prefix | Done | XLarge 43.6%, P99 -24.6% |
 
