@@ -24,11 +24,11 @@ Prefix-aware routing with load-aware fallback vs round-robin baseline (30-minute
 
 | Prefix Sharing | Cache Hit Rate | XLarge Improvement | P99 TTFT |
 |----------------|----------------|--------------------|----------|
-| 90% (default) | 97% | 34% | -81% |
-| 70% | 93% | 33% | -76% |
+| 90% (default) | 98% | 36% | -79% |
+| 70% | 90% | n/a† | -87% |
 | 50% | 90% | 44% | -82% |
 
-*Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes. XLarge improvement varies by instance (16-93% observed range); P99/throughput improvements are more consistent.*
+*†XLarge metric unreliable at 0.7 due to tiny miss sample. Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes. XLarge improvement varies by instance; P99/throughput improvements are more consistent.*
 
 ---
 
@@ -738,6 +738,9 @@ that this is expected. Throughput is essentially flat.
 | **13B** | **20** | **10m** | **35.9%** | **-78.7%** | **+13.7%** | 97.6% | **0%** | 3 |
 | **13B** | **10** | **10m** | **39.4%** | **-79.1%** | **+14.6%** | 96.8% | **0%** | 3 |
 | **8B** | **20** | **10m** | **31.6%** | -13.8% | -1.2% | 98.1% | **0%** | 3 |
+| **13B (ratio 0.7)** | **20** | **10m** | n/a† | **-86.9%** | **+31.5%** | 90.0% | **0%** | 3 |
+
+†XLarge metric unreliable: only a handful of XLarge misses (P50 64ms from tiny sample).
 
 **Pre-fix runs (30-37% incomplete from stale connections — TTFT/routing metrics valid, throughput understated):**
 
@@ -887,18 +890,20 @@ Not all workloads have 90% prefix sharing. These tests show how improvement scal
 
 | Prefix Ratio | Cache Hit Rate | XLarge Improvement | P99 TTFT Change | Throughput | Validation |
 |--------------|----------------|--------------------|-----------------|------------|------------|
-| 0.9 (default) | 97.3% | 33.6% | -81.2% | +12.9% | PASSED |
-| 0.7 | 93.4% | 33.4% | -76.3% | +19.4% | PASSED |
+| 0.9 (default) | 97.6% | 35.9% | -78.7% | +13.7% | PASSED (post-fix) |
+| 0.7 | 90.0% | n/a† | -86.9% | +31.5% | PASSED (post-fix) |
 | 0.5 | 89.5% | 43.5% | -81.8% | +17.6% | FAILED→PASSED |
+
+†XLarge improvement at 0.7 reported -1144% due to very few XLarge misses (P50 64ms from
+tiny sample). The hit P50 of 798ms is reliable; the miss sample is too small.
 
 **Key findings:**
 - **Improvement holds up remarkably well** across prefix ratios — even at 50% sharing, the
-  system delivers 90% cache hit rate and 34-44% XLarge improvement
-- **Lower prefix sharing increases miss latency** — at 0.5, XLarge miss P50 is 1523ms vs
-  1123ms at 0.7, which actually widens the hit/miss gap and increases the improvement percentage
-- **P99 tail latency improvement is consistent** — -76% to -82% regardless of prefix ratio
-- **Throughput improves at all levels** — +13% to +19%, slightly better at lower ratios where
-  load-aware routing prevents more backend pile-ups
+  system delivers 90% cache hit rate
+- **P99 tail latency improvement is consistent** — -79% to -87% regardless of prefix ratio
+- **Throughput improves at all levels** — +14% to +32%, with the strongest gains at moderate
+  ratios where load-aware routing prevents more backend pile-ups
+- **Round-robin fails validation** at all prefix levels under sustained 13B load
 
 This demonstrates prefix-aware routing benefits workloads even when prefix sharing is
 moderate — you don't need 90%+ sharing to see real gains.
@@ -964,6 +969,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 3 | 13B, 10u, 10m | **Re-run** | XLarge 39.4%, P99 -79.1%, **0% incomplete** |
 | 4 | 13B, 30u, 30m (validated) | **Re-run** | XLarge 32.8%, P99 -85.3%, +22.3% throughput, **0% incomplete** |
 | 5 | 8B, 30u, 30m (validated) | **Re-run** | XLarge 40.5%, P99 +6.5%, ~same throughput, **0% incomplete** |
+| 6 | 13B, prefix ratio 0.7 | **Re-run** | P99 -86.9%, +31.5% throughput, **0% incomplete** |
 
 **Pre-fix (runs 4-11 collected before stale connection fix — TTFT metrics valid):**
 
@@ -971,7 +977,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 |---|--------|--------|--------|
 | ~~4~~ | ~~13B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 35.0%, P99 -87.0%~~ (re-run above) |
 | ~~5~~ | ~~8B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 30.9%~~ (re-run above) |
-| 6 | 13B, prefix ratio 0.7 | Done | XLarge 33.4%, P99 -76.3% |
+| ~~6~~ | ~~13B, prefix ratio 0.7~~ | ~~Done~~ | ~~XLarge 33.4%, P99 -76.3%~~ (re-run above) |
 | 7 | 13B, prefix ratio 0.5 | Done | XLarge 43.5%, P99 -81.8% |
 | 8 | 13B, client tokenization | Done | XLarge 24.8%, P99 -30.0% |
 | 9 | 8B, 64u, 15m stress test | Done | XLarge 18.0%, 0 errors, PASSED |
