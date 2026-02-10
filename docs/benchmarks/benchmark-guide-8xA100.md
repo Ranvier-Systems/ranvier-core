@@ -376,22 +376,22 @@ With client tokenization, **cache misses also get faster** because the server sk
   --prefix-ratio 0.85
 ```
 
-**Measured Results (February 2026, 8B, 64 users, 15m, prefix-only):**
+**Measured Results (February 2026, 8B, 64 users, 15m, prefix-only, post-fix):**
 
 | Metric | Result | Alert Threshold |
 |--------|--------|-----------------|
 | Error Rate | **0%** | > 5% |
-| P99 TTFT | **731ms** | > 5000ms |
-| Requests/sec | **18.8** (successful TTFT) | < 2.0 |
-| Cache Hit Rate | **98.3%** | < 40% |
-| XLarge Improvement | **18.0%** | |
-| Incomplete Rate | **25.3%** | |
+| P99 TTFT | **600ms** | > 5000ms |
+| Requests/sec | **22.0** (successful TTFT) | < 2.0 |
+| Cache Hit Rate | **98.0%** | < 40% |
+| XLarge Improvement | **29.0%** | |
+| Incomplete Rate | **0%** | |
 | Validation | **PASSED** | |
 
-**Notes:** XLarge improvement is lower than 20-user runs (~30%) because contention compresses
+**Notes:** XLarge improvement is lower than 20-user runs (~32-40%) because contention compresses
 the hit/miss gap — even cache hits wait in backend queues at 64 users. Load distribution was
-virtually even (7574/7552/7531 across 3 Ranvier nodes). All 22,657 requests completed with
-zero errors.
+virtually even (~6600 across 3 Ranvier nodes). All 19,841 requests completed with zero errors
+and zero incomplete. Post-fix run shows higher XLarge (29% vs pre-fix 18%) and 0% incomplete.
 
 **Monitoring Commands:**
 ```bash
@@ -586,7 +586,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 13B | 10 | 10m | XLarge | ~1318ms | ~751ms | ~43% | Feb 2026, pre-fix |
 | 8B | 20 | 10m | XLarge | ~638ms | ~448ms | ~30% | Feb 2026, pre-fix |
 | 8B (16K pfx) | 20 | 10m | XLarge | ~817ms | ~461ms | **~44%** | Feb 2026, `--prefix-max-tokens 16000` |
-| 8B (64u stress) | 64 | 15m | XLarge | ~655ms | ~537ms | ~18% | Feb 2026, high concurrency |
+| 8B (64u stress) | 64 | 15m | XLarge | ~668ms | ~474ms | ~29% | Feb 2026, post-fix, high concurrency |
 | 13B (ratio 0.7) | 20 | 10m | XLarge | ~1123ms | ~748ms | ~33% | Feb 2026, `--prefix-ratio 0.7` |
 | 13B (ratio 0.5) | 20 | 10m | XLarge | ~1523ms | ~861ms | ~44% | Feb 2026, `--prefix-ratio 0.5` |
 | 13B (client tok) | 30 | 10m | XLarge | ~1065ms | ~802ms | ~25% | Feb 2026, `--client-tokenize` |
@@ -741,6 +741,7 @@ that this is expected. Throughput is essentially flat.
 | **13B (ratio 0.7)** | **20** | **10m** | n/a† | **-86.9%** | **+31.5%** | 90.0% | **0%** | 3 |
 | **13B (ratio 0.5)** | **20** | **10m** | **37.3%** | **-76.1%** | **+10.0%** | 91.0% | **0%** | 3 |
 | **13B (client tok)** | **30** | **10m** | 9.6% | **-83.6%** | **+19.4%** | 97.4% | **0%** | 3 |
+| **8B (64u stress)** | **64** | **15m** | **29.0%** | — | — | 98.0% | **0%** | 3 |
 
 †XLarge metric unreliable at ratio 0.7: only a handful of XLarge misses (P50 64ms from tiny sample).
 
@@ -973,6 +974,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 6 | 13B, prefix ratio 0.7 | **Re-run** | P99 -86.9%, +31.5% throughput, **0% incomplete** |
 | 7 | 13B, prefix ratio 0.5 | **Re-run** | XLarge 37.3%, P99 -76.1%, +10.0% throughput, **0% incomplete** |
 | 8 | 13B, client tokenization | **Re-run** | XLarge 9.6%, P99 -83.6%, +19.4% throughput, **0% incomplete** |
+| 9 | 8B, 64u, 15m stress test | **Re-run** | XLarge 29.0%, P99 600ms, 0 errors, **0% incomplete** |
 
 **Pre-fix (runs 4-11 collected before stale connection fix — TTFT metrics valid):**
 
@@ -983,7 +985,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | ~~6~~ | ~~13B, prefix ratio 0.7~~ | ~~Done~~ | ~~XLarge 33.4%, P99 -76.3%~~ (re-run above) |
 | ~~7~~ | ~~13B, prefix ratio 0.5~~ | ~~Done~~ | ~~XLarge 43.5%, P99 -81.8%~~ (re-run above) |
 | ~~8~~ | ~~13B, client tokenization~~ | ~~Done~~ | ~~XLarge 24.8%, P99 -30.0%~~ (re-run above) |
-| 9 | 8B, 64u, 15m stress test | Done | XLarge 18.0%, 0 errors, PASSED |
+| ~~9~~ | ~~8B, 64u, 15m stress test~~ | ~~Done~~ | ~~XLarge 18.0%, 0 errors~~ (re-run above) |
 | 11 | 8B, 20u, 10m, 16K prefix | Done | XLarge 43.6%, P99 -24.6% |
 
 ### Remaining Benchmarks
