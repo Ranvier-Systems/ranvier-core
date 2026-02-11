@@ -596,20 +596,21 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
         # Model weight size in MiB (FP16: params * 2 bytes, convert to MiB)
         MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))  # rough: 70B * 2B = 140GB ≈ 140000 MiB
 
-        # Usable VRAM per GPU (apply gpu-mem-util, leave 15% of usable for KV cache overhead)
-        # We use bc for float math; fall back to conservative integer math if unavailable
+        # Check fit at 0.92 utilization to find the minimum TP that maximizes
+        # the number of backends (critical for routing benchmarks). We always
+        # check at 0.92 because gpu-mem-util can be auto-raised if needed.
+        MIN_HEADROOM_MIB=2048  # minimum 2 GiB for KV cache + activations
         if command -v bc &> /dev/null; then
-            USABLE_PER_GPU=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL * 0.85" | bc | cut -d. -f1)
+            FIT_BUDGET=$(echo "$GPU_VRAM_MIB * 0.92" | bc | cut -d. -f1)
         else
-            # Integer approximation: vram * 85 / 100 * 85 / 100
-            USABLE_PER_GPU=$(( GPU_VRAM_MIB * 85 / 100 * 85 / 100 ))
+            FIT_BUDGET=$(( GPU_VRAM_MIB * 92 / 100 ))
         fi
 
-        # Find minimum TP that fits: model_weight / tp <= usable_per_gpu
+        # Find minimum TP that fits: weight/tp + headroom <= budget_at_0.92
         AUTO_TP=1
         for tp_candidate in 1 2 4 8; do
             WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / tp_candidate ))
-            if [[ $WEIGHT_PER_GPU -le $USABLE_PER_GPU ]]; then
+            if [[ $((WEIGHT_PER_GPU + MIN_HEADROOM_MIB)) -le $FIT_BUDGET ]]; then
                 AUTO_TP=$tp_candidate
                 break
             fi
@@ -618,20 +619,39 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
         if [[ $AUTO_TP -gt 1 ]]; then
             if [[ $AUTO_TP -le $TOTAL_GPUS ]]; then
                 TP_SIZE=$AUTO_TP
-                log_ok "Auto-detected --tp $TP_SIZE for ${MODEL_PARAMS_B}B model on ${GPU_VRAM_MIB}MiB GPUs"
+                NUM_AUTO_BACKENDS=$((TOTAL_GPUS / TP_SIZE))
+                log_ok "Auto-detected --tp $TP_SIZE for ${MODEL_PARAMS_B}B model on ${GPU_VRAM_MIB}MiB GPUs ($NUM_AUTO_BACKENDS backends)"
             else
                 log_error "Model ${MODEL_PARAMS_B}B requires TP=$AUTO_TP but only $TOTAL_GPUS GPUs available"
                 exit 1
             fi
-            # Auto-raise gpu-mem-util for tight fits (40GB GPUs with large models)
-            if [[ "$GPU_MEM_UTIL" == "0.85" && $GPU_VRAM_MIB -lt 49152 ]]; then
-                GPU_MEM_UTIL="0.92"
-                log_info "Auto-raised --gpu-mem-util to $GPU_MEM_UTIL (tight VRAM on ${GPU_VRAM_MIB}MiB GPUs)"
+
+            # Check if the chosen TP fits at the user's current gpu-mem-util.
+            # If not, auto-raise to 0.92 (only raise what's actually needed).
+            if command -v bc &> /dev/null; then
+                DEFAULT_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
+            else
+                DEFAULT_BUDGET=$(( GPU_VRAM_MIB * 85 / 100 ))
             fi
-            # Auto-set max-model-len for tight VRAM
-            if [[ -z "$MAX_MODEL_LEN" && $GPU_VRAM_MIB -lt 49152 ]]; then
-                MAX_MODEL_LEN=4096
-                log_info "Auto-set --max-model-len $MAX_MODEL_LEN (limited KV cache on ${GPU_VRAM_MIB}MiB GPUs)"
+            WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
+            if [[ $((WEIGHT_PER_GPU + MIN_HEADROOM_MIB)) -gt $DEFAULT_BUDGET ]]; then
+                GPU_MEM_UTIL="0.92"
+                log_info "Auto-raised --gpu-mem-util to $GPU_MEM_UTIL (${MODEL_PARAMS_B}B model tight at default 0.85)"
+            fi
+
+            # Auto-set max-model-len based on actual KV cache headroom
+            if [[ -z "$MAX_MODEL_LEN" ]]; then
+                if command -v bc &> /dev/null; then
+                    ACTUAL_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
+                else
+                    ACTUAL_BUDGET=$(( GPU_VRAM_MIB * 92 / 100 ))
+                fi
+                KV_HEADROOM=$(( ACTUAL_BUDGET - WEIGHT_PER_GPU ))
+                # Less than 4 GiB headroom → constrain context to 4096 tokens
+                if [[ $KV_HEADROOM -lt 4096 ]]; then
+                    MAX_MODEL_LEN=4096
+                    log_info "Auto-set --max-model-len $MAX_MODEL_LEN (${KV_HEADROOM}MiB KV headroom)"
+                fi
             fi
         fi
     fi
