@@ -502,62 +502,77 @@ tail -f /tmp/vllm_gpu*.log
 A 70B model in FP16 requires ~140GB VRAM and cannot fit on a single A100 40GB. Use
 `--tp` (tensor parallelism) to shard the model across multiple GPUs.
 
-**On 8xA100 40GB** — use TP=4, giving 2 backends (each using 4 GPUs):
+**Auto-detection:** `bench.sh` automatically detects GPU VRAM via `nvidia-smi` and
+selects the appropriate TP size, GPU memory utilization, and max context length. Just run:
 
 ```bash
-./scripts/bench.sh \
+./scripts/bench.sh --compare \
   --model meta-llama/Llama-3.1-70B-Instruct \
-  --duration 15m \
-  --users 16 \
-  --prompt-dist stress \
-  --tp 4 \
-  --max-model-len 4096 \
-  --gpu-mem-util 0.92
+  --warmup --duration 15m --users 16
+```
+
+The script will auto-configure based on detected GPU VRAM:
+- **40GB A100**: `--tp 4 --gpu-mem-util 0.92 --max-model-len 4096` (2 backends)
+- **80GB A100**: `--tp 2` (4 backends, full context)
+
+You can override any auto-detected value with explicit flags.
+
+**On 8xA100 40GB** — auto-detects TP=4, giving 2 backends (each using 4 GPUs):
+
+```bash
+# Explicit equivalent of auto-detected config:
+./scripts/bench.sh --compare \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --warmup --duration 15m --users 16 \
+  --tp 4 --max-model-len 4096 --gpu-mem-util 0.92
 ```
 
 **Memory constraints (40GB A100s with TP=4):**
 - Model weights per GPU: ~35GB (140GB / 4)
 - Available VRAM at 0.92 util: ~36.8GB per GPU
 - KV cache headroom: ~1.8GB per GPU — limits context to ~4096 tokens
-- Use `--max-model-len 4096` to prevent OOM
+- `--max-model-len 4096` is auto-set to prevent OOM
 
-**On 8xA100 80GB** — more comfortable. TP=4 gives 2 backends with room for 8K+ context:
+> **2 backends vs. more:** With only 2 backends, every request is a binary routing choice.
+> Cache hit rates will actually be *higher* than 8-backend configs (each backend owns half
+> the prefix space), so TTFT improvement percentages should be strong. The limitation is
+> throughput — fewer concurrent users before saturation. Use 16 users (not 30+).
+
+**On 8xA100 80GB** — auto-detects TP=2, giving 4 backends with full context:
 
 ```bash
-./scripts/bench.sh \
+# Auto-detected on 80GB GPUs. Explicit equivalent:
+./scripts/bench.sh --compare \
   --model meta-llama/Llama-3.1-70B-Instruct \
-  --duration 15m \
-  --users 16 \
-  --prompt-dist stress \
-  --tp 4 \
-  --max-model-len 8192
+  --warmup --duration 15m --users 16 \
+  --tp 2 --max-model-len 8192
 ```
 
-Or use TP=2 for 4 backends (better for routing benchmarks):
+4 backends provides a better routing surface for Ranvier — more routing decisions
+and a more realistic production-like topology.
+
+Or force TP=4 for 2 backends with 32K+ context headroom:
 
 ```bash
-./scripts/bench.sh \
+./scripts/bench.sh --compare \
   --model meta-llama/Llama-3.1-70B-Instruct \
-  --duration 15m \
-  --users 16 \
-  --prompt-dist stress \
-  --tp 2 \
-  --max-model-len 8192
+  --warmup --duration 15m --users 16 \
+  --tp 4 --max-model-len 32768
 ```
 
 **Tensor parallelism options:**
 
-| TP | Backends | GPUs/Backend | Min GPU VRAM | Notes |
-|----|----------|-------------|--------------|-------|
-| 2  | 4        | 2           | ~80GB        | Best for routing benchmarks (80GB GPUs) |
-| 4  | 2        | 4           | ~40GB        | Works on 40GB A100s with short context |
-| 8  | 1        | 8           | ~20GB        | No routing — only useful for single-backend perf |
+| TP | Backends | GPUs/Backend | Min GPU VRAM | Context (70B FP16) | Notes |
+|----|----------|-------------|--------------|-------------------|----|
+| 2  | 4        | 2           | ~80GB        | 8K+ | Best for routing benchmarks (80GB GPUs) |
+| 4  | 2        | 4           | ~40GB        | ~4K (tight) | Works on 40GB, auto-detected |
+| 8  | 1        | 8           | ~20GB        | 32K+ | No routing — single-backend perf only |
 
 **Expected:** Slower inference but higher per-request cache benefit. The 70B model's
 longer prefill time (~0.15ms/token) means KV cache hits save more compute than with 8B/13B.
 Expected XLarge TTFT improvement: 50-60%+.
 
-> **Note:** 70B model loading with TP=4 takes significantly longer than single-GPU models
+> **Note:** 70B model loading with TP takes significantly longer than single-GPU models
 > (~5-10 minutes for weight sharding and distribution). The script uses an extended 10-minute
 > timeout for TP>1 configurations.
 
@@ -1046,10 +1061,9 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 ### Remaining Benchmarks
 
 ```bash
-# 10. 70B model (TP=4 for 2 backends on 8xA100 40GB)
+# 10. 70B model (TP and memory settings auto-detected from GPU VRAM)
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-70B-Instruct \
-  --warmup --duration 15m --users 16 \
-  --tp 4 --max-model-len 4096 --gpu-mem-util 0.92
+  --warmup --duration 15m --users 16
 ```
 
 ---

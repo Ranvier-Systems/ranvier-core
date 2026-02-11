@@ -394,10 +394,11 @@ define_runs() {
         --warmup --duration 15m --users 64 --spawn-rate 4 \
         --model meta-llama/Llama-3.1-8B-Instruct
 
-    add_run low "70B model test (16 users, TP=4)" \
+    # TP, max-model-len, and gpu-mem-util are auto-detected from GPU VRAM.
+    # Explicit overrides: --tp 4 --max-model-len 4096 --gpu-mem-util 0.92 (for 40GB)
+    add_run low "70B model test (16 users)" \
         --compare --model meta-llama/Llama-3.1-70B-Instruct \
-        --warmup --duration 15m --users 16 \
-        --tp 4 --max-model-len 4096 --gpu-mem-util 0.92
+        --warmup --duration 15m --users 16
 
     add_run low "8B 16K prefix test (20 users)" \
         --compare --model meta-llama/Llama-3.1-8B-Instruct \

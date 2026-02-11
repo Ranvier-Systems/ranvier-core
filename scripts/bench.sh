@@ -259,12 +259,13 @@ BENCHMARK OPTIONS:
                         cache hit rates vs load balancing trade-offs.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
-    --tp N              Tensor parallelism size per vLLM instance (default: 1).
-                        Use --tp 4 for 70B models on 8xA100 40GB (creates 2 backends).
-                        Use --tp 8 for 70B on 40GB with full context (1 backend).
+    --tp N              Tensor parallelism size per vLLM instance (default: auto).
+                        Auto-detected from GPU VRAM for large models (70B, 65B, 34B).
+                        Override: --tp 4 for 70B on 40GB GPUs (2 backends).
+                        Override: --tp 2 for 70B on 80GB GPUs (4 backends).
                         Number of backends = total GPUs / tp.
-    --gpu-mem-util F    GPU memory utilization for vLLM (default: 0.85).
-                        Use 0.92-0.95 for 70B models on 40GB GPUs with TP=4.
+    --gpu-mem-util F    GPU memory utilization for vLLM (default: 0.85, auto-raised
+                        to 0.92 for large models on <48GB GPUs).
     --max-tokens N      Max tokens to generate per request (default: 100)
                         Lower values (e.g., 20) reduce GPU contention and incomplete
                         rates without affecting TTFT. Use 20-50 for TTFT-focused runs.
@@ -572,6 +573,70 @@ fi
 
 # Tensor parallelism: compute number of vLLM instances (backends)
 TOTAL_GPUS=$GPUS
+
+# Auto-detect TP if not explicitly set and model appears to need it
+if [[ "$TP_SIZE" -eq 1 ]]; then
+    # Detect GPU VRAM (in MiB) from nvidia-smi
+    GPU_VRAM_MIB=""
+    if command -v nvidia-smi &> /dev/null; then
+        GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    fi
+
+    # Estimate model weights from model name (FP16 = 2 bytes/param)
+    MODEL_PARAMS_B=""
+    if echo "$MODEL" | grep -qiP '(^|[-/])70[bB]'; then
+        MODEL_PARAMS_B=70
+    elif echo "$MODEL" | grep -qiP '(^|[-/])65[bB]'; then
+        MODEL_PARAMS_B=65
+    elif echo "$MODEL" | grep -qiP '(^|[-/])34[bB]'; then
+        MODEL_PARAMS_B=34
+    fi
+
+    if [[ -n "$MODEL_PARAMS_B" && -n "$GPU_VRAM_MIB" && "$GPU_VRAM_MIB" -gt 0 ]]; then
+        # Model weight size in MiB (FP16: params * 2 bytes, convert to MiB)
+        MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))  # rough: 70B * 2B = 140GB ≈ 140000 MiB
+
+        # Usable VRAM per GPU (apply gpu-mem-util, leave 15% of usable for KV cache overhead)
+        # We use bc for float math; fall back to conservative integer math if unavailable
+        if command -v bc &> /dev/null; then
+            USABLE_PER_GPU=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL * 0.85" | bc | cut -d. -f1)
+        else
+            # Integer approximation: vram * 85 / 100 * 85 / 100
+            USABLE_PER_GPU=$(( GPU_VRAM_MIB * 85 / 100 * 85 / 100 ))
+        fi
+
+        # Find minimum TP that fits: model_weight / tp <= usable_per_gpu
+        AUTO_TP=1
+        for tp_candidate in 1 2 4 8; do
+            WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / tp_candidate ))
+            if [[ $WEIGHT_PER_GPU -le $USABLE_PER_GPU ]]; then
+                AUTO_TP=$tp_candidate
+                break
+            fi
+        done
+
+        if [[ $AUTO_TP -gt 1 ]]; then
+            if [[ $AUTO_TP -le $TOTAL_GPUS ]]; then
+                TP_SIZE=$AUTO_TP
+                log_ok "Auto-detected --tp $TP_SIZE for ${MODEL_PARAMS_B}B model on ${GPU_VRAM_MIB}MiB GPUs"
+            else
+                log_error "Model ${MODEL_PARAMS_B}B requires TP=$AUTO_TP but only $TOTAL_GPUS GPUs available"
+                exit 1
+            fi
+            # Auto-raise gpu-mem-util for tight fits (40GB GPUs with large models)
+            if [[ "$GPU_MEM_UTIL" == "0.85" && $GPU_VRAM_MIB -lt 49152 ]]; then
+                GPU_MEM_UTIL="0.92"
+                log_info "Auto-raised --gpu-mem-util to $GPU_MEM_UTIL (tight VRAM on ${GPU_VRAM_MIB}MiB GPUs)"
+            fi
+            # Auto-set max-model-len for tight VRAM
+            if [[ -z "$MAX_MODEL_LEN" && $GPU_VRAM_MIB -lt 49152 ]]; then
+                MAX_MODEL_LEN=4096
+                log_info "Auto-set --max-model-len $MAX_MODEL_LEN (limited KV cache on ${GPU_VRAM_MIB}MiB GPUs)"
+            fi
+        fi
+    fi
+fi
+
 if [[ "$TP_SIZE" -gt 1 ]]; then
     if [[ $((TOTAL_GPUS % TP_SIZE)) -ne 0 ]]; then
         log_error "GPU count ($TOTAL_GPUS) is not evenly divisible by --tp $TP_SIZE"
