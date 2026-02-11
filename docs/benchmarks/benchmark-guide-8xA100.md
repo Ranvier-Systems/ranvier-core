@@ -498,15 +498,68 @@ tail -f /tmp/vllm_gpu*.log
 **Expected:** Higher cache benefit than 8B (~35% XLarge TTFT improvement, up to -87% P99 and +27% throughput at 30 users). Requires `--max-model-len 8192` on 40GB GPUs to fit in memory.
 
 #### 6d. Large Model (70B parameters)
+
+A 70B model in FP16 requires ~140GB VRAM and cannot fit on a single A100 40GB. Use
+`--tp` (tensor parallelism) to shard the model across multiple GPUs.
+
+**On 8xA100 40GB** — use TP=4, giving 2 backends (each using 4 GPUs):
+
 ```bash
 ./scripts/bench.sh \
   --model meta-llama/Llama-3.1-70B-Instruct \
   --duration 15m \
   --users 16 \
-  --prompt-dist stress
+  --prompt-dist stress \
+  --tp 4 \
+  --max-model-len 4096 \
+  --gpu-mem-util 0.92
 ```
 
-**Expected:** Slower but higher cache benefit. May need tensor parallelism across GPUs.
+**Memory constraints (40GB A100s with TP=4):**
+- Model weights per GPU: ~35GB (140GB / 4)
+- Available VRAM at 0.92 util: ~36.8GB per GPU
+- KV cache headroom: ~1.8GB per GPU — limits context to ~4096 tokens
+- Use `--max-model-len 4096` to prevent OOM
+
+**On 8xA100 80GB** — more comfortable. TP=4 gives 2 backends with room for 8K+ context:
+
+```bash
+./scripts/bench.sh \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --duration 15m \
+  --users 16 \
+  --prompt-dist stress \
+  --tp 4 \
+  --max-model-len 8192
+```
+
+Or use TP=2 for 4 backends (better for routing benchmarks):
+
+```bash
+./scripts/bench.sh \
+  --model meta-llama/Llama-3.1-70B-Instruct \
+  --duration 15m \
+  --users 16 \
+  --prompt-dist stress \
+  --tp 2 \
+  --max-model-len 8192
+```
+
+**Tensor parallelism options:**
+
+| TP | Backends | GPUs/Backend | Min GPU VRAM | Notes |
+|----|----------|-------------|--------------|-------|
+| 2  | 4        | 2           | ~80GB        | Best for routing benchmarks (80GB GPUs) |
+| 4  | 2        | 4           | ~40GB        | Works on 40GB A100s with short context |
+| 8  | 1        | 8           | ~20GB        | No routing — only useful for single-backend perf |
+
+**Expected:** Slower inference but higher per-request cache benefit. The 70B model's
+longer prefill time (~0.15ms/token) means KV cache hits save more compute than with 8B/13B.
+Expected XLarge TTFT improvement: 50-60%+.
+
+> **Note:** 70B model loading with TP=4 takes significantly longer than single-GPU models
+> (~5-10 minutes for weight sharding and distribution). The script uses an extended 10-minute
+> timeout for TP>1 configurations.
 
 ---
 
@@ -597,7 +650,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 8B | 20 | 10m | XLarge | ~804ms | ~453ms | ~44% | Jan 2026 |
 | 8B | 10 | 10m | XLarge | ~580ms | ~333ms | ~43% | Jan 2026 |
 | 1B | 30 | 10m | XLarge | ~130ms | ~130ms | ~0% | Jan 2026 |
-| 70B | - | - | XLarge | TBD | TBD | Expected 50-60%+ | |
+| 70B (TP=4) | - | - | XLarge | TBD | TBD | Expected 50-60%+ | Requires --tp 4 on 40GB A100s |
 
 **Key insights:**
 - **P99 tail latency is the strongest win** — -79% or better for 13B
@@ -952,8 +1005,8 @@ The benchmark runs below are built into `scripts/bench-runner.sh` as suites. You
 # Run high-priority only (~1.5h)
 ./scripts/bench-runner.sh --suite high
 
-# Run everything except the 70B test (no 70B support yet)
-./scripts/bench-runner.sh --suite all --skip 10
+# Run everything including the 70B test (requires 8xA100)
+./scripts/bench-runner.sh --suite all
 
 # Resume from run #4 if something failed
 ./scripts/bench-runner.sh --suite all --resume 4
@@ -993,9 +1046,10 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 ### Remaining Benchmarks
 
 ```bash
-# 10. 70B model (still TBD in the docs)
+# 10. 70B model (TP=4 for 2 backends on 8xA100 40GB)
 ./scripts/bench.sh --compare --model meta-llama/Llama-3.1-70B-Instruct \
-  --warmup --duration 15m --users 16
+  --warmup --duration 15m --users 16 \
+  --tp 4 --max-model-len 4096 --gpu-mem-util 0.92
 ```
 
 ---
@@ -1440,8 +1494,8 @@ For running the full benchmark matrix automatically, use `bench-runner.sh`:
 # Run the high-priority suite (~1.5h)
 ./scripts/bench-runner.sh --suite high
 
-# Run everything, skip 70B (no support yet)
-./scripts/bench-runner.sh --suite all --skip 10
+# Run everything including the 70B test (TP=4 on 8xA100 40GB)
+./scripts/bench-runner.sh --suite all
 ```
 
 The runner handles GPU cooldown pauses between runs, tracks per-run metrics

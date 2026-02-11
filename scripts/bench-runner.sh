@@ -261,7 +261,7 @@ BUILT-IN SUITES:
     all (adds 4 more, ~6.5h total):
       8.  13B client tokenization comparison
       9.  8B high concurrency stress test (64 users)
-      10. 70B model test
+      10. 70B model test (TP=4, 2 backends on 8xA100 40GB)
       11. 8B with 16K max prefix (tests larger-than-default prefixes)
 
 ADDING NEW RUNS:
@@ -289,7 +289,7 @@ EXAMPLES:
     # Resume from run #4 after a failure
     ./scripts/bench-runner.sh --suite all --resume 4
 
-    # Skip specific runs (e.g., 70B model not supported yet)
+    # Skip specific runs (e.g., skip 70B if GPUs are only 40GB)
     ./scripts/bench-runner.sh --suite all --skip 10
 
     # Skip multiple runs
@@ -394,9 +394,10 @@ define_runs() {
         --warmup --duration 15m --users 64 --spawn-rate 4 \
         --model meta-llama/Llama-3.1-8B-Instruct
 
-    add_run low "70B model test (16 users)" \
+    add_run low "70B model test (16 users, TP=4)" \
         --compare --model meta-llama/Llama-3.1-70B-Instruct \
-        --warmup --duration 15m --users 16
+        --warmup --duration 15m --users 16 \
+        --tp 4 --max-model-len 4096 --gpu-mem-util 0.92
 
     add_run low "8B 16K prefix test (20 users)" \
         --compare --model meta-llama/Llama-3.1-8B-Instruct \
