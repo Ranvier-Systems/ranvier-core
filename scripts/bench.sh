@@ -259,6 +259,13 @@ BENCHMARK OPTIONS:
                         cache hit rates vs load balancing trade-offs.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
+    --tp N              Tensor parallelism size per vLLM instance (default: auto).
+                        Auto-detected from GPU VRAM for large models (70B, 65B, 34B).
+                        Override: --tp 4 for 70B on 40GB GPUs (2 backends).
+                        Override: --tp 2 for 70B on 80GB GPUs (4 backends).
+                        Number of backends = total GPUs / tp.
+    --gpu-mem-util F    GPU memory utilization for vLLM (default: 0.85, auto-raised
+                        to 0.92 for large models on <48GB GPUs).
     --max-tokens N      Max tokens to generate per request (default: 100)
                         Lower values (e.g., 20) reduce GPU contention and incomplete
                         rates without affecting TTFT. Use 20-50 for TTFT-focused runs.
@@ -425,6 +432,8 @@ LOAD_AWARE=true
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 MAX_TOKENS="$DEFAULT_MAX_TOKENS"
+TP_SIZE=1
+GPU_MEM_UTIL="0.85"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -453,6 +462,8 @@ while [[ $# -gt 0 ]]; do
         --multi-depth)    MULTI_DEPTH=true; shift ;;
         --no-load-aware)  LOAD_AWARE=false; shift ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
+        --tp)             TP_SIZE="$2"; shift 2 ;;
+        --gpu-mem-util)   GPU_MEM_UTIL="$2"; shift 2 ;;
         --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
@@ -558,6 +569,103 @@ fi
 if [[ "$GPUS" -gt 8 ]]; then
     log_warn "Capping at 8 GPUs (detected $GPUS)"
     GPUS=8
+fi
+
+# Tensor parallelism: compute number of vLLM instances (backends)
+TOTAL_GPUS=$GPUS
+
+# Auto-detect TP if not explicitly set and model appears to need it
+if [[ "$TP_SIZE" -eq 1 ]]; then
+    # Detect GPU VRAM (in MiB) from nvidia-smi
+    GPU_VRAM_MIB=""
+    if command -v nvidia-smi &> /dev/null; then
+        GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    fi
+
+    # Estimate model weights from model name (FP16 = 2 bytes/param)
+    MODEL_PARAMS_B=""
+    if echo "$MODEL" | grep -qiP '(^|[-/])70[bB]'; then
+        MODEL_PARAMS_B=70
+    elif echo "$MODEL" | grep -qiP '(^|[-/])65[bB]'; then
+        MODEL_PARAMS_B=65
+    elif echo "$MODEL" | grep -qiP '(^|[-/])34[bB]'; then
+        MODEL_PARAMS_B=34
+    fi
+
+    if [[ -n "$MODEL_PARAMS_B" && -n "$GPU_VRAM_MIB" && "$GPU_VRAM_MIB" -gt 0 ]]; then
+        # Model weight size in MiB (FP16: params * 2 bytes, convert to MiB)
+        MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))  # rough: 70B * 2B = 140GB ≈ 140000 MiB
+
+        # Check fit at 0.92 utilization to find the minimum TP that maximizes
+        # the number of backends (critical for routing benchmarks). We always
+        # check at 0.92 because gpu-mem-util can be auto-raised if needed.
+        MIN_HEADROOM_MIB=2048  # minimum 2 GiB for KV cache + activations
+        if command -v bc &> /dev/null; then
+            FIT_BUDGET=$(echo "$GPU_VRAM_MIB * 0.92" | bc | cut -d. -f1)
+        else
+            FIT_BUDGET=$(( GPU_VRAM_MIB * 92 / 100 ))
+        fi
+
+        # Find minimum TP that fits: weight/tp + headroom <= budget_at_0.92
+        AUTO_TP=1
+        for tp_candidate in 1 2 4 8; do
+            WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / tp_candidate ))
+            if [[ $((WEIGHT_PER_GPU + MIN_HEADROOM_MIB)) -le $FIT_BUDGET ]]; then
+                AUTO_TP=$tp_candidate
+                break
+            fi
+        done
+
+        if [[ $AUTO_TP -gt 1 ]]; then
+            if [[ $AUTO_TP -le $TOTAL_GPUS ]]; then
+                TP_SIZE=$AUTO_TP
+                NUM_AUTO_BACKENDS=$((TOTAL_GPUS / TP_SIZE))
+                log_ok "Auto-detected --tp $TP_SIZE for ${MODEL_PARAMS_B}B model on ${GPU_VRAM_MIB}MiB GPUs ($NUM_AUTO_BACKENDS backends)"
+            else
+                log_error "Model ${MODEL_PARAMS_B}B requires TP=$AUTO_TP but only $TOTAL_GPUS GPUs available"
+                exit 1
+            fi
+
+            # Check if the chosen TP fits at the user's current gpu-mem-util.
+            # If not, auto-raise to 0.92 (only raise what's actually needed).
+            if command -v bc &> /dev/null; then
+                DEFAULT_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
+            else
+                DEFAULT_BUDGET=$(( GPU_VRAM_MIB * 85 / 100 ))
+            fi
+            WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
+            if [[ $((WEIGHT_PER_GPU + MIN_HEADROOM_MIB)) -gt $DEFAULT_BUDGET ]]; then
+                GPU_MEM_UTIL="0.92"
+                log_info "Auto-raised --gpu-mem-util to $GPU_MEM_UTIL (${MODEL_PARAMS_B}B model tight at default 0.85)"
+            fi
+
+            # Auto-set max-model-len based on actual KV cache headroom
+            if [[ -z "$MAX_MODEL_LEN" ]]; then
+                if command -v bc &> /dev/null; then
+                    ACTUAL_BUDGET=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
+                else
+                    ACTUAL_BUDGET=$(( GPU_VRAM_MIB * 92 / 100 ))
+                fi
+                KV_HEADROOM=$(( ACTUAL_BUDGET - WEIGHT_PER_GPU ))
+                # Less than 4 GiB headroom → constrain context to 4096 tokens
+                if [[ $KV_HEADROOM -lt 4096 ]]; then
+                    MAX_MODEL_LEN=4096
+                    log_info "Auto-set --max-model-len $MAX_MODEL_LEN (${KV_HEADROOM}MiB KV headroom)"
+                fi
+            fi
+        fi
+    fi
+fi
+
+if [[ "$TP_SIZE" -gt 1 ]]; then
+    if [[ $((TOTAL_GPUS % TP_SIZE)) -ne 0 ]]; then
+        log_error "GPU count ($TOTAL_GPUS) is not evenly divisible by --tp $TP_SIZE"
+        exit 1
+    fi
+    NUM_BACKENDS=$((TOTAL_GPUS / TP_SIZE))
+    log_ok "Tensor parallelism: TP=$TP_SIZE, $NUM_BACKENDS vLLM instances (each using $TP_SIZE GPUs)"
+else
+    NUM_BACKENDS=$GPUS
 fi
 
 # -----------------------------------------------------------------------------
@@ -789,7 +897,12 @@ fi
 if [[ "$DRY_RUN" = true ]]; then
     log_header "Dry Run - Configuration"
     echo "  Model:           $MODEL"
-    echo "  GPUs:            $GPUS"
+    echo "  GPUs:            $TOTAL_GPUS"
+    if [[ "$TP_SIZE" -gt 1 ]]; then
+        echo "  Tensor Parallel: $TP_SIZE (${NUM_BACKENDS} backends)"
+    fi
+    echo "  Backends:        $NUM_BACKENDS"
+    echo "  GPU Mem Util:    $GPU_MEM_UTIL"
     echo "  Duration:        $DURATION (per benchmark)"
     echo "  Users:           $USERS"
     echo "  Spawn Rate:      $SPAWN_RATE/s"
@@ -832,12 +945,16 @@ if [[ "$DRY_RUN" = true ]]; then
 
     echo ""
     if [[ "$SKIP_VLLM" = false ]]; then
-        log_info "Would start $GPUS vLLM instances on ports $DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+        if [[ "$TP_SIZE" -gt 1 ]]; then
+            log_info "Would start $NUM_BACKENDS vLLM instances (TP=$TP_SIZE) on ports $DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + NUM_BACKENDS - 1))"
+        else
+            log_info "Would start $NUM_BACKENDS vLLM instances on ports $DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + NUM_BACKENDS - 1))"
+        fi
     else
         if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
             log_info "Would use ${#VLLM_ENDPOINTS[@]} external vLLM endpoints"
         else
-            log_info "Would use $GPUS external vLLM endpoints at $VLLM_HOST:$DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+            log_info "Would use $NUM_BACKENDS external vLLM endpoints at $VLLM_HOST:$DEFAULT_VLLM_PORT_START-$((DEFAULT_VLLM_PORT_START + NUM_BACKENDS - 1))"
         fi
     fi
     log_info "Would start Ranvier cluster (3 nodes)"
@@ -885,24 +1002,38 @@ if [[ "$SKIP_VLLM" = false ]]; then
         exit 1
     fi
 
-    for ((i=0; i<GPUS; i++)); do
+    for ((i=0; i<NUM_BACKENDS; i++)); do
         PORT=$((DEFAULT_VLLM_PORT_START + i))
         LOG_FILE="/tmp/vllm_gpu${i}.log"
         # Each vLLM instance needs a unique MASTER_PORT for PyTorch distributed
         # to avoid port conflicts when running multiple instances
         DIST_PORT=$((29500 + i))
 
-        log_step "$((i+1))" "$GPUS" "GPU $i: Starting vLLM on :$PORT..."
+        # Compute CUDA_VISIBLE_DEVICES for this instance
+        if [[ "$TP_SIZE" -gt 1 ]]; then
+            # Multi-GPU: assign a contiguous range of GPUs
+            GPU_START=$((i * TP_SIZE))
+            GPU_IDS=""
+            for ((g=GPU_START; g<GPU_START+TP_SIZE; g++)); do
+                [[ -n "$GPU_IDS" ]] && GPU_IDS+=","
+                GPU_IDS+="$g"
+            done
+            log_step "$((i+1))" "$NUM_BACKENDS" "GPUs $GPU_IDS: Starting vLLM on :$PORT (TP=$TP_SIZE)..."
+        else
+            GPU_IDS=$i
+            log_step "$((i+1))" "$NUM_BACKENDS" "GPU $i: Starting vLLM on :$PORT..."
+        fi
 
-        CUDA_VISIBLE_DEVICES=$i HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
+        CUDA_VISIBLE_DEVICES=$GPU_IDS HF_TOKEN="$HF_TOKEN" MASTER_PORT=$DIST_PORT \
             python3 -m vllm.entrypoints.openai.api_server \
             --model "$MODEL" \
             --host 0.0.0.0 \
             --port "$PORT" \
             --enable-prefix-caching \
-            --gpu-memory-utilization 0.85 \
+            --gpu-memory-utilization "$GPU_MEM_UTIL" \
             --disable-frontend-multiprocessing \
             ${MAX_MODEL_LEN:+--max-model-len "$MAX_MODEL_LEN"} \
+            $( [[ "$TP_SIZE" -gt 1 ]] && echo "--tensor-parallel-size $TP_SIZE" ) \
             > "$LOG_FILE" 2>&1 &
 
         VLLM_PIDS+=($!)
@@ -915,10 +1046,16 @@ if [[ "$SKIP_VLLM" = false ]]; then
     WAIT_INTERVAL=5
     ELAPSED=0
 
+    # 70B models with TP take much longer to load (model sharding + weight distribution)
+    if [[ "$TP_SIZE" -gt 1 ]]; then
+        MAX_WAIT=600  # 10 minutes for large TP models
+        log_info "Using extended timeout (${MAX_WAIT}s) for TP=$TP_SIZE model loading..."
+    fi
+
     while [[ $ELAPSED -lt $MAX_WAIT ]]; do
         ALL_HEALTHY=true
 
-        for ((i=0; i<GPUS; i++)); do
+        for ((i=0; i<NUM_BACKENDS; i++)); do
             PORT=$((DEFAULT_VLLM_PORT_START + i))
             if ! curl -sf --connect-timeout 2 "http://localhost:$PORT/health" > /dev/null 2>&1; then
                 ALL_HEALTHY=false
@@ -933,7 +1070,7 @@ if [[ "$SKIP_VLLM" = false ]]; then
         # Check if any vLLM process died
         for ((i=0; i<${#VLLM_PIDS[@]}; i++)); do
             if ! kill -0 "${VLLM_PIDS[$i]}" 2>/dev/null; then
-                log_error "vLLM process for GPU $i died. Check /tmp/vllm_gpu${i}.log"
+                log_error "vLLM instance $i died. Check /tmp/vllm_gpu${i}.log"
                 cat "/tmp/vllm_gpu${i}.log" | tail -20
                 exit 1
             fi
@@ -947,9 +1084,15 @@ if [[ "$SKIP_VLLM" = false ]]; then
     echo ""
 
     if [[ "$ALL_HEALTHY" = true ]]; then
-        for ((i=0; i<GPUS; i++)); do
+        for ((i=0; i<NUM_BACKENDS; i++)); do
             PORT=$((DEFAULT_VLLM_PORT_START + i))
-            log_ok "GPU $i: vLLM healthy on :$PORT"
+            if [[ "$TP_SIZE" -gt 1 ]]; then
+                GPU_START=$((i * TP_SIZE))
+                GPU_END=$((GPU_START + TP_SIZE - 1))
+                log_ok "Instance $i (GPUs $GPU_START-$GPU_END): vLLM healthy on :$PORT"
+            else
+                log_ok "GPU $i: vLLM healthy on :$PORT"
+            fi
         done
     else
         log_error "vLLM backends did not become healthy within ${MAX_WAIT}s"
@@ -962,6 +1105,7 @@ else
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         log_info "Using ${#VLLM_ENDPOINTS[@]} explicit endpoints"
         GPUS=${#VLLM_ENDPOINTS[@]}
+        NUM_BACKENDS=${#VLLM_ENDPOINTS[@]}
 
         # Health check each endpoint
         FAILED=0
@@ -989,11 +1133,11 @@ else
         fi
     else
         log_info "Host: $VLLM_HOST"
-        log_info "Ports: $DEFAULT_VLLM_PORT_START - $((DEFAULT_VLLM_PORT_START + GPUS - 1))"
+        log_info "Ports: $DEFAULT_VLLM_PORT_START - $((DEFAULT_VLLM_PORT_START + NUM_BACKENDS - 1))"
 
         # Health check external endpoints (sequential ports)
         FAILED=0
-        for ((i=0; i<GPUS; i++)); do
+        for ((i=0; i<NUM_BACKENDS; i++)); do
             PORT=$((DEFAULT_VLLM_PORT_START + i))
             if curl -sf --connect-timeout 5 "http://${VLLM_HOST}:$PORT/health" > /dev/null 2>&1; then
                 log_ok "GPU $i: $VLLM_HOST:$PORT healthy"
@@ -1022,7 +1166,7 @@ fi
 
 # Build BACKEND{N}_IP and BACKEND{N}_PORT env vars
 BACKEND_ENV=""
-for ((i=1; i<=GPUS; i++)); do
+for ((i=1; i<=NUM_BACKENDS; i++)); do
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         # Use explicit endpoints
         ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
@@ -1145,7 +1289,10 @@ run_benchmark() {
         fi
         echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
         echo "  Model:        $MODEL"
-        echo "  Backends:     $GPUS"
+        echo "  Backends:     $NUM_BACKENDS"
+        if [[ "$TP_SIZE" -gt 1 ]]; then
+            echo "  Tensor Par:   $TP_SIZE GPUs/backend"
+        fi
         if [[ -n "$END_TIME" ]]; then
             echo "  Duration:     $DURATION (${START_TIME} -> ~${END_TIME})"
         else
@@ -1159,11 +1306,11 @@ run_benchmark() {
     } >&2
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    REPORT_DIR="${OUTPUT_DIR}/${TIMESTAMP}_${GPUS}gpu_${ROUTING_MODE}"
+    REPORT_DIR="${OUTPUT_DIR}/${TIMESTAMP}_${TOTAL_GPUS}gpu_${ROUTING_MODE}"
     mkdir -p "$REPORT_DIR"
 
     # Set environment for locust
-    export NUM_BACKENDS="$GPUS"
+    export NUM_BACKENDS="$NUM_BACKENDS"
     export VLLM_MODEL="$MODEL"
     export RANVIER_ROUTING_MODE="$ROUTING_MODE"
     export PROMPT_DISTRIBUTION="$PROMPT_DIST"
@@ -1172,7 +1319,7 @@ run_benchmark() {
     [[ -n "$PROMPT_FILE" ]] && export PROMPT_FILE
 
     # Export backend configuration
-    for ((i=1; i<=GPUS; i++)); do
+    for ((i=1; i<=NUM_BACKENDS; i++)); do
         if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
             # Use explicit endpoints
             ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
@@ -1193,7 +1340,7 @@ run_benchmark() {
 
     # Build backend env args for docker compose
     BACKEND_ARGS=""
-    for ((i=1; i<=GPUS; i++)); do
+    for ((i=1; i<=NUM_BACKENDS; i++)); do
         if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
             ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
             HOST="${ENDPOINT%:*}"
@@ -1250,7 +1397,7 @@ run_benchmark() {
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
         -v "$PWD/$REPORT_DIR:/mnt/locust/output" \
-        -e NUM_BACKENDS="$GPUS" \
+        -e NUM_BACKENDS="$NUM_BACKENDS" \
         -e VLLM_MODEL="$MODEL" \
         -e RANVIER_ROUTING_MODE="$ROUTING_MODE" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
@@ -1320,7 +1467,7 @@ if [[ "$WARMUP" = true ]]; then
 
     # Build backend env args
     BACKEND_ARGS=""
-    for ((i=1; i<=GPUS; i++)); do
+    for ((i=1; i<=NUM_BACKENDS; i++)); do
         if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
             ENDPOINT="${VLLM_ENDPOINTS[$((i-1))]}"
             HOST="${ENDPOINT%:*}"
@@ -1352,7 +1499,7 @@ if [[ "$WARMUP" = true ]]; then
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
-        -e NUM_BACKENDS="$GPUS" \
+        -e NUM_BACKENDS="$NUM_BACKENDS" \
         -e VLLM_MODEL="$MODEL" \
         -e RANVIER_ROUTING_MODE="prefix" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
