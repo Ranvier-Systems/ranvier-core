@@ -199,6 +199,14 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
 
     // Set up heartbeat timer with RAII timer safety
     _heartbeat_timer.set_callback([this] {
+        // RAII Timer Safety: Holder must outlive the work
+        seastar::gate::holder timer_holder;
+        try {
+            timer_holder = _transport->timer_gate().hold();
+        } catch (const seastar::gate_closed_exception&) {
+            return;
+        }
+
         (void)broadcast_heartbeat();
     });
     _heartbeat_timer.arm_periodic(_config.gossip_heartbeat_interval);

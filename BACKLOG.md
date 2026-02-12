@@ -2087,7 +2087,7 @@ These items directly affect the validity of the current performance benchmark re
 
 Section 11 fixed gate guards in RouterService and K8s timers. These are **new** gate-holder bugs in the gossip and persistence subsystems.
 
-- [ ] **[CRITICAL] Gossip heartbeat timer callback has no gate guard**
+- [x] **[CRITICAL] Gossip heartbeat timer callback has no gate guard**
   _File:Line:_ `src/gossip_protocol.cpp:201-203`
   _Issue:_ Timer callback `[this] { (void)broadcast_heartbeat(); }` captures `this` with no gate holder. `_transport` pointer is dereferenced before any internal gate acquisition. Contrast with the retry timer (line 212) and discovery timer (line 237) which DO attempt gate holders.
   _Fix:_ Acquire `_timer_gate.hold()` at the start of the callback lambda, before calling `broadcast_heartbeat()`.
