@@ -8,21 +8,21 @@ Prefix-aware routing with load-aware fallback vs round-robin baseline:
 
 | Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
 |-------|----------------|------------------------|-------------|------------|
-| **Llama-3.1-70B** | 24% → **97%** | **48%** faster | **-33%** | ~same |
+| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
 | CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
 | Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
 
-*70B results from 8xA100 80GB (TP=2, 4 backends, 32K context, 16 users, 15m). 13B/8B from 30-minute validated runs with 30 users on 8xA100 40GB.*
+*All results from 30-minute validated runs. 70B on 8xA100 80GB (TP=2, 4 backends, 32K context, 16 users). 13B/8B on 8xA100 40GB (8 backends, 30 users).*
 
 *Results from February 2026 with load-aware routing + stale connection fix.*
 
 **Key wins:**
 - **4-8x more cache hits** — Requests routed to backends with cached KV data
-- **33-48% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
+- **33-44% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
 - **Up to 85% lower tail latency** — P99 response times improve dramatically for 13B
-- **Up to 22% higher throughput** — Load-aware routing prevents backend hotspots
+- **Up to 22% higher throughput** — Load-aware routing prevents backend hotspots for 13B
 - **0% incomplete rate** — Stale connection retry ensures every request completes
-- **Benefit scales with model size** — 70B shows 48% XLarge improvement, 33% lower P99
+- **XLarge benefit scales with model size** — 33% for 13B, 40% for 8B, 44% for 70B
 
 **Works across prefix sharing levels (13B, 20 users, 10m):**
 
@@ -672,7 +672,8 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 8B | 20 | 10m | XLarge | ~804ms | ~453ms | ~44% | Jan 2026 |
 | 8B | 10 | 10m | XLarge | ~580ms | ~333ms | ~43% | Jan 2026 |
 | 1B | 30 | 10m | XLarge | ~130ms | ~130ms | ~0% | Jan 2026 |
-| 70B (TP=2) | 16 | 15m | XLarge | ~2924ms | ~1520ms | **~48%** | Feb 2026, 80GB A100s, 4 backends, 32K context |
+| 70B (TP=2) | 16 | 30m | XLarge | ~2665ms | ~1498ms | **~44%** | Feb 2026, 80GB A100s, 4 backends, 32K context |
+| 70B (TP=2) | 16 | 15m | XLarge | ~2924ms | ~1520ms | ~48% | Feb 2026, 80GB, warm-up effects inflate P99 |
 | 70B (TP=4) | 16 | 15m | XLarge | ~2108ms | ~1069ms | ~49% | Feb 2026, 40GB A100s, 2 backends, 4K context |
 
 **Key insights:**
@@ -805,54 +806,54 @@ that this is expected. Throughput is essentially flat.
 
 #### 70B Model Test
 
-**Llama-3.1-70B (TP=2, 4 backends, 8xA100 80GB, 32K context, 16 users, 15 minutes):**
+**Llama-3.1-70B (TP=2, 4 backends, 8xA100 80GB, 32K context, 16 users, 30 minutes):**
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
-| Cache Hit Rate | 23.6% | 96.9% | **+73.3%** |
-| XLarge Improvement | 0.2% | **48.0%** | **+47.9pp** |
-| Large Improvement | 0.0% | **34.9%** | **+34.9pp** |
+| Cache Hit Rate | 25.2% | 97.8% | **+72.6%** |
+| XLarge Improvement | 0.3% | **43.8%** | **+43.5pp** |
+| Large Improvement | 0.2% | **38.8%** | **+38.7pp** |
 | Overall P50 TTFT | 1,500ms | 1,500ms | 0% |
-| Overall P99 TTFT | 2,400ms | 1,600ms | **-33.3%** |
-| Throughput (req/s) | 14.8 | 14.6 | -1.4% |
+| Overall P99 TTFT | 1,600ms | 1,600ms | 0% |
+| Throughput (req/s) | 14.8 | 14.8 | 0% |
 | Incomplete Rate | 0% | 0% | **0%** |
 | Validation | PASSED | PASSED | |
 | Error Rate | 0% | 0% | — |
 
-With 4 backends (TP=2 on 80GB), round-robin handles the load without timeouts — unlike the
-40GB test below where 64% of round-robin requests timed out. The XLarge improvement (48%)
-is consistent across both configurations. P99 improves by 33% (2400ms → 1600ms), with hit
-P50 of ~1520ms vs miss P50 of ~2924ms showing the cache benefit clearly.
+Under sustained 30-minute load, the 70B model's benefit is **per-request cache efficiency**
+rather than P99 or throughput. XLarge requests are 44% faster when cache-hit (hit P50
+~1498ms vs miss P50 ~2665ms), but this doesn't translate to aggregate P99/throughput wins
+because the model is compute-bound at 16 users with 4 backends — neither side is queue-overloaded.
+
+This contrasts with 13B, where queue buildup under 30 concurrent users causes round-robin
+P99 to degrade to 6.8 seconds. With 70B, the longer per-request inference time means fewer
+concurrent requests in-flight, preventing queue saturation.
 
 <details>
-<summary>Earlier 40GB A100 test (TP=4, 2 backends, 4K context) — for reference</summary>
+<summary>15-minute and 40GB reference runs</summary>
 
-**Llama-3.1-70B (TP=4, 2 backends, 8xA100 40GB, 4K context, 16 users, 15 minutes):**
+**15-minute run (same 80GB config):** XLarge 48.0%, P99 -33.3%. The higher P99 improvement
+reflects warm-up effects — under sustained 30-minute load, round-robin P99 stabilizes from
+2400ms to 1600ms, equalizing with prefix-aware.
 
-| Metric | Round-Robin | Prefix-Aware | Change |
-|--------|-------------|--------------|--------|
-| Cache Hit Rate | 49.3% | 97.6% | **+48.4%** |
-| XLarge Improvement | -2.1% | **49.3%** | **+51.4pp** |
-| Incomplete Rate | **63.9%** | **0%** | **-63.9pp** |
-| Validation | PASSED | PASSED | |
-
-Round-robin metrics (P50 44ms, 22.9 req/s) are survivorship bias — only 36% of requests
-completed. With only 2 backends, queuing was catastrophic. The 80GB test (4 backends) is
-the reliable reference.
+**40GB A100 test (TP=4, 2 backends, 4K context):** XLarge 49.3%, but round-robin had 63.9%
+incomplete rate (only 36% of requests completed). With only 2 backends, queuing was
+catastrophic. The 80GB test (4 backends) is the reliable reference.
 
 </details>
 
 **Key findings for 70B:**
-- **XLarge improvement is the highest of any model (~48%)** — 70B has the most compute per
-  token, so KV cache reuse saves the most (~1520ms hit vs ~2924ms miss)
-- **P99 improves by 33%** — less dramatic than 13B (-85%) because 70B inference is inherently
-  slower, but still a meaningful reduction from 2.4s to 1.6s
-- **Throughput is flat** — similar to 8B, the model is compute-bound rather than queue-bound
-  at 16 users with 4 backends
+- **XLarge improvement is the highest of any model (44-49%)** — 70B has the most compute per
+  token, so KV cache reuse saves the most (~1498ms hit vs ~2665ms miss)
+- **P99 and throughput are flat under sustained load** — unlike 13B, 70B at 16 users with 4
+  backends is compute-bound, not queue-bound. The 15m run showed -33% P99 but this was a
+  warm-up effect that stabilized over 30 minutes
+- **The benefit is per-request, not aggregate** — individual large/XLarge requests are 39-44%
+  faster on cache hit, but aggregate metrics don't shift because the system isn't overloaded
 - **Backend count matters** — 2 backends (40GB) causes 64% timeouts; 4 backends (80GB) handles
   the load cleanly. Production deployments should target TP=2 on 80GB GPUs
 - **Baseline cache hit rate scales with 1/backends** — 49% with 2 backends (1/2 chance),
-  24% with 4 backends (1/4 chance), vs 12% with 8 backends for 8B/13B
+  25% with 4 backends (1/4 chance), vs 12% with 8 backends for 8B/13B
 
 #### Complete Results Matrix (All Runs)
 
@@ -860,7 +861,8 @@ the reliable reference.
 
 | Model | Users | Duration | XLarge Improvement | P99 TTFT Change | Throughput | Cache Hit Rate | Incomplete | Instance |
 |-------|-------|----------|-------------------|-----------------|------------|----------------|------------|----------|
-| **70B (TP=2, 80GB)** | **16** | **15m** | **48.0%** | **-33.3%** | -1.4% | 96.9% | **0%** | 4 |
+| **70B (TP=2, 80GB)** | **16** | **30m** | **43.8%** | 0% | 0% | 97.8% | **0%** | 4 |
+| 70B (TP=2, 80GB) | 16 | 15m | 48.0% | -33.3% | -1.4% | 96.9% | 0% | 4 |
 | 70B (TP=4, 40GB) | 16 | 15m | 49.3% | n/a‡ | n/a‡ | 97.6% | 0% (RR: 64%) | 3 |
 | **13B** | **30** | **30m** | **32.8%** | **-85.3%** | **+22.3%** | 97.5% | **0%** | 3 |
 | **8B** | **30** | **30m** | **40.5%** | +6.5% | -1.1% | 98.0% | **0%** | 3 |
@@ -920,8 +922,8 @@ and transient queuing patterns.
 | Cache hit savings | Moderate | Large | **Huge** |
 | Queue buildup under load | Mild | Severe | **Severe** (2 backends) |
 | Load-aware routing impact | Small | **Dramatic** | **Large** |
-| XLarge improvement | 28-40% | 33-39% | **48-49%** |
-| P99 TTFT change | +6.5% | -85% | **-33%** |
+| XLarge improvement | 28-40% | 33-39% | **44-49%** |
+| P99 TTFT change | +6.5% | -85% | ~same (sustained) |
 | RR incomplete rate | 0% | 0% | 0% (4 backends) / 64% (2 backends) |
 
 Larger models have higher per-token compute cost, so cache misses are more expensive.
@@ -991,7 +993,7 @@ Prefix Ratio: 0.9
 3. **P99 tail latency is the strongest win**: -85% under sustained 30-minute load, with round-robin failing validation
 4. **Throughput improves for larger models**: +22% for 13B because requests aren't stuck behind overloaded backends
 5. **XLarge improvement varies by instance**: Use 30-minute validated runs (33% for 13B, 40% for 8B) as the reliable reference
-6. **Benefit scales with model size**: 70B shows 48% XLarge improvement, -33% P99, with the hit/miss gap widening as model size grows
+6. **Benefit scales with model size**: 70B shows 44% XLarge improvement (highest of any model). P99/throughput are flat because 70B is compute-bound, not queue-bound — the benefit is per-request, not aggregate
 
 ### Value Proposition
 
@@ -1001,7 +1003,7 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 | Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate | P99 TTFT Change | Notes |
 |-------|------|-------|----------|-------------------------|----------------|-----------------|-------|
-| **Llama-3.1-70B** | **Heavy** | **16** | **15m** | **48.0%** | 96.9% | **-33.3%** | Feb 2026, TP=2, 80GB, 4 backends |
+| **Llama-3.1-70B** | **Heavy** | **16** | **30m** | **43.8%** | 97.8% | 0% | Feb 2026, TP=2, 80GB, 4 backends |
 | **CodeLlama-13b** | **Heavy** | **30** | **30m** | **32.8%** | 97.5% | **-85.3%** | Feb 2026, post-fix |
 | **CodeLlama-13b** | **Moderate** | **20** | **10m** | **35.9%** | 97.6% | **-78.7%** | Feb 2026, post-fix |
 | **CodeLlama-13b** | **Normal** | **10** | **10m** | **39.4%** | 96.8% | **-79.1%** | Feb 2026, post-fix |
@@ -1017,8 +1019,8 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 | Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% | — | Jan 2026 |
 
 **Key takeaways:**
-- **XLarge improvement scales with model size** — 28-40% for 8B/13B, 48% for 70B
-- **P99 tail latency** is the strongest and most consistent win — -85% for 13B, -33% for 70B
+- **XLarge improvement scales with model size** — 28-40% for 8B/13B, 44% for 70B
+- **P99 tail latency** is the strongest win for 13B (-85%); 70B and 8B are flat (compute-bound, not queue-bound)
 - **Throughput increases** +14-22% for 13B with 0% wasted connections (post-fix)
 - **Cache hit rate** is excellent (96-98%) regardless of load, model, or instance
 - **Backend count matters for 70B** — TP=4 (2 backends, 40GB) causes 64% timeouts; TP=2 (4 backends, 80GB) works cleanly
@@ -1116,6 +1118,7 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 11 | 8B, 20u, 10m, 16K prefix | **Re-run** | XLarge 27.9%, P99 -11.5%, **0% incomplete** |
 | 10 | 70B, 16u, 15m (TP=4, 40GB) | **Done** | XLarge 49.3%, RR 64% incomplete, prefix 0% |
 | 10b | 70B, 16u, 15m (TP=2, 80GB) | **Done** | XLarge 48.0%, P99 -33.3%, 0% incomplete both sides |
+| 10c | 70B, 16u, 30m (TP=2, 80GB) | **Done** | XLarge 43.8%, P99 ~same (sustained), 0% incomplete |
 
 **Pre-fix (runs 4-11 collected before stale connection fix — TTFT metrics valid):**
 
