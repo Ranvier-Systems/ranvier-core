@@ -2107,7 +2107,7 @@ Section 11 fixed gate guards in RouterService and K8s timers. These are **new** 
 
 ### 13.3 CRITICAL — Cross-Shard Safety
 
-- [ ] **[CRITICAL] std::function broadcast across shards in GossipConsensus**
+- [x] **[CRITICAL] std::function broadcast across shards in GossipConsensus** ✓
   _File:Lines:_ `src/gossip_consensus.cpp:130, 180, 237`
   _Issue:_ `_route_prune_callback` (`std::function`) is captured by value and sent to every shard via `smp::submit_to`. When the lambda exceeds Small Buffer Optimization size (~16-32 bytes), the heap allocation lives on shard 0 and is freed on shard N. This is anti-pattern Bug #3 (cross-shard free). Appears at 3 call sites. The code has a TODO acknowledging this.
   _Fix:_ Each shard registers its own local callback. Shard 0 broadcasts only the scalar `BackendId`; each shard invokes its local callback.
