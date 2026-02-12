@@ -258,7 +258,7 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
                     } catch (const std::exception& e) {
                         log_gossip_protocol().warn("Periodic DNS discovery failed: {}", e.what());
                     }
-                });
+                }).finally([holder = std::move(timer_holder)] {});
             }
         });
         _discovery_timer.arm_periodic(_config.discovery_refresh_interval);

@@ -2093,7 +2093,7 @@ Section 11 fixed gate guards in RouterService and K8s timers. These are **new** 
   _Fix:_ Acquire `_timer_gate.hold()` at the start of the callback lambda, before calling `broadcast_heartbeat()`.
   _Complexity:_ Low
 
-- [ ] **[CRITICAL] Gossip discovery timer gate holder drops before async work completes**
+- [x] **[CRITICAL] Gossip discovery timer gate holder drops before async work completes** ✓
   _File:Line:_ `src/gossip_protocol.cpp:237-254`
   _Issue:_ `timer_holder` is a local variable in the callback that dies when the callback returns. But `refresh_peers()` is a detached future `(void)` that runs for seconds. The gate holder provides zero protection — shutdown can destroy state while `refresh_peers()` is in-flight.
   _Fix:_ Move holder into the future chain: `(void)refresh_peers().finally([holder = std::move(timer_holder)] {});`
