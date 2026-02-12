@@ -1658,7 +1658,7 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
 
 seastar::future<> RouterService::start_gossip() {
     if (!_gossip) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Register per-shard prune callbacks on ALL shards before starting gossip.
@@ -1679,7 +1679,7 @@ seastar::future<> RouterService::start_gossip() {
 
 seastar::future<> RouterService::stop_gossip() {
     if (!_gossip) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Shutdown sequence (order matters for correctness):
