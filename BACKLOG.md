@@ -2074,7 +2074,7 @@ These items directly affect the validity of the current performance benchmark re
   _Complexity:_ Low
   _Priority:_ P0 — fix before next benchmark run
 
-- [ ] **[CRITICAL] Mutex on every proxy request via is_persistence_backpressured()**
+- [x] **[CRITICAL] Mutex on every proxy request via is_persistence_backpressured()**
   _File:Line:_ `src/http_controller.cpp:1819-1827`
   _Issue:_ Every proxy request calls `is_persistence_backpressured()` which calls `_persistence->queue_depth()`. Despite PR #118 adding an atomic for the metrics path, the queue itself is still mutex-protected (see `async_persistence.hpp:118`). The code comment at line 1819 explicitly says "queue_depth() acquires a mutex". This stalls the reactor under concurrent persistence writes.
   _Benchmark impact:_ P99 latency numbers include this mutex overhead. The actual prefix-routing benefit is better than currently measured.
