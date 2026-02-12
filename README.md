@@ -1,6 +1,6 @@
 # Ranvier Core
 
-> **48% faster Time-To-First-Token** through intelligent prefix-aware routing.
+> **33-44% faster Time-To-First-Token** through intelligent prefix-aware routing.
 >
 > *Named for the Nodes of Ranvier—enabling signals to jump gaps, just as Ranvier enables inference to skip redundant computation.*
 
@@ -46,7 +46,7 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 | **Radix Tree Lookup** | < 50μs | Pure routing decision (O(L) where L = prefix length) |
 | **Total Routing Overhead** | 1-10ms | Includes tokenization; scales with prompt size |
 | **Ranvier P50 Overhead** | ~7ms | Measured vs direct vLLM connection |
-| **Cache Hit Rate** | 94-98% | With prefix-heavy workloads (RAG, few-shot) |
+| **Cache Hit Rate** | 96-98% | With prefix-heavy workloads (RAG, few-shot) |
 
 **Design Principles:**
 * **Minimized Copying:** Uses `string_view` parsing with single network buffer copy; Radix lookups use `std::span` for zero-copy token access.
@@ -57,17 +57,19 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ## 📊 Benchmark Results
 
-Real-world results from 8x A100 40GB:
+Real-world results from 8x A100 GPUs (30-minute validated runs, February 2026):
 
 ### Performance by Model Size
 
-| Model | Users | XLarge TTFT Improvement | Cache Hit Rate | Notes |
-|-------|-------|-------------------------|----------------|-------|
-| **CodeLlama-13b** | 10 | **48.2%** | 96.4% | Larger model = bigger improvement |
-| Llama-3.1-8B | 10 | 42.7% | 95.6% | Normal load (1-2 req/GPU) |
-| Llama-3.1-8B | 30 | 23.7% | 98.0% | Heavy load (3+ req/GPU) |
+| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
+|-------|----------------|-------------------------|-------------|------------|
+| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
+| CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
+| Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
 
-**Key insight:** Larger models benefit more from prefix caching because prefill computation is more expensive. The 13B model shows 48% TTFT improvement vs 43% for 8B under equivalent load.
+*70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).*
+
+**Key insight:** Benefits scale with model size — larger models save more computation per cache hit. The 13B model is the sweet spot: queue buildup under load makes routing dramatically effective (-85% P99, +22% throughput). 70B shows the highest per-request benefit (44% TTFT) but is compute-bound rather than queue-bound.
 
 **Best suited for:**
 - RAG applications with shared context documents
