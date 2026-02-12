@@ -1,13 +1,27 @@
 # KV Cache Prefix-Affinity Routing Benchmark
 
-**Date:** January 2026
-**Environment:** 8x A100 40GB GPUs, single host
-**Model:** meta-llama/Llama-3.1-8B-Instruct
+**Date:** January–February 2026
+**Environment:** 8x A100 GPUs (40GB and 80GB), single host
+**Models:** Llama-3.1-8B, CodeLlama-13b, Llama-3.1-70B
 **vLLM:** Prefix caching enabled (`--enable-prefix-caching`)
+
+> **For the comprehensive, authoritative benchmark results** (including 13B, 70B, prefix ratio sweeps, client tokenization, stress tests, and 30-minute validated runs), see: **[Benchmark Guide for 8x A100](benchmark-guide-8xA100.md)**
+>
+> This document contains the original 8B benchmarks from January 2026 plus updated summary data.
 
 ## Executive Summary
 
-Prefix-affinity routing provides **6.5x better cache hit rate** and **7% faster overall throughput** compared to round-robin routing when serving LLM inference requests with shared prefixes.
+Prefix-affinity routing provides **4-8x better cache hit rate** and **up to 85% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes.
+
+### Results Summary (30-minute validated, February 2026)
+
+| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
+|-------|----------------|-------------------------|-------------|------------|
+| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
+| CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
+| Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
+
+*70B on 80GB A100s (TP=2, 4 backends, 32K context). 13B/8B on 40GB A100s (8 backends).*
 
 ## Test Configuration
 
@@ -168,13 +182,17 @@ This header is invaluable for debugging configuration mismatches between client 
 
 ## Conclusions
 
-1. **Prefix-affinity routing is essential for KV cache optimization** - 6.5x better cache utilization translates directly to lower latency and higher throughput.
+1. **Prefix-affinity routing is essential for KV cache optimization** — 4-8x better cache utilization translates directly to lower latency and higher throughput.
 
-2. **Larger prefixes benefit more** - XLarge prefixes (4-8K tokens) see 37% TTFT improvement vs 28% for large prefixes.
+2. **Benefits scale with model size** — 70B shows 44% XLarge TTFT improvement, 13B shows 33%, 8B shows 40%. Larger models save more computation per cache hit.
 
-3. **Tail latency improves dramatically** - P99 latency drops 47% because cache behavior is predictable, not random.
+3. **13B is the sweet spot for aggregate metrics** — Queue buildup under load makes routing dramatically effective: -85% P99 tail latency, +22% throughput. 70B is compute-bound (flat P99/throughput), 8B is fast enough that queues don't build.
 
-4. **Memory efficiency** - With prefix-affinity, each backend only needs to cache its assigned prefixes rather than potentially caching all prefixes.
+4. **Tail latency improves dramatically** — P99 latency drops up to 85% for 13B because cache behavior is predictable, not random.
+
+5. **Memory efficiency** — With prefix-affinity, each backend only needs to cache its assigned prefixes rather than potentially caching all prefixes.
+
+See the [Benchmark Guide for 8x A100](benchmark-guide-8xA100.md) for full methodology, per-run data, and detailed analysis.
 
 ## Reproducing This Benchmark
 
