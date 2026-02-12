@@ -725,14 +725,18 @@ TEST_F(RadixTreeLRUTest, RouteCountIncrementsOnInsert) {
     EXPECT_EQ(tree.route_count(), 3u);
 }
 
-TEST_F(RadixTreeLRUTest, RouteCountIncrementsOnOverwrite) {
-    // Note: route_count is approximate - it doesn't detect overwrites
+TEST_F(RadixTreeLRUTest, RouteCountStableOnOverwrite) {
     tree.insert(tokens({1, 2, 3}), 1);
     EXPECT_EQ(tree.route_count(), 1u);
 
-    tree.insert(tokens({1, 2, 3}), 99);  // Overwrite
-    // Count increases even on overwrite (documented as approximate)
-    EXPECT_EQ(tree.route_count(), 2u);
+    tree.insert(tokens({1, 2, 3}), 99);  // Overwrite same prefix
+    // Count must NOT inflate on overwrite — only new routes increment
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    // Verify the value was updated
+    auto result = tree.lookup(tokens({1, 2, 3}));
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 99);
 }
 
 TEST_F(RadixTreeLRUTest, RouteCountManyRoutes) {
