@@ -2099,7 +2099,7 @@ Section 11 fixed gate guards in RouterService and K8s timers. These are **new** 
   _Fix:_ Move holder into the future chain: `(void)refresh_peers().finally([holder = std::move(timer_holder)] {});`
   _Complexity:_ Low
 
-- [ ] **[CRITICAL] AsyncPersistence log_stats() gate holder drops at end of try block**
+- [x] **[CRITICAL] AsyncPersistence log_stats() gate holder drops at end of try block** ✓
   _File:Line:_ `src/async_persistence.cpp:371-380`
   _Issue:_ Gate holder is scoped to `try {}` block. After the block, the function accesses `_ops_processed`, `_ops_dropped`, `_batches_flushed`, and calls `queue_depth()` without gate protection. If `stop()` runs between the `try` block and the member access, it's use-after-free.
   _Fix:_ Declare `timer_holder` at function scope and assign inside `try`, matching the pattern used in `on_flush_timer()` (line 261).
