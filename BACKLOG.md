@@ -2066,7 +2066,7 @@ Cross-referenced with Section 7 (Jan 2026) and Section 11 (Feb 2). Only **new** 
 
 These items directly affect the validity of the current performance benchmark results.
 
-- [ ] **[CRITICAL] RadixTree route_count_ drift causes cascading eviction**
+- [x] **[CRITICAL] RadixTree route_count_ drift causes cascading eviction**
   _File:Line:_ `src/radix_tree.hpp:243`
   _Issue:_ `insert()` increments `route_count_++` unconditionally, but `insert_recursive()` (line 1259-1263) silently updates existing leaves without signaling "not new". Repeated inserts of the same prefix inflate the counter beyond the actual route count. When `route_count_ >= max_routes`, the eviction loop in `router_service.cpp` evicts all real routes while the counter stays inflated. The tree permanently empties itself under sustained traffic with repeated prefixes.
   _Benchmark impact:_ Cache hit rate benchmarks (reported at 98%) are time-bombs. Short runs succeed; 30+ minute runs under real traffic patterns will trigger mass eviction and fall back to round-robin.
