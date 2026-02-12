@@ -1816,10 +1816,7 @@ bool HttpController::is_persistence_backpressured() const {
     }
 
     // Check if persistence queue is above threshold.
-    // Note: queue_depth() acquires a mutex, but this is acceptable for backpressure checks:
-    // 1. The mutex is uncontended on most requests (route learning is infrequent)
-    // 2. Operators can disable this check via enable_persistence_backpressure=false
-    // Future optimization: Use an atomic queue size counter if profiling shows contention.
+    // queue_depth() reads an atomic shadow counter — zero lock, safe on the reactor.
     size_t max_depth = _persistence->max_queue_depth();
     if (max_depth == 0) {
         return false;  // Avoid division by zero; 0 means unlimited
