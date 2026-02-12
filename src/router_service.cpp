@@ -5,6 +5,7 @@
 #include "node_slab.hpp"
 #include "parse_utils.hpp"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/loop.hh>
@@ -592,13 +593,8 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             return learn_route_remote(std::move(tokens), backend);
         });
 
-        // Set up callback to prune routes when a peer fails
-        // NOTE: No `this` capture - remove_routes_for_backend is static and uses only
-        // thread_local state. This prevents accidental cross-shard state access when
-        // the callback is broadcast to all shards.
-        _gossip->set_route_prune_callback([](BackendId backend) {
-            return RouterService::remove_routes_for_backend(backend);
-        });
+        // Per-shard prune callback registration is deferred to start_gossip()
+        // where smp::invoke_on_all can register on every shard safely.
 
         // Set up callback to handle node state changes (e.g., DRAINING notifications)
         // When a peer broadcasts DRAINING, set their backend weight to 0 to stop new traffic
@@ -1665,8 +1661,20 @@ seastar::future<> RouterService::start_gossip() {
         return seastar::make_ready_future<>();
     }
 
+    // Register per-shard prune callbacks on ALL shards before starting gossip.
+    // Each shard creates its own std::function locally, avoiding cross-shard
+    // heap copies that risk wrong-shard deallocation (anti-pattern Bug #3).
+    // The outer lambda captures nothing (function pointer), so it's safe to
+    // send via smp::invoke_on_all. Each shard constructs the inner callback
+    // locally on its own allocator.
+    co_await seastar::smp::invoke_on_all([] {
+        GossipConsensus::register_local_prune_callback([](BackendId backend) {
+            return RouterService::remove_routes_for_backend(backend);
+        });
+    });
+
     start_batch_flush_timer();
-    return _gossip->start();
+    co_await _gossip->start();
 }
 
 seastar::future<> RouterService::stop_gossip() {
@@ -1678,11 +1686,16 @@ seastar::future<> RouterService::stop_gossip() {
     // 1. Cancel timer - prevents new timer-triggered flushes
     // 2. Stop gossip - prevents new routes from arriving
     // 3. Flush remaining - ensures no buffered routes are lost
+    // 4. Clear per-shard prune callbacks on all shards
     _batch_flush_timer.cancel();
 
-    return _gossip->stop().then([this] {
-        log_router.info("Gossip stopped, flushing remaining route batch");
-        return flush_route_batch();
+    co_await _gossip->stop();
+    log_router.info("Gossip stopped, flushing remaining route batch");
+    co_await flush_route_batch();
+
+    // Clear per-shard prune callbacks to prevent stale callback invocations
+    co_await seastar::smp::invoke_on_all([] {
+        GossipConsensus::clear_local_prune_callback();
     });
 }
 

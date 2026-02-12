@@ -402,9 +402,11 @@ ClusterState GossipService::get_cluster_state() const {
 }
 
 void GossipService::set_route_prune_callback(RoutePruneCallback callback) {
-    if (_consensus) {
-        _consensus->set_prune_callback(std::move(callback));
-    }
+    // Register callback on the calling shard only. The caller is responsible
+    // for invoking this on all shards (via smp::invoke_on_all) to ensure each
+    // shard has its own locally-allocated callback, avoiding cross-shard
+    // std::function copies.
+    GossipConsensus::register_local_prune_callback(std::move(callback));
 }
 
 bool GossipService::is_accepting_tasks() const {
