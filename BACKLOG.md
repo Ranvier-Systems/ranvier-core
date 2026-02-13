@@ -2173,9 +2173,10 @@ Section 7 fixed several unbounded containers. These are **new** ones.
 
 ### 13.6 MEDIUM — Additional Issues
 
-- [ ] **[MEDIUM] gossip_transport.cpp uses std::shared_ptr for shard-local data (Rule #0)**
+- [x] **[MEDIUM] gossip_transport.cpp uses std::shared_ptr for shard-local data (Rule #0)**
   _File:Lines:_ `src/gossip_transport.cpp:200-201, 263, 469`
   _Fix:_ Use `seastar::do_with` or `seastar::lw_shared_ptr`.
+  _Resolution:_ Replaced all `std::shared_ptr` with shard-safe patterns: `seastar::do_with` for `parallel_for_each` paths, direct value capture for `seastar::async`, and `seastar::lw_shared_ptr` for crypto callback sharing. Added ownership pattern tests in `gossip_transport_ownership_test.cpp`.
 
 - [ ] **[MEDIUM] sqlite_persistence.cpp has business validation in persistence layer (Rule #7)**
   _File:Line:_ `src/sqlite_persistence.cpp:325-329`
