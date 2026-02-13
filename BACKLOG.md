@@ -2136,7 +2136,7 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Add `MAX_RESPONSE_SIZE` (16MB), `MAX_LINE_SIZE` (1MB), `MAX_ENDPOINTS` (1000). Abort and reconnect if exceeded.
   _Complexity:_ Low
 
-- [ ] **[HIGH] Connection pool _pools map has no MAX_BACKENDS limit**
+- [x] **[HIGH] Connection pool _pools map has no MAX_BACKENDS limit**
   _File:Line:_ `src/connection_pool.hpp:435`
   _Issue:_ Per-host and total connection limits exist, but the number of unique backend addresses (map keys) is unbounded. Thousands of unique addresses with 0 idle connections still grow the map. Distinct from Section 7 line 927 (which fixed erasure of empty deques).
   _Fix:_ Add `MAX_BACKENDS = 1000`. Check `_pools.size()` before inserting new backend entries.
