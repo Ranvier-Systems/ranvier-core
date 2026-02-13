@@ -5,11 +5,13 @@
 
 #include <gtest/gtest.h>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Include only the types we need (avoid Seastar headers)
@@ -1807,6 +1809,212 @@ TEST_F(K8sTokenSizeBoundsTest, AllWhitespaceTokenBecomesEmpty) {
     auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
     EXPECT_TRUE(accepted);
     EXPECT_TRUE(result.empty());
+}
+
+// =============================================================================
+// HTTP Status Code Parsing Tests
+// =============================================================================
+//
+// Tests for parse_http_status_code(), which replaces the brittle string search
+// ("200 OK" / "200 ") with proper status line parsing.
+// Mirrors the production implementation in k8s_discovery_service.cpp.
+
+namespace http_status {
+
+// Replicated from k8s_discovery_service.cpp to avoid Seastar dependencies.
+static std::optional<int> parse_http_status_code(std::string_view headers) {
+    auto line_end = headers.find("\r\n");
+    std::string_view status_line = headers.substr(0, line_end);
+
+    auto first_space = status_line.find(' ');
+    if (first_space == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    auto code_start = first_space + 1;
+    while (code_start < status_line.size() && status_line[code_start] == ' ') {
+        ++code_start;
+    }
+
+    auto second_space = status_line.find(' ', code_start);
+    auto code_end = (second_space != std::string_view::npos)
+                        ? second_space
+                        : status_line.size();
+
+    if (code_start >= code_end) {
+        return std::nullopt;
+    }
+
+    int code = 0;
+    auto [ptr, ec] = std::from_chars(
+        status_line.data() + code_start,
+        status_line.data() + code_end,
+        code);
+
+    if (ec != std::errc{} || ptr != status_line.data() + code_end) {
+        return std::nullopt;
+    }
+
+    return code;
+}
+
+}  // namespace http_status
+
+class HttpStatusParseTest : public ::testing::Test {};
+
+// --- Standard status lines ---
+
+TEST_F(HttpStatusParseTest, ParsesHttp11_200Ok) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, ParsesHttp10_200Ok) {
+    auto code = http_status::parse_http_status_code("HTTP/1.0 200 OK\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, ParsesHttp2_200) {
+    // HTTP/2 may omit the reason phrase
+    auto code = http_status::parse_http_status_code("HTTP/2 200\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, Parses404NotFound) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 404 Not Found\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 404);
+}
+
+TEST_F(HttpStatusParseTest, Parses403Forbidden) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 403 Forbidden\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 403);
+}
+
+TEST_F(HttpStatusParseTest, Parses500InternalServerError) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 500 Internal Server Error\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 500);
+}
+
+TEST_F(HttpStatusParseTest, Parses503ServiceUnavailable) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 503 Service Unavailable\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 503);
+}
+
+TEST_F(HttpStatusParseTest, Parses410Gone) {
+    // K8s sends 410 Gone when watch resourceVersion is too old
+    auto code = http_status::parse_http_status_code("HTTP/1.1 410 Gone\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 410);
+}
+
+TEST_F(HttpStatusParseTest, Parses301MovedPermanently) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 301 Moved Permanently\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 301);
+}
+
+// --- Status code without reason phrase (valid per HTTP spec) ---
+
+TEST_F(HttpStatusParseTest, StatusCodeWithoutReasonPhrase) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 200\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+// --- Headers containing "200" in values should NOT confuse the parser ---
+
+TEST_F(HttpStatusParseTest, DoesNotMatchFalse200InHeaders) {
+    // The old brittle code would match "200 OK" appearing in a header value.
+    // The new code only parses the first line.
+    std::string headers =
+        "HTTP/1.1 403 Forbidden\r\n"
+        "X-Custom: 200 OK\r\n"
+        "Content-Length: 200\r\n";
+    auto code = http_status::parse_http_status_code(headers);
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 403);
+}
+
+TEST_F(HttpStatusParseTest, DoesNotMatchFalse200InBody) {
+    // Even with "200" in what looks like body content after headers
+    std::string headers = "HTTP/1.1 500 Internal Server Error\r\n"
+                          "Content-Type: text/plain\r\n";
+    auto code = http_status::parse_http_status_code(headers);
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 500);
+}
+
+// --- Full header block (multiple headers) ---
+
+TEST_F(HttpStatusParseTest, FullHeaderBlockWithMultipleHeaders) {
+    std::string headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Cache-Control: no-cache, private\r\n";
+    auto code = http_status::parse_http_status_code(headers);
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+// --- Malformed / edge cases ---
+
+TEST_F(HttpStatusParseTest, EmptyStringReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, NoSpaceInStatusLineReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1\r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, NonNumericStatusCodeReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 abc OK\r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, PartialNumericStatusCodeReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 20x OK\r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, MissingStatusCodeAfterSpaceReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 \r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, GarbageInputReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("not an http response");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, OnlyProtocolNoCodeReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, StatusLineWithoutCRLF) {
+    // No \r\n — the function should still parse if the entire input is one status line
+    auto code = http_status::parse_http_status_code("HTTP/1.1 200 OK");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, NegativeStatusCodeParsedAsInteger) {
+    // The parser extracts the integer value; HTTP validity is the caller's concern.
+    // "-200" is parseable as int, so the function returns -200.
+    auto code = http_status::parse_http_status_code("HTTP/1.1 -200 OK\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, -200);
+    // The caller would reject this: (*code != 200)
 }
 
 int main(int argc, char** argv) {

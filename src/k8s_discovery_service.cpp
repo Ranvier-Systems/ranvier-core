@@ -38,6 +38,50 @@ constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
 
 // Note: parse_port() is now provided by parse_utils.hpp using std::from_chars
 
+// Parse the numeric HTTP status code from a response header block.
+// HTTP status line format: "HTTP/<version> <code> <reason>\r\n..."
+// Returns the 3-digit numeric code (e.g. 200, 404, 503), or std::nullopt
+// if the status line is malformed or the code is not a valid integer.
+static std::optional<int> parse_http_status_code(std::string_view headers) {
+    // Extract the first line (status line)
+    auto line_end = headers.find("\r\n");
+    std::string_view status_line = headers.substr(0, line_end);
+
+    // Find the status code field: "HTTP/x.x <code> <reason>"
+    auto first_space = status_line.find(' ');
+    if (first_space == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    // Advance past whitespace to the start of the code
+    auto code_start = first_space + 1;
+    while (code_start < status_line.size() && status_line[code_start] == ' ') {
+        ++code_start;
+    }
+
+    // Find the end of the code (next space or end of line)
+    auto second_space = status_line.find(' ', code_start);
+    auto code_end = (second_space != std::string_view::npos)
+                        ? second_space
+                        : status_line.size();
+
+    if (code_start >= code_end) {
+        return std::nullopt;
+    }
+
+    int code = 0;
+    auto [ptr, ec] = std::from_chars(
+        status_line.data() + code_start,
+        status_line.data() + code_end,
+        code);
+
+    if (ec != std::errc{} || ptr != status_line.data() + code_end) {
+        return std::nullopt;
+    }
+
+    return code;
+}
+
 // Generate a stable BackendId from endpoint UID using FNV-1a 64-bit hash.
 // FNV-1a provides much better distribution than the previous hash*31+c polynomial,
 // and is deterministic across restarts (unlike absl::Hash which uses ASLR-based seeds).
@@ -552,13 +596,13 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
         std::string headers = response.substr(0, header_end);
         std::string body = response.substr(header_end + 4);
 
-        // Check status code
-        if (headers.find("200 OK") == std::string::npos &&
-            headers.find("200 ") == std::string::npos) {
-            // Extract status line
+        // Check status code — parse the numeric code from the HTTP status line
+        // rather than doing a brittle string search through all headers.
+        auto status_code = parse_http_status_code(headers);
+        if (!status_code || *status_code != 200) {
             auto status_end = headers.find("\r\n");
-            std::string status = headers.substr(0, status_end);
-            throw std::runtime_error("K8s API error: " + status);
+            std::string status_line = headers.substr(0, status_end);
+            throw std::runtime_error("K8s API error: " + status_line);
         }
 
         // Handle chunked transfer encoding
