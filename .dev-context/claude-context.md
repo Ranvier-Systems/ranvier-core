@@ -19,7 +19,7 @@ Before writing any code, verify:
 - [ ] Have I read the relevant file(s) I'm about to modify?
 - [ ] Does this touch cross-shard communication? Use `seastar::smp::submit_to`
 - [ ] Is there a MAX_SIZE for any new container?
-- [ ] Any new timer/callback? Needs gate guard
+- [ ] Any new timer/callback? Needs gate guard scoped to full async lifetime
 - [ ] Any new metrics lambda capturing `this`? Deregister in `stop()`
 - [ ] Any C API string returns? Null-guard required
 
@@ -363,9 +363,9 @@ The following patterns were identified during an adversarial security audit. Eac
 
 **THE CONSEQUENCE:** Race condition: (1) Timer fires, callback queued on reactor. (2) `stop()` cancels timer (but callback already queued). (3) `stop()` returns, destructor runs. (4) Queued callback executes with dangling `this` -> use-after-free.
 
-**THE LESSON:** *Hard Rule: Timer callbacks require RAII gate guards.* Add a `seastar::gate _timer_gate`. Callbacks acquire `_timer_gate.hold()` at entry--fails if closed. `stop()` closes the gate *first* (waiting for in-flight callbacks), *then* cancels timers.
+**THE LESSON:** *Hard Rule: Timer callbacks require RAII gate guards scoped to the full async lifetime.* Add a `seastar::gate _timer_gate`. Callbacks acquire `_timer_gate.hold()` at entry--fails if closed. **Critical: the holder must live for the entire async operation.** For synchronous callbacks, function-scope is sufficient. For async chains, move the holder into `.finally()` or the outermost lambda capture--a holder scoped only to a `try` block drops before the async work completes, leaving the remainder unprotected. `stop()` closes the gate *first* (waiting for in-flight callbacks), *then* cancels timers.
 
-**PROMPT GUARD:** "Any lambda capturing 'this' for a timer or async callback must acquire a gate holder at entry and the owning class must close that gate before cancelling the timer."
+**PROMPT GUARD:** "Any lambda capturing 'this' for a timer or async callback must acquire a gate holder at entry, the holder must be scoped to the entire async operation (move into .finally() for async chains), and the owning class must close that gate before cancelling the timer."
 
 ---
 
@@ -625,7 +625,7 @@ void worker_thread(Job& job) {
 | 2 | No `co_await` inside loops over external resources | Sequential await in for-loop |
 | 3 | Null-guard all C string returns | Direct cast of `sqlite3_column_text` |
 | 4 | Every growing container needs MAX_SIZE | Unbounded `push_back` |
-| 5 | Timer callbacks need gate guards | Lambda captures `this` without gate |
+| 5 | Timer callbacks need gate guards scoped to full async lifetime | Lambda captures `this` without gate; holder drops before async completes |
 | 6 | Deregister metrics first in `stop()` | Lambda outlives service |
 | 7 | Persistence only stores, never validates | Business logic in storage layer |
 | 8 | Single `ShardLocalState` struct for per-shard state | Scattered `thread_local` variables |
