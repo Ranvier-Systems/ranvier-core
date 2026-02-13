@@ -641,6 +641,22 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(crypto_offloader_test)
 
+    # DtlsContext Unit Tests (Requires Seastar types for header includes)
+    # Tests memory-based certificate loading (load_certs_from_memory) without reactor
+    add_executable(dtls_context_test
+      tests/unit/dtls_context_test.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(dtls_context_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(dtls_context_test
+      PRIVATE
+      Seastar::seastar
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(dtls_context_test)
+
 # ConnectionPool Unit Tests (Requires Seastar types)
     # Tests pool management logic: per-host limits, global limits, idle timeout
     # eviction, max-age TTL enforcement, and half-open detection with TestClock.

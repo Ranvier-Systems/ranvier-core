@@ -2164,11 +2164,12 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Complexity:_ Low
   _Fixed:_ Removed g_tracer.reset() and g_provider.reset() from shutdown(). Globals are now process-lifetime objects — OS reclaims at exit. Added concurrency model tests in tracing_service_test.cpp.
 
-- [ ] **[HIGH] DTLS context uses blocking stat() and SSL_CTX file I/O on reactor**
+- [x] **[HIGH] DTLS context uses blocking stat() and SSL_CTX file I/O on reactor**
   _File:Line:_ `src/dtls_context.cpp:403-410, 433-438`
   _Issue:_ `SSL_CTX_use_certificate_file` and POSIX `stat()` are blocking calls on the reactor thread during cert reload. Violates Rule #12.
   _Fix:_ Offload cert reload to `seastar::async`. Use OpenSSL memory-based APIs (`SSL_CTX_use_certificate_ASN1`) after async file read.
   _Complexity:_ Medium
+  _Fixed:_ Replaced all blocking file I/O with Seastar async APIs (`open_file_dma`, `make_file_input_stream`, `file::stat`). Replaced `SSL_CTX_use_certificate_file`/`SSL_CTX_use_PrivateKey_file`/`SSL_CTX_load_verify_locations` with memory-based OpenSSL APIs (`PEM_read_bio_X509`, `PEM_read_bio_PrivateKey`, `X509_STORE_add_cert`) fed from async-read buffers. Both `initialize()` and `check_and_reload_certs()` now return futures. Added `load_certs_from_memory()` static helper with unit tests in `dtls_context_test.cpp`.
 
 ### 13.6 MEDIUM — Additional Issues
 

@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
-#include <sys/stat.h>
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/reactor.hh>
 
 namespace ranvier {
 
@@ -339,10 +341,10 @@ DtlsContext::~DtlsContext() {
     }
 }
 
-std::optional<std::string> DtlsContext::initialize() {
+seastar::future<std::optional<std::string>> DtlsContext::initialize() {
     if (!_enabled) {
         log_dtls.info("DTLS disabled");
-        return std::nullopt;
+        co_return std::nullopt;
     }
 
     log_dtls.info("Initializing DTLS context");
@@ -351,19 +353,19 @@ std::optional<std::string> DtlsContext::initialize() {
     // Use DTLS_method() for DTLS 1.0+ (negotiates highest available)
     const SSL_METHOD* method = DTLS_method();
     if (!method) {
-        return "Failed to get DTLS method: " + DtlsSession::get_ssl_error();
+        co_return "Failed to get DTLS method: " + DtlsSession::get_ssl_error();
     }
 
     _ctx = SSL_CTX_new(method);
     if (!_ctx) {
-        return "Failed to create SSL_CTX: " + DtlsSession::get_ssl_error();
+        co_return "Failed to create SSL_CTX: " + DtlsSession::get_ssl_error();
     }
 
     // Set minimum protocol version to DTLS 1.2
     if (!SSL_CTX_set_min_proto_version(_ctx, DTLS1_2_VERSION)) {
         SSL_CTX_free(_ctx);
         _ctx = nullptr;
-        return "Failed to set minimum DTLS version: " + DtlsSession::get_ssl_error();
+        co_return "Failed to set minimum DTLS version: " + DtlsSession::get_ssl_error();
     }
 
     // Enable DTLS cookie exchange for DoS protection
@@ -378,12 +380,12 @@ std::optional<std::string> DtlsContext::initialize() {
         log_dtls.warn("DTLS peer verification disabled - NOT RECOMMENDED for production");
     }
 
-    // Load certificates
-    auto err = load_certificates();
+    // Load certificates via async file I/O (Rule #12)
+    auto err = co_await load_certificates();
     if (err) {
         SSL_CTX_free(_ctx);
         _ctx = nullptr;
-        return err;
+        co_return err;
     }
 
     _initialized = true;
@@ -395,57 +397,192 @@ std::optional<std::string> DtlsContext::initialize() {
         log_dtls.warn("Enable cluster.tls.enabled for production deployments");
     }
 
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
-std::optional<std::string> DtlsContext::load_certificates() {
-    // Load certificate
-    if (SSL_CTX_use_certificate_file(_ctx, _config.cert_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
-        return "Failed to load certificate from " + _config.cert_path + ": " + DtlsSession::get_ssl_error();
+seastar::future<std::optional<std::string>> DtlsContext::load_certificates() {
+    // Read file contents using Seastar async file I/O (Rule #12: no blocking I/O on reactor)
+    std::string cert_pem, key_pem, ca_pem;
+    try {
+        cert_pem = co_await read_file_contents(_config.cert_path);
+    } catch (const std::exception& e) {
+        co_return "Failed to read certificate file " + _config.cert_path + ": " + e.what();
     }
-    log_dtls.debug("Loaded certificate: {}", _config.cert_path);
+    try {
+        key_pem = co_await read_file_contents(_config.key_path);
+    } catch (const std::exception& e) {
+        co_return "Failed to read key file " + _config.key_path + ": " + e.what();
+    }
+    try {
+        ca_pem = co_await read_file_contents(_config.ca_path);
+    } catch (const std::exception& e) {
+        co_return "Failed to read CA file " + _config.ca_path + ": " + e.what();
+    }
 
-    // Load private key
-    if (SSL_CTX_use_PrivateKey_file(_ctx, _config.key_path.c_str(), SSL_FILETYPE_PEM) <= 0) {
-        return "Failed to load private key from " + _config.key_path + ": " + DtlsSession::get_ssl_error();
+    // Load certificates from memory (CPU-only, non-blocking)
+    auto err = load_certs_from_memory(_ctx, cert_pem, key_pem, ca_pem);
+    if (err) {
+        co_return err;
     }
+
+    log_dtls.debug("Loaded certificate: {}", _config.cert_path);
     log_dtls.debug("Loaded private key: {}", _config.key_path);
+    log_dtls.debug("Loaded CA certificate: {}", _config.ca_path);
+
+    // Store modification times for hot reload using async stat (Rule #12)
+    _cert_mtime = (co_await get_file_mtime(_config.cert_path)).value_or(std::chrono::system_clock::time_point{});
+    _key_mtime = (co_await get_file_mtime(_config.key_path)).value_or(std::chrono::system_clock::time_point{});
+    _ca_mtime = (co_await get_file_mtime(_config.ca_path)).value_or(std::chrono::system_clock::time_point{});
+
+    co_return std::nullopt;
+}
+
+std::optional<std::string> DtlsContext::load_certs_from_memory(
+    SSL_CTX* ctx,
+    const std::string& cert_pem,
+    const std::string& key_pem,
+    const std::string& ca_pem) {
+
+    if (!ctx) {
+        return "SSL_CTX is null";
+    }
+
+    // --- Load certificate (and optional chain) from PEM ---
+    BIO* cert_bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+    if (!cert_bio) {
+        return "Failed to create certificate memory BIO";
+    }
+
+    X509* cert = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr);
+    if (!cert) {
+        BIO_free(cert_bio);
+        return "Failed to parse certificate PEM: " + DtlsSession::get_ssl_error();
+    }
+
+    if (SSL_CTX_use_certificate(ctx, cert) <= 0) {
+        X509_free(cert);
+        BIO_free(cert_bio);
+        return "Failed to load certificate into SSL_CTX: " + DtlsSession::get_ssl_error();
+    }
+    X509_free(cert);
+
+    // Load any additional chain certificates from the same PEM
+    X509* chain_cert = nullptr;
+    while ((chain_cert = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr)) != nullptr) {
+        // SSL_CTX_add_extra_chain_cert takes ownership on success
+        if (!SSL_CTX_add_extra_chain_cert(ctx, chain_cert)) {
+            X509_free(chain_cert);
+            BIO_free(cert_bio);
+            return "Failed to add chain certificate: " + DtlsSession::get_ssl_error();
+        }
+    }
+    ERR_clear_error();  // Clear expected PEM_R_NO_START_LINE at EOF
+    BIO_free(cert_bio);
+
+    // --- Load private key from PEM ---
+    BIO* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+    if (!key_bio) {
+        return "Failed to create key memory BIO";
+    }
+
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr);
+    BIO_free(key_bio);
+    if (!pkey) {
+        return "Failed to parse private key PEM: " + DtlsSession::get_ssl_error();
+    }
+
+    if (SSL_CTX_use_PrivateKey(ctx, pkey) <= 0) {
+        EVP_PKEY_free(pkey);
+        return "Failed to load private key into SSL_CTX: " + DtlsSession::get_ssl_error();
+    }
+    EVP_PKEY_free(pkey);
 
     // Verify key matches certificate
-    if (!SSL_CTX_check_private_key(_ctx)) {
+    if (!SSL_CTX_check_private_key(ctx)) {
         return "Private key does not match certificate: " + DtlsSession::get_ssl_error();
     }
 
-    // Load CA certificate for peer verification
-    if (SSL_CTX_load_verify_locations(_ctx, _config.ca_path.c_str(), nullptr) <= 0) {
-        return "Failed to load CA certificate from " + _config.ca_path + ": " + DtlsSession::get_ssl_error();
+    // --- Load CA certificate(s) from PEM (supports CA bundles) ---
+    BIO* ca_bio = BIO_new_mem_buf(ca_pem.data(), static_cast<int>(ca_pem.size()));
+    if (!ca_bio) {
+        return "Failed to create CA memory BIO";
     }
-    log_dtls.debug("Loaded CA certificate: {}", _config.ca_path);
 
-    // Store modification times for hot reload
-    _cert_mtime = get_file_mtime(_config.cert_path).value_or(std::chrono::system_clock::time_point{});
-    _key_mtime = get_file_mtime(_config.key_path).value_or(std::chrono::system_clock::time_point{});
-    _ca_mtime = get_file_mtime(_config.ca_path).value_or(std::chrono::system_clock::time_point{});
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+    if (!store) {
+        BIO_free(ca_bio);
+        return "Failed to get certificate store from SSL_CTX";
+    }
+
+    X509* ca_cert = nullptr;
+    int ca_count = 0;
+    while ((ca_cert = PEM_read_bio_X509(ca_bio, nullptr, nullptr, nullptr)) != nullptr) {
+        if (!X509_STORE_add_cert(store, ca_cert)) {
+            // Duplicate certs are OK (X509_R_CERT_ALREADY_IN_HASH_TABLE)
+            unsigned long err = ERR_peek_last_error();
+            if (ERR_GET_REASON(err) != X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+                X509_free(ca_cert);
+                BIO_free(ca_bio);
+                return "Failed to add CA certificate to store: " + DtlsSession::get_ssl_error();
+            }
+            ERR_clear_error();
+        }
+        X509_free(ca_cert);
+        ++ca_count;
+    }
+    ERR_clear_error();  // Clear expected PEM_R_NO_START_LINE at EOF
+    BIO_free(ca_bio);
+
+    if (ca_count == 0) {
+        return "No CA certificates found in PEM data";
+    }
 
     return std::nullopt;
 }
 
-std::optional<std::chrono::system_clock::time_point> DtlsContext::get_file_mtime(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        return std::nullopt;
+seastar::future<std::string> DtlsContext::read_file_contents(const std::string& path) {
+    auto file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+    auto size = co_await file.size();
+
+    if (size == 0) {
+        co_await file.close();
+        throw std::runtime_error("File is empty: " + path);
     }
-    return std::chrono::system_clock::from_time_t(st.st_mtime);
+
+    auto stream = seastar::make_file_input_stream(file);
+    auto buf = co_await stream.read_exactly(size);
+    co_await stream.close();
+    co_await file.close();
+
+    co_return std::string(buf.get(), buf.size());
 }
 
-bool DtlsContext::check_and_reload_certs() {
+seastar::future<std::optional<std::chrono::system_clock::time_point>>
+DtlsContext::get_file_mtime(const std::string& path) {
+    try {
+        auto file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+        auto st = co_await file.stat();
+        co_await file.close();
+        co_return std::chrono::system_clock::from_time_t(st.st_mtime);
+    } catch (const std::exception& e) {
+        // Rule #9: every catch block logs at warn level
+        log_dtls.warn("Failed to stat file {}: {}", path, e.what());
+        co_return std::nullopt;
+    } catch (...) {
+        log_dtls.warn("Failed to stat file {}: unknown error", path);
+        co_return std::nullopt;
+    }
+}
+
+seastar::future<bool> DtlsContext::check_and_reload_certs() {
     if (!_initialized || _config.cert_reload_interval.count() == 0) {
-        return false;
+        co_return false;
     }
 
-    auto cert_mtime = get_file_mtime(_config.cert_path);
-    auto key_mtime = get_file_mtime(_config.key_path);
-    auto ca_mtime = get_file_mtime(_config.ca_path);
+    // Check modification times using async stat (Rule #12: no blocking I/O on reactor)
+    auto cert_mtime = co_await get_file_mtime(_config.cert_path);
+    auto key_mtime = co_await get_file_mtime(_config.key_path);
+    auto ca_mtime = co_await get_file_mtime(_config.ca_path);
 
     bool changed = false;
     if (cert_mtime && *cert_mtime != _cert_mtime) {
@@ -459,16 +596,27 @@ bool DtlsContext::check_and_reload_certs() {
     }
 
     if (!changed) {
-        return false;
+        co_return false;
     }
 
     log_dtls.info("Certificate files changed, reloading...");
 
-    // Create a new context with new certificates
+    // Read file contents using Seastar async file I/O (Rule #12)
+    std::string cert_pem, key_pem, ca_pem;
+    try {
+        cert_pem = co_await read_file_contents(_config.cert_path);
+        key_pem = co_await read_file_contents(_config.key_path);
+        ca_pem = co_await read_file_contents(_config.ca_path);
+    } catch (const std::exception& e) {
+        log_dtls.error("Failed to read certificate files during reload: {}", e.what());
+        co_return false;
+    }
+
+    // Create a new context with new certificates (CPU-only, non-blocking)
     SSL_CTX* new_ctx = SSL_CTX_new(DTLS_method());
     if (!new_ctx) {
         log_dtls.error("Failed to create new SSL_CTX for reload");
-        return false;
+        co_return false;
     }
 
     // Configure new context
@@ -479,14 +627,12 @@ bool DtlsContext::check_and_reload_certs() {
         SSL_CTX_set_verify(new_ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
     }
 
-    // Load certificates into new context
-    if (SSL_CTX_use_certificate_file(new_ctx, _config.cert_path.c_str(), SSL_FILETYPE_PEM) <= 0 ||
-        SSL_CTX_use_PrivateKey_file(new_ctx, _config.key_path.c_str(), SSL_FILETYPE_PEM) <= 0 ||
-        !SSL_CTX_check_private_key(new_ctx) ||
-        SSL_CTX_load_verify_locations(new_ctx, _config.ca_path.c_str(), nullptr) <= 0) {
-        log_dtls.error("Failed to load certificates during reload");
+    // Load certificates from memory into new context (CPU-only, non-blocking)
+    auto err = load_certs_from_memory(new_ctx, cert_pem, key_pem, ca_pem);
+    if (err) {
+        log_dtls.error("Failed to load certificates during reload: {}", *err);
         SSL_CTX_free(new_ctx);
-        return false;
+        co_return false;
     }
 
     // Success - swap contexts
@@ -506,7 +652,7 @@ bool DtlsContext::check_and_reload_certs() {
     SSL_CTX_free(old_ctx);
 
     log_dtls.info("Certificates reloaded successfully, cleared {} sessions", session_count);
-    return true;
+    co_return true;
 }
 
 SSL* DtlsContext::create_ssl(bool is_server) {
