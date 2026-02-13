@@ -38,15 +38,19 @@ constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
 
 // Note: parse_port() is now provided by parse_utils.hpp using std::from_chars
 
-// Generate a stable BackendId from endpoint UID
+// Generate a stable BackendId from endpoint UID using FNV-1a 64-bit hash.
+// FNV-1a provides much better distribution than the previous hash*31+c polynomial,
+// and is deterministic across restarts (unlike absl::Hash which uses ASLR-based seeds).
 BackendId K8sEndpoint::to_backend_id() const {
-    // Use a simple hash of the UID string
-    // This provides stability across restarts while being deterministic
-    uint32_t hash = 0;
-    for (char c : uid) {
-        hash = hash * 31 + static_cast<uint32_t>(c);
+    constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+    constexpr uint64_t kFnvPrime = 1099511628211ULL;
+
+    uint64_t hash = kFnvOffsetBasis;
+    for (unsigned char c : uid) {
+        hash ^= c;
+        hash *= kFnvPrime;
     }
-    // Ensure positive BackendId (use upper 31 bits)
+    // Ensure positive BackendId: truncate to 31 bits
     return static_cast<BackendId>(hash & 0x7FFFFFFF);
 }
 
@@ -85,7 +89,9 @@ K8sDiscoveryService::K8sDiscoveryService(const K8sDiscoveryConfig& config)
         seastar::metrics::make_counter("k8s_line_size_exceeded", _line_size_exceeded,
             seastar::metrics::description("Times K8s watch buffer exceeded MAX_LINE_SIZE")),
         seastar::metrics::make_counter("k8s_endpoints_limit_exceeded", _endpoints_limit_exceeded,
-            seastar::metrics::description("Times endpoint insertion was rejected due to MAX_ENDPOINTS limit"))
+            seastar::metrics::description("Times endpoint insertion was rejected due to MAX_ENDPOINTS limit")),
+        seastar::metrics::make_counter("k8s_backend_id_collisions", _backend_id_collisions,
+            seastar::metrics::description("Times two different UIDs produced the same BackendId hash"))
     });
 }
 
@@ -757,9 +763,22 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& 
         co_return;
     }
 
-    log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, ready={})",
+    auto backend_id = endpoint.to_backend_id();
+
+    // Collision detection: check if a different UID already maps to this BackendId
+    auto collision_it = _backend_id_to_uid.find(backend_id);
+    if (collision_it != _backend_id_to_uid.end() && collision_it->second != endpoint.uid) {
+        ++_backend_id_collisions;
+        log_k8s.error("BackendId collision detected: UID '{}' and UID '{}' both hash to BackendId {} - "
+                      "the new endpoint will shadow the existing one. "
+                      "This is a hash collision that may cause routing errors.",
+                      endpoint.uid, collision_it->second, backend_id);
+    }
+    _backend_id_to_uid[backend_id] = endpoint.uid;
+
+    log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, ready={}, backend_id={})",
                  endpoint.uid, endpoint.address, endpoint.port,
-                 endpoint.weight, endpoint.priority, endpoint.ready);
+                 endpoint.weight, endpoint.priority, endpoint.ready, backend_id);
 
     _endpoints[endpoint.uid] = endpoint;
     ++_endpoints_added;
@@ -770,7 +789,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& 
             seastar::net::inet_address inet_addr(endpoint.address);
             seastar::socket_address addr(inet_addr, endpoint.port);
 
-            co_await _register_callback(endpoint.to_backend_id(), addr,
+            co_await _register_callback(backend_id, addr,
                                          endpoint.weight, endpoint.priority);
         } catch (const std::exception& e) {
             log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
@@ -787,15 +806,22 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
     }
 
     const auto& endpoint = it->second;
-    log_k8s.info("K8s endpoint removed: {} ({}:{})",
-                 endpoint.uid, endpoint.address, endpoint.port);
+    auto backend_id = endpoint.to_backend_id();
+    log_k8s.info("K8s endpoint removed: {} ({}:{}, backend_id={})",
+                 endpoint.uid, endpoint.address, endpoint.port, backend_id);
 
     ++_endpoints_removed;
+
+    // Clean up reverse map (only if this UID still owns the BackendId entry)
+    auto rev_it = _backend_id_to_uid.find(backend_id);
+    if (rev_it != _backend_id_to_uid.end() && rev_it->second == endpoint.uid) {
+        _backend_id_to_uid.erase(rev_it);
+    }
 
     // Drain the backend
     if (_drain_callback) {
         try {
-            co_await _drain_callback(endpoint.to_backend_id());
+            co_await _drain_callback(backend_id);
         } catch (const std::exception& e) {
             log_k8s.error("Failed to drain backend for {}: {}", uid, e.what());
         }
@@ -806,8 +832,13 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
 }
 
 seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoint& endpoint) {
-    log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={})",
-                 endpoint.uid, endpoint.ready, endpoint.weight, endpoint.priority);
+    auto backend_id = endpoint.to_backend_id();
+
+    log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={}, backend_id={})",
+                 endpoint.uid, endpoint.ready, endpoint.weight, endpoint.priority, backend_id);
+
+    // Keep reverse map consistent for the modify path
+    _backend_id_to_uid[backend_id] = endpoint.uid;
 
     auto it = _endpoints.find(endpoint.uid);
     bool was_ready = it != _endpoints.end() && it->second.ready;
@@ -821,7 +852,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
                 seastar::net::inet_address inet_addr(endpoint.address);
                 seastar::socket_address addr(inet_addr, endpoint.port);
 
-                co_await _register_callback(endpoint.to_backend_id(), addr,
+                co_await _register_callback(backend_id, addr,
                                              endpoint.weight, endpoint.priority);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
@@ -831,7 +862,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
         // Became not ready - drain
         if (_drain_callback) {
             try {
-                co_await _drain_callback(endpoint.to_backend_id());
+                co_await _drain_callback(backend_id);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to drain backend for {}: {}", endpoint.uid, e.what());
             }
@@ -843,7 +874,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
                 seastar::net::inet_address inet_addr(endpoint.address);
                 seastar::socket_address addr(inet_addr, endpoint.port);
 
-                co_await _register_callback(endpoint.to_backend_id(), addr,
+                co_await _register_callback(backend_id, addr,
                                              endpoint.weight, endpoint.priority);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to update backend for {}: {}", endpoint.uid, e.what());

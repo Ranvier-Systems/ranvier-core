@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -240,10 +241,16 @@ struct K8sEndpoint {
     uint32_t weight = K8S_DEFAULT_WEIGHT;
     uint32_t priority = K8S_DEFAULT_PRIORITY;
 
+    // FNV-1a 64-bit hash, truncated to 31 bits for positive BackendId.
+    // Mirrors the production implementation in k8s_discovery_service.cpp.
     BackendId to_backend_id() const {
-        uint32_t hash = 0;
-        for (char c : uid) {
-            hash = hash * 31 + static_cast<uint32_t>(c);
+        constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+        constexpr uint64_t kFnvPrime = 1099511628211ULL;
+
+        uint64_t hash = kFnvOffsetBasis;
+        for (unsigned char c : uid) {
+            hash ^= c;
+            hash *= kFnvPrime;
         }
         return static_cast<BackendId>(hash & 0x7FFFFFFF);
     }
@@ -854,6 +861,184 @@ TEST_F(K8sBackendIdTest, IdIsDeterministic) {
     BackendId id2 = ep.to_backend_id();
 
     EXPECT_EQ(id1, id2);
+}
+
+// =============================================================================
+// FNV-1a Hash Quality Tests
+// =============================================================================
+// Verify that the FNV-1a hash produces well-distributed BackendIds
+// and avoids the clustering issues of the old hash*31+c polynomial.
+
+class K8sFnvHashQualityTest : public ::testing::Test {};
+
+TEST_F(K8sFnvHashQualityTest, SimilarUidsProduceDifferentIds) {
+    // The old hash*31+c had poor distribution for similar strings.
+    // FNV-1a should distribute these well.
+    std::vector<std::string> similar_uids = {
+        "pod-uid-001", "pod-uid-002", "pod-uid-003",
+        "pod-uid-010", "pod-uid-011", "pod-uid-012",
+        "pod-uid-100", "pod-uid-101", "pod-uid-102"
+    };
+
+    std::set<BackendId> ids;
+    for (const auto& uid : similar_uids) {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ids.insert(ep.to_backend_id());
+    }
+    // All similar UIDs should produce unique BackendIds
+    EXPECT_EQ(ids.size(), similar_uids.size());
+}
+
+TEST_F(K8sFnvHashQualityTest, RealK8sUidsProduceUniqueIds) {
+    // Test with realistic K8s pod UIDs (UUID v4 format)
+    std::vector<std::string> k8s_uids = {
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        "d4e5f6a7-b8c9-0123-def1-234567890123",
+        "e5f6a7b8-c9d0-1234-ef12-345678901234",
+        "f6a7b8c9-d0e1-2345-f123-456789012345",
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "12345678-1234-1234-1234-123456789abc"
+    };
+
+    std::set<BackendId> ids;
+    for (const auto& uid : k8s_uids) {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ids.insert(ep.to_backend_id());
+    }
+    EXPECT_EQ(ids.size(), k8s_uids.size());
+}
+
+TEST_F(K8sFnvHashQualityTest, NoCollisionsInFirst1000SequentialUids) {
+    // Test that 1000 sequential UIDs (the MAX_ENDPOINTS limit)
+    // produce no collisions
+    std::set<BackendId> ids;
+    for (int i = 0; i < 1000; ++i) {
+        K8sEndpoint ep;
+        ep.uid = "pod-" + std::to_string(i);
+        ids.insert(ep.to_backend_id());
+    }
+    EXPECT_EQ(ids.size(), 1000u);
+}
+
+TEST_F(K8sFnvHashQualityTest, EmptyUidProducesValidId) {
+    K8sEndpoint ep;
+    ep.uid = "";
+    BackendId id = ep.to_backend_id();
+    EXPECT_GE(id, 0);
+}
+
+TEST_F(K8sFnvHashQualityTest, SingleCharUidsProduceUniqueIds) {
+    std::set<BackendId> ids;
+    for (int c = 0; c < 128; ++c) {
+        K8sEndpoint ep;
+        ep.uid = std::string(1, static_cast<char>(c));
+        ids.insert(ep.to_backend_id());
+    }
+    // All single-char UIDs should produce unique BackendIds
+    EXPECT_EQ(ids.size(), 128u);
+}
+
+// =============================================================================
+// BackendId Collision Detection Tests
+// =============================================================================
+// Tests for the collision detection logic added to handle_endpoint_added().
+// Replicates the reverse-map collision check without Seastar dependencies.
+
+class K8sCollisionDetectionTest : public ::testing::Test {
+protected:
+    // Simulates the collision detection from handle_endpoint_added()
+    struct CollisionTracker {
+        std::map<BackendId, std::string> backend_id_to_uid;  // reverse map
+        std::map<std::string, K8sEndpoint> endpoints;
+        uint64_t collision_count = 0;
+
+        // Returns true if collision was detected
+        bool try_add(const K8sEndpoint& ep) {
+            auto backend_id = ep.to_backend_id();
+            bool collision = false;
+
+            auto it = backend_id_to_uid.find(backend_id);
+            if (it != backend_id_to_uid.end() && it->second != ep.uid) {
+                ++collision_count;
+                collision = true;
+            }
+            backend_id_to_uid[backend_id] = ep.uid;
+            endpoints[ep.uid] = ep;
+            return collision;
+        }
+
+        void remove(const std::string& uid) {
+            auto it = endpoints.find(uid);
+            if (it == endpoints.end()) return;
+
+            auto backend_id = it->second.to_backend_id();
+            auto rev_it = backend_id_to_uid.find(backend_id);
+            if (rev_it != backend_id_to_uid.end() && rev_it->second == uid) {
+                backend_id_to_uid.erase(rev_it);
+            }
+            endpoints.erase(it);
+        }
+    };
+
+    static K8sEndpoint make_ep(const std::string& uid) {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ep.address = "10.0.0.1";
+        ep.port = 8080;
+        ep.ready = true;
+        return ep;
+    }
+};
+
+TEST_F(K8sCollisionDetectionTest, NoCollisionForDistinctUids) {
+    CollisionTracker tracker;
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-alpha")));
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-beta")));
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-gamma")));
+    EXPECT_EQ(tracker.collision_count, 0u);
+}
+
+TEST_F(K8sCollisionDetectionTest, SameUidReaddIsNotCollision) {
+    CollisionTracker tracker;
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-same")));
+    // Re-adding the same UID should NOT be flagged as collision
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-same")));
+    EXPECT_EQ(tracker.collision_count, 0u);
+}
+
+TEST_F(K8sCollisionDetectionTest, ReverseMapCleanedOnRemove) {
+    CollisionTracker tracker;
+    tracker.try_add(make_ep("uid-1"));
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 1u);
+
+    tracker.remove("uid-1");
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 0u);
+    EXPECT_EQ(tracker.endpoints.size(), 0u);
+}
+
+TEST_F(K8sCollisionDetectionTest, RemoveNonexistentUidIsNoop) {
+    CollisionTracker tracker;
+    tracker.try_add(make_ep("uid-exists"));
+    tracker.remove("uid-nonexistent");
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 1u);
+    EXPECT_EQ(tracker.endpoints.size(), 1u);
+}
+
+TEST_F(K8sCollisionDetectionTest, No1000EndpointCollisions) {
+    // Verify no collisions when adding 1000 endpoints with sequential UIDs
+    CollisionTracker tracker;
+    for (int i = 0; i < 1000; ++i) {
+        bool collision = tracker.try_add(make_ep("pod-" + std::to_string(i)));
+        EXPECT_FALSE(collision) << "Unexpected collision at index " << i;
+    }
+    EXPECT_EQ(tracker.collision_count, 0u);
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 1000u);
 }
 
 // =============================================================================
