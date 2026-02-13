@@ -432,16 +432,20 @@ public:
     // This populates ranvier_backend_latency_seconds{backend_id="X"}
     // Shard-local for lock-free hot path efficiency
     void record_backend_latency_by_id(BackendId backend_id, double seconds) {
-        auto& backend_metrics = get_or_create_backend_metrics(backend_id);
-        backend_metrics.latency.record(seconds);
-        // Also record in the aggregate histogram
+        auto* backend_metrics = get_or_create_backend_metrics(backend_id);
+        if (backend_metrics) {
+            backend_metrics->latency.record(seconds);
+        }
+        // Always record in the aggregate histogram regardless of overflow
         _router_backend_latency.record(seconds);
     }
 
     // Record first-byte latency with backend_id label
     void record_first_byte_latency_by_id(BackendId backend_id, double seconds) {
-        auto& backend_metrics = get_or_create_backend_metrics(backend_id);
-        backend_metrics.first_byte_latency.record(seconds);
+        auto* backend_metrics = get_or_create_backend_metrics(backend_id);
+        if (backend_metrics) {
+            backend_metrics->first_byte_latency.record(seconds);
+        }
     }
 
     // Helper to convert chrono duration to seconds
@@ -520,19 +524,19 @@ private:
     // Get or create per-backend metrics and register with Seastar
     // Metrics are shard-local (lock-free) to maintain hot path efficiency
     // Rule #4: Bounded container - rejects new backends beyond MAX_TRACKED_BACKENDS
-    BackendMetrics& get_or_create_backend_metrics(BackendId backend_id) {
+    // Returns nullptr when the limit is reached (caller skips per-backend recording)
+    BackendMetrics* get_or_create_backend_metrics(BackendId backend_id) {
         auto it = _per_backend_metrics.find(backend_id);
         if (it != _per_backend_metrics.end()) {
-            return it->second;
+            return &it->second;
         }
 
         // Bounds check: reject new backends if limit reached (Rule #4)
+        // Increment overflow counter and return nullptr — caller skips per-backend
+        // recording while aggregate histograms still capture the data
         if (_per_backend_metrics.size() >= MAX_TRACKED_BACKENDS) {
             ++_backend_metrics_overflow;
-            // Return fallback metrics that are not registered with Prometheus
-            // This prevents OOM while still allowing the request to proceed
-            static thread_local BackendMetrics fallback_metrics;
-            return fallback_metrics;
+            return nullptr;
         }
 
         // Create new backend metrics
@@ -563,7 +567,7 @@ private:
         });
 
         metrics.registered = true;
-        return metrics;
+        return &metrics;
     }
 
 public:
