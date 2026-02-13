@@ -1861,6 +1861,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-13 | **[Security]** Add bounds checking to K8s discovery service to prevent OOM (Rule #4). MAX_RESPONSE_SIZE (16MB) for API responses, MAX_LINE_SIZE (1MB) for watch stream buffer, MAX_ENDPOINTS (1000) for endpoints map. Overflow counter metrics added. | #134 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to radix_tree.hpp. Comprehensive documentation for Rules #1, #4, #9, #14 covering lookup, insert, eviction, and slab allocation code paths. | #212 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to router_service.cpp. Documentation for Rules #1, #5, #6, #14 covering route_request, learn_route_global, get_backend_for_prefix, and timer callbacks. | #208 |
 | 2026-02-01 | **[DX]** Consolidate 8 gossip debug metrics behind RANVIER_DEBUG_METRICS compile flag. Reduces Prometheus scrape overhead in production. | #209 |
@@ -2129,7 +2130,7 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Bound to `MAX_DEDUP_PEERS`. Clean entries for peers no longer in peer table.
   _Complexity:_ Low
 
-- [ ] **[HIGH] K8s discovery: response body, watch buffer, and endpoints map all unbounded**
+- [x] **[HIGH] K8s discovery: response body, watch buffer, and endpoints map all unbounded** ✓
   _File:Lines:_ `src/k8s_discovery_service.cpp:501-506` (response), `src/k8s_discovery_service.cpp:1067-1084` (watch buffer), `src/k8s_discovery_service.hpp:120` (endpoints map)
   _Issue:_ Three independent OOM vectors. A compromised or misconfigured K8s API server can exhaust shard 0 memory via: (1) arbitrarily large response body, (2) streaming data without newlines (Slowloris-style), (3) endpoint count explosion from a broad selector.
   _Fix:_ Add `MAX_RESPONSE_SIZE` (16MB), `MAX_LINE_SIZE` (1MB), `MAX_ENDPOINTS` (1000). Abort and reconnect if exceeded.

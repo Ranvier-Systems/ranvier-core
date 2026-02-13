@@ -79,7 +79,13 @@ K8sDiscoveryService::K8sDiscoveryService(const K8sDiscoveryConfig& config)
         seastar::metrics::make_counter("k8s_dns_timeouts", _dns_timeouts,
             seastar::metrics::description("Total number of DNS resolution timeouts")),
         seastar::metrics::make_counter("k8s_dns_cache_hits", _dns_cache_hits,
-            seastar::metrics::description("Total number of DNS cache hits (fallback to cached address)"))
+            seastar::metrics::description("Total number of DNS cache hits (fallback to cached address)")),
+        seastar::metrics::make_counter("k8s_response_size_exceeded", _response_size_exceeded,
+            seastar::metrics::description("Times K8s API response exceeded MAX_RESPONSE_SIZE")),
+        seastar::metrics::make_counter("k8s_line_size_exceeded", _line_size_exceeded,
+            seastar::metrics::description("Times K8s watch buffer exceeded MAX_LINE_SIZE")),
+        seastar::metrics::make_counter("k8s_endpoints_limit_exceeded", _endpoints_limit_exceeded,
+            seastar::metrics::description("Times endpoint insertion was rejected due to MAX_ENDPOINTS limit"))
     });
 }
 
@@ -497,11 +503,19 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
         co_await out.write(request);
         co_await out.flush();
 
-        // Read response
+        // Read response (Rule #4: bounded to K8S_MAX_RESPONSE_SIZE)
         std::string response;
         while (!in.eof()) {
             auto buf = co_await in.read();
             if (buf.empty()) break;
+            if (response.size() + buf.size() > K8S_MAX_RESPONSE_SIZE) {
+                ++_response_size_exceeded;
+                log_k8s.error("K8s API response exceeds MAX_RESPONSE_SIZE ({} bytes) - "
+                              "aborting to prevent OOM", K8S_MAX_RESPONSE_SIZE);
+                co_await out.close();
+                co_await in.close();
+                throw std::runtime_error("K8s API response exceeded size limit");
+            }
             response.append(buf.get(), buf.size());
         }
 
@@ -718,6 +732,16 @@ seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discov
 }
 
 seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& endpoint) {
+    // Rule #4: Bound endpoints map to prevent OOM from broad selector
+    if (_endpoints.find(endpoint.uid) == _endpoints.end() &&
+        _endpoints.size() >= K8S_MAX_ENDPOINTS) {
+        ++_endpoints_limit_exceeded;
+        log_k8s.error("Endpoint limit reached ({}) - rejecting new endpoint {} ({}:{}) - "
+                      "check label selector specificity",
+                      K8S_MAX_ENDPOINTS, endpoint.uid, endpoint.address, endpoint.port);
+        co_return;
+    }
+
     log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, ready={})",
                  endpoint.uid, endpoint.address, endpoint.port,
                  endpoint.weight, endpoint.priority, endpoint.ready);
@@ -1072,6 +1096,7 @@ seastar::future<> K8sDiscoveryService::k8s_watch(
 
         buffer.append(buf.get(), buf.size());
 
+        // Rule #4: Bound buffer between newlines to prevent Slowloris-style OOM
         size_t pos;
         while ((pos = buffer.find('\n')) != std::string::npos) {
             std::string line = buffer.substr(0, pos);
@@ -1081,6 +1106,15 @@ seastar::future<> K8sDiscoveryService::k8s_watch(
                 keep_going = co_await on_event(line);
                 if (!keep_going) break;
             }
+        }
+
+        // If no newline found and buffer exceeds MAX_LINE_SIZE, abort watch
+        if (buffer.size() > K8S_MAX_LINE_SIZE) {
+            ++_line_size_exceeded;
+            log_k8s.error("K8s watch buffer exceeds MAX_LINE_SIZE ({} bytes) without newline - "
+                          "aborting watch to prevent OOM (possible Slowloris attack)",
+                          K8S_MAX_LINE_SIZE);
+            break;
         }
     }
 

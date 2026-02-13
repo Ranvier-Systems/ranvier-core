@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include <cctype>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1201,6 +1202,315 @@ TEST_F(PortValidationTest, InvalidPortFloat) {
 TEST_F(PortValidationTest, InvalidPortHex) {
     auto result = port_validation::parse_port("0x1F90");
     EXPECT_FALSE(result.has_value());
+}
+
+// =============================================================================
+// Bounds Checking Tests (Rule #4) - OOM Prevention
+// =============================================================================
+//
+// Tests for the three bounds introduced to prevent OOM from a compromised or
+// misconfigured K8s API server:
+//   1. K8S_MAX_RESPONSE_SIZE (16 MB) - caps response body accumulation
+//   2. K8S_MAX_LINE_SIZE (1 MB) - caps watch buffer between newlines
+//   3. K8S_MAX_ENDPOINTS (1000) - caps endpoints map size
+
+// Replicate constants here (mirrors k8s_discovery_service.hpp, avoids Seastar include)
+constexpr size_t K8S_MAX_RESPONSE_SIZE = 16 * 1024 * 1024;
+constexpr size_t K8S_MAX_LINE_SIZE = 1 * 1024 * 1024;
+constexpr size_t K8S_MAX_ENDPOINTS = 1000;
+
+// --- Response Size Bounds ---
+// Replicates the accumulation guard from k8s_get()
+
+class K8sResponseSizeBoundsTest : public ::testing::Test {
+protected:
+    // Simulates the bounded response accumulation loop from k8s_get().
+    // Returns true if the response was fully accumulated within the limit,
+    // false if the limit was exceeded (would throw in production).
+    static bool accumulate_response(const std::vector<std::string>& chunks,
+                                    std::string& out) {
+        out.clear();
+        for (const auto& chunk : chunks) {
+            if (out.size() + chunk.size() > K8S_MAX_RESPONSE_SIZE) {
+                return false;  // Limit exceeded
+            }
+            out.append(chunk);
+        }
+        return true;
+    }
+};
+
+TEST_F(K8sResponseSizeBoundsTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_RESPONSE_SIZE, 16u * 1024 * 1024);
+}
+
+TEST_F(K8sResponseSizeBoundsTest, SmallResponseAccepted) {
+    std::string out;
+    std::vector<std::string> chunks = {
+        R"({"kind":"EndpointSliceList","items":[]})"
+    };
+    EXPECT_TRUE(accumulate_response(chunks, out));
+    EXPECT_EQ(out, chunks[0]);
+}
+
+TEST_F(K8sResponseSizeBoundsTest, ResponseExactlyAtLimitAccepted) {
+    std::string out;
+    std::string chunk(K8S_MAX_RESPONSE_SIZE, 'x');
+    std::vector<std::string> chunks = {chunk};
+    EXPECT_TRUE(accumulate_response(chunks, out));
+    EXPECT_EQ(out.size(), K8S_MAX_RESPONSE_SIZE);
+}
+
+TEST_F(K8sResponseSizeBoundsTest, ResponseOneOverLimitRejected) {
+    std::string out;
+    std::string chunk(K8S_MAX_RESPONSE_SIZE, 'x');
+    // First chunk fills exactly to limit, second byte pushes over
+    std::vector<std::string> chunks = {chunk, "x"};
+    EXPECT_FALSE(accumulate_response(chunks, out));
+}
+
+TEST_F(K8sResponseSizeBoundsTest, LargeResponseInManySmallChunksRejected) {
+    std::string out;
+    // 16 MB + 1 byte delivered in 4KB chunks
+    size_t chunk_size = 4096;
+    size_t total_chunks = (K8S_MAX_RESPONSE_SIZE / chunk_size) + 1;
+    std::vector<std::string> chunks;
+    chunks.reserve(total_chunks);
+    for (size_t i = 0; i < total_chunks; ++i) {
+        chunks.emplace_back(chunk_size, 'a');
+    }
+    EXPECT_FALSE(accumulate_response(chunks, out));
+}
+
+TEST_F(K8sResponseSizeBoundsTest, SingleHugeChunkRejected) {
+    std::string out;
+    std::string huge(K8S_MAX_RESPONSE_SIZE + 1, 'z');
+    std::vector<std::string> chunks = {huge};
+    EXPECT_FALSE(accumulate_response(chunks, out));
+}
+
+// --- Watch Buffer (Line Size) Bounds ---
+// Replicates the watch buffer guard from k8s_watch()
+
+class K8sLineSizeBoundsTest : public ::testing::Test {
+protected:
+    // Simulates the bounded watch buffer logic from k8s_watch().
+    // Feeds data chunks into a line buffer, extracts newline-delimited lines,
+    // and checks if the buffer between newlines exceeds K8S_MAX_LINE_SIZE.
+    //
+    // Returns: pair<vector of extracted lines, bool exceeded_limit>
+    static std::pair<std::vector<std::string>, bool>
+    process_watch_stream(const std::vector<std::string>& chunks) {
+        std::vector<std::string> lines;
+        std::string buffer;
+        bool exceeded = false;
+
+        for (const auto& chunk : chunks) {
+            buffer.append(chunk);
+
+            // Extract complete lines
+            size_t pos;
+            while ((pos = buffer.find('\n')) != std::string::npos) {
+                std::string line = buffer.substr(0, pos);
+                buffer.erase(0, pos + 1);
+                if (!line.empty() && line != "\r") {
+                    lines.push_back(std::move(line));
+                }
+            }
+
+            // Check if remaining buffer (no newline yet) exceeds limit
+            if (buffer.size() > K8S_MAX_LINE_SIZE) {
+                exceeded = true;
+                break;
+            }
+        }
+
+        return {std::move(lines), exceeded};
+    }
+};
+
+TEST_F(K8sLineSizeBoundsTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_LINE_SIZE, 1u * 1024 * 1024);
+}
+
+TEST_F(K8sLineSizeBoundsTest, NormalLinesAccepted) {
+    auto [lines, exceeded] = process_watch_stream({
+        R"({"type":"ADDED","object":{"metadata":{"uid":"pod-1"}}})" "\n",
+        R"({"type":"MODIFIED","object":{"metadata":{"uid":"pod-2"}}})" "\n"
+    });
+    EXPECT_FALSE(exceeded);
+    ASSERT_EQ(lines.size(), 2u);
+}
+
+TEST_F(K8sLineSizeBoundsTest, LineExactlyAtLimitAccepted) {
+    // Line of exactly MAX_LINE_SIZE bytes followed by newline
+    std::string line(K8S_MAX_LINE_SIZE, 'x');
+    line += '\n';
+    auto [lines, exceeded] = process_watch_stream({line});
+    EXPECT_FALSE(exceeded);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_EQ(lines[0].size(), K8S_MAX_LINE_SIZE);
+}
+
+TEST_F(K8sLineSizeBoundsTest, BufferOneOverLimitWithoutNewlineRejected) {
+    // Data without any newline that exceeds MAX_LINE_SIZE
+    std::string data(K8S_MAX_LINE_SIZE + 1, 'x');
+    auto [lines, exceeded] = process_watch_stream({data});
+    EXPECT_TRUE(exceeded);
+    EXPECT_TRUE(lines.empty());
+}
+
+TEST_F(K8sLineSizeBoundsTest, SlowlorisStyleGradualGrowthRejected) {
+    // Simulates Slowloris: many small chunks without newlines
+    size_t chunk_size = 1024;
+    size_t num_chunks = (K8S_MAX_LINE_SIZE / chunk_size) + 2;
+    std::vector<std::string> chunks;
+    chunks.reserve(num_chunks);
+    for (size_t i = 0; i < num_chunks; ++i) {
+        chunks.emplace_back(chunk_size, 'a');
+    }
+    auto [lines, exceeded] = process_watch_stream(chunks);
+    EXPECT_TRUE(exceeded);
+}
+
+TEST_F(K8sLineSizeBoundsTest, NewlineResetsBuffer) {
+    // Large data followed by newline, then more large data with newline
+    // Should succeed because newlines reset the buffer
+    std::string half(K8S_MAX_LINE_SIZE / 2, 'x');
+    auto [lines, exceeded] = process_watch_stream({
+        half + "\n",
+        half + "\n"
+    });
+    EXPECT_FALSE(exceeded);
+    ASSERT_EQ(lines.size(), 2u);
+}
+
+TEST_F(K8sLineSizeBoundsTest, LargeLineFollowedByOverflowDetected) {
+    // First line is valid, second buffer overflows without newline
+    std::string valid_line = R"({"type":"ADDED"})" "\n";
+    std::string overflow(K8S_MAX_LINE_SIZE + 1, 'z');
+    auto [lines, exceeded] = process_watch_stream({valid_line, overflow});
+    EXPECT_TRUE(exceeded);
+    ASSERT_EQ(lines.size(), 1u);  // First line was extracted before overflow
+}
+
+// --- Endpoints Map Bounds ---
+// Replicates the endpoint insertion guard from handle_endpoint_added()
+
+class K8sEndpointsLimitTest : public ::testing::Test {
+protected:
+    // Simulates the bounded endpoint insertion from handle_endpoint_added().
+    // Uses a simple map to mirror _endpoints behavior.
+    struct EndpointMap {
+        std::map<std::string, K8sEndpoint> endpoints;
+        uint64_t limit_exceeded_count = 0;
+
+        // Returns true if the endpoint was inserted/updated, false if rejected
+        bool try_add(const K8sEndpoint& ep) {
+            // Mirror production logic: only check limit for genuinely new entries
+            if (endpoints.find(ep.uid) == endpoints.end() &&
+                endpoints.size() >= K8S_MAX_ENDPOINTS) {
+                ++limit_exceeded_count;
+                return false;  // Rejected
+            }
+            endpoints[ep.uid] = ep;
+            return true;
+        }
+
+        bool try_remove(const std::string& uid) {
+            return endpoints.erase(uid) > 0;
+        }
+    };
+
+    static K8sEndpoint make_endpoint(const std::string& uid, const std::string& addr = "10.0.0.1") {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ep.address = addr;
+        ep.port = 8080;
+        ep.ready = true;
+        ep.weight = K8S_DEFAULT_WEIGHT;
+        ep.priority = K8S_DEFAULT_PRIORITY;
+        return ep;
+    }
+};
+
+TEST_F(K8sEndpointsLimitTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_ENDPOINTS, 1000u);
+}
+
+TEST_F(K8sEndpointsLimitTest, SingleEndpointAccepted) {
+    EndpointMap map;
+    auto ep = make_endpoint("pod-1");
+    EXPECT_TRUE(map.try_add(ep));
+    EXPECT_EQ(map.endpoints.size(), 1u);
+}
+
+TEST_F(K8sEndpointsLimitTest, FillToExactLimitAllAccepted) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        auto ep = make_endpoint("pod-" + std::to_string(i));
+        EXPECT_TRUE(map.try_add(ep));
+    }
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 0u);
+}
+
+TEST_F(K8sEndpointsLimitTest, OneOverLimitRejected) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // This should be rejected
+    auto overflow = make_endpoint("pod-overflow");
+    EXPECT_FALSE(map.try_add(overflow));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 1u);
+}
+
+TEST_F(K8sEndpointsLimitTest, UpdateExistingEndpointAtLimitSucceeds) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // Updating an existing endpoint should succeed even at capacity
+    auto updated = make_endpoint("pod-0", "10.0.0.99");
+    updated.weight = 500;
+    EXPECT_TRUE(map.try_add(updated));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.endpoints["pod-0"].weight, 500u);
+    EXPECT_EQ(map.limit_exceeded_count, 0u);
+}
+
+TEST_F(K8sEndpointsLimitTest, RemoveThenAddSucceeds) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // Remove one, then add a new one — should succeed
+    EXPECT_TRUE(map.try_remove("pod-0"));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS - 1);
+
+    auto new_ep = make_endpoint("pod-new");
+    EXPECT_TRUE(map.try_add(new_ep));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 0u);
+}
+
+TEST_F(K8sEndpointsLimitTest, MultipleRejectionsCountedCorrectly) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // Try adding 5 more — all should be rejected
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_FALSE(map.try_add(make_endpoint("overflow-" + std::to_string(i))));
+    }
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 5u);
 }
 
 int main(int argc, char** argv) {

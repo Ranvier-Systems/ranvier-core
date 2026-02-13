@@ -55,6 +55,14 @@ constexpr uint32_t K8S_DEFAULT_PRIORITY = 0;
 constexpr uint32_t K8S_MAX_WEIGHT = 1000000;
 constexpr uint32_t K8S_MAX_PRIORITY = 1000;
 
+// Rule #4: Bounds for containers and buffers to prevent OOM
+// MAX_RESPONSE_SIZE: Cap on k8s_get response body (16 MB)
+constexpr size_t K8S_MAX_RESPONSE_SIZE = 16 * 1024 * 1024;
+// MAX_LINE_SIZE: Cap on watch stream buffer between newlines (1 MB)
+constexpr size_t K8S_MAX_LINE_SIZE = 1 * 1024 * 1024;
+// MAX_ENDPOINTS: Cap on total tracked endpoints in the map
+constexpr size_t K8S_MAX_ENDPOINTS = 1000;
+
 // Represents a discovered backend endpoint
 struct K8sEndpoint {
     std::string uid;                      // Unique identifier (pod UID + address)
@@ -145,6 +153,9 @@ private:
     uint64_t _dns_failures = 0;
     uint64_t _dns_timeouts = 0;
     uint64_t _dns_cache_hits = 0;
+    uint64_t _response_size_exceeded = 0;
+    uint64_t _line_size_exceeded = 0;
+    uint64_t _endpoints_limit_exceeded = 0;
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;
