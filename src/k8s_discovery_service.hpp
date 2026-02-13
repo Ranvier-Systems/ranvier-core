@@ -165,6 +165,7 @@ private:
     uint64_t _line_size_exceeded = 0;
     uint64_t _endpoints_limit_exceeded = 0;
     uint64_t _backend_id_collisions = 0;
+    uint64_t _watch_410_gone = 0;
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;

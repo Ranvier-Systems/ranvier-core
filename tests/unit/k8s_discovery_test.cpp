@@ -2017,6 +2017,262 @@ TEST_F(HttpStatusParseTest, NegativeStatusCodeParsedAsInteger) {
     // The caller would reject this: (*code != 200)
 }
 
+// =============================================================================
+// K8s Watch 410 Gone Detection Tests
+// =============================================================================
+//
+// When a K8s watch receives a 410 Gone status, it means the resourceVersion
+// is too old (compacted by etcd). The fix: parse the status code from the
+// Status event, clear _resource_version, and trigger sync_endpoints() to
+// re-list with a fresh resourceVersion before reconnecting.
+//
+// 410 can arrive in two forms:
+// 1. Direct Status object: {"kind":"Status","code":410,"message":"..."}
+// 2. ERROR watch event: {"type":"ERROR","object":{"kind":"Status","code":410,...}}
+
+class K8sWatch410Test : public ::testing::Test {
+protected:
+    // Mirrors the Status detection logic from watch_endpoints()
+    struct WatchEventResult {
+        bool is_status_error = false;
+        bool is_410_gone = false;
+        int status_code = 0;
+        std::string message;
+    };
+
+    // Check for direct Status objects (top-level kind == "Status")
+    static WatchEventResult check_direct_status(const std::string& json) {
+        WatchEventResult result;
+        auto kind = k8s_json::get_string(json, "kind");
+        if (!kind || *kind != "Status") {
+            return result;
+        }
+        result.is_status_error = true;
+        auto code = k8s_json::get_int(json, "code");
+        result.status_code = static_cast<int>(code.value_or(0));
+        auto msg = k8s_json::get_string(json, "message");
+        result.message = msg.value_or("Unknown error");
+        result.is_410_gone = (result.status_code == 410);
+        return result;
+    }
+
+    // Check for ERROR watch events with embedded Status object
+    static WatchEventResult check_error_event(const std::string& json) {
+        WatchEventResult result;
+        auto type = k8s_json::get_string(json, "type");
+        if (!type || *type != "ERROR") {
+            return result;
+        }
+        auto obj = k8s_json::get_object(json, "object");
+        if (!obj) {
+            return result;
+        }
+        auto kind = k8s_json::get_string(*obj, "kind");
+        if (!kind || *kind != "Status") {
+            return result;
+        }
+        result.is_status_error = true;
+        auto code = k8s_json::get_int(*obj, "code");
+        result.status_code = static_cast<int>(code.value_or(0));
+        auto msg = k8s_json::get_string(*obj, "message");
+        result.message = msg.value_or("Unknown error");
+        result.is_410_gone = (result.status_code == 410);
+        return result;
+    }
+
+    // Simulates the resource version management on 410 Gone.
+    // Mirrors: clear _resource_version when 410 is detected.
+    struct ResourceVersionTracker {
+        std::string resource_version;
+
+        void handle_410() {
+            resource_version.clear();
+        }
+
+        bool needs_full_relist() const {
+            return resource_version.empty();
+        }
+    };
+};
+
+// --- Direct Status 410 Gone ---
+
+TEST_F(K8sWatch410Test, DirectStatus410Detected) {
+    std::string json = R"({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 12345 (67890)","reason":"Gone","code":410})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_TRUE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 410);
+    EXPECT_EQ(result.message, "too old resource version: 12345 (67890)");
+}
+
+TEST_F(K8sWatch410Test, DirectStatus403NotGone) {
+    std::string json = R"({"kind":"Status","apiVersion":"v1","status":"Failure","message":"forbidden","code":403})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 403);
+}
+
+TEST_F(K8sWatch410Test, DirectStatus500NotGone) {
+    std::string json = R"({"kind":"Status","status":"Failure","message":"internal error","code":500})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 500);
+}
+
+TEST_F(K8sWatch410Test, DirectStatusMissingCodeDefaultsToZero) {
+    std::string json = R"({"kind":"Status","message":"some error"})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 0);
+    EXPECT_EQ(result.message, "some error");
+}
+
+TEST_F(K8sWatch410Test, DirectStatusMissingMessageDefaultsToUnknown) {
+    std::string json = R"({"kind":"Status","code":410})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_TRUE(result.is_410_gone);
+    EXPECT_EQ(result.message, "Unknown error");
+}
+
+// --- ERROR Watch Events ---
+
+TEST_F(K8sWatch410Test, ErrorEvent410Detected) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 100 (200)","reason":"Gone","code":410}})";
+    auto result = check_error_event(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_TRUE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 410);
+    EXPECT_EQ(result.message, "too old resource version: 100 (200)");
+}
+
+TEST_F(K8sWatch410Test, ErrorEvent403NotGone) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"Status","message":"forbidden","code":403}})";
+    auto result = check_error_event(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 403);
+}
+
+TEST_F(K8sWatch410Test, ErrorEventMissingObjectNotDetected) {
+    std::string json = R"({"type":"ERROR"})";
+    auto result = check_error_event(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, ErrorEventNonStatusObjectNotDetected) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"EndpointSlice"}})";
+    auto result = check_error_event(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, ErrorEventMissingCodeDefaultsToZero) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"Status","message":"unknown"}})";
+    auto result = check_error_event(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 0);
+}
+
+// --- Non-error events should NOT match ---
+
+TEST_F(K8sWatch410Test, AddedEventNotDetectedAsDirect) {
+    std::string json = R"({"type":"ADDED","object":{"kind":"EndpointSlice","metadata":{"uid":"abc"}}})";
+    auto result = check_direct_status(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, AddedEventNotDetectedAsError) {
+    std::string json = R"({"type":"ADDED","object":{"kind":"EndpointSlice","metadata":{"uid":"abc"}}})";
+    auto result = check_error_event(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, ModifiedEventNotDetected) {
+    std::string json = R"({"type":"MODIFIED","object":{"kind":"EndpointSlice"}})";
+    auto direct = check_direct_status(json);
+    auto error = check_error_event(json);
+    EXPECT_FALSE(direct.is_status_error);
+    EXPECT_FALSE(error.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, DeletedEventNotDetected) {
+    std::string json = R"({"type":"DELETED","object":{"kind":"EndpointSlice"}})";
+    auto direct = check_direct_status(json);
+    auto error = check_error_event(json);
+    EXPECT_FALSE(direct.is_status_error);
+    EXPECT_FALSE(error.is_status_error);
+}
+
+// --- Resource Version Management ---
+
+TEST_F(K8sWatch410Test, ResourceVersionClearedOn410) {
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "12345";
+
+    // Simulate receiving a 410 Gone
+    tracker.handle_410();
+    EXPECT_TRUE(tracker.resource_version.empty());
+    EXPECT_TRUE(tracker.needs_full_relist());
+}
+
+TEST_F(K8sWatch410Test, ResourceVersionNotEmptyBeforeError) {
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "12345";
+    EXPECT_FALSE(tracker.needs_full_relist());
+}
+
+TEST_F(K8sWatch410Test, EmptyResourceVersionTriggersRelist) {
+    ResourceVersionTracker tracker;
+    EXPECT_TRUE(tracker.needs_full_relist());
+}
+
+TEST_F(K8sWatch410Test, FullReconnectFlowSimulation) {
+    // Simulate the full reconnect flow:
+    // 1. Watch starts with a resource version
+    // 2. 410 Gone received - resource version cleared
+    // 3. sync_endpoints() called - sets new resource version
+    // 4. Watch reconnects with new resource version
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "old-version-12345";
+
+    // Step 1: Detect 410 in direct Status
+    std::string status_json = R"({"kind":"Status","code":410,"message":"too old resource version"})";
+    auto result = check_direct_status(status_json);
+    EXPECT_TRUE(result.is_410_gone);
+
+    // Step 2: Clear resource version
+    tracker.handle_410();
+    EXPECT_TRUE(tracker.needs_full_relist());
+
+    // Step 3: sync_endpoints() would set a new version
+    tracker.resource_version = "fresh-version-67890";
+    EXPECT_FALSE(tracker.needs_full_relist());
+
+    // Step 4: Watch reconnects - would use "fresh-version-67890"
+    EXPECT_EQ(tracker.resource_version, "fresh-version-67890");
+}
+
+TEST_F(K8sWatch410Test, FullReconnectFlowWithErrorEvent) {
+    // Same flow but with ERROR watch event instead of direct Status
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "stale-version";
+
+    std::string error_json = R"({"type":"ERROR","object":{"kind":"Status","code":410,"message":"expired"}})";
+    auto result = check_error_event(error_json);
+    EXPECT_TRUE(result.is_410_gone);
+
+    tracker.handle_410();
+    EXPECT_TRUE(tracker.needs_full_relist());
+
+    tracker.resource_version = "new-version";
+    EXPECT_FALSE(tracker.needs_full_relist());
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

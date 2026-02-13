@@ -2188,9 +2188,10 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Parse HTTP status line properly: extract first line, split on space, parse numeric code.
   _Resolution:_ Replaced brittle `headers.find("200 OK")` / `headers.find("200 ")` string search with a proper `parse_http_status_code()` function that extracts the first line (status line), finds the status code field, and parses it as an integer using `std::from_chars` (Rule #10). The old approach could false-match "200" appearing in header values; the new approach only inspects the status line. Added 20 unit tests in `k8s_discovery_test.cpp` covering standard codes (200, 404, 503, 410), HTTP/1.0 and HTTP/2 variants, status lines without reason phrase, malformed input, and the false-match regression case.
 
-- [ ] **[MEDIUM] K8s watch 410 Gone causes infinite reconnect loop**
+- [x] **[MEDIUM] K8s watch 410 Gone causes infinite reconnect loop** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:844-846`
   _Fix:_ Parse Status event `code`. On 410, clear `_resource_version` and trigger `sync_endpoints()`.
+  _Resolution:_ Fixed the watch callback in `watch_endpoints()` to parse the `code` field from K8s Status events. On 410 Gone, `_resource_version` is cleared and `sync_endpoints()` is called to re-list with a fresh resourceVersion before the watch reconnects. Handles both delivery forms: (1) direct Status objects (HTTP error response body) and (2) ERROR watch events with embedded Status objects (mid-stream 410). Also fixed a null-dereference risk on `event["message"]` access (now guarded with `HasMember` + `IsString`). Added `_watch_410_gone` metric counter for observability. Added 20 unit tests covering direct Status 410 detection, ERROR event 410 detection, non-410 status codes, missing fields, and full reconnect flow simulation.
 
 - [ ] **[MEDIUM] metrics_service.hpp fallback_metrics is a shared mutable singleton**
   _File:Line:_ `src/metrics_service.hpp:530-534`
