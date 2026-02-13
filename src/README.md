@@ -8,7 +8,9 @@ This guide maps source files to logical modules, helping contributors navigate t
 |------|-------------|
 | `main.cpp` | Entry point, Seastar reactor loop, signal setup |
 | `application.*` | Service lifecycle management, startup/shutdown orchestration |
-| `config.hpp` | YAML configuration loading and validation |
+| `config.hpp` | Backward-compatible facade (includes schema + loader) |
+| `config_schema.hpp` | Pure configuration data structures (all `*Config` structs) |
+| `config_loader.*` | YAML loading, validation, environment variable overrides |
 | `sharded_config.hpp` | Per-shard configuration for lock-free access |
 | `types.hpp` | Common type definitions (TokenId, BackendId) |
 | `logging.hpp` | Structured logging utilities |
@@ -24,6 +26,7 @@ This guide maps source files to logical modules, helping contributors navigate t
 | `shard_load_metrics.hpp` | Per-shard load tracking (active requests, queue depth) |
 | `cross_shard_request.hpp` | Safe cross-shard request context transfer |
 | `tokenizer_service.*` | HuggingFace tokenizer integration (GPT-2) |
+| `tokenizer_thread_pool.*` | Dedicated worker pool for blocking tokenizer FFI calls |
 | `request_rewriter.hpp` | Token injection for pre-tokenized forwarding |
 
 ## Networking Layer
@@ -33,8 +36,11 @@ This guide maps source files to logical modules, helping contributors navigate t
 | `http_controller.*` | HTTP/1.1 handling, SSE streaming, admin API |
 | `stream_parser.*` | Zero-copy chunked transfer parsing |
 | `connection_pool.hpp` | Upstream connection management with TTL |
-| `rate_limiter.hpp` | Token bucket rate limiting per client |
-| `text_validator.hpp` | Input validation helpers |
+| `rate_limiter_core.hpp` | Pure token bucket algorithm (no Seastar deps, testable) |
+| `rate_limiter.hpp` | Seastar service wrapper with timer, gate, and metrics |
+| `proxy_retry_policy.hpp` | Retry/backoff/fallback decisions for backend proxying |
+| `text_validator.hpp` | UTF-8 and null-byte input validation |
+| `parse_utils.hpp` | Safe integer parsing via `std::from_chars` |
 
 ## Cluster State (Gossip)
 
