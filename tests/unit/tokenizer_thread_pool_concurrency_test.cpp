@@ -234,6 +234,83 @@ TEST_F(TokenizerWorkerConcurrencyTest, SubmitRejectsWhenNotRunning) {
     EXPECT_EQ(rejected, kQueueSize);
 }
 
+TEST_F(TokenizerWorkerConcurrencyTest, ConcurrentMultiProducerRejection) {
+    // Multiple producer threads all submit simultaneously.
+    // Worker is not started, so all submits are rejected.
+    // Validates no race in the _running check path with multiple producers.
+    constexpr int kProducers = 4;
+    constexpr int kJobsPerProducer = 5'000;
+    TokenizerWorker worker(0, 256);
+
+    std::latch start_latch(kProducers);
+    std::atomic<uint64_t> total_rejected{0};
+    std::vector<std::thread> threads;
+
+    for (int p = 0; p < kProducers; ++p) {
+        threads.emplace_back([&worker, &start_latch, &total_rejected, p]() {
+            start_latch.arrive_and_wait();
+            uint64_t local_rejected = 0;
+            for (int i = 0; i < kJobsPerProducer; ++i) {
+                TokenizationJob job;
+                job.job_id = static_cast<uint64_t>(p * kJobsPerProducer + i);
+                job.text = "multi-producer text " + std::to_string(i);
+                job.source_shard = static_cast<uint32_t>(p);
+
+                if (!worker.submit(std::move(job))) {
+                    local_rejected++;
+                }
+            }
+            total_rejected.fetch_add(local_rejected, std::memory_order_relaxed);
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // All submits rejected: worker not running
+    EXPECT_EQ(total_rejected.load(),
+              static_cast<uint64_t>(kProducers) * kJobsPerProducer);
+    EXPECT_EQ(worker.jobs_processed(), 0u);
+    EXPECT_FALSE(worker.is_running());
+}
+
+TEST_F(TokenizerWorkerConcurrencyTest, StopOnNonStartedWorkerConcurrentWithReads) {
+    // Call stop() on a worker that was never started while stat readers run.
+    // Validates stop() is safe when worker thread doesn't exist.
+    TokenizerWorker worker(0, 128);
+    ASSERT_FALSE(worker.is_running());
+
+    std::atomic<bool> done{false};
+    std::latch start_latch(kNumReaders + 1);
+
+    std::vector<std::thread> readers;
+    for (int r = 0; r < kNumReaders; ++r) {
+        readers.emplace_back([&worker, &start_latch, &done]() {
+            start_latch.arrive_and_wait();
+            while (!done.load(std::memory_order_acquire)) {
+                [[maybe_unused]] auto p = worker.jobs_processed();
+                [[maybe_unused]] auto d = worker.jobs_dropped();
+                [[maybe_unused]] auto r = worker.is_running();
+            }
+        });
+    }
+
+    // Stop thread
+    std::thread stopper([&worker, &start_latch, &done]() {
+        start_latch.arrive_and_wait();
+        worker.stop();  // Should be safe on non-started worker
+        done.store(true, std::memory_order_release);
+    });
+
+    for (auto& t : readers) {
+        t.join();
+    }
+    stopper.join();
+
+    EXPECT_FALSE(worker.is_running());
+}
+
 TEST_F(TokenizerWorkerConcurrencyTest, SubmitAndReadStatsNoCrash) {
     // Rapidly submit from one thread, read stats from another.
     // Validates no data race between submit path and stat reads.

@@ -316,6 +316,93 @@ TEST_F(AsyncPersistenceConcurrencyTest, HighContentionSmallQueue) {
 }
 
 // =============================================================================
+// Close During Concurrent Enqueue (Shutdown Stress)
+// =============================================================================
+
+TEST_F(AsyncPersistenceConcurrencyTest, CloseDuringConcurrentEnqueue) {
+    // Writers enqueue while one thread calls close() on the manager.
+    // After close(), is_open() returns false, so queue_save_route silently
+    // drops operations. Validates no crash or data corruption when the
+    // store is closed mid-enqueue.
+    auto manager = create_manager(100000);
+    std::latch start_latch(kNumThreads + 1);  // writers + closer
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> enqueue_attempts{0};
+
+    // Writer threads: enqueue continuously
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&manager, &start_latch, &enqueue_attempts, t]() {
+            start_latch.arrive_and_wait();
+            for (int i = 0; i < 5000; ++i) {
+                std::vector<TokenId> tokens = {
+                    static_cast<TokenId>(t * 100000 + i)
+                };
+                manager->queue_save_route(tokens, static_cast<BackendId>(t));
+                enqueue_attempts.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    // Closer thread: wait briefly then close the store
+    threads.emplace_back([&manager, &start_latch]() {
+        start_latch.arrive_and_wait();
+        // Let some enqueues happen
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        manager->close();
+    });
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // After close, some ops were enqueued (before close) and some were dropped
+    // (after close when is_open() returns false). Total should be consistent.
+    size_t queued = manager->queue_depth();
+    size_t dropped = manager->operations_dropped();
+    uint64_t attempted = enqueue_attempts.load();
+
+    // Queued + dropped + silently-skipped (is_open check) == total attempts
+    // We can't track the silently-skipped ones, but we can verify:
+    EXPECT_LE(queued + dropped, attempted);
+    // The store should be closed
+    EXPECT_FALSE(manager->is_open());
+}
+
+TEST_F(AsyncPersistenceConcurrencyTest, ConcurrentOperationsProcessedCounter) {
+    // Verify the _ops_processed and _ops_dropped atomic counters are accurate
+    // when multiple threads are enqueuing (some hitting backpressure).
+    constexpr size_t kMediumQueue = 5000;
+    auto manager = create_manager(kMediumQueue);
+    std::latch start_latch(kNumThreads);
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&manager, &start_latch, t]() {
+            start_latch.arrive_and_wait();
+            for (int i = 0; i < kOpsPerThread; ++i) {
+                std::vector<TokenId> tokens = {
+                    static_cast<TokenId>(t * 100000 + i)
+                };
+                manager->queue_save_route(tokens, static_cast<BackendId>(t));
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    size_t total_attempted = static_cast<size_t>(kNumThreads) * kOpsPerThread;
+    size_t queued = manager->queue_depth();
+    size_t dropped = manager->operations_dropped();
+
+    // Invariant: queued + dropped == total attempted
+    EXPECT_EQ(queued + dropped, total_attempted);
+    // operations_processed should be 0 (no flush timer running)
+    EXPECT_EQ(manager->operations_processed(), 0u);
+}
+
+// =============================================================================
 // Large Token Vector Under Contention
 // =============================================================================
 
