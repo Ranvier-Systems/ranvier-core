@@ -9,6 +9,7 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
+#include <seastar/core/reactor.hh>
 
 namespace ranvier {
 
