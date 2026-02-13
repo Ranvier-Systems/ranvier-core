@@ -789,7 +789,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& 
             seastar::net::inet_address inet_addr(endpoint.address);
             seastar::socket_address addr(inet_addr, endpoint.port);
 
-            co_await _register_callback(endpoint.to_backend_id(), addr,
+            co_await _register_callback(backend_id, addr,
                                          endpoint.weight, endpoint.priority);
         } catch (const std::exception& e) {
             log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
@@ -821,7 +821,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
     // Drain the backend
     if (_drain_callback) {
         try {
-            co_await _drain_callback(endpoint.to_backend_id());
+            co_await _drain_callback(backend_id);
         } catch (const std::exception& e) {
             log_k8s.error("Failed to drain backend for {}: {}", uid, e.what());
         }
@@ -832,8 +832,13 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
 }
 
 seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoint& endpoint) {
-    log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={})",
-                 endpoint.uid, endpoint.ready, endpoint.weight, endpoint.priority);
+    auto backend_id = endpoint.to_backend_id();
+
+    log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={}, backend_id={})",
+                 endpoint.uid, endpoint.ready, endpoint.weight, endpoint.priority, backend_id);
+
+    // Keep reverse map consistent for the modify path
+    _backend_id_to_uid[backend_id] = endpoint.uid;
 
     auto it = _endpoints.find(endpoint.uid);
     bool was_ready = it != _endpoints.end() && it->second.ready;
@@ -847,7 +852,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
                 seastar::net::inet_address inet_addr(endpoint.address);
                 seastar::socket_address addr(inet_addr, endpoint.port);
 
-                co_await _register_callback(endpoint.to_backend_id(), addr,
+                co_await _register_callback(backend_id, addr,
                                              endpoint.weight, endpoint.priority);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
@@ -857,7 +862,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
         // Became not ready - drain
         if (_drain_callback) {
             try {
-                co_await _drain_callback(endpoint.to_backend_id());
+                co_await _drain_callback(backend_id);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to drain backend for {}: {}", endpoint.uid, e.what());
             }
@@ -869,7 +874,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
                 seastar::net::inet_address inet_addr(endpoint.address);
                 seastar::socket_address addr(inet_addr, endpoint.port);
 
-                co_await _register_callback(endpoint.to_backend_id(), addr,
+                co_await _register_callback(backend_id, addr,
                                              endpoint.weight, endpoint.priority);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to update backend for {}: {}", endpoint.uid, e.what());
