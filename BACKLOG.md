@@ -2157,11 +2157,12 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Complexity:_ Medium
   _Fixed:_ Replaced weak polynomial hash with FNV-1a 64-bit hash (deterministic across restarts, much better distribution). Added `_backend_id_to_uid` reverse map for collision detection in `handle_endpoint_added()` with error logging and `k8s_backend_id_collisions` Prometheus metric. Reverse map cleaned up in `handle_endpoint_removed()`.
 
-- [ ] **[HIGH] TracingService shutdown race on g_tracer.reset()**
+- [x] **[HIGH] TracingService shutdown race on g_tracer.reset()** ✓
   _File:Line:_ `src/tracing_service.cpp:437-456`
   _Issue:_ `shutdown()` resets `g_tracer` at line 456, racing with span construction at line 267 which reads `g_tracer` after checking `g_shutting_down`. TOCTOU race. Distinct from Section 11.4 which documented the shared_ptr as a known SDK exception but did NOT cover this shutdown race.
   _Fix:_ Do not call `g_tracer.reset()` or `g_provider.reset()`. Let them leak at process exit.
   _Complexity:_ Low
+  _Fixed:_ Removed g_tracer.reset() and g_provider.reset() from shutdown(). Globals are now process-lifetime objects — OS reclaims at exit. Added concurrency model tests in tracing_service_test.cpp.
 
 - [ ] **[HIGH] DTLS context uses blocking stat() and SSL_CTX file I/O on reactor**
   _File:Line:_ `src/dtls_context.cpp:403-410, 433-438`

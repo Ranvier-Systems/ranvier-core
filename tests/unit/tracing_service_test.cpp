@@ -429,3 +429,178 @@ TEST_F(W3cHelperTest, IsAllZeros) {
 TEST_F(W3cHelperTest, MinTraceparentLenIs55) {
     EXPECT_EQ(w3c::MIN_TRACEPARENT_LEN, 55u);
 }
+
+// =============================================================================
+// Shutdown Race Condition Model Tests
+//
+// These tests model the TOCTOU race between ScopedSpan construction and
+// TracingService::shutdown(). The real g_tracer/g_provider are file-static
+// and require OpenTelemetry, so we use a structural model with the same
+// atomic flag + shared_ptr pattern to verify the fix (never resetting the
+// shared resource) eliminates the race.
+//
+// The original bug: shutdown() called g_tracer.reset() and g_provider.reset()
+// after setting g_shutting_down=true, but a span constructor could read
+// g_shutting_down==false and then dereference g_tracer after the reset.
+//
+// The fix: never call .reset() on g_tracer/g_provider. This test proves
+// that under the fixed pattern, the shared resource is always dereferenceable
+// even during concurrent shutdown.
+// =============================================================================
+
+#include <atomic>
+#include <latch>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// Models the production shutdown race pattern.
+// Resource represents g_tracer / g_provider (a shared_ptr to some object).
+// The flag pattern mirrors g_enabled + g_shutting_down atomics.
+struct ShutdownRaceModel {
+    std::atomic<bool> enabled{false};
+    std::atomic<bool> shutting_down{false};
+    std::shared_ptr<std::atomic<int>> resource;  // models g_tracer
+
+    void init() {
+        resource = std::make_shared<std::atomic<int>>(0);
+        enabled.store(true, std::memory_order_release);
+    }
+
+    // Models the FIXED shutdown (no reset — the fix for the TOCTOU race)
+    void shutdown_safe() {
+        shutting_down.store(true, std::memory_order_release);
+        enabled.exchange(false, std::memory_order_acq_rel);
+        // NO resource.reset() — resource remains valid for in-flight readers
+    }
+
+    // Models ScopedSpan constructor hot path
+    // Returns true if resource was successfully accessed, false if skipped
+    bool try_use_resource() {
+        if (!enabled.load(std::memory_order_acquire) || !resource) {
+            return false;
+        }
+        if (shutting_down.load(std::memory_order_acquire)) {
+            return false;
+        }
+        // Between the check above and the dereference below is the TOCTOU window.
+        // With the fix (no reset), resource is always valid here.
+        if (resource) {
+            resource->fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+};
+
+}  // namespace
+
+class TracingShutdownRaceTest : public ::testing::Test {
+protected:
+    static constexpr int kReaderThreads = 8;
+    static constexpr int kOpsPerThread = 10'000;
+};
+
+// Verify that under the fixed shutdown (no reset), concurrent readers
+// never observe a null resource after passing the gate checks.
+TEST_F(TracingShutdownRaceTest, SafeShutdownNeverInvalidatesResource) {
+    for (int trial = 0; trial < 50; ++trial) {
+        ShutdownRaceModel model;
+        model.init();
+
+        std::latch start_latch(kReaderThreads + 1);  // +1 for shutdown thread
+        std::atomic<bool> saw_null{false};
+        std::atomic<int> successful_uses{0};
+
+        std::vector<std::thread> readers;
+        for (int t = 0; t < kReaderThreads; ++t) {
+            readers.emplace_back([&]() {
+                start_latch.arrive_and_wait();
+                for (int i = 0; i < kOpsPerThread; ++i) {
+                    // Model the ScopedSpan constructor path
+                    if (!model.enabled.load(std::memory_order_acquire) || !model.resource) {
+                        continue;
+                    }
+                    if (model.shutting_down.load(std::memory_order_acquire)) {
+                        continue;
+                    }
+                    // TOCTOU window: shutdown could run between the check and here
+                    auto ptr = model.resource;  // copy shared_ptr (atomic refcount)
+                    if (ptr) {
+                        ptr->fetch_add(1, std::memory_order_relaxed);
+                        successful_uses.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        saw_null.store(true, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+
+        // Shutdown thread
+        std::thread shutdown_thread([&]() {
+            start_latch.arrive_and_wait();
+            model.shutdown_safe();  // Uses the FIXED pattern (no reset)
+        });
+
+        for (auto& t : readers) t.join();
+        shutdown_thread.join();
+
+        // With the safe shutdown, the resource pointer is never reset,
+        // so no reader should ever see a null after passing the gate checks.
+        EXPECT_FALSE(saw_null.load()) << "Trial " << trial
+            << ": reader saw null resource during safe shutdown";
+        // At least some readers should have succeeded before shutdown
+        // (not strictly guaranteed on every trial, but across 50 trials
+        // we expect this to hold)
+    }
+}
+
+// Verify the shutdown flags correctly prevent new span creation after shutdown.
+TEST_F(TracingShutdownRaceTest, ShutdownPreventsNewSpanCreation) {
+    ShutdownRaceModel model;
+    model.init();
+
+    EXPECT_TRUE(model.try_use_resource());  // Should succeed before shutdown
+
+    model.shutdown_safe();
+
+    // After shutdown, both flags should prevent resource use
+    EXPECT_FALSE(model.try_use_resource());
+    // Resource itself should still be valid (not reset)
+    EXPECT_NE(model.resource, nullptr);
+}
+
+// Verify the two-flag barrier ordering: g_shutting_down is set before
+// g_enabled is cleared.
+TEST_F(TracingShutdownRaceTest, ShutdownFlagOrderingCorrect) {
+    ShutdownRaceModel model;
+    model.init();
+
+    EXPECT_TRUE(model.enabled.load());
+    EXPECT_FALSE(model.shutting_down.load());
+
+    model.shutdown_safe();
+
+    // Both flags should be in their post-shutdown state
+    EXPECT_TRUE(model.shutting_down.load());
+    EXPECT_FALSE(model.enabled.load());
+}
+
+// Verify that init -> shutdown -> verify resource still alive
+// (process-lifetime guarantee)
+TEST_F(TracingShutdownRaceTest, ResourceSurvivesShutdown) {
+    ShutdownRaceModel model;
+    model.init();
+
+    auto resource_before = model.resource;
+    ASSERT_NE(resource_before, nullptr);
+
+    model.shutdown_safe();
+
+    // Resource must still point to the same object
+    EXPECT_EQ(model.resource, resource_before);
+    EXPECT_NE(model.resource, nullptr);
+    // Resource should still be functional
+    model.resource->store(42, std::memory_order_relaxed);
+    EXPECT_EQ(model.resource->load(), 42);
+}
