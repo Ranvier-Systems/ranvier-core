@@ -2098,7 +2098,12 @@ protected:
 // --- Direct Status 410 Gone ---
 
 TEST_F(K8sWatch410Test, DirectStatus410Detected) {
-    std::string json = R"({"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 12345 (67890)","reason":"Gone","code":410})";
+    std::string json = R"({
+        "kind":"Status","apiVersion":"v1","metadata":{},
+        "status":"Failure",
+        "message":"too old resource version: 12345 (67890)",
+        "reason":"Gone","code":410
+    })";
     auto result = check_direct_status(json);
     EXPECT_TRUE(result.is_status_error);
     EXPECT_TRUE(result.is_410_gone);
@@ -2142,7 +2147,15 @@ TEST_F(K8sWatch410Test, DirectStatusMissingMessageDefaultsToUnknown) {
 // --- ERROR Watch Events ---
 
 TEST_F(K8sWatch410Test, ErrorEvent410Detected) {
-    std::string json = R"({"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 100 (200)","reason":"Gone","code":410}})";
+    std::string json = R"({
+        "type":"ERROR",
+        "object":{
+            "kind":"Status","apiVersion":"v1","metadata":{},
+            "status":"Failure",
+            "message":"too old resource version: 100 (200)",
+            "reason":"Gone","code":410
+        }
+    })";
     auto result = check_error_event(json);
     EXPECT_TRUE(result.is_status_error);
     EXPECT_TRUE(result.is_410_gone);
