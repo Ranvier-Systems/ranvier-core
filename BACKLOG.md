@@ -2117,7 +2117,7 @@ Section 11 fixed gate guards in RouterService and K8s timers. These are **new** 
 
 Section 7 fixed several unbounded containers. These are **new** ones.
 
-- [ ] **[HIGH] DTLS _sessions map has no MAX_SIZE — unbounded SSL session creation**
+- [x] **[HIGH] DTLS _sessions map has no MAX_SIZE — unbounded SSL session creation** ✓
   _File:Line:_ `src/dtls_context.hpp:181`, `src/dtls_context.cpp:540`
   _Issue:_ `get_or_create_session()` creates a new SSL session for every unique peer address. Spoofed source addresses create thousands of sessions/sec. Cleanup runs every 60s. Each session allocates OpenSSL SSL objects + BIO pairs.
   _Fix:_ Add `MAX_SESSIONS` constant. Reject new sessions when limit reached. Add overflow metric.

@@ -529,6 +529,14 @@ DtlsSession* DtlsContext::get_or_create_session(const seastar::socket_address& p
         return it->second.get();
     }
 
+    // Hard Rule #4: Reject new sessions when at capacity
+    if (_sessions.size() >= MAX_SESSIONS) {
+        ++_sessions_rejected;
+        log_dtls.warn("DTLS session limit reached ({}/{}) — rejecting session for peer {}",
+                      _sessions.size(), MAX_SESSIONS, peer);
+        return nullptr;
+    }
+
     // Create new session
     SSL* ssl = create_ssl(is_server);
     if (!ssl) {
