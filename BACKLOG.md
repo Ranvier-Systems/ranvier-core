@@ -2178,9 +2178,10 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Use `seastar::do_with` or `seastar::lw_shared_ptr`.
   _Resolution:_ Replaced all `std::shared_ptr` with shard-safe patterns: `seastar::do_with` for `parallel_for_each` paths, direct value capture for `seastar::async`, and `seastar::lw_shared_ptr` for crypto callback sharing. Added ownership pattern tests in `gossip_transport_ownership_test.cpp`.
 
-- [ ] **[MEDIUM] sqlite_persistence.cpp has business validation in persistence layer (Rule #7)**
+- [x] **[MEDIUM] sqlite_persistence.cpp has business validation in persistence layer (Rule #7)** ✓
   _File:Line:_ `src/sqlite_persistence.cpp:325-329`
   _Fix:_ Move `backend_id <= 0` check to service layer. Persistence should return raw data.
+  _Resolution:_ Removed `backend_id <= 0` filtering from `SqlitePersistence::load_routes()`. Persistence now returns raw data. Validation moved to `Application::load_persisted_state()` using `std::erase_if` with warning log. Added 3 unit tests in `persistence_test.cpp` confirming persistence returns routes with zero, negative, and mixed backend IDs.
 
 - [ ] **[MEDIUM] K8s HTTP status parsing is brittle — string search instead of code parse**
   _File:Line:_ `src/k8s_discovery_service.cpp:521-522`

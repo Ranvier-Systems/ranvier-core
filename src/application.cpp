@@ -336,6 +336,15 @@ seastar::future<> Application::load_persisted_state() {
         log_main.warn("Skipped {} corrupted route records during load", skipped);
     }
 
+    // Step 2b: Filter out routes with invalid backend_id (business validation)
+    // Persistence returns raw data; the service layer validates.
+    size_t invalid_backend_count = std::erase_if(routes, [](const RouteRecord& r) {
+        return r.backend_id <= 0;
+    });
+    if (invalid_backend_count > 0) {
+        log_main.warn("Discarded {} routes with invalid backend_id <= 0", invalid_backend_count);
+    }
+
     if (backends.empty() && routes.empty()) {
         log_main.info("Persistence store is empty - starting fresh");
         return seastar::make_ready_future<>();
@@ -343,7 +352,8 @@ seastar::future<> Application::load_persisted_state() {
 
     log_main.info("Restoring state from persistence:");
     log_main.info("  Backends: {}", backends.size());
-    log_main.info("  Routes:   {} (skipped {} corrupted)", routes.size(), skipped);
+    log_main.info("  Routes:   {} (skipped {} corrupted, {} invalid backend_id)",
+                  routes.size(), skipped, invalid_backend_count);
 
     for (const auto& rec : backends) {
         log_main.info("  - Backend {} -> {}:{} (weight={}, priority={})",
