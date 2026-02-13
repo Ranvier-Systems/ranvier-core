@@ -35,6 +35,12 @@ struct ConnectionPoolConfig {
 //
 // Clock injection: Template parameter defaults to std::chrono::steady_clock
 // for zero-overhead production use. Tests use TestClock for deterministic timing.
+//
+// Suppress deprecation warnings for Seastar stream default ctor and move-assignment.
+// Seastar deprecated these operations but our pool requires default-constructible
+// and move-assignable bundles for std::deque storage and element erasure.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 template<typename Clock = std::chrono::steady_clock>
 struct BasicConnectionBundle {
     seastar::connected_socket fd;
@@ -96,6 +102,8 @@ struct BasicConnectionBundle {
         return in.eof();
     }
 };
+
+#pragma GCC diagnostic pop
 
 // Backward-compatible alias: production code uses ConnectionBundle unchanged
 using ConnectionBundle = BasicConnectionBundle<>;

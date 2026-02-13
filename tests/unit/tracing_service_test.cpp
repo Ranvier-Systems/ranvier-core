@@ -5,7 +5,9 @@
 // The W3C parsing logic and w3c:: helpers are provided below (extracted
 // from tracing_service.cpp) since they are pure string logic.
 
+#ifndef RANVIER_NO_TELEMETRY
 #define RANVIER_NO_TELEMETRY
+#endif
 #include "tracing_service.hpp"
 #include <gtest/gtest.h>
 #include <string>

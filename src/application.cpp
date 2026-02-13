@@ -669,7 +669,6 @@ seastar::future<> Application::start_servers() {
         return _metrics_server->start();
     }).then([this] {
         seastar::prometheus::config pconf;
-        pconf.metric_help = "Ranvier AI Router";
         return seastar::prometheus::start(*_metrics_server, pconf);
     }).then([this] {
         auto addr = seastar::socket_address(
@@ -720,7 +719,7 @@ void Application::setup_signal_handlers() {
     // Uses Seastar-native signal handling which integrates with the reactor.
     // The handler runs within the Seastar event loop context, allowing us to
     // return futures and use async operations safely.
-    seastar::engine().handle_signal(SIGHUP, [this] {
+    seastar::handle_signal(SIGHUP, [this] {
         log_main.info("SIGHUP received - triggering configuration reload");
         // reload_config() uses sharded<HttpController>::invoke_on_all to
         // propagate configuration changes across all CPU cores
@@ -759,7 +758,7 @@ void Application::setup_signal_handlers() {
     //   - Uses std::exit(1) to terminate immediately
     // Note: If already shutting down (e.g., from SIGTERM), first SIGINT
     //       triggers hard kill since graceful shutdown is already in progress.
-    seastar::engine().handle_signal(SIGINT, [this] {
+    seastar::handle_signal(SIGINT, [this] {
         int count = _sigint_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
         if (count == 1 && !is_shutting_down()) {
@@ -787,7 +786,7 @@ void Application::setup_signal_handlers() {
     // always trigger a graceful shutdown. Unlike SIGINT, we don't support
     // hard kill on repeated SIGTERM since process managers have their own
     // escalation (SIGKILL after timeout).
-    seastar::engine().handle_signal(SIGTERM, [this] {
+    seastar::handle_signal(SIGTERM, [this] {
         log_main.info("SIGTERM received - initiating graceful shutdown");
         signal_shutdown();
     });

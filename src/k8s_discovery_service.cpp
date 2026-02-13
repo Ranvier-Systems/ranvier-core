@@ -442,7 +442,7 @@ seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server
                 seastar::net::dns::get_host_by_name(host)
             );
 
-            if (hostent.addr_list.empty()) {
+            if (hostent.addr_entries.empty()) {
                 log_k8s.error("DNS resolution returned no addresses for: {} - "
                               "check CoreDNS/kube-dns configuration and network connectivity",
                               host);
@@ -451,13 +451,13 @@ seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server
             }
 
             // Use the first address
-            auto addr = seastar::socket_address(hostent.addr_list[0], port);
+            auto addr = seastar::socket_address(hostent.addr_entries[0], port);
 
             // Cache successful resolution for graceful degradation
             _cached_api_server_addr = addr;
 
             log_k8s.debug("DNS resolved {} to {} (attempt {})",
-                          host, hostent.addr_list[0], attempt + 1);
+                          host, hostent.addr_entries[0], attempt + 1);
 
             co_return addr;
 

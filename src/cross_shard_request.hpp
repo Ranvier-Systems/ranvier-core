@@ -155,6 +155,12 @@ struct CrossShardRequestContext {
     // provide a way to release its internal buffer. For high-throughput paths,
     // prefer using string_view directly from req.content when possible.
     // The temporary_buffer enables efficient cross-shard transfer via foreign_ptr.
+    //
+    // Suppress request::content deprecation: Seastar deprecated content in favor
+    // of content_stream for streaming body processing. Our handlers receive the
+    // full buffered body, so we continue to use content until migrating to streaming.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     static CrossShardRequestContext from_request(
         seastar::http::request& req,
         const std::string& request_id,
@@ -173,6 +179,7 @@ struct CrossShardRequestContext {
         ctx.origin_shard = seastar::this_shard_id();
         return ctx;
     }
+#pragma GCC diagnostic pop
 
     // Create from temporary_buffer directly (true zero-copy path)
     // Use this when you already have a temporary_buffer from the network stack
@@ -237,6 +244,8 @@ namespace cross_shard {
 
 // Create from Seastar HTTP request with validation
 // Returns: Result with context if valid, or error message if validation fails
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 inline CrossShardRequestCreateResult try_create_from_request(
     seastar::http::request& req,
     const std::string& request_id,
@@ -262,6 +271,7 @@ inline CrossShardRequestCreateResult try_create_from_request(
     return CrossShardRequestCreateResult::ok(
         CrossShardRequestContext::from_request(req, request_id, client_ip, traceparent));
 }
+#pragma GCC diagnostic pop
 
 // Create from temporary_buffer with validation (true zero-copy path)
 inline CrossShardRequestCreateResult try_create_from_buffer(

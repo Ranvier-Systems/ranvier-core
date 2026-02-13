@@ -433,12 +433,11 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
         return seastar::make_ready_future<>();
     }
 
-    // Linearize packet data
-    seastar::net::packet data = std::move(dgram.get_data());
-    data.linearize();
+    // Get datagram payload as contiguous buffer
+    auto data = std::move(dgram.get_buf());
 
-    const uint8_t* raw_ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
-    size_t raw_len = data.len();
+    const uint8_t* raw_ptr = reinterpret_cast<const uint8_t*>(data.get());
+    size_t raw_len = data.size();
 
     // mTLS lockdown check
     if (_transport->should_drop_mtls_lockdown(src_addr, raw_ptr, raw_len)) {
@@ -593,7 +592,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
             for (const auto& srv : srv_records) {
                 try {
                     auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
-                    for (const auto& addr : host_entry.addr_list) {
+                    for (const auto& addr : host_entry.addr_entries) {
                         discovered_addresses.emplace_back(addr, srv.port);
                         log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
                     }
@@ -604,7 +603,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
         } else if (_config.discovery_type == DiscoveryType::A) {
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
 
-            for (const auto& addr : host_entry.addr_list) {
+            for (const auto& addr : host_entry.addr_entries) {
                 discovered_addresses.emplace_back(addr, _config.gossip_port);
                 log_gossip_protocol().debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
             }
