@@ -73,7 +73,7 @@ FetchContent_MakeAvailable(rapidjson)
 # RapidJSON is header-only. We must define the include path for the project.
 # The headers are located in the 'include' subdirectory of the fetched source.
 add_library(rapidjson_interface INTERFACE)
-target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
+target_include_directories(rapidjson_interface SYSTEM INTERFACE ${rapidjson_SOURCE_DIR}/include)
 
 # Option to disable OpenTelemetry (avoids static initialization that can block)
 option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
@@ -157,7 +157,15 @@ if(Seastar_FOUND)
       GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp
       GIT_TAG        main
     )
+    # Suppress warnings from third-party code compiled within tokenizers_cpp
+    # (vendored protobuf-lite emits -Warray-bounds false positives with GCC 12+)
+    set(_saved_c_flags "${CMAKE_C_FLAGS}")
+    set(_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+    string(APPEND CMAKE_C_FLAGS " -w")
+    string(APPEND CMAKE_CXX_FLAGS " -w")
     FetchContent_MakeAvailable(tokenizers_cpp)
+    set(CMAKE_C_FLAGS "${_saved_c_flags}")
+    set(CMAKE_CXX_FLAGS "${_saved_cxx_flags}")
 
     # ==========================================================================
     # Patch tokenizers-cpp to use jemalloc as Rust's global allocator

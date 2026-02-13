@@ -5,6 +5,7 @@
 #include "gossip_transport.hpp"
 
 #include <cstring>
+#include <span>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
@@ -161,8 +162,7 @@ seastar::future<> GossipTransport::send(const seastar::socket_address& peer,
         // Plaintext mode
         seastar::temporary_buffer<char> buf(data.size());
         std::memcpy(buf.get_write(), data.data(), data.size());
-        seastar::net::packet packet(std::move(buf));
-        return _channel->send(peer, std::move(packet));
+        return _channel->send(peer, std::span<seastar::temporary_buffer<char>>(&buf, 1));
     }
 
     auto* session = _dtls_context->get_or_create_session(peer, false);
@@ -184,8 +184,7 @@ seastar::future<> GossipTransport::send(const seastar::socket_address& peer,
 
         seastar::temporary_buffer<char> buf(encrypted.size());
         std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
-        seastar::net::packet packet(std::move(buf));
-        return _channel->send(peer_copy, std::move(packet)).handle_exception([peer_copy](auto ep) {
+        return _channel->send(peer_copy, std::span<seastar::temporary_buffer<char>>(&buf, 1)).handle_exception([peer_copy](auto ep) {
             log_gossip_transport().debug("Failed to send encrypted data to {}: {}", peer_copy, ep);
         });
     });
@@ -406,9 +405,8 @@ void GossipTransport::send_packet_async(const seastar::socket_address& peer,
 
     seastar::temporary_buffer<char> buf(data.size());
     std::memcpy(buf.get_write(), data.data(), data.size());
-    seastar::net::packet packet(std::move(buf));
 
-    (void)_channel->send(peer, std::move(packet)).handle_exception([peer](auto ep) {
+    (void)_channel->send(peer, std::span<seastar::temporary_buffer<char>>(&buf, 1)).handle_exception([peer](auto ep) {
         try {
             std::rethrow_exception(ep);
         } catch (const std::exception& e) {

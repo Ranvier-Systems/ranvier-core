@@ -116,7 +116,7 @@ class MetricsService {
             data.sample_count = 0;
             data.sample_sum = 0;
             for (double b : boundaries) {
-                data.buckets.push_back({b, 0});
+                data.buckets.push_back({0, b});
             }
         }
 

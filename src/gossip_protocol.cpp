@@ -434,7 +434,10 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
     }
 
     // Linearize packet data
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     seastar::net::packet data = std::move(dgram.get_data());
+#pragma GCC diagnostic pop
     data.linearize();
 
     const uint8_t* raw_ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
@@ -590,6 +593,8 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 "_gossip",
                 _config.discovery_dns_name);
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             for (const auto& srv : srv_records) {
                 try {
                     auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
@@ -608,6 +613,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 discovered_addresses.emplace_back(addr, _config.gossip_port);
                 log_gossip_protocol().debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
             }
+#pragma GCC diagnostic pop
         }
 
         if (discovered_addresses.empty()) {

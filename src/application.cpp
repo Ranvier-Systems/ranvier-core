@@ -669,7 +669,6 @@ seastar::future<> Application::start_servers() {
         return _metrics_server->start();
     }).then([this] {
         seastar::prometheus::config pconf;
-        pconf.metric_help = "Ranvier AI Router";
         return seastar::prometheus::start(*_metrics_server, pconf);
     }).then([this] {
         auto addr = seastar::socket_address(
@@ -714,6 +713,12 @@ seastar::future<> Application::stop_servers() {
 }
 
 void Application::setup_signal_handlers() {
+    // Suppress deprecation: reactor::handle_signal is deprecated in favor of
+    // seastar::handle_signal() free function, but the free function is not
+    // available in our Seastar version yet.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
     // =========================================================================
     // SIGHUP handler - Configuration hot-reload
     // =========================================================================
@@ -792,6 +797,8 @@ void Application::setup_signal_handlers() {
         signal_shutdown();
     });
     log_main.info("SIGTERM handler registered (graceful shutdown)");
+
+#pragma GCC diagnostic pop
 }
 
 void Application::signal_shutdown() {
