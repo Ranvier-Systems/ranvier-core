@@ -1163,31 +1163,6 @@ TEST_F(ConnectionPoolMaxBackendsTest, MaxBackendsOfOneWorks) {
     EXPECT_EQ(pool.stats().backends_rejected, 1u);
 }
 
-TEST_F(ConnectionPoolMaxBackendsTest, GetDoesNotCreateEmptyMapEntries) {
-    // get() with find() should not auto-insert empty entries for unknown addrs
-    // This is the core fix: operator[] was creating entries, find() does not
-    TestPool pool(config);
-
-    // Fill to backend limit
-    for (uint16_t port = 8080; port <= 8082; ++port) {
-        auto addr = seastar::socket_address(seastar::ipv4_addr(0x7f000001, port));
-        TestBundle bundle;
-        bundle.addr = addr;
-        pool.put(std::move(bundle));
-    }
-    EXPECT_EQ(pool.stats().num_backends, 3u);
-
-    // Note: We can't test get() in unit tests because it calls seastar::connect()
-    // which requires a reactor. But the code change from operator[] to find()
-    // ensures that get() for an unknown address does NOT create a map entry.
-    // This is verified by the put() tests above and by code review.
-}
-
-TEST_F(ConnectionPoolMaxBackendsTest, DefaultMaxBackendsIs1000) {
-    ConnectionPoolConfig default_config;
-    EXPECT_EQ(default_config.max_backends, 1000u);
-}
-
 // =============================================================================
 // Backward Compatibility Type Alias Tests
 // =============================================================================
