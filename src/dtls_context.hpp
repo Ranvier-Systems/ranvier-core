@@ -5,7 +5,7 @@
 //
 // Key features:
 // - Per-peer DTLS sessions with connection-oriented handshake
-// - Certificate hot-reloading without restart
+// - Certificate hot-reloading without restart (async file I/O, Rule #12)
 // - Async-compatible with Seastar (uses memory BIOs, non-blocking)
 // - Supports certificate verification and client authentication
 
@@ -24,7 +24,9 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
 
@@ -149,9 +151,9 @@ public:
     DtlsContext(const DtlsContext&) = delete;
     DtlsContext& operator=(const DtlsContext&) = delete;
 
-    // Initialize the context (load certificates)
+    // Initialize the context (load certificates via async file I/O)
     // Returns error message on failure, nullopt on success
-    std::optional<std::string> initialize();
+    seastar::future<std::optional<std::string>> initialize();
 
     // Check if DTLS is enabled and initialized
     bool is_enabled() const { return _enabled && _initialized; }
@@ -163,9 +165,9 @@ public:
     // Remove a session for a peer
     void remove_session(const seastar::socket_address& peer);
 
-    // Check and reload certificates if changed
+    // Check and reload certificates if changed (async file I/O, Rule #12)
     // Returns true if certificates were reloaded
-    bool check_and_reload_certs();
+    seastar::future<bool> check_and_reload_certs();
 
     // Get session count (for metrics)
     size_t session_count() const;
@@ -178,6 +180,15 @@ public:
 
     // Get configuration
     const GossipTlsConfig& config() const { return _config; }
+
+    // Load PEM certificates from memory buffers into an SSL_CTX (CPU-only, non-blocking).
+    // Returns error message on failure, nullopt on success.
+    // Static so it can be tested independently without Seastar reactor.
+    static std::optional<std::string> load_certs_from_memory(
+        SSL_CTX* ctx,
+        const std::string& cert_pem,
+        const std::string& key_pem,
+        const std::string& ca_pem);
 
 private:
     GossipTlsConfig _config;
@@ -199,11 +210,15 @@ private:
     // Create a new SSL object for a session
     SSL* create_ssl(bool is_server);
 
-    // Load certificates into context
-    std::optional<std::string> load_certificates();
+    // Load certificates via async file I/O + memory-based OpenSSL APIs (Rule #12)
+    seastar::future<std::optional<std::string>> load_certificates();
 
-    // Get file modification time
-    static std::optional<std::chrono::system_clock::time_point> get_file_mtime(const std::string& path);
+    // Read file contents using Seastar async file I/O (Rule #12)
+    static seastar::future<std::string> read_file_contents(const std::string& path);
+
+    // Get file modification time using Seastar async file I/O (Rule #12)
+    static seastar::future<std::optional<std::chrono::system_clock::time_point>>
+        get_file_mtime(const std::string& path);
 };
 
 // RAII wrapper for OpenSSL initialization

@@ -84,7 +84,7 @@ seastar::future<> GossipTransport::initialize_dtls() {
 
     _dtls_context = std::make_unique<DtlsContext>(_config.tls);
 
-    auto err = _dtls_context->initialize();
+    auto err = co_await _dtls_context->initialize();
     if (err) {
         log_gossip_transport().error("Failed to initialize DTLS: {}", *err);
         if (!_config.tls.allow_plaintext_fallback) {
@@ -521,7 +521,7 @@ seastar::future<> GossipTransport::check_cert_reload() {
         co_return;
     }
 
-    if (!_dtls_context->check_and_reload_certs()) {
+    if (!co_await _dtls_context->check_and_reload_certs()) {
         co_return;
     }
 
