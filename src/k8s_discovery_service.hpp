@@ -77,7 +77,8 @@ struct K8sEndpoint {
     uint32_t priority = K8S_DEFAULT_PRIORITY;
 
     // Generate a stable BackendId from the endpoint
-    // Uses a hash of the UID for consistency across restarts
+    // Uses FNV-1a 64-bit hash for quality distribution, truncated to 31 bits (positive int32_t).
+    // Deterministic across restarts (no randomized seed unlike absl::Hash).
     BackendId to_backend_id() const;
 
     bool operator==(const K8sEndpoint& other) const {
@@ -131,6 +132,9 @@ private:
     // Using absl::flat_hash_map for SIMD-accelerated lookups and better cache locality
     absl::flat_hash_map<std::string, K8sEndpoint> _endpoints;  // UID -> Endpoint
 
+    // Reverse map for BackendId collision detection: BackendId -> UID
+    absl::flat_hash_map<BackendId, std::string> _backend_id_to_uid;
+
     // Running state
     bool _running = false;
     seastar::gate _gate;
@@ -160,6 +164,7 @@ private:
     uint64_t _response_size_exceeded = 0;
     uint64_t _line_size_exceeded = 0;
     uint64_t _endpoints_limit_exceeded = 0;
+    uint64_t _backend_id_collisions = 0;
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;

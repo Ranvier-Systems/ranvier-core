@@ -2150,11 +2150,12 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Read file size first (like `load_ca_cert` at line 227), then `read_exactly(size)`. Log error if token exceeds reasonable max.
   _Complexity:_ Low
 
-- [ ] **[HIGH] BackendId hash collision risk at scale**
+- [x] **[HIGH] BackendId hash collision risk at scale** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:42-51`
   _Issue:_ `to_backend_id()` uses a weak `hash * 31 + c` truncated to 31 bits. Birthday problem: ~50% collision probability at ~46K UIDs. Two endpoints with the same BackendId shadow each other with no detection or warning.
   _Fix:_ Use stronger hash (first 4 bytes of SHA-256, or `absl::Hash`). Add collision detection in `handle_endpoint_added()`.
   _Complexity:_ Medium
+  _Fixed:_ Replaced weak polynomial hash with FNV-1a 64-bit hash (deterministic across restarts, much better distribution). Added `_backend_id_to_uid` reverse map for collision detection in `handle_endpoint_added()` with error logging and `k8s_backend_id_collisions` Prometheus metric. Reverse map cleaned up in `handle_endpoint_removed()`.
 
 - [ ] **[HIGH] TracingService shutdown race on g_tracer.reset()**
   _File:Line:_ `src/tracing_service.cpp:437-456`
