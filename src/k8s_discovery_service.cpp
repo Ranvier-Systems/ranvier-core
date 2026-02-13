@@ -202,8 +202,23 @@ seastar::future<> K8sDiscoveryService::load_service_account_token() {
 
     try {
         auto file = co_await seastar::open_file_dma(_config.token_path, seastar::open_flags::ro);
+        auto size = co_await file.size();
+
+        if (size == 0) {
+            log_k8s.warn("Token file is empty: {} - continuing without auth", _config.token_path);
+            co_await file.close();
+            co_return;
+        }
+
+        if (size > K8S_MAX_TOKEN_SIZE) {
+            log_k8s.error("Token file {} is {} bytes, exceeds maximum allowed size ({} bytes) - "
+                          "continuing without auth", _config.token_path, size, K8S_MAX_TOKEN_SIZE);
+            co_await file.close();
+            co_return;
+        }
+
         auto stream = seastar::make_file_input_stream(file);
-        auto buf = co_await stream.read_exactly(4096);  // Tokens are usually small
+        auto buf = co_await stream.read_exactly(size);
 
         _bearer_token = std::string(buf.get(), buf.size());
 

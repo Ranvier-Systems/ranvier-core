@@ -62,6 +62,10 @@ constexpr size_t K8S_MAX_RESPONSE_SIZE = 16 * 1024 * 1024;
 constexpr size_t K8S_MAX_LINE_SIZE = 1 * 1024 * 1024;
 // MAX_ENDPOINTS: Cap on total tracked endpoints in the map
 constexpr size_t K8S_MAX_ENDPOINTS = 1000;
+// MAX_TOKEN_SIZE: Cap on service account token file size (1 MB)
+// K8s projected tokens are typically 1-4KB but can exceed 4KB with custom audiences.
+// 1 MB is generous while preventing unbounded reads.
+constexpr size_t K8S_MAX_TOKEN_SIZE = 1 * 1024 * 1024;
 
 // Represents a discovered backend endpoint
 struct K8sEndpoint {
