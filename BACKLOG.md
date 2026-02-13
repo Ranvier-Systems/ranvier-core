@@ -2123,7 +2123,7 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Add `MAX_SESSIONS` constant. Reject new sessions when limit reached. Add overflow metric.
   _Complexity:_ Low
 
-- [ ] **[HIGH] Gossip _peer_seq_counters map unbounded**
+- [x] **[HIGH] Gossip _peer_seq_counters map unbounded**
   _File:Line:_ `src/gossip_protocol.hpp:204-207`
   _Issue:_ `next_seq_num()` inserts unboundedly. Old entries never cleaned unless `cleanup_peer_state()` is called. Distinct from `_pending_acks` (fixed in Section 7 line 871).
   _Fix:_ Bound to `MAX_DEDUP_PEERS`. Clean entries for peers no longer in peer table.

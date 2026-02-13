@@ -826,6 +826,36 @@ void GossipProtocol::process_retries() {
 }
 
 uint32_t GossipProtocol::next_seq_num(const seastar::socket_address& peer) {
+    // Fast path: peer already tracked
+    auto it = _peer_seq_counters.find(peer);
+    if (it != _peer_seq_counters.end()) {
+        return ++(it->second);
+    }
+
+    // New peer - check bounds (Rule #4: bounded containers)
+    if (_peer_seq_counters.size() >= MAX_DEDUP_PEERS) {
+        // Evict entries for peers no longer in the peer table
+        if (_peer_addresses) {
+            std::unordered_set<seastar::socket_address> active_peers(
+                _peer_addresses->begin(), _peer_addresses->end());
+            for (auto map_it = _peer_seq_counters.begin(); map_it != _peer_seq_counters.end(); ) {
+                if (active_peers.find(map_it->first) == active_peers.end()) {
+                    map_it = _peer_seq_counters.erase(map_it);
+                } else {
+                    ++map_it;
+                }
+            }
+        }
+
+        // Still at capacity after eviction - reject
+        if (_peer_seq_counters.size() >= MAX_DEDUP_PEERS) {
+            ++_dedup_peers_overflow;
+            log_gossip_protocol().warn("Peer seq counters at capacity ({}), cannot track peer={}",
+                                       MAX_DEDUP_PEERS, peer);
+            return 0;
+        }
+    }
+
     auto& counter = _peer_seq_counters[peer];
     return ++counter;
 }
