@@ -137,6 +137,11 @@ private:
 // Manages SSL_CTX and per-peer sessions
 class DtlsContext {
 public:
+    // Hard Rule #4: Every growing container must have an explicit MAX_SIZE.
+    // Limits the number of concurrent DTLS sessions to prevent OOM from
+    // spoofed source addresses creating unbounded SSL objects + BIO pairs.
+    static constexpr size_t MAX_SESSIONS = 10000;
+
     explicit DtlsContext(const GossipTlsConfig& config);
     ~DtlsContext();
 
@@ -168,6 +173,9 @@ public:
     // Clean up idle sessions older than timeout
     void cleanup_idle_sessions(std::chrono::seconds timeout);
 
+    // Overflow counter: times a new session was rejected due to MAX_SESSIONS (Rule #4)
+    uint64_t sessions_rejected() const { return _sessions_rejected; }
+
     // Get configuration
     const GossipTlsConfig& config() const { return _config; }
 
@@ -177,8 +185,11 @@ private:
     bool _enabled = false;
     bool _initialized = false;
 
-    // Per-peer sessions
+    // Per-peer sessions (bounded by MAX_SESSIONS, Rule #4)
     std::unordered_map<seastar::socket_address, std::unique_ptr<DtlsSession>> _sessions;
+
+    // Overflow counter for rejected sessions
+    uint64_t _sessions_rejected = 0;
 
     // Certificate file modification times for hot reload
     std::chrono::system_clock::time_point _cert_mtime;

@@ -167,7 +167,10 @@ void GossipService::register_metrics() {
             seastar::metrics::description("Times dedup peer limit was reached (Rule #4)")),
         seastar::metrics::make_counter("cluster_pending_acks_overflow",
             [this] { return _protocol->pending_acks_overflow(); },
-            seastar::metrics::description("Times pending acks limit was reached (Rule #4)"))
+            seastar::metrics::description("Times pending acks limit was reached (Rule #4)")),
+        seastar::metrics::make_counter("cluster_dtls_sessions_rejected",
+            [this] { return _transport->dtls_sessions_rejected(); },
+            seastar::metrics::description("Times DTLS session limit was reached (Rule #4)"))
     });
 #endif
 }

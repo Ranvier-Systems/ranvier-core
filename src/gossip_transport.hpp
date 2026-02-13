@@ -110,6 +110,9 @@ public:
     uint64_t dtls_packets_decrypted() const { return _dtls_packets_decrypted; }
     uint64_t dtls_cert_reloads() const { return _dtls_cert_reloads; }
     uint64_t dtls_lockdown_drops() const { return _dtls_lockdown_drops; }
+    uint64_t dtls_sessions_rejected() const {
+        return _dtls_context ? _dtls_context->sessions_rejected() : 0;
+    }
     uint64_t crypto_stall_warnings() const { return _crypto_stall_warnings; }
     uint64_t crypto_ops_offloaded() const { return _crypto_ops_offloaded; }
     uint64_t crypto_batch_broadcasts() const { return _crypto_batch_broadcasts; }
