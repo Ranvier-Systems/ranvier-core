@@ -1576,18 +1576,21 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         try {
             auto hostent = co_await seastar::net::dns::get_host_by_name(std::string(ip_str));
 
-            if (hostent.addr_entries.empty()) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            if (hostent.addr_list.empty()) {
                 log_control.warn("POST /admin/backends: DNS resolution returned no addresses for '{}'", ip_str);
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->write_body("json", "{\"error\": \"DNS resolution returned no addresses for hostname\"}");
                 co_return std::move(rep);
             }
 
-            addr = seastar::socket_address(hostent.addr_entries[0], port);
+            addr = seastar::socket_address(hostent.addr_list[0], port);
             // Convert resolved address back to string for logging/persistence
             std::ostringstream oss;
-            oss << hostent.addr_entries[0];
+            oss << hostent.addr_list[0];
             resolved_ip = oss.str();
+#pragma GCC diagnostic pop
 
             log_control.info("POST /admin/backends: resolved hostname '{}' to IP '{}'", ip_str, resolved_ip);
 

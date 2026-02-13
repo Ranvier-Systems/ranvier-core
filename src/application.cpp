@@ -713,13 +713,19 @@ seastar::future<> Application::stop_servers() {
 }
 
 void Application::setup_signal_handlers() {
+    // Suppress deprecation: reactor::handle_signal is deprecated in favor of
+    // seastar::handle_signal() free function, but the free function is not
+    // available in our Seastar version yet.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
     // =========================================================================
     // SIGHUP handler - Configuration hot-reload
     // =========================================================================
     // Uses Seastar-native signal handling which integrates with the reactor.
     // The handler runs within the Seastar event loop context, allowing us to
     // return futures and use async operations safely.
-    seastar::handle_signal(SIGHUP, [this] {
+    seastar::engine().handle_signal(SIGHUP, [this] {
         log_main.info("SIGHUP received - triggering configuration reload");
         // reload_config() uses sharded<HttpController>::invoke_on_all to
         // propagate configuration changes across all CPU cores
@@ -758,7 +764,7 @@ void Application::setup_signal_handlers() {
     //   - Uses std::exit(1) to terminate immediately
     // Note: If already shutting down (e.g., from SIGTERM), first SIGINT
     //       triggers hard kill since graceful shutdown is already in progress.
-    seastar::handle_signal(SIGINT, [this] {
+    seastar::engine().handle_signal(SIGINT, [this] {
         int count = _sigint_count.fetch_add(1, std::memory_order_relaxed) + 1;
 
         if (count == 1 && !is_shutting_down()) {
@@ -786,11 +792,13 @@ void Application::setup_signal_handlers() {
     // always trigger a graceful shutdown. Unlike SIGINT, we don't support
     // hard kill on repeated SIGTERM since process managers have their own
     // escalation (SIGKILL after timeout).
-    seastar::handle_signal(SIGTERM, [this] {
+    seastar::engine().handle_signal(SIGTERM, [this] {
         log_main.info("SIGTERM received - initiating graceful shutdown");
         signal_shutdown();
     });
     log_main.info("SIGTERM handler registered (graceful shutdown)");
+
+#pragma GCC diagnostic pop
 }
 
 void Application::signal_shutdown() {
