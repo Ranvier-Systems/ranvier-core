@@ -2183,9 +2183,10 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Move `backend_id <= 0` check to service layer. Persistence should return raw data.
   _Resolution:_ Removed `backend_id <= 0` filtering from `SqlitePersistence::load_routes()`. Persistence now returns raw data. Validation moved to `Application::load_persisted_state()` using `std::erase_if` with warning log. Added 3 unit tests in `persistence_test.cpp` confirming persistence returns routes with zero, negative, and mixed backend IDs.
 
-- [ ] **[MEDIUM] K8s HTTP status parsing is brittle — string search instead of code parse**
+- [x] **[MEDIUM] K8s HTTP status parsing is brittle — string search instead of code parse** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:521-522`
   _Fix:_ Parse HTTP status line properly: extract first line, split on space, parse numeric code.
+  _Resolution:_ Replaced brittle `headers.find("200 OK")` / `headers.find("200 ")` string search with a proper `parse_http_status_code()` function that extracts the first line (status line), finds the status code field, and parses it as an integer using `std::from_chars` (Rule #10). The old approach could false-match "200" appearing in header values; the new approach only inspects the status line. Added 20 unit tests in `k8s_discovery_test.cpp` covering standard codes (200, 404, 503, 410), HTTP/1.0 and HTTP/2 variants, status lines without reason phrase, malformed input, and the false-match regression case.
 
 - [ ] **[MEDIUM] K8s watch 410 Gone causes infinite reconnect loop**
   _File:Line:_ `src/k8s_discovery_service.cpp:844-846`
