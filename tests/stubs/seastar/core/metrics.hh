@@ -13,8 +13,8 @@ namespace seastar {
 namespace metrics {
 
 struct histogram_bucket {
-    double upper_bound;
     uint64_t count;
+    double upper_bound;
 };
 
 struct histogram {
