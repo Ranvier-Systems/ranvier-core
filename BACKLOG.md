@@ -21,6 +21,8 @@ This document identifies missing features and optimizations required to promote 
 9. [Benchmark Extensions](#9-benchmark-extensions)
 10. [Load-Aware Prefix Routing](#10-load-aware-prefix-routing)
 11. [System Architecture Audit (2026-02-02)](#11-system-architecture-audit-2026-02-02)
+12. [Test Coverage Gaps (2026-02-06)](#12-test-coverage-gaps-2026-02-06)
+13. [Adversarial System Audit (2026-02-12)](#13-adversarial-system-audit-2026-02-12)
 
 ---
 
@@ -1321,7 +1323,28 @@ Extend benchmarking to make it more realistic with production traces, cache pres
   _Location:_ `tests/integration/locustfile_real.py`
   _Complexity:_ Medium
 
-### 9.5 Tokenizer Performance
+### 9.5 Incomplete Request Rate Investigation
+
+- [x] **Investigate high incomplete (timeout) rate in benchmarks (~30-37%)** ✓
+  _Root cause:_ Stale pooled connections. Ranvier's connection pool returned TCP connections where vLLM had already closed its end, but `is_half_open()` didn't detect it. The proxy sent HTTP 200 to the client, forwarded the request on a dead socket, got immediate EOF, and recorded "success" with an empty body. Sub-categorization revealed 100% of incompletes were `no_data` with 3-24ms response times (too fast for vLLM — confirms Ranvier-side issue).
+  _Fix:_ Phase 3.5 stale connection retry in `http_controller.cpp`. After streaming completes with 0 bytes written and no error flags, close the dead connection and retry once on a fresh connection via `ConnectionPool::get_fresh()`. Transparent to client (HTTP 200 already sent, no body data yet).
+  _Changes:_
+  - `src/http_controller.{hpp,cpp}` — Phase 3.5 retry logic, `ProxyContext` tracking fields
+  - `src/connection_pool.hpp` — `get_fresh()` method, `create_connection()` refactor
+  - `src/proxy_retry_policy.hpp` — `should_retry_stale_connection()` pure function
+  - `src/metrics_service.hpp` — `stale_connection_retries_total` counter
+  - `src/config_schema.hpp`, `src/config_loader.cpp`, `src/application.cpp` — config wiring (`RANVIER_RETRY_MAX_STALE` env var, `retry.max_stale_retries` YAML)
+  - `tests/unit/proxy_retry_policy_test.cpp` — 10 unit tests for detection predicate
+  - `tests/integration/test_negative_paths.py` — `test_05a_stale_connection_retry` integration test
+  - `tests/integration/mock_backend.py` — keep-alive admin endpoint for testing
+  - `tests/integration/locustfile_real.py` — incomplete sub-categorization, `MAX_OUTPUT_TOKENS` env var, diagnostic logging
+  - `scripts/bench.sh` — `--max-tokens` flag
+  _Investigation report:_ `.dev-context/investigations/benchmark-timeout-investigation.md`
+  _Complexity:_ Medium
+  _Verified:_ 2026-02-08 — 8B/30u/5m/stress benchmark: 3194/3194 successful, 0 incomplete, 0 failed (was 30-37% incomplete). Debug logging (`no_data` warnings) can now be removed.
+  _Priority:_ P2 - Medium (CLOSED)
+
+### 9.6 Tokenizer Performance
 
 - [x] **Rebuild tokenizers-cpp with statically-linked jemalloc allocator** ✓
   _Justification:_ Cross-shard dispatch revealed memory allocation overhead in Rust tokenizer. jemalloc provides better performance for multi-threaded allocations and avoids glibc malloc contention.
@@ -1399,6 +1422,7 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 | **P3 - Low** | Benchmark | Traffic variability - traffic pattern option | Low | |
 | **P2 - Medium** | Benchmark | Traffic variability - cold-start measurement | Medium | |
 | **P2 - Medium** | Benchmark | Traffic variability - cache warm-up metrics | Medium | |
+| **P2 - Medium** | Benchmark | Incomplete rate investigation - timeout tuning | Medium | ✅ Done (stale connection retry) |
 | **P2 - Medium** | Performance | Tokenizer - jemalloc static linking | Medium | ✅ Done |
 | **P1 - High** | Performance | Load-aware prefix routing - backend load tracking | Medium | ✅ Done (#222) |
 | **P1 - High** | Performance | Load-aware prefix routing - load-aware selection | Medium | ✅ Done (#223) |
@@ -1837,6 +1861,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-13 | **[Security]** Add bounds checking to K8s discovery service to prevent OOM (Rule #4). MAX_RESPONSE_SIZE (16MB) for API responses, MAX_LINE_SIZE (1MB) for watch stream buffer, MAX_ENDPOINTS (1000) for endpoints map. Overflow counter metrics added. | #134 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to radix_tree.hpp. Comprehensive documentation for Rules #1, #4, #9, #14 covering lookup, insert, eviction, and slab allocation code paths. | #212 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to router_service.cpp. Documentation for Rules #1, #5, #6, #14 covering route_request, learn_route_global, get_backend_for_prefix, and timer callbacks. | #208 |
 | 2026-02-01 | **[DX]** Consolidate 8 gossip debug metrics behind RANVIER_DEBUG_METRICS compile flag. Reduces Prometheus scrape overhead in production. | #209 |
@@ -1906,6 +1931,281 @@ _Move completed items here with completion date and PR reference._
 | 2024-12-XX | Abseil high-performance containers | #48 |
 | 2024-12-XX | Multi-node integration tests | #47 |
 | 2024-12-XX | Request rewriting for token forwarding | #46 |
+
+---
+
+## 12. Test Coverage Gaps (2026-02-06)
+
+> **Analysis:** 851 unit tests across 20 files, 4 integration suites, 5 validation scripts.
+> **Finding:** 14 source files (25%) have zero unit tests. 5 systematic weaknesses affect all tests.
+>
+> **Conventions for all test tasks below:**
+> - Read `CLAUDE.md` and `.dev-context/claude-context.md` first (coding conventions, 16 Hard Rules).
+> - **Do not build.** Static analysis only — Seastar deps are too heavy for sandbox.
+> - Tests go in `tests/unit/<name>_test.cpp`. Use Google Test (`gtest`). Follow the pattern in `tests/unit/text_validator_test.cpp` (include header, `using namespace ranvier;`, `TEST_F` with fixture classes).
+> - Wire the new test into `CMakeLists.txt` following the pattern of nearby pure-C++ tests (e.g., `text_validator_test`): `add_executable`, `target_include_directories(... PRIVATE ${CMAKE_SOURCE_DIR}/src)`, `target_link_libraries(... GTest::gtest_main)`, `gtest_discover_tests(...)`. Add `.cpp` source files from `src/` only if the header under test is not header-only.
+> - Namespace is `ranvier`. All source headers are in `src/`.
+
+### 12.1 P0 — New Unit Tests for Untested Pure-Function Files
+
+- [x] **Add `parse_utils_test.cpp`** ✓
+  _Source:_ `src/parse_utils.hpp` — contains `parse_int32`, `parse_uint32`, `parse_port` using `std::from_chars`. Header-only, no Seastar dependency, no `.cpp` to compile.
+  _Test cases:_ Valid integers (positive, negative, zero, INT32_MIN/MAX), overflow/underflow for int32 and uint32, trailing garbage rejection ("123abc"), empty string, whitespace-only input, port range validation (0, 1, 65535, 65536), negative values rejected for unsigned parse.
+  _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `text_validator_test` block in `CMakeLists.txt`.
+  _Complexity:_ Low
+  _Completed:_ 2026-02-06. 5 fixture classes, ~40 test cases covering `parse_int32`, `parse_uint32`, `parse_port`, `parse_token_id`, `parse_backend_id`.
+
+- [x] **Add `logging_test.cpp`** ✓
+  _Source:_ `src/logging.hpp` — contains `generate_request_id()` and header extraction helpers (`extract_request_id_view`, `extract_traceparent_view`). Header-only, no Seastar dependency.
+  _Test cases:_ Request ID format (`{shard}-{timestamp}-{seq}` structure), monotonically increasing sequence numbers, `extract_request_id_view` prefers X-Request-ID over X-Correlation-ID, `extract_traceparent_view` case-insensitive header lookup, missing headers return empty `string_view`, empty header values handled correctly.
+  _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `text_validator_test`.
+  _Complexity:_ Low
+  _Completed:_ 2026-02-06. 3 fixture classes, ~25 test cases. Introduced `tests/stubs/` directory with minimal Seastar/fmt stubs for headers with lightweight Seastar deps.
+
+- [x] **Add `shard_load_metrics_test.cpp`** ✓
+  _Source:_ `src/shard_load_metrics.hpp` — atomic counters and RAII guards (`ActiveRequestGuard`, `QueuedRequestGuard`) used by load-aware routing. Header-only, no Seastar dependency.
+  _Test cases:_ `ActiveRequestGuard` increments on construction / decrements on destruction, `QueuedRequestGuard` same RAII semantics, `load_score()` = active × 2.0 + queued, `ShardLoadSnapshot` captures point-in-time values, move semantics of guards (no double-decrement), underflow protection (decrement below zero).
+  _CMake:_ Add as pure-C++ test (no extra `.cpp` sources). Model after `load_aware_routing_test`.
+  _Complexity:_ Low
+  _Completed:_ 2026-02-06. 5 fixture classes, ~25 test cases covering RAII guards, load scoring, snapshot semantics, lifecycle, and type traits.
+
+### 12.2 P1 — New Unit Tests for Core Infrastructure
+
+- [x] **Add `metrics_service_test.cpp`** ✓
+  _Source:_ `src/metrics_service.hpp` (~200 LOC) — histogram bucket logic, bounded container enforcement (Rule #4: max 10K backends), cache-hit-ratio computation. Header-only, no Seastar dependency (uses Seastar types only as forward declarations behind `#ifdef`).
+  _Test cases:_ Histogram bucket correctness, bounded container limits, cache-hit-ratio divide-by-zero protection, metric recording and reset. Read the header to determine which structs/functions are testable without Seastar — test those only.
+  _CMake:_ Add as pure-C++ test. May need conditional compilation — check `#ifdef HAVE_SEASTAR` guards in header.
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 7 fixture classes, ~30 test cases. Added `seastar/core/metrics.hh` and `metrics_registration.hh` stubs with histogram types and labeled metric overloads.
+
+- [x] **Add `node_slab_test.cpp`** ✓
+  _Source:_ `src/node_slab.hpp` + `src/node_slab.cpp` (~250 LOC) — per-shard memory pool for RadixTree nodes. Note: `radix_tree_test.cpp` already compiles `src/node_slab.cpp` so allocation works — but there are no dedicated slab tests.
+  _Test cases:_ Allocate/free round-trips, free-list integrity after allocate→free→reallocate cycles, peak usage tracking, pool exhaustion behavior (what happens when slab is full).
+  _CMake:_ Add with `src/node_slab.cpp` as source. Model after `radix_tree_test` block.
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 7 fixture classes, ~30 test cases covering allocate/deallocate, free-list LIFO, peak tracking, auto-growth, make_node factories, and thread-local accessors.
+
+- [x] **Add `cross_shard_request_test.cpp`** ✓
+  _Source:_ `src/cross_shard_request.hpp` (~180 LOC) — validation functions for body size (128 MB limit), token count (128K limit), string length (4 KB limit), and `force_local_allocation()`. Read the header to identify which functions are pure (no Seastar runtime required) and test those.
+  _Test cases:_ Body size at/over 128 MB limit, token count at/over 128K limit, string length at/over 4 KB limit, `force_local_allocation()` copy behavior, boundary values.
+  _CMake:_ Add as pure-C++ test if validation functions are constexpr/inline. If they depend on Seastar types, add under the `if(Seastar_FOUND)` block.
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 8 fixture classes, ~35 test cases. Added `temporary_buffer`, `shared_ptr`/`foreign_ptr`, `http::request`/`reply` stubs. Updated `future.hh` and `smp.hh` stubs.
+
+- [x] **Add `tracing_service_test.cpp` (W3C traceparent parsing only)** ✓
+  _Source:_ `src/tracing_service.hpp` + `src/tracing_service.cpp` (~250 LOC). The W3C traceparent parsing (`version-traceid-spanid-flags`) is pure string logic. Read the source to identify which functions can be tested without OpenTelemetry/Seastar runtime.
+  _Test cases:_ Valid traceparent format (`00-<32hex>-<16hex>-<2hex>`), invalid formats (wrong length, non-hex chars, wrong version), field length enforcement, flag parsing, version 00 vs unknown versions.
+  _CMake:_ Add with `src/tracing_service.cpp` as source. May need conditional compilation — check `#ifdef WITH_TELEMETRY` guards.
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-06. 7 fixture classes, ~35 test cases. Compiled with `RANVIER_NO_TELEMETRY`; W3C parse logic provided directly in test (no OTel dependency).
+
+### 12.3 P2 — Strengthen Existing Tests
+
+- [x] **Introduce clock injection for time-dependent tests** ✓
+  _Context:_ 0 of 20 test files have deterministic timing tests. `src/rate_limiter.hpp`, `src/circuit_breaker.hpp`, and `src/gossip_consensus.hpp` all have time-sensitive behavior tested with no time control.
+  _Approach:_ Add a template parameter or `std::function<steady_clock::time_point()>` to each component's clock source. Introduce a `TestClock` helper in `tests/unit/` that allows manual time advancement. Retrofit into: rate_limiter (test token refill over simulated time), circuit_breaker (test OPEN→HALF_OPEN after exact timeout), quorum (test peer liveness window expiration). Update existing tests in `tests/unit/rate_limiter_test.cpp`, `tests/unit/circuit_breaker_test.cpp`, `tests/unit/quorum_test.cpp` to use the new clock. Ensure production code defaults to `steady_clock` with no overhead.
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-07. Template parameter `Clock` added to `BasicTokenBucket`, `BasicRateLimiter`, `BasicBackendCircuit`, `BasicCircuitBreaker`, and `BasicPeerState` with backward-compatible aliases. `TestClock` helper in `tests/unit/test_clock.hpp`. Pure algorithm split into `src/rate_limiter_core.hpp` (no Seastar deps); `src/rate_limiter.hpp` is Seastar service inheriting from core. 9 rate limiter timing tests, 7 circuit breaker timing tests, 10 quorum liveness timing tests — all deterministic, zero sleeps.
+
+- [x] **Adopt Google Mock (`gmock`) for dependency isolation** ✓
+  _Context:_ Only `tests/unit/async_persistence_test.cpp` uses mocks (hand-rolled `MockPersistenceStore`). GTest is already a dependency (`GTest::gtest_main` in `CMakeLists.txt`) and gmock ships with it — just link `GTest::gmock`.
+  _Approach:_ Replace hand-rolled mock in `tests/unit/async_persistence_test.cpp` with `gmock` (`MOCK_METHOD`). Add mock interfaces for: `PersistenceStore` (interface in `src/persistence.hpp`), `HealthChecker`, `UdpChannel`. Update `CMakeLists.txt` to link `GTest::gmock` for tests that need it.
+  _Complexity:_ Medium
+  _Completed:_ 2026-02-07. Replaced 148-line hand-rolled `MockPersistenceStore` with gmock `MOCK_METHOD` declarations + `ON_CALL` defaults for open/close state tracking. Created reusable mock headers in `tests/unit/mocks/`: `mock_persistence_store.hpp` (gmock of `PersistenceStore` interface), `mock_health_checker.hpp` (abstract `HealthChecker` interface + gmock mock), `mock_udp_channel.hpp` (abstract `UdpChannel` interface + gmock mock). Linked `GTest::gmock` in `CMakeLists.txt` for `async_persistence_test`. All tests use `NiceMock<MockPersistenceStore>` to suppress uninteresting-call warnings.
+
+- [x] **Add negative-path integration tests**
+  _Context:_ All 4 integration suites in `tests/integration/` are happy-path only. They use Docker Compose (`docker-compose.test.yml`) with a 3-node cluster and mock backends (`tests/integration/mock_backend.py`). Follow the same pattern (Python unittest, `requests` library, Docker Compose lifecycle in setUp/tearDown).
+  _Test cases:_
+  - Split-brain: Use `docker network disconnect` to partition nodes, verify quorum detection via `/admin/cluster` endpoint, reconnect and verify recovery
+  - Backend flap: Rapidly `docker stop`/`docker start` mock backend containers, verify circuit breaker engages via metrics endpoint (`ranvier_circuit_open`)
+  - Config reload: Send `docker kill -s HUP` with invalid YAML, verify old config preserved via `/admin/config`
+  - Rate limit: Send concurrent requests exceeding configured rate limits, verify 429 responses with `Retry-After` header
+  - Oversized request: Send request body exceeding `max_request_body_size`, verify 413 rejection
+  _Location:_ Add as `tests/integration/test_negative_paths.py`. No CMake changes needed (Python tests).
+  _Complexity:_ High
+  _Completed:_ 2026-02-07. Added `tests/integration/test_negative_paths.py` with 5 test cases: (1) Split-brain partition via `docker network disconnect`, verifying peer count drops and quorum state via `/admin/dump/cluster`, then reconnect and verify recovery. (2) Backend flap via rapid `docker stop`/`start` of mock backend, verifying `circuit_breaker_opens` metric increments. (3) Config reload with invalid YAML via `docker exec` + SIGHUP, verifying old config preserved and server continues operating. (4) Rate limiting by enabling low limits via config reload, flooding with concurrent requests, verifying 503 responses with `Retry-After` header. (5) Oversized request body (~5 MB), verifying rejection with 400/413/500 and server remains healthy. Follows same pattern as existing suites (Python unittest, `requests`, Docker Compose lifecycle).
+
+### 12.4 P3 — Longer-Term Test Infrastructure
+
+- [x] **Add `connection_pool_test.cpp`**
+  _Source:_ `src/connection_pool.hpp` (~300 LOC) — manages upstream connections with per-host limits, global limits, idle timeout, and max-age TTL. Tightly coupled to Seastar networking (`seastar::connected_socket`).
+  _Approach:_ Extract pool management logic (eviction, TTL, limits) behind a policy interface that can be tested without real sockets. Test: per-host connection limits, global connection limits, idle timeout eviction, max-age TTL enforcement, half-open connection detection.
+  _CMake:_ Add under `if(Seastar_FOUND)` block. Model after `stream_parser_test`.
+  _Complexity:_ High
+  _Completed:_ 2026-02-07. Templatized `ConnectionBundle` and `ConnectionPool` on `Clock` parameter (same pattern as `BasicCircuitBreaker<Clock>` and `BasicRateLimiter<Clock>`) with backward-compatible `using` aliases. Created `tests/unit/connection_pool_test.cpp` with 35 tests across 10 fixture classes: `ConnectionPoolConfigTest` (defaults, customization), `ConnectionBundleTest` (timestamps, expiry, TTL, touch semantics), `ConnectionPoolPerHostLimitTest` (per-host limit enforcement, independent host limits), `ConnectionPoolGlobalLimitTest` (global eviction across hosts), `ConnectionPoolIdleTimeoutTest` (deterministic expiry with TestClock, boundary conditions), `ConnectionPoolMaxAgeTest` (TTL enforcement independent of idle, counter accumulation), `ConnectionPoolHalfOpenTest` (non-half-open survival, invalid rejection), `ConnectionPoolStatsTest` (counter tracking), `ConnectionPoolClearPoolTest` (backend removal), `ConnectionPoolMapCleanupTest` (Rule #4 empty map entry removal), `ConnectionPoolEvictionOrderTest` (FIFO eviction semantics), `ConnectionPoolMixedTest` (multi-round cleanup, put-after-clear). Default-constructed Seastar streams have `close()` returning ready futures, enabling testing without a reactor. Wired into CMakeLists.txt under `if(Seastar_FOUND)` with `Seastar::seastar` and `GTest::gtest_main`.
+
+- [x] **Add router service integration tests (Seastar-dependent)**
+  _Source:_ `src/router_service.hpp` + `src/router_service.cpp` (~700 LOC) — the core routing brain. Currently only tested transitively through Docker Compose integration suites. Depends on Seastar sharding, RadixTree, and shard_load_balancer.
+  _Test cases:_ Route learning from proxied requests, route TTL expiration and cleanup, cross-shard route broadcast, backend registration/deregistration with route cleanup, draining mode with timeout.
+  _CMake:_ Add under `if(Seastar_FOUND)` block. Will need multiple `src/*.cpp` files. Model after `application_test`.
+  _Complexity:_ High
+  _Completed:_ 2026-02-07. Created `tests/unit/router_service_test.cpp` with 55+ tests across 20 sections covering all 5 required test cases. Added test helper methods to `RouterService` (`register_backend_for_testing`, `insert_route_for_testing`, `set_backend_draining_for_testing`, `mark_backend_dead_for_testing`, `unregister_backend_for_testing`, `get_route_count_for_testing`) following the existing `reset_shard_state_for_testing` pattern to enable shard-local testing without a running Seastar reactor. Tests cover: route learning via ART insert+lookup, route TTL cleanup via reset, cross-shard batch structure verification, backend registration/deregistration with route cleanup, draining mode skipping, dead backend circuit breaker, routing mode dispatch (PREFIX/HASH/RANDOM), consistent hash determinism, weighted random selection with priority groups, prefix boundary routing, BackendRequestGuard RAII semantics, load tracking helpers, tree dump API, and edge cases. Wired into CMakeLists.txt under `if(Seastar_FOUND)` linking `router_service.cpp`, `node_slab.cpp`, `gossip_service.cpp`, `gossip_protocol.cpp`, `gossip_consensus.cpp`, `gossip_transport.cpp`, `crypto_offloader.cpp`, `dtls_context.cpp` with Seastar, abseil, OpenSSL, and GTest.
+
+- [x] **Extract and test HTTP controller proxy logic**
+  _Source:_ `src/http_controller.cpp` (~1200 LOC) — the retry/fallback state machine (`ProxyContext`) is the most complex untested code. Tightly coupled to Seastar HTTP and ConnectionPool.
+  _Approach:_ Extract retry/backoff decision logic into a pure function or policy class in a new header. Test retry counts, backoff intervals, fallback backend selection, timeout handling. Separately test admin API endpoint handlers. Test backpressure semaphore acquire/release behavior.
+  _Complexity:_ High
+  _Completed:_ 2026-02-08. Created `src/proxy_retry_policy.hpp` extracting four pure components from `http_controller.cpp`: (1) `ConnectionErrorType` enum with `classify_connection_error()` and `is_retryable_connection_error()` — classifies `std::system_error` exceptions for EPIPE/ECONNRESET; (2) `BasicProxyRetryPolicy<Clock>` template class — retry count tracking, exponential backoff with cap, fallback-before-retry priority, deadline enforcement; (3) `select_fallback_backend()` template — pure fallback selection with predicate-based filtering; (4) `check_concurrency()` / `check_persistence_backpressure()` — backpressure decision functions. Created `tests/unit/proxy_retry_policy_test.cpp` with 60+ tests across 10 fixture classes: connection error classification (null, broken pipe, connection reset, non-system errors), backoff calculation (exponential doubling, cap enforcement, custom multiplier, constant backoff), retry count enforcement (0/1/3 retries, should_continue), deadline handling (initial, exceeded, boundary, overrides retry/fallback), fallback decisions (preferred over retry, doesn't consume retry, disabled, no candidate, max attempts, zero attempts), combined scenarios (realistic fallback→retry→give-up, deadline during fallback, intermittent candidates), fallback selection (first available, skip failed/disallowed, empty list, large list), backpressure concurrency (under/at/over limit, unlimited), persistence queue (threshold, disabled, empty, large values), initial state and config access. Updated `http_controller.hpp` and `.cpp` to include `proxy_retry_policy.hpp` and use its definitions. Wired into CMakeLists.txt as pure C++ test with TestClock.
+
+- [x] **Add concurrency stress tests for cross-shard components**
+  _Context:_ 0 of 20 test files exercise concurrent access. Several components cross shard boundaries or use shared-state primitives.
+  _Approach:_ Use `std::thread` + `std::latch`/`std::barrier` (C++20) to test concurrent operations on: `shard_load_metrics` atomics (concurrent increment/decrement), `async_persistence` queue (concurrent enqueue from multiple threads), `tokenizer_thread_pool` (concurrent job submission), `rate_limiter` buckets (concurrent `try_consume` from same client). Add as separate `tests/unit/*_concurrency_test.cpp` files.
+  _Complexity:_ High
+
+---
+
+## 13. Adversarial System Audit (2026-02-12)
+
+> **Criticality Score: 7/10**
+> Generated: 2026-02-12
+> Audit Scope: All 57 source files under `src/` against 16 Hard Rules, Seastar reactor model, 4 lenses
+> Full report: `.dev-context/adversarial-audit-2026-02-12.md`
+
+Cross-referenced with Section 7 (Jan 2026) and Section 11 (Feb 2). Only **new** findings not already tracked or resolved are listed below.
+
+### 13.1 CRITICAL — Benchmark-Impacting
+
+These items directly affect the validity of the current performance benchmark results.
+
+- [x] **[CRITICAL] RadixTree route_count_ drift causes cascading eviction**
+  _File:Line:_ `src/radix_tree.hpp:243`
+  _Issue:_ `insert()` increments `route_count_++` unconditionally, but `insert_recursive()` (line 1259-1263) silently updates existing leaves without signaling "not new". Repeated inserts of the same prefix inflate the counter beyond the actual route count. When `route_count_ >= max_routes`, the eviction loop in `router_service.cpp` evicts all real routes while the counter stays inflated. The tree permanently empties itself under sustained traffic with repeated prefixes.
+  _Benchmark impact:_ Cache hit rate benchmarks (reported at 98%) are time-bombs. Short runs succeed; 30+ minute runs under real traffic patterns will trigger mass eviction and fall back to round-robin.
+  _Fix:_ Have `insert_recursive()` return `std::pair<NodePtr, bool>` where the bool indicates new-vs-update. Only increment `route_count_` for new inserts.
+  _Complexity:_ Low
+  _Priority:_ P0 — fix before next benchmark run
+
+- [x] **[CRITICAL] Mutex on every proxy request via is_persistence_backpressured()**
+  _File:Line:_ `src/http_controller.cpp:1819-1827`
+  _Issue:_ Every proxy request calls `is_persistence_backpressured()` which calls `_persistence->queue_depth()`. Despite PR #118 adding an atomic for the metrics path, the queue itself is still mutex-protected (see `async_persistence.hpp:118`). The code comment at line 1819 explicitly says "queue_depth() acquires a mutex". This stalls the reactor under concurrent persistence writes.
+  _Benchmark impact:_ P99 latency numbers include this mutex overhead. The actual prefix-routing benefit is better than currently measured.
+  _Relationship:_ Extends Section 7 line 865 ("Consider lock-free queue") which is still open as MEDIUM. Recommend re-prioritizing to CRITICAL.
+  _Fix:_ Shadow the queue size with `std::atomic<size_t>` incremented/decremented alongside queue push/pop. `queue_depth()` reads the atomic, zero lock.
+  _Complexity:_ Low
+  _Priority:_ P0 — fix before next benchmark run
+
+### 13.2 CRITICAL — Async Integrity (Gate Holder Bugs)
+
+Section 11 fixed gate guards in RouterService and K8s timers. These are **new** gate-holder bugs in the gossip and persistence subsystems.
+
+- [x] **[CRITICAL] Gossip heartbeat timer callback has no gate guard**
+  _File:Line:_ `src/gossip_protocol.cpp:201-203`
+  _Issue:_ Timer callback `[this] { (void)broadcast_heartbeat(); }` captures `this` with no gate holder. `_transport` pointer is dereferenced before any internal gate acquisition. Contrast with the retry timer (line 212) and discovery timer (line 237) which DO attempt gate holders.
+  _Fix:_ Acquire `_timer_gate.hold()` at the start of the callback lambda, before calling `broadcast_heartbeat()`.
+  _Complexity:_ Low
+
+- [x] **[CRITICAL] Gossip discovery timer gate holder drops before async work completes** ✓
+  _File:Line:_ `src/gossip_protocol.cpp:237-254`
+  _Issue:_ `timer_holder` is a local variable in the callback that dies when the callback returns. But `refresh_peers()` is a detached future `(void)` that runs for seconds. The gate holder provides zero protection — shutdown can destroy state while `refresh_peers()` is in-flight.
+  _Fix:_ Move holder into the future chain: `(void)refresh_peers().finally([holder = std::move(timer_holder)] {});`
+  _Complexity:_ Low
+
+- [x] **[CRITICAL] AsyncPersistence log_stats() gate holder drops at end of try block** ✓
+  _File:Line:_ `src/async_persistence.cpp:371-380`
+  _Issue:_ Gate holder is scoped to `try {}` block. After the block, the function accesses `_ops_processed`, `_ops_dropped`, `_batches_flushed`, and calls `queue_depth()` without gate protection. If `stop()` runs between the `try` block and the member access, it's use-after-free.
+  _Fix:_ Declare `timer_holder` at function scope and assign inside `try`, matching the pattern used in `on_flush_timer()` (line 261).
+  _Complexity:_ Low
+
+### 13.3 CRITICAL — Cross-Shard Safety
+
+- [x] **[CRITICAL] std::function broadcast across shards in GossipConsensus** ✓
+  _File:Lines:_ `src/gossip_consensus.cpp:130, 180, 237`
+  _Issue:_ `_route_prune_callback` (`std::function`) is captured by value and sent to every shard via `smp::submit_to`. When the lambda exceeds Small Buffer Optimization size (~16-32 bytes), the heap allocation lives on shard 0 and is freed on shard N. This is anti-pattern Bug #3 (cross-shard free). Appears at 3 call sites. The code has a TODO acknowledging this.
+  _Fix:_ Each shard registers its own local callback. Shard 0 broadcasts only the scalar `BackendId`; each shard invokes its local callback.
+  _Complexity:_ Medium
+
+### 13.4 HIGH — Unbounded Containers (Rule #4)
+
+Section 7 fixed several unbounded containers. These are **new** ones.
+
+- [x] **[HIGH] DTLS _sessions map has no MAX_SIZE — unbounded SSL session creation** ✓
+  _File:Line:_ `src/dtls_context.hpp:181`, `src/dtls_context.cpp:540`
+  _Issue:_ `get_or_create_session()` creates a new SSL session for every unique peer address. Spoofed source addresses create thousands of sessions/sec. Cleanup runs every 60s. Each session allocates OpenSSL SSL objects + BIO pairs.
+  _Fix:_ Add `MAX_SESSIONS` constant. Reject new sessions when limit reached. Add overflow metric.
+  _Complexity:_ Low
+
+- [x] **[HIGH] Gossip _peer_seq_counters map unbounded**
+  _File:Line:_ `src/gossip_protocol.hpp:204-207`
+  _Issue:_ `next_seq_num()` inserts unboundedly. Old entries never cleaned unless `cleanup_peer_state()` is called. Distinct from `_pending_acks` (fixed in Section 7 line 871).
+  _Fix:_ Bound to `MAX_DEDUP_PEERS`. Clean entries for peers no longer in peer table.
+  _Complexity:_ Low
+
+- [x] **[HIGH] K8s discovery: response body, watch buffer, and endpoints map all unbounded** ✓
+  _File:Lines:_ `src/k8s_discovery_service.cpp:501-506` (response), `src/k8s_discovery_service.cpp:1067-1084` (watch buffer), `src/k8s_discovery_service.hpp:120` (endpoints map)
+  _Issue:_ Three independent OOM vectors. A compromised or misconfigured K8s API server can exhaust shard 0 memory via: (1) arbitrarily large response body, (2) streaming data without newlines (Slowloris-style), (3) endpoint count explosion from a broad selector.
+  _Fix:_ Add `MAX_RESPONSE_SIZE` (16MB), `MAX_LINE_SIZE` (1MB), `MAX_ENDPOINTS` (1000). Abort and reconnect if exceeded.
+  _Complexity:_ Low
+
+- [x] **[HIGH] Connection pool _pools map has no MAX_BACKENDS limit**
+  _File:Line:_ `src/connection_pool.hpp:435`
+  _Issue:_ Per-host and total connection limits exist, but the number of unique backend addresses (map keys) is unbounded. Thousands of unique addresses with 0 idle connections still grow the map. Distinct from Section 7 line 927 (which fixed erasure of empty deques).
+  _Fix:_ Add `MAX_BACKENDS = 1000`. Check `_pools.size()` before inserting new backend entries.
+  _Complexity:_ Low
+
+### 13.5 HIGH — Edge-Case Crashes
+
+- [x] **[HIGH] K8s token file read truncated at 4096 bytes**
+  _File:Line:_ `src/k8s_discovery_service.cpp:200`
+  _Issue:_ `co_await stream.read_exactly(4096)` silently truncates K8s projected tokens that exceed 4KB. Authentication fails with no error.
+  _Fix:_ Read file size first (like `load_ca_cert` at line 227), then `read_exactly(size)`. Log error if token exceeds reasonable max.
+  _Complexity:_ Low
+
+- [x] **[HIGH] BackendId hash collision risk at scale** ✓
+  _File:Line:_ `src/k8s_discovery_service.cpp:42-51`
+  _Issue:_ `to_backend_id()` uses a weak `hash * 31 + c` truncated to 31 bits. Birthday problem: ~50% collision probability at ~46K UIDs. Two endpoints with the same BackendId shadow each other with no detection or warning.
+  _Fix:_ Use stronger hash (first 4 bytes of SHA-256, or `absl::Hash`). Add collision detection in `handle_endpoint_added()`.
+  _Complexity:_ Medium
+  _Fixed:_ Replaced weak polynomial hash with FNV-1a 64-bit hash (deterministic across restarts, much better distribution). Added `_backend_id_to_uid` reverse map for collision detection in `handle_endpoint_added()` with error logging and `k8s_backend_id_collisions` Prometheus metric. Reverse map cleaned up in `handle_endpoint_removed()`.
+
+- [x] **[HIGH] TracingService shutdown race on g_tracer.reset()** ✓
+  _File:Line:_ `src/tracing_service.cpp:437-456`
+  _Issue:_ `shutdown()` resets `g_tracer` at line 456, racing with span construction at line 267 which reads `g_tracer` after checking `g_shutting_down`. TOCTOU race. Distinct from Section 11.4 which documented the shared_ptr as a known SDK exception but did NOT cover this shutdown race.
+  _Fix:_ Do not call `g_tracer.reset()` or `g_provider.reset()`. Let them leak at process exit.
+  _Complexity:_ Low
+  _Fixed:_ Removed g_tracer.reset() and g_provider.reset() from shutdown(). Globals are now process-lifetime objects — OS reclaims at exit. Added concurrency model tests in tracing_service_test.cpp.
+
+- [x] **[HIGH] DTLS context uses blocking stat() and SSL_CTX file I/O on reactor**
+  _File:Line:_ `src/dtls_context.cpp:403-410, 433-438`
+  _Issue:_ `SSL_CTX_use_certificate_file` and POSIX `stat()` are blocking calls on the reactor thread during cert reload. Violates Rule #12.
+  _Fix:_ Offload cert reload to `seastar::async`. Use OpenSSL memory-based APIs (`SSL_CTX_use_certificate_ASN1`) after async file read.
+  _Complexity:_ Medium
+  _Fixed:_ Replaced all blocking file I/O with Seastar async APIs (`open_file_dma`, `make_file_input_stream`, `file::stat`). Replaced `SSL_CTX_use_certificate_file`/`SSL_CTX_use_PrivateKey_file`/`SSL_CTX_load_verify_locations` with memory-based OpenSSL APIs (`PEM_read_bio_X509`, `PEM_read_bio_PrivateKey`, `X509_STORE_add_cert`) fed from async-read buffers. Both `initialize()` and `check_and_reload_certs()` now return futures. Added `load_certs_from_memory()` static helper with unit tests in `dtls_context_test.cpp`.
+
+### 13.6 MEDIUM — Additional Issues
+
+- [x] **[MEDIUM] gossip_transport.cpp uses std::shared_ptr for shard-local data (Rule #0)**
+  _File:Lines:_ `src/gossip_transport.cpp:200-201, 263, 469`
+  _Fix:_ Use `seastar::do_with` or `seastar::lw_shared_ptr`.
+  _Resolution:_ Replaced all `std::shared_ptr` with shard-safe patterns: `seastar::do_with` for `parallel_for_each` paths, direct value capture for `seastar::async`, and `seastar::lw_shared_ptr` for crypto callback sharing. Added ownership pattern tests in `gossip_transport_ownership_test.cpp`.
+
+- [x] **[MEDIUM] sqlite_persistence.cpp has business validation in persistence layer (Rule #7)** ✓
+  _File:Line:_ `src/sqlite_persistence.cpp:325-329`
+  _Fix:_ Move `backend_id <= 0` check to service layer. Persistence should return raw data.
+  _Resolution:_ Removed `backend_id <= 0` filtering from `SqlitePersistence::load_routes()`. Persistence now returns raw data. Validation moved to `Application::load_persisted_state()` using `std::erase_if` with warning log. Added 3 unit tests in `persistence_test.cpp` confirming persistence returns routes with zero, negative, and mixed backend IDs.
+
+- [x] **[MEDIUM] K8s HTTP status parsing is brittle — string search instead of code parse** ✓
+  _File:Line:_ `src/k8s_discovery_service.cpp:521-522`
+  _Fix:_ Parse HTTP status line properly: extract first line, split on space, parse numeric code.
+  _Resolution:_ Replaced brittle `headers.find("200 OK")` / `headers.find("200 ")` string search with a proper `parse_http_status_code()` function that extracts the first line (status line), finds the status code field, and parses it as an integer using `std::from_chars` (Rule #10). The old approach could false-match "200" appearing in header values; the new approach only inspects the status line. Added 20 unit tests in `k8s_discovery_test.cpp` covering standard codes (200, 404, 503, 410), HTTP/1.0 and HTTP/2 variants, status lines without reason phrase, malformed input, and the false-match regression case.
+
+- [x] **[MEDIUM] K8s watch 410 Gone causes infinite reconnect loop** ✓
+  _File:Line:_ `src/k8s_discovery_service.cpp:844-846`
+  _Fix:_ Parse Status event `code`. On 410, clear `_resource_version` and trigger `sync_endpoints()`.
+  _Resolution:_ Fixed the watch callback in `watch_endpoints()` to parse the `code` field from K8s Status events. On 410 Gone, `_resource_version` is cleared and `sync_endpoints()` is called to re-list with a fresh resourceVersion before the watch reconnects. Handles both delivery forms: (1) direct Status objects (HTTP error response body) and (2) ERROR watch events with embedded Status objects (mid-stream 410). Also fixed a null-dereference risk on `event["message"]` access (now guarded with `HasMember` + `IsString`). Added `_watch_410_gone` metric counter for observability. Added 20 unit tests covering direct Status 410 detection, ERROR event 410 detection, non-410 status codes, missing fields, and full reconnect flow simulation.
+
+- [x] **[MEDIUM] metrics_service.hpp fallback_metrics is a shared mutable singleton** ✓
+  _File:Line:_ `src/metrics_service.hpp:530-534`
+  _Issue:_ When `MAX_TRACKED_BACKENDS` is hit, all overflow backends share one `static thread_local BackendMetrics` accumulator. Data becomes incoherent; histograms leak slowly.
+  _Fix:_ Return a freshly default-constructed null-op `BackendMetrics`, or reject recording and increment overflow counter only.
+  _Resolution:_ Changed `get_or_create_backend_metrics()` to return `BackendMetrics*` (nullable) instead of `BackendMetrics&`. On overflow, returns `nullptr` and increments `_backend_metrics_overflow` counter. Callers (`record_backend_latency_by_id`, `record_first_byte_latency_by_id`) null-check before per-backend recording; aggregate histogram still captures all data unconditionally. Removed the `static thread_local BackendMetrics fallback_metrics` singleton that caused data incoherence and histogram memory leaks. Added 5 unit tests for overflow isolation.
+
+### 13.7 Anti-Pattern Candidates for Hard Rules
+
+Three systemic patterns observed across multiple findings:
+
+1. **Gate-Holder-Scoping:** Gate holders scoped to `try` blocks or callbacks instead of the full async operation (A2, A3). _Proposed rule: "A gate holder must be scoped to the entire async operation it protects."_
+2. **Unconditional-Counter-Increment:** Incrementing size counters after operations that may be no-ops (E1). _Proposed rule: "Mutation methods must signal insert-vs-update; counters only increment on actual size change."_
+3. **Unbounded-External-Response:** Accumulating HTTP response bodies from external services without size limits (S3, S4). _Proposed rule: "All HTTP response accumulation from external services must have MAX_RESPONSE_SIZE."_
 
 ---
 

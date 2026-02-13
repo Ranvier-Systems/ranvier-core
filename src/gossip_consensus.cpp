@@ -14,6 +14,19 @@
 
 namespace ranvier {
 
+// Per-shard callback for route pruning. Each shard registers its own callback
+// during initialization, avoiding the need to broadcast a std::function across
+// shards (which risks cross-shard heap free when the function exceeds SBO size).
+static thread_local RoutePruneCallback s_local_prune_callback;
+
+void GossipConsensus::register_local_prune_callback(RoutePruneCallback callback) {
+    s_local_prune_callback = std::move(callback);
+}
+
+void GossipConsensus::clear_local_prune_callback() {
+    s_local_prune_callback = nullptr;
+}
+
 GossipConsensus::GossipConsensus(const ClusterConfig& config)
     : _config(config) {
 }
@@ -118,20 +131,19 @@ void GossipConsensus::add_peer(const seastar::socket_address& peer) {
 void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
     auto it = _peer_table.find(peer);
     if (it != _peer_table.end()) {
-        // Prune routes for removed peer if it had an associated backend
-        // NOTE: std::function is passed across shards here. This relies on Small Buffer
-        // Optimization (SBO) to avoid cross-shard heap issues. The callback lambda only
-        // captures a pointer, which fits in SBO. A proper fix would make callbacks
-        // shard-aware (each shard registers its own callback).
-        // TODO: Refactor to use per-shard callback registration for full memory safety.
-        if (it->second.associated_backend && _route_prune_callback) {
+        // Prune routes for removed peer if it had an associated backend.
+        // Each shard invokes its own locally-registered callback to avoid
+        // broadcasting std::function across shards (cross-shard free risk).
+        if (it->second.associated_backend && s_local_prune_callback) {
             BackendId b_id = *it->second.associated_backend;
-            auto callback = _route_prune_callback;
             (void)seastar::parallel_for_each(
                 boost::irange<unsigned>(0, seastar::smp::count),
-                [callback, b_id](unsigned shard_id) {
-                    return seastar::smp::submit_to(shard_id, [callback, b_id] {
-                        return callback(b_id);
+                [b_id](unsigned shard_id) {
+                    return seastar::smp::submit_to(shard_id, [b_id] {
+                        if (s_local_prune_callback) {
+                            return s_local_prune_callback(b_id);
+                        }
+                        return seastar::make_ready_future<>();
                     });
                 }).handle_exception([b_id](auto ep) {
                     try { std::rethrow_exception(ep); }
@@ -172,16 +184,18 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
         if (new_peer_table.find(peer) == new_peer_table.end()) {
             log_gossip_consensus().info("DNS discovery: peer removed: {}", peer);
 
-            // Prune routes for removed peers if they had an associated backend
-            // NOTE: See comment in remove_peer() about std::function SBO reliance.
-            if (state.associated_backend && _route_prune_callback) {
+            // Prune routes for removed peers if they had an associated backend.
+            // Each shard invokes its own locally-registered callback.
+            if (state.associated_backend && s_local_prune_callback) {
                 BackendId b_id = *state.associated_backend;
-                auto callback = _route_prune_callback;
                 (void)seastar::parallel_for_each(
                     boost::irange<unsigned>(0, seastar::smp::count),
-                    [callback, b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [callback, b_id] {
-                            return callback(b_id);
+                    [b_id](unsigned shard_id) {
+                        return seastar::smp::submit_to(shard_id, [b_id] {
+                            if (s_local_prune_callback) {
+                                return s_local_prune_callback(b_id);
+                            }
+                            return seastar::make_ready_future<>();
                         });
                     }).handle_exception([b_id](auto ep) {
                         try { std::rethrow_exception(ep); }
@@ -227,17 +241,19 @@ void GossipConsensus::check_liveness() {
             state.is_alive = false;
             log_gossip_consensus().warn("Peer marked dead: socket_address={}", addr);
 
-            // Prune routes for dead peer if it had an associated backend
-            // NOTE: See comment in remove_peer() about std::function SBO reliance.
-            if (state.associated_backend && _route_prune_callback) {
+            // Prune routes for dead peer if it had an associated backend.
+            // Broadcast only the scalar BackendId; each shard invokes its
+            // own locally-registered callback.
+            if (state.associated_backend && s_local_prune_callback) {
                 BackendId b_id = *state.associated_backend;
-                auto callback = _route_prune_callback;
 
-                // Broadcast the prune command to ALL shards
                 (void)seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
-                    [callback, b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [callback, b_id] {
-                            return callback(b_id);
+                    [b_id](unsigned shard_id) {
+                        return seastar::smp::submit_to(shard_id, [b_id] {
+                            if (s_local_prune_callback) {
+                                return s_local_prune_callback(b_id);
+                            }
+                            return seastar::make_ready_future<>();
                         });
                     }).handle_exception([b_id](auto ep) {
                         try { std::rethrow_exception(ep); }

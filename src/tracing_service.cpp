@@ -127,8 +127,12 @@ inline bool is_all_zeros(std::string_view s) noexcept {
 // Thread-safety model:
 // - g_init_flag: Ensures init() runs exactly once across all shards
 // - g_enabled: Atomic flag for lock-free reads in hot path (start_span)
+// - g_shutting_down: Atomic flag set during shutdown(); provides a barrier
+//   to prevent new span creation while shutdown is in progress
 // - g_tracer/g_provider: Written once during init (protected by call_once),
-//   then only read. The acquire fence on g_enabled ensures visibility.
+//   then only read. Never reset — they are process-lifetime objects to
+//   avoid a TOCTOU race between the g_shutting_down check and StartSpan.
+//   The acquire fence on g_enabled ensures visibility after init.
 // - g_service_name: Written once during init, immutable thereafter
 // ============================================================================
 
@@ -430,10 +434,9 @@ void TracingService::init(const TelemetryConfig& config) {
 
 void TracingService::shutdown() {
     // First, signal that we're shutting down to prevent new spans from starting.
-    // This must happen before we disable tracing to avoid a race where:
-    // 1. Thread A checks g_enabled (true), proceeds to create span
-    // 2. This thread sets g_enabled = false and resets g_provider
-    // 3. Thread A accesses g_provider (now null) -> crash
+    // This must happen before we disable tracing so that the ScopedSpan
+    // constructor's g_shutting_down check (line ~234) acts as a barrier
+    // against new span creation during the shutdown sequence.
     g_shutting_down.store(true, std::memory_order_release);
 
     // Now atomically disable tracing. Use exchange to get the previous value
@@ -442,18 +445,21 @@ void TracingService::shutdown() {
 
     if (was_enabled && g_provider) {
         // Flush any pending spans before shutdown.
-        // Note: We don't reset g_provider here to avoid potential use-after-free
-        // if any spans are still being processed. The provider will be cleaned
-        // up at process exit. This is safe because:
-        // 1. g_enabled is now false, so no new spans will be created
-        // 2. g_shutting_down is true, providing a second barrier
-        // 3. Any in-flight spans will complete their operations on the existing provider
         g_provider->ForceFlush();
 
-        // Reset after flush completes - spans created before shutdown will have
-        // finished by now since ForceFlush is synchronous
-        g_provider.reset();
-        g_tracer.reset();
+        // INTENTIONALLY do NOT call g_provider.reset() or g_tracer.reset().
+        //
+        // There is a TOCTOU race between the g_shutting_down check in
+        // ScopedSpan's constructor (line ~234) and the actual use of g_tracer
+        // at StartSpan (line ~267). A thread can observe g_shutting_down==false,
+        // get preempted, then dereference g_tracer after it has been reset here.
+        //
+        // Letting these leak is safe:
+        // 1. g_enabled is false — no new spans will be created after this point
+        // 2. g_shutting_down is true — second barrier for late arrivals
+        // 3. The provider/tracer remain valid so any in-flight StartSpan call
+        //    that slipped past the checks still dereferences a live object
+        // 4. These are process-lifetime statics; the OS reclaims them at exit
     }
 }
 

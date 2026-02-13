@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
 #include "sqlite_persistence.hpp"
-#include <filesystem>
 #include <cstdio>
+#include <filesystem>
+#include <set>
 
 using namespace ranvier;
 
@@ -550,4 +551,87 @@ TEST_F(PersistenceTest, MultipleBackendsWithNullIpAreSkipped) {
 
     // Verify skipped count includes the 3 invalid records
     EXPECT_GE(store_->last_load_skipped_count(), 3);
+}
+
+// =============================================================================
+// Persistence Returns Raw Data Tests (Rule #7 - No Business Logic in Persistence)
+// =============================================================================
+// The persistence layer must return raw data without business validation.
+// Filtering of backend_id <= 0 is the service/application layer's responsibility.
+
+TEST_F(PersistenceTest, LoadRoutesReturnsZeroBackendId) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    std::vector<TokenId> tokens = {100, 200, 300};
+    EXPECT_TRUE(store_->save_route(tokens, 0));
+
+    auto routes = store_->load_routes();
+    ASSERT_EQ(routes.size(), 1);
+    EXPECT_EQ(routes[0].tokens, tokens);
+    EXPECT_EQ(routes[0].backend_id, 0);
+}
+
+TEST_F(PersistenceTest, LoadRoutesReturnsNegativeBackendId) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    // Directly insert a route with negative backend_id via SQL
+    // (save_route uses BackendId=int32_t which supports negative values)
+    store_->close();
+
+    sqlite3* db;
+    ASSERT_EQ(sqlite3_open(test_db_path_.c_str(), &db), SQLITE_OK);
+
+    // Create tables if needed
+    ASSERT_EQ(sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS routes (tokens BLOB PRIMARY KEY, backend_id INTEGER NOT NULL)",
+        nullptr, nullptr, nullptr), SQLITE_OK);
+
+    // Insert route with negative backend_id
+    sqlite3_stmt* stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+        "INSERT INTO routes (tokens, backend_id) VALUES (?, ?)", -1, &stmt, nullptr), SQLITE_OK);
+
+    std::vector<TokenId> tokens = {400, 500};
+    sqlite3_bind_blob(stmt, 1, tokens.data(), static_cast<int>(tokens.size() * sizeof(TokenId)), SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, -5);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+
+    // Reopen with our store and verify raw data is returned
+    ASSERT_TRUE(store_->open(test_db_path_));
+    auto routes = store_->load_routes();
+    ASSERT_EQ(routes.size(), 1);
+    EXPECT_EQ(routes[0].tokens, tokens);
+    EXPECT_EQ(routes[0].backend_id, -5);
+}
+
+TEST_F(PersistenceTest, LoadRoutesReturnsMixOfValidAndInvalidBackendIds) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+
+    std::vector<TokenId> tokens1 = {10, 20};
+    std::vector<TokenId> tokens2 = {30, 40};
+    std::vector<TokenId> tokens3 = {50, 60};
+    std::vector<TokenId> tokens4 = {70, 80};
+
+    EXPECT_TRUE(store_->save_route(tokens1, 1));    // valid
+    EXPECT_TRUE(store_->save_route(tokens2, 0));    // zero (previously filtered)
+    EXPECT_TRUE(store_->save_route(tokens3, -1));   // negative (previously filtered)
+    EXPECT_TRUE(store_->save_route(tokens4, 42));   // valid
+
+    auto routes = store_->load_routes();
+    ASSERT_EQ(routes.size(), 4);
+
+    // All routes should be returned — persistence does not validate backend_id
+    std::set<BackendId> backend_ids;
+    for (const auto& r : routes) {
+        backend_ids.insert(r.backend_id);
+    }
+    EXPECT_TRUE(backend_ids.count(1));
+    EXPECT_TRUE(backend_ids.count(0));
+    EXPECT_TRUE(backend_ids.count(-1));
+    EXPECT_TRUE(backend_ids.count(42));
+
+    // No records should be counted as skipped — these are valid persistence records
+    EXPECT_EQ(store_->last_load_skipped_count(), 0);
 }

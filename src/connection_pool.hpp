@@ -28,23 +28,34 @@ struct ConnectionPoolConfig {
     std::chrono::seconds keepalive_interval{10};// Interval between keepalive probes
     unsigned keepalive_count = 3;               // Number of failed probes before closing
     std::chrono::seconds max_connection_age{300}; // Max lifetime of a connection (5 min default)
+    size_t max_backends = 1000;                    // Max unique backend addresses in pool map (Rule #4)
 };
 
 // A bundle representing an active connection with timestamp tracking
-struct ConnectionBundle {
+//
+// Clock injection: Template parameter defaults to std::chrono::steady_clock
+// for zero-overhead production use. Tests use TestClock for deterministic timing.
+//
+// Suppress deprecation warnings for Seastar stream default ctor and move-assignment.
+// Seastar deprecated these operations but our pool requires default-constructible
+// and move-assignable bundles for std::deque storage and element erasure.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+template<typename Clock = std::chrono::steady_clock>
+struct BasicConnectionBundle {
     seastar::connected_socket fd;
     seastar::input_stream<char> in;
     seastar::output_stream<char> out;
     seastar::socket_address addr;
     bool is_valid = true;
-    std::chrono::steady_clock::time_point created_at;
-    std::chrono::steady_clock::time_point last_used;
+    typename Clock::time_point created_at;
+    typename Clock::time_point last_used;
 
-    ConnectionBundle()
-        : created_at(std::chrono::steady_clock::now())
-        , last_used(std::chrono::steady_clock::now()) {}
+    BasicConnectionBundle()
+        : created_at(Clock::now())
+        , last_used(Clock::now()) {}
 
-    ConnectionBundle(seastar::connected_socket&& socket,
+    BasicConnectionBundle(seastar::connected_socket&& socket,
                      seastar::input_stream<char>&& input,
                      seastar::output_stream<char>&& output,
                      seastar::socket_address address)
@@ -53,8 +64,8 @@ struct ConnectionBundle {
         , out(std::move(output))
         , addr(address)
         , is_valid(true)
-        , created_at(std::chrono::steady_clock::now())
-        , last_used(std::chrono::steady_clock::now()) {}
+        , created_at(Clock::now())
+        , last_used(Clock::now()) {}
 
     // Close the connection
     seastar::future<> close() {
@@ -67,20 +78,20 @@ struct ConnectionBundle {
 
     // Check if connection has been idle too long
     bool is_expired(std::chrono::seconds timeout) const {
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
         return (now - last_used) > timeout;
     }
 
     // Check if connection has exceeded its maximum age (TTL)
     // Returns true if connection should be closed regardless of recent activity
     bool is_too_old(std::chrono::seconds max_age) const {
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
         return (now - created_at) > max_age;
     }
 
     // Update last used timestamp
     void touch() {
-        last_used = std::chrono::steady_clock::now();
+        last_used = Clock::now();
     }
 
     // Check if connection received FIN from backend (half-open detection)
@@ -92,9 +103,47 @@ struct ConnectionBundle {
     }
 };
 
-class ConnectionPool {
+#pragma GCC diagnostic pop
+
+// Backward-compatible alias: production code uses ConnectionBundle unchanged
+using ConnectionBundle = BasicConnectionBundle<>;
+
+// Close policy for production: async close keeps bundle alive on heap until
+// Seastar stream close completes, preventing batch-mode assertion failures.
+struct AsyncClosePolicy {
+    template<typename Bundle>
+    static void close(Bundle&& bundle) {
+        auto ptr = std::make_unique<Bundle>(std::move(bundle));
+        auto* raw_ptr = ptr.get();
+        (void)raw_ptr->close().finally([p = std::move(ptr)] {});
+    }
+};
+
+// Close policy for unit tests: synchronous drop without Seastar future operations.
+// Safe for default-constructed bundles whose null streams can be destroyed directly.
+// Avoids reactor dependency (.then()/.finally() call need_preempt() which segfaults
+// without a running Seastar reactor).
+struct SyncClosePolicy {
+    template<typename Bundle>
+    static void close(Bundle&& bundle) {
+        bundle.is_valid = false;
+    }
+};
+
+// Connection pool with LRU + TTL connection management
+//
+// Clock injection: Template parameter defaults to std::chrono::steady_clock
+// for zero-overhead production use. Tests use TestClock for deterministic timing.
+//
+// ClosePolicy injection: Controls how evicted bundles are closed.
+// Production uses AsyncClosePolicy (heap + .finally() to keep bundle alive).
+// Unit tests use SyncClosePolicy to avoid requiring a Seastar reactor.
+template<typename Clock = std::chrono::steady_clock, typename ClosePolicy = AsyncClosePolicy>
+class BasicConnectionPool {
 public:
-    explicit ConnectionPool(ConnectionPoolConfig config = {})
+    using Bundle = BasicConnectionBundle<Clock>;
+
+    explicit BasicConnectionPool(ConnectionPoolConfig config = {})
         : _config(config)
         , _reaper_timer([this] { reap_dead_connections(); })
     {
@@ -104,7 +153,7 @@ public:
         }
     }
 
-    ~ConnectionPool() {
+    ~BasicConnectionPool() {
         // Note: stop() should be called before destruction to properly wait
         // for in-flight timer callbacks. Destructor cancels as a safety net.
         _reaper_timer.cancel();
@@ -128,102 +177,92 @@ public:
     // GET: Reuse existing or create new connection
     // request_id: Optional request ID for tracing (empty string if not tracing)
     // Performs liveness checks on pooled connections before returning them
-    seastar::future<ConnectionBundle> get(seastar::socket_address addr,
+    seastar::future<Bundle> get(seastar::socket_address addr,
                                            const std::string& request_id = "") {
-        auto& pool = _pools[addr];
+        // Use find() instead of operator[] to avoid auto-inserting empty map
+        // entries for unknown addresses (Rule #4: bounded containers)
+        auto pool_it = _pools.find(addr);
 
-        // Try to find a valid, non-expired, live connection (LIFO for cache locality)
-        while (!pool.empty()) {
-            auto bundle = std::move(pool.back());
-            pool.pop_back();
-            _total_idle_connections--;
+        if (pool_it != _pools.end()) {
+            auto& pool = pool_it->second;
 
-            // Skip expired connections (idle too long)
-            if (bundle.is_expired(_config.idle_timeout)) {
-                if (!request_id.empty()) {
-                    log_pool.debug("[{}] Closing expired pooled connection to {}",
-                                   request_id, addr);
+            // Try to find a valid, non-expired, live connection (LIFO for cache locality)
+            while (!pool.empty()) {
+                auto bundle = std::move(pool.back());
+                pool.pop_back();
+                _total_idle_connections--;
+
+                // Skip expired connections (idle too long)
+                if (bundle.is_expired(_config.idle_timeout)) {
+                    if (!request_id.empty()) {
+                        log_pool.debug("[{}] Closing expired pooled connection to {}",
+                                       request_id, addr);
+                    }
+                    _dead_connections_reaped++;
+                    // Move to heap to keep alive during async close
+                    close_bundle_async(std::move(bundle));
+                    continue;
                 }
-                _dead_connections_reaped++;
-                // Move to heap to keep alive during async close
-                close_bundle_async(std::move(bundle));
-                continue;
-            }
 
-            // Skip connections that exceeded max age (TTL)
-            if (bundle.is_too_old(_config.max_connection_age)) {
-                if (!request_id.empty()) {
-                    log_pool.debug("[{}] Closing max-age pooled connection to {} (created too long ago)",
-                                   request_id, addr);
+                // Skip connections that exceeded max age (TTL)
+                if (bundle.is_too_old(_config.max_connection_age)) {
+                    if (!request_id.empty()) {
+                        log_pool.debug("[{}] Closing max-age pooled connection to {} (created too long ago)",
+                                       request_id, addr);
+                    }
+                    _dead_connections_reaped++;
+                    _connections_reaped_max_age++;
+                    // Move to heap to keep alive during async close
+                    close_bundle_async(std::move(bundle));
+                    continue;
                 }
-                _dead_connections_reaped++;
-                _connections_reaped_max_age++;
-                // Move to heap to keep alive during async close
-                close_bundle_async(std::move(bundle));
-                continue;
-            }
 
-            // Zombie/half-open detection: check if backend sent FIN
-            if (bundle.is_half_open()) {
-                if (!request_id.empty()) {
-                    log_pool.debug("[{}] Closing half-open connection to {} (backend closed)",
-                                   request_id, addr);
+                // Zombie/half-open detection: check if backend sent FIN
+                if (bundle.is_half_open()) {
+                    if (!request_id.empty()) {
+                        log_pool.debug("[{}] Closing half-open connection to {} (backend closed)",
+                                       request_id, addr);
+                    }
+                    _dead_connections_reaped++;
+                    // Move to heap to keep alive during async close
+                    close_bundle_async(std::move(bundle));
+                    continue;
                 }
-                _dead_connections_reaped++;
-                // Move to heap to keep alive during async close
-                close_bundle_async(std::move(bundle));
-                continue;
+
+                // Connection passed liveness checks
+                if (!request_id.empty()) {
+                    log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
+                }
+                bundle.touch();
+                return seastar::make_ready_future<Bundle>(std::move(bundle));
             }
 
-            // Connection passed liveness checks
-            if (!request_id.empty()) {
-                log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
-            }
-            bundle.touch();
-            return seastar::make_ready_future<ConnectionBundle>(std::move(bundle));
+            // All connections were stale - remove empty map entry (Rule #4)
+            _pools.erase(pool_it);
         }
 
         // No pooled connection available, create new one
         if (!request_id.empty()) {
             log_pool.debug("[{}] Creating new connection to {}", request_id, addr);
         }
-        return seastar::connect(addr).then([this, addr, request_id](seastar::connected_socket fd) {
-            // Disable Nagle's algorithm for lower latency
-            fd.set_nodelay(true);
+        return create_connection(addr, request_id);
+    }
 
-            // Enable TCP keep-alives to detect stale network paths
-            if (_config.tcp_keepalive) {
-                try {
-                    // Initialize the specific TCP parameters struct
-                    seastar::net::tcp_keepalive_params tcp_params;
-                    tcp_params.idle = _config.keepalive_idle;
-                    tcp_params.interval = _config.keepalive_interval;
-                    tcp_params.count = _config.keepalive_count;
-
-                    // Assign the struct to the variant
-                    seastar::net::keepalive_params params = tcp_params;
-
-                    fd.set_keepalive(true);
-                    fd.set_keepalive_parameters(params);
-
-                    if (!request_id.empty()) {
-                        log_pool.trace("[{}] TCP keepalive enabled for connection to {}", request_id, addr);
-                    }
-                } catch (const std::exception& e) {
-                    // Log but don't fail - keepalive is a nice-to-have
-                    log_pool.warn("Failed to set TCP keepalive for {}: {}", addr, e.what());
-                }
-            }
-
-            auto in = fd.input();
-            auto out = fd.output();
-            return ConnectionBundle{std::move(fd), std::move(in), std::move(out), addr};
-        });
+    // GET FRESH: Always create a new connection, bypassing pool cache.
+    // Use when a pooled connection was detected as stale after use.
+    // request_id: Optional request ID for tracing (empty string if not tracing)
+    seastar::future<Bundle> get_fresh(seastar::socket_address addr,
+                                      const std::string& request_id = "") {
+        if (!request_id.empty()) {
+            log_pool.info("[{}] Creating fresh connection to {} (bypassing pool)",
+                          request_id, addr);
+        }
+        return create_connection(addr, request_id);
     }
 
     // PUT: Return connection to pool
     // request_id: Optional request ID for tracing (empty string if not tracing)
-    void put(ConnectionBundle&& bundle, const std::string& request_id = "") {
+    void put(Bundle&& bundle, const std::string& request_id = "") {
         if (!bundle.is_valid) {
             if (!request_id.empty()) {
                 log_pool.debug("[{}] Closing invalid connection to {}",
@@ -245,7 +284,21 @@ public:
         }
 
         bundle.touch();
-        auto& pool = _pools[bundle.addr];
+
+        // Rule #4: Check MAX_BACKENDS before inserting new map entry
+        auto pool_it = _pools.find(bundle.addr);
+        if (pool_it == _pools.end()) {
+            if (_pools.size() >= _config.max_backends) {
+                // Too many unique backends - reject pooling this connection
+                log_pool.warn("Backend limit reached ({} backends), not pooling connection to {}",
+                              _pools.size(), bundle.addr);
+                _backends_rejected++;
+                close_bundle_async(std::move(bundle));
+                return;
+            }
+            pool_it = _pools.emplace(bundle.addr, std::deque<Bundle>{}).first;
+        }
+        auto& pool = pool_it->second;
 
         // Check per-host limit
         if (pool.size() >= _config.max_connections_per_host) {
@@ -277,8 +330,10 @@ public:
         size_t num_backends;
         size_t max_per_host;
         size_t max_total;
+        size_t max_backends;
         size_t dead_connections_reaped;      // Total dead connections detected and closed
         size_t connections_reaped_max_age;   // Connections closed due to exceeding max age
+        size_t backends_rejected;            // Connections not pooled due to backend limit
     };
 
     Stats stats() const {
@@ -287,8 +342,10 @@ public:
             _pools.size(),
             _config.max_connections_per_host,
             _config.max_total_connections,
+            _config.max_backends,
             _dead_connections_reaped,
-            _connections_reaped_max_age
+            _connections_reaped_max_age,
+            _backends_rejected
         };
     }
 
@@ -377,11 +434,45 @@ public:
     }
 
 private:
+    // Create a new TCP connection with nodelay and keepalive configured.
+    // Shared by get() (pool miss) and get_fresh() (bypassing pool).
+    seastar::future<Bundle> create_connection(seastar::socket_address addr,
+                                              const std::string& request_id) {
+        return seastar::connect(addr).then([this, addr, request_id](seastar::connected_socket fd) {
+            fd.set_nodelay(true);
+
+            if (_config.tcp_keepalive) {
+                try {
+                    seastar::net::tcp_keepalive_params tcp_params;
+                    tcp_params.idle = _config.keepalive_idle;
+                    tcp_params.interval = _config.keepalive_interval;
+                    tcp_params.count = _config.keepalive_count;
+
+                    seastar::net::keepalive_params params = tcp_params;
+
+                    fd.set_keepalive(true);
+                    fd.set_keepalive_parameters(params);
+
+                    if (!request_id.empty()) {
+                        log_pool.trace("[{}] TCP keepalive enabled for connection to {}", request_id, addr);
+                    }
+                } catch (const std::exception& e) {
+                    log_pool.warn("Failed to set TCP keepalive for {}: {}", addr, e.what());
+                }
+            }
+
+            auto in = fd.input();
+            auto out = fd.output();
+            return Bundle{std::move(fd), std::move(in), std::move(out), addr};
+        });
+    }
+
     ConnectionPoolConfig _config;
-    std::unordered_map<seastar::socket_address, std::deque<ConnectionBundle>> _pools;
+    std::unordered_map<seastar::socket_address, std::deque<Bundle>> _pools;
     size_t _total_idle_connections = 0;
     size_t _dead_connections_reaped = 0;
     size_t _connections_reaped_max_age = 0;
+    size_t _backends_rejected = 0;
     seastar::timer<> _reaper_timer;
 
     // RAII gate for timer callback lifetime safety (Rule #5).
@@ -426,7 +517,7 @@ private:
     // Evict the oldest connection across all pools
     void evict_oldest_global() {
         seastar::socket_address* oldest_addr = nullptr;
-        std::chrono::steady_clock::time_point oldest_time = std::chrono::steady_clock::now();
+        typename Clock::time_point oldest_time = Clock::now();
 
         for (auto& [addr, pool] : _pools) {
             if (!pool.empty() && pool.front().last_used < oldest_time) {
@@ -446,18 +537,16 @@ private:
         }
     }
 
-    // Close a connection bundle asynchronously, keeping it alive until close completes.
-    // This prevents the Seastar output_stream assertion failure that occurs when
-    // a stream is destroyed while still in batch mode.
-    static void close_bundle_async(ConnectionBundle&& bundle) {
-        // Move bundle to heap so it outlives this scope
-        auto ptr = std::make_unique<ConnectionBundle>(std::move(bundle));
-        auto* raw_ptr = ptr.get();
-        // Start close and destroy bundle after completion
-        (void)raw_ptr->close().finally([p = std::move(ptr)] {
-            // unique_ptr releases the bundle here after close completes
-        });
+    // Close a connection bundle via the configured close policy.
+    // Production (AsyncClosePolicy): keeps bundle alive on heap during async close
+    // to prevent Seastar output_stream batch-mode assertion failures.
+    // Tests (SyncClosePolicy): synchronous drop for null streams without reactor.
+    static void close_bundle_async(Bundle&& bundle) {
+        ClosePolicy::close(std::move(bundle));
     }
 };
+
+// Backward-compatible alias: production code uses ConnectionPool unchanged
+using ConnectionPool = BasicConnectionPool<>;
 
 } // namespace ranvier

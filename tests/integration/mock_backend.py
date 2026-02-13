@@ -28,6 +28,9 @@ sys.stderr.reconfigure(line_buffering=True)
 
 BACKEND_ID = os.environ.get("BACKEND_ID", "unknown")
 
+# Server-wide state for admin-controlled behaviors
+_keepalive_enabled = os.environ.get("MOCK_KEEPALIVE", "0") == "1"
+
 
 class MockBackendHandler(BaseHTTPRequestHandler):
     """Handler for mock vLLM endpoints."""
@@ -62,26 +65,47 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health" or parsed.path == "/":
+            body = json.dumps({"status": "ok", "backend_id": BACKEND_ID, "keepalive": _keepalive_enabled}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            response = {"status": "ok", "backend_id": BACKEND_ID}
-            self.wfile.write(json.dumps(response).encode())
+            self.wfile.write(body)
+            self.wfile.flush()
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
-        """Handle POST requests for chat completions."""
+        """Handle POST requests for chat completions and admin endpoints."""
         print(f"[Backend {BACKEND_ID}] POST received: {self.path}", flush=True)
         parsed = urlparse(self.path)
 
         if parsed.path == "/v1/chat/completions":
             self._handle_chat_completion()
+        elif parsed.path == "/admin/keepalive":
+            self._handle_admin_keepalive()
         else:
             print(f"[Backend {BACKEND_ID}] Unknown path: {parsed.path}", flush=True)
             self.send_response(404)
             self.end_headers()
+
+    def _handle_admin_keepalive(self):
+        """Toggle keep-alive mode. POST /admin/keepalive?enabled=1|0"""
+        global _keepalive_enabled
+        from urllib.parse import parse_qs
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        enabled = params.get("enabled", ["1"])[0]
+        _keepalive_enabled = enabled == "1"
+        print(f"[Backend {BACKEND_ID}] Keep-alive set to: {_keepalive_enabled}", flush=True)
+        body = json.dumps({"keepalive": _keepalive_enabled}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
 
     def _handle_chat_completion(self):
         """Simulate a streaming chat completion response."""
@@ -95,10 +119,13 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         try:
             request_data = json.loads(body) if body else {}
         except json.JSONDecodeError:
+            body = b'{"error": "Invalid JSON"}'
             self.send_response(400)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b'{"error": "Invalid JSON"}')
+            self.wfile.write(body)
+            self.wfile.flush()
             return
 
         # Extract prompt from messages
@@ -111,12 +138,12 @@ class MockBackendHandler(BaseHTTPRequestHandler):
         print(f"[Backend {BACKEND_ID}] Request {request_id}: prompt='{prompt[:50]}...'", flush=True)
 
         # Send streaming response with chunked transfer encoding
-        # Use Connection: close to prevent blocking on single-threaded server
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
-        self.send_header("Connection", "close")  # Prevent keep-alive blocking
+        if not _keepalive_enabled:
+            self.send_header("Connection", "close")
         self.send_header("X-Request-ID", request_id)
         self.send_header("X-Backend-ID", BACKEND_ID)
         self.end_headers()

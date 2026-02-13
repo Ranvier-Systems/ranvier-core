@@ -307,6 +307,7 @@ struct RetryConfig {
     std::chrono::milliseconds initial_backoff{100};   // Initial backoff delay
     std::chrono::milliseconds max_backoff{5000};      // Maximum backoff delay
     double backoff_multiplier = 2.0;                  // Exponential backoff multiplier
+    uint32_t max_stale_retries = 1;                   // Max retries for stale/empty backend responses (0 = disabled)
 };
 
 // =============================================================================

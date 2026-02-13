@@ -154,10 +154,10 @@ services:
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
-    # Use --smp 8 to leverage multi-core performance
-    # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
-    # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
-    command: ["./ranvier_server", "--smp", "8", "--std-alloc"]
+    # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
+    # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
+    # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
+    command: ["./ranvier_server", "--smp", "8"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -202,10 +202,10 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       - RAYON_NUM_THREADS=1
-    # Use --smp 8 to leverage multi-core performance
-    # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
-    # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
-    command: ["./ranvier_server", "--smp", "8", "--std-alloc"]
+    # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
+    # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
+    # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
+    command: ["./ranvier_server", "--smp", "8"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -250,10 +250,10 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       - RAYON_NUM_THREADS=1
-    # Use --smp 8 to leverage multi-core performance
-    # --std-alloc uses glibc malloc instead of Seastar's per-shard allocator,
-    # which is required for Rust FFI (tokenizers) to work correctly with multiple shards
-    command: ["./ranvier_server", "--smp", "8", "--std-alloc"]
+    # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
+    # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
+    # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
+    command: ["./ranvier_server", "--smp", "8"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s

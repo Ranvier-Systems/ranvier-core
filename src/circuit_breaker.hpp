@@ -3,6 +3,9 @@
 // Implements the circuit breaker pattern for graceful degradation.
 // Tracks backend failures and automatically stops routing to failing backends.
 //
+// Clock injection: Template parameter defaults to std::chrono::steady_clock
+// for zero-overhead production use. Tests use TestClock for deterministic timing.
+//
 // States:
 // - CLOSED: Normal operation, requests flow through
 // - OPEN: Backend has failed too many times, requests are blocked
@@ -25,18 +28,26 @@ enum class CircuitState {
 };
 
 // Per-backend circuit state
-struct BackendCircuit {
+// Clock parameter allows injecting a test clock for deterministic timing
+template<typename Clock = std::chrono::steady_clock>
+struct BasicBackendCircuit {
     CircuitState state = CircuitState::CLOSED;
     uint32_t failure_count = 0;
     uint32_t success_count = 0;
-    std::chrono::steady_clock::time_point last_failure_time;
-    std::chrono::steady_clock::time_point opened_at;
+    typename Clock::time_point last_failure_time;
+    typename Clock::time_point opened_at;
 
-    BackendCircuit() = default;
+    BasicBackendCircuit() = default;
 };
 
+// Backward-compatible alias: production code uses BackendCircuit unchanged
+using BackendCircuit = BasicBackendCircuit<>;
+
 // Thread-local circuit breaker (no locks needed in Seastar's shared-nothing model)
-class CircuitBreaker {
+// Clock parameter allows injecting a test clock for deterministic timing.
+// Production default (steady_clock) is resolved at compile time with zero overhead.
+template<typename Clock = std::chrono::steady_clock>
+class BasicCircuitBreaker {
     // Maximum number of unique circuits to track (Rule #4: bounded containers)
     // Prevents OOM from malicious/buggy backends flooding unique IDs
     static constexpr size_t MAX_CIRCUITS = 10000;
@@ -50,7 +61,7 @@ public:
         bool enabled = true;                       // Enable/disable circuit breaker
     };
 
-    explicit CircuitBreaker(Config config)
+    explicit BasicCircuitBreaker(Config config)
         : _config(std::move(config)) {}
 
     // Check if a request to this backend should be allowed
@@ -69,12 +80,12 @@ public:
                 return true;  // Fail-open: allow request when limit reached
             }
             // Create new circuit in CLOSED state
-            _circuits.emplace(backend_id, BackendCircuit{});
+            _circuits.emplace(backend_id, BasicBackendCircuit<Clock>{});
             return true;  // New circuit starts CLOSED, allow request
         }
 
         auto& circuit = it->second;
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
 
         switch (circuit.state) {
             case CircuitState::CLOSED:
@@ -153,11 +164,11 @@ public:
                 return;  // Skip: cannot track new circuit when limit reached
             }
             // Create new circuit and record the failure
-            it = _circuits.emplace(backend_id, BackendCircuit{}).first;
+            it = _circuits.emplace(backend_id, BasicBackendCircuit<Clock>{}).first;
         }
 
         auto& circuit = it->second;
-        auto now = std::chrono::steady_clock::now();
+        auto now = Clock::now();
 
         circuit.failure_count++;
         circuit.last_failure_time = now;
@@ -261,10 +272,13 @@ public:
 
 private:
     Config _config;
-    std::unordered_map<BackendId, BackendCircuit> _circuits;
+    std::unordered_map<BackendId, BasicBackendCircuit<Clock>> _circuits;
     uint64_t _circuits_overflow = 0;  // Times circuit limit was hit (Rule #4)
     uint64_t _circuits_removed = 0;   // Circuits cleaned up when backends deregistered (Rule #4)
 };
+
+// Backward-compatible alias: production code uses CircuitBreaker unchanged
+using CircuitBreaker = BasicCircuitBreaker<>;
 
 // Convert circuit state to string for logging
 inline const char* circuit_state_to_string(CircuitState state) {

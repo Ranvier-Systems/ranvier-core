@@ -45,11 +45,16 @@ enum class QuorumState : uint8_t {
 };
 
 // Peer state tracking for liveness detection
-struct PeerState {
-    seastar::lowres_clock::time_point last_seen;
+// Clock parameter allows injecting a test clock for deterministic timing
+template<typename Clock = seastar::lowres_clock>
+struct BasicPeerState {
+    typename Clock::time_point last_seen;
     bool is_alive = true;
     std::optional<BackendId> associated_backend;  // Track which backend this peer represents
 };
+
+// Backward-compatible alias: production code uses PeerState unchanged
+using PeerState = BasicPeerState<>;
 
 // Peer info for admin API
 struct PeerInfo {
@@ -148,10 +153,13 @@ public:
     // Admin API
     ClusterState get_cluster_state() const;
 
-    // Callbacks
-    void set_prune_callback(RoutePruneCallback callback) {
-        _route_prune_callback = std::move(callback);
-    }
+    // Per-shard callback registration for route pruning.
+    // Each shard registers its own local callback to avoid broadcasting
+    // std::function across shards (anti-pattern Bug #3: cross-shard free).
+    // Shard 0 broadcasts only the scalar BackendId; each shard invokes
+    // its own locally-registered callback.
+    static void register_local_prune_callback(RoutePruneCallback callback);
+    static void clear_local_prune_callback();
 
     // Provide read access to peer table for protocol layer
     const std::unordered_map<seastar::socket_address, PeerState>& peer_table() const {
@@ -204,9 +212,6 @@ private:
     // Timers
     seastar::timer<> _liveness_timer;
     seastar::gate _timer_gate;
-
-    // Callbacks
-    RoutePruneCallback _route_prune_callback;
 
     // Internal methods
     void check_liveness();

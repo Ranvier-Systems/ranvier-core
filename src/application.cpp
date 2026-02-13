@@ -140,6 +140,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.retry.initial_backoff = config.retry.initial_backoff;
     cfg.retry.max_backoff = config.retry.max_backoff;
     cfg.retry.backoff_multiplier = config.retry.backoff_multiplier;
+    cfg.max_stale_retries = config.retry.max_stale_retries;
     // Circuit breaker
     cfg.circuit_breaker.enabled = config.circuit_breaker.enabled;
     cfg.circuit_breaker.failure_threshold = config.circuit_breaker.failure_threshold;
@@ -335,6 +336,15 @@ seastar::future<> Application::load_persisted_state() {
         log_main.warn("Skipped {} corrupted route records during load", skipped);
     }
 
+    // Step 2b: Filter out routes with invalid backend_id (business validation)
+    // Persistence returns raw data; the service layer validates.
+    size_t invalid_backend_count = std::erase_if(routes, [](const RouteRecord& r) {
+        return r.backend_id <= 0;
+    });
+    if (invalid_backend_count > 0) {
+        log_main.warn("Discarded {} routes with invalid backend_id <= 0", invalid_backend_count);
+    }
+
     if (backends.empty() && routes.empty()) {
         log_main.info("Persistence store is empty - starting fresh");
         return seastar::make_ready_future<>();
@@ -342,7 +352,8 @@ seastar::future<> Application::load_persisted_state() {
 
     log_main.info("Restoring state from persistence:");
     log_main.info("  Backends: {}", backends.size());
-    log_main.info("  Routes:   {} (skipped {} corrupted)", routes.size(), skipped);
+    log_main.info("  Routes:   {} (skipped {} corrupted, {} invalid backend_id)",
+                  routes.size(), skipped, invalid_backend_count);
 
     for (const auto& rec : backends) {
         log_main.info("  - Backend {} -> {}:{} (weight={}, priority={})",
@@ -658,7 +669,6 @@ seastar::future<> Application::start_servers() {
         return _metrics_server->start();
     }).then([this] {
         seastar::prometheus::config pconf;
-        pconf.metric_help = "Ranvier AI Router";
         return seastar::prometheus::start(*_metrics_server, pconf);
     }).then([this] {
         auto addr = seastar::socket_address(
@@ -703,6 +713,12 @@ seastar::future<> Application::stop_servers() {
 }
 
 void Application::setup_signal_handlers() {
+    // Suppress deprecation: reactor::handle_signal is deprecated in favor of
+    // seastar::handle_signal() free function, but the free function is not
+    // available in our Seastar version yet.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
     // =========================================================================
     // SIGHUP handler - Configuration hot-reload
     // =========================================================================
@@ -781,6 +797,8 @@ void Application::setup_signal_handlers() {
         signal_shutdown();
     });
     log_main.info("SIGTERM handler registered (graceful shutdown)");
+
+#pragma GCC diagnostic pop
 }
 
 void Application::signal_shutdown() {

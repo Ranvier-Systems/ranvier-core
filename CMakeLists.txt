@@ -73,7 +73,7 @@ FetchContent_MakeAvailable(rapidjson)
 # RapidJSON is header-only. We must define the include path for the project.
 # The headers are located in the 'include' subdirectory of the fetched source.
 add_library(rapidjson_interface INTERFACE)
-target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
+target_include_directories(rapidjson_interface SYSTEM INTERFACE ${rapidjson_SOURCE_DIR}/include)
 
 # Option to disable OpenTelemetry (avoids static initialization that can block)
 option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
@@ -157,7 +157,15 @@ if(Seastar_FOUND)
       GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp
       GIT_TAG        main
     )
+    # Suppress warnings from third-party code compiled within tokenizers_cpp
+    # (vendored protobuf-lite emits -Warray-bounds false positives with GCC 12+)
+    set(_saved_c_flags "${CMAKE_C_FLAGS}")
+    set(_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+    string(APPEND CMAKE_C_FLAGS " -w")
+    string(APPEND CMAKE_CXX_FLAGS " -w")
     FetchContent_MakeAvailable(tokenizers_cpp)
+    set(CMAKE_C_FLAGS "${_saved_c_flags}")
+    set(CMAKE_CXX_FLAGS "${_saved_cxx_flags}")
 
     # ==========================================================================
     # Patch tokenizers-cpp to use jemalloc as Rust's global allocator
@@ -319,6 +327,105 @@ target_link_libraries(text_validator_test
 )
 gtest_discover_tests(text_validator_test)
 
+# ParseUtils Unit Tests (Pure C++, header-only)
+add_executable(parse_utils_test
+  tests/unit/parse_utils_test.cpp
+)
+target_include_directories(parse_utils_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(parse_utils_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(parse_utils_test)
+
+# Logging Unit Tests (Pure C++, uses stubs for Seastar/fmt)
+# Tests generate_request_id format and header extraction helpers.
+add_executable(logging_test
+  tests/unit/logging_test.cpp
+)
+target_include_directories(logging_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(logging_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(logging_test)
+
+# ShardLoadMetrics Unit Tests (Pure C++, uses stubs for Seastar)
+# Tests RAII guards, atomic counters, load scoring, and snapshot semantics.
+add_executable(shard_load_metrics_test
+  tests/unit/shard_load_metrics_test.cpp
+)
+target_include_directories(shard_load_metrics_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(shard_load_metrics_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(shard_load_metrics_test)
+
+# MetricsService Unit Tests (Pure C++, uses stubs for Seastar metrics)
+# Tests histogram buckets, bounded containers (Rule #4), cache-hit-ratio,
+# prefix skip averaging, and counter recording.
+add_executable(metrics_service_test
+  tests/unit/metrics_service_test.cpp
+)
+target_include_directories(metrics_service_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(metrics_service_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(metrics_service_test)
+
+# NodeSlab Unit Tests (Pure C++, no Seastar dependency)
+# Tests slab allocator: allocate/free round-trips, free-list integrity,
+# peak tracking, auto-growth, and make_node factory methods.
+add_executable(node_slab_test
+  tests/unit/node_slab_test.cpp
+  src/node_slab.cpp
+)
+target_include_directories(node_slab_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(node_slab_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(node_slab_test)
+
+# CrossShardRequest Unit Tests (Pure C++, uses stubs for Seastar)
+# Tests validation limits, force_local_allocation, and result factories.
+add_executable(cross_shard_request_test
+  tests/unit/cross_shard_request_test.cpp
+)
+target_include_directories(cross_shard_request_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(cross_shard_request_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(cross_shard_request_test)
+
+# TracingService Unit Tests (W3C traceparent parsing only, no OTel)
+# Compiled with RANVIER_NO_TELEMETRY; real parse logic provided in test file.
+add_executable(tracing_service_test
+  tests/unit/tracing_service_test.cpp
+)
+target_compile_definitions(tracing_service_test PRIVATE RANVIER_NO_TELEMETRY)
+target_include_directories(tracing_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(tracing_service_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(tracing_service_test)
+
 # Persistence Unit Tests (Pure C++, no Seastar dependency)
 add_executable(persistence_test
   tests/unit/persistence_test.cpp
@@ -356,6 +463,18 @@ target_link_libraries(gossip_protocol_test
   GTest::gtest_main
 )
 gtest_discover_tests(gossip_protocol_test)
+
+# Gossip Transport Ownership Pattern Tests (Pure C++, no Seastar dependency)
+# Tests verifying shard-local ownership patterns (Rule #0: no std::shared_ptr)
+add_executable(gossip_transport_ownership_test
+  tests/unit/gossip_transport_ownership_test.cpp
+)
+target_include_directories(gossip_transport_ownership_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gossip_transport_ownership_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_transport_ownership_test)
 
 # Route Batching Unit Tests (Pure C++, no Seastar dependency)
 # Tests for route batching data structures and behavior
@@ -421,11 +540,14 @@ target_link_libraries(load_aware_routing_test
 gtest_discover_tests(load_aware_routing_test)
 
 # Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
-# Tests for quorum calculation and state transitions
+# Tests for quorum calculation, state transitions, and peer liveness with TestClock
 add_executable(quorum_test
   tests/unit/quorum_test.cpp
 )
-target_include_directories(quorum_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(quorum_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
 target_link_libraries(quorum_test
   PRIVATE
   GTest::gtest_main
@@ -433,16 +555,81 @@ target_link_libraries(quorum_test
 gtest_discover_tests(quorum_test)
 
 # Circuit Breaker Unit Tests (Pure C++, no Seastar dependency)
-# Tests for circuit breaker pattern and remove_circuit cleanup (Rule #4)
+# Tests for circuit breaker pattern, remove_circuit cleanup (Rule #4), and timing with TestClock
 add_executable(circuit_breaker_test
   tests/unit/circuit_breaker_test.cpp
 )
-target_include_directories(circuit_breaker_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(circuit_breaker_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
 target_link_libraries(circuit_breaker_test
   PRIVATE
   GTest::gtest_main
 )
 gtest_discover_tests(circuit_breaker_test)
+
+# Rate Limiter Unit Tests (Pure C++, no Seastar dependency)
+# Tests for token bucket rate limiter, MAX_BUCKETS bound (Rule #4), and timing with TestClock
+add_executable(rate_limiter_test
+  tests/unit/rate_limiter_test.cpp
+)
+target_include_directories(rate_limiter_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(rate_limiter_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(rate_limiter_test)
+
+# Proxy Retry Policy Unit Tests (Pure C++, no Seastar dependency)
+# Tests for retry/backoff/fallback decisions, connection error classification,
+# fallback backend selection, and backpressure policy with TestClock
+add_executable(proxy_retry_policy_test
+  tests/unit/proxy_retry_policy_test.cpp
+)
+target_include_directories(proxy_retry_policy_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(proxy_retry_policy_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(proxy_retry_policy_test)
+
+# ShardLoadMetrics Concurrency Stress Tests (Pure C++, uses stubs for Seastar)
+# Tests concurrent atomic increment/decrement, RAII guard balance, and snapshot under contention
+add_executable(shard_load_metrics_concurrency_test
+  tests/unit/shard_load_metrics_concurrency_test.cpp
+)
+target_include_directories(shard_load_metrics_concurrency_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(shard_load_metrics_concurrency_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(shard_load_metrics_concurrency_test)
+
+# Rate Limiter Concurrency Stress Tests (Pure C++, no Seastar dependency)
+# Tests atomic overflow counter under MAX_BUCKETS pressure, concurrent allow() with unique IPs,
+# and concurrent cleanup/config reads with TestClock
+add_executable(rate_limiter_concurrency_test
+  tests/unit/rate_limiter_concurrency_test.cpp
+)
+target_include_directories(rate_limiter_concurrency_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/unit
+)
+target_link_libraries(rate_limiter_concurrency_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(rate_limiter_concurrency_test)
 
 # ShardedConfig Unit Tests (Requires Seastar types for header includes)
 # Tests ShardedConfig wrapper class for per-core config distribution
@@ -474,6 +661,39 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(crypto_offloader_test)
 
+    # DtlsContext Unit Tests (Requires Seastar types for header includes)
+    # Tests memory-based certificate loading (load_certs_from_memory) without reactor
+    add_executable(dtls_context_test
+      tests/unit/dtls_context_test.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(dtls_context_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(dtls_context_test
+      PRIVATE
+      Seastar::seastar
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(dtls_context_test)
+
+# ConnectionPool Unit Tests (Requires Seastar types)
+    # Tests pool management logic: per-host limits, global limits, idle timeout
+    # eviction, max-age TTL enforcement, and half-open detection with TestClock.
+    add_executable(connection_pool_test
+      tests/unit/connection_pool_test.cpp
+    )
+    target_include_directories(connection_pool_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/tests/unit
+    )
+    target_link_libraries(connection_pool_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest_main
+    )
+    gtest_discover_tests(connection_pool_test)
+
 # StreamParser Unit Tests (Requires Seastar types)
     add_executable(stream_parser_test
       tests/unit/stream_parser_test.cpp
@@ -489,17 +709,23 @@ if(Seastar_FOUND)
 
     # AsyncPersistence Unit Tests (Requires Seastar types for header includes)
     # Tests queue behavior, backpressure, and configuration without running Seastar event loop
+    # Uses gmock for MockPersistenceStore (dependency isolation)
     add_executable(async_persistence_test
       tests/unit/async_persistence_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
     )
-    target_include_directories(async_persistence_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    target_include_directories(async_persistence_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${SQLITE3_INCLUDE_DIRS}
+    )
     target_link_libraries(async_persistence_test
       PRIVATE
       Seastar::seastar
       ${SQLITE3_LIBRARIES}
       GTest::gtest_main
+      GTest::gmock
     )
     gtest_discover_tests(async_persistence_test)
 
@@ -581,4 +807,68 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(tokenizer_thread_pool_test)
+
+    # RouterService Integration Tests (Seastar-dependent)
+    # Tests the core routing brain: route learning, TTL, backend lifecycle, draining mode.
+    # Links against multiple src/*.cpp files for full RouterService + GossipService compilation.
+    add_executable(router_service_test
+      tests/unit/router_service_test.cpp
+      src/router_service.cpp
+      src/node_slab.cpp
+      src/gossip_service.cpp
+      src/gossip_protocol.cpp
+      src/gossip_consensus.cpp
+      src/gossip_transport.cpp
+      src/crypto_offloader.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(router_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(router_service_test
+      PRIVATE
+      Seastar::seastar
+      absl::flat_hash_map
+      absl::flat_hash_set
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(router_service_test)
+
+    # AsyncPersistence Concurrency Stress Tests (Requires Seastar types)
+    # Tests concurrent enqueue from multiple threads, backpressure enforcement,
+    # queue depth accounting, and ClearAll under contention
+    add_executable(async_persistence_concurrency_test
+      tests/unit/async_persistence_concurrency_test.cpp
+      src/async_persistence.cpp
+      src/sqlite_persistence.cpp
+    )
+    target_include_directories(async_persistence_concurrency_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src
+      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${SQLITE3_INCLUDE_DIRS}
+    )
+    target_link_libraries(async_persistence_concurrency_test
+      PRIVATE
+      Seastar::seastar
+      ${SQLITE3_LIBRARIES}
+      GTest::gtest_main
+      GTest::gmock
+    )
+    gtest_discover_tests(async_persistence_concurrency_test)
+
+    # TokenizerThreadPool Concurrency Stress Tests (Requires Seastar types)
+    # Tests concurrent SPSC queue submit and stat reads, config accessor thread safety,
+    # and queue boundary behavior under contention
+    add_executable(tokenizer_thread_pool_concurrency_test
+      tests/unit/tokenizer_thread_pool_concurrency_test.cpp
+      src/tokenizer_thread_pool.cpp
+    )
+    target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(tokenizer_thread_pool_concurrency_test
+      PRIVATE
+      Seastar::seastar
+      tokenizers_cpp
+      GTest::gtest_main
+    )
+    gtest_discover_tests(tokenizer_thread_pool_concurrency_test)
 endif()

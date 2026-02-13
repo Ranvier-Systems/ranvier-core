@@ -5,9 +5,13 @@
 
 #include <gtest/gtest.h>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Include only the types we need (avoid Seastar headers)
@@ -239,10 +243,16 @@ struct K8sEndpoint {
     uint32_t weight = K8S_DEFAULT_WEIGHT;
     uint32_t priority = K8S_DEFAULT_PRIORITY;
 
+    // FNV-1a 64-bit hash, truncated to 31 bits for positive BackendId.
+    // Mirrors the production implementation in k8s_discovery_service.cpp.
     BackendId to_backend_id() const {
-        uint32_t hash = 0;
-        for (char c : uid) {
-            hash = hash * 31 + static_cast<uint32_t>(c);
+        constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+        constexpr uint64_t kFnvPrime = 1099511628211ULL;
+
+        uint64_t hash = kFnvOffsetBasis;
+        for (unsigned char c : uid) {
+            hash ^= c;
+            hash *= kFnvPrime;
         }
         return static_cast<BackendId>(hash & 0x7FFFFFFF);
     }
@@ -856,6 +866,184 @@ TEST_F(K8sBackendIdTest, IdIsDeterministic) {
 }
 
 // =============================================================================
+// FNV-1a Hash Quality Tests
+// =============================================================================
+// Verify that the FNV-1a hash produces well-distributed BackendIds
+// and avoids the clustering issues of the old hash*31+c polynomial.
+
+class K8sFnvHashQualityTest : public ::testing::Test {};
+
+TEST_F(K8sFnvHashQualityTest, SimilarUidsProduceDifferentIds) {
+    // The old hash*31+c had poor distribution for similar strings.
+    // FNV-1a should distribute these well.
+    std::vector<std::string> similar_uids = {
+        "pod-uid-001", "pod-uid-002", "pod-uid-003",
+        "pod-uid-010", "pod-uid-011", "pod-uid-012",
+        "pod-uid-100", "pod-uid-101", "pod-uid-102"
+    };
+
+    std::set<BackendId> ids;
+    for (const auto& uid : similar_uids) {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ids.insert(ep.to_backend_id());
+    }
+    // All similar UIDs should produce unique BackendIds
+    EXPECT_EQ(ids.size(), similar_uids.size());
+}
+
+TEST_F(K8sFnvHashQualityTest, RealK8sUidsProduceUniqueIds) {
+    // Test with realistic K8s pod UIDs (UUID v4 format)
+    std::vector<std::string> k8s_uids = {
+        "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        "c3d4e5f6-a7b8-9012-cdef-123456789012",
+        "d4e5f6a7-b8c9-0123-def1-234567890123",
+        "e5f6a7b8-c9d0-1234-ef12-345678901234",
+        "f6a7b8c9-d0e1-2345-f123-456789012345",
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "12345678-1234-1234-1234-123456789abc"
+    };
+
+    std::set<BackendId> ids;
+    for (const auto& uid : k8s_uids) {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ids.insert(ep.to_backend_id());
+    }
+    EXPECT_EQ(ids.size(), k8s_uids.size());
+}
+
+TEST_F(K8sFnvHashQualityTest, NoCollisionsInFirst1000SequentialUids) {
+    // Test that 1000 sequential UIDs (the MAX_ENDPOINTS limit)
+    // produce no collisions
+    std::set<BackendId> ids;
+    for (int i = 0; i < 1000; ++i) {
+        K8sEndpoint ep;
+        ep.uid = "pod-" + std::to_string(i);
+        ids.insert(ep.to_backend_id());
+    }
+    EXPECT_EQ(ids.size(), 1000u);
+}
+
+TEST_F(K8sFnvHashQualityTest, EmptyUidProducesValidId) {
+    K8sEndpoint ep;
+    ep.uid = "";
+    BackendId id = ep.to_backend_id();
+    EXPECT_GE(id, 0);
+}
+
+TEST_F(K8sFnvHashQualityTest, SingleCharUidsProduceUniqueIds) {
+    std::set<BackendId> ids;
+    for (int c = 0; c < 128; ++c) {
+        K8sEndpoint ep;
+        ep.uid = std::string(1, static_cast<char>(c));
+        ids.insert(ep.to_backend_id());
+    }
+    // All single-char UIDs should produce unique BackendIds
+    EXPECT_EQ(ids.size(), 128u);
+}
+
+// =============================================================================
+// BackendId Collision Detection Tests
+// =============================================================================
+// Tests for the collision detection logic added to handle_endpoint_added().
+// Replicates the reverse-map collision check without Seastar dependencies.
+
+class K8sCollisionDetectionTest : public ::testing::Test {
+protected:
+    // Simulates the collision detection from handle_endpoint_added()
+    struct CollisionTracker {
+        std::map<BackendId, std::string> backend_id_to_uid;  // reverse map
+        std::map<std::string, K8sEndpoint> endpoints;
+        uint64_t collision_count = 0;
+
+        // Returns true if collision was detected
+        bool try_add(const K8sEndpoint& ep) {
+            auto backend_id = ep.to_backend_id();
+            bool collision = false;
+
+            auto it = backend_id_to_uid.find(backend_id);
+            if (it != backend_id_to_uid.end() && it->second != ep.uid) {
+                ++collision_count;
+                collision = true;
+            }
+            backend_id_to_uid[backend_id] = ep.uid;
+            endpoints[ep.uid] = ep;
+            return collision;
+        }
+
+        void remove(const std::string& uid) {
+            auto it = endpoints.find(uid);
+            if (it == endpoints.end()) return;
+
+            auto backend_id = it->second.to_backend_id();
+            auto rev_it = backend_id_to_uid.find(backend_id);
+            if (rev_it != backend_id_to_uid.end() && rev_it->second == uid) {
+                backend_id_to_uid.erase(rev_it);
+            }
+            endpoints.erase(it);
+        }
+    };
+
+    static K8sEndpoint make_ep(const std::string& uid) {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ep.address = "10.0.0.1";
+        ep.port = 8080;
+        ep.ready = true;
+        return ep;
+    }
+};
+
+TEST_F(K8sCollisionDetectionTest, NoCollisionForDistinctUids) {
+    CollisionTracker tracker;
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-alpha")));
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-beta")));
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-gamma")));
+    EXPECT_EQ(tracker.collision_count, 0u);
+}
+
+TEST_F(K8sCollisionDetectionTest, SameUidReaddIsNotCollision) {
+    CollisionTracker tracker;
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-same")));
+    // Re-adding the same UID should NOT be flagged as collision
+    EXPECT_FALSE(tracker.try_add(make_ep("uid-same")));
+    EXPECT_EQ(tracker.collision_count, 0u);
+}
+
+TEST_F(K8sCollisionDetectionTest, ReverseMapCleanedOnRemove) {
+    CollisionTracker tracker;
+    tracker.try_add(make_ep("uid-1"));
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 1u);
+
+    tracker.remove("uid-1");
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 0u);
+    EXPECT_EQ(tracker.endpoints.size(), 0u);
+}
+
+TEST_F(K8sCollisionDetectionTest, RemoveNonexistentUidIsNoop) {
+    CollisionTracker tracker;
+    tracker.try_add(make_ep("uid-exists"));
+    tracker.remove("uid-nonexistent");
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 1u);
+    EXPECT_EQ(tracker.endpoints.size(), 1u);
+}
+
+TEST_F(K8sCollisionDetectionTest, No1000EndpointCollisions) {
+    // Verify no collisions when adding 1000 endpoints with sequential UIDs
+    CollisionTracker tracker;
+    for (int i = 0; i < 1000; ++i) {
+        bool collision = tracker.try_add(make_ep("pod-" + std::to_string(i)));
+        EXPECT_FALSE(collision) << "Unexpected collision at index " << i;
+    }
+    EXPECT_EQ(tracker.collision_count, 0u);
+    EXPECT_EQ(tracker.backend_id_to_uid.size(), 1000u);
+}
+
+// =============================================================================
 // Real-world K8s Response Tests
 // =============================================================================
 
@@ -1201,6 +1389,901 @@ TEST_F(PortValidationTest, InvalidPortFloat) {
 TEST_F(PortValidationTest, InvalidPortHex) {
     auto result = port_validation::parse_port("0x1F90");
     EXPECT_FALSE(result.has_value());
+}
+
+// =============================================================================
+// Bounds Checking Tests (Rule #4) - OOM Prevention
+// =============================================================================
+//
+// Tests for the three bounds introduced to prevent OOM from a compromised or
+// misconfigured K8s API server:
+//   1. K8S_MAX_RESPONSE_SIZE (16 MB) - caps response body accumulation
+//   2. K8S_MAX_LINE_SIZE (1 MB) - caps watch buffer between newlines
+//   3. K8S_MAX_ENDPOINTS (1000) - caps endpoints map size
+
+// Replicate constants here (mirrors k8s_discovery_service.hpp, avoids Seastar include)
+constexpr size_t K8S_MAX_RESPONSE_SIZE = 16 * 1024 * 1024;
+constexpr size_t K8S_MAX_LINE_SIZE = 1 * 1024 * 1024;
+constexpr size_t K8S_MAX_ENDPOINTS = 1000;
+constexpr size_t K8S_MAX_TOKEN_SIZE = 1 * 1024 * 1024;
+
+// --- Response Size Bounds ---
+// Replicates the accumulation guard from k8s_get()
+
+class K8sResponseSizeBoundsTest : public ::testing::Test {
+protected:
+    // Simulates the bounded response accumulation loop from k8s_get().
+    // Returns true if the response was fully accumulated within the limit,
+    // false if the limit was exceeded (would throw in production).
+    static bool accumulate_response(const std::vector<std::string>& chunks,
+                                    std::string& out) {
+        out.clear();
+        for (const auto& chunk : chunks) {
+            if (out.size() + chunk.size() > K8S_MAX_RESPONSE_SIZE) {
+                return false;  // Limit exceeded
+            }
+            out.append(chunk);
+        }
+        return true;
+    }
+};
+
+TEST_F(K8sResponseSizeBoundsTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_RESPONSE_SIZE, 16u * 1024 * 1024);
+}
+
+TEST_F(K8sResponseSizeBoundsTest, SmallResponseAccepted) {
+    std::string out;
+    std::vector<std::string> chunks = {
+        R"({"kind":"EndpointSliceList","items":[]})"
+    };
+    EXPECT_TRUE(accumulate_response(chunks, out));
+    EXPECT_EQ(out, chunks[0]);
+}
+
+TEST_F(K8sResponseSizeBoundsTest, ResponseExactlyAtLimitAccepted) {
+    std::string out;
+    std::string chunk(K8S_MAX_RESPONSE_SIZE, 'x');
+    std::vector<std::string> chunks = {chunk};
+    EXPECT_TRUE(accumulate_response(chunks, out));
+    EXPECT_EQ(out.size(), K8S_MAX_RESPONSE_SIZE);
+}
+
+TEST_F(K8sResponseSizeBoundsTest, ResponseOneOverLimitRejected) {
+    std::string out;
+    std::string chunk(K8S_MAX_RESPONSE_SIZE, 'x');
+    // First chunk fills exactly to limit, second byte pushes over
+    std::vector<std::string> chunks = {chunk, "x"};
+    EXPECT_FALSE(accumulate_response(chunks, out));
+}
+
+TEST_F(K8sResponseSizeBoundsTest, LargeResponseInManySmallChunksRejected) {
+    std::string out;
+    // 16 MB + 1 byte delivered in 4KB chunks
+    size_t chunk_size = 4096;
+    size_t total_chunks = (K8S_MAX_RESPONSE_SIZE / chunk_size) + 1;
+    std::vector<std::string> chunks;
+    chunks.reserve(total_chunks);
+    for (size_t i = 0; i < total_chunks; ++i) {
+        chunks.emplace_back(chunk_size, 'a');
+    }
+    EXPECT_FALSE(accumulate_response(chunks, out));
+}
+
+TEST_F(K8sResponseSizeBoundsTest, SingleHugeChunkRejected) {
+    std::string out;
+    std::string huge(K8S_MAX_RESPONSE_SIZE + 1, 'z');
+    std::vector<std::string> chunks = {huge};
+    EXPECT_FALSE(accumulate_response(chunks, out));
+}
+
+// --- Watch Buffer (Line Size) Bounds ---
+// Replicates the watch buffer guard from k8s_watch()
+
+class K8sLineSizeBoundsTest : public ::testing::Test {
+protected:
+    // Simulates the bounded watch buffer logic from k8s_watch().
+    // Feeds data chunks into a line buffer, extracts newline-delimited lines,
+    // and checks if the buffer between newlines exceeds K8S_MAX_LINE_SIZE.
+    //
+    // Returns: pair<vector of extracted lines, bool exceeded_limit>
+    static std::pair<std::vector<std::string>, bool>
+    process_watch_stream(const std::vector<std::string>& chunks) {
+        std::vector<std::string> lines;
+        std::string buffer;
+        bool exceeded = false;
+
+        for (const auto& chunk : chunks) {
+            buffer.append(chunk);
+
+            // Extract complete lines
+            size_t pos;
+            while ((pos = buffer.find('\n')) != std::string::npos) {
+                std::string line = buffer.substr(0, pos);
+                buffer.erase(0, pos + 1);
+                if (!line.empty() && line != "\r") {
+                    lines.push_back(std::move(line));
+                }
+            }
+
+            // Check if remaining buffer (no newline yet) exceeds limit
+            if (buffer.size() > K8S_MAX_LINE_SIZE) {
+                exceeded = true;
+                break;
+            }
+        }
+
+        return {std::move(lines), exceeded};
+    }
+};
+
+TEST_F(K8sLineSizeBoundsTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_LINE_SIZE, 1u * 1024 * 1024);
+}
+
+TEST_F(K8sLineSizeBoundsTest, NormalLinesAccepted) {
+    auto [lines, exceeded] = process_watch_stream({
+        R"({"type":"ADDED","object":{"metadata":{"uid":"pod-1"}}})" "\n",
+        R"({"type":"MODIFIED","object":{"metadata":{"uid":"pod-2"}}})" "\n"
+    });
+    EXPECT_FALSE(exceeded);
+    ASSERT_EQ(lines.size(), 2u);
+}
+
+TEST_F(K8sLineSizeBoundsTest, LineExactlyAtLimitAccepted) {
+    // Line of exactly MAX_LINE_SIZE bytes followed by newline
+    std::string line(K8S_MAX_LINE_SIZE, 'x');
+    line += '\n';
+    auto [lines, exceeded] = process_watch_stream({line});
+    EXPECT_FALSE(exceeded);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_EQ(lines[0].size(), K8S_MAX_LINE_SIZE);
+}
+
+TEST_F(K8sLineSizeBoundsTest, BufferOneOverLimitWithoutNewlineRejected) {
+    // Data without any newline that exceeds MAX_LINE_SIZE
+    std::string data(K8S_MAX_LINE_SIZE + 1, 'x');
+    auto [lines, exceeded] = process_watch_stream({data});
+    EXPECT_TRUE(exceeded);
+    EXPECT_TRUE(lines.empty());
+}
+
+TEST_F(K8sLineSizeBoundsTest, SlowlorisStyleGradualGrowthRejected) {
+    // Simulates Slowloris: many small chunks without newlines
+    size_t chunk_size = 1024;
+    size_t num_chunks = (K8S_MAX_LINE_SIZE / chunk_size) + 2;
+    std::vector<std::string> chunks;
+    chunks.reserve(num_chunks);
+    for (size_t i = 0; i < num_chunks; ++i) {
+        chunks.emplace_back(chunk_size, 'a');
+    }
+    auto [lines, exceeded] = process_watch_stream(chunks);
+    EXPECT_TRUE(exceeded);
+}
+
+TEST_F(K8sLineSizeBoundsTest, NewlineResetsBuffer) {
+    // Large data followed by newline, then more large data with newline
+    // Should succeed because newlines reset the buffer
+    std::string half(K8S_MAX_LINE_SIZE / 2, 'x');
+    auto [lines, exceeded] = process_watch_stream({
+        half + "\n",
+        half + "\n"
+    });
+    EXPECT_FALSE(exceeded);
+    ASSERT_EQ(lines.size(), 2u);
+}
+
+TEST_F(K8sLineSizeBoundsTest, LargeLineFollowedByOverflowDetected) {
+    // First line is valid, second buffer overflows without newline
+    std::string valid_line = R"({"type":"ADDED"})" "\n";
+    std::string overflow(K8S_MAX_LINE_SIZE + 1, 'z');
+    auto [lines, exceeded] = process_watch_stream({valid_line, overflow});
+    EXPECT_TRUE(exceeded);
+    ASSERT_EQ(lines.size(), 1u);  // First line was extracted before overflow
+}
+
+// --- Endpoints Map Bounds ---
+// Replicates the endpoint insertion guard from handle_endpoint_added()
+
+class K8sEndpointsLimitTest : public ::testing::Test {
+protected:
+    // Simulates the bounded endpoint insertion from handle_endpoint_added().
+    // Uses a simple map to mirror _endpoints behavior.
+    struct EndpointMap {
+        std::map<std::string, K8sEndpoint> endpoints;
+        uint64_t limit_exceeded_count = 0;
+
+        // Returns true if the endpoint was inserted/updated, false if rejected
+        bool try_add(const K8sEndpoint& ep) {
+            // Mirror production logic: only check limit for genuinely new entries
+            if (endpoints.find(ep.uid) == endpoints.end() &&
+                endpoints.size() >= K8S_MAX_ENDPOINTS) {
+                ++limit_exceeded_count;
+                return false;  // Rejected
+            }
+            endpoints[ep.uid] = ep;
+            return true;
+        }
+
+        bool try_remove(const std::string& uid) {
+            return endpoints.erase(uid) > 0;
+        }
+    };
+
+    static K8sEndpoint make_endpoint(const std::string& uid, const std::string& addr = "10.0.0.1") {
+        K8sEndpoint ep;
+        ep.uid = uid;
+        ep.address = addr;
+        ep.port = 8080;
+        ep.ready = true;
+        ep.weight = K8S_DEFAULT_WEIGHT;
+        ep.priority = K8S_DEFAULT_PRIORITY;
+        return ep;
+    }
+};
+
+TEST_F(K8sEndpointsLimitTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_ENDPOINTS, 1000u);
+}
+
+TEST_F(K8sEndpointsLimitTest, SingleEndpointAccepted) {
+    EndpointMap map;
+    auto ep = make_endpoint("pod-1");
+    EXPECT_TRUE(map.try_add(ep));
+    EXPECT_EQ(map.endpoints.size(), 1u);
+}
+
+TEST_F(K8sEndpointsLimitTest, FillToExactLimitAllAccepted) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        auto ep = make_endpoint("pod-" + std::to_string(i));
+        EXPECT_TRUE(map.try_add(ep));
+    }
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 0u);
+}
+
+TEST_F(K8sEndpointsLimitTest, OneOverLimitRejected) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // This should be rejected
+    auto overflow = make_endpoint("pod-overflow");
+    EXPECT_FALSE(map.try_add(overflow));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 1u);
+}
+
+TEST_F(K8sEndpointsLimitTest, UpdateExistingEndpointAtLimitSucceeds) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // Updating an existing endpoint should succeed even at capacity
+    auto updated = make_endpoint("pod-0", "10.0.0.99");
+    updated.weight = 500;
+    EXPECT_TRUE(map.try_add(updated));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.endpoints["pod-0"].weight, 500u);
+    EXPECT_EQ(map.limit_exceeded_count, 0u);
+}
+
+TEST_F(K8sEndpointsLimitTest, RemoveThenAddSucceeds) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // Remove one, then add a new one — should succeed
+    EXPECT_TRUE(map.try_remove("pod-0"));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS - 1);
+
+    auto new_ep = make_endpoint("pod-new");
+    EXPECT_TRUE(map.try_add(new_ep));
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 0u);
+}
+
+TEST_F(K8sEndpointsLimitTest, MultipleRejectionsCountedCorrectly) {
+    EndpointMap map;
+    for (size_t i = 0; i < K8S_MAX_ENDPOINTS; ++i) {
+        map.try_add(make_endpoint("pod-" + std::to_string(i)));
+    }
+
+    // Try adding 5 more — all should be rejected
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_FALSE(map.try_add(make_endpoint("overflow-" + std::to_string(i))));
+    }
+    EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
+    EXPECT_EQ(map.limit_exceeded_count, 5u);
+}
+
+// =============================================================================
+// Token File Size Bounds Tests
+// =============================================================================
+//
+// Tests for the token file size validation introduced to fix truncation of
+// K8s projected tokens exceeding 4096 bytes (BACKLOG.md #13.5).
+//
+// The fix reads file size first (like load_ca_cert), then read_exactly(size),
+// with a K8S_MAX_TOKEN_SIZE bound to prevent unbounded reads.
+
+class K8sTokenSizeBoundsTest : public ::testing::Test {
+protected:
+    // Simulates the token size validation from load_service_account_token().
+    // Returns: pair<bool accepted, std::string token_or_empty>
+    // On rejection: accepted=false, token is empty.
+    // On success: accepted=true, token is trimmed content.
+    static std::pair<bool, std::string> validate_and_load_token(
+            size_t file_size, const std::string& file_content) {
+        // Mirror production logic: check size == 0
+        if (file_size == 0) {
+            return {false, {}};
+        }
+
+        // Mirror production logic: check size > K8S_MAX_TOKEN_SIZE
+        if (file_size > K8S_MAX_TOKEN_SIZE) {
+            return {false, {}};
+        }
+
+        // Simulate read_exactly(size) - in production this reads the actual file
+        std::string token = file_content.substr(0, file_size);
+
+        // Mirror production trimming logic
+        token.erase(token.find_last_not_of(" \n\r\t") + 1);
+        token.erase(0, token.find_first_not_of(" \n\r\t"));
+
+        return {true, token};
+    }
+};
+
+TEST_F(K8sTokenSizeBoundsTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_TOKEN_SIZE, 1u * 1024 * 1024);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TypicalSmallTokenAccepted) {
+    // Typical K8s service account token (~900 bytes)
+    std::string token(900, 'a');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), 900u);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenExceeding4KBAccepted) {
+    // This is the key fix: tokens > 4096 bytes must now be accepted
+    // (previously silently truncated at 4096)
+    std::string token(8192, 'b');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), 8192u);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, LargeProjectedTokenAccepted) {
+    // K8s projected tokens with custom audiences can be ~16KB
+    std::string token(16384, 'c');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), 16384u);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenAtExactMaxAccepted) {
+    std::string token(K8S_MAX_TOKEN_SIZE, 'd');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), K8S_MAX_TOKEN_SIZE);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenOneOverMaxRejected) {
+    std::string token(K8S_MAX_TOKEN_SIZE + 1, 'e');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_FALSE(accepted);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(K8sTokenSizeBoundsTest, EmptyTokenFileRejected) {
+    auto [accepted, result] = validate_and_load_token(0, "");
+    EXPECT_FALSE(accepted);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenWithWhitespaceTrimmed) {
+    std::string raw_token = "  \n  eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature  \n\r\t  ";
+    auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result, "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature");
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenWithTrailingNewlineTrimmed) {
+    // K8s token files typically have a trailing newline
+    std::string raw_token = "eyJhbGciOiJSUzI1NiJ9.payload.sig\n";
+    auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result, "eyJhbGciOiJSUzI1NiJ9.payload.sig");
+}
+
+TEST_F(K8sTokenSizeBoundsTest, AllWhitespaceTokenBecomesEmpty) {
+    std::string raw_token = "   \n\r\t   ";
+    auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
+    EXPECT_TRUE(accepted);
+    EXPECT_TRUE(result.empty());
+}
+
+// =============================================================================
+// HTTP Status Code Parsing Tests
+// =============================================================================
+//
+// Tests for parse_http_status_code(), which replaces the brittle string search
+// ("200 OK" / "200 ") with proper status line parsing.
+// Mirrors the production implementation in k8s_discovery_service.cpp.
+
+namespace http_status {
+
+// Replicated from k8s_discovery_service.cpp to avoid Seastar dependencies.
+static std::optional<int> parse_http_status_code(std::string_view headers) {
+    auto line_end = headers.find("\r\n");
+    std::string_view status_line = headers.substr(0, line_end);
+
+    auto first_space = status_line.find(' ');
+    if (first_space == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    auto code_start = first_space + 1;
+    while (code_start < status_line.size() && status_line[code_start] == ' ') {
+        ++code_start;
+    }
+
+    auto second_space = status_line.find(' ', code_start);
+    auto code_end = (second_space != std::string_view::npos)
+                        ? second_space
+                        : status_line.size();
+
+    if (code_start >= code_end) {
+        return std::nullopt;
+    }
+
+    int code = 0;
+    auto [ptr, ec] = std::from_chars(
+        status_line.data() + code_start,
+        status_line.data() + code_end,
+        code);
+
+    if (ec != std::errc{} || ptr != status_line.data() + code_end) {
+        return std::nullopt;
+    }
+
+    return code;
+}
+
+}  // namespace http_status
+
+class HttpStatusParseTest : public ::testing::Test {};
+
+// --- Standard status lines ---
+
+TEST_F(HttpStatusParseTest, ParsesHttp11_200Ok) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, ParsesHttp10_200Ok) {
+    auto code = http_status::parse_http_status_code("HTTP/1.0 200 OK\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, ParsesHttp2_200) {
+    // HTTP/2 may omit the reason phrase
+    auto code = http_status::parse_http_status_code("HTTP/2 200\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, Parses404NotFound) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 404 Not Found\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 404);
+}
+
+TEST_F(HttpStatusParseTest, Parses403Forbidden) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 403 Forbidden\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 403);
+}
+
+TEST_F(HttpStatusParseTest, Parses500InternalServerError) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 500 Internal Server Error\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 500);
+}
+
+TEST_F(HttpStatusParseTest, Parses503ServiceUnavailable) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 503 Service Unavailable\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 503);
+}
+
+TEST_F(HttpStatusParseTest, Parses410Gone) {
+    // K8s sends 410 Gone when watch resourceVersion is too old
+    auto code = http_status::parse_http_status_code("HTTP/1.1 410 Gone\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 410);
+}
+
+TEST_F(HttpStatusParseTest, Parses301MovedPermanently) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 301 Moved Permanently\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 301);
+}
+
+// --- Status code without reason phrase (valid per HTTP spec) ---
+
+TEST_F(HttpStatusParseTest, StatusCodeWithoutReasonPhrase) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 200\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+// --- Headers containing "200" in values should NOT confuse the parser ---
+
+TEST_F(HttpStatusParseTest, DoesNotMatchFalse200InHeaders) {
+    // The old brittle code would match "200 OK" appearing in a header value.
+    // The new code only parses the first line.
+    std::string headers =
+        "HTTP/1.1 403 Forbidden\r\n"
+        "X-Custom: 200 OK\r\n"
+        "Content-Length: 200\r\n";
+    auto code = http_status::parse_http_status_code(headers);
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 403);
+}
+
+TEST_F(HttpStatusParseTest, DoesNotMatchFalse200InBody) {
+    // Even with "200" in what looks like body content after headers
+    std::string headers = "HTTP/1.1 500 Internal Server Error\r\n"
+                          "Content-Type: text/plain\r\n";
+    auto code = http_status::parse_http_status_code(headers);
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 500);
+}
+
+// --- Full header block (multiple headers) ---
+
+TEST_F(HttpStatusParseTest, FullHeaderBlockWithMultipleHeaders) {
+    std::string headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Cache-Control: no-cache, private\r\n";
+    auto code = http_status::parse_http_status_code(headers);
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+// --- Malformed / edge cases ---
+
+TEST_F(HttpStatusParseTest, EmptyStringReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, NoSpaceInStatusLineReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1\r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, NonNumericStatusCodeReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 abc OK\r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, PartialNumericStatusCodeReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 20x OK\r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, MissingStatusCodeAfterSpaceReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1 \r\n");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, GarbageInputReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("not an http response");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, OnlyProtocolNoCodeReturnsNullopt) {
+    auto code = http_status::parse_http_status_code("HTTP/1.1");
+    EXPECT_FALSE(code.has_value());
+}
+
+TEST_F(HttpStatusParseTest, StatusLineWithoutCRLF) {
+    // No \r\n — the function should still parse if the entire input is one status line
+    auto code = http_status::parse_http_status_code("HTTP/1.1 200 OK");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, 200);
+}
+
+TEST_F(HttpStatusParseTest, NegativeStatusCodeParsedAsInteger) {
+    // The parser extracts the integer value; HTTP validity is the caller's concern.
+    // "-200" is parseable as int, so the function returns -200.
+    auto code = http_status::parse_http_status_code("HTTP/1.1 -200 OK\r\n");
+    ASSERT_TRUE(code.has_value());
+    EXPECT_EQ(*code, -200);
+    // The caller would reject this: (*code != 200)
+}
+
+// =============================================================================
+// K8s Watch 410 Gone Detection Tests
+// =============================================================================
+//
+// When a K8s watch receives a 410 Gone status, it means the resourceVersion
+// is too old (compacted by etcd). The fix: parse the status code from the
+// Status event, clear _resource_version, and trigger sync_endpoints() to
+// re-list with a fresh resourceVersion before reconnecting.
+//
+// 410 can arrive in two forms:
+// 1. Direct Status object: {"kind":"Status","code":410,"message":"..."}
+// 2. ERROR watch event: {"type":"ERROR","object":{"kind":"Status","code":410,...}}
+
+class K8sWatch410Test : public ::testing::Test {
+protected:
+    // Mirrors the Status detection logic from watch_endpoints()
+    struct WatchEventResult {
+        bool is_status_error = false;
+        bool is_410_gone = false;
+        int status_code = 0;
+        std::string message;
+    };
+
+    // Check for direct Status objects (top-level kind == "Status")
+    static WatchEventResult check_direct_status(const std::string& json) {
+        WatchEventResult result;
+        auto kind = k8s_json::get_string(json, "kind");
+        if (!kind || *kind != "Status") {
+            return result;
+        }
+        result.is_status_error = true;
+        auto code = k8s_json::get_int(json, "code");
+        result.status_code = static_cast<int>(code.value_or(0));
+        auto msg = k8s_json::get_string(json, "message");
+        result.message = msg.value_or("Unknown error");
+        result.is_410_gone = (result.status_code == 410);
+        return result;
+    }
+
+    // Check for ERROR watch events with embedded Status object
+    static WatchEventResult check_error_event(const std::string& json) {
+        WatchEventResult result;
+        auto type = k8s_json::get_string(json, "type");
+        if (!type || *type != "ERROR") {
+            return result;
+        }
+        auto obj = k8s_json::get_object(json, "object");
+        if (!obj) {
+            return result;
+        }
+        auto kind = k8s_json::get_string(*obj, "kind");
+        if (!kind || *kind != "Status") {
+            return result;
+        }
+        result.is_status_error = true;
+        auto code = k8s_json::get_int(*obj, "code");
+        result.status_code = static_cast<int>(code.value_or(0));
+        auto msg = k8s_json::get_string(*obj, "message");
+        result.message = msg.value_or("Unknown error");
+        result.is_410_gone = (result.status_code == 410);
+        return result;
+    }
+
+    // Simulates the resource version management on 410 Gone.
+    // Mirrors: clear _resource_version when 410 is detected.
+    struct ResourceVersionTracker {
+        std::string resource_version;
+
+        void handle_410() {
+            resource_version.clear();
+        }
+
+        bool needs_full_relist() const {
+            return resource_version.empty();
+        }
+    };
+};
+
+// --- Direct Status 410 Gone ---
+
+TEST_F(K8sWatch410Test, DirectStatus410Detected) {
+    std::string json = R"json({
+        "kind":"Status","apiVersion":"v1","metadata":{},
+        "status":"Failure",
+        "message":"too old resource version: 12345 (67890)",
+        "reason":"Gone","code":410
+    })json";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_TRUE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 410);
+    EXPECT_EQ(result.message, "too old resource version: 12345 (67890)");
+}
+
+TEST_F(K8sWatch410Test, DirectStatus403NotGone) {
+    std::string json = R"({"kind":"Status","apiVersion":"v1","status":"Failure","message":"forbidden","code":403})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 403);
+}
+
+TEST_F(K8sWatch410Test, DirectStatus500NotGone) {
+    std::string json = R"({"kind":"Status","status":"Failure","message":"internal error","code":500})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 500);
+}
+
+TEST_F(K8sWatch410Test, DirectStatusMissingCodeDefaultsToZero) {
+    std::string json = R"({"kind":"Status","message":"some error"})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 0);
+    EXPECT_EQ(result.message, "some error");
+}
+
+TEST_F(K8sWatch410Test, DirectStatusMissingMessageDefaultsToUnknown) {
+    std::string json = R"({"kind":"Status","code":410})";
+    auto result = check_direct_status(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_TRUE(result.is_410_gone);
+    EXPECT_EQ(result.message, "Unknown error");
+}
+
+// --- ERROR Watch Events ---
+
+TEST_F(K8sWatch410Test, ErrorEvent410Detected) {
+    std::string json = R"json({
+        "type":"ERROR",
+        "object":{
+            "kind":"Status","apiVersion":"v1","metadata":{},
+            "status":"Failure",
+            "message":"too old resource version: 100 (200)",
+            "reason":"Gone","code":410
+        }
+    })json";
+    auto result = check_error_event(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_TRUE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 410);
+    EXPECT_EQ(result.message, "too old resource version: 100 (200)");
+}
+
+TEST_F(K8sWatch410Test, ErrorEvent403NotGone) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"Status","message":"forbidden","code":403}})";
+    auto result = check_error_event(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 403);
+}
+
+TEST_F(K8sWatch410Test, ErrorEventMissingObjectNotDetected) {
+    std::string json = R"({"type":"ERROR"})";
+    auto result = check_error_event(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, ErrorEventNonStatusObjectNotDetected) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"EndpointSlice"}})";
+    auto result = check_error_event(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, ErrorEventMissingCodeDefaultsToZero) {
+    std::string json = R"({"type":"ERROR","object":{"kind":"Status","message":"unknown"}})";
+    auto result = check_error_event(json);
+    EXPECT_TRUE(result.is_status_error);
+    EXPECT_FALSE(result.is_410_gone);
+    EXPECT_EQ(result.status_code, 0);
+}
+
+// --- Non-error events should NOT match ---
+
+TEST_F(K8sWatch410Test, AddedEventNotDetectedAsDirect) {
+    std::string json = R"({"type":"ADDED","object":{"kind":"EndpointSlice","metadata":{"uid":"abc"}}})";
+    auto result = check_direct_status(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, AddedEventNotDetectedAsError) {
+    std::string json = R"({"type":"ADDED","object":{"kind":"EndpointSlice","metadata":{"uid":"abc"}}})";
+    auto result = check_error_event(json);
+    EXPECT_FALSE(result.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, ModifiedEventNotDetected) {
+    std::string json = R"({"type":"MODIFIED","object":{"kind":"EndpointSlice"}})";
+    auto direct = check_direct_status(json);
+    auto error = check_error_event(json);
+    EXPECT_FALSE(direct.is_status_error);
+    EXPECT_FALSE(error.is_status_error);
+}
+
+TEST_F(K8sWatch410Test, DeletedEventNotDetected) {
+    std::string json = R"({"type":"DELETED","object":{"kind":"EndpointSlice"}})";
+    auto direct = check_direct_status(json);
+    auto error = check_error_event(json);
+    EXPECT_FALSE(direct.is_status_error);
+    EXPECT_FALSE(error.is_status_error);
+}
+
+// --- Resource Version Management ---
+
+TEST_F(K8sWatch410Test, ResourceVersionClearedOn410) {
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "12345";
+
+    // Simulate receiving a 410 Gone
+    tracker.handle_410();
+    EXPECT_TRUE(tracker.resource_version.empty());
+    EXPECT_TRUE(tracker.needs_full_relist());
+}
+
+TEST_F(K8sWatch410Test, ResourceVersionNotEmptyBeforeError) {
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "12345";
+    EXPECT_FALSE(tracker.needs_full_relist());
+}
+
+TEST_F(K8sWatch410Test, EmptyResourceVersionTriggersRelist) {
+    ResourceVersionTracker tracker;
+    EXPECT_TRUE(tracker.needs_full_relist());
+}
+
+TEST_F(K8sWatch410Test, FullReconnectFlowSimulation) {
+    // Simulate the full reconnect flow:
+    // 1. Watch starts with a resource version
+    // 2. 410 Gone received - resource version cleared
+    // 3. sync_endpoints() called - sets new resource version
+    // 4. Watch reconnects with new resource version
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "old-version-12345";
+
+    // Step 1: Detect 410 in direct Status
+    std::string status_json = R"({"kind":"Status","code":410,"message":"too old resource version"})";
+    auto result = check_direct_status(status_json);
+    EXPECT_TRUE(result.is_410_gone);
+
+    // Step 2: Clear resource version
+    tracker.handle_410();
+    EXPECT_TRUE(tracker.needs_full_relist());
+
+    // Step 3: sync_endpoints() would set a new version
+    tracker.resource_version = "fresh-version-67890";
+    EXPECT_FALSE(tracker.needs_full_relist());
+
+    // Step 4: Watch reconnects - would use "fresh-version-67890"
+    EXPECT_EQ(tracker.resource_version, "fresh-version-67890");
+}
+
+TEST_F(K8sWatch410Test, FullReconnectFlowWithErrorEvent) {
+    // Same flow but with ERROR watch event instead of direct Status
+    ResourceVersionTracker tracker;
+    tracker.resource_version = "stale-version";
+
+    std::string error_json = R"({"type":"ERROR","object":{"kind":"Status","code":410,"message":"expired"}})";
+    auto result = check_error_event(error_json);
+    EXPECT_TRUE(result.is_410_gone);
+
+    tracker.handle_410();
+    EXPECT_TRUE(tracker.needs_full_relist());
+
+    tracker.resource_version = "new-version";
+    EXPECT_FALSE(tracker.needs_full_relist());
 }
 
 int main(int argc, char** argv) {

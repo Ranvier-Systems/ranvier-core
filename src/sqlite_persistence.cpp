@@ -320,17 +320,9 @@ std::vector<RouteRecord> SqlitePersistence::load_routes() {
         }
         // If blob is null/empty, tokens stays empty (valid empty sequence)
 
-        int backend_id = sqlite3_column_int(stmt, 1);
-
-        // Validate backend_id is reasonable (positive integer)
-        if (backend_id <= 0) {
-            skipped_count++;
-            continue;
-        }
-
         RouteRecord record;
         record.tokens = std::move(tokens);
-        record.backend_id = backend_id;
+        record.backend_id = sqlite3_column_int(stmt, 1);
         results.push_back(std::move(record));
     }
 

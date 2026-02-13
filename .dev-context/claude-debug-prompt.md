@@ -7,16 +7,7 @@ I have a BUILD/RUNTIME FAILURE.
 <PASTE_ERROR_LOG>
 ```
 
----
-
-1. Ref .dev-context/claude-context.md for the "No Locks/Async Only" rules.
-2. DO NOT read the full /docs or /assets folders.
-3. Run /compact if the conversation exceeds 4 turns.
-
-Build Constraints:
-1. Static Analysis Only: Do not attempt to run cmake or build. Seastar dependencies are too heavy for the sandbox.
-2. API Verification: Verify syntax against Seastar documentation logic.
-3. Manual Verification: I will build in my Docker container and provide logs if it fails.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
 
 ---
 
@@ -69,9 +60,6 @@ File:Line:  [location]
 Rule Violated: [#N if applicable, or "N/A"]
 ```
 
-### Analysis
-[Explain why this error occurred and how it manifests]
-
 ### Fix
 ```cpp
 // Before (problematic code)
@@ -81,12 +69,6 @@ Rule Violated: [#N if applicable, or "N/A"]
 [code]
 ```
 
-### Verification Steps
-1. [How to verify the fix locally]
-2. [What to check in the build output]
-3. [Any runtime verification needed]
-
 ### Prevention
-- [ ] Should this become a new anti-pattern in .dev-context/claude-context.md?
+- [ ] Should this become a new anti-pattern in claude-context.md?
 - [ ] Is there a missing test case that would have caught this?
-

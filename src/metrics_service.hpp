@@ -116,7 +116,7 @@ class MetricsService {
             data.sample_count = 0;
             data.sample_sum = 0;
             for (double b : boundaries) {
-                data.buckets.push_back({b, 0});
+                data.buckets.push_back({0, b});
             }
         }
 
@@ -169,6 +169,9 @@ public:
 
             seastar::metrics::make_counter("http_requests_connection_error", _requests_connection_error,
                 seastar::metrics::description("Total number of requests failed due to connection errors (broken pipe, reset)")),
+
+            seastar::metrics::make_counter("stale_connection_retries_total", _stale_connection_retries,
+                seastar::metrics::description("Retries triggered by empty backend response on stale pooled connection")),
 
             seastar::metrics::make_counter("circuit_breaker_opens", _circuit_opens,
                 seastar::metrics::description("Total number of circuit breaker opens")),
@@ -302,6 +305,7 @@ public:
     void record_timeout() { _requests_timeout++; }
     void record_rate_limited() { _requests_rate_limited++; }
     void record_connection_error() { _requests_connection_error++; }
+    void record_stale_connection_retry() { _stale_connection_retries++; }
 
     // Cache hit/miss tracking for ranvier_cache_hit_ratio gauge
     // These are shard-local (lock-free) for hot path efficiency
@@ -428,16 +432,20 @@ public:
     // This populates ranvier_backend_latency_seconds{backend_id="X"}
     // Shard-local for lock-free hot path efficiency
     void record_backend_latency_by_id(BackendId backend_id, double seconds) {
-        auto& backend_metrics = get_or_create_backend_metrics(backend_id);
-        backend_metrics.latency.record(seconds);
-        // Also record in the aggregate histogram
+        auto* backend_metrics = get_or_create_backend_metrics(backend_id);
+        if (backend_metrics) {
+            backend_metrics->latency.record(seconds);
+        }
+        // Always record in the aggregate histogram regardless of overflow
         _router_backend_latency.record(seconds);
     }
 
     // Record first-byte latency with backend_id label
     void record_first_byte_latency_by_id(BackendId backend_id, double seconds) {
-        auto& backend_metrics = get_or_create_backend_metrics(backend_id);
-        backend_metrics.first_byte_latency.record(seconds);
+        auto* backend_metrics = get_or_create_backend_metrics(backend_id);
+        if (backend_metrics) {
+            backend_metrics->first_byte_latency.record(seconds);
+        }
     }
 
     // Helper to convert chrono duration to seconds
@@ -457,6 +465,7 @@ private:
     uint64_t _requests_timeout = 0;
     uint64_t _requests_rate_limited = 0;
     uint64_t _requests_connection_error = 0;
+    uint64_t _stale_connection_retries = 0;
     uint64_t _requests_backpressure = 0;
     uint64_t _circuit_opens = 0;
     uint64_t _circuits_removed = 0;
@@ -515,19 +524,19 @@ private:
     // Get or create per-backend metrics and register with Seastar
     // Metrics are shard-local (lock-free) to maintain hot path efficiency
     // Rule #4: Bounded container - rejects new backends beyond MAX_TRACKED_BACKENDS
-    BackendMetrics& get_or_create_backend_metrics(BackendId backend_id) {
+    // Returns nullptr when the limit is reached (caller skips per-backend recording)
+    BackendMetrics* get_or_create_backend_metrics(BackendId backend_id) {
         auto it = _per_backend_metrics.find(backend_id);
         if (it != _per_backend_metrics.end()) {
-            return it->second;
+            return &it->second;
         }
 
         // Bounds check: reject new backends if limit reached (Rule #4)
+        // Increment overflow counter and return nullptr — caller skips per-backend
+        // recording while aggregate histograms still capture the data
         if (_per_backend_metrics.size() >= MAX_TRACKED_BACKENDS) {
             ++_backend_metrics_overflow;
-            // Return fallback metrics that are not registered with Prometheus
-            // This prevents OOM while still allowing the request to proceed
-            static thread_local BackendMetrics fallback_metrics;
-            return fallback_metrics;
+            return nullptr;
         }
 
         // Create new backend metrics
@@ -558,7 +567,7 @@ private:
         });
 
         metrics.registered = true;
-        return metrics;
+        return &metrics;
     }
 
 public:

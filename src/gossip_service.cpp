@@ -167,7 +167,10 @@ void GossipService::register_metrics() {
             seastar::metrics::description("Times dedup peer limit was reached (Rule #4)")),
         seastar::metrics::make_counter("cluster_pending_acks_overflow",
             [this] { return _protocol->pending_acks_overflow(); },
-            seastar::metrics::description("Times pending acks limit was reached (Rule #4)"))
+            seastar::metrics::description("Times pending acks limit was reached (Rule #4)")),
+        seastar::metrics::make_counter("cluster_dtls_sessions_rejected",
+            [this] { return _transport->dtls_sessions_rejected(); },
+            seastar::metrics::description("Times DTLS session limit was reached (Rule #4)"))
     });
 #endif
 }
@@ -402,9 +405,11 @@ ClusterState GossipService::get_cluster_state() const {
 }
 
 void GossipService::set_route_prune_callback(RoutePruneCallback callback) {
-    if (_consensus) {
-        _consensus->set_prune_callback(std::move(callback));
-    }
+    // Register callback on the calling shard only. The caller is responsible
+    // for invoking this on all shards (via smp::invoke_on_all) to ensure each
+    // shard has its own locally-allocated callback, avoiding cross-shard
+    // std::function copies.
+    GossipConsensus::register_local_prune_callback(std::move(callback));
 }
 
 bool GossipService::is_accepting_tasks() const {

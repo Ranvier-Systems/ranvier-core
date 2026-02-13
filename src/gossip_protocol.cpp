@@ -199,6 +199,14 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
 
     // Set up heartbeat timer with RAII timer safety
     _heartbeat_timer.set_callback([this] {
+        // RAII Timer Safety: Holder must outlive the work
+        seastar::gate::holder timer_holder;
+        try {
+            timer_holder = _transport->timer_gate().hold();
+        } catch (const seastar::gate_closed_exception&) {
+            return;
+        }
+
         (void)broadcast_heartbeat();
     });
     _heartbeat_timer.arm_periodic(_config.gossip_heartbeat_interval);
@@ -250,7 +258,7 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
                     } catch (const std::exception& e) {
                         log_gossip_protocol().warn("Periodic DNS discovery failed: {}", e.what());
                     }
-                });
+                }).finally([holder = std::move(timer_holder)] {});
             }
         });
         _discovery_timer.arm_periodic(_config.discovery_refresh_interval);
@@ -426,7 +434,10 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
     }
 
     // Linearize packet data
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     seastar::net::packet data = std::move(dgram.get_data());
+#pragma GCC diagnostic pop
     data.linearize();
 
     const uint8_t* raw_ptr = reinterpret_cast<const uint8_t*>(data.fragments()[0].base);
@@ -582,6 +593,8 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 "_gossip",
                 _config.discovery_dns_name);
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             for (const auto& srv : srv_records) {
                 try {
                     auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
@@ -600,6 +613,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 discovered_addresses.emplace_back(addr, _config.gossip_port);
                 log_gossip_protocol().debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
             }
+#pragma GCC diagnostic pop
         }
 
         if (discovered_addresses.empty()) {
@@ -818,6 +832,36 @@ void GossipProtocol::process_retries() {
 }
 
 uint32_t GossipProtocol::next_seq_num(const seastar::socket_address& peer) {
+    // Fast path: peer already tracked
+    auto it = _peer_seq_counters.find(peer);
+    if (it != _peer_seq_counters.end()) {
+        return ++(it->second);
+    }
+
+    // New peer - check bounds (Rule #4: bounded containers)
+    if (_peer_seq_counters.size() >= MAX_DEDUP_PEERS) {
+        // Evict entries for peers no longer in the peer table
+        if (_peer_addresses) {
+            std::unordered_set<seastar::socket_address> active_peers(
+                _peer_addresses->begin(), _peer_addresses->end());
+            for (auto map_it = _peer_seq_counters.begin(); map_it != _peer_seq_counters.end(); ) {
+                if (active_peers.find(map_it->first) == active_peers.end()) {
+                    map_it = _peer_seq_counters.erase(map_it);
+                } else {
+                    ++map_it;
+                }
+            }
+        }
+
+        // Still at capacity after eviction - reject
+        if (_peer_seq_counters.size() >= MAX_DEDUP_PEERS) {
+            ++_dedup_peers_overflow;
+            log_gossip_protocol().warn("Peer seq counters at capacity ({}), cannot track peer={}",
+                                       MAX_DEDUP_PEERS, peer);
+            return 0;
+        }
+    }
+
     auto& counter = _peer_seq_counters[peer];
     return ++counter;
 }

@@ -55,6 +55,18 @@ constexpr uint32_t K8S_DEFAULT_PRIORITY = 0;
 constexpr uint32_t K8S_MAX_WEIGHT = 1000000;
 constexpr uint32_t K8S_MAX_PRIORITY = 1000;
 
+// Rule #4: Bounds for containers and buffers to prevent OOM
+// MAX_RESPONSE_SIZE: Cap on k8s_get response body (16 MB)
+constexpr size_t K8S_MAX_RESPONSE_SIZE = 16 * 1024 * 1024;
+// MAX_LINE_SIZE: Cap on watch stream buffer between newlines (1 MB)
+constexpr size_t K8S_MAX_LINE_SIZE = 1 * 1024 * 1024;
+// MAX_ENDPOINTS: Cap on total tracked endpoints in the map
+constexpr size_t K8S_MAX_ENDPOINTS = 1000;
+// MAX_TOKEN_SIZE: Cap on service account token file size (1 MB)
+// K8s projected tokens are typically 1-4KB but can exceed 4KB with custom audiences.
+// 1 MB is generous while preventing unbounded reads.
+constexpr size_t K8S_MAX_TOKEN_SIZE = 1 * 1024 * 1024;
+
 // Represents a discovered backend endpoint
 struct K8sEndpoint {
     std::string uid;                      // Unique identifier (pod UID + address)
@@ -65,7 +77,8 @@ struct K8sEndpoint {
     uint32_t priority = K8S_DEFAULT_PRIORITY;
 
     // Generate a stable BackendId from the endpoint
-    // Uses a hash of the UID for consistency across restarts
+    // Uses FNV-1a 64-bit hash for quality distribution, truncated to 31 bits (positive int32_t).
+    // Deterministic across restarts (no randomized seed unlike absl::Hash).
     BackendId to_backend_id() const;
 
     bool operator==(const K8sEndpoint& other) const {
@@ -119,6 +132,9 @@ private:
     // Using absl::flat_hash_map for SIMD-accelerated lookups and better cache locality
     absl::flat_hash_map<std::string, K8sEndpoint> _endpoints;  // UID -> Endpoint
 
+    // Reverse map for BackendId collision detection: BackendId -> UID
+    absl::flat_hash_map<BackendId, std::string> _backend_id_to_uid;
+
     // Running state
     bool _running = false;
     seastar::gate _gate;
@@ -145,6 +161,11 @@ private:
     uint64_t _dns_failures = 0;
     uint64_t _dns_timeouts = 0;
     uint64_t _dns_cache_hits = 0;
+    uint64_t _response_size_exceeded = 0;
+    uint64_t _line_size_exceeded = 0;
+    uint64_t _endpoints_limit_exceeded = 0;
+    uint64_t _backend_id_collisions = 0;
+    uint64_t _watch_410_gone = 0;
 
     // Seastar metrics registration
     seastar::metrics::metric_groups _metrics;

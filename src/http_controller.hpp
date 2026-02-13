@@ -6,6 +6,7 @@
 #include "connection_pool.hpp"
 #include "cross_shard_request.hpp"
 #include "metrics_service.hpp"
+#include "proxy_retry_policy.hpp"
 #include "rate_limiter.hpp"
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
@@ -58,9 +59,6 @@ struct LoadBalancingSettings {
     uint64_t snapshot_refresh_interval_us = 1000;     // Snapshot cache refresh interval (microseconds)
 };
 
-// Forward declaration for connection bundle
-struct ConnectionBundle;
-
 // Context struct for proxy request state - reduces parameter passing and improves readability
 // This bundles all state that flows through the proxy request lifecycle
 struct ProxyContext {
@@ -107,6 +105,11 @@ struct ProxyContext {
     std::chrono::milliseconds current_backoff;
     uint32_t fallback_attempts = 0;
     static constexpr uint32_t MAX_FALLBACK_ATTEMPTS = 3;
+
+    // Stale connection retry tracking
+    size_t bytes_written_to_client = 0;   // Total bytes written to client output stream
+    uint32_t chunks_received = 0;         // Chunks received from backend
+    uint32_t stale_retry_attempt = 0;     // Number of stale connection retries attempted
 };
 
 // HTTP controller configuration
@@ -131,6 +134,7 @@ struct HttpControllerConfig {
     size_t min_prefix_boundary_tokens = 4;      // Minimum system message tokens for prefix boundary
     bool accept_client_prefix_boundary = false; // Accept client-provided prefix_token_count
     bool enable_multi_depth_routing = false;    // Enable multi-depth route storage (Option C)
+    uint32_t max_stale_retries = 1;              // Max retries for empty backend responses on stale pooled connections (0 = disabled)
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }

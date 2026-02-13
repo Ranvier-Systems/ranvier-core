@@ -239,8 +239,12 @@ public:
         size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
         if (aligned_len == 0) return;
 
-        root_ = insert_recursive(std::move(root_), tokens.subspan(0, aligned_len), backend, origin);
-        route_count_++;
+        auto [new_root, is_new_route] = insert_recursive(
+            std::move(root_), tokens.subspan(0, aligned_len), backend, origin);
+        root_ = std::move(new_root);
+        if (is_new_route) {
+            route_count_++;
+        }
     }
 
     std::optional<BackendId> lookup(std::span<const TokenId> tokens) {
@@ -1237,7 +1241,10 @@ private:
     // Insert Implementation
     // -------------------------------------------------------------------------
 
-    NodePtr insert_recursive(NodePtr node,
+    // Returns {node, is_new_route} where is_new_route is true only when a
+    // previously non-existent leaf was created (not when an existing leaf was
+    // updated). This allows insert() to keep route_count_ accurate.
+    std::pair<NodePtr, bool> insert_recursive(NodePtr node,
                              std::span<const TokenId> tokens,
                              BackendId backend,
                              RouteOrigin origin) {
@@ -1257,18 +1264,20 @@ private:
 
         // Exact match - update leaf
         if (remaining.empty()) {
+            bool is_new = !node->leaf_value.has_value();
             node->leaf_value = backend;
             node->origin = origin;
             node->last_accessed = std::chrono::steady_clock::now();
-            return node;
+            return {std::move(node), is_new};
         }
 
         // Traverse or create child
         TokenId next_key = remaining[0];
         if (find_child(node.get(), next_key)) {
             auto child_ptr = extract_child(node.get(), next_key);
-            auto new_child = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin);
+            auto [new_child, is_new] = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin);
             set_child(node.get(), next_key, std::move(new_child));
+            return {std::move(node), is_new};
         } else {
             auto new_child = make_node<Node4>();
             if (remaining.size() > 1) {
@@ -1277,9 +1286,8 @@ private:
             new_child->leaf_value = backend;
             new_child->origin = origin;
             node = add_child(std::move(node), next_key, std::move(new_child));
+            return {std::move(node), true};
         }
-
-        return node;
     }
 
     // -------------------------------------------------------------------------
