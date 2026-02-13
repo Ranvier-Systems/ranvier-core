@@ -135,7 +135,9 @@ K8sDiscoveryService::K8sDiscoveryService(const K8sDiscoveryConfig& config)
         seastar::metrics::make_counter("k8s_endpoints_limit_exceeded", _endpoints_limit_exceeded,
             seastar::metrics::description("Times endpoint insertion was rejected due to MAX_ENDPOINTS limit")),
         seastar::metrics::make_counter("k8s_backend_id_collisions", _backend_id_collisions,
-            seastar::metrics::description("Times two different UIDs produced the same BackendId hash"))
+            seastar::metrics::description("Times two different UIDs produced the same BackendId hash")),
+        seastar::metrics::make_counter("k8s_watch_410_gone", _watch_410_gone,
+            seastar::metrics::description("Times K8s watch received 410 Gone requiring full re-list"))
     });
 }
 
@@ -955,8 +957,25 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             rapidjson::Document event;
             if (event.Parse(line.c_str()).HasParseError()) co_return true;
 
-            if (event.HasMember("kind") && std::string(event["kind"].GetString()) == "Status") {
-                log_k8s.warn("Watch error: {}", event["message"].GetString());
+            // Handle direct Status objects (e.g., HTTP error response body)
+            if (event.HasMember("kind") && event["kind"].IsString() &&
+                std::string(event["kind"].GetString()) == "Status") {
+                int status_code = 0;
+                if (event.HasMember("code") && event["code"].IsInt()) {
+                    status_code = event["code"].GetInt();
+                }
+                std::string message = (event.HasMember("message") && event["message"].IsString())
+                    ? event["message"].GetString() : "Unknown error";
+
+                if (status_code == 410) {
+                    log_k8s.warn("Watch received 410 Gone (resource version expired): {} - "
+                                 "clearing resource version and re-syncing", message);
+                    ++_watch_410_gone;
+                    _resource_version.clear();
+                    co_await sync_endpoints();
+                    co_return false;
+                }
+                log_k8s.warn("Watch error (status {}): {}", status_code, message);
                 co_return false;
             }
 
@@ -964,6 +983,32 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
 
             std::string type = event["type"].GetString();
             const auto& obj = event["object"];
+
+            // Handle ERROR watch events (e.g., 410 Gone sent mid-stream as a watch event)
+            if (type == "ERROR") {
+                int status_code = 0;
+                std::string message = "Unknown error";
+                if (obj.HasMember("kind") && obj["kind"].IsString() &&
+                    std::string(obj["kind"].GetString()) == "Status") {
+                    if (obj.HasMember("code") && obj["code"].IsInt()) {
+                        status_code = obj["code"].GetInt();
+                    }
+                    if (obj.HasMember("message") && obj["message"].IsString()) {
+                        message = obj["message"].GetString();
+                    }
+                }
+
+                if (status_code == 410) {
+                    log_k8s.warn("Watch received 410 Gone event (resource version expired): {} - "
+                                 "clearing resource version and re-syncing", message);
+                    ++_watch_410_gone;
+                    _resource_version.clear();
+                    co_await sync_endpoints();
+                    co_return false;
+                }
+                log_k8s.warn("Watch ERROR event (status {}): {}", status_code, message);
+                co_return false;
+            }
 
             if (obj.HasMember("metadata") && obj["metadata"].HasMember("resourceVersion")) {
                 _resource_version = obj["metadata"]["resourceVersion"].GetString();
