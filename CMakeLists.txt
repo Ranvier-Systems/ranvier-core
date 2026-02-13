@@ -73,7 +73,7 @@ FetchContent_MakeAvailable(rapidjson)
 # RapidJSON is header-only. We must define the include path for the project.
 # The headers are located in the 'include' subdirectory of the fetched source.
 add_library(rapidjson_interface INTERFACE)
-target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
+target_include_directories(rapidjson_interface SYSTEM INTERFACE ${rapidjson_SOURCE_DIR}/include)
 
 # Option to disable OpenTelemetry (avoids static initialization that can block)
 option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
