@@ -230,7 +230,11 @@ TEST_F(DtlsLoadCertsFromMemoryTest, MismatchedKeyAndCert) {
 
     auto err = DtlsContext::load_certs_from_memory(_ctx, _cert_pem, wrong_key_pem, _ca_pem);
     ASSERT_TRUE(err.has_value());
-    EXPECT_NE(err->find("does not match"), std::string::npos);
+    // OpenSSL may reject at SSL_CTX_use_PrivateKey ("Failed to load private key")
+    // or at SSL_CTX_check_private_key ("does not match") depending on version.
+    EXPECT_TRUE(err->find("does not match") != std::string::npos ||
+                err->find("Failed to load private key") != std::string::npos)
+        << "Unexpected error for mismatched key/cert: " << *err;
 }
 
 TEST_F(DtlsLoadCertsFromMemoryTest, NullSSLCtx) {
