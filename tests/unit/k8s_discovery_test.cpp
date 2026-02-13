@@ -1218,6 +1218,7 @@ TEST_F(PortValidationTest, InvalidPortHex) {
 constexpr size_t K8S_MAX_RESPONSE_SIZE = 16 * 1024 * 1024;
 constexpr size_t K8S_MAX_LINE_SIZE = 1 * 1024 * 1024;
 constexpr size_t K8S_MAX_ENDPOINTS = 1000;
+constexpr size_t K8S_MAX_TOKEN_SIZE = 1 * 1024 * 1024;
 
 // --- Response Size Bounds ---
 // Replicates the accumulation guard from k8s_get()
@@ -1511,6 +1512,116 @@ TEST_F(K8sEndpointsLimitTest, MultipleRejectionsCountedCorrectly) {
     }
     EXPECT_EQ(map.endpoints.size(), K8S_MAX_ENDPOINTS);
     EXPECT_EQ(map.limit_exceeded_count, 5u);
+}
+
+// =============================================================================
+// Token File Size Bounds Tests
+// =============================================================================
+//
+// Tests for the token file size validation introduced to fix truncation of
+// K8s projected tokens exceeding 4096 bytes (BACKLOG.md #13.5).
+//
+// The fix reads file size first (like load_ca_cert), then read_exactly(size),
+// with a K8S_MAX_TOKEN_SIZE bound to prevent unbounded reads.
+
+class K8sTokenSizeBoundsTest : public ::testing::Test {
+protected:
+    // Simulates the token size validation from load_service_account_token().
+    // Returns: pair<bool accepted, std::string token_or_empty>
+    // On rejection: accepted=false, token is empty.
+    // On success: accepted=true, token is trimmed content.
+    static std::pair<bool, std::string> validate_and_load_token(
+            size_t file_size, const std::string& file_content) {
+        // Mirror production logic: check size == 0
+        if (file_size == 0) {
+            return {false, {}};
+        }
+
+        // Mirror production logic: check size > K8S_MAX_TOKEN_SIZE
+        if (file_size > K8S_MAX_TOKEN_SIZE) {
+            return {false, {}};
+        }
+
+        // Simulate read_exactly(size) - in production this reads the actual file
+        std::string token = file_content.substr(0, file_size);
+
+        // Mirror production trimming logic
+        token.erase(token.find_last_not_of(" \n\r\t") + 1);
+        token.erase(0, token.find_first_not_of(" \n\r\t"));
+
+        return {true, token};
+    }
+};
+
+TEST_F(K8sTokenSizeBoundsTest, ConstantValue) {
+    EXPECT_EQ(K8S_MAX_TOKEN_SIZE, 1u * 1024 * 1024);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TypicalSmallTokenAccepted) {
+    // Typical K8s service account token (~900 bytes)
+    std::string token(900, 'a');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), 900u);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenExceeding4KBAccepted) {
+    // This is the key fix: tokens > 4096 bytes must now be accepted
+    // (previously silently truncated at 4096)
+    std::string token(8192, 'b');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), 8192u);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, LargeProjectedTokenAccepted) {
+    // K8s projected tokens with custom audiences can be ~16KB
+    std::string token(16384, 'c');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), 16384u);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenAtExactMaxAccepted) {
+    std::string token(K8S_MAX_TOKEN_SIZE, 'd');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result.size(), K8S_MAX_TOKEN_SIZE);
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenOneOverMaxRejected) {
+    std::string token(K8S_MAX_TOKEN_SIZE + 1, 'e');
+    auto [accepted, result] = validate_and_load_token(token.size(), token);
+    EXPECT_FALSE(accepted);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(K8sTokenSizeBoundsTest, EmptyTokenFileRejected) {
+    auto [accepted, result] = validate_and_load_token(0, "");
+    EXPECT_FALSE(accepted);
+    EXPECT_TRUE(result.empty());
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenWithWhitespaceTrimmed) {
+    std::string raw_token = "  \n  eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature  \n\r\t  ";
+    auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result, "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature");
+}
+
+TEST_F(K8sTokenSizeBoundsTest, TokenWithTrailingNewlineTrimmed) {
+    // K8s token files typically have a trailing newline
+    std::string raw_token = "eyJhbGciOiJSUzI1NiJ9.payload.sig\n";
+    auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
+    EXPECT_TRUE(accepted);
+    EXPECT_EQ(result, "eyJhbGciOiJSUzI1NiJ9.payload.sig");
+}
+
+TEST_F(K8sTokenSizeBoundsTest, AllWhitespaceTokenBecomesEmpty) {
+    std::string raw_token = "   \n\r\t   ";
+    auto [accepted, result] = validate_and_load_token(raw_token.size(), raw_token);
+    EXPECT_TRUE(accepted);
+    EXPECT_TRUE(result.empty());
 }
 
 int main(int argc, char** argv) {

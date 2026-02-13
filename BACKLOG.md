@@ -2144,7 +2144,7 @@ Section 7 fixed several unbounded containers. These are **new** ones.
 
 ### 13.5 HIGH — Edge-Case Crashes
 
-- [ ] **[HIGH] K8s token file read truncated at 4096 bytes**
+- [x] **[HIGH] K8s token file read truncated at 4096 bytes**
   _File:Line:_ `src/k8s_discovery_service.cpp:200`
   _Issue:_ `co_await stream.read_exactly(4096)` silently truncates K8s projected tokens that exceed 4KB. Authentication fails with no error.
   _Fix:_ Read file size first (like `load_ca_cert` at line 227), then `read_exactly(size)`. Log error if token exceeds reasonable max.
