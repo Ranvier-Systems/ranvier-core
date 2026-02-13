@@ -269,10 +269,18 @@ seastar::future<> K8sDiscoveryService::load_service_account_token() {
             co_return;
         }
 
+        // Read file using read() loop instead of read_exactly() to avoid
+        // GCC coroutine COMDAT bug on x86_64 with read_exactly_part.
         auto stream = seastar::make_file_input_stream(file);
-        auto buf = co_await stream.read_exactly(size);
+        std::string token_data;
+        token_data.reserve(size);
+        for (;;) {
+            auto buf = co_await stream.read();
+            if (buf.empty()) break;
+            token_data.append(buf.get(), buf.size());
+        }
 
-        _bearer_token = std::string(buf.get(), buf.size());
+        _bearer_token = std::move(token_data);
 
         // Trim whitespace
         _bearer_token.erase(_bearer_token.find_last_not_of(" \n\r\t") + 1);
@@ -305,13 +313,18 @@ seastar::future<std::string> K8sDiscoveryService::load_ca_cert(const std::string
             co_return std::string{};
         }
 
-        // Read entire file contents
+        // Read file using read() loop instead of read_exactly() to avoid
+        // GCC coroutine COMDAT bug on x86_64 with read_exactly_part.
         auto stream = seastar::make_file_input_stream(file);
-        auto buf = co_await stream.read_exactly(size);
+        std::string content;
+        content.reserve(size);
+        for (;;) {
+            auto buf = co_await stream.read();
+            if (buf.empty()) break;
+            content.append(buf.get(), buf.size());
+        }
         co_await stream.close();
         co_await file.close();
-
-        std::string content(buf.get(), buf.size());
 
         // Trim trailing whitespace/newlines
         while (!content.empty() && std::isspace(static_cast<unsigned char>(content.back()))) {
