@@ -225,17 +225,6 @@ static GLOBAL: Jemalloc = Jemalloc;
         message(STATUS "Tokenizers-cpp jemalloc patch already applied (skipping)")
     endif()
 
-    # Workaround: GCC coroutine COMDAT bug on x86_64.
-    # With -ffunction-sections, the coroutine .Frame.destroy for
-    # seastar::input_stream<char>::read_exactly_part is placed in a COMDAT
-    # section, but the .rodata.cst8 reference to it lives outside the group.
-    # The linker's --gc-sections discards the COMDAT section while the
-    # reference remains, causing a link failure.  This only affects amd64;
-    # aarch64 codegen doesn't produce the cross-section reference.
-    # Fix: disable -ffunction-sections for the affected translation unit.
-    set_source_files_properties(src/k8s_discovery_service.cpp
-        PROPERTIES COMPILE_OPTIONS "-fno-function-sections")
-
     # Limit the Noise
     add_compile_options(-fmax-errors=3)
 

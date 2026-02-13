@@ -549,12 +549,20 @@ seastar::future<std::string> DtlsContext::read_file_contents(const std::string& 
         throw std::runtime_error("File is empty: " + path);
     }
 
+    // Read file using read() loop instead of read_exactly() to avoid
+    // GCC coroutine COMDAT bug on x86_64 with read_exactly_part.
     auto stream = seastar::make_file_input_stream(file);
-    auto buf = co_await stream.read_exactly(size);
+    std::string content;
+    content.reserve(size);
+    for (;;) {
+        auto buf = co_await stream.read();
+        if (buf.empty()) break;
+        content.append(buf.get(), buf.size());
+    }
     co_await stream.close();
     co_await file.close();
 
-    co_return std::string(buf.get(), buf.size());
+    co_return content;
 }
 
 seastar::future<std::optional<std::chrono::system_clock::time_point>>
