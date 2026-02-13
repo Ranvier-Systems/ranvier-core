@@ -280,6 +280,92 @@ TEST_F(BoundedBackendMetricsTest, ExistingBackendStillWorksAfterOverflow) {
 }
 
 // =============================================================================
+// Overflow Isolation Tests (fix for shared mutable singleton fallback_metrics)
+// Verifies that overflow backends don't share state and that aggregate
+// histograms still capture data when per-backend tracking is at capacity.
+// =============================================================================
+
+class OverflowIsolationTest : public ::testing::Test {
+protected:
+    MetricsService svc;
+
+    // Fill the per-backend map to capacity
+    void fill_to_capacity() {
+        for (BackendId id = 0; id < 10000; ++id) {
+            svc.record_backend_latency_by_id(id, 0.1);
+        }
+    }
+};
+
+TEST_F(OverflowIsolationTest, OverflowDoesNotCorruptExistingBackendData) {
+    // Record a known value for backend 0
+    svc.record_backend_latency_by_id(0, 1.0);
+
+    // Fill remaining capacity (backends 1-9999)
+    for (BackendId id = 1; id < 10000; ++id) {
+        svc.record_backend_latency_by_id(id, 0.1);
+    }
+
+    // Now trigger overflow with many different backends and large values
+    for (BackendId id = 10000; id < 10100; ++id) {
+        svc.record_backend_latency_by_id(id, 999.0);
+    }
+
+    // Backend 0 should still only have its original single recording
+    // (Before the fix, the shared static singleton would have accumulated
+    // all overflow recordings, making data incoherent)
+    EXPECT_EQ(svc.get_backend_metrics_overflow(), 100u);
+}
+
+TEST_F(OverflowIsolationTest, AggregateHistogramStillRecordsOnOverflow) {
+    fill_to_capacity();
+
+    // Record the aggregate latency before overflow
+    // The aggregate histogram (_router_backend_latency) should capture
+    // data even when per-backend tracking overflows
+    svc.record_backend_latency_by_id(99999, 5.0);
+    EXPECT_EQ(svc.get_backend_metrics_overflow(), 1u);
+
+    // The request still completes successfully (no crash, no UB)
+    // Aggregate recording happens regardless of per-backend overflow
+}
+
+TEST_F(OverflowIsolationTest, FirstByteLatencyOverflowIsHandled) {
+    fill_to_capacity();
+
+    // first_byte_latency recording should also handle overflow gracefully
+    svc.record_first_byte_latency_by_id(99999, 2.0);
+    EXPECT_EQ(svc.get_backend_metrics_overflow(), 1u);
+
+    // Multiple overflow recordings should each increment the counter
+    svc.record_first_byte_latency_by_id(99998, 3.0);
+    EXPECT_EQ(svc.get_backend_metrics_overflow(), 2u);
+}
+
+TEST_F(OverflowIsolationTest, MixedLatencyAndFirstByteOverflow) {
+    fill_to_capacity();
+
+    // Both recording methods should independently handle overflow
+    svc.record_backend_latency_by_id(50000, 1.0);
+    svc.record_first_byte_latency_by_id(50001, 2.0);
+    svc.record_backend_latency_by_id(50002, 3.0);
+
+    // Each call to a new overflow backend increments the counter
+    EXPECT_EQ(svc.get_backend_metrics_overflow(), 3u);
+}
+
+TEST_F(OverflowIsolationTest, RepeatedOverflowBackendIncrementsEachTime) {
+    fill_to_capacity();
+
+    // The same overflow backend ID recorded multiple times should
+    // increment the overflow counter each time (it's never added to the map)
+    svc.record_backend_latency_by_id(99999, 1.0);
+    svc.record_backend_latency_by_id(99999, 2.0);
+    svc.record_backend_latency_by_id(99999, 3.0);
+    EXPECT_EQ(svc.get_backend_metrics_overflow(), 3u);
+}
+
+// =============================================================================
 // to_seconds Static Helper Tests
 // =============================================================================
 

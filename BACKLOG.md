@@ -2193,10 +2193,11 @@ Section 7 fixed several unbounded containers. These are **new** ones.
   _Fix:_ Parse Status event `code`. On 410, clear `_resource_version` and trigger `sync_endpoints()`.
   _Resolution:_ Fixed the watch callback in `watch_endpoints()` to parse the `code` field from K8s Status events. On 410 Gone, `_resource_version` is cleared and `sync_endpoints()` is called to re-list with a fresh resourceVersion before the watch reconnects. Handles both delivery forms: (1) direct Status objects (HTTP error response body) and (2) ERROR watch events with embedded Status objects (mid-stream 410). Also fixed a null-dereference risk on `event["message"]` access (now guarded with `HasMember` + `IsString`). Added `_watch_410_gone` metric counter for observability. Added 20 unit tests covering direct Status 410 detection, ERROR event 410 detection, non-410 status codes, missing fields, and full reconnect flow simulation.
 
-- [ ] **[MEDIUM] metrics_service.hpp fallback_metrics is a shared mutable singleton**
+- [x] **[MEDIUM] metrics_service.hpp fallback_metrics is a shared mutable singleton** ✓
   _File:Line:_ `src/metrics_service.hpp:530-534`
   _Issue:_ When `MAX_TRACKED_BACKENDS` is hit, all overflow backends share one `static thread_local BackendMetrics` accumulator. Data becomes incoherent; histograms leak slowly.
   _Fix:_ Return a freshly default-constructed null-op `BackendMetrics`, or reject recording and increment overflow counter only.
+  _Resolution:_ Changed `get_or_create_backend_metrics()` to return `BackendMetrics*` (nullable) instead of `BackendMetrics&`. On overflow, returns `nullptr` and increments `_backend_metrics_overflow` counter. Callers (`record_backend_latency_by_id`, `record_first_byte_latency_by_id`) null-check before per-backend recording; aggregate histogram still captures all data unconditionally. Removed the `static thread_local BackendMetrics fallback_metrics` singleton that caused data incoherence and histogram memory leaks. Added 5 unit tests for overflow isolation.
 
 ### 13.7 Anti-Pattern Candidates for Hard Rules
 
