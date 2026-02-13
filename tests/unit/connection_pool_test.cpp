@@ -40,6 +40,7 @@ TEST_F(ConnectionPoolConfigTest, DefaultConfigValues) {
     EXPECT_EQ(config.keepalive_interval, std::chrono::seconds(10));
     EXPECT_EQ(config.keepalive_count, 3u);
     EXPECT_EQ(config.max_connection_age, std::chrono::seconds(300));
+    EXPECT_EQ(config.max_backends, 1000u);
 }
 
 TEST_F(ConnectionPoolConfigTest, ConfigCanBeCustomized) {
