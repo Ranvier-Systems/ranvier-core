@@ -456,6 +456,18 @@ target_link_libraries(gossip_protocol_test
 )
 gtest_discover_tests(gossip_protocol_test)
 
+# Gossip Transport Ownership Pattern Tests (Pure C++, no Seastar dependency)
+# Tests verifying shard-local ownership patterns (Rule #0: no std::shared_ptr)
+add_executable(gossip_transport_ownership_test
+  tests/unit/gossip_transport_ownership_test.cpp
+)
+target_include_directories(gossip_transport_ownership_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gossip_transport_ownership_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_transport_ownership_test)
+
 # Route Batching Unit Tests (Pure C++, no Seastar dependency)
 # Tests for route batching data structures and behavior
 add_executable(route_batching_test
