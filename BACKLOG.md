@@ -1861,6 +1861,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-13 | **[Security]** Add bounds checking to K8s discovery service to prevent OOM (Rule #4). MAX_RESPONSE_SIZE (16MB) for API responses, MAX_LINE_SIZE (1MB) for watch stream buffer, MAX_ENDPOINTS (1000) for endpoints map. Overflow counter metrics added. | #134 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to radix_tree.hpp. Comprehensive documentation for Rules #1, #4, #9, #14 covering lookup, insert, eviction, and slab allocation code paths. | #212 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to router_service.cpp. Documentation for Rules #1, #5, #6, #14 covering route_request, learn_route_global, get_backend_for_prefix, and timer callbacks. | #208 |
 | 2026-02-01 | **[DX]** Consolidate 8 gossip debug metrics behind RANVIER_DEBUG_METRICS compile flag. Reduces Prometheus scrape overhead in production. | #209 |
@@ -2066,7 +2067,7 @@ Cross-referenced with Section 7 (Jan 2026) and Section 11 (Feb 2). Only **new** 
 
 These items directly affect the validity of the current performance benchmark results.
 
-- [ ] **[CRITICAL] RadixTree route_count_ drift causes cascading eviction**
+- [x] **[CRITICAL] RadixTree route_count_ drift causes cascading eviction**
   _File:Line:_ `src/radix_tree.hpp:243`
   _Issue:_ `insert()` increments `route_count_++` unconditionally, but `insert_recursive()` (line 1259-1263) silently updates existing leaves without signaling "not new". Repeated inserts of the same prefix inflate the counter beyond the actual route count. When `route_count_ >= max_routes`, the eviction loop in `router_service.cpp` evicts all real routes while the counter stays inflated. The tree permanently empties itself under sustained traffic with repeated prefixes.
   _Benchmark impact:_ Cache hit rate benchmarks (reported at 98%) are time-bombs. Short runs succeed; 30+ minute runs under real traffic patterns will trigger mass eviction and fall back to round-robin.
@@ -2074,7 +2075,7 @@ These items directly affect the validity of the current performance benchmark re
   _Complexity:_ Low
   _Priority:_ P0 — fix before next benchmark run
 
-- [ ] **[CRITICAL] Mutex on every proxy request via is_persistence_backpressured()**
+- [x] **[CRITICAL] Mutex on every proxy request via is_persistence_backpressured()**
   _File:Line:_ `src/http_controller.cpp:1819-1827`
   _Issue:_ Every proxy request calls `is_persistence_backpressured()` which calls `_persistence->queue_depth()`. Despite PR #118 adding an atomic for the metrics path, the queue itself is still mutex-protected (see `async_persistence.hpp:118`). The code comment at line 1819 explicitly says "queue_depth() acquires a mutex". This stalls the reactor under concurrent persistence writes.
   _Benchmark impact:_ P99 latency numbers include this mutex overhead. The actual prefix-routing benefit is better than currently measured.
@@ -2087,19 +2088,19 @@ These items directly affect the validity of the current performance benchmark re
 
 Section 11 fixed gate guards in RouterService and K8s timers. These are **new** gate-holder bugs in the gossip and persistence subsystems.
 
-- [ ] **[CRITICAL] Gossip heartbeat timer callback has no gate guard**
+- [x] **[CRITICAL] Gossip heartbeat timer callback has no gate guard**
   _File:Line:_ `src/gossip_protocol.cpp:201-203`
   _Issue:_ Timer callback `[this] { (void)broadcast_heartbeat(); }` captures `this` with no gate holder. `_transport` pointer is dereferenced before any internal gate acquisition. Contrast with the retry timer (line 212) and discovery timer (line 237) which DO attempt gate holders.
   _Fix:_ Acquire `_timer_gate.hold()` at the start of the callback lambda, before calling `broadcast_heartbeat()`.
   _Complexity:_ Low
 
-- [ ] **[CRITICAL] Gossip discovery timer gate holder drops before async work completes**
+- [x] **[CRITICAL] Gossip discovery timer gate holder drops before async work completes** ✓
   _File:Line:_ `src/gossip_protocol.cpp:237-254`
   _Issue:_ `timer_holder` is a local variable in the callback that dies when the callback returns. But `refresh_peers()` is a detached future `(void)` that runs for seconds. The gate holder provides zero protection — shutdown can destroy state while `refresh_peers()` is in-flight.
   _Fix:_ Move holder into the future chain: `(void)refresh_peers().finally([holder = std::move(timer_holder)] {});`
   _Complexity:_ Low
 
-- [ ] **[CRITICAL] AsyncPersistence log_stats() gate holder drops at end of try block**
+- [x] **[CRITICAL] AsyncPersistence log_stats() gate holder drops at end of try block** ✓
   _File:Line:_ `src/async_persistence.cpp:371-380`
   _Issue:_ Gate holder is scoped to `try {}` block. After the block, the function accesses `_ops_processed`, `_ops_dropped`, `_batches_flushed`, and calls `queue_depth()` without gate protection. If `stop()` runs between the `try` block and the member access, it's use-after-free.
   _Fix:_ Declare `timer_holder` at function scope and assign inside `try`, matching the pattern used in `on_flush_timer()` (line 261).
@@ -2107,7 +2108,7 @@ Section 11 fixed gate guards in RouterService and K8s timers. These are **new** 
 
 ### 13.3 CRITICAL — Cross-Shard Safety
 
-- [ ] **[CRITICAL] std::function broadcast across shards in GossipConsensus**
+- [x] **[CRITICAL] std::function broadcast across shards in GossipConsensus** ✓
   _File:Lines:_ `src/gossip_consensus.cpp:130, 180, 237`
   _Issue:_ `_route_prune_callback` (`std::function`) is captured by value and sent to every shard via `smp::submit_to`. When the lambda exceeds Small Buffer Optimization size (~16-32 bytes), the heap allocation lives on shard 0 and is freed on shard N. This is anti-pattern Bug #3 (cross-shard free). Appears at 3 call sites. The code has a TODO acknowledging this.
   _Fix:_ Each shard registers its own local callback. Shard 0 broadcasts only the scalar `BackendId`; each shard invokes its local callback.
@@ -2117,25 +2118,25 @@ Section 11 fixed gate guards in RouterService and K8s timers. These are **new** 
 
 Section 7 fixed several unbounded containers. These are **new** ones.
 
-- [ ] **[HIGH] DTLS _sessions map has no MAX_SIZE — unbounded SSL session creation**
+- [x] **[HIGH] DTLS _sessions map has no MAX_SIZE — unbounded SSL session creation** ✓
   _File:Line:_ `src/dtls_context.hpp:181`, `src/dtls_context.cpp:540`
   _Issue:_ `get_or_create_session()` creates a new SSL session for every unique peer address. Spoofed source addresses create thousands of sessions/sec. Cleanup runs every 60s. Each session allocates OpenSSL SSL objects + BIO pairs.
   _Fix:_ Add `MAX_SESSIONS` constant. Reject new sessions when limit reached. Add overflow metric.
   _Complexity:_ Low
 
-- [ ] **[HIGH] Gossip _peer_seq_counters map unbounded**
+- [x] **[HIGH] Gossip _peer_seq_counters map unbounded**
   _File:Line:_ `src/gossip_protocol.hpp:204-207`
   _Issue:_ `next_seq_num()` inserts unboundedly. Old entries never cleaned unless `cleanup_peer_state()` is called. Distinct from `_pending_acks` (fixed in Section 7 line 871).
   _Fix:_ Bound to `MAX_DEDUP_PEERS`. Clean entries for peers no longer in peer table.
   _Complexity:_ Low
 
-- [ ] **[HIGH] K8s discovery: response body, watch buffer, and endpoints map all unbounded**
+- [x] **[HIGH] K8s discovery: response body, watch buffer, and endpoints map all unbounded** ✓
   _File:Lines:_ `src/k8s_discovery_service.cpp:501-506` (response), `src/k8s_discovery_service.cpp:1067-1084` (watch buffer), `src/k8s_discovery_service.hpp:120` (endpoints map)
   _Issue:_ Three independent OOM vectors. A compromised or misconfigured K8s API server can exhaust shard 0 memory via: (1) arbitrarily large response body, (2) streaming data without newlines (Slowloris-style), (3) endpoint count explosion from a broad selector.
   _Fix:_ Add `MAX_RESPONSE_SIZE` (16MB), `MAX_LINE_SIZE` (1MB), `MAX_ENDPOINTS` (1000). Abort and reconnect if exceeded.
   _Complexity:_ Low
 
-- [ ] **[HIGH] Connection pool _pools map has no MAX_BACKENDS limit**
+- [x] **[HIGH] Connection pool _pools map has no MAX_BACKENDS limit**
   _File:Line:_ `src/connection_pool.hpp:435`
   _Issue:_ Per-host and total connection limits exist, but the number of unique backend addresses (map keys) is unbounded. Thousands of unique addresses with 0 idle connections still grow the map. Distinct from Section 7 line 927 (which fixed erasure of empty deques).
   _Fix:_ Add `MAX_BACKENDS = 1000`. Check `_pools.size()` before inserting new backend entries.
@@ -2143,52 +2144,60 @@ Section 7 fixed several unbounded containers. These are **new** ones.
 
 ### 13.5 HIGH — Edge-Case Crashes
 
-- [ ] **[HIGH] K8s token file read truncated at 4096 bytes**
+- [x] **[HIGH] K8s token file read truncated at 4096 bytes**
   _File:Line:_ `src/k8s_discovery_service.cpp:200`
   _Issue:_ `co_await stream.read_exactly(4096)` silently truncates K8s projected tokens that exceed 4KB. Authentication fails with no error.
   _Fix:_ Read file size first (like `load_ca_cert` at line 227), then `read_exactly(size)`. Log error if token exceeds reasonable max.
   _Complexity:_ Low
 
-- [ ] **[HIGH] BackendId hash collision risk at scale**
+- [x] **[HIGH] BackendId hash collision risk at scale** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:42-51`
   _Issue:_ `to_backend_id()` uses a weak `hash * 31 + c` truncated to 31 bits. Birthday problem: ~50% collision probability at ~46K UIDs. Two endpoints with the same BackendId shadow each other with no detection or warning.
   _Fix:_ Use stronger hash (first 4 bytes of SHA-256, or `absl::Hash`). Add collision detection in `handle_endpoint_added()`.
   _Complexity:_ Medium
+  _Fixed:_ Replaced weak polynomial hash with FNV-1a 64-bit hash (deterministic across restarts, much better distribution). Added `_backend_id_to_uid` reverse map for collision detection in `handle_endpoint_added()` with error logging and `k8s_backend_id_collisions` Prometheus metric. Reverse map cleaned up in `handle_endpoint_removed()`.
 
-- [ ] **[HIGH] TracingService shutdown race on g_tracer.reset()**
+- [x] **[HIGH] TracingService shutdown race on g_tracer.reset()** ✓
   _File:Line:_ `src/tracing_service.cpp:437-456`
   _Issue:_ `shutdown()` resets `g_tracer` at line 456, racing with span construction at line 267 which reads `g_tracer` after checking `g_shutting_down`. TOCTOU race. Distinct from Section 11.4 which documented the shared_ptr as a known SDK exception but did NOT cover this shutdown race.
   _Fix:_ Do not call `g_tracer.reset()` or `g_provider.reset()`. Let them leak at process exit.
   _Complexity:_ Low
+  _Fixed:_ Removed g_tracer.reset() and g_provider.reset() from shutdown(). Globals are now process-lifetime objects — OS reclaims at exit. Added concurrency model tests in tracing_service_test.cpp.
 
-- [ ] **[HIGH] DTLS context uses blocking stat() and SSL_CTX file I/O on reactor**
+- [x] **[HIGH] DTLS context uses blocking stat() and SSL_CTX file I/O on reactor**
   _File:Line:_ `src/dtls_context.cpp:403-410, 433-438`
   _Issue:_ `SSL_CTX_use_certificate_file` and POSIX `stat()` are blocking calls on the reactor thread during cert reload. Violates Rule #12.
   _Fix:_ Offload cert reload to `seastar::async`. Use OpenSSL memory-based APIs (`SSL_CTX_use_certificate_ASN1`) after async file read.
   _Complexity:_ Medium
+  _Fixed:_ Replaced all blocking file I/O with Seastar async APIs (`open_file_dma`, `make_file_input_stream`, `file::stat`). Replaced `SSL_CTX_use_certificate_file`/`SSL_CTX_use_PrivateKey_file`/`SSL_CTX_load_verify_locations` with memory-based OpenSSL APIs (`PEM_read_bio_X509`, `PEM_read_bio_PrivateKey`, `X509_STORE_add_cert`) fed from async-read buffers. Both `initialize()` and `check_and_reload_certs()` now return futures. Added `load_certs_from_memory()` static helper with unit tests in `dtls_context_test.cpp`.
 
 ### 13.6 MEDIUM — Additional Issues
 
-- [ ] **[MEDIUM] gossip_transport.cpp uses std::shared_ptr for shard-local data (Rule #0)**
+- [x] **[MEDIUM] gossip_transport.cpp uses std::shared_ptr for shard-local data (Rule #0)**
   _File:Lines:_ `src/gossip_transport.cpp:200-201, 263, 469`
   _Fix:_ Use `seastar::do_with` or `seastar::lw_shared_ptr`.
+  _Resolution:_ Replaced all `std::shared_ptr` with shard-safe patterns: `seastar::do_with` for `parallel_for_each` paths, direct value capture for `seastar::async`, and `seastar::lw_shared_ptr` for crypto callback sharing. Added ownership pattern tests in `gossip_transport_ownership_test.cpp`.
 
-- [ ] **[MEDIUM] sqlite_persistence.cpp has business validation in persistence layer (Rule #7)**
+- [x] **[MEDIUM] sqlite_persistence.cpp has business validation in persistence layer (Rule #7)** ✓
   _File:Line:_ `src/sqlite_persistence.cpp:325-329`
   _Fix:_ Move `backend_id <= 0` check to service layer. Persistence should return raw data.
+  _Resolution:_ Removed `backend_id <= 0` filtering from `SqlitePersistence::load_routes()`. Persistence now returns raw data. Validation moved to `Application::load_persisted_state()` using `std::erase_if` with warning log. Added 3 unit tests in `persistence_test.cpp` confirming persistence returns routes with zero, negative, and mixed backend IDs.
 
-- [ ] **[MEDIUM] K8s HTTP status parsing is brittle — string search instead of code parse**
+- [x] **[MEDIUM] K8s HTTP status parsing is brittle — string search instead of code parse** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:521-522`
   _Fix:_ Parse HTTP status line properly: extract first line, split on space, parse numeric code.
+  _Resolution:_ Replaced brittle `headers.find("200 OK")` / `headers.find("200 ")` string search with a proper `parse_http_status_code()` function that extracts the first line (status line), finds the status code field, and parses it as an integer using `std::from_chars` (Rule #10). The old approach could false-match "200" appearing in header values; the new approach only inspects the status line. Added 20 unit tests in `k8s_discovery_test.cpp` covering standard codes (200, 404, 503, 410), HTTP/1.0 and HTTP/2 variants, status lines without reason phrase, malformed input, and the false-match regression case.
 
-- [ ] **[MEDIUM] K8s watch 410 Gone causes infinite reconnect loop**
+- [x] **[MEDIUM] K8s watch 410 Gone causes infinite reconnect loop** ✓
   _File:Line:_ `src/k8s_discovery_service.cpp:844-846`
   _Fix:_ Parse Status event `code`. On 410, clear `_resource_version` and trigger `sync_endpoints()`.
+  _Resolution:_ Fixed the watch callback in `watch_endpoints()` to parse the `code` field from K8s Status events. On 410 Gone, `_resource_version` is cleared and `sync_endpoints()` is called to re-list with a fresh resourceVersion before the watch reconnects. Handles both delivery forms: (1) direct Status objects (HTTP error response body) and (2) ERROR watch events with embedded Status objects (mid-stream 410). Also fixed a null-dereference risk on `event["message"]` access (now guarded with `HasMember` + `IsString`). Added `_watch_410_gone` metric counter for observability. Added 20 unit tests covering direct Status 410 detection, ERROR event 410 detection, non-410 status codes, missing fields, and full reconnect flow simulation.
 
-- [ ] **[MEDIUM] metrics_service.hpp fallback_metrics is a shared mutable singleton**
+- [x] **[MEDIUM] metrics_service.hpp fallback_metrics is a shared mutable singleton** ✓
   _File:Line:_ `src/metrics_service.hpp:530-534`
   _Issue:_ When `MAX_TRACKED_BACKENDS` is hit, all overflow backends share one `static thread_local BackendMetrics` accumulator. Data becomes incoherent; histograms leak slowly.
   _Fix:_ Return a freshly default-constructed null-op `BackendMetrics`, or reject recording and increment overflow counter only.
+  _Resolution:_ Changed `get_or_create_backend_metrics()` to return `BackendMetrics*` (nullable) instead of `BackendMetrics&`. On overflow, returns `nullptr` and increments `_backend_metrics_overflow` counter. Callers (`record_backend_latency_by_id`, `record_first_byte_latency_by_id`) null-check before per-backend recording; aggregate histogram still captures all data unconditionally. Removed the `static thread_local BackendMetrics fallback_metrics` singleton that caused data incoherence and histogram memory leaks. Added 5 unit tests for overflow isolation.
 
 ### 13.7 Anti-Pattern Candidates for Hard Rules
 

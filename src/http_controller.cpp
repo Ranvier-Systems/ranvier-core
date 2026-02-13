@@ -58,7 +58,7 @@ template <typename Func>
 struct async_handler : public seastar::httpd::handler_base {
     Func _func;
     async_handler(Func&& f) : _func(std::move(f)) {}
-    future<std::unique_ptr<seastar::httpd::reply>> handle(const sstring& path, std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) override {
+    future<std::unique_ptr<seastar::http::reply>> handle(const sstring& path, std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) override {
         return _func(std::move(req), std::move(rep));
     }
 };
@@ -170,7 +170,7 @@ auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler
     return new async_handler([
         auth_check_with_info = std::forward<AuthCheckWithInfo>(auth_check_with_info),
         handler = std::forward<Func>(handler)
-    ](auto req, auto rep) mutable -> future<std::unique_ptr<seastar::httpd::reply>> {
+    ](auto req, auto rep) mutable -> future<std::unique_ptr<seastar::http::reply>> {
 
         // Execute the captured private check with detailed info
         auto [authorized, info] = auth_check_with_info(*req);
@@ -180,7 +180,7 @@ auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler
             // Provide specific error message
             std::string error_msg = "{\"error\": \"Unauthorized - " + info + "\"}";
             rep->write_body("json", error_msg);
-            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+            return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
         return handler(std::move(req), std::move(rep));
     });
@@ -193,13 +193,13 @@ auto make_rate_limited_handler(RateLimitCheck&& rate_limit_check, Func&& handler
         rate_limit_check = std::forward<RateLimitCheck>(rate_limit_check),
         handler = std::forward<Func>(handler)
     ](auto req, auto rep) mutable
-        -> future<std::unique_ptr<seastar::httpd::reply>> {
+        -> future<std::unique_ptr<seastar::http::reply>> {
         if (!rate_limit_check(*req)) {
             metrics().record_rate_limited();
             rep->set_status(seastar::http::reply::status_type::service_unavailable);
             rep->add_header("Retry-After", "1");
             rep->write_body("json", "{\"error\": \"Rate limit exceeded - try again later\"}");
-            return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+            return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
         return handler(std::move(req), std::move(rep));
     });
@@ -209,7 +209,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
     // 0. HEALTH CHECK (public, no auth required - for load balancer probes)
-    r.add(operation_type::GET, url("/health"), new async_handler<std::function<future<std::unique_ptr<seastar::httpd::reply>>(std::unique_ptr<seastar::httpd::request>, std::unique_ptr<seastar::httpd::reply>)>>(
+    r.add(operation_type::GET, url("/health"), new async_handler<std::function<future<std::unique_ptr<seastar::http::reply>>(std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
         [this](auto req, auto rep) {
             return this->handle_health(std::move(req), std::move(rep));
         }));
@@ -631,9 +631,9 @@ future<> HttpController::stream_backend_response(
 // ---------------------------------------------------------
 // PROXY HANDLER
 // ---------------------------------------------------------
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
-    std::unique_ptr<seastar::httpd::request> req,
-    std::unique_ptr<seastar::httpd::reply> rep,
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep,
     std::string_view endpoint) {
     // Extract or generate request ID for distributed tracing
     std::string request_id = extract_request_id(req->_headers);
@@ -736,7 +736,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
 
     // Zero-copy body access: use string_view for tokenization and parsing,
     // only create string copy when we need to forward/modify the body
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     std::string_view body_view(req->content.data(), req->content.size());
+#pragma GCC diagnostic pop
     std::string client_ip = get_client_ip(*req);
 
     log_proxy.info("[{}] Request received from {} ({} bytes)",
@@ -1410,13 +1413,13 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_proxy(
 // CONTROL PLANE HANDLERS
 // ---------------------------------------------------------
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_route(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_route(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     sstring id_str = req->get_query_param("backend_id");
     if (id_str.empty()) {
         log_control.warn("POST /admin/routes: missing backend_id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     auto backend_id_opt = parse_backend_id(std::string_view(id_str));
@@ -1424,13 +1427,16 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         log_control.warn("POST /admin/routes: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
     int backend_id = *backend_id_opt;
 
     std::vector<int32_t> tokens;
     // Use string_view for zero-copy tokenization
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     std::string_view content_view(req->content.data(), req->content.size());
+#pragma GCC diagnostic pop
 
     // Validate input before passing to tokenizer
     auto validation = TextValidator::validate_for_tokenizer(
@@ -1440,7 +1446,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         metrics().record_tokenizer_validation_failure();
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Input validation failed: " + validation.error + "\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     try {
@@ -1450,7 +1456,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         metrics().record_tokenizer_error();
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Failed to tokenize request content\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     // Check if route will actually be stored (must meet block_alignment minimum)
@@ -1468,7 +1474,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
             << ", \"warning\": \"Content too short (" << token_count << " tokens), need at least "
             << _config.block_alignment << " for block_alignment. Route not stored.\"}";
         rep->write_body("json", oss.str());
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     // Queue route for async persistence (fire-and-forget, non-blocking)
@@ -1482,11 +1488,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
              << ", \"tokens\": " << token_count
              << ", \"stored_tokens\": " << aligned_len << "}";
          rep->write_body("json", oss.str());
-         return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+         return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     });
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0
     // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
     sstring id_str = req->get_query_param("id");
@@ -1570,6 +1576,8 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
         try {
             auto hostent = co_await seastar::net::dns::get_host_by_name(std::string(ip_str));
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             if (hostent.addr_list.empty()) {
                 log_control.warn("POST /admin/backends: DNS resolution returned no addresses for '{}'", ip_str);
                 rep->set_status(seastar::http::reply::status_type::bad_request);
@@ -1582,6 +1590,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
             std::ostringstream oss;
             oss << hostent.addr_list[0];
             resolved_ip = oss.str();
+#pragma GCC diagnostic pop
 
             log_control.info("POST /admin/backends: resolved hostname '{}' to IP '{}'", ip_str, resolved_ip);
 
@@ -1612,7 +1621,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_broadcast_
 // ADMIN DELETE HANDLERS
 // ---------------------------------------------------------
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_backend(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_delete_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     // Usage: DELETE /admin/backends?id=1
     sstring id_str = req->get_query_param("id");
 
@@ -1620,7 +1629,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
         log_control.warn("DELETE /admin/backends: missing id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing id parameter\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     auto id_opt = parse_int32(std::string_view(id_str));
@@ -1628,7 +1637,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
         log_control.warn("DELETE /admin/backends: invalid id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid id: must be a valid integer\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
     int id = *id_opt;
 
@@ -1642,11 +1651,11 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_bac
     return _router.unregister_backend_global(id).then([id, rep = std::move(rep)]() mutable {
         log_control.info("Deleted Backend {} and its persisted routes", id);
         rep->write_body("json", "{\"status\": \"ok\", \"backend_deleted\": " + std::to_string(id) + "}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     });
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_routes(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_delete_routes(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     // Usage: DELETE /admin/routes?backend_id=1
     sstring id_str = req->get_query_param("backend_id");
 
@@ -1654,7 +1663,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
         log_control.warn("DELETE /admin/routes: missing backend_id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     auto backend_id_opt = parse_backend_id(std::string_view(id_str));
@@ -1662,7 +1671,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
         log_control.warn("DELETE /admin/routes: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
     int backend_id = *backend_id_opt;
 
@@ -1676,10 +1685,10 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_delete_rou
     // traverse the entire tree which is expensive.
     log_control.info("Deleted persisted routes for Backend {} (in-memory routes cleared on restart)", backend_id);
     rep->write_body("json", "{\"status\": \"ok\", \"routes_deleted_for_backend\": " + std::to_string(backend_id) + ", \"note\": \"In-memory routes will be cleared on restart\"}");
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     // Usage: POST /admin/clear
     // WARNING: This is destructive!
 
@@ -1690,14 +1699,14 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_clear_all(
 
     log_control.warn("Queued clear of all persisted data (backends and routes). Restart required to clear in-memory state.");
     rep->write_body("json", "{\"status\": \"ok\", \"warning\": \"All persisted data queued for clearing. Restart to clear in-memory state.\"}");
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
 // ---------------------------------------------------------
 // API KEY MANAGEMENT
 // ---------------------------------------------------------
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reload(std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
     // Usage: POST /admin/keys/reload
     // Triggers a hot-reload of the configuration file to pick up new API keys
     // Note: This triggers SIGHUP for async reload. The response returns current state,
@@ -1710,7 +1719,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reloa
         log_control.error("Config reload callback not configured");
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->write_body("json", "{\"error\": \"Config reload not available\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     // Trigger the reload (sends SIGHUP to self for async processing)
@@ -1720,7 +1729,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reloa
         log_control.error("Failed to trigger config reload");
         rep->set_status(seastar::http::reply::status_type::internal_server_error);
         rep->write_body("json", "{\"error\": \"Failed to trigger config reload\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     log_control.info("Config reload triggered via /admin/keys/reload endpoint");
@@ -1771,7 +1780,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_keys_reloa
     response += "]}";
 
     rep->write_body("json", response);
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
 // ---------------------------------------------------------
@@ -1816,10 +1825,7 @@ bool HttpController::is_persistence_backpressured() const {
     }
 
     // Check if persistence queue is above threshold.
-    // Note: queue_depth() acquires a mutex, but this is acceptable for backpressure checks:
-    // 1. The mutex is uncontended on most requests (route learning is infrequent)
-    // 2. Operators can disable this check via enable_persistence_backpressure=false
-    // Future optimization: Use an atomic queue size counter if profiling shows contention.
+    // queue_depth() reads an atomic shadow counter — zero lock, safe on the reactor.
     size_t max_depth = _persistence->max_queue_depth();
     if (max_depth == 0) {
         return false;  // Avoid division by zero; 0 means unlimited
@@ -1906,9 +1912,9 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
     return ss.str();
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_tree(
-    std::unique_ptr<seastar::httpd::request> req,
-    std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
 
     // Check for optional prefix filter (comma-separated token IDs)
     sstring prefix_str = req->get_query_param("prefix");
@@ -1925,7 +1931,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_tree(
                 log_control.warn("GET /admin/dump/tree: invalid prefix token '{}'", token_str);
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->write_body("json", "{\"error\": \"Invalid prefix token ID\"}");
-                return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+                return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
             }
             prefix_filter.push_back(*token_opt);
         }
@@ -1976,12 +1982,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_tree(
     }
 
     rep->write_body("json", json_response);
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_cluster(
-    std::unique_ptr<seastar::httpd::request> req,
-    std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_cluster(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
 
     // GossipService is only on shard 0
     auto* gossip = _router.gossip_service();
@@ -1991,7 +1997,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_clust
             "  \"cluster_enabled\": false\n"
             "}";
         rep->write_body("json", response);
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     auto state = gossip->get_cluster_state();
@@ -2029,12 +2035,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_clust
     oss << "}";
 
     rep->write_body("json", oss.str());
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_backends(
-    std::unique_ptr<seastar::httpd::request> req,
-    std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backends(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
 
     auto backends = _router.get_all_backend_states();
 
@@ -2068,12 +2074,12 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_dump_backe
     oss << "}";
 
     rep->write_body("json", oss.str());
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_backend(
-    std::unique_ptr<seastar::httpd::request> req,
-    std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_drain_backend(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
 
     // Usage: POST /admin/drain?backend_id=1
     sstring id_str = req->get_query_param("backend_id");
@@ -2082,7 +2088,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_back
         log_control.warn("POST /admin/drain: missing backend_id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id parameter\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     auto backend_id_opt = parse_backend_id(std::string_view(id_str));
@@ -2090,7 +2096,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_back
         log_control.warn("POST /admin/drain: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
     int backend_id = *backend_id_opt;
 
@@ -2117,7 +2123,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_back
         oss << "}";
 
         rep->write_body("json", oss.str());
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     });
 }
 
@@ -2125,15 +2131,15 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_drain_back
 // HEALTH CHECK HANDLER (public, no auth)
 // ---------------------------------------------------------
 
-future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_health(
-    std::unique_ptr<seastar::httpd::request> req,
-    std::unique_ptr<seastar::httpd::reply> rep) {
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_health(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
 
     // Check draining state first (atomic read - lock-free per Anti-Pattern #1)
     if (_draining.load(std::memory_order_relaxed)) {
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->write_body("json", "{\"status\": \"draining\"}");
-        return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
     // Determine quorum status
@@ -2154,7 +2160,7 @@ future<std::unique_ptr<seastar::httpd::reply>> HttpController::handle_health(
         : "{\"status\": \"healthy\", \"quorum\": false}";
 
     rep->write_body("json", response);
-    return make_ready_future<std::unique_ptr<seastar::httpd::reply>>(std::move(rep));
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 
 } // namespace ranvier

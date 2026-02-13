@@ -279,8 +279,9 @@ OPTIONS:
     --dry-run               Validate configuration and exit (no server start)
     --smp <N>               Number of CPU cores to use
     --memory <SIZE>         Memory to allocate (e.g., 4G)
-    --std-alloc             Use standard libc allocator (required for Rust FFI
-                            with multiple shards)
+    --std-alloc             Use standard libc allocator instead of Seastar's
+                            per-shard allocator (no longer required since
+                            tokenizers-cpp uses jemalloc)
 
 SIGNALS:
     SIGHUP                  Reload configuration (hot-reload)
@@ -353,7 +354,8 @@ int main(int argc, char** argv) {
     app_template::seastar_options opts;
     opts.name = "ranvier_server";
 
-    // Configure standard allocator if requested (for Rust FFI compatibility)
+    // Configure standard allocator if requested. No longer required for Rust FFI
+    // (jemalloc isolates Rust allocations), but kept as an option for debugging.
     // This MUST be set before app_template is created - cannot be changed after
     if (use_std_alloc) {
         opts.smp_opts.memory_allocator = memory_allocator::standard;
@@ -367,7 +369,7 @@ int main(int argc, char** argv) {
         ("config", boost::program_options::value<std::string>()->default_value("ranvier.yaml"),
          "Path to configuration file")
         ("dry-run", "Validate configuration and exit (no server start)")
-        ("std-alloc", "Use standard libc allocator instead of Seastar's (required for Rust FFI)");
+        ("std-alloc", "Use standard libc allocator instead of Seastar's per-shard allocator");
 
     // Run the application
     return app.run(argc, argv, [config = std::move(config), config_path]() mutable {

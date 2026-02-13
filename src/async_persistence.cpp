@@ -372,8 +372,9 @@ void AsyncPersistenceManager::log_stats() {
     // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
     // If the gate is closed (stop() in progress), this throws gate_closed_exception
     // and the callback safely exits without accessing any member state.
+    seastar::gate::holder timer_holder;
     try {
-        [[maybe_unused]] auto timer_holder = _timer_gate.hold();
+        timer_holder = _timer_gate.hold();
     } catch (const seastar::gate_closed_exception&) {
         // Gate closed - stop() is in progress, exit safely
         return;

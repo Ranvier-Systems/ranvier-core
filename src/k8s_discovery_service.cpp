@@ -38,15 +38,63 @@ constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
 
 // Note: parse_port() is now provided by parse_utils.hpp using std::from_chars
 
-// Generate a stable BackendId from endpoint UID
-BackendId K8sEndpoint::to_backend_id() const {
-    // Use a simple hash of the UID string
-    // This provides stability across restarts while being deterministic
-    uint32_t hash = 0;
-    for (char c : uid) {
-        hash = hash * 31 + static_cast<uint32_t>(c);
+// Parse the numeric HTTP status code from a response header block.
+// HTTP status line format: "HTTP/<version> <code> <reason>\r\n..."
+// Returns the 3-digit numeric code (e.g. 200, 404, 503), or std::nullopt
+// if the status line is malformed or the code is not a valid integer.
+static std::optional<int> parse_http_status_code(std::string_view headers) {
+    // Extract the first line (status line)
+    auto line_end = headers.find("\r\n");
+    std::string_view status_line = headers.substr(0, line_end);
+
+    // Find the status code field: "HTTP/x.x <code> <reason>"
+    auto first_space = status_line.find(' ');
+    if (first_space == std::string_view::npos) {
+        return std::nullopt;
     }
-    // Ensure positive BackendId (use upper 31 bits)
+
+    // Advance past whitespace to the start of the code
+    auto code_start = first_space + 1;
+    while (code_start < status_line.size() && status_line[code_start] == ' ') {
+        ++code_start;
+    }
+
+    // Find the end of the code (next space or end of line)
+    auto second_space = status_line.find(' ', code_start);
+    auto code_end = (second_space != std::string_view::npos)
+                        ? second_space
+                        : status_line.size();
+
+    if (code_start >= code_end) {
+        return std::nullopt;
+    }
+
+    int code = 0;
+    auto [ptr, ec] = std::from_chars(
+        status_line.data() + code_start,
+        status_line.data() + code_end,
+        code);
+
+    if (ec != std::errc{} || ptr != status_line.data() + code_end) {
+        return std::nullopt;
+    }
+
+    return code;
+}
+
+// Generate a stable BackendId from endpoint UID using FNV-1a 64-bit hash.
+// FNV-1a provides much better distribution than the previous hash*31+c polynomial,
+// and is deterministic across restarts (unlike absl::Hash which uses ASLR-based seeds).
+BackendId K8sEndpoint::to_backend_id() const {
+    constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+    constexpr uint64_t kFnvPrime = 1099511628211ULL;
+
+    uint64_t hash = kFnvOffsetBasis;
+    for (unsigned char c : uid) {
+        hash ^= c;
+        hash *= kFnvPrime;
+    }
+    // Ensure positive BackendId: truncate to 31 bits
     return static_cast<BackendId>(hash & 0x7FFFFFFF);
 }
 
@@ -79,7 +127,17 @@ K8sDiscoveryService::K8sDiscoveryService(const K8sDiscoveryConfig& config)
         seastar::metrics::make_counter("k8s_dns_timeouts", _dns_timeouts,
             seastar::metrics::description("Total number of DNS resolution timeouts")),
         seastar::metrics::make_counter("k8s_dns_cache_hits", _dns_cache_hits,
-            seastar::metrics::description("Total number of DNS cache hits (fallback to cached address)"))
+            seastar::metrics::description("Total number of DNS cache hits (fallback to cached address)")),
+        seastar::metrics::make_counter("k8s_response_size_exceeded", _response_size_exceeded,
+            seastar::metrics::description("Times K8s API response exceeded MAX_RESPONSE_SIZE")),
+        seastar::metrics::make_counter("k8s_line_size_exceeded", _line_size_exceeded,
+            seastar::metrics::description("Times K8s watch buffer exceeded MAX_LINE_SIZE")),
+        seastar::metrics::make_counter("k8s_endpoints_limit_exceeded", _endpoints_limit_exceeded,
+            seastar::metrics::description("Times endpoint insertion was rejected due to MAX_ENDPOINTS limit")),
+        seastar::metrics::make_counter("k8s_backend_id_collisions", _backend_id_collisions,
+            seastar::metrics::description("Times two different UIDs produced the same BackendId hash")),
+        seastar::metrics::make_counter("k8s_watch_410_gone", _watch_410_gone,
+            seastar::metrics::description("Times K8s watch received 410 Gone requiring full re-list"))
     });
 }
 
@@ -196,8 +254,23 @@ seastar::future<> K8sDiscoveryService::load_service_account_token() {
 
     try {
         auto file = co_await seastar::open_file_dma(_config.token_path, seastar::open_flags::ro);
+        auto size = co_await file.size();
+
+        if (size == 0) {
+            log_k8s.warn("Token file is empty: {} - continuing without auth", _config.token_path);
+            co_await file.close();
+            co_return;
+        }
+
+        if (size > K8S_MAX_TOKEN_SIZE) {
+            log_k8s.error("Token file {} is {} bytes, exceeds maximum allowed size ({} bytes) - "
+                          "continuing without auth", _config.token_path, size, K8S_MAX_TOKEN_SIZE);
+            co_await file.close();
+            co_return;
+        }
+
         auto stream = seastar::make_file_input_stream(file);
-        auto buf = co_await stream.read_exactly(4096);  // Tokens are usually small
+        auto buf = co_await stream.read_exactly(size);
 
         _bearer_token = std::string(buf.get(), buf.size());
 
@@ -369,6 +442,8 @@ seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server
                 seastar::net::dns::get_host_by_name(host)
             );
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             if (hostent.addr_list.empty()) {
                 log_k8s.error("DNS resolution returned no addresses for: {} - "
                               "check CoreDNS/kube-dns configuration and network connectivity",
@@ -385,6 +460,7 @@ seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server
 
             log_k8s.debug("DNS resolved {} to {} (attempt {})",
                           host, hostent.addr_list[0], attempt + 1);
+#pragma GCC diagnostic pop
 
             co_return addr;
 
@@ -497,11 +573,19 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
         co_await out.write(request);
         co_await out.flush();
 
-        // Read response
+        // Read response (Rule #4: bounded to K8S_MAX_RESPONSE_SIZE)
         std::string response;
         while (!in.eof()) {
             auto buf = co_await in.read();
             if (buf.empty()) break;
+            if (response.size() + buf.size() > K8S_MAX_RESPONSE_SIZE) {
+                ++_response_size_exceeded;
+                log_k8s.error("K8s API response exceeds MAX_RESPONSE_SIZE ({} bytes) - "
+                              "aborting to prevent OOM", K8S_MAX_RESPONSE_SIZE);
+                co_await out.close();
+                co_await in.close();
+                throw std::runtime_error("K8s API response exceeded size limit");
+            }
             response.append(buf.get(), buf.size());
         }
 
@@ -517,13 +601,13 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& pat
         std::string headers = response.substr(0, header_end);
         std::string body = response.substr(header_end + 4);
 
-        // Check status code
-        if (headers.find("200 OK") == std::string::npos &&
-            headers.find("200 ") == std::string::npos) {
-            // Extract status line
+        // Check status code — parse the numeric code from the HTTP status line
+        // rather than doing a brittle string search through all headers.
+        auto status_code = parse_http_status_code(headers);
+        if (!status_code || *status_code != 200) {
             auto status_end = headers.find("\r\n");
-            std::string status = headers.substr(0, status_end);
-            throw std::runtime_error("K8s API error: " + status);
+            std::string status_line = headers.substr(0, status_end);
+            throw std::runtime_error("K8s API error: " + status_line);
         }
 
         // Handle chunked transfer encoding
@@ -718,9 +802,32 @@ seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discov
 }
 
 seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& endpoint) {
-    log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, ready={})",
+    // Rule #4: Bound endpoints map to prevent OOM from broad selector
+    if (_endpoints.find(endpoint.uid) == _endpoints.end() &&
+        _endpoints.size() >= K8S_MAX_ENDPOINTS) {
+        ++_endpoints_limit_exceeded;
+        log_k8s.error("Endpoint limit reached ({}) - rejecting new endpoint {} ({}:{}) - "
+                      "check label selector specificity",
+                      K8S_MAX_ENDPOINTS, endpoint.uid, endpoint.address, endpoint.port);
+        co_return;
+    }
+
+    auto backend_id = endpoint.to_backend_id();
+
+    // Collision detection: check if a different UID already maps to this BackendId
+    auto collision_it = _backend_id_to_uid.find(backend_id);
+    if (collision_it != _backend_id_to_uid.end() && collision_it->second != endpoint.uid) {
+        ++_backend_id_collisions;
+        log_k8s.error("BackendId collision detected: UID '{}' and UID '{}' both hash to BackendId {} - "
+                      "the new endpoint will shadow the existing one. "
+                      "This is a hash collision that may cause routing errors.",
+                      endpoint.uid, collision_it->second, backend_id);
+    }
+    _backend_id_to_uid[backend_id] = endpoint.uid;
+
+    log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, ready={}, backend_id={})",
                  endpoint.uid, endpoint.address, endpoint.port,
-                 endpoint.weight, endpoint.priority, endpoint.ready);
+                 endpoint.weight, endpoint.priority, endpoint.ready, backend_id);
 
     _endpoints[endpoint.uid] = endpoint;
     ++_endpoints_added;
@@ -731,7 +838,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& 
             seastar::net::inet_address inet_addr(endpoint.address);
             seastar::socket_address addr(inet_addr, endpoint.port);
 
-            co_await _register_callback(endpoint.to_backend_id(), addr,
+            co_await _register_callback(backend_id, addr,
                                          endpoint.weight, endpoint.priority);
         } catch (const std::exception& e) {
             log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
@@ -748,15 +855,22 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
     }
 
     const auto& endpoint = it->second;
-    log_k8s.info("K8s endpoint removed: {} ({}:{})",
-                 endpoint.uid, endpoint.address, endpoint.port);
+    auto backend_id = endpoint.to_backend_id();
+    log_k8s.info("K8s endpoint removed: {} ({}:{}, backend_id={})",
+                 endpoint.uid, endpoint.address, endpoint.port, backend_id);
 
     ++_endpoints_removed;
+
+    // Clean up reverse map (only if this UID still owns the BackendId entry)
+    auto rev_it = _backend_id_to_uid.find(backend_id);
+    if (rev_it != _backend_id_to_uid.end() && rev_it->second == endpoint.uid) {
+        _backend_id_to_uid.erase(rev_it);
+    }
 
     // Drain the backend
     if (_drain_callback) {
         try {
-            co_await _drain_callback(endpoint.to_backend_id());
+            co_await _drain_callback(backend_id);
         } catch (const std::exception& e) {
             log_k8s.error("Failed to drain backend for {}: {}", uid, e.what());
         }
@@ -767,8 +881,13 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
 }
 
 seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoint& endpoint) {
-    log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={})",
-                 endpoint.uid, endpoint.ready, endpoint.weight, endpoint.priority);
+    auto backend_id = endpoint.to_backend_id();
+
+    log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={}, backend_id={})",
+                 endpoint.uid, endpoint.ready, endpoint.weight, endpoint.priority, backend_id);
+
+    // Keep reverse map consistent for the modify path
+    _backend_id_to_uid[backend_id] = endpoint.uid;
 
     auto it = _endpoints.find(endpoint.uid);
     bool was_ready = it != _endpoints.end() && it->second.ready;
@@ -782,7 +901,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
                 seastar::net::inet_address inet_addr(endpoint.address);
                 seastar::socket_address addr(inet_addr, endpoint.port);
 
-                co_await _register_callback(endpoint.to_backend_id(), addr,
+                co_await _register_callback(backend_id, addr,
                                              endpoint.weight, endpoint.priority);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
@@ -792,7 +911,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
         // Became not ready - drain
         if (_drain_callback) {
             try {
-                co_await _drain_callback(endpoint.to_backend_id());
+                co_await _drain_callback(backend_id);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to drain backend for {}: {}", endpoint.uid, e.what());
             }
@@ -804,7 +923,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoin
                 seastar::net::inet_address inet_addr(endpoint.address);
                 seastar::socket_address addr(inet_addr, endpoint.port);
 
-                co_await _register_callback(endpoint.to_backend_id(), addr,
+                co_await _register_callback(backend_id, addr,
                                              endpoint.weight, endpoint.priority);
             } catch (const std::exception& e) {
                 log_k8s.error("Failed to update backend for {}: {}", endpoint.uid, e.what());
@@ -841,8 +960,25 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             rapidjson::Document event;
             if (event.Parse(line.c_str()).HasParseError()) co_return true;
 
-            if (event.HasMember("kind") && std::string(event["kind"].GetString()) == "Status") {
-                log_k8s.warn("Watch error: {}", event["message"].GetString());
+            // Handle direct Status objects (e.g., HTTP error response body)
+            if (event.HasMember("kind") && event["kind"].IsString() &&
+                std::string(event["kind"].GetString()) == "Status") {
+                int status_code = 0;
+                if (event.HasMember("code") && event["code"].IsInt()) {
+                    status_code = event["code"].GetInt();
+                }
+                std::string message = (event.HasMember("message") && event["message"].IsString())
+                    ? event["message"].GetString() : "Unknown error";
+
+                if (status_code == 410) {
+                    log_k8s.warn("Watch received 410 Gone (resource version expired): {} - "
+                                 "clearing resource version and re-syncing", message);
+                    ++_watch_410_gone;
+                    _resource_version.clear();
+                    co_await sync_endpoints();
+                    co_return false;
+                }
+                log_k8s.warn("Watch error (status {}): {}", status_code, message);
                 co_return false;
             }
 
@@ -850,6 +986,32 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
 
             std::string type = event["type"].GetString();
             const auto& obj = event["object"];
+
+            // Handle ERROR watch events (e.g., 410 Gone sent mid-stream as a watch event)
+            if (type == "ERROR") {
+                int status_code = 0;
+                std::string message = "Unknown error";
+                if (obj.HasMember("kind") && obj["kind"].IsString() &&
+                    std::string(obj["kind"].GetString()) == "Status") {
+                    if (obj.HasMember("code") && obj["code"].IsInt()) {
+                        status_code = obj["code"].GetInt();
+                    }
+                    if (obj.HasMember("message") && obj["message"].IsString()) {
+                        message = obj["message"].GetString();
+                    }
+                }
+
+                if (status_code == 410) {
+                    log_k8s.warn("Watch received 410 Gone event (resource version expired): {} - "
+                                 "clearing resource version and re-syncing", message);
+                    ++_watch_410_gone;
+                    _resource_version.clear();
+                    co_await sync_endpoints();
+                    co_return false;
+                }
+                log_k8s.warn("Watch ERROR event (status {}): {}", status_code, message);
+                co_return false;
+            }
 
             if (obj.HasMember("metadata") && obj["metadata"].HasMember("resourceVersion")) {
                 _resource_version = obj["metadata"]["resourceVersion"].GetString();
@@ -1072,6 +1234,7 @@ seastar::future<> K8sDiscoveryService::k8s_watch(
 
         buffer.append(buf.get(), buf.size());
 
+        // Rule #4: Bound buffer between newlines to prevent Slowloris-style OOM
         size_t pos;
         while ((pos = buffer.find('\n')) != std::string::npos) {
             std::string line = buffer.substr(0, pos);
@@ -1081,6 +1244,15 @@ seastar::future<> K8sDiscoveryService::k8s_watch(
                 keep_going = co_await on_event(line);
                 if (!keep_going) break;
             }
+        }
+
+        // If no newline found and buffer exceeds MAX_LINE_SIZE, abort watch
+        if (buffer.size() > K8S_MAX_LINE_SIZE) {
+            ++_line_size_exceeded;
+            log_k8s.error("K8s watch buffer exceeds MAX_LINE_SIZE ({} bytes) without newline - "
+                          "aborting watch to prevent OOM (possible Slowloris attack)",
+                          K8S_MAX_LINE_SIZE);
+            break;
         }
     }
 

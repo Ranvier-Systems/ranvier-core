@@ -153,10 +153,13 @@ public:
     // Admin API
     ClusterState get_cluster_state() const;
 
-    // Callbacks
-    void set_prune_callback(RoutePruneCallback callback) {
-        _route_prune_callback = std::move(callback);
-    }
+    // Per-shard callback registration for route pruning.
+    // Each shard registers its own local callback to avoid broadcasting
+    // std::function across shards (anti-pattern Bug #3: cross-shard free).
+    // Shard 0 broadcasts only the scalar BackendId; each shard invokes
+    // its own locally-registered callback.
+    static void register_local_prune_callback(RoutePruneCallback callback);
+    static void clear_local_prune_callback();
 
     // Provide read access to peer table for protocol layer
     const std::unordered_map<seastar::socket_address, PeerState>& peer_table() const {
@@ -209,9 +212,6 @@ private:
     // Timers
     seastar::timer<> _liveness_timer;
     seastar::gate _timer_gate;
-
-    // Callbacks
-    RoutePruneCallback _route_prune_callback;
 
     // Internal methods
     void check_liveness();

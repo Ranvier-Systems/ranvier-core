@@ -73,7 +73,7 @@ FetchContent_MakeAvailable(rapidjson)
 # RapidJSON is header-only. We must define the include path for the project.
 # The headers are located in the 'include' subdirectory of the fetched source.
 add_library(rapidjson_interface INTERFACE)
-target_include_directories(rapidjson_interface INTERFACE ${rapidjson_SOURCE_DIR}/include)
+target_include_directories(rapidjson_interface SYSTEM INTERFACE ${rapidjson_SOURCE_DIR}/include)
 
 # Option to disable OpenTelemetry (avoids static initialization that can block)
 option(WITH_TELEMETRY "Enable OpenTelemetry distributed tracing" ON)
@@ -157,7 +157,15 @@ if(Seastar_FOUND)
       GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp
       GIT_TAG        main
     )
+    # Suppress warnings from third-party code compiled within tokenizers_cpp
+    # (vendored protobuf-lite emits -Warray-bounds false positives with GCC 12+)
+    set(_saved_c_flags "${CMAKE_C_FLAGS}")
+    set(_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+    string(APPEND CMAKE_C_FLAGS " -w")
+    string(APPEND CMAKE_CXX_FLAGS " -w")
     FetchContent_MakeAvailable(tokenizers_cpp)
+    set(CMAKE_C_FLAGS "${_saved_c_flags}")
+    set(CMAKE_CXX_FLAGS "${_saved_cxx_flags}")
 
     # ==========================================================================
     # Patch tokenizers-cpp to use jemalloc as Rust's global allocator
@@ -456,6 +464,18 @@ target_link_libraries(gossip_protocol_test
 )
 gtest_discover_tests(gossip_protocol_test)
 
+# Gossip Transport Ownership Pattern Tests (Pure C++, no Seastar dependency)
+# Tests verifying shard-local ownership patterns (Rule #0: no std::shared_ptr)
+add_executable(gossip_transport_ownership_test
+  tests/unit/gossip_transport_ownership_test.cpp
+)
+target_include_directories(gossip_transport_ownership_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gossip_transport_ownership_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_transport_ownership_test)
+
 # Route Batching Unit Tests (Pure C++, no Seastar dependency)
 # Tests for route batching data structures and behavior
 add_executable(route_batching_test
@@ -640,6 +660,22 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(crypto_offloader_test)
+
+    # DtlsContext Unit Tests (Requires Seastar types for header includes)
+    # Tests memory-based certificate loading (load_certs_from_memory) without reactor
+    add_executable(dtls_context_test
+      tests/unit/dtls_context_test.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(dtls_context_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(dtls_context_test
+      PRIVATE
+      Seastar::seastar
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(dtls_context_test)
 
 # ConnectionPool Unit Tests (Requires Seastar types)
     # Tests pool management logic: per-host limits, global limits, idle timeout
