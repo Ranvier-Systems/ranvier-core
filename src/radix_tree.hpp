@@ -505,6 +505,66 @@ private:
     }
 
     // -------------------------------------------------------------------------
+    // Small-Node Template Helpers
+    // -------------------------------------------------------------------------
+    //
+    // Node4, Node16, and Node48 all use parallel keys/children vectors with
+    // identical access patterns.  These template helpers eliminate duplication
+    // across the per-type switch branches.  Node256 (direct-index array) is
+    // always handled separately.
+
+    // Linear-scan find on any node with .keys / .children vectors.
+    template<typename SmallNodeT>
+    static Node* find_child_keyed(SmallNodeT* n, TokenId key) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) return n->children[i].get();
+        }
+        return nullptr;
+    }
+
+    // Move child out of a keyed node (leaves stale entry for set_child to update).
+    template<typename SmallNodeT>
+    static NodePtr extract_child_keyed(SmallNodeT* n, TokenId key) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) return std::move(n->children[i]);
+        }
+        return nullptr;
+    }
+
+    // Replace existing child in a keyed node.
+    template<typename SmallNodeT>
+    static void set_child_keyed(SmallNodeT* n, TokenId key, NodePtr child) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) {
+                n->children[i] = std::move(child);
+                return;
+            }
+        }
+    }
+
+    // Visit all children of a keyed node.
+    template<typename SmallNodeT, typename Callback>
+    static void visit_children_keyed(SmallNodeT* n, Callback&& callback) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            callback(n->keys[i], n->children[i].get());
+        }
+    }
+
+    // Erase child by key from a keyed node (used by compaction).
+    template<typename SmallNodeT>
+    static NodeType remove_child_keyed(SmallNodeT* n, TokenId key) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) {
+                NodeType removed_type = n->children[i]->type;
+                n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
+                n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
+                return removed_type;
+            }
+        }
+        return NodeType::Node4; // Fallback (shouldn't happen)
+    }
+
+    // -------------------------------------------------------------------------
     // Node Visitor Helpers
     // -------------------------------------------------------------------------
 
@@ -512,32 +572,20 @@ private:
     template<typename Callback>
     static void visit_children(Node* node, Callback&& callback) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    callback(n->keys[i], n->children[i].get());
-                }
+            case NodeType::Node4:
+                visit_children_keyed(static_cast<Node4*>(node), callback);
                 break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    callback(n->keys[i], n->children[i].get());
-                }
+            case NodeType::Node16:
+                visit_children_keyed(static_cast<Node16*>(node), callback);
                 break;
-            }
-            case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    callback(n->keys[i], n->children[i].get());
-                }
+            case NodeType::Node48:
+                visit_children_keyed(static_cast<Node48*>(node), callback);
                 break;
-            }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
                     if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) {
-                        callback(n->keys[i], n->children[i].get());  // Use stored full key
+                        callback(n->keys[i], n->children[i].get());
                     }
                 }
                 break;
@@ -586,22 +634,10 @@ private:
     // Find child by key - hot path, optimized for common cases
     Node* find_child(Node* node, TokenId key) const {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                // Small node: linear scan is cache-friendly
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return n->children[i].get();
-                }
-                return nullptr;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                // Medium node: linear scan, SIMD-friendly in future
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return n->children[i].get();
-                }
-                return nullptr;
-            }
+            case NodeType::Node4:
+                return find_child_keyed(static_cast<Node4*>(node), key);
+            case NodeType::Node16:
+                return find_child_keyed(static_cast<Node16*>(node), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 // O(1) index lookup with full key verification
@@ -646,20 +682,10 @@ private:
 
     NodePtr extract_child(Node* node, TokenId key) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return std::move(n->children[i]);
-                }
-                break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return std::move(n->children[i]);
-                }
-                break;
-            }
+            case NodeType::Node4:
+                return extract_child_keyed(static_cast<Node4*>(node), key);
+            case NodeType::Node16:
+                return extract_child_keyed(static_cast<Node16*>(node), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
@@ -696,26 +722,12 @@ private:
 
     void set_child(Node* node, TokenId key, NodePtr child) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        n->children[i] = std::move(child);
-                        return;
-                    }
-                }
-                break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        n->children[i] = std::move(child);
-                        return;
-                    }
-                }
-                break;
-            }
+            case NodeType::Node4:
+                set_child_keyed(static_cast<Node4*>(node), key, std::move(child));
+                return;
+            case NodeType::Node16:
+                set_child_keyed(static_cast<Node16*>(node), key, std::move(child));
+                return;
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
@@ -1087,20 +1099,21 @@ private:
         }
     }
 
+    // Append a key+child to a keyed node (used after split when capacity is guaranteed).
+    template<typename SmallNodeT>
+    static void append_child_keyed(SmallNodeT* n, TokenId key, NodePtr child) {
+        n->keys.push_back(key);
+        n->children.push_back(std::move(child));
+    }
+
     void add_single_child_after_split(Node* node, TokenId key, NodePtr child) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                n->keys.push_back(key);
-                n->children.push_back(std::move(child));
+            case NodeType::Node4:
+                append_child_keyed(static_cast<Node4*>(node), key, std::move(child));
                 break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                n->keys.push_back(key);
-                n->children.push_back(std::move(child));
+            case NodeType::Node16:
+                append_child_keyed(static_cast<Node16*>(node), key, std::move(child));
                 break;
-            }
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 n->index[key_byte(key)] = 0;
@@ -1482,6 +1495,22 @@ private:
         return false;
     }
 
+    // Compact helper for keyed node types (Node4/Node16/Node48).
+    template<typename SmallNodeT>
+    void compact_children_keyed(SmallNodeT* n, CompactionStats& stats,
+                                std::vector<TokenId>& keys_to_remove) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            Node* child = n->children[i].get();
+            compact_children(child, stats);
+            if (should_shrink(child)) {
+                n->children[i] = shrink_node(std::move(n->children[i]), stats);
+            }
+            if (is_node_empty(n->children[i].get())) {
+                keys_to_remove.push_back(n->keys[i]);
+            }
+        }
+    }
+
     // Recursively compact children of a node, removing empty ones
     void compact_children(Node* node, CompactionStats& stats) {
         if (!node) return;
@@ -1491,51 +1520,15 @@ private:
         keys_to_remove.reserve(8); // Bounded allocation (Rule #4)
 
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    Node* child = n->children[i].get();
-                    // Recurse first (post-order traversal)
-                    compact_children(child, stats);
-                    // Check if child should be shrunk
-                    if (should_shrink(child)) {
-                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
-                    }
-                    // Mark for removal if empty
-                    if (is_node_empty(n->children[i].get())) {
-                        keys_to_remove.push_back(n->keys[i]);
-                    }
-                }
+            case NodeType::Node4:
+                compact_children_keyed(static_cast<Node4*>(node), stats, keys_to_remove);
                 break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    Node* child = n->children[i].get();
-                    compact_children(child, stats);
-                    if (should_shrink(child)) {
-                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
-                    }
-                    if (is_node_empty(n->children[i].get())) {
-                        keys_to_remove.push_back(n->keys[i]);
-                    }
-                }
+            case NodeType::Node16:
+                compact_children_keyed(static_cast<Node16*>(node), stats, keys_to_remove);
                 break;
-            }
-            case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    Node* child = n->children[i].get();
-                    compact_children(child, stats);
-                    if (should_shrink(child)) {
-                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
-                    }
-                    if (is_node_empty(n->children[i].get())) {
-                        keys_to_remove.push_back(n->keys[i]);
-                    }
-                }
+            case NodeType::Node48:
+                compact_children_keyed(static_cast<Node48*>(node), stats, keys_to_remove);
                 break;
-            }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
@@ -1565,30 +1558,10 @@ private:
     // Remove a child by key, returns the type of the removed node
     NodeType remove_child(Node* parent, TokenId key) {
         switch (parent->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(parent);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        NodeType removed_type = n->children[i]->type;
-                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
-                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
-                        return removed_type;
-                    }
-                }
-                break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(parent);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        NodeType removed_type = n->children[i]->type;
-                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
-                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
-                        return removed_type;
-                    }
-                }
-                break;
-            }
+            case NodeType::Node4:
+                return remove_child_keyed(static_cast<Node4*>(parent), key);
+            case NodeType::Node16:
+                return remove_child_keyed(static_cast<Node16*>(parent), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(parent);
                 uint8_t indexed_pos = n->index[key_byte(key)];
