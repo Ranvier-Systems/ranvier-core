@@ -2227,12 +2227,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.2 Fix `cache_hit` Misreporting in `route_request()`
 
-- [ ] **Return accurate `cache_hit` from `route_request()` for PREFIX mode**
+- [x] **Return accurate `cache_hit` from `route_request()` for PREFIX mode** ✓
   _Justification:_ `route_request()` unconditionally sets `result.cache_hit = true` when `get_backend_for_prefix()` returns a backend, even when the backend was selected via hash fallback (an ART miss). This inflates `cache_hit` rates in monitoring dashboards and makes the metric unreliable for capacity planning.
-  _What to change:_ Modify `get_backend_for_prefix()` to return a struct (or add an out-parameter) indicating whether the result came from an ART hit or hash fallback. Update `route_request()` to set `cache_hit` only on actual ART hits. Update the `RouteResult` comment to clarify semantics.
-  _Location:_ `src/router_service.cpp` (line 1050), `src/router_service.hpp` (`RouteResult` struct)
+  _Approach implemented:_ Added `PrefixRouteResult` struct with `backend_id` + `art_hit` flag. Changed `get_backend_for_prefix()` return type from `std::optional<BackendId>` to `PrefixRouteResult`. Each return path explicitly sets `art_hit` (true only for ART lookup hits). `route_request()` now sets `cache_hit = prefix_result.art_hit`. Updated `RouteResult::cache_hit` comment. Added `HashFallbackReportsCacheMiss` test and updated existing tests for new return type.
+  _Location:_ `src/router_service.hpp`, `src/router_service.cpp`, `tests/unit/router_service_test.cpp`
   _Complexity:_ Low
-  _Priority:_ P2 — Affects observability accuracy
+  _Completed:_ 2026-02-14
 
 ### 14.3 Extract Shared Live-Backend Filtering Helper
 

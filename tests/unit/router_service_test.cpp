@@ -113,6 +113,17 @@ TEST_F(RouterServiceTest, LearnedRouteReturnsViaRouteRequest) {
     EXPECT_TRUE(result.cache_hit);
 }
 
+TEST_F(RouterServiceTest, HashFallbackReportsCacheMiss) {
+    register_two_backends();
+    // No ART route inserted → route_request must use hash fallback
+    std::vector<int32_t> tokens = {100, 200, 300, 400};
+
+    auto result = router_->route_request(tokens);
+    EXPECT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.routing_mode, "prefix");
+    EXPECT_FALSE(result.cache_hit);  // hash fallback, not ART hit
+}
+
 TEST_F(RouterServiceTest, LookupMissReturnsNullopt) {
     register_two_backends();
     RouterService::insert_route_for_testing({1, 2, 3}, 1);
@@ -358,9 +369,10 @@ TEST_F(RouterServiceTest, DrainingBackendSkippedByPrefixRouting) {
     RouterService::insert_route_for_testing({1, 2, 3}, 1);
 
     auto result = router_->get_backend_for_prefix({1, 2, 3});
-    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.backend_id.has_value());
     // Should fall back to backend 2 (hash fallback skips draining backends)
-    EXPECT_EQ(result.value(), 2);
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_FALSE(result.art_hit);  // Draining ART backend → hash fallback
 }
 
 TEST_F(RouterServiceTest, DrainingBackendStateReported) {
@@ -381,7 +393,7 @@ TEST_F(RouterServiceTest, AllBackendsDrainingReturnsNullopt) {
     EXPECT_FALSE(result.has_value());
 
     auto prefix_result = router_->get_backend_for_prefix({1, 2, 3});
-    EXPECT_FALSE(prefix_result.has_value());
+    EXPECT_FALSE(prefix_result.backend_id.has_value());
 }
 
 TEST_F(RouterServiceTest, RouteRequestReturnsErrorWhenAllDraining) {
@@ -524,9 +536,11 @@ TEST_F(RouterServiceTest, PrefixHashFallbackIsDeterministic) {
     auto first = router_->get_backend_for_prefix(tokens);
     auto second = router_->get_backend_for_prefix(tokens);
 
-    ASSERT_TRUE(first.has_value());
-    ASSERT_TRUE(second.has_value());
-    EXPECT_EQ(first.value(), second.value());
+    ASSERT_TRUE(first.backend_id.has_value());
+    ASSERT_TRUE(second.backend_id.has_value());
+    EXPECT_EQ(first.backend_id.value(), second.backend_id.value());
+    EXPECT_FALSE(first.art_hit);   // No ART route → hash fallback
+    EXPECT_FALSE(second.art_hit);
 }
 
 TEST_F(RouterServiceTest, JumpHashMinimalRemapOnBackendAddition) {
