@@ -178,6 +178,7 @@ private:
     GossipTransport* _transport = nullptr;
     GossipConsensus* _consensus = nullptr;
     std::vector<seastar::socket_address>* _peer_addresses = nullptr;
+    std::unordered_set<seastar::socket_address> _peer_address_set;  // O(1) lookup for handle_packet()
 
     // Callbacks
     RouteLearnCallback _route_learn_callback;

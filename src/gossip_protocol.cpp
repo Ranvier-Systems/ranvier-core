@@ -190,6 +190,7 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
     _transport = &transport;
     _consensus = &consensus;
     _peer_addresses = &peer_addresses;
+    _peer_address_set.insert(peer_addresses.begin(), peer_addresses.end());
     _running = true;
 
     // Only shard 0 manages protocol logic
@@ -331,36 +332,46 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
     log_gossip_protocol().debug("Broadcasting route: {} tokens -> backend {} to {} peers",
                                 tokens.size(), backend, _peer_addresses->size());
 
-    // Send to each peer with per-peer sequence numbers
-    return seastar::parallel_for_each(*_peer_addresses, [this, tokens, backend](const seastar::socket_address& peer) mutable {
-        RouteAnnouncementPacket pkt;
-        pkt.backend_id = backend;
-        // Force local allocation for tokens (Rule #14: cross-shard heap memory)
-        pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
-        pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
-                                                          static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+    // Serialize the packet once with seq_num=0, then stamp per-peer seq_num.
+    // This avoids N token vector copies and N serialization passes.
+    RouteAnnouncementPacket pkt;
+    pkt.backend_id = backend;
+    pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
+    pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
+                                                      static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+    pkt.seq_num = 0;
+    auto base_serialized = pkt.serialize();
 
+    // Send to each peer, stamping per-peer sequence numbers into the pre-serialized buffer
+    return seastar::parallel_for_each(*_peer_addresses,
+        [this, base_serialized = std::move(base_serialized)](const seastar::socket_address& peer) mutable {
+
+        // Copy the pre-serialized buffer and stamp this peer's seq_num at bytes 2-5
+        auto serialized = std::vector<uint8_t>(base_serialized);
+        uint32_t seq_num = 0;
         if (_config.gossip_reliable_delivery) {
-            pkt.seq_num = next_seq_num(peer);
+            seq_num = next_seq_num(peer);
+            serialized[2] = (seq_num >> 24) & 0xFF;
+            serialized[3] = (seq_num >> 16) & 0xFF;
+            serialized[4] = (seq_num >> 8) & 0xFF;
+            serialized[5] = seq_num & 0xFF;
         }
-
-        auto serialized = pkt.serialize();
 
         // Track pending ACK if reliable delivery enabled
         if (_config.gossip_reliable_delivery) {
             if (_stats_pending_acks_count >= MAX_PENDING_ACKS) {
                 ++_pending_acks_overflow;
                 log_gossip_protocol().warn("Pending acks limit reached ({}), not tracking ACK for peer={}, seq_num={}",
-                                           MAX_PENDING_ACKS, peer, pkt.seq_num);
+                                           MAX_PENDING_ACKS, peer, seq_num);
             } else {
                 PendingAck pending;
-                pending.seq_num = pkt.seq_num;
+                pending.seq_num = seq_num;
                 pending.serialized_packet = serialized;
                 pending.next_retry = seastar::lowres_clock::now() + _config.gossip_ack_timeout;
                 pending.retry_count = 0;
-                _pending_acks[peer][pkt.seq_num] = std::move(pending);
+                _pending_acks[peer][seq_num] = std::move(pending);
                 ++_stats_pending_acks_count;
-                log_gossip_protocol().trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
+                log_gossip_protocol().trace("Tracking pending ACK: peer={}, seq_num={}", peer, seq_num);
             }
         }
 
@@ -422,13 +433,8 @@ seastar::future<> GossipProtocol::broadcast_heartbeat() {
 seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgram) {
     auto src_addr = dgram.get_src();
 
-    // Verify source is a known peer
-    if (!_peer_addresses) {
-        ++_packets_untrusted;
-        return seastar::make_ready_future<>();
-    }
-    auto it = std::find(_peer_addresses->begin(), _peer_addresses->end(), src_addr);
-    if (it == _peer_addresses->end()) {
+    // Verify source is a known peer (O(1) set lookup)
+    if (_peer_address_set.find(src_addr) == _peer_address_set.end()) {
         ++_packets_untrusted;
         return seastar::make_ready_future<>();
     }
@@ -650,8 +656,10 @@ seastar::future<> GossipProtocol::refresh_peers() {
             }
         }
 
-        // Update peer addresses
+        // Update peer addresses and lookup set
         *_peer_addresses = std::move(new_peer_addresses);
+        _peer_address_set.clear();
+        _peer_address_set.insert(_peer_addresses->begin(), _peer_addresses->end());
 
         log_gossip_protocol().info("DNS discovery complete: {} peers ({} from DNS)",
                                    _peer_addresses->size(), discovered_addresses.size());
@@ -762,7 +770,8 @@ bool GossipProtocol::is_duplicate(const seastar::socket_address& peer, uint32_t 
 }
 
 void GossipProtocol::process_retries() {
-    // RAII Timer Safety: Holder must outlive the work
+    // RAII Timer Safety: Holder must outlive the work including async sends.
+    // Moved into .finally() so stop() waits for all in-flight retries (Rule #5).
     seastar::gate::holder timer_holder;
     try {
         if (_transport) {
@@ -777,6 +786,7 @@ void GossipProtocol::process_retries() {
     }
 
     auto now = seastar::lowres_clock::now();
+    std::vector<seastar::future<>> send_futures;
 
     for (auto& [peer, pending_map] : _pending_acks) {
         std::vector<uint32_t> to_retry;
@@ -804,15 +814,17 @@ void GossipProtocol::process_retries() {
             log_gossip_protocol().debug("Retrying route announcement: peer={}, seq_num={}, retry={}/{}",
                                         peer, seq_num, pending.retry_count, _config.gossip_max_retries);
 
-            (void)_transport->send(peer, pending.serialized_packet).then([this] {
-                ++_retries_sent;
-            }).handle_exception([peer, seq_num](auto ep) {
-                try {
-                    std::rethrow_exception(ep);
-                } catch (const std::exception& e) {
-                    log_gossip_protocol().debug("Failed to retry to peer {}: {}", peer, e.what());
-                }
-            });
+            send_futures.push_back(
+                _transport->send(peer, pending.serialized_packet).then([this] {
+                    ++_retries_sent;
+                }).handle_exception([peer, seq_num](auto ep) {
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (const std::exception& e) {
+                        log_gossip_protocol().debug("Failed to retry to peer {}: {}", peer, e.what());
+                    }
+                })
+            );
         }
 
         for (uint32_t seq_num : to_remove) {
@@ -828,6 +840,13 @@ void GossipProtocol::process_retries() {
         } else {
             ++it;
         }
+    }
+
+    // Gate holder spans all async sends so stop() waits for completion
+    if (!send_futures.empty()) {
+        (void)seastar::when_all_succeed(send_futures.begin(), send_futures.end())
+            .discard_result()
+            .finally([holder = std::move(timer_holder)] {});
     }
 }
 

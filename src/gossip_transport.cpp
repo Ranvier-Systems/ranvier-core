@@ -30,20 +30,16 @@ seastar::future<> GossipTransport::start(uint16_t port) {
 
     seastar::socket_address bind_addr(seastar::ipv4_addr("0.0.0.0", port));
 
-    try {
-        _channel = seastar::engine().net().make_bound_datagram_channel(bind_addr);
-        log_gossip_transport().info("Gossip UDP channel opened on port {}", port);
+    _channel = seastar::engine().net().make_bound_datagram_channel(bind_addr);
+    log_gossip_transport().info("Gossip UDP channel opened on port {}", port);
 
-        // Initialize DTLS if enabled
-        if (_config.tls.enabled) {
-            co_await initialize_dtls();
-            initialize_crypto_offloader();
-        } else {
-            log_gossip_transport().warn("Gossip TLS is DISABLED - cluster traffic is unencrypted!");
-            log_gossip_transport().warn("This is a SECURITY RISK in production. Enable cluster.tls for encrypted gossip.");
-        }
-    } catch (...) {
-        throw;
+    // Initialize DTLS if enabled
+    if (_config.tls.enabled) {
+        co_await initialize_dtls();
+        initialize_crypto_offloader();
+    } else {
+        log_gossip_transport().warn("Gossip TLS is DISABLED - cluster traffic is unencrypted!");
+        log_gossip_transport().warn("This is a SECURITY RISK in production. Enable cluster.tls for encrypted gossip.");
     }
 }
 

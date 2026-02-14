@@ -27,6 +27,7 @@ This document identifies missing features and optimizations required to promote 
 15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
 16. [Radix Tree Review (2026-02-14)](#16-radix-tree-review-2026-02-14)
 17. [Connection Pool Review (2026-02-14)](#17-connection-pool-review-2026-02-14)
+18. [Gossip Service Review (2026-02-14)](#18-gossip-service-review-2026-02-14)
 
 ---
 
@@ -2633,6 +2634,84 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Location:_ `src/connection_pool.hpp` (Stats struct, `create_connection()`, `get()`)
   _Complexity:_ Low
   _Priority:_ P2 — Observability; essential for production tuning and incident response
+
+---
+
+## 18. Gossip Service Review (2026-02-14)
+
+Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_consensus`, `gossip_protocol`, `gossip_transport`). Findings span correctness, performance, and maintainability.
+
+### 18.1 Fire-and-Forget Route Prune Futures Bypass the Gate (Rule #5)
+
+- [x] **Gate-protect the route prune `parallel_for_each` futures instead of discarding them**
+  _Justification:_ In three locations — `check_liveness()` (line 250), `remove_peer()` (line 139), and `update_peer_list()` (line 191) — the route pruning operation is dispatched as `(void)seastar::parallel_for_each(...)`, discarding the returned future. These fire-and-forget async operations are not covered by any gate, so they can continue executing after `GossipConsensus::stop()` returns and the object is destroyed. The `parallel_for_each` lambda captures `b_id` by value (safe), but the `.handle_exception` lambda calls `log_gossip_consensus()` which accesses a static logger (safe), so the immediate crash risk is limited. However, the `s_local_prune_callback` invoked on each shard could itself capture state from a service that has already been stopped. This is a latent use-after-free that will surface when callback implementations become more complex.
+  _What to change:_ Acquire a `_timer_gate.hold()` at the start of each pruning dispatch and move the holder into `.finally()` on the outermost future. This ensures `stop()` (which closes `_timer_gate`) waits for all in-flight prune operations. Alternatively, collect the prune futures into a member `std::vector<seastar::future<>>` and drain them in `stop()`.
+  _Location:_ `src/gossip_consensus.cpp:139-153`, `191-206`, `248-264`
+  _Complexity:_ Low
+  _Priority:_ P1 — Correctness; violates Rule #5 (gate guards for async lifetime)
+
+### 18.2 Unbounded `_peer_table` Violates Rule #4
+
+- [x] **Add a MAX_PEERS bound to the peer table and DNS discovery insertion paths**
+  _Justification:_ `_peer_table` (`std::unordered_map<socket_address, PeerState>`) has no maximum size. The `add_peer()`, `update_peer_list()`, and initial population in `start()` all insert without a size check. A misconfigured or malicious DNS discovery response could return thousands of addresses, growing memory unbounded. Other gossip containers (`_received_seq_sets`, `_pending_acks`, `_peer_seq_counters`) already have `MAX_DEDUP_PEERS` and `MAX_PENDING_ACKS` bounds (Rule #4 compliance), but the authoritative peer table does not.
+  _What to change:_ Add `static constexpr size_t MAX_PEERS = 1000;` (or configurable). Check size in `add_peer()` and `update_peer_list()` before inserting new entries. Log a warning and increment an overflow counter when the limit is reached. The existing `MAX_DEDUP_PEERS = 10000` in `GossipProtocol` should arguably be derived from `MAX_PEERS` rather than independently defined.
+  _Location:_ `src/gossip_consensus.hpp:191`, `src/gossip_consensus.cpp:124-129`, `160-223`
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness; violates Rule #4 (bounded containers)
+
+### 18.3 Dead `update_quorum_state()` Diverges From Active `check_quorum()`
+
+- [x] **Remove dead `update_quorum_state()` or unify with `check_quorum()`**
+  _Justification:_ `update_quorum_state()` (line 346) is declared private, defined at ~50 LOC, but never called anywhere in the codebase. It uses `_stats_cluster_peers_alive` (binary alive/dead) for quorum calculation, while the active `check_quorum()` uses `peers_recently_seen` (time-windowed). These two functions produce different quorum decisions for the same cluster state. If a future developer calls `update_quorum_state()` thinking it's interchangeable with `check_quorum()`, the cluster will exhibit inconsistent quorum behavior — one path could report HEALTHY while the other reports DEGRADED for the same peer table.
+  _What to change:_ Option A (preferred): Delete `update_quorum_state()` entirely — it's dead code, and `check_quorum()` is the authoritative quorum path. Option B: If both alive-count and recently-seen semantics are needed, parameterize a single `evaluate_quorum(size_t alive_count)` method and call it from both sites with the appropriate count.
+  _Location:_ `src/gossip_consensus.hpp:219`, `src/gossip_consensus.cpp:346-395`
+  _Complexity:_ Low
+  _Priority:_ P2 — Maintainability; dead code with divergent logic is a latent correctness risk
+
+### 18.4 `process_retries()` Gate Holder Does Not Cover Fire-and-Forget Sends (Rule #5)
+
+- [x] **Extend the gate holder lifetime in `process_retries()` to cover the send futures**
+  _Justification:_ `process_retries()` (line 764) acquires a `_transport->timer_gate().hold()` at the top, then iterates pending ACKs and fires `(void)_transport->send(peer, pending.serialized_packet)` for each retry. The gate holder is scoped to the synchronous function body; it is destroyed when `process_retries()` returns. But the send futures are fire-and-forget — they execute asynchronously after the function returns. If `GossipTransport::stop()` closes the timer gate and destroys the channel while these sends are in-flight, the send futures may access a destroyed `_channel`. In practice Seastar's UDP send likely resolves with an exception on a closed channel, but this violates the gate pattern (Rule #5) and is unsafe if the transport's shutdown sequence changes.
+  _What to change:_ Collect the retry send futures into a local vector and return `seastar::when_all_succeed(...)` from `process_retries()`, or move the gate holder into a `.finally()` on the aggregated future. This requires changing the retry timer callback to handle the returned future (e.g., `(void)process_retries().handle_exception(...)`).
+  _Location:_ `src/gossip_protocol.cpp:764-832`
+  _Complexity:_ Medium
+  _Priority:_ P2 — Correctness; violates Rule #5 (gate guards must scope to full async lifetime)
+
+### 18.5 O(N) Peer Address Lookup on Every Incoming Packet
+
+- [x] **Replace `std::find()` on `_peer_addresses` vector with an `absl::flat_hash_set` for O(1) peer validation**
+  _Justification:_ `handle_packet()` (line 430) validates the source address of every incoming UDP packet with `std::find(_peer_addresses->begin(), _peer_addresses->end(), src_addr)`. This is O(N) where N is the number of configured peers. While current cluster sizes are small (3-10 nodes), this is the hot path for packet reception — every heartbeat, route announcement, and ACK hits this linear scan. With DNS discovery enabled and larger clusters, this becomes a measurable cost per packet. The project already depends on Abseil.
+  _What to change:_ Maintain a `absl::flat_hash_set<seastar::socket_address>` (or `std::unordered_set`) alongside the `_peer_addresses` vector. Update it in `refresh_peers()` when the peer list changes. Replace `std::find()` with a set lookup. The vector is still needed for iteration (heartbeat broadcast, etc.), so keep both.
+  _Location:_ `src/gossip_protocol.cpp:430-434`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; linear scan on hot path scales poorly with cluster size
+
+### 18.6 Per-Peer Token Vector Copy in `broadcast_route()`
+
+- [x] **Serialize the route packet once and reuse across peers, stamping only the per-peer sequence number**
+  _Justification:_ `broadcast_route()` (line 335) uses `parallel_for_each` with a lambda that captures `tokens` by value. Inside the lambda, line 339 performs `pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end())` — an explicit copy for each peer. For a cluster of N peers, this creates N+1 copies of the token vector (1 capture + N per-peer). With MAX_TOKENS=256 and sizeof(TokenId)=4, each copy is up to 1KB. The serialization at line 347 (`pkt.serialize()`) is also repeated N times. Since the packet differs only in `seq_num` (4 bytes at offset 2-5), the bulk of serialization is redundant work.
+  _What to change:_ Serialize the packet once outside the loop with `seq_num=0`. Inside the per-peer lambda, copy the pre-serialized buffer and stamp the peer-specific `seq_num` at bytes 2-5. This eliminates N-1 token vector copies and N-1 serialization passes.
+  _Location:_ `src/gossip_protocol.cpp:335-376`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; redundant copies and serialization on broadcast path
+
+### 18.7 Triplicated Route Prune Broadcast Code
+
+- [x] **Extract route prune dispatch into a `broadcast_prune(BackendId)` helper method**
+  _Justification:_ The identical ~12-line pattern of `parallel_for_each(irange(0, smp::count), [b_id](shard) { submit_to(shard, [b_id] { s_local_prune_callback(b_id); }); }).handle_exception(...)` appears verbatim in three methods: `check_liveness()`, `remove_peer()`, and `update_peer_list()`. This DRY violation means any fix to the prune dispatch (e.g., adding gate protection per 18.1, changing error handling, adding metrics) must be applied in three places. A missed update creates behavioral divergence.
+  _What to change:_ Extract a private `seastar::future<> broadcast_prune(BackendId b_id)` method on `GossipConsensus`. Call it from all three sites. This also simplifies applying the gate fix from 18.1 in a single location.
+  _Location:_ `src/gossip_consensus.cpp:139-153`, `191-206`, `248-264`
+  _Complexity:_ Low
+  _Priority:_ P3 — Maintainability; DRY violation across three call sites
+
+### 18.8 No-Op `catch (...) { throw; }` Blocks Violate Rule #9
+
+- [x] **Remove empty catch-rethrow blocks in `GossipService::start()` and `GossipTransport::start()`**
+  _Justification:_ `GossipService::start()` (line 227-229) and `GossipTransport::start()` (line 45-47) both contain `catch (...) { throw; }` blocks that catch all exceptions and immediately rethrow without logging. These are no-ops — the exception would propagate identically without the try-catch. They add cognitive noise and violate Rule #9 (every catch block must log at warn level). If the intent was to add logging or cleanup later, the empty block is a "TODO" that was never completed.
+  _What to change:_ Option A (preferred): Remove the try-catch blocks entirely — the exception propagates naturally. Option B: If cleanup is needed on failure (e.g., setting `_running = false`), add meaningful cleanup and a `log_gossip.error(...)` call before rethrowing.
+  _Location:_ `src/gossip_service.cpp:227-229`, `src/gossip_transport.cpp:45-47`
+  _Complexity:_ Low
+  _Priority:_ P3 — Maintainability; dead code violating Rule #9
 
 ---
 
