@@ -2272,12 +2272,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.7 Add Error Handling to Fire-and-Forget `unregister_backend_global` in Draining Reaper
 
-- [ ] **Attach `.handle_exception()` to discarded `unregister_backend_global()` futures**
+- [x] **Attach `.handle_exception()` to discarded `unregister_backend_global()` futures** ✓
   _Justification:_ `run_draining_reaper()` calls `(void)unregister_backend_global(id)`, discarding the future. If unregistration fails (e.g., `submit_to` timeout on an overloaded shard), the backend remains registered but past its drain timeout — a "ghost backend" that is draining forever. There is no retry, no error logging, and no way to detect the failure. This violates Hard Rule #9 (every catch block must log at warn level).
-  _What to change:_ Replace `(void)unregister_backend_global(id)` with `(void)unregister_backend_global(id).handle_exception([id](std::exception_ptr ep) { ... log warning ... })`. Optionally, track failed removals in a retry set and re-attempt on the next reaper tick.
-  _Location:_ `src/router_service.cpp` (line 2111)
+  _Approach implemented:_ Attached `.handle_exception()` with rethrow-and-log pattern (matching existing `flush_route_batch` style). Logs at `warn` level with backend ID and exception message.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Defensive correctness
+  _Completed:_ 2026-02-14
 
 ---
 
