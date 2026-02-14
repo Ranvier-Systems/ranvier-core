@@ -1587,9 +1587,11 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
     // ========================================================================
     // Validate remote routes before buffering. Remote peers should also enforce
     // this limit, but we validate defensively to reject malformed gossip messages.
-    if (_config.max_route_tokens > 0 && tokens.size() > _config.max_route_tokens) {
+    // Use shard-local config for consistency with hot-reload (same pattern as learn_route_global).
+    const size_t max_route_tokens = g_shard_state ? g_shard_state->config.max_route_tokens : 0;
+    if (max_route_tokens > 0 && tokens.size() > max_route_tokens) {
         log_router.warn("Remote route rejected: {} tokens exceeds limit {} (backend={})",
-                        tokens.size(), _config.max_route_tokens, backend);
+                        tokens.size(), max_route_tokens, backend);
         return seastar::make_ready_future<>();
     }
 
