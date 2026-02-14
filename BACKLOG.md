@@ -23,6 +23,7 @@ This document identifies missing features and optimizations required to promote 
 11. [System Architecture Audit (2026-02-02)](#11-system-architecture-audit-2026-02-02)
 12. [Test Coverage Gaps (2026-02-06)](#12-test-coverage-gaps-2026-02-06)
 13. [Adversarial System Audit (2026-02-12)](#13-adversarial-system-audit-2026-02-12)
+14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
 
 ---
 
@@ -2206,6 +2207,75 @@ Three systemic patterns observed across multiple findings:
 1. **Gate-Holder-Scoping:** Gate holders scoped to `try` blocks or callbacks instead of the full async operation (A2, A3). _Proposed rule: "A gate holder must be scoped to the entire async operation it protects."_
 2. **Unconditional-Counter-Increment:** Incrementing size counters after operations that may be no-ops (E1). _Proposed rule: "Mutation methods must signal insert-vs-update; counters only increment on actual size change."_
 3. **Unbounded-External-Response:** Accumulating HTTP response bodies from external services without size limits (S3, S4). _Proposed rule: "All HTTP response accumulation from external services must have MAX_RESPONSE_SIZE."_
+
+---
+
+## 14. Router Service Review (2026-02-14)
+
+Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintainability, and performance improvements. Full analysis in `.dev-context/router-service-review.md`.
+
+### 14.1 Replace Modular Hash with Jump Consistent Hash
+
+- [ ] **Replace `prefix_hash % live_backends.size()` with jump consistent hash**
+  _Justification:_ The hash fallback in `get_backend_for_prefix()` and `get_backend_by_hash()` uses modular hashing, which reshuffles **all** keys when a backend is added/removed. True consistent hashing (e.g., jump hash) remaps only ~1/n keys, preserving KV-cache affinity during topology changes — which is the project's core value proposition.
+  _What to change:_ Implement `jump_consistent_hash(uint64_t key, int32_t num_buckets)` (Google's algorithm, ~10 lines, public domain). Replace the two `prefix_hash % live_backends.size()` call sites at `router_service.cpp:1271` and `router_service.cpp:1337`. `live_backends` is already sorted for determinism, so the jump hash bucket index maps directly.
+  _Location:_ `src/router_service.cpp` (lines 1271, 1337)
+  _Complexity:_ Low
+  _Priority:_ P1 — Directly impacts cache hit rate during backend scaling events
+
+### 14.2 Fix `cache_hit` Misreporting in `route_request()`
+
+- [ ] **Return accurate `cache_hit` from `route_request()` for PREFIX mode**
+  _Justification:_ `route_request()` unconditionally sets `result.cache_hit = true` when `get_backend_for_prefix()` returns a backend, even when the backend was selected via hash fallback (an ART miss). This inflates `cache_hit` rates in monitoring dashboards and makes the metric unreliable for capacity planning.
+  _What to change:_ Modify `get_backend_for_prefix()` to return a struct (or add an out-parameter) indicating whether the result came from an ART hit or hash fallback. Update `route_request()` to set `cache_hit` only on actual ART hits. Update the `RouteResult` comment to clarify semantics.
+  _Location:_ `src/router_service.cpp` (line 1050), `src/router_service.hpp` (`RouteResult` struct)
+  _Complexity:_ Low
+  _Priority:_ P2 — Affects observability accuracy
+
+### 14.3 Extract Shared Live-Backend Filtering Helper
+
+- [ ] **Deduplicate the live-backend collection pattern into `ShardLocalState::get_live_backends()`**
+  _Justification:_ The pattern of iterating `backend_ids`, checking `dead_backends.contains()`, looking up in `backends`, and checking `is_draining` is repeated identically in `get_random_backend()`, `get_backend_for_prefix()`, and `get_backend_by_hash()`. If filtering criteria change (e.g., adding weight=0 exclusion), all three sites must be updated in lockstep — a latent inconsistency risk.
+  _What to change:_ Add a `std::vector<BackendId> get_live_backends()` method to `ShardLocalState` that encapsulates the filtering logic. Replace the three inline loops with calls to this helper. `get_random_backend()` needs additional weight/priority data — consider a second overload that returns `vector<pair<BackendId, const BackendInfo*>>`.
+  _Location:_ `src/router_service.cpp` (lines 1092-1119, 1184-1197, 1307-1320)
+  _Complexity:_ Low
+  _Priority:_ P3 — Maintainability improvement
+
+### 14.4 Eliminate `std::map` Allocation on Hot Path in `get_random_backend()`
+
+- [ ] **Replace `std::map` priority grouping with a single-pass min-priority scan**
+  _Justification:_ `get_random_backend()` constructs a `std::map<uint32_t, std::vector<...>>` on every call. `std::map` allocates a red-black tree node per entry. Since only the highest-priority group (lowest number) is used, a single pass tracking the minimum priority and accumulating candidates into a pre-allocated vector eliminates all heap allocations.
+  _What to change:_ Replace the `std::map priority_groups` with a two-pass or single-pass approach: (1) find the minimum priority value across live backends, (2) collect candidates matching that priority. Alternatively, combine with backlog item 14.3 by having `get_live_backends()` return results sorted by priority.
+  _Location:_ `src/router_service.cpp` (line 1102)
+  _Complexity:_ Low
+  _Priority:_ P3 — Hot-path performance; most impactful under RANDOM mode or fail-open
+
+### 14.5 Preserve Original Backend Weight Across DRAINING→ACTIVE Transitions
+
+- [ ] **Stop overwriting backend weight during DRAINING, or store original weight for restoration**
+  _Justification:_ `handle_node_state_change()` sets `weight = 0` on DRAINING and hardcodes `weight = 100` on ACTIVE restore. Backends registered with custom weights (e.g., 50 for smaller GPUs, 200 for larger ones) lose their weight permanently. Since `is_draining = true` already excludes backends from all routing paths (`get_random_backend`, `get_backend_for_prefix`, `get_backend_by_hash` all check `is_draining`), the `weight = 0` assignment is redundant.
+  _What to change:_ **Option A (simplest):** Remove the `weight = 0` line from the DRAINING handler and the `weight = 100` line from the ACTIVE handler. The `is_draining` flag is already sufficient. **Option B:** Add `uint32_t original_weight` to `BackendInfo`, save before zeroing, restore on ACTIVE.
+  _Location:_ `src/router_service.cpp` (lines 2149-2152 for DRAINING, 2169-2172 for ACTIVE)
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness bug for deployments using custom backend weights
+
+### 14.6 Replace `std::atomic` with Plain `uint64_t` for Shard-Local Load Counter
+
+- [ ] **Remove unnecessary `std::atomic` from `BackendInfo::active_requests`**
+  _Justification:_ `BackendInfo` lives inside `thread_local ShardLocalState`. In Seastar's cooperative model, `active_requests` is only accessed from a single reactor thread (the `BackendRequestGuard` is documented as "shard-local operation only"). `std::atomic` is unnecessary and causes: (1) ~40 lines of manual copy/move constructor boilerplate because `std::atomic` isn't copyable/movable, (2) architectural confusion suggesting cross-thread access, (3) minor overhead on ARM (atomic stores emit barrier instructions even with relaxed ordering).
+  _What to change:_ Replace `std::atomic<uint64_t> active_requests{0}` with `uint64_t active_requests = 0`. Delete the manual copy constructor, move constructor, copy assignment, and move assignment (lines 87-131) — the compiler-generated defaults will work. Update `BackendRequestGuard` to use direct read/write instead of `.load()`/`.fetch_add()`/`.fetch_sub()`.
+  _Location:_ `src/router_service.cpp` (lines 73, 87-131, 334-399, 406-417)
+  _Complexity:_ Low
+  _Priority:_ P3 — Code simplification, minor perf improvement
+
+### 14.7 Add Error Handling to Fire-and-Forget `unregister_backend_global` in Draining Reaper
+
+- [ ] **Attach `.handle_exception()` to discarded `unregister_backend_global()` futures**
+  _Justification:_ `run_draining_reaper()` calls `(void)unregister_backend_global(id)`, discarding the future. If unregistration fails (e.g., `submit_to` timeout on an overloaded shard), the backend remains registered but past its drain timeout — a "ghost backend" that is draining forever. There is no retry, no error logging, and no way to detect the failure. This violates Hard Rule #9 (every catch block must log at warn level).
+  _What to change:_ Replace `(void)unregister_backend_global(id)` with `(void)unregister_backend_global(id).handle_exception([id](std::exception_ptr ep) { ... log warning ... })`. Optionally, track failed removals in a retry set and re-attempt on the next reaper tick.
+  _Location:_ `src/router_service.cpp` (line 2111)
+  _Complexity:_ Low
+  _Priority:_ P3 — Defensive correctness
 
 ---
 
