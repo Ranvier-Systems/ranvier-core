@@ -332,36 +332,46 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
     log_gossip_protocol().debug("Broadcasting route: {} tokens -> backend {} to {} peers",
                                 tokens.size(), backend, _peer_addresses->size());
 
-    // Send to each peer with per-peer sequence numbers
-    return seastar::parallel_for_each(*_peer_addresses, [this, tokens, backend](const seastar::socket_address& peer) mutable {
-        RouteAnnouncementPacket pkt;
-        pkt.backend_id = backend;
-        // Force local allocation for tokens (Rule #14: cross-shard heap memory)
-        pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
-        pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
-                                                          static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+    // Serialize the packet once with seq_num=0, then stamp per-peer seq_num.
+    // This avoids N token vector copies and N serialization passes.
+    RouteAnnouncementPacket pkt;
+    pkt.backend_id = backend;
+    pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end());
+    pkt.token_count = static_cast<uint16_t>(std::min(tokens.size(),
+                                                      static_cast<size_t>(RouteAnnouncementPacket::MAX_TOKENS)));
+    pkt.seq_num = 0;
+    auto base_serialized = pkt.serialize();
 
+    // Send to each peer, stamping per-peer sequence numbers into the pre-serialized buffer
+    return seastar::parallel_for_each(*_peer_addresses,
+        [this, base_serialized = std::move(base_serialized)](const seastar::socket_address& peer) mutable {
+
+        // Copy the pre-serialized buffer and stamp this peer's seq_num at bytes 2-5
+        auto serialized = std::vector<uint8_t>(base_serialized);
+        uint32_t seq_num = 0;
         if (_config.gossip_reliable_delivery) {
-            pkt.seq_num = next_seq_num(peer);
+            seq_num = next_seq_num(peer);
+            serialized[2] = (seq_num >> 24) & 0xFF;
+            serialized[3] = (seq_num >> 16) & 0xFF;
+            serialized[4] = (seq_num >> 8) & 0xFF;
+            serialized[5] = seq_num & 0xFF;
         }
-
-        auto serialized = pkt.serialize();
 
         // Track pending ACK if reliable delivery enabled
         if (_config.gossip_reliable_delivery) {
             if (_stats_pending_acks_count >= MAX_PENDING_ACKS) {
                 ++_pending_acks_overflow;
                 log_gossip_protocol().warn("Pending acks limit reached ({}), not tracking ACK for peer={}, seq_num={}",
-                                           MAX_PENDING_ACKS, peer, pkt.seq_num);
+                                           MAX_PENDING_ACKS, peer, seq_num);
             } else {
                 PendingAck pending;
-                pending.seq_num = pkt.seq_num;
+                pending.seq_num = seq_num;
                 pending.serialized_packet = serialized;
                 pending.next_retry = seastar::lowres_clock::now() + _config.gossip_ack_timeout;
                 pending.retry_count = 0;
-                _pending_acks[peer][pkt.seq_num] = std::move(pending);
+                _pending_acks[peer][seq_num] = std::move(pending);
                 ++_stats_pending_acks_count;
-                log_gossip_protocol().trace("Tracking pending ACK: peer={}, seq_num={}", peer, pkt.seq_num);
+                log_gossip_protocol().trace("Tracking pending ACK: peer={}, seq_num={}", peer, seq_num);
             }
         }
 
