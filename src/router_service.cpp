@@ -19,7 +19,6 @@
 #include <chrono>
 #include <cstdint>
 #include <random>
-#include <sstream>
 
 // ============================================================================
 // RouterService: Central Routing Orchestration
@@ -1863,38 +1862,25 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         BackendState bs;
         bs.id = id;
 
-        // Extract address and port from socket_address
-        auto addr = info.addr;
-        std::ostringstream oss;
-        oss << addr;
-        std::string addr_str = oss.str();
+        // Extract address and port from socket_address.
+        // Uses fmt::format (stack-friendly) instead of std::ostringstream (heap alloc).
+        // Seastar formats: IPv4 "192.168.1.1:8080", IPv6 "[::1]:8080"
+        auto addr_str = fmt::format("{}", info.addr);
+        bs.port = 0;
 
-        // Parse address:port format
-        // Handle both IPv4 (192.168.1.1:8080) and IPv6 ([::1]:8080) formats
-        // Seastar formats IPv6 as [addr]:port
-        if (!addr_str.empty() && addr_str.back() >= '0' && addr_str.back() <= '9') {
-            auto colon_pos = addr_str.find_last_of(':');
-            // For IPv6, the colon before port comes after the closing bracket
-            // For IPv4, it's just the last colon
-            if (colon_pos != std::string::npos && colon_pos > 0) {
-                // Verify this is the port separator, not part of IPv6 address
-                bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
-                                         (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
-                if (is_port_separator) {
-                    bs.address = addr_str.substr(0, colon_pos);
-                    auto port_opt = parse_port(std::string_view(addr_str).substr(colon_pos + 1));
-                    bs.port = port_opt.value_or(0);
-                } else {
-                    bs.address = addr_str;
-                    bs.port = 0;
-                }
+        // Find the port separator (last ':' that's not inside an IPv6 address)
+        auto colon_pos = addr_str.find_last_of(':');
+        if (colon_pos != std::string::npos && colon_pos > 0) {
+            bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
+                                     (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
+            if (is_port_separator) {
+                bs.address = addr_str.substr(0, colon_pos);
+                bs.port = parse_port(std::string_view(addr_str).substr(colon_pos + 1)).value_or(0);
             } else {
-                bs.address = addr_str;
-                bs.port = 0;
+                bs.address = std::move(addr_str);
             }
         } else {
-            bs.address = addr_str;
-            bs.port = 0;
+            bs.address = std::move(addr_str);
         }
 
         bs.weight = info.weight;
