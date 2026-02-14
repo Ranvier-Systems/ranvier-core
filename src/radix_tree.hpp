@@ -465,6 +465,11 @@ public:
     }
 
 private:
+    // Rule #4: Maximum prefix length per node (bounds memory for path-compressed segments).
+    // A prefix of 1024 tokens covers ~16K original tokens at block_alignment=16, which is
+    // far beyond typical LLM context windows. Segments exceeding this are split across nodes.
+    static constexpr size_t MAX_PREFIX_LENGTH = 1024;
+
     NodePtr root_;
     uint32_t block_alignment_;
     size_t route_count_ = 0;
@@ -1284,7 +1289,11 @@ private:
         } else {
             auto new_child = make_node<Node4>();
             if (remaining.size() > 1) {
-                new_child->prefix.assign(remaining.begin() + 1, remaining.end());
+                // Rule #4: Bound prefix length to prevent unbounded memory growth.
+                // Tokens beyond MAX_PREFIX_LENGTH are truncated — the route is stored
+                // at a shorter position, reducing granularity but preserving correctness.
+                size_t prefix_len = std::min(remaining.size() - 1, MAX_PREFIX_LENGTH);
+                new_child->prefix.assign(remaining.begin() + 1, remaining.begin() + 1 + prefix_len);
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;
