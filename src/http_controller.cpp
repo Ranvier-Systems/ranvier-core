@@ -1769,10 +1769,17 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_reload
 // ---------------------------------------------------------
 
 future<> HttpController::stop() {
+    // Guard against double-stop: wait_for_drain() also calls _rate_limiter.stop()
+    // and _request_gate.close(). The rate limiter's internal gate cannot be closed
+    // twice, so we track whether stop has already been called.
+    if (_stopped) {
+        co_return;
+    }
+    _stopped = true;
+
     // Hard Rule #5: Stop timers before destruction to prevent use-after-free.
     // Hard Rule #6: Metrics lambdas capturing `this` are deregistered when
     // the rate limiter's internal timer is cancelled.
-    // Idempotent: safe to call even if wait_for_drain() already stopped these.
     co_await _rate_limiter.stop();
 
     // Close gate if not already closed by wait_for_drain()
@@ -1791,6 +1798,9 @@ void HttpController::start_draining() {
 future<> HttpController::wait_for_drain() {
     auto drain_timeout = _config.drain_timeout;
     log_proxy.info("Waiting for in-flight requests to complete (timeout: {}s)", drain_timeout.count());
+
+    // Mark as stopped so HttpController::stop() is a no-op after drain
+    _stopped = true;
 
     // Stop rate limiter cleanup timer first (Hard Rule #5: close gate before destruction)
     // This ensures no timer callbacks are in-flight when we proceed with shutdown

@@ -257,6 +257,7 @@ private:
     // Graceful shutdown state
     // Plain bool: set/read only from this shard's reactor via invoke_on_all/local handler
     bool _draining{false};
+    bool _stopped{false};                // Guards against double-stop (wait_for_drain + stop)
     seastar::gate _request_gate;         // Tracks in-flight requests
 
     // Backpressure: semaphore for concurrency limiting
