@@ -218,6 +218,11 @@ public:
     // Rate limit helper - public for handler wrapper access
     bool check_rate_limit(const seastar::http::request& req);
 
+    // Seastar sharded<> lifecycle: orderly per-shard cleanup (Hard Rule #5/#6).
+    // Stops rate limiter timer and closes request gate. Safe to call even if
+    // wait_for_drain() was already called (idempotent).
+    seastar::future<> stop();
+
     // Graceful shutdown: Start draining (reject new requests)
     void start_draining();
 

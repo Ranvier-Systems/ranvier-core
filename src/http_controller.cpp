@@ -1762,6 +1762,21 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_reload
 // GRACEFUL SHUTDOWN
 // ---------------------------------------------------------
 
+future<> HttpController::stop() {
+    // Hard Rule #5: Stop timers before destruction to prevent use-after-free.
+    // Hard Rule #6: Metrics lambdas capturing `this` are deregistered when
+    // the rate limiter's internal timer is cancelled.
+    // Idempotent: safe to call even if wait_for_drain() already stopped these.
+    co_await _rate_limiter.stop();
+
+    // Close gate if not already closed by wait_for_drain()
+    if (!_request_gate.is_closed()) {
+        co_await _request_gate.close();
+    }
+
+    log_proxy.debug("HttpController::stop() completed on shard {}", seastar::this_shard_id());
+}
+
 void HttpController::start_draining() {
     _draining.store(true, std::memory_order_relaxed);
     log_proxy.info("Draining started - rejecting new requests");
