@@ -97,15 +97,15 @@ struct SlabPoolConfig {
     // Slot sizes must accommodate SlabHeader + sizeof(NodeType) + alignment padding
     // Values are determined empirically from sizeof() and aligned to cache lines
 
-    // Node4:   ~144 bytes object (prefix uses InlinedVector<TokenId,8>)
-    //          -> 144 + 8 header = 152, round to 192
-    // Node16:  ~144 bytes object (prefix uses InlinedVector<TokenId,8>)
-    //          -> 144 + 8 header = 152, round to 192
-    // Node48:  ~400 bytes object (prefix uses InlinedVector<TokenId,8>)
-    //          -> 400 + 8 header = 408, round to 448
-    // Node256: ~3168 bytes object (prefix uses InlinedVector<TokenId,8>,
+    // Node4:   ~160 bytes object (InlinedVector prefix + LRU pointers)
+    //          -> 160 + 8 header = 168, round to 192
+    // Node16:  ~160 bytes object (InlinedVector prefix + LRU pointers)
+    //          -> 160 + 8 header = 168, round to 192
+    // Node48:  ~416 bytes object (InlinedVector prefix + LRU pointers)
+    //          -> 416 + 8 header = 424, round to 448
+    // Node256: ~3184 bytes object (InlinedVector prefix + LRU pointers,
     //          includes 256-entry keys array for hash collision fix)
-    //          -> 3168 + 8 header = 3176, round to 3200
+    //          -> 3184 + 8 header = 3192, round to 3200
 
     static constexpr size_t NODE4_SLOT_SIZE = 192;
     static constexpr size_t NODE16_SLOT_SIZE = 192;

@@ -848,11 +848,25 @@ private:
     //   - No atomic refcounting (unlike std::shared_ptr)
     //
 
-    static void copy_node_metadata(Node* dest, Node* src) {
+    // Transfer metadata and LRU list position from src to dest.
+    // src's leaf_value and LRU pointers are cleared after transfer.
+    void transfer_node_metadata(Node* dest, Node* src) {
         dest->prefix = std::move(src->prefix);
         dest->leaf_value = src->leaf_value;
         dest->origin = src->origin;
         dest->last_accessed = src->last_accessed;
+
+        // Splice dest into src's position in the LRU list
+        if (src->leaf_value.has_value()) {
+            dest->lru_prev = src->lru_prev;
+            dest->lru_next = src->lru_next;
+            if (src->lru_prev) src->lru_prev->lru_next = dest;
+            if (src->lru_next) src->lru_next->lru_prev = dest;
+            if (lru_head_ == src) lru_head_ = dest;
+            if (lru_tail_ == src) lru_tail_ = dest;
+            src->lru_prev = nullptr;
+            src->lru_next = nullptr;
+        }
     }
 
     NodePtr add_child(NodePtr parent, TokenId key, NodePtr child) {
@@ -920,7 +934,7 @@ private:
         auto n16_ptr = make_node<Node16>();
         auto* n16 = static_cast<Node16*>(n16_ptr.get());
 
-        copy_node_metadata(n16, n4);
+        transfer_node_metadata(n16, n4);
         n16->keys = std::move(n4->keys);
         n16->children = std::move(n4->children);
         n16->keys.push_back(key);
@@ -934,7 +948,7 @@ private:
         auto n48_ptr = make_node<Node48>();
         auto* n48 = static_cast<Node48*>(n48_ptr.get());
 
-        copy_node_metadata(n48, n16);
+        transfer_node_metadata(n48, n16);
         for (size_t i = 0; i < n16->keys.size(); i++) {
             uint8_t key_idx = key_byte(n16->keys[i]);
             // Only set index if slot is empty (first key with this key_byte wins)
@@ -961,7 +975,7 @@ private:
         auto n256_ptr = make_node<Node256>();
         auto* n256 = static_cast<Node256*>(n256_ptr.get());
 
-        copy_node_metadata(n256, n48);
+        transfer_node_metadata(n256, n48);
 
         // Copy existing children, handling potential collisions
         for (size_t i = 0; i < n48->keys.size(); i++) {
@@ -1787,7 +1801,7 @@ private:
     NodePtr shrink_to_node4(NodePtr node) {
         auto n4_ptr = make_node<Node4>();
         auto* n4 = static_cast<Node4*>(n4_ptr.get());
-        copy_node_metadata(n4, node.get());
+        transfer_node_metadata(n4, node.get());
 
         // Move up to 4 children
         size_t count = 0;
@@ -1828,7 +1842,7 @@ private:
     NodePtr shrink_to_node16(NodePtr node) {
         auto n16_ptr = make_node<Node16>();
         auto* n16 = static_cast<Node16*>(n16_ptr.get());
-        copy_node_metadata(n16, node.get());
+        transfer_node_metadata(n16, node.get());
 
         // Move up to 16 children
         size_t count = 0;
@@ -1861,7 +1875,7 @@ private:
     NodePtr shrink_to_node48(NodePtr node) {
         auto n48_ptr = make_node<Node48>();
         auto* n48 = static_cast<Node48*>(n48_ptr.get());
-        copy_node_metadata(n48, node.get());
+        transfer_node_metadata(n48, node.get());
 
         // Only Node256 can shrink to Node48
         if (node->type == NodeType::Node256) {
