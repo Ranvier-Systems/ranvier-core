@@ -1539,14 +1539,16 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
-                    if (n->children[i]) {
+                    if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) {
                         Node* child = n->children[i].get();
                         compact_children(child, stats);
                         if (should_shrink(child)) {
                             n->children[i] = shrink_node(std::move(n->children[i]), stats);
                         }
                         if (is_node_empty(n->children[i].get())) {
-                            keys_to_remove.push_back(static_cast<TokenId>(i));
+                            // Use the actual token key, not the slot index.
+                            // Displaced keys (from hash collisions) have key != slot index.
+                            keys_to_remove.push_back(n->keys[i]);
                         }
                     }
                 }
