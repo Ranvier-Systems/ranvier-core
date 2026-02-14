@@ -1315,6 +1315,16 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                                        const std::string& request_id,
                                                        size_t prefix_boundary) {
+    // Rule #5: Acquire gate holder to protect 'this' captures in gossip submit_to lambdas.
+    // The holder must live for the entire async lifetime (moved into when_all_succeed below).
+    // If the gate is closed (shutdown in progress), skip route learning gracefully.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return seastar::make_ready_future<>();
+    }
+
     // Determine effective prefix length for route storage:
     // 1. If prefix_boundary > 0 and valid, use it (truncate to shared prefix like system messages)
     // 2. Otherwise, fall back to config.prefix_token_length (default: 128)
@@ -1426,8 +1436,13 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
         });
     });
 
-    // Wait for both gossip broadcast and shard updates
-    return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
+    // Wait for both gossip broadcast and shard updates.
+    // Keep gate holder alive for the full async lifetime via do_with.
+    return seastar::do_with(std::move(holder),
+        [gossip_future = std::move(gossip_future), shard_future = std::move(shard_future)]
+        (seastar::gate::holder&) mutable {
+            return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
+        });
 }
 
 seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> tokens, BackendId backend,
@@ -1435,6 +1450,14 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
                                                            const std::vector<size_t>& prefix_boundaries) {
     // Multi-depth route learning: store routes at each provided boundary
     // This enables cache reuse at any conversation depth (Option C)
+
+    // Rule #5: Acquire gate holder to protect 'this' captures in gossip submit_to lambdas.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return seastar::make_ready_future<>();
+    }
 
     // Use shard-local config for lock-free, hot-reloadable access (same as learn_route_global)
     const size_t max_route_tokens = g_shard_state ? g_shard_state->config.max_route_tokens : 0;
@@ -1541,7 +1564,11 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
 
     futures.push_back(std::move(gossip_future));
 
-    return seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
+    // Keep gate holder alive for the full async lifetime via do_with.
+    return seastar::do_with(std::move(holder), std::move(futures),
+        [](seastar::gate::holder&, std::vector<seastar::future<>>& futures) {
+            return seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
+        });
 }
 
 // ============================================================================
