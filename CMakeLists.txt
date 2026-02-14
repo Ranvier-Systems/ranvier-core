@@ -287,6 +287,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       rapidjson_interface
       absl::flat_hash_map
       absl::flat_hash_set
+      absl::inlined_vector
       OpenSSL::SSL
       OpenSSL::Crypto
       ${OTEL_LIBS}
@@ -313,6 +314,7 @@ target_include_directories(radix_tree_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(radix_tree_test
   PRIVATE
   GTest::gtest_main
+  absl::inlined_vector
 )
 gtest_discover_tests(radix_tree_test)
 
@@ -395,6 +397,7 @@ target_include_directories(node_slab_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(node_slab_test
   PRIVATE
   GTest::gtest_main
+  absl::inlined_vector
 )
 gtest_discover_tests(node_slab_test)
 
@@ -769,6 +772,7 @@ if(Seastar_FOUND)
       tokenizers_cpp
       absl::flat_hash_map
       absl::flat_hash_set
+      absl::inlined_vector
       OpenSSL::SSL
       OpenSSL::Crypto
       ${OTEL_LIBS}
@@ -828,6 +832,7 @@ if(Seastar_FOUND)
       Seastar::seastar
       absl::flat_hash_map
       absl::flat_hash_set
+      absl::inlined_vector
       OpenSSL::SSL
       OpenSSL::Crypto
       GTest::gtest_main

@@ -11,6 +11,8 @@
 #include <functional>
 #include <cassert>
 
+#include <absl/container/inlined_vector.h>
+
 #include "types.hpp"
 #include "node_slab.hpp"
 
@@ -96,7 +98,10 @@ enum class NodeType : uint8_t {
 
 struct Node {
     NodeType type;
-    std::vector<TokenId> prefix;
+    // Inline storage for up to 8 tokens eliminates heap allocation for short
+    // prefixes (the common case after path compression splits).  Falls back to
+    // heap transparently for longer prefixes.
+    absl::InlinedVector<TokenId, 8> prefix;
     std::optional<BackendId> leaf_value;
     RouteOrigin origin = RouteOrigin::LOCAL;
     std::chrono::steady_clock::time_point last_accessed;
@@ -365,7 +370,7 @@ private:
             case NodeType::Node48: result.type = "Node48"; break;
             case NodeType::Node256: result.type = "Node256"; break;
         }
-        result.prefix = node->prefix;
+        result.prefix.assign(node->prefix.begin(), node->prefix.end());
         result.backend = node->leaf_value;
         result.origin = (node->origin == RouteOrigin::LOCAL) ? "LOCAL" : "REMOTE";
         result.last_accessed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
