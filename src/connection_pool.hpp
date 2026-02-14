@@ -73,7 +73,10 @@ struct BasicConnectionBundle {
         is_valid = false;
         return out.close().then([this] {
             return in.close();
-        }).handle_exception([](auto) {}); // Ignore errors on close
+        }).handle_exception([addr = this->addr](auto ep) {
+            // Rule #9: every catch must log at warn level
+            log_pool.warn("Failed to close connection to {}: {}", addr, ep);
+        });
     }
 
     // Check if connection has been idle too long
