@@ -693,6 +693,7 @@ if(Seastar_FOUND)
     target_link_libraries(connection_pool_test
       PRIVATE
       Seastar::seastar
+      absl::flat_hash_map
       GTest::gtest_main
     )
     gtest_discover_tests(connection_pool_test)
