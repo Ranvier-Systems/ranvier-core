@@ -177,8 +177,8 @@ auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler
         if (!authorized) {
             rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->add_header("WWW-Authenticate", "Bearer");
-            // Provide specific error message
-            std::string error_msg = "{\"error\": \"Unauthorized - " + info + "\"}";
+            // Provide specific error message (escape to prevent malformed JSON)
+            std::string error_msg = "{\"error\": \"Unauthorized - " + escape_json_string(info) + "\"}";
             rep->write_body("json", error_msg);
             return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
@@ -801,7 +801,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     // active_request_guard destructor will decrement counter
                     rep->add_header("X-Request-ID", request_id);
                     rep->set_status(seastar::http::reply::status_type::bad_request);
-                    rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
+                    rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + escape_json_string(token_result.error) + "\"}");
                     co_return std::move(rep);
                 }
             }
@@ -1069,7 +1069,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             route_span.set_error(route_result.error_message);
             metrics().record_failure();
             rep->add_header("X-Request-ID", request_id);
-            rep->write_body("json", "{\"error\": \"" + route_result.error_message + "!\"}");
+            rep->write_body("json", "{\"error\": \"" + escape_json_string(route_result.error_message) + "!\"}");
             co_return std::move(rep);
         }
 
@@ -1446,7 +1446,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
         log_control.warn("POST /admin/routes: input validation failed for backend {}: {}", backend_id, validation.error);
         metrics().record_tokenizer_validation_failure();
         rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->write_body("json", "{\"error\": \"Input validation failed: " + validation.error + "\"}");
+        rep->write_body("json", "{\"error\": \"Input validation failed: " + escape_json_string(validation.error) + "\"}");
         return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
@@ -1735,34 +1735,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_reload
 
     log_control.info("Config reload triggered via /admin/keys/reload endpoint");
 
-    // Helper to escape JSON string values (prevent injection)
-    auto escape_json_string = [](const std::string& s) -> std::string {
-        std::string result;
-        result.reserve(s.size() + 8);
-        for (char c : s) {
-            switch (c) {
-                case '"': result += "\\\""; break;
-                case '\\': result += "\\\\"; break;
-                case '\b': result += "\\b"; break;
-                case '\f': result += "\\f"; break;
-                case '\n': result += "\\n"; break;
-                case '\r': result += "\\r"; break;
-                case '\t': result += "\\t"; break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20) {
-                        // Control character - encode as \u00XX
-                        char buf[8];
-                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                        result += buf;
-                    } else {
-                        result += c;
-                    }
-            }
-        }
-        return result;
-    };
-
     // Build response with current key metadata (names only, not values)
+    // Uses escape_json_string() from parse_utils.hpp for JSON safety
     // Note: This shows the state BEFORE the reload completes
     std::string response = "{\"status\": \"reload_triggered\", \"message\": \"Configuration reload initiated\", "
                           "\"current_key_count\": " + std::to_string(current_key_count) + ", \"current_keys\": [";
