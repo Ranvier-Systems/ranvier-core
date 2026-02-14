@@ -529,6 +529,78 @@ TEST_F(RouterServiceTest, PrefixHashFallbackIsDeterministic) {
     EXPECT_EQ(first.value(), second.value());
 }
 
+TEST_F(RouterServiceTest, JumpHashMinimalRemapOnBackendAddition) {
+    // With 3 backends, record hash assignments for many token sequences.
+    // Add a 4th backend, then verify that at most ~1/4 of assignments change.
+    // This is the core property of jump consistent hash vs modular hash.
+    register_three_backends();
+
+    constexpr int NUM_PROBES = 200;
+    std::vector<BackendId> assignments_before;
+    assignments_before.reserve(NUM_PROBES);
+
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 7, i * 13 + 1, i * 31 + 2, i * 53 + 3, i * 97 + 4};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        assignments_before.push_back(result.value());
+    }
+
+    // Add a 4th backend
+    RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080));
+
+    int changed = 0;
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 7, i * 13 + 1, i * 31 + 2, i * 53 + 3, i * 97 + 4};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        if (result.value() != assignments_before[i]) {
+            ++changed;
+        }
+    }
+
+    // Jump consistent hash should remap ~1/4 of keys (new bucket gets ~25%).
+    // Modular hash would remap ~75%.  Allow generous margin: at most 40%.
+    EXPECT_LE(changed, NUM_PROBES * 40 / 100)
+        << "Too many keys remapped (" << changed << "/" << NUM_PROBES
+        << "); jump consistent hash should remap ~25%";
+}
+
+TEST_F(RouterServiceTest, JumpHashMinimalRemapOnBackendRemoval) {
+    // With 4 backends, record assignments. Remove one, verify minimal remap.
+    register_three_backends();
+    RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080));
+
+    constexpr int NUM_PROBES = 200;
+    std::vector<BackendId> assignments_before;
+    assignments_before.reserve(NUM_PROBES);
+
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 11, i * 17 + 5, i * 37 + 7};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        assignments_before.push_back(result.value());
+    }
+
+    // Kill backend 4 (mark dead so it's excluded from live_backends)
+    RouterService::mark_backend_dead_for_testing(4);
+
+    int changed = 0;
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 11, i * 17 + 5, i * 37 + 7};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        if (result.value() != assignments_before[i]) {
+            ++changed;
+        }
+    }
+
+    // Removing 1 of 4 backends should remap ~25% of keys, not 75%.
+    EXPECT_LE(changed, NUM_PROBES * 40 / 100)
+        << "Too many keys remapped (" << changed << "/" << NUM_PROBES
+        << "); jump consistent hash should remap ~25%";
+}
+
 // =============================================================================
 // 9. Weighted Random Selection
 // =============================================================================
