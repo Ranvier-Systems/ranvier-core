@@ -190,6 +190,7 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
     _transport = &transport;
     _consensus = &consensus;
     _peer_addresses = &peer_addresses;
+    _peer_address_set.insert(peer_addresses.begin(), peer_addresses.end());
     _running = true;
 
     // Only shard 0 manages protocol logic
@@ -422,13 +423,8 @@ seastar::future<> GossipProtocol::broadcast_heartbeat() {
 seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgram) {
     auto src_addr = dgram.get_src();
 
-    // Verify source is a known peer
-    if (!_peer_addresses) {
-        ++_packets_untrusted;
-        return seastar::make_ready_future<>();
-    }
-    auto it = std::find(_peer_addresses->begin(), _peer_addresses->end(), src_addr);
-    if (it == _peer_addresses->end()) {
+    // Verify source is a known peer (O(1) set lookup)
+    if (_peer_address_set.find(src_addr) == _peer_address_set.end()) {
         ++_packets_untrusted;
         return seastar::make_ready_future<>();
     }
@@ -650,8 +646,10 @@ seastar::future<> GossipProtocol::refresh_peers() {
             }
         }
 
-        // Update peer addresses
+        // Update peer addresses and lookup set
         *_peer_addresses = std::move(new_peer_addresses);
+        _peer_address_set.clear();
+        _peer_address_set.insert(_peer_addresses->begin(), _peer_addresses->end());
 
         log_gossip_protocol().info("DNS discovery complete: {} peers ({} from DNS)",
                                    _peer_addresses->size(), discovered_addresses.size());
