@@ -762,7 +762,8 @@ bool GossipProtocol::is_duplicate(const seastar::socket_address& peer, uint32_t 
 }
 
 void GossipProtocol::process_retries() {
-    // RAII Timer Safety: Holder must outlive the work
+    // RAII Timer Safety: Holder must outlive the work including async sends.
+    // Moved into .finally() so stop() waits for all in-flight retries (Rule #5).
     seastar::gate::holder timer_holder;
     try {
         if (_transport) {
@@ -777,6 +778,7 @@ void GossipProtocol::process_retries() {
     }
 
     auto now = seastar::lowres_clock::now();
+    std::vector<seastar::future<>> send_futures;
 
     for (auto& [peer, pending_map] : _pending_acks) {
         std::vector<uint32_t> to_retry;
@@ -804,15 +806,17 @@ void GossipProtocol::process_retries() {
             log_gossip_protocol().debug("Retrying route announcement: peer={}, seq_num={}, retry={}/{}",
                                         peer, seq_num, pending.retry_count, _config.gossip_max_retries);
 
-            (void)_transport->send(peer, pending.serialized_packet).then([this] {
-                ++_retries_sent;
-            }).handle_exception([peer, seq_num](auto ep) {
-                try {
-                    std::rethrow_exception(ep);
-                } catch (const std::exception& e) {
-                    log_gossip_protocol().debug("Failed to retry to peer {}: {}", peer, e.what());
-                }
-            });
+            send_futures.push_back(
+                _transport->send(peer, pending.serialized_packet).then([this] {
+                    ++_retries_sent;
+                }).handle_exception([peer, seq_num](auto ep) {
+                    try {
+                        std::rethrow_exception(ep);
+                    } catch (const std::exception& e) {
+                        log_gossip_protocol().debug("Failed to retry to peer {}: {}", peer, e.what());
+                    }
+                })
+            );
         }
 
         for (uint32_t seq_num : to_remove) {
@@ -828,6 +832,13 @@ void GossipProtocol::process_retries() {
         } else {
             ++it;
         }
+    }
+
+    // Gate holder spans all async sends so stop() waits for completion
+    if (!send_futures.empty()) {
+        (void)seastar::when_all_succeed(send_futures.begin(), send_futures.end())
+            .discard_result()
+            .finally([holder = std::move(timer_holder)] {});
     }
 }
 
