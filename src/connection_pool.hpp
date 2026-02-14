@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <deque>
 #include <memory>
 #include <unordered_map>
@@ -237,6 +238,7 @@ public:
                     log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
                 }
                 bundle.touch();
+                debug_validate_idle_count();
                 return seastar::make_ready_future<Bundle>(std::move(bundle));
             }
 
@@ -248,6 +250,7 @@ public:
         if (!request_id.empty()) {
             log_pool.debug("[{}] Creating new connection to {}", request_id, addr);
         }
+        debug_validate_idle_count();
         return create_connection(addr, request_id);
     }
 
@@ -325,6 +328,7 @@ public:
         }
         pool.push_back(std::move(bundle));
         _total_idle_connections++;
+        debug_validate_idle_count();
     }
 
     // Get pool statistics
@@ -373,6 +377,7 @@ public:
         if (closed > 0) {
             log_pool.info("Cleared {} pooled connections for removed backend {}", closed, addr);
         }
+        debug_validate_idle_count();
         return closed;
     }
 
@@ -433,6 +438,7 @@ public:
             log_pool.trace("Removed empty pool entry for {}", addr);
         }
 
+        debug_validate_idle_count();
         return closed;
     }
 
@@ -538,6 +544,19 @@ private:
                 close_bundle_async(std::move(oldest));
             }
         }
+    }
+
+    // Debug-only: validate _total_idle_connections matches actual pool contents.
+    // Catches counter drift from missed increment/decrement paths.
+    void debug_validate_idle_count() const {
+#ifndef NDEBUG
+        size_t actual = 0;
+        for (const auto& [addr, pool] : _pools) {
+            actual += pool.size();
+        }
+        assert(actual == _total_idle_connections &&
+               "connection_pool: _total_idle_connections out of sync with actual pool sizes");
+#endif
     }
 
     // Close a connection bundle via the configured close policy.
