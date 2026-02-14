@@ -25,6 +25,7 @@ This document identifies missing features and optimizations required to promote 
 13. [Adversarial System Audit (2026-02-12)](#13-adversarial-system-audit-2026-02-12)
 14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
 15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
+16. [Radix Tree Review (2026-02-14)](#16-radix-tree-review-2026-02-14)
 
 ---
 
@@ -2346,6 +2347,75 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
   _Location:_ `src/http_controller.cpp` (lines 1871-1986, 2005-2077)
   _Complexity:_ Low
   _Priority:_ P3 — Defensive correctness; prevents OOM on large trees
+
+---
+
+## 16. Radix Tree Review (2026-02-14)
+
+Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the codebase (per Strategic Assessment). Findings cover correctness bugs, maintainability debt, and performance opportunities.
+
+### 16.1 Fix Node256 Collision Lookup Failure When Preferred Slot Is Vacated
+
+- [ ] **Prevent `find_child()` from silently missing displaced children in Node256**
+  _Justification:_ `key_byte()` truncates `TokenId` (int32_t) to the lower 8 bits, so tokens like 0, 256, 512 all map to index 0. When a collision occurs during `add_child()`, the displaced child is placed in an arbitrary empty slot. However, `find_child()` at line 629 short-circuits the linear scan fallback with `if (n->keys[idx] != Node256::EMPTY_KEY)` — if the preferred slot is later vacated (by eviction or compaction), the condition becomes false and the displaced child becomes permanently invisible to lookups, even though it still exists in the tree. The same pattern affects `set_child()` and `extract_child()`.
+  _What to change:_ Remove the `if (n->keys[idx] != Node256::EMPTY_KEY)` guard before the linear fallback in `find_child()`, `extract_child()`, and `set_child()` for Node256. Always fall through to linear scan when the preferred-slot key doesn't match. Alternatively, redesign Node256 to use a proper open-addressing hash table with a defined probe sequence so displaced entries are findable in O(1) amortized time.
+  _Location:_ `src/radix_tree.hpp` lines 629-636 (`find_child`), 679-687 (`extract_child`), 740-747 (`set_child`)
+  _Complexity:_ Low (fix) / Medium (redesign)
+  _Priority:_ P1 — Correctness bug; causes silent data loss on lookup for colliding token IDs
+
+### 16.2 Fix `compact_children()` Using Slot Index Instead of Key for Node256 Removal
+
+- [ ] **Use `n->keys[i]` instead of `static_cast<TokenId>(i)` when marking Node256 children for removal**
+  _Justification:_ In `compact_children()` for the Node256 case (line 1547), empty children are marked for removal via `keys_to_remove.push_back(static_cast<TokenId>(i))`, where `i` is the array slot index (0–255). But `remove_child()` matches against the *stored key* (`n->keys[i]`), not the slot index. When collisions displace a child to a non-preferred slot, the slot index differs from the stored key. `remove_child()` will either remove the wrong child (if another key happens to equal the slot index) or fail to find and remove the target, leaking the empty node.
+  _What to change:_ Replace `keys_to_remove.push_back(static_cast<TokenId>(i))` with `keys_to_remove.push_back(n->keys[i])` in the Node256 branch of `compact_children()`.
+  _Location:_ `src/radix_tree.hpp` line 1547
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness bug; causes memory leaks during compaction with colliding token IDs
+
+### 16.3 Fix `extract_child()` Leaving Stale Entries in Node4/Node16/Node48 Vectors
+
+- [ ] **Erase the key/child entry from vectors after extracting a child, or switch to swap-and-pop**
+  _Justification:_ `extract_child()` for Node4/Node16 does `std::move(n->children[i])` but does not erase the entry from `keys` or `children` vectors. The vector retains its original size with a null `NodePtr` at position `i` and the key still present. Consequences: (1) `find_child()` will match the stale key and return nullptr, (2) `child_count()` returns an inflated count (it uses `keys.size()`), (3) `add_child()` may trigger premature growth (checking `keys.size() < 4`). The Node48 path has the same issue. `extract_child()` is called by `insert_recursive()` on every insert that traverses an existing child, making this a common code path.
+  _What to change:_ After extracting, erase both `keys[i]` and `children[i]` from their respective vectors. For Node4/Node16, use swap-with-last + `pop_back()` for O(1) removal (order doesn't matter). For Node48, also update the index array (decrement indices > i, clear the removed key's index entry). Alternatively, refactor `insert_recursive()` to avoid extract+reinsert entirely — use a mutable reference to the child slot.
+  _Location:_ `src/radix_tree.hpp` lines 643-691 (`extract_child`), called from line 1277 (`insert_recursive`)
+  _Complexity:_ Medium
+  _Priority:_ P2 — Correctness bug; causes wrong child counts, missed lookups, and premature node growth on every insert through existing paths
+
+### 16.4 Replace `std::vector` with Small-Buffer-Optimized Container for Node Prefix and Small Node Keys
+
+- [ ] **Eliminate heap allocations for short prefixes and small node key/child arrays**
+  _Justification:_ `Node::prefix` is `std::vector<TokenId>`, which always heap-allocates (even for 1-token prefixes). `Node4::keys` and `Node4::children` are also vectors with `reserve(4)`, causing two heap allocations per Node4 construction. In an ART, most prefixes are short (1-4 tokens) and most nodes are Node4 (the smallest type). Every `insert()` that creates a new leaf allocates a Node4 via slab, then does 2-3 additional heap allocations for vectors — undermining the slab allocator's goal of eliminating heap allocation. This also fragments memory and hurts cache locality since prefix data is not co-located with the node.
+  _What to change:_ Replace `std::vector<TokenId>` prefix with a `SmallVector<TokenId, 8>` (inline storage for up to 8 tokens, ~32 bytes). Replace Node4 keys/children with `std::array<TokenId, 4>` + `std::array<NodePtr, 4>` + `uint8_t count`. Same for Node16. This keeps small-case data inline within the slab-allocated node, eliminating heap allocation entirely for the common case. Boost.Container `small_vector` or Abseil `InlinedVector` (already a dependency) are ready-made options.
+  _Location:_ `src/radix_tree.hpp` lines 99 (`Node::prefix`), 109-110 (`Node4`), 119-120 (`Node16`)
+  _Complexity:_ Medium
+  _Priority:_ P2 — Performance; eliminates 2-3 heap allocations per node on the insert path, improves cache locality
+
+### 16.5 Reduce Code Duplication via Unified Small-Node Template for Node4/Node16
+
+- [ ] **Consolidate duplicated switch-on-type code by templating Node4/Node16 operations**
+  _Justification:_ Node4 and Node16 have identical structure (keys vector + children vector), yet every operation (`find_child`, `extract_child`, `set_child`, `add_child`, `remove_child`, `compact_children`, `visit_children`, `child_count`, `move_from_small_node`) duplicates the same logic in separate switch branches. This is ~300+ lines of pure duplication. If a bug is fixed in one branch but missed in the other, they silently diverge (as already happened with `extract_child` not erasing entries). The `move_from_small_node` template at line 987 shows this was partially recognized but not applied consistently.
+  _What to change:_ Create a `SmallNode<N>` template (or a common base `KeyChildNode`) that Node4 and Node16 inherit from. Move shared logic into free functions or template methods operating on this base. This halves the switch-case branches for small nodes and makes it impossible to fix a bug in one without fixing the other. The Node48/Node256 cases remain separate since their storage differs.
+  _Location:_ `src/radix_tree.hpp` — affects `find_child`, `extract_child`, `set_child`, `add_child`, `remove_child`, `compact_children`, `visit_children`, `child_count`
+  _Complexity:_ Medium
+  _Priority:_ P2 — Maintainability; reduces ~300 lines of duplication and prevents divergence bugs
+
+### 16.6 Replace O(n) Full-Tree Scan in `evict_oldest()` with an LRU Index Structure
+
+- [ ] **Add an intrusive LRU list to make eviction O(1) instead of O(n)**
+  _Justification:_ `evict_oldest()` calls `find_oldest_leaf()` which recursively walks the entire tree to find the leaf with the minimum `last_accessed` timestamp. This is O(n) where n is total nodes. Eviction is called in a loop (`while (route_count >= max_routes) evict_oldest()`), making bulk eviction O(n × k) where k is the number of routes to evict. Under memory pressure with thousands of routes, this becomes a latency spike on the insert path — potentially violating Hard Rule #1 (no blocking on hot path).
+  _What to change:_ Maintain an intrusive doubly-linked list threaded through leaf nodes, ordered by `last_accessed`. On lookup hit, move the node to the head (O(1) with intrusive list). On eviction, pop from the tail (O(1)). Add `lru_prev`/`lru_next` pointers to `Node` (8 bytes each, acceptable overhead). This makes eviction O(1) and lookup LRU update O(1), at the cost of ~16 bytes per node and pointer maintenance on insert/remove.
+  _Location:_ `src/radix_tree.hpp` lines 1404-1428 (`find_oldest_leaf`, `find_oldest_recursive`), lines 409-427 (`evict_oldest`, `evict_oldest_remote`)
+  _Complexity:_ High
+  _Priority:_ P3 — Performance; only impacts workloads at or near route capacity with frequent eviction
+
+### 16.7 Add MAX_SIZE Bound to Node Prefix Length
+
+- [ ] **Enforce a maximum prefix length to prevent unbounded memory growth from long token sequences**
+  _Justification:_ `insert_recursive()` creates new nodes with `prefix.assign(remaining.begin() + 1, remaining.end())` (line 1284). The prefix length is bounded only by the input token sequence length (after block alignment truncation). A very long input (e.g., a 128k-context request producing 100k+ tokens) could create a single node with a 100k-element prefix vector, allocating ~400KB of heap memory for one node. This violates Hard Rule #4 (every growing container needs explicit MAX_SIZE). While block_alignment truncation helps, typical alignment values (16) still allow prefixes up to `aligned_len - depth` tokens.
+  _What to change:_ Add a `MAX_PREFIX_LENGTH` constant (e.g., 256 or 512 tokens). When a new node's prefix would exceed this, split it into a chain of nodes with bounded prefixes. This is analogous to how B-trees split pages — each node stores at most N prefix tokens, with overflow continuing in a child node. Add a check in `insert_recursive()` after constructing the prefix: `if (new_child->prefix.size() > MAX_PREFIX_LENGTH) split_long_prefix(new_child)`.
+  _Location:_ `src/radix_tree.hpp` lines 1282-1285 (new node creation in `insert_recursive`), line 950 (`split_node` prefix assignment)
+  _Complexity:_ Low
+  _Priority:_ P3 — Defensive correctness; prevents pathological memory usage from long inputs
 
 ---
 
