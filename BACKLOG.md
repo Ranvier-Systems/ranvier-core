@@ -2236,12 +2236,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.3 Extract Shared Live-Backend Filtering Helper
 
-- [ ] **Deduplicate the live-backend collection pattern into `ShardLocalState::get_live_backends()`**
+- [x] **Deduplicate the live-backend collection pattern into `ShardLocalState::get_live_backends()`** ✓
   _Justification:_ The pattern of iterating `backend_ids`, checking `dead_backends.contains()`, looking up in `backends`, and checking `is_draining` is repeated identically in `get_random_backend()`, `get_backend_for_prefix()`, and `get_backend_by_hash()`. If filtering criteria change (e.g., adding weight=0 exclusion), all three sites must be updated in lockstep — a latent inconsistency risk.
-  _What to change:_ Add a `std::vector<BackendId> get_live_backends()` method to `ShardLocalState` that encapsulates the filtering logic. Replace the three inline loops with calls to this helper. `get_random_backend()` needs additional weight/priority data — consider a second overload that returns `vector<pair<BackendId, const BackendInfo*>>`.
-  _Location:_ `src/router_service.cpp` (lines 1092-1119, 1184-1197, 1307-1320)
+  _Approach implemented:_ Added two helpers to `ShardLocalState`: (1) `get_live_backends()` returns a sorted `vector<BackendId>` — used by `get_backend_for_prefix()` and `get_backend_by_hash()`; (2) `get_live_backend_infos()` returns `vector<pair<BackendId, const BackendInfo*>>` — used by `get_random_backend()` for weight/priority access. Replaced all three inline loops. Net −30 lines.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Maintainability improvement
+  _Completed:_ 2026-02-14
 
 ### 14.4 Eliminate `std::map` Allocation on Hot Path in `get_random_backend()`
 
