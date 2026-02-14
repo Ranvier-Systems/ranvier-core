@@ -673,13 +673,13 @@ private:
                 auto* n = static_cast<Node256*>(node);
                 uint8_t idx = key_byte(key);
                 if (n->keys[idx] == key) {
-                    n->keys[idx] = Node256::EMPTY_KEY;
+                    // Move child out but preserve the key so set_child() can
+                    // find this slot again (matches Node4/Node16/Node48 behavior).
                     return std::move(n->children[idx]);
                 }
                 // Collision case: always linear scan — entry may be displaced
                 for (int i = 0; i < 256; i++) {
                     if (n->keys[i] == key) {
-                        n->keys[i] = Node256::EMPTY_KEY;
                         return std::move(n->children[i]);
                     }
                 }
