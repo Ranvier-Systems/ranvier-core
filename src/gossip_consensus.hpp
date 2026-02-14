@@ -173,6 +173,7 @@ public:
     uint64_t routes_rejected_incoming_degraded() const { return _routes_rejected_incoming_degraded; }
     uint64_t routes_allowed_fail_open() const { return _routes_allowed_fail_open; }
     uint64_t gossip_accepted_fail_open() const { return _gossip_accepted_fail_open; }
+    uint64_t peer_table_overflow() const { return _peer_table_overflow; }
 
     // Increment metrics (called by protocol layer)
     void inc_routes_rejected_degraded() { ++_routes_rejected_degraded; }
@@ -187,7 +188,8 @@ private:
     const ClusterConfig& _config;
     bool _running = false;
 
-    // Peer table (shard 0 only)
+    // Peer table (shard 0 only) - bounded by MAX_PEERS (Rule #4)
+    static constexpr size_t MAX_PEERS = 1000;
     std::unordered_map<seastar::socket_address, PeerState> _peer_table;
 
     // Local backend ID
@@ -207,6 +209,7 @@ private:
     uint64_t _gossip_accepted_fail_open = 0;
     uint64_t _stats_cluster_peers_alive = 0;
     uint64_t _stats_peers_recently_seen = 0;
+    uint64_t _peer_table_overflow = 0;
     bool _quorum_warning_active = false;
 
     // Timers
