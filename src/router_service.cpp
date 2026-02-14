@@ -2032,25 +2032,35 @@ void RouterService::run_draining_reaper() {
         }
     }
 
-    // Remove each expired draining backend
+    if (to_remove.empty()) return;
+
+    // Call pool cleanup callbacks synchronously before launching async removal
     for (const auto& [id, addr] : to_remove) {
         log_router.info("Backend {} drain timeout expired, removing from all shards", id);
-
-        // Call pool cleanup callback before removing (if set)
         if (_pool_cleanup_callback) {
             _pool_cleanup_callback(addr);
         }
+    }
 
-        // Unregister from all shards asynchronously; log on failure
-        // (Rule #9: every catch must log at warn level)
-        (void)unregister_backend_global(id).handle_exception([id](std::exception_ptr ep) {
+    // Rule #5: Keep gate holder alive for the full async lifetime of all
+    // unregister_backend_global() futures via do_with. Without this, the holder
+    // would drop when run_draining_reaper() returns, leaving the futures
+    // unprotected — stop() could close the gate and destroy members while the
+    // futures are still in flight.
+    (void)seastar::do_with(std::move(holder), std::move(to_remove),
+        [this](seastar::gate::holder&, std::vector<std::pair<BackendId, seastar::socket_address>>& to_remove) {
+            return seastar::parallel_for_each(to_remove,
+                [this](const std::pair<BackendId, seastar::socket_address>& entry) {
+                    return unregister_backend_global(entry.first);
+                });
+        }).handle_exception([](std::exception_ptr ep) {
+            // Rule #9: every catch must log at warn level
             try {
                 std::rethrow_exception(ep);
             } catch (const std::exception& e) {
-                log_router.warn("Failed to unregister drained backend {}: {}", id, e.what());
+                log_router.warn("Failed to unregister drained backends: {}", e.what());
             }
         });
-    }
 }
 
 seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
