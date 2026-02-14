@@ -219,7 +219,6 @@ private:
     // Internal methods
     void check_liveness();
     void check_quorum();
-    void update_quorum_state();
 
     // Broadcast route prune to all shards for a dead/removed peer's backend.
     // Gate-protected: stop() waits for in-flight prune operations (Rule #5).

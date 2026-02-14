@@ -307,57 +307,6 @@ void GossipConsensus::check_quorum() {
     }
 }
 
-void GossipConsensus::update_quorum_state() {
-    // Only run on shard 0 since it manages the peer table
-    if (seastar::this_shard_id() != 0) {
-        return;
-    }
-
-    size_t total_nodes = _peer_table.size() + 1;  // +1 for self
-    size_t alive_nodes = _stats_cluster_peers_alive + 1;  // +1 for self
-    size_t required = quorum_required();
-
-    QuorumState new_state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
-
-    if (new_state != _quorum_state) {
-        ++_quorum_transitions;
-
-        if (new_state == QuorumState::DEGRADED) {
-            _quorum_warning_active = false;
-            log_gossip_consensus().error("QUORUM LOST: Cluster entering DEGRADED mode. "
-                                         "Only {}/{} nodes reachable (need {} for quorum). "
-                                         "New route writes will be rejected to prevent split-brain divergence.",
-                                         alive_nodes, total_nodes, required);
-        } else {
-            log_gossip_consensus().info("QUORUM RESTORED: Cluster returning to HEALTHY mode. "
-                                        "{}/{} nodes reachable (need {} for quorum). "
-                                        "Route writes re-enabled.",
-                                        alive_nodes, total_nodes, required);
-        }
-
-        _quorum_state = new_state;
-        _stats_quorum_state = (new_state == QuorumState::HEALTHY) ? 1 : 0;
-    }
-
-    // Check for warning threshold
-    if (_config.quorum_warning_threshold > 0 && new_state == QuorumState::HEALTHY) {
-        size_t margin = alive_nodes - required;
-        bool should_warn = margin <= _config.quorum_warning_threshold;
-
-        if (should_warn && !_quorum_warning_active) {
-            _quorum_warning_active = true;
-            log_gossip_consensus().warn("QUORUM WARNING: Only {} node(s) above quorum threshold "
-                                        "(alive={}, required={}, total={}). Cluster at risk of split-brain.",
-                                        margin, alive_nodes, required, total_nodes);
-        } else if (!should_warn && _quorum_warning_active) {
-            _quorum_warning_active = false;
-            log_gossip_consensus().info("QUORUM WARNING CLEARED: Cluster has sufficient margin "
-                                        "(alive={}, required={}, total={}).",
-                                        alive_nodes, required, total_nodes);
-        }
-    }
-}
-
 void GossipConsensus::broadcast_prune(BackendId b_id) {
     // Gate-protect so stop() waits for in-flight prune operations (Rule #5).
     // The holder is moved into .finally() to span the full async lifetime.
