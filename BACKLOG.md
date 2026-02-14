@@ -2218,12 +2218,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.1 Replace Modular Hash with Jump Consistent Hash
 
-- [ ] **Replace `prefix_hash % live_backends.size()` with jump consistent hash**
+- [x] **Replace `prefix_hash % live_backends.size()` with jump consistent hash** ✓
   _Justification:_ The hash fallback in `get_backend_for_prefix()` and `get_backend_by_hash()` uses modular hashing, which reshuffles **all** keys when a backend is added/removed. True consistent hashing (e.g., jump hash) remaps only ~1/n keys, preserving KV-cache affinity during topology changes — which is the project's core value proposition.
-  _What to change:_ Implement `jump_consistent_hash(uint64_t key, int32_t num_buckets)` (Google's algorithm, ~10 lines, public domain). Replace the two `prefix_hash % live_backends.size()` call sites at `router_service.cpp:1271` and `router_service.cpp:1337`. `live_backends` is already sorted for determinism, so the jump hash bucket index maps directly.
-  _Location:_ `src/router_service.cpp` (lines 1271, 1337)
+  _Approach implemented:_ Added `jump_consistent_hash(uint64_t key, int32_t num_buckets)` (Lamping & Veach 2014) next to existing `hash_prefix()`. Replaced both `prefix_hash % live_backends.size()` call sites. Added two unit tests verifying minimal-remap property on backend addition and removal (≤40% remap threshold vs ~75% for modular hash).
+  _Location:_ `src/router_service.cpp`, `tests/unit/router_service_test.cpp`
   _Complexity:_ Low
-  _Priority:_ P1 — Directly impacts cache hit rate during backend scaling events
+  _Completed:_ 2026-02-14
 
 ### 14.2 Fix `cache_hit` Misreporting in `route_request()`
 

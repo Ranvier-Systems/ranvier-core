@@ -546,6 +546,23 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
 constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
 constexpr uint64_t FNV_PRIME = 1099511628211ULL;
 
+// Jump consistent hash (Lamping & Veach, 2014).
+// Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
+// removing a bucket remaps only ~1/n keys.  This preserves KV-cache affinity
+// during backend topology changes, unlike modular hashing which reshuffles all.
+inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
+    int64_t b = -1, j = 0;
+    while (j < num_buckets) {
+        b = j;
+        key = key * 2862933555777941757ULL + 1;
+        j = static_cast<int64_t>(
+            static_cast<double>(b + 1) *
+            (static_cast<double>(1LL << 31) /
+             static_cast<double>((key >> 33) + 1)));
+    }
+    return static_cast<int32_t>(b);
+}
+
 // Hash function for prefix tokens using FNV-1a
 // Aligns to block_alignment boundary for vLLM compatibility
 inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
@@ -1268,7 +1285,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     // This provides deterministic routing for new prefixes
     // Uses prefix_boundary if provided (system message only) for multi-node consistency
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-    size_t index = prefix_hash % live_backends.size();
+    int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
     BackendId selected = live_backends[index];
 
     // This is a cache miss - the route will be learned after successful response
@@ -1334,7 +1351,7 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 
     // Consistent hash on prefix tokens
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-    size_t index = prefix_hash % live_backends.size();
+    int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
     BackendId selected = live_backends[index];
 
     if (!request_id.empty()) {
