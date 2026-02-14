@@ -131,26 +131,8 @@ void GossipConsensus::add_peer(const seastar::socket_address& peer) {
 void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
     auto it = _peer_table.find(peer);
     if (it != _peer_table.end()) {
-        // Prune routes for removed peer if it had an associated backend.
-        // Each shard invokes its own locally-registered callback to avoid
-        // broadcasting std::function across shards (cross-shard free risk).
         if (it->second.associated_backend && s_local_prune_callback) {
-            BackendId b_id = *it->second.associated_backend;
-            (void)seastar::parallel_for_each(
-                boost::irange<unsigned>(0, seastar::smp::count),
-                [b_id](unsigned shard_id) {
-                    return seastar::smp::submit_to(shard_id, [b_id] {
-                        if (s_local_prune_callback) {
-                            return s_local_prune_callback(b_id);
-                        }
-                        return seastar::make_ready_future<>();
-                    });
-                }).handle_exception([b_id](auto ep) {
-                    try { std::rethrow_exception(ep); }
-                    catch (const std::exception& e) {
-                        log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
-                    }
-                });
+            broadcast_prune(*it->second.associated_backend);
         }
         _peer_table.erase(it);
         log_gossip_consensus().info("Peer removed: {}", peer);
@@ -184,25 +166,8 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
         if (new_peer_table.find(peer) == new_peer_table.end()) {
             log_gossip_consensus().info("DNS discovery: peer removed: {}", peer);
 
-            // Prune routes for removed peers if they had an associated backend.
-            // Each shard invokes its own locally-registered callback.
             if (state.associated_backend && s_local_prune_callback) {
-                BackendId b_id = *state.associated_backend;
-                (void)seastar::parallel_for_each(
-                    boost::irange<unsigned>(0, seastar::smp::count),
-                    [b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [b_id] {
-                            if (s_local_prune_callback) {
-                                return s_local_prune_callback(b_id);
-                            }
-                            return seastar::make_ready_future<>();
-                        });
-                    }).handle_exception([b_id](auto ep) {
-                        try { std::rethrow_exception(ep); }
-                        catch (const std::exception& e) {
-                            log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
-                        }
-                    });
+                broadcast_prune(*state.associated_backend);
             }
         }
     }
@@ -241,26 +206,8 @@ void GossipConsensus::check_liveness() {
             state.is_alive = false;
             log_gossip_consensus().warn("Peer marked dead: socket_address={}", addr);
 
-            // Prune routes for dead peer if it had an associated backend.
-            // Broadcast only the scalar BackendId; each shard invokes its
-            // own locally-registered callback.
             if (state.associated_backend && s_local_prune_callback) {
-                BackendId b_id = *state.associated_backend;
-
-                (void)seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
-                    [b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [b_id] {
-                            if (s_local_prune_callback) {
-                                return s_local_prune_callback(b_id);
-                            }
-                            return seastar::make_ready_future<>();
-                        });
-                    }).handle_exception([b_id](auto ep) {
-                        try { std::rethrow_exception(ep); }
-                        catch (const std::exception& e) {
-                            log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
-                        }
-                    });
+                broadcast_prune(*state.associated_backend);
             }
         }
 
@@ -392,6 +339,33 @@ void GossipConsensus::update_quorum_state() {
                                         alive_nodes, required, total_nodes);
         }
     }
+}
+
+void GossipConsensus::broadcast_prune(BackendId b_id) {
+    // Gate-protect so stop() waits for in-flight prune operations (Rule #5).
+    // The holder is moved into .finally() to span the full async lifetime.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return;
+    }
+
+    (void)seastar::parallel_for_each(
+        boost::irange<unsigned>(0, seastar::smp::count),
+        [b_id](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [b_id] {
+                if (s_local_prune_callback) {
+                    return s_local_prune_callback(b_id);
+                }
+                return seastar::make_ready_future<>();
+            });
+        }).handle_exception([b_id](auto ep) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) {
+                log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
+            }
+        }).finally([holder = std::move(holder)] {});
 }
 
 void GossipConsensus::start_resync() {
