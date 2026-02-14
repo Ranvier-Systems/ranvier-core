@@ -124,7 +124,6 @@ struct ShardLocalState {
         uint64_t compaction_runs = 0;
         // Load-aware routing stats
         uint64_t load_aware_fallbacks = 0;       // Times we chose non-preferred backend due to load
-        uint64_t cache_miss_due_to_load = 0;     // Routes diverted due to backend load (same as fallbacks)
 
         void reset() {
             cache_hits = 0;
@@ -141,7 +140,6 @@ struct ShardLocalState {
             compaction_bytes_reclaimed = 0;
             compaction_runs = 0;
             load_aware_fallbacks = 0;
-            cache_miss_due_to_load = 0;
         }
     } stats;
 
@@ -469,7 +467,6 @@ static BackendId apply_load_aware_selection(
     }
 
     // Significant difference - divert to less-loaded backend
-    g_shard_state->stats.cache_miss_due_to_load++;
     g_shard_state->stats.load_aware_fallbacks++;
     if (g_metrics) {
         metrics().record_load_aware_fallback();
@@ -736,12 +733,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // Counter: requests diverted to less-loaded backends
         seastar::metrics::make_counter("router_load_aware_fallbacks_total",
             [] { return g_shard_state ? g_shard_state->stats.load_aware_fallbacks : 0UL; },
-            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth")),
-
-        // Counter: cache misses accepted for load balancing
-        seastar::metrics::make_counter("router_cache_miss_due_to_load_total",
-            [] { return g_shard_state ? g_shard_state->stats.cache_miss_due_to_load : 0UL; },
-            seastar::metrics::description("Total number of cache misses accepted to avoid routing to overloaded backends"))
+            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth"))
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
     });
