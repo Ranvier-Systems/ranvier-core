@@ -665,7 +665,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     request_span.set_attribute("ranvier.request_id", request_id);
 
     // Check if we're draining - reject new requests with 503
-    if (_draining.load(std::memory_order_relaxed)) {
+    if (_draining) {
         log_proxy.info("[{}] Request rejected - server is draining", request_id);
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->add_header("X-Request-ID", request_id);
@@ -1778,7 +1778,7 @@ future<> HttpController::stop() {
 }
 
 void HttpController::start_draining() {
-    _draining.store(true, std::memory_order_relaxed);
+    _draining = true;
     log_proxy.info("Draining started - rejecting new requests");
 }
 
@@ -1806,7 +1806,7 @@ future<> HttpController::wait_for_drain() {
 }
 
 bool HttpController::is_draining() const {
-    return _draining.load(std::memory_order_relaxed);
+    return _draining;
 }
 
 bool HttpController::is_persistence_backpressured() const {
@@ -2120,7 +2120,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_health(
     std::unique_ptr<seastar::http::reply> rep) {
 
     // Check draining state first (atomic read - lock-free per Anti-Pattern #1)
-    if (_draining.load(std::memory_order_relaxed)) {
+    if (_draining) {
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->write_body("json", "{\"status\": \"draining\"}");
         return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));

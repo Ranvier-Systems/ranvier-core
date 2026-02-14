@@ -13,7 +13,6 @@
 #include "shard_load_metrics.hpp"
 #include "tokenizer_service.hpp"
 
-#include <atomic>
 #include <functional>
 #include <limits>
 
@@ -256,16 +255,17 @@ private:
     ShardLoadBalancerConfig _lb_config;  // Local copy of load balancer config
 
     // Graceful shutdown state
-    std::atomic<bool> _draining{false};  // Set to true to reject new requests
+    // Plain bool: set/read only from this shard's reactor via invoke_on_all/local handler
+    bool _draining{false};
     seastar::gate _request_gate;         // Tracks in-flight requests
 
     // Backpressure: semaphore for concurrency limiting
     // Uses try_get_units() for immediate rejection (no queueing)
     seastar::semaphore _request_semaphore;
 
-    // Backpressure metrics
-    std::atomic<uint64_t> _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
-    std::atomic<uint64_t> _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
+    // Backpressure metrics (shard-local — no cross-shard access)
+    uint64_t _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
+    uint64_t _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
 
     // Shard load balancing metrics (reserved for future cross-shard dispatch)
     uint64_t _requests_local_dispatch{0};         // Requests processed locally
