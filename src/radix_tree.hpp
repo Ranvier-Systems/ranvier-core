@@ -1541,7 +1541,7 @@ private:
                             n->children[i] = shrink_node(std::move(n->children[i]), stats);
                         }
                         if (is_node_empty(n->children[i].get())) {
-                            keys_to_remove.push_back(static_cast<TokenId>(i));
+                            keys_to_remove.push_back(n->keys[i]);
                         }
                     }
                 }
