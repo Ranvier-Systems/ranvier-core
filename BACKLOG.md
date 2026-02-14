@@ -26,8 +26,9 @@ This document identifies missing features and optimizations required to promote 
 14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
 15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
 16. [Radix Tree Review (2026-02-14)](#16-radix-tree-review-2026-02-14)
-17. [Connection Pool Review (2026-02-14)](#17-connection-pool-review-2026-02-14)
-18. [Gossip Service Review (2026-02-14)](#18-gossip-service-review-2026-02-14)
+17. [Router Service Review Pass 2 (2026-02-14)](#17-router-service-review-pass-2-2026-02-14)
+18. [Connection Pool Review (2026-02-14)](#18-connection-pool-review-2026-02-14)
+19. [Gossip Service Review (2026-02-14)](#19-gossip-service-review-2026-02-14)
 
 ---
 
@@ -2365,7 +2366,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.1 Fix Node256 Collision Lookup Failure When Preferred Slot Is Vacated
 
-- [ ] **Prevent `find_child()` from silently missing displaced children in Node256**
+- [x] **Prevent `find_child()` from silently missing displaced children in Node256**
   _Justification:_ `key_byte()` truncates `TokenId` (int32_t) to the lower 8 bits, so tokens like 0, 256, 512 all map to index 0. When a collision occurs during `add_child()`, the displaced child is placed in an arbitrary empty slot. However, `find_child()` at line 629 short-circuits the linear scan fallback with `if (n->keys[idx] != Node256::EMPTY_KEY)` — if the preferred slot is later vacated (by eviction or compaction), the condition becomes false and the displaced child becomes permanently invisible to lookups, even though it still exists in the tree. The same pattern affects `set_child()` and `extract_child()`.
   _What to change:_ Remove the `if (n->keys[idx] != Node256::EMPTY_KEY)` guard before the linear fallback in `find_child()`, `extract_child()`, and `set_child()` for Node256. Always fall through to linear scan when the preferred-slot key doesn't match. Alternatively, redesign Node256 to use a proper open-addressing hash table with a defined probe sequence so displaced entries are findable in O(1) amortized time.
   _Location:_ `src/radix_tree.hpp` lines 629-636 (`find_child`), 679-687 (`extract_child`), 740-747 (`set_child`)
@@ -2374,7 +2375,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.2 Fix `compact_children()` Using Slot Index Instead of Key for Node256 Removal
 
-- [ ] **Use `n->keys[i]` instead of `static_cast<TokenId>(i)` when marking Node256 children for removal**
+- [x] **Use `n->keys[i]` instead of `static_cast<TokenId>(i)` when marking Node256 children for removal**
   _Justification:_ In `compact_children()` for the Node256 case (line 1547), empty children are marked for removal via `keys_to_remove.push_back(static_cast<TokenId>(i))`, where `i` is the array slot index (0–255). But `remove_child()` matches against the *stored key* (`n->keys[i]`), not the slot index. When collisions displace a child to a non-preferred slot, the slot index differs from the stored key. `remove_child()` will either remove the wrong child (if another key happens to equal the slot index) or fail to find and remove the target, leaking the empty node.
   _What to change:_ Replace `keys_to_remove.push_back(static_cast<TokenId>(i))` with `keys_to_remove.push_back(n->keys[i])` in the Node256 branch of `compact_children()`.
   _Location:_ `src/radix_tree.hpp` line 1547
@@ -2383,7 +2384,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.3 Fix `extract_child()` Leaving Stale Entries in Node4/Node16/Node48 Vectors
 
-- [ ] **Erase the key/child entry from vectors after extracting a child, or switch to swap-and-pop**
+- [x] **Erase the key/child entry from vectors after extracting a child, or switch to swap-and-pop**
   _Justification:_ `extract_child()` for Node4/Node16 does `std::move(n->children[i])` but does not erase the entry from `keys` or `children` vectors. The vector retains its original size with a null `NodePtr` at position `i` and the key still present. Consequences: (1) `find_child()` will match the stale key and return nullptr, (2) `child_count()` returns an inflated count (it uses `keys.size()`), (3) `add_child()` may trigger premature growth (checking `keys.size() < 4`). The Node48 path has the same issue. `extract_child()` is called by `insert_recursive()` on every insert that traverses an existing child, making this a common code path.
   _What to change:_ After extracting, erase both `keys[i]` and `children[i]` from their respective vectors. For Node4/Node16, use swap-with-last + `pop_back()` for O(1) removal (order doesn't matter). For Node48, also update the index array (decrement indices > i, clear the removed key's index entry). Alternatively, refactor `insert_recursive()` to avoid extract+reinsert entirely — use a mutable reference to the child slot.
   _Location:_ `src/radix_tree.hpp` lines 643-691 (`extract_child`), called from line 1277 (`insert_recursive`)
@@ -2392,7 +2393,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.4 Replace `std::vector` with Small-Buffer-Optimized Container for Node Prefix and Small Node Keys
 
-- [ ] **Eliminate heap allocations for short prefixes and small node key/child arrays**
+- [x] **Eliminate heap allocations for short prefixes and small node key/child arrays**
   _Justification:_ `Node::prefix` is `std::vector<TokenId>`, which always heap-allocates (even for 1-token prefixes). `Node4::keys` and `Node4::children` are also vectors with `reserve(4)`, causing two heap allocations per Node4 construction. In an ART, most prefixes are short (1-4 tokens) and most nodes are Node4 (the smallest type). Every `insert()` that creates a new leaf allocates a Node4 via slab, then does 2-3 additional heap allocations for vectors — undermining the slab allocator's goal of eliminating heap allocation. This also fragments memory and hurts cache locality since prefix data is not co-located with the node.
   _What to change:_ Replace `std::vector<TokenId>` prefix with a `SmallVector<TokenId, 8>` (inline storage for up to 8 tokens, ~32 bytes). Replace Node4 keys/children with `std::array<TokenId, 4>` + `std::array<NodePtr, 4>` + `uint8_t count`. Same for Node16. This keeps small-case data inline within the slab-allocated node, eliminating heap allocation entirely for the common case. Boost.Container `small_vector` or Abseil `InlinedVector` (already a dependency) are ready-made options.
   _Location:_ `src/radix_tree.hpp` lines 99 (`Node::prefix`), 109-110 (`Node4`), 119-120 (`Node16`)
@@ -2401,7 +2402,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.5 Reduce Code Duplication via Unified Small-Node Template for Node4/Node16
 
-- [ ] **Consolidate duplicated switch-on-type code by templating Node4/Node16 operations**
+- [x] **Consolidate duplicated switch-on-type code by templating Node4/Node16 operations**
   _Justification:_ Node4 and Node16 have identical structure (keys vector + children vector), yet every operation (`find_child`, `extract_child`, `set_child`, `add_child`, `remove_child`, `compact_children`, `visit_children`, `child_count`, `move_from_small_node`) duplicates the same logic in separate switch branches. This is ~300+ lines of pure duplication. If a bug is fixed in one branch but missed in the other, they silently diverge (as already happened with `extract_child` not erasing entries). The `move_from_small_node` template at line 987 shows this was partially recognized but not applied consistently.
   _What to change:_ Create a `SmallNode<N>` template (or a common base `KeyChildNode`) that Node4 and Node16 inherit from. Move shared logic into free functions or template methods operating on this base. This halves the switch-case branches for small nodes and makes it impossible to fix a bug in one without fixing the other. The Node48/Node256 cases remain separate since their storage differs.
   _Location:_ `src/radix_tree.hpp` — affects `find_child`, `extract_child`, `set_child`, `add_child`, `remove_child`, `compact_children`, `visit_children`, `child_count`
@@ -2410,7 +2411,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.6 Replace O(n) Full-Tree Scan in `evict_oldest()` with an LRU Index Structure
 
-- [ ] **Add an intrusive LRU list to make eviction O(1) instead of O(n)**
+- [x] **Add an intrusive LRU list to make eviction O(1) instead of O(n)**
   _Justification:_ `evict_oldest()` calls `find_oldest_leaf()` which recursively walks the entire tree to find the leaf with the minimum `last_accessed` timestamp. This is O(n) where n is total nodes. Eviction is called in a loop (`while (route_count >= max_routes) evict_oldest()`), making bulk eviction O(n × k) where k is the number of routes to evict. Under memory pressure with thousands of routes, this becomes a latency spike on the insert path — potentially violating Hard Rule #1 (no blocking on hot path).
   _What to change:_ Maintain an intrusive doubly-linked list threaded through leaf nodes, ordered by `last_accessed`. On lookup hit, move the node to the head (O(1) with intrusive list). On eviction, pop from the tail (O(1)). Add `lru_prev`/`lru_next` pointers to `Node` (8 bytes each, acceptable overhead). This makes eviction O(1) and lookup LRU update O(1), at the cost of ~16 bytes per node and pointer maintenance on insert/remove.
   _Location:_ `src/radix_tree.hpp` lines 1404-1428 (`find_oldest_leaf`, `find_oldest_recursive`), lines 409-427 (`evict_oldest`, `evict_oldest_remote`)
@@ -2419,7 +2420,7 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.7 Add MAX_SIZE Bound to Node Prefix Length
 
-- [ ] **Enforce a maximum prefix length to prevent unbounded memory growth from long token sequences**
+- [x] **Enforce a maximum prefix length to prevent unbounded memory growth from long token sequences**
   _Justification:_ `insert_recursive()` creates new nodes with `prefix.assign(remaining.begin() + 1, remaining.end())` (line 1284). The prefix length is bounded only by the input token sequence length (after block alignment truncation). A very long input (e.g., a 128k-context request producing 100k+ tokens) could create a single node with a 100k-element prefix vector, allocating ~400KB of heap memory for one node. This violates Hard Rule #4 (every growing container needs explicit MAX_SIZE). While block_alignment truncation helps, typical alignment values (16) still allow prefixes up to `aligned_len - depth` tokens.
   _What to change:_ Add a `MAX_PREFIX_LENGTH` constant (e.g., 256 or 512 tokens). When a new node's prefix would exceed this, split it into a chain of nodes with bounded prefixes. This is analogous to how B-trees split pages — each node stores at most N prefix tokens, with overflow continuing in a child node. Add a check in `insert_recursive()` after constructing the prefix: `if (new_child->prefix.size() > MAX_PREFIX_LENGTH) split_long_prefix(new_child)`.
   _Location:_ `src/radix_tree.hpp` lines 1282-1285 (new node creation in `insert_recursive`), line 950 (`split_node` prefix assignment)
@@ -2506,11 +2507,11 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ---
 
-## 17. Connection Pool Review (2026-02-14)
+## 18. Connection Pool Review (2026-02-14)
 
 Deep-dive review of `src/connection_pool.hpp` across correctness, performance, and maintainability.
 
-### 17.1 Silent Exception Swallowing in `BasicConnectionBundle::close()` (Rule #9)
+### 18.1 Silent Exception Swallowing in `BasicConnectionBundle::close()` (Rule #9)
 
 - [x] **Log exceptions in `BasicConnectionBundle::close()` instead of silently discarding them**
   _Justification:_ Line 76 uses `.handle_exception([](auto) {})` which silently swallows all exceptions during stream close. This violates Hard Rule #9 (every catch block must log at warn level). A failed close could indicate a networking issue, resource leak, or Seastar internal error—all invisible today. The connection pool reaper and eviction paths funnel through `close()`, so a systematic close failure would be completely silent.
@@ -2519,7 +2520,7 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Complexity:_ Low
   _Priority:_ P2 — Correctness; violations of Rule #9 hide operational issues
 
-### 17.2 Fragile `const_cast` in `evict_oldest_global()`
+### 18.2 Fragile `const_cast` in `evict_oldest_global()`
 
 - [x] **Remove `const_cast` in `evict_oldest_global()` by storing the iterator or address by value**
   _Justification:_ Line 525 uses `const_cast<seastar::socket_address*>(&addr)` to capture a pointer to a map key during iteration, then dereferences it after the loop to index back into the map. While safe in single-threaded Seastar code today (no `co_await` between capture and use), this pattern is fragile: any future modification that inserts/erases map entries between the scan and the lookup would invalidate the pointer. `const_cast` on map keys is a well-known anti-pattern because it circumvents the const-correctness that protects key integrity.
@@ -2528,7 +2529,7 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Complexity:_ Low
   _Priority:_ P3 — Maintainability; eliminates a dangerous pattern before it becomes a real bug
 
-### 17.3 Manual `_total_idle_connections` Counter is Drift-Prone
+### 18.3 Manual `_total_idle_connections` Counter is Drift-Prone
 
 - [x] **Replace manual `_total_idle_connections` tracking with a derived or RAII-guarded counter**
   _Justification:_ The `_total_idle_connections` counter is manually incremented in `put()` (line 324) and decremented in four separate locations: `get()` (line 194), `put()` per-host eviction (line 308), `evict_oldest_global()` (line 534), `cleanup_expired()` (line 410), and `clear_pool()` (line 367). Any missed or double decrement silently corrupts capacity enforcement—the global eviction in `put()` uses this counter to decide when to evict (line 314), so drift means either premature eviction (lost connections) or unbounded growth (OOM). The scattered nature of these updates makes it easy to introduce drift during future modifications.
@@ -2537,7 +2538,7 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Complexity:_ Medium
   _Priority:_ P2 — Correctness; silent counter drift causes incorrect capacity enforcement
 
-### 17.4 `evict_oldest_global()` is O(B) on the `put()` Hot Path
+### 18.4 `evict_oldest_global()` is O(B) on the `put()` Hot Path
 
 - [x] **Avoid O(B) scan in `evict_oldest_global()` by maintaining a sorted eviction index**
   _Justification:_ When the pool is at `max_total_connections` capacity, every `put()` call triggers `evict_oldest_global()` (line 316), which iterates over all backend pools to find the one with the globally oldest front element (line 522-527). With `max_backends = 1000`, this is 1000 iterations per `put()` at capacity. In steady-state high-load scenarios (many backends, pool at capacity), this becomes a non-trivial reactor stall on the hot proxy path.
@@ -2546,7 +2547,7 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Complexity:_ Medium
   _Priority:_ P3 — Performance; only matters at sustained high connection churn with many backends
 
-### 17.5 Replace `std::unordered_map` with `absl::flat_hash_map`
+### 18.5 Replace `std::unordered_map` with `absl::flat_hash_map`
 
 - [x] **Switch `_pools` from `std::unordered_map` to `absl::flat_hash_map`**
   _Justification:_ The project already depends on Abseil (`absl::flat_hash_map` is used elsewhere). `std::unordered_map` uses node-based storage (one heap allocation per entry), causing poor cache locality during iteration. `absl::flat_hash_map` uses open addressing with flat storage, providing better cache behavior for both lookup (`get()`, `put()` call `find()`) and iteration (`evict_oldest_global()`, `cleanup_expired()`). The connection pool's `get()` and `put()` are on the hot proxy path, so even small lookup improvements compound.
@@ -2555,7 +2556,7 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Complexity:_ Low
   _Priority:_ P3 — Performance; incremental improvement on hot path
 
-### 17.6 `BasicConnectionBundle::close()` Self-Referencing Continuation is an API Footgun
+### 18.6 `BasicConnectionBundle::close()` Self-Referencing Continuation is an API Footgun
 
 - [x] **Make `BasicConnectionBundle::close()` safe for direct callers or mark it private**
   _Justification:_ The `close()` method at line 74 chains `.then([this] { return in.close(); })`, capturing `this` in a Seastar continuation. This is only safe when the bundle is heap-allocated with a lifetime extending beyond the future (as `AsyncClosePolicy` does by moving to `unique_ptr` and capturing it in `.finally()`). If any caller invokes `close()` on a stack-local or member bundle that is destroyed before the continuation runs, the `[this]` capture becomes dangling—a use-after-free. The current code is safe because all close paths go through `close_bundle_async()` → `AsyncClosePolicy`, but the public `close()` method doesn't communicate this lifetime requirement.
@@ -2564,7 +2565,7 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
   _Complexity:_ Low (Option C) to Medium (Option A/B)
   _Priority:_ P3 — Maintainability; prevents future misuse as the codebase grows
 
-### 17.7 Add `connections_created` and `connections_reused` Counters for Operational Visibility
+### 18.7 Add `connections_created` and `connections_reused` Counters for Operational Visibility
 
 - [x] **Track connection reuse ratio with `connections_created` and `connections_reused` stats**
   _Justification:_ The pool tracks `dead_connections_reaped`, `connections_reaped_max_age`, and `backends_rejected` but has no counter for total connections created (`create_connection()` calls) or successful pool reuses (the early-return path in `get()`). Without these, operators cannot determine the pool's hit rate—a critical metric for tuning `max_connections_per_host`, `idle_timeout`, and `max_connection_age`. A pool with <50% reuse rate suggests misconfigured timeouts or backend instability.
@@ -2575,11 +2576,11 @@ Deep-dive review of `src/connection_pool.hpp` across correctness, performance, a
 
 ---
 
-## 18. Gossip Service Review (2026-02-14)
+## 19. Gossip Service Review (2026-02-14)
 
 Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_consensus`, `gossip_protocol`, `gossip_transport`). Findings span correctness, performance, and maintainability.
 
-### 18.1 Fire-and-Forget Route Prune Futures Bypass the Gate (Rule #5)
+### 19.1 Fire-and-Forget Route Prune Futures Bypass the Gate (Rule #5)
 
 - [x] **Gate-protect the route prune `parallel_for_each` futures instead of discarding them**
   _Justification:_ In three locations — `check_liveness()` (line 250), `remove_peer()` (line 139), and `update_peer_list()` (line 191) — the route pruning operation is dispatched as `(void)seastar::parallel_for_each(...)`, discarding the returned future. These fire-and-forget async operations are not covered by any gate, so they can continue executing after `GossipConsensus::stop()` returns and the object is destroyed. The `parallel_for_each` lambda captures `b_id` by value (safe), but the `.handle_exception` lambda calls `log_gossip_consensus()` which accesses a static logger (safe), so the immediate crash risk is limited. However, the `s_local_prune_callback` invoked on each shard could itself capture state from a service that has already been stopped. This is a latent use-after-free that will surface when callback implementations become more complex.
@@ -2588,7 +2589,7 @@ Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_con
   _Complexity:_ Low
   _Priority:_ P1 — Correctness; violates Rule #5 (gate guards for async lifetime)
 
-### 18.2 Unbounded `_peer_table` Violates Rule #4
+### 19.2 Unbounded `_peer_table` Violates Rule #4
 
 - [x] **Add a MAX_PEERS bound to the peer table and DNS discovery insertion paths**
   _Justification:_ `_peer_table` (`std::unordered_map<socket_address, PeerState>`) has no maximum size. The `add_peer()`, `update_peer_list()`, and initial population in `start()` all insert without a size check. A misconfigured or malicious DNS discovery response could return thousands of addresses, growing memory unbounded. Other gossip containers (`_received_seq_sets`, `_pending_acks`, `_peer_seq_counters`) already have `MAX_DEDUP_PEERS` and `MAX_PENDING_ACKS` bounds (Rule #4 compliance), but the authoritative peer table does not.
@@ -2597,7 +2598,7 @@ Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_con
   _Complexity:_ Low
   _Priority:_ P2 — Correctness; violates Rule #4 (bounded containers)
 
-### 18.3 Dead `update_quorum_state()` Diverges From Active `check_quorum()`
+### 19.3 Dead `update_quorum_state()` Diverges From Active `check_quorum()`
 
 - [x] **Remove dead `update_quorum_state()` or unify with `check_quorum()`**
   _Justification:_ `update_quorum_state()` (line 346) is declared private, defined at ~50 LOC, but never called anywhere in the codebase. It uses `_stats_cluster_peers_alive` (binary alive/dead) for quorum calculation, while the active `check_quorum()` uses `peers_recently_seen` (time-windowed). These two functions produce different quorum decisions for the same cluster state. If a future developer calls `update_quorum_state()` thinking it's interchangeable with `check_quorum()`, the cluster will exhibit inconsistent quorum behavior — one path could report HEALTHY while the other reports DEGRADED for the same peer table.
@@ -2606,7 +2607,7 @@ Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_con
   _Complexity:_ Low
   _Priority:_ P2 — Maintainability; dead code with divergent logic is a latent correctness risk
 
-### 18.4 `process_retries()` Gate Holder Does Not Cover Fire-and-Forget Sends (Rule #5)
+### 19.4 `process_retries()` Gate Holder Does Not Cover Fire-and-Forget Sends (Rule #5)
 
 - [x] **Extend the gate holder lifetime in `process_retries()` to cover the send futures**
   _Justification:_ `process_retries()` (line 764) acquires a `_transport->timer_gate().hold()` at the top, then iterates pending ACKs and fires `(void)_transport->send(peer, pending.serialized_packet)` for each retry. The gate holder is scoped to the synchronous function body; it is destroyed when `process_retries()` returns. But the send futures are fire-and-forget — they execute asynchronously after the function returns. If `GossipTransport::stop()` closes the timer gate and destroys the channel while these sends are in-flight, the send futures may access a destroyed `_channel`. In practice Seastar's UDP send likely resolves with an exception on a closed channel, but this violates the gate pattern (Rule #5) and is unsafe if the transport's shutdown sequence changes.
@@ -2615,7 +2616,7 @@ Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_con
   _Complexity:_ Medium
   _Priority:_ P2 — Correctness; violates Rule #5 (gate guards must scope to full async lifetime)
 
-### 18.5 O(N) Peer Address Lookup on Every Incoming Packet
+### 19.5 O(N) Peer Address Lookup on Every Incoming Packet
 
 - [x] **Replace `std::find()` on `_peer_addresses` vector with an `absl::flat_hash_set` for O(1) peer validation**
   _Justification:_ `handle_packet()` (line 430) validates the source address of every incoming UDP packet with `std::find(_peer_addresses->begin(), _peer_addresses->end(), src_addr)`. This is O(N) where N is the number of configured peers. While current cluster sizes are small (3-10 nodes), this is the hot path for packet reception — every heartbeat, route announcement, and ACK hits this linear scan. With DNS discovery enabled and larger clusters, this becomes a measurable cost per packet. The project already depends on Abseil.
@@ -2624,7 +2625,7 @@ Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_con
   _Complexity:_ Low
   _Priority:_ P3 — Performance; linear scan on hot path scales poorly with cluster size
 
-### 18.6 Per-Peer Token Vector Copy in `broadcast_route()`
+### 19.6 Per-Peer Token Vector Copy in `broadcast_route()`
 
 - [x] **Serialize the route packet once and reuse across peers, stamping only the per-peer sequence number**
   _Justification:_ `broadcast_route()` (line 335) uses `parallel_for_each` with a lambda that captures `tokens` by value. Inside the lambda, line 339 performs `pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end())` — an explicit copy for each peer. For a cluster of N peers, this creates N+1 copies of the token vector (1 capture + N per-peer). With MAX_TOKENS=256 and sizeof(TokenId)=4, each copy is up to 1KB. The serialization at line 347 (`pkt.serialize()`) is also repeated N times. Since the packet differs only in `seq_num` (4 bytes at offset 2-5), the bulk of serialization is redundant work.
@@ -2633,16 +2634,16 @@ Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_con
   _Complexity:_ Low
   _Priority:_ P3 — Performance; redundant copies and serialization on broadcast path
 
-### 18.7 Triplicated Route Prune Broadcast Code
+### 19.7 Triplicated Route Prune Broadcast Code
 
 - [x] **Extract route prune dispatch into a `broadcast_prune(BackendId)` helper method**
-  _Justification:_ The identical ~12-line pattern of `parallel_for_each(irange(0, smp::count), [b_id](shard) { submit_to(shard, [b_id] { s_local_prune_callback(b_id); }); }).handle_exception(...)` appears verbatim in three methods: `check_liveness()`, `remove_peer()`, and `update_peer_list()`. This DRY violation means any fix to the prune dispatch (e.g., adding gate protection per 18.1, changing error handling, adding metrics) must be applied in three places. A missed update creates behavioral divergence.
-  _What to change:_ Extract a private `seastar::future<> broadcast_prune(BackendId b_id)` method on `GossipConsensus`. Call it from all three sites. This also simplifies applying the gate fix from 18.1 in a single location.
+  _Justification:_ The identical ~12-line pattern of `parallel_for_each(irange(0, smp::count), [b_id](shard) { submit_to(shard, [b_id] { s_local_prune_callback(b_id); }); }).handle_exception(...)` appears verbatim in three methods: `check_liveness()`, `remove_peer()`, and `update_peer_list()`. This DRY violation means any fix to the prune dispatch (e.g., adding gate protection per 19.1, changing error handling, adding metrics) must be applied in three places. A missed update creates behavioral divergence.
+  _What to change:_ Extract a private `seastar::future<> broadcast_prune(BackendId b_id)` method on `GossipConsensus`. Call it from all three sites. This also simplifies applying the gate fix from 19.1 in a single location.
   _Location:_ `src/gossip_consensus.cpp:139-153`, `191-206`, `248-264`
   _Complexity:_ Low
   _Priority:_ P3 — Maintainability; DRY violation across three call sites
 
-### 18.8 No-Op `catch (...) { throw; }` Blocks Violate Rule #9
+### 19.8 No-Op `catch (...) { throw; }` Blocks Violate Rule #9
 
 - [x] **Remove empty catch-rethrow blocks in `GossipService::start()` and `GossipTransport::start()`**
   _Justification:_ `GossipService::start()` (line 227-229) and `GossipTransport::start()` (line 45-47) both contain `catch (...) { throw; }` blocks that catch all exceptions and immediately rethrow without logging. These are no-ops — the exception would propagate identically without the try-catch. They add cognitive noise and violate Rule #9 (every catch block must log at warn level). If the intent was to add logging or cleanup later, the empty block is a "TODO" that was never completed.
