@@ -1316,13 +1316,18 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // When provided, routes are stored at the "shared prefix" boundary (e.g., system
     // message token count), so requests with the same system prompt but different
     // user queries route to the same backend for KV-cache efficiency.
+    // Use shard-local config for lock-free, hot-reloadable access.
+    // _config is a member on shard 0 — reading it from shard N would be a cross-shard access.
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    const auto& cfg = g_shard_state->config;
+
     size_t effective_prefix_len;
     bool used_shared_prefix = false;
     if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
         effective_prefix_len = prefix_boundary;
         used_shared_prefix = true;
     } else {
-        effective_prefix_len = std::min(tokens.size(), _config.prefix_token_length);
+        effective_prefix_len = std::min(tokens.size(), cfg.prefix_token_length);
     }
 
     if (effective_prefix_len < tokens.size()) {
@@ -1335,9 +1340,9 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // Validate token count AFTER truncation to enforce business-level limits.
     // This check belongs in RouterService (business layer), not persistence.
     // The persistence layer only handles serialization and storage.
-    if (_config.max_route_tokens > 0 && tokens.size() > _config.max_route_tokens) {
+    if (cfg.max_route_tokens > 0 && tokens.size() > cfg.max_route_tokens) {
         log_router.warn("Route rejected: {} tokens exceeds limit {} (backend={}, request={})",
-                        tokens.size(), _config.max_route_tokens, backend,
+                        tokens.size(), cfg.max_route_tokens, backend,
                         request_id.empty() ? "N/A" : request_id);
         return seastar::make_ready_future<>();
     }
@@ -1424,6 +1429,9 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
     // Multi-depth route learning: store routes at each provided boundary
     // This enables cache reuse at any conversation depth (Option C)
 
+    // Use shard-local config for lock-free, hot-reloadable access (same as learn_route_global)
+    const size_t max_route_tokens = g_shard_state ? g_shard_state->config.max_route_tokens : 0;
+
     if (prefix_boundaries.empty()) {
         // No boundaries provided - fall back to single-depth learning
         return learn_route_global(std::move(tokens), backend, request_id, 0);
@@ -1467,8 +1475,8 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
         // Create a prefix at this boundary
         std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + boundary);
 
-        // Validate token count
-        if (_config.max_route_tokens > 0 && prefix.size() > _config.max_route_tokens) {
+        // Validate token count (using shard-local config)
+        if (max_route_tokens > 0 && prefix.size() > max_route_tokens) {
             continue;  // Skip this boundary if it exceeds the limit
         }
 
