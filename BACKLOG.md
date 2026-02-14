@@ -2287,12 +2287,8 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
 
 ### 15.1 Implement or Remove Dead P2C Cross-Shard Dispatch
 
-- [ ] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
-  _Justification:_ The P2C algorithm selects a target shard, but the result is only logged — the request is always processed on the local shard. There is no `smp::submit_to(target_shard, ...)` anywhere in `http_controller.cpp`. The `_requests_cross_shard_dispatch` counter increments, but no actual cross-shard dispatch occurs. The entire P2C load balancing feature (`LoadBalancingSettings`, `ShardLoadBalancer` integration, cross-shard dispatch metrics) is dead code that gives the appearance of load balancing without providing it.
-  _What to change:_ **Option A (implement):** Add `smp::submit_to(target_shard, ...)` to actually dispatch requests cross-shard when P2C selects a remote shard. Requires `cross_shard_request.hpp` / `foreign_ptr` for safe data transfer per Hard Rule #14. **Option B (remove):** Delete `select_target_shard()`, `LoadBalancingSettings`, `_load_balancer`, `_lb_config`, and the cross-shard dispatch metrics to eliminate dead code.
-  _Location:_ `src/http_controller.cpp` (lines 725-731, 1839-1864), `src/http_controller.hpp` (lines 55-60, 247-248)
-  _Complexity:_ High (Option A), Low (Option B)
-  _Priority:_ P1 — Dead code that misleads operators into believing load balancing is active
+- [x] **`select_target_shard()` computes a P2C target shard but never dispatches to it** ✅ Fixed (Option B: removed dead code)
+  _What was changed:_ Removed `select_target_shard()` method, `_requests_local_dispatch`, `_requests_cross_shard_dispatch` counters, and dead comments. Kept `LoadBalancingSettings`, `_load_balancer`, and `_lb_config` (used by TokenizerService for cross-shard tokenizer dispatch).
 
 ### 15.2 Escape User-Controlled Strings in JSON Error Responses
 
@@ -2356,21 +2352,13 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.1 Fix Node256 Collision Lookup Failure When Preferred Slot Is Vacated
 
-- [ ] **Prevent `find_child()` from silently missing displaced children in Node256**
-  _Justification:_ `key_byte()` truncates `TokenId` (int32_t) to the lower 8 bits, so tokens like 0, 256, 512 all map to index 0. When a collision occurs during `add_child()`, the displaced child is placed in an arbitrary empty slot. However, `find_child()` at line 629 short-circuits the linear scan fallback with `if (n->keys[idx] != Node256::EMPTY_KEY)` — if the preferred slot is later vacated (by eviction or compaction), the condition becomes false and the displaced child becomes permanently invisible to lookups, even though it still exists in the tree. The same pattern affects `set_child()` and `extract_child()`.
-  _What to change:_ Remove the `if (n->keys[idx] != Node256::EMPTY_KEY)` guard before the linear fallback in `find_child()`, `extract_child()`, and `set_child()` for Node256. Always fall through to linear scan when the preferred-slot key doesn't match. Alternatively, redesign Node256 to use a proper open-addressing hash table with a defined probe sequence so displaced entries are findable in O(1) amortized time.
-  _Location:_ `src/radix_tree.hpp` lines 629-636 (`find_child`), 679-687 (`extract_child`), 740-747 (`set_child`)
-  _Complexity:_ Low (fix) / Medium (redesign)
-  _Priority:_ P1 — Correctness bug; causes silent data loss on lookup for colliding token IDs
+- [x] **Prevent `find_child()` from silently missing displaced children in Node256** ✅ Fixed
+  _What was changed:_ Removed `if (n->keys[idx] != Node256::EMPTY_KEY)` guard in `find_child()` and `extract_child()` for Node256. Both now always fall through to linear scan when the preferred slot doesn't match. Also fixed `extract_child()` to not clear keys[idx] to EMPTY_KEY (which broke the extract→modify→set_child pattern in insert_recursive, causing silent subtree drops).
 
 ### 16.2 Fix `compact_children()` Using Slot Index Instead of Key for Node256 Removal
 
-- [ ] **Use `n->keys[i]` instead of `static_cast<TokenId>(i)` when marking Node256 children for removal**
-  _Justification:_ In `compact_children()` for the Node256 case (line 1547), empty children are marked for removal via `keys_to_remove.push_back(static_cast<TokenId>(i))`, where `i` is the array slot index (0–255). But `remove_child()` matches against the *stored key* (`n->keys[i]`), not the slot index. When collisions displace a child to a non-preferred slot, the slot index differs from the stored key. `remove_child()` will either remove the wrong child (if another key happens to equal the slot index) or fail to find and remove the target, leaking the empty node.
-  _What to change:_ Replace `keys_to_remove.push_back(static_cast<TokenId>(i))` with `keys_to_remove.push_back(n->keys[i])` in the Node256 branch of `compact_children()`.
-  _Location:_ `src/radix_tree.hpp` line 1547
-  _Complexity:_ Low
-  _Priority:_ P2 — Correctness bug; causes memory leaks during compaction with colliding token IDs
+- [x] **Use `n->keys[i]` instead of `static_cast<TokenId>(i)` when marking Node256 children for removal** ✅ Fixed
+  _What was changed:_ Replaced `keys_to_remove.push_back(static_cast<TokenId>(i))` with `keys_to_remove.push_back(n->keys[i])`. Also added `n->keys[i] != Node256::EMPTY_KEY` guard to the iteration for consistency with `visit_children`/`child_count`.
 
 ### 16.3 Fix `extract_child()` Leaving Stale Entries in Node4/Node16/Node48 Vectors
 
@@ -2410,12 +2398,8 @@ Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the cod
 
 ### 16.7 Add MAX_SIZE Bound to Node Prefix Length
 
-- [ ] **Enforce a maximum prefix length to prevent unbounded memory growth from long token sequences**
-  _Justification:_ `insert_recursive()` creates new nodes with `prefix.assign(remaining.begin() + 1, remaining.end())` (line 1284). The prefix length is bounded only by the input token sequence length (after block alignment truncation). A very long input (e.g., a 128k-context request producing 100k+ tokens) could create a single node with a 100k-element prefix vector, allocating ~400KB of heap memory for one node. This violates Hard Rule #4 (every growing container needs explicit MAX_SIZE). While block_alignment truncation helps, typical alignment values (16) still allow prefixes up to `aligned_len - depth` tokens.
-  _What to change:_ Add a `MAX_PREFIX_LENGTH` constant (e.g., 256 or 512 tokens). When a new node's prefix would exceed this, split it into a chain of nodes with bounded prefixes. This is analogous to how B-trees split pages — each node stores at most N prefix tokens, with overflow continuing in a child node. Add a check in `insert_recursive()` after constructing the prefix: `if (new_child->prefix.size() > MAX_PREFIX_LENGTH) split_long_prefix(new_child)`.
-  _Location:_ `src/radix_tree.hpp` lines 1282-1285 (new node creation in `insert_recursive`), line 950 (`split_node` prefix assignment)
-  _Complexity:_ Low
-  _Priority:_ P3 — Defensive correctness; prevents pathological memory usage from long inputs
+- [x] **Enforce a maximum prefix length to prevent unbounded memory growth from long token sequences** ✅ Fixed
+  _What was changed:_ Added `MAX_PREFIX_LENGTH = 1024` constant and enforced it in `insert_recursive()` when creating new child nodes. Prefixes exceeding 1024 tokens are truncated (route stored at shorter position, reducing granularity but preserving correctness). 1024 tokens covers ~16K original tokens at block_alignment=16, far beyond typical LLM context windows.
 
 ---
 
@@ -2503,12 +2487,8 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
 
 ### 15.1 Implement or Remove Dead P2C Cross-Shard Dispatch
 
-- [ ] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
-  _Justification:_ The P2C algorithm selects a target shard, but the result is only logged — the request is always processed on the local shard. There is no `smp::submit_to(target_shard, ...)` anywhere in `http_controller.cpp`. The `_requests_cross_shard_dispatch` counter increments, but no actual cross-shard dispatch occurs. The entire P2C load balancing feature (`LoadBalancingSettings`, `ShardLoadBalancer` integration, cross-shard dispatch metrics) is dead code that gives the appearance of load balancing without providing it.
-  _What to change:_ **Option A (implement):** Add `smp::submit_to(target_shard, ...)` to actually dispatch requests cross-shard when P2C selects a remote shard. Requires `cross_shard_request.hpp` / `foreign_ptr` for safe data transfer per Hard Rule #14. **Option B (remove):** Delete `select_target_shard()`, `LoadBalancingSettings`, `_load_balancer`, `_lb_config`, and the cross-shard dispatch metrics to eliminate dead code.
-  _Location:_ `src/http_controller.cpp` (lines 725-731, 1839-1864), `src/http_controller.hpp` (lines 55-60, 247-248)
-  _Complexity:_ High (Option A), Low (Option B)
-  _Priority:_ P1 — Dead code that misleads operators into believing load balancing is active
+- [x] **`select_target_shard()` computes a P2C target shard but never dispatches to it** ✅ Fixed (Option B: removed dead code)
+  _What was changed:_ Removed `select_target_shard()` method, `_requests_local_dispatch`, `_requests_cross_shard_dispatch` counters, and dead comments. Kept `LoadBalancingSettings`, `_load_balancer`, and `_lb_config` (used by TokenizerService for cross-shard tokenizer dispatch).
 
 ### 15.2 Escape User-Controlled Strings in JSON Error Responses
 
