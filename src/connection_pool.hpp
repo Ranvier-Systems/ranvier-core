@@ -3,10 +3,11 @@
 #include <cassert>
 #include <deque>
 #include <memory>
-#include <unordered_map>
 #include <chrono>
 #include <string>
 #include <system_error>
+
+#include <absl/container/flat_hash_map.h>
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/iostream.hh>
@@ -485,7 +486,7 @@ private:
     }
 
     ConnectionPoolConfig _config;
-    std::unordered_map<seastar::socket_address, std::deque<Bundle>> _pools;
+    absl::flat_hash_map<seastar::socket_address, std::deque<Bundle>> _pools;
     size_t _total_idle_connections = 0;
     size_t _dead_connections_reaped = 0;
     size_t _connections_reaped_max_age = 0;
