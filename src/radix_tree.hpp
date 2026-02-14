@@ -624,13 +624,13 @@ private:
                 if (n->keys[idx] == key) [[likely]] {
                     return n->children[idx].get();
                 }
-                // Collision case: key_byte matches but full key differs
-                // Fall back to linear search for the correct entry
-                if (n->keys[idx] != Node256::EMPTY_KEY) {
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == key) {
-                            return n->children[i].get();
-                        }
+                // Collision case: preferred slot doesn't hold our key.
+                // The key may be displaced to another slot (e.g., after a collision
+                // during insertion, or after the preferred slot's occupant was removed).
+                // Always fall back to linear search regardless of preferred slot state.
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        return n->children[i].get();
                     }
                 }
                 return nullptr;
@@ -670,19 +670,22 @@ private:
                 break;
             }
             case NodeType::Node256: {
+                // NOTE: Do NOT clear keys[idx] to EMPTY_KEY here. extract_child
+                // is used in insert_recursive's extract→modify→set_child pattern.
+                // If we clear the key, set_child cannot find the slot to restore
+                // the modified child, silently dropping the subtree.
+                // The key is left in place (matching Node4/Node16 behavior) so
+                // set_child can locate it. The null child pointer is temporary.
                 auto* n = static_cast<Node256*>(node);
                 uint8_t idx = key_byte(key);
                 if (n->keys[idx] == key) {
-                    n->keys[idx] = Node256::EMPTY_KEY;
                     return std::move(n->children[idx]);
                 }
-                // Collision case: linear search
-                if (n->keys[idx] != Node256::EMPTY_KEY) {
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == key) {
-                            n->keys[i] = Node256::EMPTY_KEY;
-                            return std::move(n->children[i]);
-                        }
+                // Collision case: key may be displaced to another slot.
+                // Always scan regardless of preferred slot state.
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        return std::move(n->children[i]);
                     }
                 }
                 break;
