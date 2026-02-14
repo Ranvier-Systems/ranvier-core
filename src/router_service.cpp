@@ -1054,17 +1054,11 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
-        auto affinity_backend = get_backend_for_prefix(tokens, request_id, prefix_boundary);
+        auto prefix_result = get_backend_for_prefix(tokens, request_id, prefix_boundary);
 
-        if (affinity_backend.has_value()) {
-            result.backend_id = affinity_backend.value();
-            // Note: get_backend_for_prefix internally tracks cache_hit via stats.cache_hits/misses
-            // and returns a backend even on cache miss (via hash fallback).
-            // For external visibility, we report cache_hit based on whether ART had a hit.
-            // Since get_backend_for_prefix always returns a backend when backends exist,
-            // cache_hit here means we found the route in ART (not hash fallback).
-            // The internal stats.cache_hits counter was already incremented appropriately.
-            result.cache_hit = true;  // Prefix mode always has affinity (ART or hash)
+        if (prefix_result.backend_id.has_value()) {
+            result.backend_id = prefix_result.backend_id.value();
+            result.cache_hit = prefix_result.art_hit;
         } else {
             result.error_message = "No backends registered";
         }
@@ -1187,14 +1181,14 @@ std::optional<BackendId> RouterService::get_random_backend() {
 // routes are stored/looked up at the shared prefix boundary rather than the
 // full token sequence, improving KV-cache reuse for multi-turn conversations.
 //
-std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                                 const std::string& request_id,
-                                                                 size_t prefix_boundary) {
-    if (!g_shard_state) return std::nullopt;
+PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                                         const std::string& request_id,
+                                                         size_t prefix_boundary) {
+    if (!g_shard_state) return {};
     auto& state = shard_state();
 
     if (state.backend_ids.empty()) {
-        return std::nullopt;
+        return {};
     }
 
     // Collect live backends (not dead, not draining)
@@ -1214,7 +1208,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     }
 
     if (live_backends.empty()) {
-        return std::nullopt;
+        return {};
     }
 
     // Sort for deterministic ordering across shards
@@ -1232,8 +1226,8 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
         prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
     }
     if (prefix_len == 0) {
-        // No tokens to route on, fall back to first backend
-        return live_backends[0];
+        // No tokens to route on, fall back to first backend (not an ART hit)
+        return {live_backends[0], false};
     }
 
     // HYBRID ROUTING: ART lookup first, hash fallback
@@ -1273,7 +1267,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                     log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
                                      request_id, tokens.size(), art_backend);
                 }
-                return final_backend;
+                return {final_backend, true};
             }
             // Backend is dead/draining, fall through to hash-based selection
             log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
@@ -1304,7 +1298,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                          request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
     }
 
-    return final_backend;
+    return {final_backend, false};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
