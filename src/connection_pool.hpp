@@ -567,11 +567,8 @@ private:
                 pool.pop_front();
                 _total_idle_connections--;
                 close_bundle_async(std::move(oldest));
-
-                // Clean up empty map entry to shrink future scans (Rule #4)
-                if (pool.empty()) {
-                    _pools.erase(oldest_it);
-                }
+                // Note: don't erase empty map entries here — put() may hold a
+                // reference to this pool. cleanup_expired() handles empty entries.
             }
         }
     }
