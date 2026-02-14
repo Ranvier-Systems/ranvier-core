@@ -732,11 +732,6 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         shard_load_metrics().increment_active();
     }
 
-    // NOTE: P2C shard selection is computed but cross-shard dispatch is not yet
-    // implemented (requires foreign_ptr plumbing per Hard Rule #14). Requests are
-    // always processed on the local shard. Track local dispatch for future metrics.
-    ++_requests_local_dispatch;
-
     // RAII guard ensures active request counter is decremented even if exception thrown
     // Guard is released before entering the lambda, which takes over responsibility
     ActiveRequestGuard active_request_guard(metrics());
@@ -1840,27 +1835,6 @@ bool HttpController::is_persistence_backpressured() const {
     double fill_ratio = static_cast<double>(current_depth) / static_cast<double>(max_depth);
 
     return fill_ratio >= _config.backpressure.persistence_queue_threshold;
-}
-
-uint32_t HttpController::select_target_shard() {
-    // NOTE: This method computes the optimal target shard using the P2C algorithm,
-    // but actual cross-shard dispatch is NOT yet implemented. The caller always
-    // processes on the local shard. This method exists to maintain the load balancer
-    // snapshot cache and will be used when smp::submit_to dispatch is added.
-    uint32_t local_shard = seastar::this_shard_id();
-
-    // Fast path: load balancing disabled or single shard
-    if (!_lb_config.enabled || !_load_balancer || seastar::smp::count <= 1) {
-        return local_shard;
-    }
-
-    // Update local shard's metrics snapshot in the load balancer cache
-    if (shard_load_metrics_initialized()) {
-        _load_balancer->local().update_local_snapshot();
-    }
-
-    // Compute target shard (result is advisory until dispatch is implemented)
-    return _load_balancer->local().select_shard();
 }
 
 // ---------------------------------------------------------

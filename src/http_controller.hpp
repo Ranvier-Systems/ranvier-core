@@ -50,12 +50,10 @@ struct BackpressureSettings {
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
 };
 
-// Shard load balancing settings
-// NOTE: Cross-shard dispatch is not yet implemented (requires foreign_ptr plumbing
-// per Hard Rule #14). These settings control the ShardLoadBalancer snapshot cache
-// and P2C algorithm, which will be used when dispatch is implemented.
+// Shard load balancing settings for P2C algorithm.
+// Used by ShardLoadBalancer and TokenizerService for cross-shard request distribution.
 struct LoadBalancingSettings {
-    bool enabled = false;                             // Disabled until cross-shard dispatch is implemented
+    bool enabled = false;                             // Enable P2C cross-shard load balancing
     double min_load_difference = 0.2;                 // Min load difference (ratio) to trigger dispatch
     uint64_t local_processing_threshold = 10;         // Process locally if active < this threshold
     uint64_t snapshot_refresh_interval_us = 1000;     // Snapshot cache refresh interval (microseconds)
@@ -268,16 +266,8 @@ private:
     uint64_t _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
     uint64_t _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
 
-    // Shard load balancing metrics (reserved for future cross-shard dispatch)
-    uint64_t _requests_local_dispatch{0};         // Requests processed locally
-    uint64_t _requests_cross_shard_dispatch{0};   // Requests dispatched cross-shard (always 0 until dispatch is implemented)
-
     // Check if persistence queue is under backpressure
     bool is_persistence_backpressured() const;
-
-    // Select target shard for request processing using P2C algorithm
-    // Returns local shard if load balancing disabled or not beneficial
-    uint32_t select_target_shard();
 
     // Helper handlers
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(
