@@ -1857,8 +1857,13 @@ uint32_t HttpController::select_target_shard() {
 // STATE INSPECTION HANDLERS (for rvctl CLI)
 // ---------------------------------------------------------
 
-// Helper to serialize a DumpNode to JSON
-static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent_level = 0) {
+// Default maximum recursion depth for tree dump serialization.
+// Prevents stack overflow and multi-MB responses for large trees.
+static constexpr int DEFAULT_MAX_DUMP_DEPTH = 32;
+
+// Helper to serialize a DumpNode to JSON with bounded recursion depth.
+// When max_depth is reached, children are replaced with a count summary.
+static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent_level = 0, int remaining_depth = DEFAULT_MAX_DUMP_DEPTH) {
     std::ostringstream ss;
     std::string indent(indent_level * 2, ' ');
     std::string inner_indent((indent_level + 1) * 2, ' ');
@@ -1884,14 +1889,21 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
     ss << inner_indent << "\"origin\": \"" << node.origin << "\",\n";
     ss << inner_indent << "\"last_accessed_ms\": " << node.last_accessed_ms << ",\n";
 
-    // Children array
+    // Children array (bounded by remaining_depth)
     ss << inner_indent << "\"children\": [";
     if (!node.children.empty()) {
+        if (remaining_depth <= 0) {
+            // Depth limit reached — emit count instead of recursing
+            ss << "],\n";
+            ss << inner_indent << "\"children_truncated\": " << node.children.size() << "\n";
+            ss << indent << "}";
+            return ss.str();
+        }
         ss << "\n";
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0) ss << ",\n";
             ss << inner_indent << "  {\"edge\": " << node.children[i].first << ", \"node\": ";
-            ss << dump_node_to_json(node.children[i].second, indent_level + 2);
+            ss << dump_node_to_json(node.children[i].second, indent_level + 2, remaining_depth - 1);
             ss << "}";
         }
         ss << "\n" << inner_indent;
@@ -1905,6 +1917,16 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
     std::unique_ptr<seastar::http::request> req,
     std::unique_ptr<seastar::http::reply> rep) {
+
+    // Parse optional max_depth parameter to bound recursion (default: 32)
+    int max_depth = DEFAULT_MAX_DUMP_DEPTH;
+    sstring depth_str = req->get_query_param("max_depth");
+    if (!depth_str.empty()) {
+        auto depth_opt = parse_uint32(std::string_view(depth_str));
+        if (depth_opt && *depth_opt > 0 && *depth_opt <= 256) {
+            max_depth = static_cast<int>(*depth_opt);
+        }
+    }
 
     // Check for optional prefix filter (comma-separated token IDs)
     sstring prefix_str = req->get_query_param("prefix");
@@ -1936,7 +1958,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
         std::ostringstream oss;
         oss << "{\n";
         oss << "  \"shard_id\": " << seastar::this_shard_id() << ",\n";
-        oss << "  \"tree\": " << dump_node_to_json(dump, 1) << "\n";
+        oss << "  \"max_depth\": " << max_depth << ",\n";
+        oss << "  \"tree\": " << dump_node_to_json(dump, 1, max_depth) << "\n";
         oss << "}";
         json_response = oss.str();
     } else {
@@ -1951,7 +1974,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
                 oss << prefix_filter[i];
             }
             oss << "],\n";
-            oss << "  \"tree\": " << dump_node_to_json(dump.value(), 1) << "\n";
+            oss << "  \"max_depth\": " << max_depth << ",\n";
+            oss << "  \"tree\": " << dump_node_to_json(dump.value(), 1, max_depth) << "\n";
             oss << "}";
             json_response = oss.str();
         } else {
