@@ -140,10 +140,9 @@ TEST_F(MetricsServiceCounterTest, TokenizationCacheCounters) {
     EXPECT_EQ(svc.get_tokenization_cross_shard(), 1u);
 }
 
-TEST_F(MetricsServiceCounterTest, LoadAwareFallbackIncrementsBothCounters) {
+TEST_F(MetricsServiceCounterTest, LoadAwareFallbackIncrementsCounter) {
     svc.record_load_aware_fallback();
     EXPECT_EQ(svc.get_load_aware_fallbacks(), 1u);
-    EXPECT_EQ(svc.get_cache_miss_due_to_load(), 1u);
 }
 
 // =============================================================================

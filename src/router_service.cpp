@@ -16,12 +16,9 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <map>
 #include <random>
-#include <sstream>
 
 // ============================================================================
 // RouterService: Central Routing Orchestration
@@ -67,68 +64,17 @@ struct BackendInfo {
     bool is_draining = false;
     std::chrono::steady_clock::time_point drain_start_time;
 
-    // Load tracking: in-flight requests to this backend (Rule #1: lock-free atomic)
-    // Incremented by BackendRequestGuard on construction, decremented on destruction.
-    // Uses relaxed ordering - we only need eventual visibility, not strict ordering.
-    std::atomic<uint64_t> active_requests{0};
+    // Load tracking: in-flight requests to this backend.
+    // Shard-local only — BackendInfo lives in thread_local ShardLocalState,
+    // accessed exclusively from one reactor thread.  No atomic needed.
+    uint64_t active_requests = 0;
 
-    // Default constructor
     BackendInfo() = default;
 
-    // Constructor for common initialization pattern
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_)
         : addr(std::move(addr_))
         , weight(weight_)
-        , priority(priority_)
-        , is_draining(false)
-        , drain_start_time()
-        , active_requests(0) {}
-
-    // Copy constructor: atomics aren't copyable, so load the value explicitly
-    BackendInfo(const BackendInfo& other)
-        : addr(other.addr)
-        , weight(other.weight)
-        , priority(other.priority)
-        , is_draining(other.is_draining)
-        , drain_start_time(other.drain_start_time)
-        , active_requests(other.active_requests.load(std::memory_order_relaxed)) {}
-
-    // Move constructor: atomics aren't movable, so load the value explicitly
-    BackendInfo(BackendInfo&& other) noexcept
-        : addr(std::move(other.addr))
-        , weight(other.weight)
-        , priority(other.priority)
-        , is_draining(other.is_draining)
-        , drain_start_time(other.drain_start_time)
-        , active_requests(other.active_requests.load(std::memory_order_relaxed)) {}
-
-    // Copy assignment
-    BackendInfo& operator=(const BackendInfo& other) {
-        if (this != &other) {
-            addr = other.addr;
-            weight = other.weight;
-            priority = other.priority;
-            is_draining = other.is_draining;
-            drain_start_time = other.drain_start_time;
-            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-        }
-        return *this;
-    }
-
-    // Move assignment
-    BackendInfo& operator=(BackendInfo&& other) noexcept {
-        if (this != &other) {
-            addr = std::move(other.addr);
-            weight = other.weight;
-            priority = other.priority;
-            is_draining = other.is_draining;
-            drain_start_time = other.drain_start_time;
-            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-        }
-        return *this;
-    }
+        , priority(priority_) {}
 };
 
 // ============================================================================
@@ -178,7 +124,6 @@ struct ShardLocalState {
         uint64_t compaction_runs = 0;
         // Load-aware routing stats
         uint64_t load_aware_fallbacks = 0;       // Times we chose non-preferred backend due to load
-        uint64_t cache_miss_due_to_load = 0;     // Routes diverted due to backend load (same as fallbacks)
 
         void reset() {
             cache_hits = 0;
@@ -195,7 +140,6 @@ struct ShardLocalState {
             compaction_bytes_reclaimed = 0;
             compaction_runs = 0;
             load_aware_fallbacks = 0;
-            cache_miss_due_to_load = 0;
         }
     } stats;
 
@@ -296,6 +240,39 @@ struct ShardLocalState {
         }
     }
 
+    // ========================================================================
+    // Live Backend Helpers (shared filter: not dead, not missing, not draining)
+    // ========================================================================
+
+    // Return sorted vector of live backend IDs.
+    // Used by get_backend_for_prefix() and get_backend_by_hash().
+    std::vector<BackendId> get_live_backends() const {
+        std::vector<BackendId> result;
+        for (BackendId id : backend_ids) {
+            if (dead_backends.contains(id)) continue;
+            auto it = backends.find(id);
+            if (it == backends.end()) continue;
+            if (it->second.is_draining) continue;
+            result.push_back(id);
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
+    // Return live backends with BackendInfo pointers for weight/priority access.
+    // Used by get_random_backend().
+    std::vector<std::pair<BackendId, const BackendInfo*>> get_live_backend_infos() const {
+        std::vector<std::pair<BackendId, const BackendInfo*>> result;
+        for (BackendId id : backend_ids) {
+            if (dead_backends.contains(id)) continue;
+            auto it = backends.find(id);
+            if (it == backends.end()) continue;
+            if (it->second.is_draining) continue;
+            result.emplace_back(id, &it->second);
+        }
+        return result;
+    }
+
     // Destructor ensures proper cleanup order
     ~ShardLocalState() {
         // Explicit destruction order: tree before slab
@@ -328,7 +305,8 @@ static RadixTree* local_tree() {
 // ============================================================================
 //
 // RAII guard for tracking in-flight requests per backend.
-// Rule #1: Uses atomic with relaxed ordering for lock-free operation.
+// BackendInfo lives in thread_local ShardLocalState — all access is from a
+// single reactor thread, so plain uint64_t is sufficient (no atomic needed).
 //
 
 BackendRequestGuard::BackendRequestGuard(BackendId id) : _backend_id(id), _active(false) {
@@ -341,8 +319,7 @@ BackendRequestGuard::BackendRequestGuard(BackendId id) : _backend_id(id), _activ
         return;  // Backend not found, guard remains inactive
     }
 
-    // Increment active requests (Rule #1: relaxed ordering for lock-free counter)
-    it->second.active_requests.fetch_add(1, std::memory_order_relaxed);
+    ++it->second.active_requests;
     _active = true;
 }
 
@@ -360,15 +337,10 @@ BackendRequestGuard::~BackendRequestGuard() {
         return;  // Backend was removed while request was in-flight
     }
 
-    // Decrement active requests (Rule #1: relaxed ordering)
-    // Guard against underflow: if backend was removed and re-registered while request
-    // was in-flight, the counter would be 0 (never incremented by this guard).
-    // Decrementing 0 would wrap to UINT64_MAX, causing incorrect load readings.
-    // In Seastar's cooperative model, no co_await between load and fetch_sub means
-    // this check is safe without additional synchronization.
-    uint64_t current = it->second.active_requests.load(std::memory_order_relaxed);
-    if (current > 0) {
-        it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+    // Guard against underflow: if backend was removed and re-registered while
+    // request was in-flight, the counter would be 0.
+    if (it->second.active_requests > 0) {
+        --it->second.active_requests;
     }
 }
 
@@ -383,11 +355,8 @@ BackendRequestGuard& BackendRequestGuard::operator=(BackendRequestGuard&& other)
         // Decrement our current count if active (with underflow guard)
         if (_active && g_shard_state) {
             auto it = g_shard_state->backends.find(_backend_id);
-            if (it != g_shard_state->backends.end()) {
-                uint64_t current = it->second.active_requests.load(std::memory_order_relaxed);
-                if (current > 0) {
-                    it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
-                }
+            if (it != g_shard_state->backends.end() && it->second.active_requests > 0) {
+                --it->second.active_requests;
             }
         }
 
@@ -413,7 +382,7 @@ uint64_t get_backend_load(BackendId id) {
         return 0;
     }
 
-    return it->second.active_requests.load(std::memory_order_relaxed);
+    return it->second.active_requests;
 }
 
 std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates) {
@@ -438,7 +407,7 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
             continue;
         }
 
-        uint64_t load = it->second.active_requests.load(std::memory_order_relaxed);
+        uint64_t load = it->second.active_requests;
         if (load < best_load) {
             best_load = load;
             best_id = id;
@@ -462,12 +431,12 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
 //   request_id: For logging (can be empty)
 //   source: Description for logging ("ART" or "hash")
 //
-// Rule #1: Lock-free - all reads use atomic with relaxed ordering
+// Rule #1: Lock-free - shard-local state, no synchronization needed
 //
 // Performance notes:
 // - Early exits minimize work in the common case (not overloaded)
 // - Config values cached in shard-local state (no cross-shard access)
-// - Atomic reads use relaxed ordering (no memory barriers)
+// - All reads are shard-local plain integers (no atomics needed)
 static BackendId apply_load_aware_selection(
     BackendId preferred_id,
     const std::vector<BackendId>& live_backends,
@@ -483,7 +452,7 @@ static BackendId apply_load_aware_selection(
     const uint64_t queue_threshold = g_shard_state->config.queue_depth_threshold;
     const uint64_t diff_threshold = g_shard_state->config.queue_diff_threshold;
 
-    // Check preferred backend's load (single atomic read)
+    // Check preferred backend's load
     uint64_t preferred_load = get_backend_load(preferred_id);
     if (preferred_load <= queue_threshold) {
         return preferred_id;  // Not overloaded - fast path
@@ -498,7 +467,6 @@ static BackendId apply_load_aware_selection(
     }
 
     // Significant difference - divert to less-loaded backend
-    g_shard_state->stats.cache_miss_due_to_load++;
     g_shard_state->stats.load_aware_fallbacks++;
     if (g_metrics) {
         metrics().record_load_aware_fallback();
@@ -545,6 +513,23 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
 // FNV-1a hash constants for 64-bit
 constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
 constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+
+// Jump consistent hash (Lamping & Veach, 2014).
+// Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
+// removing a bucket remaps only ~1/n keys.  This preserves KV-cache affinity
+// during backend topology changes, unlike modular hashing which reshuffles all.
+inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
+    int64_t b = -1, j = 0;
+    while (j < num_buckets) {
+        b = j;
+        key = key * 2862933555777941757ULL + 1;
+        j = static_cast<int64_t>(
+            static_cast<double>(b + 1) *
+            (static_cast<double>(1LL << 31) /
+             static_cast<double>((key >> 33) + 1)));
+    }
+    return static_cast<int32_t>(b);
+}
 
 // Hash function for prefix tokens using FNV-1a
 // Aligns to block_alignment boundary for vLLM compatibility
@@ -748,12 +733,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // Counter: requests diverted to less-loaded backends
         seastar::metrics::make_counter("router_load_aware_fallbacks_total",
             [] { return g_shard_state ? g_shard_state->stats.load_aware_fallbacks : 0UL; },
-            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth")),
-
-        // Counter: cache misses accepted for load balancing
-        seastar::metrics::make_counter("router_cache_miss_due_to_load_total",
-            [] { return g_shard_state ? g_shard_state->stats.cache_miss_due_to_load : 0UL; },
-            seastar::metrics::description("Total number of cache misses accepted to avoid routing to overloaded backends"))
+            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth"))
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
     });
@@ -897,6 +877,13 @@ void RouterService::run_ttl_cleanup() {
                 return seastar::make_ready_future<>();
             });
         });
+    }).handle_exception([](std::exception_ptr ep) {
+        // Rule #9: every catch must log at warn level
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_main.warn("TTL cleanup failed: {}", e.what());
+        }
     });
 }
 
@@ -1037,17 +1024,11 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
-        auto affinity_backend = get_backend_for_prefix(tokens, request_id, prefix_boundary);
+        auto prefix_result = get_backend_for_prefix(tokens, request_id, prefix_boundary);
 
-        if (affinity_backend.has_value()) {
-            result.backend_id = affinity_backend.value();
-            // Note: get_backend_for_prefix internally tracks cache_hit via stats.cache_hits/misses
-            // and returns a backend even on cache miss (via hash fallback).
-            // For external visibility, we report cache_hit based on whether ART had a hit.
-            // Since get_backend_for_prefix always returns a backend when backends exist,
-            // cache_hit here means we found the route in ART (not hash fallback).
-            // The internal stats.cache_hits counter was already incremented appropriately.
-            result.cache_hit = true;  // Prefix mode always has affinity (ART or hash)
+        if (prefix_result.backend_id.has_value()) {
+            result.backend_id = prefix_result.backend_id.value();
+            result.cache_hit = prefix_result.art_hit;
         } else {
             result.error_message = "No backends registered";
         }
@@ -1097,58 +1078,45 @@ std::optional<BackendId> RouterService::get_random_backend() {
         return std::nullopt;
     }
 
-    // Collect live backends grouped by priority
-    // Priority 0 = highest, backends with lower priority number are tried first
-    std::map<uint32_t, std::vector<std::pair<BackendId, uint32_t>>> priority_groups;
+    auto live_infos = state.get_live_backend_infos();
 
-    for (BackendId id : state.backend_ids) {
-        if (state.dead_backends.contains(id)) {
-            continue;  // Skip dead backends
-        }
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) {
-            continue;
-        }
-        const auto& info = it->second;
-        if (info.is_draining) {
-            continue;  // Skip draining backends for new requests
-        }
-        if (info.weight > 0) {
-            priority_groups[info.priority].emplace_back(id, info.weight);
+    // Pass 1: find the highest priority group (lowest priority number)
+    // and accumulate its total weight — no heap allocation needed.
+    uint32_t min_priority = std::numeric_limits<uint32_t>::max();
+    for (const auto& [id, info] : live_infos) {
+        if (info->weight > 0 && info->priority < min_priority) {
+            min_priority = info->priority;
         }
     }
 
-    if (priority_groups.empty()) {
-        return std::nullopt;  // No live backends available
+    if (min_priority == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;  // No live backends with weight > 0
     }
 
-    // Get the highest priority group (lowest priority number)
-    const auto& candidates = priority_groups.begin()->second;
-
-    // Calculate total weight
     uint64_t total_weight = 0;
-    for (const auto& [id, weight] : candidates) {
-        total_weight += weight;
+    for (const auto& [id, info] : live_infos) {
+        if (info->priority == min_priority && info->weight > 0) {
+            total_weight += info->weight;
+        }
     }
 
-    if (total_weight == 0) {
-        return std::nullopt;
-    }
-
-    // Weighted random selection
+    // Pass 2: weighted random selection over the highest-priority candidates
     std::uniform_int_distribution<uint64_t> dist(0, total_weight - 1);
     uint64_t roll = dist(state.rng);
 
     uint64_t cumulative = 0;
-    for (const auto& [id, weight] : candidates) {
-        cumulative += weight;
+    BackendId last_candidate = 0;
+    for (const auto& [id, info] : live_infos) {
+        if (info->priority != min_priority || info->weight == 0) continue;
+        cumulative += info->weight;
+        last_candidate = id;
         if (roll < cumulative) {
             return id;
         }
     }
 
     // Fallback (shouldn't reach here)
-    return candidates.back().first;
+    return last_candidate;
 }
 
 // ============================================================================
@@ -1170,38 +1138,20 @@ std::optional<BackendId> RouterService::get_random_backend() {
 // routes are stored/looked up at the shared prefix boundary rather than the
 // full token sequence, improving KV-cache reuse for multi-turn conversations.
 //
-std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                                 const std::string& request_id,
-                                                                 size_t prefix_boundary) {
-    if (!g_shard_state) return std::nullopt;
+PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                                         const std::string& request_id,
+                                                         size_t prefix_boundary) {
+    if (!g_shard_state) return {};
     auto& state = shard_state();
 
     if (state.backend_ids.empty()) {
-        return std::nullopt;
+        return {};
     }
 
-    // Collect live backends (not dead, not draining)
-    std::vector<BackendId> live_backends;
-    for (BackendId id : state.backend_ids) {
-        if (state.dead_backends.contains(id)) {
-            continue;  // Skip dead backends
-        }
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) {
-            continue;
-        }
-        if (it->second.is_draining) {
-            continue;  // Skip draining backends
-        }
-        live_backends.push_back(id);
-    }
-
+    auto live_backends = state.get_live_backends();
     if (live_backends.empty()) {
-        return std::nullopt;
+        return {};
     }
-
-    // Sort for deterministic ordering across shards
-    std::sort(live_backends.begin(), live_backends.end());
 
     // Determine prefix length for hash fallback:
     // 1. If prefix_boundary is valid (> 0 and <= tokens.size()), use it
@@ -1215,8 +1165,8 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
         prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
     }
     if (prefix_len == 0) {
-        // No tokens to route on, fall back to first backend
-        return live_backends[0];
+        // No tokens to route on, fall back to first backend (not an ART hit)
+        return {live_backends[0], false};
     }
 
     // HYBRID ROUTING: ART lookup first, hash fallback
@@ -1256,7 +1206,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                     log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
                                      request_id, tokens.size(), art_backend);
                 }
-                return final_backend;
+                return {final_backend, true};
             }
             // Backend is dead/draining, fall through to hash-based selection
             log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
@@ -1268,7 +1218,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
     // This provides deterministic routing for new prefixes
     // Uses prefix_boundary if provided (system message only) for multi-node consistency
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-    size_t index = prefix_hash % live_backends.size();
+    int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
     BackendId selected = live_backends[index];
 
     // This is a cache miss - the route will be learned after successful response
@@ -1287,7 +1237,7 @@ std::optional<BackendId> RouterService::get_backend_for_prefix(const std::vector
                          request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
     }
 
-    return final_backend;
+    return {final_backend, false};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
@@ -1303,28 +1253,10 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
         return std::nullopt;
     }
 
-    // Collect live backends (not dead, not draining)
-    std::vector<BackendId> live_backends;
-    for (BackendId id : state.backend_ids) {
-        if (state.dead_backends.contains(id)) {
-            continue;
-        }
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) {
-            continue;
-        }
-        if (it->second.is_draining) {
-            continue;
-        }
-        live_backends.push_back(id);
-    }
-
+    auto live_backends = state.get_live_backends();
     if (live_backends.empty()) {
         return std::nullopt;
     }
-
-    // Sort for deterministic ordering across shards
-    std::sort(live_backends.begin(), live_backends.end());
 
     // Extract prefix (first N tokens)
     size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
@@ -1334,7 +1266,7 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 
     // Consistent hash on prefix tokens
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-    size_t index = prefix_hash % live_backends.size();
+    int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
     BackendId selected = live_backends[index];
 
     if (!request_id.empty()) {
@@ -1374,6 +1306,16 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                                        const std::string& request_id,
                                                        size_t prefix_boundary) {
+    // Rule #5: Acquire gate holder to protect 'this' captures in gossip submit_to lambdas.
+    // The holder must live for the entire async lifetime (moved into when_all_succeed below).
+    // If the gate is closed (shutdown in progress), skip route learning gracefully.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return seastar::make_ready_future<>();
+    }
+
     // Determine effective prefix length for route storage:
     // 1. If prefix_boundary > 0 and valid, use it (truncate to shared prefix like system messages)
     // 2. Otherwise, fall back to config.prefix_token_length (default: 128)
@@ -1382,13 +1324,18 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // When provided, routes are stored at the "shared prefix" boundary (e.g., system
     // message token count), so requests with the same system prompt but different
     // user queries route to the same backend for KV-cache efficiency.
+    // Use shard-local config for lock-free, hot-reloadable access.
+    // _config is a member on shard 0 — reading it from shard N would be a cross-shard access.
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    const auto& cfg = g_shard_state->config;
+
     size_t effective_prefix_len;
     bool used_shared_prefix = false;
     if (prefix_boundary > 0 && prefix_boundary <= tokens.size()) {
         effective_prefix_len = prefix_boundary;
         used_shared_prefix = true;
     } else {
-        effective_prefix_len = std::min(tokens.size(), _config.prefix_token_length);
+        effective_prefix_len = std::min(tokens.size(), cfg.prefix_token_length);
     }
 
     if (effective_prefix_len < tokens.size()) {
@@ -1401,9 +1348,9 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // Validate token count AFTER truncation to enforce business-level limits.
     // This check belongs in RouterService (business layer), not persistence.
     // The persistence layer only handles serialization and storage.
-    if (_config.max_route_tokens > 0 && tokens.size() > _config.max_route_tokens) {
+    if (cfg.max_route_tokens > 0 && tokens.size() > cfg.max_route_tokens) {
         log_router.warn("Route rejected: {} tokens exceeds limit {} (backend={}, request={})",
-                        tokens.size(), _config.max_route_tokens, backend,
+                        tokens.size(), cfg.max_route_tokens, backend,
                         request_id.empty() ? "N/A" : request_id);
         return seastar::make_ready_future<>();
     }
@@ -1480,8 +1427,13 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
         });
     });
 
-    // Wait for both gossip broadcast and shard updates
-    return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
+    // Wait for both gossip broadcast and shard updates.
+    // Keep gate holder alive for the full async lifetime via do_with.
+    return seastar::do_with(std::move(holder),
+        [gossip_future = std::move(gossip_future), shard_future = std::move(shard_future)]
+        (seastar::gate::holder&) mutable {
+            return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
+        });
 }
 
 seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> tokens, BackendId backend,
@@ -1489,6 +1441,17 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
                                                            const std::vector<size_t>& prefix_boundaries) {
     // Multi-depth route learning: store routes at each provided boundary
     // This enables cache reuse at any conversation depth (Option C)
+
+    // Rule #5: Acquire gate holder to protect 'this' captures in gossip submit_to lambdas.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Use shard-local config for lock-free, hot-reloadable access (same as learn_route_global)
+    const size_t max_route_tokens = g_shard_state ? g_shard_state->config.max_route_tokens : 0;
 
     if (prefix_boundaries.empty()) {
         // No boundaries provided - fall back to single-depth learning
@@ -1533,8 +1496,8 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
         // Create a prefix at this boundary
         std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + boundary);
 
-        // Validate token count
-        if (_config.max_route_tokens > 0 && prefix.size() > _config.max_route_tokens) {
+        // Validate token count (using shard-local config)
+        if (max_route_tokens > 0 && prefix.size() > max_route_tokens) {
             continue;  // Skip this boundary if it exceeds the limit
         }
 
@@ -1592,7 +1555,11 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
 
     futures.push_back(std::move(gossip_future));
 
-    return seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
+    // Keep gate holder alive for the full async lifetime via do_with.
+    return seastar::do_with(std::move(holder), std::move(futures),
+        [](seastar::gate::holder&, std::vector<seastar::future<>>& futures) {
+            return seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
+        });
 }
 
 // ============================================================================
@@ -1611,9 +1578,11 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
     // ========================================================================
     // Validate remote routes before buffering. Remote peers should also enforce
     // this limit, but we validate defensively to reject malformed gossip messages.
-    if (_config.max_route_tokens > 0 && tokens.size() > _config.max_route_tokens) {
+    // Use shard-local config for consistency with hot-reload (same pattern as learn_route_global).
+    const size_t max_route_tokens = g_shard_state ? g_shard_state->config.max_route_tokens : 0;
+    if (max_route_tokens > 0 && tokens.size() > max_route_tokens) {
         log_router.warn("Remote route rejected: {} tokens exceeds limit {} (backend={})",
-                        tokens.size(), _config.max_route_tokens, backend);
+                        tokens.size(), max_route_tokens, backend);
         return seastar::make_ready_future<>();
     }
 
@@ -1885,38 +1854,25 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         BackendState bs;
         bs.id = id;
 
-        // Extract address and port from socket_address
-        auto addr = info.addr;
-        std::ostringstream oss;
-        oss << addr;
-        std::string addr_str = oss.str();
+        // Extract address and port from socket_address.
+        // Uses fmt::format (stack-friendly) instead of std::ostringstream (heap alloc).
+        // Seastar formats: IPv4 "192.168.1.1:8080", IPv6 "[::1]:8080"
+        auto addr_str = fmt::format("{}", info.addr);
+        bs.port = 0;
 
-        // Parse address:port format
-        // Handle both IPv4 (192.168.1.1:8080) and IPv6 ([::1]:8080) formats
-        // Seastar formats IPv6 as [addr]:port
-        if (!addr_str.empty() && addr_str.back() >= '0' && addr_str.back() <= '9') {
-            auto colon_pos = addr_str.find_last_of(':');
-            // For IPv6, the colon before port comes after the closing bracket
-            // For IPv4, it's just the last colon
-            if (colon_pos != std::string::npos && colon_pos > 0) {
-                // Verify this is the port separator, not part of IPv6 address
-                bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
-                                         (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
-                if (is_port_separator) {
-                    bs.address = addr_str.substr(0, colon_pos);
-                    auto port_opt = parse_port(std::string_view(addr_str).substr(colon_pos + 1));
-                    bs.port = port_opt.value_or(0);
-                } else {
-                    bs.address = addr_str;
-                    bs.port = 0;
-                }
+        // Find the port separator (last ':' that's not inside an IPv6 address)
+        auto colon_pos = addr_str.find_last_of(':');
+        if (colon_pos != std::string::npos && colon_pos > 0) {
+            bool is_port_separator = (addr_str[colon_pos - 1] == ']') ||  // IPv6: [::1]:8080
+                                     (addr_str.find('[') == std::string::npos);  // IPv4: no brackets
+            if (is_port_separator) {
+                bs.address = addr_str.substr(0, colon_pos);
+                bs.port = parse_port(std::string_view(addr_str).substr(colon_pos + 1)).value_or(0);
             } else {
-                bs.address = addr_str;
-                bs.port = 0;
+                bs.address = std::move(addr_str);
             }
         } else {
-            bs.address = addr_str;
-            bs.port = 0;
+            bs.address = std::move(addr_str);
         }
 
         bs.weight = info.weight;
@@ -2098,18 +2054,35 @@ void RouterService::run_draining_reaper() {
         }
     }
 
-    // Remove each expired draining backend
+    if (to_remove.empty()) return;
+
+    // Call pool cleanup callbacks synchronously before launching async removal
     for (const auto& [id, addr] : to_remove) {
         log_router.info("Backend {} drain timeout expired, removing from all shards", id);
-
-        // Call pool cleanup callback before removing (if set)
         if (_pool_cleanup_callback) {
             _pool_cleanup_callback(addr);
         }
-
-        // Fire-and-forget the unregister (runs asynchronously)
-        (void)unregister_backend_global(id);
     }
+
+    // Rule #5: Keep gate holder alive for the full async lifetime of all
+    // unregister_backend_global() futures via do_with. Without this, the holder
+    // would drop when run_draining_reaper() returns, leaving the futures
+    // unprotected — stop() could close the gate and destroy members while the
+    // futures are still in flight.
+    (void)seastar::do_with(std::move(holder), std::move(to_remove),
+        [this](seastar::gate::holder&, std::vector<std::pair<BackendId, seastar::socket_address>>& to_remove) {
+            return seastar::parallel_for_each(to_remove,
+                [this](const std::pair<BackendId, seastar::socket_address>& entry) {
+                    return unregister_backend_global(entry.first);
+                });
+        }).handle_exception([](std::exception_ptr ep) {
+            // Rule #9: every catch must log at warn level
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_router.warn("Failed to unregister drained backends: {}", e.what());
+            }
+        });
 }
 
 seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
@@ -2134,11 +2107,12 @@ seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
 
 seastar::future<> RouterService::handle_node_state_change(BackendId backend, NodeState node_state) {
     if (node_state == NodeState::DRAINING) {
-        log_router.info("Received DRAINING notification for backend {} - setting weight to 0", backend);
+        log_router.info("Received DRAINING notification for backend {} - marking as draining", backend);
 
-        // Broadcast weight=0 to all shards to stop new traffic to this backend
-        // This is more graceful than removing the backend entirely, as it allows
-        // in-flight requests to complete while preventing new routing decisions
+        // Broadcast draining state to all shards to stop new traffic to this backend.
+        // The is_draining flag is checked by get_live_backends()/get_live_backend_infos(),
+        // which all routing paths use.  We intentionally preserve the original weight so
+        // it is restored correctly when the backend returns to ACTIVE.
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
@@ -2146,20 +2120,16 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
                     auto& state = shard_state();
                     auto it = state.backends.find(backend);
                     if (it != state.backends.end()) {
-                        // Set weight to 0 - backend won't be selected for new requests
-                        // but existing connections continue working
-                        it->second.weight = 0;
                         it->second.is_draining = true;
                         it->second.drain_start_time = std::chrono::steady_clock::now();
-                        log_router.debug("Shard {}: Backend {} weight set to 0 (draining)",
-                                        seastar::this_shard_id(), backend);
+                        log_router.debug("Shard {}: Backend {} marked draining (weight {} preserved)",
+                                        seastar::this_shard_id(), backend, it->second.weight);
                     }
                     return seastar::make_ready_future<>();
                 });
             });
     } else if (node_state == NodeState::ACTIVE) {
-        // Node is back online - restore default weight (could be enhanced to store original weight)
-        log_router.info("Received ACTIVE notification for backend {} - restoring weight", backend);
+        log_router.info("Received ACTIVE notification for backend {} - restoring to active", backend);
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
@@ -2167,11 +2137,9 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
                     auto& state = shard_state();
                     auto it = state.backends.find(backend);
                     if (it != state.backends.end() && it->second.is_draining) {
-                        // Restore default weight
-                        it->second.weight = 100;
                         it->second.is_draining = false;
-                        log_router.debug("Shard {}: Backend {} restored to active (weight=100)",
-                                        seastar::this_shard_id(), backend);
+                        log_router.debug("Shard {}: Backend {} restored to active (weight {})",
+                                        seastar::this_shard_id(), backend, it->second.weight);
                     }
                     return seastar::make_ready_future<>();
                 });
@@ -2229,6 +2197,14 @@ void RouterService::set_backend_draining_for_testing(BackendId id) {
     if (it != g_shard_state->backends.end()) {
         it->second.is_draining = true;
         it->second.drain_start_time = std::chrono::steady_clock::now();
+    }
+}
+
+void RouterService::clear_backend_draining_for_testing(BackendId id) {
+    if (!g_shard_state) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it != g_shard_state->backends.end()) {
+        it->second.is_draining = false;
     }
 }
 

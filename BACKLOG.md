@@ -25,6 +25,7 @@ This document identifies missing features and optimizations required to promote 
 13. [Adversarial System Audit (2026-02-12)](#13-adversarial-system-audit-2026-02-12)
 14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
 15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
+16. [Radix Tree Review (2026-02-14)](#16-radix-tree-review-2026-02-14)
 
 ---
 
@@ -2217,66 +2218,282 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.1 Replace Modular Hash with Jump Consistent Hash
 
-- [ ] **Replace `prefix_hash % live_backends.size()` with jump consistent hash**
+- [x] **Replace `prefix_hash % live_backends.size()` with jump consistent hash** ✓
   _Justification:_ The hash fallback in `get_backend_for_prefix()` and `get_backend_by_hash()` uses modular hashing, which reshuffles **all** keys when a backend is added/removed. True consistent hashing (e.g., jump hash) remaps only ~1/n keys, preserving KV-cache affinity during topology changes — which is the project's core value proposition.
-  _What to change:_ Implement `jump_consistent_hash(uint64_t key, int32_t num_buckets)` (Google's algorithm, ~10 lines, public domain). Replace the two `prefix_hash % live_backends.size()` call sites at `router_service.cpp:1271` and `router_service.cpp:1337`. `live_backends` is already sorted for determinism, so the jump hash bucket index maps directly.
-  _Location:_ `src/router_service.cpp` (lines 1271, 1337)
+  _Approach implemented:_ Added `jump_consistent_hash(uint64_t key, int32_t num_buckets)` (Lamping & Veach 2014) next to existing `hash_prefix()`. Replaced both `prefix_hash % live_backends.size()` call sites. Added two unit tests verifying minimal-remap property on backend addition and removal (≤40% remap threshold vs ~75% for modular hash).
+  _Location:_ `src/router_service.cpp`, `tests/unit/router_service_test.cpp`
   _Complexity:_ Low
-  _Priority:_ P1 — Directly impacts cache hit rate during backend scaling events
+  _Completed:_ 2026-02-14
 
 ### 14.2 Fix `cache_hit` Misreporting in `route_request()`
 
-- [ ] **Return accurate `cache_hit` from `route_request()` for PREFIX mode**
+- [x] **Return accurate `cache_hit` from `route_request()` for PREFIX mode** ✓
   _Justification:_ `route_request()` unconditionally sets `result.cache_hit = true` when `get_backend_for_prefix()` returns a backend, even when the backend was selected via hash fallback (an ART miss). This inflates `cache_hit` rates in monitoring dashboards and makes the metric unreliable for capacity planning.
-  _What to change:_ Modify `get_backend_for_prefix()` to return a struct (or add an out-parameter) indicating whether the result came from an ART hit or hash fallback. Update `route_request()` to set `cache_hit` only on actual ART hits. Update the `RouteResult` comment to clarify semantics.
-  _Location:_ `src/router_service.cpp` (line 1050), `src/router_service.hpp` (`RouteResult` struct)
+  _Approach implemented:_ Added `PrefixRouteResult` struct with `backend_id` + `art_hit` flag. Changed `get_backend_for_prefix()` return type from `std::optional<BackendId>` to `PrefixRouteResult`. Each return path explicitly sets `art_hit` (true only for ART lookup hits). `route_request()` now sets `cache_hit = prefix_result.art_hit`. Updated `RouteResult::cache_hit` comment. Added `HashFallbackReportsCacheMiss` test and updated existing tests for new return type.
+  _Location:_ `src/router_service.hpp`, `src/router_service.cpp`, `tests/unit/router_service_test.cpp`
   _Complexity:_ Low
-  _Priority:_ P2 — Affects observability accuracy
+  _Completed:_ 2026-02-14
 
 ### 14.3 Extract Shared Live-Backend Filtering Helper
 
-- [ ] **Deduplicate the live-backend collection pattern into `ShardLocalState::get_live_backends()`**
+- [x] **Deduplicate the live-backend collection pattern into `ShardLocalState::get_live_backends()`** ✓
   _Justification:_ The pattern of iterating `backend_ids`, checking `dead_backends.contains()`, looking up in `backends`, and checking `is_draining` is repeated identically in `get_random_backend()`, `get_backend_for_prefix()`, and `get_backend_by_hash()`. If filtering criteria change (e.g., adding weight=0 exclusion), all three sites must be updated in lockstep — a latent inconsistency risk.
-  _What to change:_ Add a `std::vector<BackendId> get_live_backends()` method to `ShardLocalState` that encapsulates the filtering logic. Replace the three inline loops with calls to this helper. `get_random_backend()` needs additional weight/priority data — consider a second overload that returns `vector<pair<BackendId, const BackendInfo*>>`.
-  _Location:_ `src/router_service.cpp` (lines 1092-1119, 1184-1197, 1307-1320)
+  _Approach implemented:_ Added two helpers to `ShardLocalState`: (1) `get_live_backends()` returns a sorted `vector<BackendId>` — used by `get_backend_for_prefix()` and `get_backend_by_hash()`; (2) `get_live_backend_infos()` returns `vector<pair<BackendId, const BackendInfo*>>` — used by `get_random_backend()` for weight/priority access. Replaced all three inline loops. Net −30 lines.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Maintainability improvement
+  _Completed:_ 2026-02-14
 
 ### 14.4 Eliminate `std::map` Allocation on Hot Path in `get_random_backend()`
 
-- [ ] **Replace `std::map` priority grouping with a single-pass min-priority scan**
+- [x] **Replace `std::map` priority grouping with a single-pass min-priority scan** ✓
   _Justification:_ `get_random_backend()` constructs a `std::map<uint32_t, std::vector<...>>` on every call. `std::map` allocates a red-black tree node per entry. Since only the highest-priority group (lowest number) is used, a single pass tracking the minimum priority and accumulating candidates into a pre-allocated vector eliminates all heap allocations.
-  _What to change:_ Replace the `std::map priority_groups` with a two-pass or single-pass approach: (1) find the minimum priority value across live backends, (2) collect candidates matching that priority. Alternatively, combine with backlog item 14.3 by having `get_live_backends()` return results sorted by priority.
-  _Location:_ `src/router_service.cpp` (line 1102)
+  _Approach implemented:_ Two linear passes over the `live_infos` vector returned by `get_live_backend_infos()`: (1) find `min_priority` and accumulate `total_weight` for that priority, (2) weighted random selection over matching candidates. Zero heap allocations — no `std::map`, no `std::vector` of candidates. Also removed now-unused `#include <map>`.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Hot-path performance; most impactful under RANDOM mode or fail-open
+  _Completed:_ 2026-02-14
 
 ### 14.5 Preserve Original Backend Weight Across DRAINING→ACTIVE Transitions
 
-- [ ] **Stop overwriting backend weight during DRAINING, or store original weight for restoration**
+- [x] **Stop overwriting backend weight during DRAINING, or store original weight for restoration** ✓
   _Justification:_ `handle_node_state_change()` sets `weight = 0` on DRAINING and hardcodes `weight = 100` on ACTIVE restore. Backends registered with custom weights (e.g., 50 for smaller GPUs, 200 for larger ones) lose their weight permanently. Since `is_draining = true` already excludes backends from all routing paths (`get_random_backend`, `get_backend_for_prefix`, `get_backend_by_hash` all check `is_draining`), the `weight = 0` assignment is redundant.
-  _What to change:_ **Option A (simplest):** Remove the `weight = 0` line from the DRAINING handler and the `weight = 100` line from the ACTIVE handler. The `is_draining` flag is already sufficient. **Option B:** Add `uint32_t original_weight` to `BackendInfo`, save before zeroing, restore on ACTIVE.
-  _Location:_ `src/router_service.cpp` (lines 2149-2152 for DRAINING, 2169-2172 for ACTIVE)
+  _Approach implemented:_ Option A — removed `weight = 0` from DRAINING handler and `weight = 100` from ACTIVE handler. The `is_draining` flag (checked by `get_live_backends()`/`get_live_backend_infos()`) is sufficient to exclude backends from all routing decisions. Original weight is now preserved through the full drain cycle. Added `clear_backend_draining_for_testing()` helper and `CustomWeightPreservedAcrossDrainCycle` unit test.
+  _Location:_ `src/router_service.cpp`, `src/router_service.hpp`, `tests/unit/router_service_test.cpp`
   _Complexity:_ Low
-  _Priority:_ P2 — Correctness bug for deployments using custom backend weights
+  _Completed:_ 2026-02-14
 
 ### 14.6 Replace `std::atomic` with Plain `uint64_t` for Shard-Local Load Counter
 
-- [ ] **Remove unnecessary `std::atomic` from `BackendInfo::active_requests`**
+- [x] **Remove unnecessary `std::atomic` from `BackendInfo::active_requests`** ✓
   _Justification:_ `BackendInfo` lives inside `thread_local ShardLocalState`. In Seastar's cooperative model, `active_requests` is only accessed from a single reactor thread (the `BackendRequestGuard` is documented as "shard-local operation only"). `std::atomic` is unnecessary and causes: (1) ~40 lines of manual copy/move constructor boilerplate because `std::atomic` isn't copyable/movable, (2) architectural confusion suggesting cross-thread access, (3) minor overhead on ARM (atomic stores emit barrier instructions even with relaxed ordering).
-  _What to change:_ Replace `std::atomic<uint64_t> active_requests{0}` with `uint64_t active_requests = 0`. Delete the manual copy constructor, move constructor, copy assignment, and move assignment (lines 87-131) — the compiler-generated defaults will work. Update `BackendRequestGuard` to use direct read/write instead of `.load()`/`.fetch_add()`/`.fetch_sub()`.
-  _Location:_ `src/router_service.cpp` (lines 73, 87-131, 334-399, 406-417)
+  _Approach implemented:_ Replaced `std::atomic<uint64_t>` with plain `uint64_t`. Deleted all four manual special members (copy/move ctor/assignment) — compiler defaults now work. Updated `BackendRequestGuard` to use `++`/`--`/direct reads. Updated `get_backend_load()` and `get_least_loaded_backend()`. Removed `#include <atomic>`. Net −51 lines.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Code simplification, minor perf improvement
+  _Completed:_ 2026-02-14
 
 ### 14.7 Add Error Handling to Fire-and-Forget `unregister_backend_global` in Draining Reaper
 
-- [ ] **Attach `.handle_exception()` to discarded `unregister_backend_global()` futures**
+- [x] **Attach `.handle_exception()` to discarded `unregister_backend_global()` futures** ✓
   _Justification:_ `run_draining_reaper()` calls `(void)unregister_backend_global(id)`, discarding the future. If unregistration fails (e.g., `submit_to` timeout on an overloaded shard), the backend remains registered but past its drain timeout — a "ghost backend" that is draining forever. There is no retry, no error logging, and no way to detect the failure. This violates Hard Rule #9 (every catch block must log at warn level).
-  _What to change:_ Replace `(void)unregister_backend_global(id)` with `(void)unregister_backend_global(id).handle_exception([id](std::exception_ptr ep) { ... log warning ... })`. Optionally, track failed removals in a retry set and re-attempt on the next reaper tick.
-  _Location:_ `src/router_service.cpp` (line 2111)
+  _Approach implemented:_ Attached `.handle_exception()` with rethrow-and-log pattern (matching existing `flush_route_batch` style). Logs at `warn` level with backend ID and exception message.
+  _Location:_ `src/router_service.cpp`
+  _Complexity:_ Low
+  _Completed:_ 2026-02-14
+
+---
+
+## 15. HTTP Controller Review (2026-02-14)
+
+Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines). Full analysis in `.dev-context/http-controller-review.md`.
+
+### 15.1 Implement or Remove Dead P2C Cross-Shard Dispatch
+
+- [ ] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
+  _Justification:_ The P2C algorithm selects a target shard, but the result is only logged — the request is always processed on the local shard. There is no `smp::submit_to(target_shard, ...)` anywhere in `http_controller.cpp`. The `_requests_cross_shard_dispatch` counter increments, but no actual cross-shard dispatch occurs. The entire P2C load balancing feature (`LoadBalancingSettings`, `ShardLoadBalancer` integration, cross-shard dispatch metrics) is dead code that gives the appearance of load balancing without providing it.
+  _What to change:_ **Option A (implement):** Add `smp::submit_to(target_shard, ...)` to actually dispatch requests cross-shard when P2C selects a remote shard. Requires `cross_shard_request.hpp` / `foreign_ptr` for safe data transfer per Hard Rule #14. **Option B (remove):** Delete `select_target_shard()`, `LoadBalancingSettings`, `_load_balancer`, `_lb_config`, and the cross-shard dispatch metrics to eliminate dead code.
+  _Location:_ `src/http_controller.cpp` (lines 725-731, 1839-1864), `src/http_controller.hpp` (lines 55-60, 247-248)
+  _Complexity:_ High (Option A), Low (Option B)
+  _Priority:_ P1 — Dead code that misleads operators into believing load balancing is active
+
+### 15.2 Escape User-Controlled Strings in JSON Error Responses
+
+- [ ] **Extract `escape_json_string` into a shared utility and use it for all JSON string interpolation**
+  _Justification:_ Multiple error responses interpolate external strings directly into JSON without escaping. If any of these strings contain `"`, `\`, or control characters, the response becomes malformed JSON. The codebase already has an `escape_json_string` lambda at line 1738, but it is local to `handle_keys_reload`. Affected lines: 181 (auth info), 803 (token error), 1071 (route error message), 1448 (validation error).
+  _What to change:_ Move `escape_json_string` from the local lambda in `handle_keys_reload` to a utility function in `parse_utils.hpp`. Apply it to all JSON string interpolation sites. Alternatively, use RapidJSON (already a dependency) for response construction.
+  _Location:_ `src/http_controller.cpp` (lines 181, 803, 1071, 1448, 1738), `src/parse_utils.hpp`
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness; malformed JSON responses on certain inputs
+
+### 15.3 Replace `std::atomic` Counters With Plain `uint64_t`
+
+- [ ] **Remove unnecessary `std::atomic` from shard-local metric counters in `HttpController`**
+  _Justification:_ In Seastar's shared-nothing model, each `HttpController` instance lives on exactly one shard. The four atomic counters (`_requests_rejected_concurrency`, `_requests_rejected_persistence`, `_requests_local_dispatch`, `_requests_cross_shard_dispatch`) are only ever incremented from that shard's reactor thread. No cross-shard code reads them. Using `std::atomic` adds unnecessary memory fence overhead and contradicts Hard Rule #0/#1.
+  _What to change:_ Replace `std::atomic<uint64_t>` with plain `uint64_t` for all four counters. If metrics scraping needs cross-shard access, use `smp::submit_to` to gather them.
+  _Location:_ `src/http_controller.hpp` (lines 259-264)
+  _Complexity:_ Low
+  _Priority:_ P3 — Code hygiene and minor performance improvement
+
+### 15.4 Sanitize Header Values and Fix Hardcoded Host in Backend Request Construction
+
+- [ ] **Sanitize outgoing header values and derive Host from target address**
+  _Justification:_ `send_backend_request()` builds the HTTP request via raw string concatenation. The `Host` header is hardcoded to `localhost`. `ctx.request_id` and `ctx.backend_traceparent` originate from client headers and are injected without CRLF injection checks — a crafted `X-Request-ID` containing `\r\n` could inject arbitrary headers. The body is also concatenated into the header string, doubling memory for large payloads.
+  _What to change:_ (1) Strip `\r` and `\n` from `request_id` and `backend_traceparent` before interpolation. (2) Derive the `Host` header from `ctx.current_addr`. (3) Write headers and body as two separate `write()` calls to avoid the double-copy for large payloads.
+  _Location:_ `src/http_controller.cpp` (lines 420-432)
+  _Complexity:_ Low
+  _Priority:_ P2 — Header injection risk and correctness
+
+### 15.5 Optimize Per-Chunk Flush in SSE Streaming Loop
+
+- [ ] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
+  _Justification:_ Every chunk received from the backend triggers a `write()` + `flush()` to the client. For streaming LLM responses with many small SSE events (10-50 bytes per token), this produces one syscall per token. While low-latency delivery is intentional for SSE, a more nuanced approach could batch flushes when multiple chunks are available in the same reactor tick.
+  _What to change:_ Remove the per-chunk `flush()` and rely on Seastar's internal output stream buffering, or implement a configurable flush strategy: immediate for `[DONE]` events, batched otherwise (e.g., flush every 10ms via a timer or after N bytes accumulated).
+  _Location:_ `src/http_controller.cpp` (lines 602-603)
+  _Complexity:_ Medium
+  _Priority:_ P3 — Performance; most impactful at high token throughput
+
+### 15.6 Add Explicit `stop()` Method for Orderly Shutdown
+
+- [ ] **Add `seastar::future<> stop()` to `HttpController` for clean lifecycle management**
+  _Justification:_ `HttpController` is used as `seastar::sharded<HttpController>`, so Seastar calls `.stop()` on each shard during shutdown. The class has no `stop()` method and relies on the default (ready future). However, `_rate_limiter.start()` is called in `register_routes()` and only stopped in `wait_for_drain()`. If teardown skips `wait_for_drain()`, the rate limiter timer could fire after destruction. Per Hard Rule #5 (timer gate guards) and #6 (deregister metrics in stop).
+  _What to change:_ Add `seastar::future<> stop()` that: (1) calls `_rate_limiter.stop()`, (2) closes `_request_gate` if not already closed, (3) ensures orderly cleanup regardless of whether `wait_for_drain()` was called.
+  _Location:_ `src/http_controller.hpp` (class declaration), `src/http_controller.cpp` (new method)
+  _Complexity:_ Low
+  _Priority:_ P2 — Defensive correctness; prevents use-after-free on abnormal shutdown paths
+
+### 15.7 Bound Recursive JSON Serialization in Admin Endpoints
+
+- [ ] **Add depth and size limits to `dump_node_to_json` and admin dump handlers**
+  _Justification:_ The tree dump handler recursively serializes the entire radix tree into a `std::ostringstream` with no upper bound. For production systems with tens of thousands of routes, this could produce multi-MB JSON responses. The recursive `dump_node_to_json` also risks stack overflow for deeply nested trees. `handle_dump_cluster` and `handle_dump_backends` have similar unbounded output.
+  _What to change:_ (1) Add a `max_depth` parameter to `dump_node_to_json` (default: 32) to bound recursion. (2) Add a `?limit=N` query parameter to cap the number of nodes returned. (3) Consider streaming JSON output for large responses rather than building the entire string in memory.
+  _Location:_ `src/http_controller.cpp` (lines 1871-1986, 2005-2077)
+  _Complexity:_ Low
+  _Priority:_ P3 — Defensive correctness; prevents OOM on large trees
+
+---
+
+## 16. Radix Tree Review (2026-02-14)
+
+Deep-dive review of `src/radix_tree.hpp` — the #1 load-bearing file in the codebase (per Strategic Assessment). Findings cover correctness bugs, maintainability debt, and performance opportunities.
+
+### 16.1 Fix Node256 Collision Lookup Failure When Preferred Slot Is Vacated
+
+- [ ] **Prevent `find_child()` from silently missing displaced children in Node256**
+  _Justification:_ `key_byte()` truncates `TokenId` (int32_t) to the lower 8 bits, so tokens like 0, 256, 512 all map to index 0. When a collision occurs during `add_child()`, the displaced child is placed in an arbitrary empty slot. However, `find_child()` at line 629 short-circuits the linear scan fallback with `if (n->keys[idx] != Node256::EMPTY_KEY)` — if the preferred slot is later vacated (by eviction or compaction), the condition becomes false and the displaced child becomes permanently invisible to lookups, even though it still exists in the tree. The same pattern affects `set_child()` and `extract_child()`.
+  _What to change:_ Remove the `if (n->keys[idx] != Node256::EMPTY_KEY)` guard before the linear fallback in `find_child()`, `extract_child()`, and `set_child()` for Node256. Always fall through to linear scan when the preferred-slot key doesn't match. Alternatively, redesign Node256 to use a proper open-addressing hash table with a defined probe sequence so displaced entries are findable in O(1) amortized time.
+  _Location:_ `src/radix_tree.hpp` lines 629-636 (`find_child`), 679-687 (`extract_child`), 740-747 (`set_child`)
+  _Complexity:_ Low (fix) / Medium (redesign)
+  _Priority:_ P1 — Correctness bug; causes silent data loss on lookup for colliding token IDs
+
+### 16.2 Fix `compact_children()` Using Slot Index Instead of Key for Node256 Removal
+
+- [ ] **Use `n->keys[i]` instead of `static_cast<TokenId>(i)` when marking Node256 children for removal**
+  _Justification:_ In `compact_children()` for the Node256 case (line 1547), empty children are marked for removal via `keys_to_remove.push_back(static_cast<TokenId>(i))`, where `i` is the array slot index (0–255). But `remove_child()` matches against the *stored key* (`n->keys[i]`), not the slot index. When collisions displace a child to a non-preferred slot, the slot index differs from the stored key. `remove_child()` will either remove the wrong child (if another key happens to equal the slot index) or fail to find and remove the target, leaking the empty node.
+  _What to change:_ Replace `keys_to_remove.push_back(static_cast<TokenId>(i))` with `keys_to_remove.push_back(n->keys[i])` in the Node256 branch of `compact_children()`.
+  _Location:_ `src/radix_tree.hpp` line 1547
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness bug; causes memory leaks during compaction with colliding token IDs
+
+### 16.3 Fix `extract_child()` Leaving Stale Entries in Node4/Node16/Node48 Vectors
+
+- [ ] **Erase the key/child entry from vectors after extracting a child, or switch to swap-and-pop**
+  _Justification:_ `extract_child()` for Node4/Node16 does `std::move(n->children[i])` but does not erase the entry from `keys` or `children` vectors. The vector retains its original size with a null `NodePtr` at position `i` and the key still present. Consequences: (1) `find_child()` will match the stale key and return nullptr, (2) `child_count()` returns an inflated count (it uses `keys.size()`), (3) `add_child()` may trigger premature growth (checking `keys.size() < 4`). The Node48 path has the same issue. `extract_child()` is called by `insert_recursive()` on every insert that traverses an existing child, making this a common code path.
+  _What to change:_ After extracting, erase both `keys[i]` and `children[i]` from their respective vectors. For Node4/Node16, use swap-with-last + `pop_back()` for O(1) removal (order doesn't matter). For Node48, also update the index array (decrement indices > i, clear the removed key's index entry). Alternatively, refactor `insert_recursive()` to avoid extract+reinsert entirely — use a mutable reference to the child slot.
+  _Location:_ `src/radix_tree.hpp` lines 643-691 (`extract_child`), called from line 1277 (`insert_recursive`)
+  _Complexity:_ Medium
+  _Priority:_ P2 — Correctness bug; causes wrong child counts, missed lookups, and premature node growth on every insert through existing paths
+
+### 16.4 Replace `std::vector` with Small-Buffer-Optimized Container for Node Prefix and Small Node Keys
+
+- [ ] **Eliminate heap allocations for short prefixes and small node key/child arrays**
+  _Justification:_ `Node::prefix` is `std::vector<TokenId>`, which always heap-allocates (even for 1-token prefixes). `Node4::keys` and `Node4::children` are also vectors with `reserve(4)`, causing two heap allocations per Node4 construction. In an ART, most prefixes are short (1-4 tokens) and most nodes are Node4 (the smallest type). Every `insert()` that creates a new leaf allocates a Node4 via slab, then does 2-3 additional heap allocations for vectors — undermining the slab allocator's goal of eliminating heap allocation. This also fragments memory and hurts cache locality since prefix data is not co-located with the node.
+  _What to change:_ Replace `std::vector<TokenId>` prefix with a `SmallVector<TokenId, 8>` (inline storage for up to 8 tokens, ~32 bytes). Replace Node4 keys/children with `std::array<TokenId, 4>` + `std::array<NodePtr, 4>` + `uint8_t count`. Same for Node16. This keeps small-case data inline within the slab-allocated node, eliminating heap allocation entirely for the common case. Boost.Container `small_vector` or Abseil `InlinedVector` (already a dependency) are ready-made options.
+  _Location:_ `src/radix_tree.hpp` lines 99 (`Node::prefix`), 109-110 (`Node4`), 119-120 (`Node16`)
+  _Complexity:_ Medium
+  _Priority:_ P2 — Performance; eliminates 2-3 heap allocations per node on the insert path, improves cache locality
+
+### 16.5 Reduce Code Duplication via Unified Small-Node Template for Node4/Node16
+
+- [ ] **Consolidate duplicated switch-on-type code by templating Node4/Node16 operations**
+  _Justification:_ Node4 and Node16 have identical structure (keys vector + children vector), yet every operation (`find_child`, `extract_child`, `set_child`, `add_child`, `remove_child`, `compact_children`, `visit_children`, `child_count`, `move_from_small_node`) duplicates the same logic in separate switch branches. This is ~300+ lines of pure duplication. If a bug is fixed in one branch but missed in the other, they silently diverge (as already happened with `extract_child` not erasing entries). The `move_from_small_node` template at line 987 shows this was partially recognized but not applied consistently.
+  _What to change:_ Create a `SmallNode<N>` template (or a common base `KeyChildNode`) that Node4 and Node16 inherit from. Move shared logic into free functions or template methods operating on this base. This halves the switch-case branches for small nodes and makes it impossible to fix a bug in one without fixing the other. The Node48/Node256 cases remain separate since their storage differs.
+  _Location:_ `src/radix_tree.hpp` — affects `find_child`, `extract_child`, `set_child`, `add_child`, `remove_child`, `compact_children`, `visit_children`, `child_count`
+  _Complexity:_ Medium
+  _Priority:_ P2 — Maintainability; reduces ~300 lines of duplication and prevents divergence bugs
+
+### 16.6 Replace O(n) Full-Tree Scan in `evict_oldest()` with an LRU Index Structure
+
+- [ ] **Add an intrusive LRU list to make eviction O(1) instead of O(n)**
+  _Justification:_ `evict_oldest()` calls `find_oldest_leaf()` which recursively walks the entire tree to find the leaf with the minimum `last_accessed` timestamp. This is O(n) where n is total nodes. Eviction is called in a loop (`while (route_count >= max_routes) evict_oldest()`), making bulk eviction O(n × k) where k is the number of routes to evict. Under memory pressure with thousands of routes, this becomes a latency spike on the insert path — potentially violating Hard Rule #1 (no blocking on hot path).
+  _What to change:_ Maintain an intrusive doubly-linked list threaded through leaf nodes, ordered by `last_accessed`. On lookup hit, move the node to the head (O(1) with intrusive list). On eviction, pop from the tail (O(1)). Add `lru_prev`/`lru_next` pointers to `Node` (8 bytes each, acceptable overhead). This makes eviction O(1) and lookup LRU update O(1), at the cost of ~16 bytes per node and pointer maintenance on insert/remove.
+  _Location:_ `src/radix_tree.hpp` lines 1404-1428 (`find_oldest_leaf`, `find_oldest_recursive`), lines 409-427 (`evict_oldest`, `evict_oldest_remote`)
+  _Complexity:_ High
+  _Priority:_ P3 — Performance; only impacts workloads at or near route capacity with frequent eviction
+
+### 16.7 Add MAX_SIZE Bound to Node Prefix Length
+
+- [ ] **Enforce a maximum prefix length to prevent unbounded memory growth from long token sequences**
+  _Justification:_ `insert_recursive()` creates new nodes with `prefix.assign(remaining.begin() + 1, remaining.end())` (line 1284). The prefix length is bounded only by the input token sequence length (after block alignment truncation). A very long input (e.g., a 128k-context request producing 100k+ tokens) could create a single node with a 100k-element prefix vector, allocating ~400KB of heap memory for one node. This violates Hard Rule #4 (every growing container needs explicit MAX_SIZE). While block_alignment truncation helps, typical alignment values (16) still allow prefixes up to `aligned_len - depth` tokens.
+  _What to change:_ Add a `MAX_PREFIX_LENGTH` constant (e.g., 256 or 512 tokens). When a new node's prefix would exceed this, split it into a chain of nodes with bounded prefixes. This is analogous to how B-trees split pages — each node stores at most N prefix tokens, with overflow continuing in a child node. Add a check in `insert_recursive()` after constructing the prefix: `if (new_child->prefix.size() > MAX_PREFIX_LENGTH) split_long_prefix(new_child)`.
+  _Location:_ `src/radix_tree.hpp` lines 1282-1285 (new node creation in `insert_recursive`), line 950 (`split_node` prefix assignment)
+  _Complexity:_ Low
+  _Priority:_ P3 — Defensive correctness; prevents pathological memory usage from long inputs
+
+---
+
+## 17. Router Service Review Pass 2 (2026-02-14)
+
+Second review pass of `src/router_service.cpp` and `src/router_service.hpp` after completing all items from section 14. Focuses on correctness, stale comments, lifecycle safety, and minor code quality issues.
+
+### 17.1 Stale "atomic" / "lock-free" Comments in Header File
+
+- [x] **Update `BackendRequestGuard` class comment and `apply_load_aware_selection` comment in header**
+  _Justification:_ Item 14.6 replaced `std::atomic` with plain `uint64_t`, but the header file `router_service.hpp` line 92 still says "Lock-free: uses atomic increment/decrement with relaxed ordering". The `apply_load_aware_selection` comment at line 442 in the .cpp also has "Atomic reads use relaxed ordering (no memory barriers)" which is stale.
+  _What to change:_ In `router_service.hpp` line 92, change to "Shard-local: uses plain integer increment/decrement (no atomic needed)". In `router_service.cpp` line 442, remove the stale "Atomic reads use relaxed ordering" comment.
+  _Location:_ `src/router_service.hpp:92`, `src/router_service.cpp:442`
+  _Complexity:_ Trivial
+  _Priority:_ P4 — Comment hygiene
+
+### 17.2 `run_draining_reaper` Gate Holder Drops Before Fire-and-Forget Futures Complete
+
+- [x] **Keep gate holder alive for the duration of `unregister_backend_global()` futures**
+  _Justification:_ `run_draining_reaper()` acquires a `gate::holder` at line 2013, then launches fire-and-forget futures via `unregister_backend_global(id)` in a loop (lines 2046-2052). The gate holder is a local variable scoped to `run_draining_reaper()` — it drops when the function returns, which is immediately after launching the fire-and-forget futures. This means the gate is not actually protecting the async lifetime of `unregister_backend_global()`. If `stop()` closes `_timer_gate` while those futures are still in flight, the futures may access `this` (via `unregister_backend_global`) after destruction begins. Contrast with `run_ttl_cleanup()` at line 858 which correctly uses `do_with(std::move(holder), ...)` to extend the holder's lifetime.
+  _What to change:_ Collect all `unregister_backend_global()` futures into a vector, then use `seastar::do_with(std::move(holder), ...)` to keep the holder alive until all futures complete. Apply `.handle_exception()` to the combined future (not individual ones). This also keeps the fire-and-forget pattern but with proper gate lifetime.
+  _Location:_ `src/router_service.cpp:2009-2054`
+  _Complexity:_ Medium
+  _Priority:_ P2 — Latent use-after-free during shutdown
+
+### 17.3 `run_ttl_cleanup` Fire-and-Forget Future Missing Error Handling
+
+- [x] **Attach `.handle_exception()` to the discarded future in `run_ttl_cleanup()`**
+  _Justification:_ `run_ttl_cleanup()` at line 858 launches `(void)seastar::do_with(...)` as fire-and-forget. If `parallel_for_each` or any `submit_to` inside fails, the exception is silently discarded. This violates Rule #9 (every catch must log at warn level). The same pattern was fixed in `run_draining_reaper` (item 14.7) and `flush_route_batch` (existing code).
+  _What to change:_ Attach `.handle_exception([](std::exception_ptr ep) { try { std::rethrow_exception(ep); } catch (const std::exception& e) { log_main.warn("TTL cleanup failed: {}", e.what()); } })` to the `do_with` chain.
+  _Location:_ `src/router_service.cpp:858`
+  _Complexity:_ Low
+  _Priority:_ P3 — Defensive correctness (Rule #9)
+
+### 17.4 `get_all_backend_states()` Uses `std::ostringstream` on Hot-ish Path
+
+- [x] **Replace `std::ostringstream` address formatting with `fmt::format`**
+  _Justification:_ `get_all_backend_states()` (lines 1824-1826) creates a `std::ostringstream` per backend to format the socket address into a string, then manually parses the result to split address and port. `std::ostringstream` heap-allocates and is relatively expensive. While this is an admin API (not a true hot path), it runs on the reactor thread and could stall the event loop if there are many backends. Seastar's `socket_address` provides direct accessors for the address family, IPv4/IPv6 address, and port that avoid the stream round-trip entirely.
+  _What to change:_ Use `seastar::net::inet_address` accessors and `addr.port()` directly instead of streaming to `ostringstream` and parsing back. This eliminates both the heap allocation and the string parsing.
+  _Location:_ `src/router_service.cpp:1822-1854`
+  _Complexity:_ Low
+  _Priority:_ P4 — Code quality, minor perf improvement
+
+### 17.5 `learn_route_global` Captures `this` in Cross-Shard Gossip Lambda
+
+- [x] **Guard `this` captures in `learn_route_global()` gossip `submit_to` lambdas with gate**
+  _Justification:_ At line 1368, `learn_route_global()` captures `this` in a `submit_to(0, ...)` lambda to access `_gossip->is_enabled()` and `_gossip->broadcast_route()`. This lambda runs on shard 0 asynchronously. The caller (`HttpController`) awaits the returned future, so normally `this` (the `RouterService`) is alive. However, if the caller drops or ignores the returned future (fire-and-forget pattern), the lambda could execute after `RouterService::stop()` has been called and `_gossip` has been destroyed. Currently `learn_route_global` is awaited by the caller, but this is a latent hazard if any future callsite uses fire-and-forget. The same pattern appears in `learn_route_global_multi()` at line 1518.
+  _What to change:_ Add a `_timer_gate.hold()` at the start of `learn_route_global()` (with gate_closed_exception handling for early return), or document the contract that the returned future MUST be awaited. Both approaches are valid.
+  _Location:_ `src/router_service.cpp:1368`, `src/router_service.cpp:1518`
   _Complexity:_ Low
   _Priority:_ P3 — Defensive correctness
+
+### 17.6 `learn_route_global` Uses `_config` Instead of Shard-Local Config for `prefix_token_length`
+
+- [x] **Use shard-local config for `prefix_token_length` in `learn_route_global()`**
+  _Justification:_ At line 1325, `learn_route_global()` reads `_config.prefix_token_length` (the member variable) instead of `g_shard_state->config.prefix_token_length` (the shard-local copy). After a hot-reload via `update_routing_config()`, the shard-local config is updated on all shards (line 1943), and `_config` is also updated on shard 0 (line 1928). So on shard 0 they match. But `learn_route_global()` can be called from any shard via `HttpController`. If called from shard N (N > 0), `_config` is the RouterService member which lives on shard 0 — accessing it from shard N is a cross-shard read (Rule #14 violation). This hasn't caused issues because `learn_route_global` is likely always called on shard 0 via `submit_to`, but it's architecturally incorrect.
+  _What to change:_ Replace `_config.prefix_token_length` with `g_shard_state->config.prefix_token_length` (with null guard). Same for `_config.max_route_tokens` at line 1338.
+  _Location:_ `src/router_service.cpp:1325,1338`
+  _Complexity:_ Low
+  _Priority:_ P2 — Cross-shard data access correctness
+
+### 17.7 `learn_route_remote` Uses `_config.max_route_tokens` (Member on Shard 0 Only)
+
+- [x] **Use shard-local config for `max_route_tokens` in `learn_route_remote()`**
+  _Justification:_ Same issue as 17.6. `learn_route_remote()` at line 1548 reads `_config.max_route_tokens`. This function is called from the GossipService callback registered at line 581-583, which runs on shard 0 (where GossipService lives), so in practice the access is safe. However, the method is public and could theoretically be called from other shards. Using `g_shard_state->config.max_route_tokens` would be architecturally correct and consistent with the hot-reload pattern.
+  _What to change:_ Replace `_config.max_route_tokens` with `g_shard_state->config.max_route_tokens` (with null guard). Similarly for `learn_route_global_multi()` at line 1471.
+  _Location:_ `src/router_service.cpp:1548,1471`
+  _Complexity:_ Low
+  _Priority:_ P3 — Consistency with shard-local config pattern
+
+### 17.8 Duplicate Load-Tracking Stats: `cache_miss_due_to_load` and `load_aware_fallbacks`
+
+- [x] **Remove duplicate stat `cache_miss_due_to_load` (identical to `load_aware_fallbacks`)**
+  _Justification:_ In `apply_load_aware_selection()` at lines 473-474, both `cache_miss_due_to_load` and `load_aware_fallbacks` are incremented in exactly the same place, making them always identical. They also have separate Prometheus metrics (`router_cache_miss_due_to_load_total` and `router_load_aware_fallbacks_total`) that report the same value. The `cache_miss_due_to_load` comment at line 128 says "Routes diverted due to backend load (same as fallbacks)" — explicitly acknowledging the duplication.
+  _What to change:_ Remove `cache_miss_due_to_load` from `Stats`, its `reset()` call, the Prometheus metric registration, and the increment in `apply_load_aware_selection`. Keep `load_aware_fallbacks` as the single source of truth.
+  _Location:_ `src/router_service.cpp:128,145,473,743-745`
+  _Complexity:_ Low
+  _Priority:_ P4 — Code hygiene
 
 ---
 

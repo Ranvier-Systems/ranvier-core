@@ -63,8 +63,14 @@ class GossipService;
 struct RouteResult {
     std::optional<BackendId> backend_id;  // Selected backend (nullopt if routing failed)
     std::string routing_mode;             // "prefix", "hash", or "random"
-    bool cache_hit = false;               // True if route was found in cache (ART or prefix affinity)
+    bool cache_hit = false;               // True if route was found via ART lookup (not hash fallback)
     std::string error_message;            // Non-empty if backend_id is nullopt
+};
+
+// Result from get_backend_for_prefix(), distinguishing ART hits from hash fallback.
+struct PrefixRouteResult {
+    std::optional<BackendId> backend_id;  // Selected backend (nullopt if no backends)
+    bool art_hit = false;                 // True only when ART lookup found a live backend
 };
 
 // ============================================================================
@@ -83,7 +89,7 @@ struct RouteResult {
 // Design:
 //   - Move-only for safe ownership transfer through do_with chains
 //   - Shard-local operation only (accesses thread_local g_shard_state)
-//   - Lock-free: uses atomic increment/decrement with relaxed ordering
+//   - Shard-local: uses plain integer increment/decrement (no atomic needed)
 //
 class BackendRequestGuard {
 public:
@@ -242,9 +248,10 @@ public:
     // Routes requests with the same prefix to the same backend for KV cache reuse
     // prefix_boundary: If > 0, used for hash fallback instead of prefix_token_length.
     //                  Ensures consistent routing across cluster nodes for same system prompt.
-    std::optional<BackendId> get_backend_for_prefix(const std::vector<int32_t>& tokens,
-                                                     const std::string& request_id = "",
-                                                     size_t prefix_boundary = 0);
+    // Returns PrefixRouteResult with art_hit=true only on actual ART cache hit.
+    PrefixRouteResult get_backend_for_prefix(const std::vector<int32_t>& tokens,
+                                             const std::string& request_id = "",
+                                             size_t prefix_boundary = 0);
 
     // Get a backend using consistent hash only (no ART, no learning)
     // Used to measure baseline hash performance vs ART
@@ -336,6 +343,9 @@ public:
 
     // Mark a backend as draining in shard-local state.
     static void set_backend_draining_for_testing(BackendId id);
+
+    // Clear draining flag on a backend (simulates ACTIVE state transition).
+    static void clear_backend_draining_for_testing(BackendId id);
 
     // Mark a backend as dead (circuit-breaker quarantine) in shard-local state.
     static void mark_backend_dead_for_testing(BackendId id);

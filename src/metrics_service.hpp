@@ -222,9 +222,6 @@ public:
             seastar::metrics::make_counter("routing_load_aware_fallbacks_total", _load_aware_fallbacks,
                 seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth exceeding threshold")),
 
-            seastar::metrics::make_counter("routing_cache_miss_due_to_load_total", _cache_miss_due_to_load,
-                seastar::metrics::description("Total number of cache misses accepted to avoid routing to overloaded backends")),
-
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -371,10 +368,8 @@ public:
     // Records when a request is diverted to a less-loaded backend
     void record_load_aware_fallback() {
         _load_aware_fallbacks++;
-        _cache_miss_due_to_load++;
     }
     uint64_t get_load_aware_fallbacks() const { return _load_aware_fallbacks; }
-    uint64_t get_cache_miss_due_to_load() const { return _cache_miss_due_to_load; }
 
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
@@ -484,7 +479,6 @@ private:
 
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
-    uint64_t _cache_miss_due_to_load = 0;  // Cache misses accepted for load balancing
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance

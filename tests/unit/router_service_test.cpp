@@ -113,6 +113,17 @@ TEST_F(RouterServiceTest, LearnedRouteReturnsViaRouteRequest) {
     EXPECT_TRUE(result.cache_hit);
 }
 
+TEST_F(RouterServiceTest, HashFallbackReportsCacheMiss) {
+    register_two_backends();
+    // No ART route inserted → route_request must use hash fallback
+    std::vector<int32_t> tokens = {100, 200, 300, 400};
+
+    auto result = router_->route_request(tokens);
+    EXPECT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.routing_mode, "prefix");
+    EXPECT_FALSE(result.cache_hit);  // hash fallback, not ART hit
+}
+
 TEST_F(RouterServiceTest, LookupMissReturnsNullopt) {
     register_two_backends();
     RouterService::insert_route_for_testing({1, 2, 3}, 1);
@@ -358,9 +369,10 @@ TEST_F(RouterServiceTest, DrainingBackendSkippedByPrefixRouting) {
     RouterService::insert_route_for_testing({1, 2, 3}, 1);
 
     auto result = router_->get_backend_for_prefix({1, 2, 3});
-    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.backend_id.has_value());
     // Should fall back to backend 2 (hash fallback skips draining backends)
-    EXPECT_EQ(result.value(), 2);
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_FALSE(result.art_hit);  // Draining ART backend → hash fallback
 }
 
 TEST_F(RouterServiceTest, DrainingBackendStateReported) {
@@ -372,6 +384,24 @@ TEST_F(RouterServiceTest, DrainingBackendStateReported) {
     EXPECT_TRUE(states[0].is_draining);
 }
 
+TEST_F(RouterServiceTest, CustomWeightPreservedAcrossDrainCycle) {
+    // Register with a custom weight (not the default 100)
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080), 200, 0);
+
+    auto before = router_->get_all_backend_states();
+    ASSERT_EQ(before.size(), 1u);
+    EXPECT_EQ(before[0].weight, 200u);
+
+    // Drain and then restore
+    RouterService::set_backend_draining_for_testing(1);
+    RouterService::clear_backend_draining_for_testing(1);
+
+    auto after = router_->get_all_backend_states();
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].weight, 200u);  // Original weight must survive drain cycle
+    EXPECT_FALSE(after[0].is_draining);
+}
+
 TEST_F(RouterServiceTest, AllBackendsDrainingReturnsNullopt) {
     register_two_backends();
     RouterService::set_backend_draining_for_testing(1);
@@ -381,7 +411,7 @@ TEST_F(RouterServiceTest, AllBackendsDrainingReturnsNullopt) {
     EXPECT_FALSE(result.has_value());
 
     auto prefix_result = router_->get_backend_for_prefix({1, 2, 3});
-    EXPECT_FALSE(prefix_result.has_value());
+    EXPECT_FALSE(prefix_result.backend_id.has_value());
 }
 
 TEST_F(RouterServiceTest, RouteRequestReturnsErrorWhenAllDraining) {
@@ -524,9 +554,83 @@ TEST_F(RouterServiceTest, PrefixHashFallbackIsDeterministic) {
     auto first = router_->get_backend_for_prefix(tokens);
     auto second = router_->get_backend_for_prefix(tokens);
 
-    ASSERT_TRUE(first.has_value());
-    ASSERT_TRUE(second.has_value());
-    EXPECT_EQ(first.value(), second.value());
+    ASSERT_TRUE(first.backend_id.has_value());
+    ASSERT_TRUE(second.backend_id.has_value());
+    EXPECT_EQ(first.backend_id.value(), second.backend_id.value());
+    EXPECT_FALSE(first.art_hit);   // No ART route → hash fallback
+    EXPECT_FALSE(second.art_hit);
+}
+
+TEST_F(RouterServiceTest, JumpHashMinimalRemapOnBackendAddition) {
+    // With 3 backends, record hash assignments for many token sequences.
+    // Add a 4th backend, then verify that at most ~1/4 of assignments change.
+    // This is the core property of jump consistent hash vs modular hash.
+    register_three_backends();
+
+    constexpr int NUM_PROBES = 200;
+    std::vector<BackendId> assignments_before;
+    assignments_before.reserve(NUM_PROBES);
+
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 7, i * 13 + 1, i * 31 + 2, i * 53 + 3, i * 97 + 4};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        assignments_before.push_back(result.value());
+    }
+
+    // Add a 4th backend
+    RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080));
+
+    int changed = 0;
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 7, i * 13 + 1, i * 31 + 2, i * 53 + 3, i * 97 + 4};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        if (result.value() != assignments_before[i]) {
+            ++changed;
+        }
+    }
+
+    // Jump consistent hash should remap ~1/4 of keys (new bucket gets ~25%).
+    // Modular hash would remap ~75%.  Allow generous margin: at most 40%.
+    EXPECT_LE(changed, NUM_PROBES * 40 / 100)
+        << "Too many keys remapped (" << changed << "/" << NUM_PROBES
+        << "); jump consistent hash should remap ~25%";
+}
+
+TEST_F(RouterServiceTest, JumpHashMinimalRemapOnBackendRemoval) {
+    // With 4 backends, record assignments. Remove one, verify minimal remap.
+    register_three_backends();
+    RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080));
+
+    constexpr int NUM_PROBES = 200;
+    std::vector<BackendId> assignments_before;
+    assignments_before.reserve(NUM_PROBES);
+
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 11, i * 17 + 5, i * 37 + 7};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        assignments_before.push_back(result.value());
+    }
+
+    // Kill backend 4 (mark dead so it's excluded from live_backends)
+    RouterService::mark_backend_dead_for_testing(4);
+
+    int changed = 0;
+    for (int i = 0; i < NUM_PROBES; ++i) {
+        std::vector<int32_t> tokens = {i * 11, i * 17 + 5, i * 37 + 7};
+        auto result = router_->get_backend_by_hash(tokens);
+        ASSERT_TRUE(result.has_value());
+        if (result.value() != assignments_before[i]) {
+            ++changed;
+        }
+    }
+
+    // Removing 1 of 4 backends should remap ~25% of keys, not 75%.
+    EXPECT_LE(changed, NUM_PROBES * 40 / 100)
+        << "Too many keys remapped (" << changed << "/" << NUM_PROBES
+        << "); jump consistent hash should remap ~25%";
 }
 
 // =============================================================================
