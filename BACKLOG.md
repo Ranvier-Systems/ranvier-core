@@ -2425,7 +2425,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.1 Stale "atomic" / "lock-free" Comments in Header File
 
-- [ ] **Update `BackendRequestGuard` class comment and `apply_load_aware_selection` comment in header**
+- [x] **Update `BackendRequestGuard` class comment and `apply_load_aware_selection` comment in header**
   _Justification:_ Item 14.6 replaced `std::atomic` with plain `uint64_t`, but the header file `router_service.hpp` line 92 still says "Lock-free: uses atomic increment/decrement with relaxed ordering". The `apply_load_aware_selection` comment at line 442 in the .cpp also has "Atomic reads use relaxed ordering (no memory barriers)" which is stale.
   _What to change:_ In `router_service.hpp` line 92, change to "Shard-local: uses plain integer increment/decrement (no atomic needed)". In `router_service.cpp` line 442, remove the stale "Atomic reads use relaxed ordering" comment.
   _Location:_ `src/router_service.hpp:92`, `src/router_service.cpp:442`
@@ -2434,7 +2434,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.2 `run_draining_reaper` Gate Holder Drops Before Fire-and-Forget Futures Complete
 
-- [ ] **Keep gate holder alive for the duration of `unregister_backend_global()` futures**
+- [x] **Keep gate holder alive for the duration of `unregister_backend_global()` futures**
   _Justification:_ `run_draining_reaper()` acquires a `gate::holder` at line 2013, then launches fire-and-forget futures via `unregister_backend_global(id)` in a loop (lines 2046-2052). The gate holder is a local variable scoped to `run_draining_reaper()` — it drops when the function returns, which is immediately after launching the fire-and-forget futures. This means the gate is not actually protecting the async lifetime of `unregister_backend_global()`. If `stop()` closes `_timer_gate` while those futures are still in flight, the futures may access `this` (via `unregister_backend_global`) after destruction begins. Contrast with `run_ttl_cleanup()` at line 858 which correctly uses `do_with(std::move(holder), ...)` to extend the holder's lifetime.
   _What to change:_ Collect all `unregister_backend_global()` futures into a vector, then use `seastar::do_with(std::move(holder), ...)` to keep the holder alive until all futures complete. Apply `.handle_exception()` to the combined future (not individual ones). This also keeps the fire-and-forget pattern but with proper gate lifetime.
   _Location:_ `src/router_service.cpp:2009-2054`
@@ -2443,7 +2443,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.3 `run_ttl_cleanup` Fire-and-Forget Future Missing Error Handling
 
-- [ ] **Attach `.handle_exception()` to the discarded future in `run_ttl_cleanup()`**
+- [x] **Attach `.handle_exception()` to the discarded future in `run_ttl_cleanup()`**
   _Justification:_ `run_ttl_cleanup()` at line 858 launches `(void)seastar::do_with(...)` as fire-and-forget. If `parallel_for_each` or any `submit_to` inside fails, the exception is silently discarded. This violates Rule #9 (every catch must log at warn level). The same pattern was fixed in `run_draining_reaper` (item 14.7) and `flush_route_batch` (existing code).
   _What to change:_ Attach `.handle_exception([](std::exception_ptr ep) { try { std::rethrow_exception(ep); } catch (const std::exception& e) { log_main.warn("TTL cleanup failed: {}", e.what()); } })` to the `do_with` chain.
   _Location:_ `src/router_service.cpp:858`
@@ -2452,7 +2452,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.4 `get_all_backend_states()` Uses `std::ostringstream` on Hot-ish Path
 
-- [ ] **Replace `std::ostringstream` address formatting with direct Seastar address accessors**
+- [x] **Replace `std::ostringstream` address formatting with `fmt::format`**
   _Justification:_ `get_all_backend_states()` (lines 1824-1826) creates a `std::ostringstream` per backend to format the socket address into a string, then manually parses the result to split address and port. `std::ostringstream` heap-allocates and is relatively expensive. While this is an admin API (not a true hot path), it runs on the reactor thread and could stall the event loop if there are many backends. Seastar's `socket_address` provides direct accessors for the address family, IPv4/IPv6 address, and port that avoid the stream round-trip entirely.
   _What to change:_ Use `seastar::net::inet_address` accessors and `addr.port()` directly instead of streaming to `ostringstream` and parsing back. This eliminates both the heap allocation and the string parsing.
   _Location:_ `src/router_service.cpp:1822-1854`
@@ -2461,7 +2461,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.5 `learn_route_global` Captures `this` in Cross-Shard Gossip Lambda
 
-- [ ] **Audit `this` capture safety in `learn_route_global()` gossip `submit_to` lambda**
+- [x] **Guard `this` captures in `learn_route_global()` gossip `submit_to` lambdas with gate**
   _Justification:_ At line 1368, `learn_route_global()` captures `this` in a `submit_to(0, ...)` lambda to access `_gossip->is_enabled()` and `_gossip->broadcast_route()`. This lambda runs on shard 0 asynchronously. The caller (`HttpController`) awaits the returned future, so normally `this` (the `RouterService`) is alive. However, if the caller drops or ignores the returned future (fire-and-forget pattern), the lambda could execute after `RouterService::stop()` has been called and `_gossip` has been destroyed. Currently `learn_route_global` is awaited by the caller, but this is a latent hazard if any future callsite uses fire-and-forget. The same pattern appears in `learn_route_global_multi()` at line 1518.
   _What to change:_ Add a `_timer_gate.hold()` at the start of `learn_route_global()` (with gate_closed_exception handling for early return), or document the contract that the returned future MUST be awaited. Both approaches are valid.
   _Location:_ `src/router_service.cpp:1368`, `src/router_service.cpp:1518`
@@ -2470,7 +2470,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.6 `learn_route_global` Uses `_config` Instead of Shard-Local Config for `prefix_token_length`
 
-- [ ] **Use shard-local config for `prefix_token_length` in `learn_route_global()`**
+- [x] **Use shard-local config for `prefix_token_length` in `learn_route_global()`**
   _Justification:_ At line 1325, `learn_route_global()` reads `_config.prefix_token_length` (the member variable) instead of `g_shard_state->config.prefix_token_length` (the shard-local copy). After a hot-reload via `update_routing_config()`, the shard-local config is updated on all shards (line 1943), and `_config` is also updated on shard 0 (line 1928). So on shard 0 they match. But `learn_route_global()` can be called from any shard via `HttpController`. If called from shard N (N > 0), `_config` is the RouterService member which lives on shard 0 — accessing it from shard N is a cross-shard read (Rule #14 violation). This hasn't caused issues because `learn_route_global` is likely always called on shard 0 via `submit_to`, but it's architecturally incorrect.
   _What to change:_ Replace `_config.prefix_token_length` with `g_shard_state->config.prefix_token_length` (with null guard). Same for `_config.max_route_tokens` at line 1338.
   _Location:_ `src/router_service.cpp:1325,1338`
@@ -2479,7 +2479,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.7 `learn_route_remote` Uses `_config.max_route_tokens` (Member on Shard 0 Only)
 
-- [ ] **Use shard-local config for `max_route_tokens` in `learn_route_remote()`**
+- [x] **Use shard-local config for `max_route_tokens` in `learn_route_remote()`**
   _Justification:_ Same issue as 17.6. `learn_route_remote()` at line 1548 reads `_config.max_route_tokens`. This function is called from the GossipService callback registered at line 581-583, which runs on shard 0 (where GossipService lives), so in practice the access is safe. However, the method is public and could theoretically be called from other shards. Using `g_shard_state->config.max_route_tokens` would be architecturally correct and consistent with the hot-reload pattern.
   _What to change:_ Replace `_config.max_route_tokens` with `g_shard_state->config.max_route_tokens` (with null guard). Similarly for `learn_route_global_multi()` at line 1471.
   _Location:_ `src/router_service.cpp:1548,1471`
@@ -2488,7 +2488,7 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ### 17.8 Duplicate Load-Tracking Stats: `cache_miss_due_to_load` and `load_aware_fallbacks`
 
-- [ ] **Remove duplicate stat `cache_miss_due_to_load` (identical to `load_aware_fallbacks`)**
+- [x] **Remove duplicate stat `cache_miss_due_to_load` (identical to `load_aware_fallbacks`)**
   _Justification:_ In `apply_load_aware_selection()` at lines 473-474, both `cache_miss_due_to_load` and `load_aware_fallbacks` are incremented in exactly the same place, making them always identical. They also have separate Prometheus metrics (`router_cache_miss_due_to_load_total` and `router_load_aware_fallbacks_total`) that report the same value. The `cache_miss_due_to_load` comment at line 128 says "Routes diverted due to backend load (same as fallbacks)" — explicitly acknowledging the duplication.
   _What to change:_ Remove `cache_miss_due_to_load` from `Stats`, its `reset()` call, the Prometheus metric registration, and the increment in `apply_load_aware_selection`. Keep `load_aware_fallbacks` as the single source of truth.
   _Location:_ `src/router_service.cpp:128,145,473,743-745`
