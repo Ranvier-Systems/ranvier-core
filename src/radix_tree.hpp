@@ -106,6 +106,11 @@ struct Node {
     RouteOrigin origin = RouteOrigin::LOCAL;
     std::chrono::steady_clock::time_point last_accessed;
 
+    // Intrusive LRU list pointers (only meaningful for leaf nodes).
+    // Maintained by RadixTree — do not modify directly.
+    Node* lru_prev = nullptr;  // Toward head (more recent)
+    Node* lru_next = nullptr;  // Toward tail (older)
+
     explicit Node(NodeType t) : type(t), last_accessed(std::chrono::steady_clock::now()) {}
     virtual ~Node() = default;
 };
@@ -412,21 +417,23 @@ public:
     //   while (tree->route_count() >= max_routes) tree->evict_oldest();
     //
     bool evict_oldest() {
-        Node* oldest = find_oldest_leaf(root_.get(), std::nullopt);
-        if (oldest && oldest->leaf_value.has_value()) {
-            oldest->leaf_value = std::nullopt;
-            if (route_count_ > 0) route_count_--;
-            return true;
-        }
-        return false;
+        if (!lru_tail_) return false;
+        Node* oldest = lru_tail_;
+        lru_remove(oldest);
+        oldest->leaf_value = std::nullopt;
+        if (route_count_ > 0) route_count_--;
+        return true;
     }
 
     bool evict_oldest_remote() {
-        Node* oldest = find_oldest_leaf(root_.get(), RouteOrigin::REMOTE);
-        if (oldest && oldest->leaf_value.has_value()) {
-            oldest->leaf_value = std::nullopt;
-            if (route_count_ > 0) route_count_--;
-            return true;
+        // Scan from tail (oldest) looking for a REMOTE route.
+        for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
+            if (n->origin == RouteOrigin::REMOTE) {
+                lru_remove(n);
+                n->leaf_value = std::nullopt;
+                if (route_count_ > 0) route_count_--;
+                return true;
+            }
         }
         return evict_oldest();
     }
@@ -474,6 +481,11 @@ private:
     uint32_t block_alignment_;
     size_t route_count_ = 0;
 
+    // Intrusive LRU doubly-linked list of leaf nodes.
+    // lru_head_ = most recently accessed, lru_tail_ = oldest (eviction target).
+    Node* lru_head_ = nullptr;
+    Node* lru_tail_ = nullptr;
+
     // -------------------------------------------------------------------------
     // Slab Allocator Access
     // -------------------------------------------------------------------------
@@ -502,6 +514,52 @@ private:
     template<typename NodeT>
     NodePtr make_node() const {
         return slab()->make_node<NodeT>();
+    }
+
+    // -------------------------------------------------------------------------
+    // Intrusive LRU List Operations
+    // -------------------------------------------------------------------------
+    //
+    // O(1) LRU maintenance for leaf nodes.  Only nodes with leaf_value are
+    // linked.  The list is ordered by access time: head = most recent,
+    // tail = oldest (eviction candidate).
+    //
+
+    // Unlink a node from the LRU list (safe to call on unlinked nodes).
+    void lru_remove(Node* node) {
+        if (!node) return;
+        if (node->lru_prev) {
+            node->lru_prev->lru_next = node->lru_next;
+        } else if (lru_head_ == node) {
+            lru_head_ = node->lru_next;
+        }
+        if (node->lru_next) {
+            node->lru_next->lru_prev = node->lru_prev;
+        } else if (lru_tail_ == node) {
+            lru_tail_ = node->lru_prev;
+        }
+        node->lru_prev = nullptr;
+        node->lru_next = nullptr;
+    }
+
+    // Insert a node at the head of the LRU list (most recently accessed).
+    void lru_push_front(Node* node) {
+        node->lru_prev = nullptr;
+        node->lru_next = lru_head_;
+        if (lru_head_) {
+            lru_head_->lru_prev = node;
+        }
+        lru_head_ = node;
+        if (!lru_tail_) {
+            lru_tail_ = node;
+        }
+    }
+
+    // Move an existing node to the head (touch on access).
+    void lru_touch(Node* node) {
+        if (!node || node == lru_head_) return;
+        lru_remove(node);
+        lru_push_front(node);
     }
 
     // -------------------------------------------------------------------------
@@ -968,10 +1026,21 @@ private:
             );
         }
 
-        // Transfer leaf data to child
+        // Transfer leaf data to child (including LRU position)
         new_child->leaf_value = node->leaf_value;
         new_child->origin = node->origin;
         new_child->last_accessed = node->last_accessed;
+        if (node->leaf_value.has_value()) {
+            // Replace node's position in the LRU list with new_child
+            new_child->lru_prev = node->lru_prev;
+            new_child->lru_next = node->lru_next;
+            if (node->lru_prev) node->lru_prev->lru_next = new_child.get();
+            if (node->lru_next) node->lru_next->lru_prev = new_child.get();
+            if (lru_head_ == node) lru_head_ = new_child.get();
+            if (lru_tail_ == node) lru_tail_ = new_child.get();
+            node->lru_prev = nullptr;
+            node->lru_next = nullptr;
+        }
         node->leaf_value = std::nullopt;
 
         // Move children to new node
@@ -1207,6 +1276,7 @@ private:
                     // Prefix mismatch - return best match so far
                     if (best_match_node) {
                         best_match_node->last_accessed = std::chrono::steady_clock::now();
+                        lru_touch(best_match_node);
                     }
                     result.backend = best_match;
                     return result;
@@ -1221,6 +1291,7 @@ private:
             if (match_len < prefix_len) {
                 if (best_match_node) {
                     best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    lru_touch(best_match_node);
                 }
                 result.backend = best_match;
                 return result;
@@ -1245,9 +1316,10 @@ private:
             tokens = tokens.subspan(1);
         }
 
-        // Touch LRU timestamp for matched node
+        // Touch LRU for matched node
         if (best_match_node) {
             best_match_node->last_accessed = std::chrono::steady_clock::now();
+            lru_touch(best_match_node);
         }
         result.backend = best_match;
         return result;
@@ -1284,6 +1356,11 @@ private:
             node->leaf_value = backend;
             node->origin = origin;
             node->last_accessed = std::chrono::steady_clock::now();
+            if (is_new) {
+                lru_push_front(node.get());
+            } else {
+                lru_touch(node.get());
+            }
             return {std::move(node), is_new};
         }
 
@@ -1301,6 +1378,7 @@ private:
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;
+            lru_push_front(new_child.get());
             node = add_child(std::move(node), next_key, std::move(new_child));
             return {std::move(node), true};
         }
@@ -1335,6 +1413,7 @@ private:
                     // Prefix mismatch - return best match so far
                     if (best_match_node) {
                         best_match_node->last_accessed = std::chrono::steady_clock::now();
+                        lru_touch(best_match_node);
                     }
                     return best_match;
                 }
@@ -1345,6 +1424,7 @@ private:
             if (match_len < prefix_len) {
                 if (best_match_node) {
                     best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    lru_touch(best_match_node);
                 }
                 return best_match;
             }
@@ -1368,9 +1448,10 @@ private:
             tokens = tokens.subspan(1);
         }
 
-        // Touch LRU timestamp for matched node
+        // Touch LRU for matched node
         if (best_match_node) {
             best_match_node->last_accessed = std::chrono::steady_clock::now();
+            lru_touch(best_match_node);
         }
         return best_match;
     }
@@ -1408,6 +1489,7 @@ private:
         if (!node) return;
 
         if (node->leaf_value.has_value() && node->last_accessed < cutoff) {
+            lru_remove(node);
             node->leaf_value = std::nullopt;
             removed++;
         }
@@ -1417,38 +1499,13 @@ private:
         });
     }
 
-    Node* find_oldest_leaf(Node* node, std::optional<RouteOrigin> filter_origin) {
-        if (!node) return nullptr;
-
-        Node* oldest = nullptr;
-        auto oldest_time = std::chrono::steady_clock::time_point::max();
-
-        find_oldest_recursive(node, oldest, oldest_time, filter_origin);
-        return oldest;
-    }
-
-    void find_oldest_recursive(Node* node, Node*& oldest,
-                               std::chrono::steady_clock::time_point& oldest_time,
-                               std::optional<RouteOrigin> filter_origin) {
-        if (!node) return;
-
-        bool matches_filter = !filter_origin.has_value() || node->origin == filter_origin.value();
-        if (node->leaf_value.has_value() && matches_filter && node->last_accessed < oldest_time) {
-            oldest_time = node->last_accessed;
-            oldest = node;
-        }
-
-        visit_children(node, [&](TokenId, Node* child) {
-            find_oldest_recursive(child, oldest, oldest_time, filter_origin);
-        });
-    }
-
     void remove_by_backend_recursive(Node* node, BackendId backend, RouteOrigin origin, size_t& removed) {
         if (!node) return;
 
         if (node->leaf_value.has_value() &&
             node->leaf_value.value() == backend &&
             node->origin == origin) {
+            lru_remove(node);
             node->leaf_value = std::nullopt;
             removed++;
         }
