@@ -69,7 +69,15 @@ struct BasicConnectionBundle {
         , created_at(Clock::now())
         , last_used(Clock::now()) {}
 
-    // Close the connection
+    /// Close the connection streams (output first, then input).
+    ///
+    /// @warning This method captures `this` in a Seastar continuation chain.
+    /// The caller MUST ensure the bundle outlives the returned future.
+    /// Safe patterns:
+    ///   - `co_await bundle.close()` — coroutine frame keeps bundle alive
+    ///   - `AsyncClosePolicy` — moves bundle to heap via unique_ptr
+    /// Unsafe pattern:
+    ///   - `(void)bundle.close()` on a stack/member bundle — use-after-free
     seastar::future<> close() {
         if (!is_valid) return seastar::make_ready_future<>();
         is_valid = false;
