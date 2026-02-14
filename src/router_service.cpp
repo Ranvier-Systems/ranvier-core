@@ -886,6 +886,13 @@ void RouterService::run_ttl_cleanup() {
                 return seastar::make_ready_future<>();
             });
         });
+    }).handle_exception([](std::exception_ptr ep) {
+        // Rule #9: every catch must log at warn level
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_main.warn("TTL cleanup failed: {}", e.what());
+        }
     });
 }
 
