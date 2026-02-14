@@ -2263,12 +2263,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.6 Replace `std::atomic` with Plain `uint64_t` for Shard-Local Load Counter
 
-- [ ] **Remove unnecessary `std::atomic` from `BackendInfo::active_requests`**
+- [x] **Remove unnecessary `std::atomic` from `BackendInfo::active_requests`** ✓
   _Justification:_ `BackendInfo` lives inside `thread_local ShardLocalState`. In Seastar's cooperative model, `active_requests` is only accessed from a single reactor thread (the `BackendRequestGuard` is documented as "shard-local operation only"). `std::atomic` is unnecessary and causes: (1) ~40 lines of manual copy/move constructor boilerplate because `std::atomic` isn't copyable/movable, (2) architectural confusion suggesting cross-thread access, (3) minor overhead on ARM (atomic stores emit barrier instructions even with relaxed ordering).
-  _What to change:_ Replace `std::atomic<uint64_t> active_requests{0}` with `uint64_t active_requests = 0`. Delete the manual copy constructor, move constructor, copy assignment, and move assignment (lines 87-131) — the compiler-generated defaults will work. Update `BackendRequestGuard` to use direct read/write instead of `.load()`/`.fetch_add()`/`.fetch_sub()`.
-  _Location:_ `src/router_service.cpp` (lines 73, 87-131, 334-399, 406-417)
+  _Approach implemented:_ Replaced `std::atomic<uint64_t>` with plain `uint64_t`. Deleted all four manual special members (copy/move ctor/assignment) — compiler defaults now work. Updated `BackendRequestGuard` to use `++`/`--`/direct reads. Updated `get_backend_load()` and `get_least_loaded_backend()`. Removed `#include <atomic>`. Net −51 lines.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Code simplification, minor perf improvement
+  _Completed:_ 2026-02-14
 
 ### 14.7 Add Error Handling to Fire-and-Forget `unregister_backend_global` in Draining Reaper
 

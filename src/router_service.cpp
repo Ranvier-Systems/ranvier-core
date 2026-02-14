@@ -16,7 +16,6 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <random>
@@ -66,68 +65,17 @@ struct BackendInfo {
     bool is_draining = false;
     std::chrono::steady_clock::time_point drain_start_time;
 
-    // Load tracking: in-flight requests to this backend (Rule #1: lock-free atomic)
-    // Incremented by BackendRequestGuard on construction, decremented on destruction.
-    // Uses relaxed ordering - we only need eventual visibility, not strict ordering.
-    std::atomic<uint64_t> active_requests{0};
+    // Load tracking: in-flight requests to this backend.
+    // Shard-local only — BackendInfo lives in thread_local ShardLocalState,
+    // accessed exclusively from one reactor thread.  No atomic needed.
+    uint64_t active_requests = 0;
 
-    // Default constructor
     BackendInfo() = default;
 
-    // Constructor for common initialization pattern
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_)
         : addr(std::move(addr_))
         , weight(weight_)
-        , priority(priority_)
-        , is_draining(false)
-        , drain_start_time()
-        , active_requests(0) {}
-
-    // Copy constructor: atomics aren't copyable, so load the value explicitly
-    BackendInfo(const BackendInfo& other)
-        : addr(other.addr)
-        , weight(other.weight)
-        , priority(other.priority)
-        , is_draining(other.is_draining)
-        , drain_start_time(other.drain_start_time)
-        , active_requests(other.active_requests.load(std::memory_order_relaxed)) {}
-
-    // Move constructor: atomics aren't movable, so load the value explicitly
-    BackendInfo(BackendInfo&& other) noexcept
-        : addr(std::move(other.addr))
-        , weight(other.weight)
-        , priority(other.priority)
-        , is_draining(other.is_draining)
-        , drain_start_time(other.drain_start_time)
-        , active_requests(other.active_requests.load(std::memory_order_relaxed)) {}
-
-    // Copy assignment
-    BackendInfo& operator=(const BackendInfo& other) {
-        if (this != &other) {
-            addr = other.addr;
-            weight = other.weight;
-            priority = other.priority;
-            is_draining = other.is_draining;
-            drain_start_time = other.drain_start_time;
-            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-        }
-        return *this;
-    }
-
-    // Move assignment
-    BackendInfo& operator=(BackendInfo&& other) noexcept {
-        if (this != &other) {
-            addr = std::move(other.addr);
-            weight = other.weight;
-            priority = other.priority;
-            is_draining = other.is_draining;
-            drain_start_time = other.drain_start_time;
-            active_requests.store(other.active_requests.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-        }
-        return *this;
-    }
+        , priority(priority_) {}
 };
 
 // ============================================================================
@@ -360,7 +308,8 @@ static RadixTree* local_tree() {
 // ============================================================================
 //
 // RAII guard for tracking in-flight requests per backend.
-// Rule #1: Uses atomic with relaxed ordering for lock-free operation.
+// BackendInfo lives in thread_local ShardLocalState — all access is from a
+// single reactor thread, so plain uint64_t is sufficient (no atomic needed).
 //
 
 BackendRequestGuard::BackendRequestGuard(BackendId id) : _backend_id(id), _active(false) {
@@ -373,8 +322,7 @@ BackendRequestGuard::BackendRequestGuard(BackendId id) : _backend_id(id), _activ
         return;  // Backend not found, guard remains inactive
     }
 
-    // Increment active requests (Rule #1: relaxed ordering for lock-free counter)
-    it->second.active_requests.fetch_add(1, std::memory_order_relaxed);
+    ++it->second.active_requests;
     _active = true;
 }
 
@@ -392,15 +340,10 @@ BackendRequestGuard::~BackendRequestGuard() {
         return;  // Backend was removed while request was in-flight
     }
 
-    // Decrement active requests (Rule #1: relaxed ordering)
-    // Guard against underflow: if backend was removed and re-registered while request
-    // was in-flight, the counter would be 0 (never incremented by this guard).
-    // Decrementing 0 would wrap to UINT64_MAX, causing incorrect load readings.
-    // In Seastar's cooperative model, no co_await between load and fetch_sub means
-    // this check is safe without additional synchronization.
-    uint64_t current = it->second.active_requests.load(std::memory_order_relaxed);
-    if (current > 0) {
-        it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
+    // Guard against underflow: if backend was removed and re-registered while
+    // request was in-flight, the counter would be 0.
+    if (it->second.active_requests > 0) {
+        --it->second.active_requests;
     }
 }
 
@@ -415,11 +358,8 @@ BackendRequestGuard& BackendRequestGuard::operator=(BackendRequestGuard&& other)
         // Decrement our current count if active (with underflow guard)
         if (_active && g_shard_state) {
             auto it = g_shard_state->backends.find(_backend_id);
-            if (it != g_shard_state->backends.end()) {
-                uint64_t current = it->second.active_requests.load(std::memory_order_relaxed);
-                if (current > 0) {
-                    it->second.active_requests.fetch_sub(1, std::memory_order_relaxed);
-                }
+            if (it != g_shard_state->backends.end() && it->second.active_requests > 0) {
+                --it->second.active_requests;
             }
         }
 
@@ -445,7 +385,7 @@ uint64_t get_backend_load(BackendId id) {
         return 0;
     }
 
-    return it->second.active_requests.load(std::memory_order_relaxed);
+    return it->second.active_requests;
 }
 
 std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates) {
@@ -470,7 +410,7 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
             continue;
         }
 
-        uint64_t load = it->second.active_requests.load(std::memory_order_relaxed);
+        uint64_t load = it->second.active_requests;
         if (load < best_load) {
             best_load = load;
             best_id = id;
@@ -494,7 +434,7 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
 //   request_id: For logging (can be empty)
 //   source: Description for logging ("ART" or "hash")
 //
-// Rule #1: Lock-free - all reads use atomic with relaxed ordering
+// Rule #1: Lock-free - shard-local state, no synchronization needed
 //
 // Performance notes:
 // - Early exits minimize work in the common case (not overloaded)
@@ -515,7 +455,7 @@ static BackendId apply_load_aware_selection(
     const uint64_t queue_threshold = g_shard_state->config.queue_depth_threshold;
     const uint64_t diff_threshold = g_shard_state->config.queue_diff_threshold;
 
-    // Check preferred backend's load (single atomic read)
+    // Check preferred backend's load
     uint64_t preferred_load = get_backend_load(preferred_id);
     if (preferred_load <= queue_threshold) {
         return preferred_id;  // Not overloaded - fast path
