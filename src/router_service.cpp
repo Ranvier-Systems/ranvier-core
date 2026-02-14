@@ -439,7 +439,7 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
 // Performance notes:
 // - Early exits minimize work in the common case (not overloaded)
 // - Config values cached in shard-local state (no cross-shard access)
-// - Atomic reads use relaxed ordering (no memory barriers)
+// - All reads are shard-local plain integers (no atomics needed)
 static BackendId apply_load_aware_selection(
     BackendId preferred_id,
     const std::vector<BackendId>& live_backends,

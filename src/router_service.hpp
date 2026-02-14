@@ -89,7 +89,7 @@ struct PrefixRouteResult {
 // Design:
 //   - Move-only for safe ownership transfer through do_with chains
 //   - Shard-local operation only (accesses thread_local g_shard_state)
-//   - Lock-free: uses atomic increment/decrement with relaxed ordering
+//   - Shard-local: uses plain integer increment/decrement (no atomic needed)
 //
 class BackendRequestGuard {
 public:
