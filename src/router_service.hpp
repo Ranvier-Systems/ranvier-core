@@ -344,6 +344,9 @@ public:
     // Mark a backend as draining in shard-local state.
     static void set_backend_draining_for_testing(BackendId id);
 
+    // Clear draining flag on a backend (simulates ACTIVE state transition).
+    static void clear_backend_draining_for_testing(BackendId id);
+
     // Mark a backend as dead (circuit-breaker quarantine) in shard-local state.
     static void mark_backend_dead_for_testing(BackendId id);
 

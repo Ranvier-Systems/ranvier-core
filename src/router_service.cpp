@@ -2128,11 +2128,12 @@ seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
 
 seastar::future<> RouterService::handle_node_state_change(BackendId backend, NodeState node_state) {
     if (node_state == NodeState::DRAINING) {
-        log_router.info("Received DRAINING notification for backend {} - setting weight to 0", backend);
+        log_router.info("Received DRAINING notification for backend {} - marking as draining", backend);
 
-        // Broadcast weight=0 to all shards to stop new traffic to this backend
-        // This is more graceful than removing the backend entirely, as it allows
-        // in-flight requests to complete while preventing new routing decisions
+        // Broadcast draining state to all shards to stop new traffic to this backend.
+        // The is_draining flag is checked by get_live_backends()/get_live_backend_infos(),
+        // which all routing paths use.  We intentionally preserve the original weight so
+        // it is restored correctly when the backend returns to ACTIVE.
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
@@ -2140,20 +2141,16 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
                     auto& state = shard_state();
                     auto it = state.backends.find(backend);
                     if (it != state.backends.end()) {
-                        // Set weight to 0 - backend won't be selected for new requests
-                        // but existing connections continue working
-                        it->second.weight = 0;
                         it->second.is_draining = true;
                         it->second.drain_start_time = std::chrono::steady_clock::now();
-                        log_router.debug("Shard {}: Backend {} weight set to 0 (draining)",
-                                        seastar::this_shard_id(), backend);
+                        log_router.debug("Shard {}: Backend {} marked draining (weight {} preserved)",
+                                        seastar::this_shard_id(), backend, it->second.weight);
                     }
                     return seastar::make_ready_future<>();
                 });
             });
     } else if (node_state == NodeState::ACTIVE) {
-        // Node is back online - restore default weight (could be enhanced to store original weight)
-        log_router.info("Received ACTIVE notification for backend {} - restoring weight", backend);
+        log_router.info("Received ACTIVE notification for backend {} - restoring to active", backend);
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [backend](unsigned shard_id) {
                 return seastar::smp::submit_to(shard_id, [backend] {
@@ -2161,11 +2158,9 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
                     auto& state = shard_state();
                     auto it = state.backends.find(backend);
                     if (it != state.backends.end() && it->second.is_draining) {
-                        // Restore default weight
-                        it->second.weight = 100;
                         it->second.is_draining = false;
-                        log_router.debug("Shard {}: Backend {} restored to active (weight=100)",
-                                        seastar::this_shard_id(), backend);
+                        log_router.debug("Shard {}: Backend {} restored to active (weight {})",
+                                        seastar::this_shard_id(), backend, it->second.weight);
                     }
                     return seastar::make_ready_future<>();
                 });
@@ -2223,6 +2218,14 @@ void RouterService::set_backend_draining_for_testing(BackendId id) {
     if (it != g_shard_state->backends.end()) {
         it->second.is_draining = true;
         it->second.drain_start_time = std::chrono::steady_clock::now();
+    }
+}
+
+void RouterService::clear_backend_draining_for_testing(BackendId id) {
+    if (!g_shard_state) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it != g_shard_state->backends.end()) {
+        it->second.is_draining = false;
     }
 }
 

@@ -2254,12 +2254,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.5 Preserve Original Backend Weight Across DRAINING→ACTIVE Transitions
 
-- [ ] **Stop overwriting backend weight during DRAINING, or store original weight for restoration**
+- [x] **Stop overwriting backend weight during DRAINING, or store original weight for restoration** ✓
   _Justification:_ `handle_node_state_change()` sets `weight = 0` on DRAINING and hardcodes `weight = 100` on ACTIVE restore. Backends registered with custom weights (e.g., 50 for smaller GPUs, 200 for larger ones) lose their weight permanently. Since `is_draining = true` already excludes backends from all routing paths (`get_random_backend`, `get_backend_for_prefix`, `get_backend_by_hash` all check `is_draining`), the `weight = 0` assignment is redundant.
-  _What to change:_ **Option A (simplest):** Remove the `weight = 0` line from the DRAINING handler and the `weight = 100` line from the ACTIVE handler. The `is_draining` flag is already sufficient. **Option B:** Add `uint32_t original_weight` to `BackendInfo`, save before zeroing, restore on ACTIVE.
-  _Location:_ `src/router_service.cpp` (lines 2149-2152 for DRAINING, 2169-2172 for ACTIVE)
+  _Approach implemented:_ Option A — removed `weight = 0` from DRAINING handler and `weight = 100` from ACTIVE handler. The `is_draining` flag (checked by `get_live_backends()`/`get_live_backend_infos()`) is sufficient to exclude backends from all routing decisions. Original weight is now preserved through the full drain cycle. Added `clear_backend_draining_for_testing()` helper and `CustomWeightPreservedAcrossDrainCycle` unit test.
+  _Location:_ `src/router_service.cpp`, `src/router_service.hpp`, `tests/unit/router_service_test.cpp`
   _Complexity:_ Low
-  _Priority:_ P2 — Correctness bug for deployments using custom backend weights
+  _Completed:_ 2026-02-14
 
 ### 14.6 Replace `std::atomic` with Plain `uint64_t` for Shard-Local Load Counter
 
