@@ -2245,12 +2245,12 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
 
 ### 14.4 Eliminate `std::map` Allocation on Hot Path in `get_random_backend()`
 
-- [ ] **Replace `std::map` priority grouping with a single-pass min-priority scan**
+- [x] **Replace `std::map` priority grouping with a single-pass min-priority scan** ✓
   _Justification:_ `get_random_backend()` constructs a `std::map<uint32_t, std::vector<...>>` on every call. `std::map` allocates a red-black tree node per entry. Since only the highest-priority group (lowest number) is used, a single pass tracking the minimum priority and accumulating candidates into a pre-allocated vector eliminates all heap allocations.
-  _What to change:_ Replace the `std::map priority_groups` with a two-pass or single-pass approach: (1) find the minimum priority value across live backends, (2) collect candidates matching that priority. Alternatively, combine with backlog item 14.3 by having `get_live_backends()` return results sorted by priority.
-  _Location:_ `src/router_service.cpp` (line 1102)
+  _Approach implemented:_ Two linear passes over the `live_infos` vector returned by `get_live_backend_infos()`: (1) find `min_priority` and accumulate `total_weight` for that priority, (2) weighted random selection over matching candidates. Zero heap allocations — no `std::map`, no `std::vector` of candidates. Also removed now-unused `#include <map>`.
+  _Location:_ `src/router_service.cpp`
   _Complexity:_ Low
-  _Priority:_ P3 — Hot-path performance; most impactful under RANDOM mode or fail-open
+  _Completed:_ 2026-02-14
 
 ### 14.5 Preserve Original Backend Weight Across DRAINING→ACTIVE Transitions
 
