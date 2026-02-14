@@ -5,7 +5,7 @@ E2E Integration Tests for Load-Aware Routing
 This test suite validates Ranvier's load-aware routing behavior:
 1. Baseline: Disabled load-aware routing under heavy load (control)
 2. Enabled: Load-aware routing reduces TTFT under heavy load
-3. Metrics: cache_miss_due_to_load counter increments correctly
+3. Metrics: load_aware_fallbacks counter increments correctly
 4. Metrics: backend_active_requests gauge reflects in-flight requests
 5. Normal load: No routing changes when load is below threshold
 
@@ -225,7 +225,6 @@ def get_load_aware_metrics(metrics_url: str) -> Dict[str, float]:
 
     return {
         # Load-aware fallback counters (Seastar adds 'seastar_' prefix)
-        "cache_miss_due_to_load": sum(metrics.get("seastar_ranvier_cache_miss_due_to_load_total", [0])),
         "load_aware_fallbacks": sum(metrics.get("seastar_ranvier_load_aware_fallbacks_total", [0])),
         # Backend active requests gauges
         "backend_active_requests": metrics.get("seastar_ranvier_backend_active_requests", []),
@@ -609,13 +608,13 @@ class LoadAwareRoutingTest(unittest.TestCase):
 
         print("  PASSED: Load test completed with load-aware routing")
 
-    def test_03_metrics_cache_miss_due_to_load(self):
-        """Verify that cache_miss_due_to_load counter increments under heavy load.
+    def test_03_metrics_load_aware_fallbacks(self):
+        """Verify that load_aware_fallbacks counter increments under heavy load.
 
         Under heavy load, when load-aware routing diverts requests from overloaded
-        backends, the cache_miss_due_to_load metric should increment.
+        backends, the load_aware_fallbacks metric should increment.
         """
-        print("\nTest: Metrics cache_miss_due_to_load increments")
+        print("\nTest: Metrics load_aware_fallbacks increments")
 
         api_url = NODES["node1"]["api"]
         metrics_url = NODES["node1"]["metrics"]
@@ -821,7 +820,7 @@ def main():
     print("=" * 70)
     print("\nThese tests validate load-aware routing behavior:")
     print("  - TTFT improvement under heavy concurrent load")
-    print("  - Proper metric tracking (cache_miss_due_to_load, active_requests)")
+    print("  - Proper metric tracking (load_aware_fallbacks, active_requests)")
     print("  - Normal load behavior (no unnecessary fallbacks)")
     print("")
 
