@@ -384,6 +384,24 @@ TEST_F(RouterServiceTest, DrainingBackendStateReported) {
     EXPECT_TRUE(states[0].is_draining);
 }
 
+TEST_F(RouterServiceTest, CustomWeightPreservedAcrossDrainCycle) {
+    // Register with a custom weight (not the default 100)
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080), 200, 0);
+
+    auto before = router_->get_all_backend_states();
+    ASSERT_EQ(before.size(), 1u);
+    EXPECT_EQ(before[0].weight, 200u);
+
+    // Drain and then restore
+    RouterService::set_backend_draining_for_testing(1);
+    RouterService::clear_backend_draining_for_testing(1);
+
+    auto after = router_->get_all_backend_states();
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0].weight, 200u);  // Original weight must survive drain cycle
+    EXPECT_FALSE(after[0].is_draining);
+}
+
 TEST_F(RouterServiceTest, AllBackendsDrainingReturnsNullopt) {
     register_two_backends();
     RouterService::set_backend_draining_for_testing(1);
