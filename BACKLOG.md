@@ -24,6 +24,7 @@ This document identifies missing features and optimizations required to promote 
 12. [Test Coverage Gaps (2026-02-06)](#12-test-coverage-gaps-2026-02-06)
 13. [Adversarial System Audit (2026-02-12)](#13-adversarial-system-audit-2026-02-12)
 14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
+15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
 
 ---
 
@@ -2276,6 +2277,75 @@ Deep-dive review of `router_service.{hpp,cpp}` identifying correctness, maintain
   _Location:_ `src/router_service.cpp` (line 2111)
   _Complexity:_ Low
   _Priority:_ P3 — Defensive correctness
+
+---
+
+## 15. HTTP Controller Review (2026-02-14)
+
+Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines). Full analysis in `.dev-context/http-controller-review.md`.
+
+### 15.1 Implement or Remove Dead P2C Cross-Shard Dispatch
+
+- [ ] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
+  _Justification:_ The P2C algorithm selects a target shard, but the result is only logged — the request is always processed on the local shard. There is no `smp::submit_to(target_shard, ...)` anywhere in `http_controller.cpp`. The `_requests_cross_shard_dispatch` counter increments, but no actual cross-shard dispatch occurs. The entire P2C load balancing feature (`LoadBalancingSettings`, `ShardLoadBalancer` integration, cross-shard dispatch metrics) is dead code that gives the appearance of load balancing without providing it.
+  _What to change:_ **Option A (implement):** Add `smp::submit_to(target_shard, ...)` to actually dispatch requests cross-shard when P2C selects a remote shard. Requires `cross_shard_request.hpp` / `foreign_ptr` for safe data transfer per Hard Rule #14. **Option B (remove):** Delete `select_target_shard()`, `LoadBalancingSettings`, `_load_balancer`, `_lb_config`, and the cross-shard dispatch metrics to eliminate dead code.
+  _Location:_ `src/http_controller.cpp` (lines 725-731, 1839-1864), `src/http_controller.hpp` (lines 55-60, 247-248)
+  _Complexity:_ High (Option A), Low (Option B)
+  _Priority:_ P1 — Dead code that misleads operators into believing load balancing is active
+
+### 15.2 Escape User-Controlled Strings in JSON Error Responses
+
+- [ ] **Extract `escape_json_string` into a shared utility and use it for all JSON string interpolation**
+  _Justification:_ Multiple error responses interpolate external strings directly into JSON without escaping. If any of these strings contain `"`, `\`, or control characters, the response becomes malformed JSON. The codebase already has an `escape_json_string` lambda at line 1738, but it is local to `handle_keys_reload`. Affected lines: 181 (auth info), 803 (token error), 1071 (route error message), 1448 (validation error).
+  _What to change:_ Move `escape_json_string` from the local lambda in `handle_keys_reload` to a utility function in `parse_utils.hpp`. Apply it to all JSON string interpolation sites. Alternatively, use RapidJSON (already a dependency) for response construction.
+  _Location:_ `src/http_controller.cpp` (lines 181, 803, 1071, 1448, 1738), `src/parse_utils.hpp`
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness; malformed JSON responses on certain inputs
+
+### 15.3 Replace `std::atomic` Counters With Plain `uint64_t`
+
+- [ ] **Remove unnecessary `std::atomic` from shard-local metric counters in `HttpController`**
+  _Justification:_ In Seastar's shared-nothing model, each `HttpController` instance lives on exactly one shard. The four atomic counters (`_requests_rejected_concurrency`, `_requests_rejected_persistence`, `_requests_local_dispatch`, `_requests_cross_shard_dispatch`) are only ever incremented from that shard's reactor thread. No cross-shard code reads them. Using `std::atomic` adds unnecessary memory fence overhead and contradicts Hard Rule #0/#1.
+  _What to change:_ Replace `std::atomic<uint64_t>` with plain `uint64_t` for all four counters. If metrics scraping needs cross-shard access, use `smp::submit_to` to gather them.
+  _Location:_ `src/http_controller.hpp` (lines 259-264)
+  _Complexity:_ Low
+  _Priority:_ P3 — Code hygiene and minor performance improvement
+
+### 15.4 Sanitize Header Values and Fix Hardcoded Host in Backend Request Construction
+
+- [ ] **Sanitize outgoing header values and derive Host from target address**
+  _Justification:_ `send_backend_request()` builds the HTTP request via raw string concatenation. The `Host` header is hardcoded to `localhost`. `ctx.request_id` and `ctx.backend_traceparent` originate from client headers and are injected without CRLF injection checks — a crafted `X-Request-ID` containing `\r\n` could inject arbitrary headers. The body is also concatenated into the header string, doubling memory for large payloads.
+  _What to change:_ (1) Strip `\r` and `\n` from `request_id` and `backend_traceparent` before interpolation. (2) Derive the `Host` header from `ctx.current_addr`. (3) Write headers and body as two separate `write()` calls to avoid the double-copy for large payloads.
+  _Location:_ `src/http_controller.cpp` (lines 420-432)
+  _Complexity:_ Low
+  _Priority:_ P2 — Header injection risk and correctness
+
+### 15.5 Optimize Per-Chunk Flush in SSE Streaming Loop
+
+- [ ] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
+  _Justification:_ Every chunk received from the backend triggers a `write()` + `flush()` to the client. For streaming LLM responses with many small SSE events (10-50 bytes per token), this produces one syscall per token. While low-latency delivery is intentional for SSE, a more nuanced approach could batch flushes when multiple chunks are available in the same reactor tick.
+  _What to change:_ Remove the per-chunk `flush()` and rely on Seastar's internal output stream buffering, or implement a configurable flush strategy: immediate for `[DONE]` events, batched otherwise (e.g., flush every 10ms via a timer or after N bytes accumulated).
+  _Location:_ `src/http_controller.cpp` (lines 602-603)
+  _Complexity:_ Medium
+  _Priority:_ P3 — Performance; most impactful at high token throughput
+
+### 15.6 Add Explicit `stop()` Method for Orderly Shutdown
+
+- [ ] **Add `seastar::future<> stop()` to `HttpController` for clean lifecycle management**
+  _Justification:_ `HttpController` is used as `seastar::sharded<HttpController>`, so Seastar calls `.stop()` on each shard during shutdown. The class has no `stop()` method and relies on the default (ready future). However, `_rate_limiter.start()` is called in `register_routes()` and only stopped in `wait_for_drain()`. If teardown skips `wait_for_drain()`, the rate limiter timer could fire after destruction. Per Hard Rule #5 (timer gate guards) and #6 (deregister metrics in stop).
+  _What to change:_ Add `seastar::future<> stop()` that: (1) calls `_rate_limiter.stop()`, (2) closes `_request_gate` if not already closed, (3) ensures orderly cleanup regardless of whether `wait_for_drain()` was called.
+  _Location:_ `src/http_controller.hpp` (class declaration), `src/http_controller.cpp` (new method)
+  _Complexity:_ Low
+  _Priority:_ P2 — Defensive correctness; prevents use-after-free on abnormal shutdown paths
+
+### 15.7 Bound Recursive JSON Serialization in Admin Endpoints
+
+- [ ] **Add depth and size limits to `dump_node_to_json` and admin dump handlers**
+  _Justification:_ The tree dump handler recursively serializes the entire radix tree into a `std::ostringstream` with no upper bound. For production systems with tens of thousands of routes, this could produce multi-MB JSON responses. The recursive `dump_node_to_json` also risks stack overflow for deeply nested trees. `handle_dump_cluster` and `handle_dump_backends` have similar unbounded output.
+  _What to change:_ (1) Add a `max_depth` parameter to `dump_node_to_json` (default: 32) to bound recursion. (2) Add a `?limit=N` query parameter to cap the number of nodes returned. (3) Consider streaming JSON output for large responses rather than building the entire string in memory.
+  _Location:_ `src/http_controller.cpp` (lines 1871-1986, 2005-2077)
+  _Complexity:_ Low
+  _Priority:_ P3 — Defensive correctness; prevents OOM on large trees
 
 ---
 
