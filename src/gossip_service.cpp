@@ -196,37 +196,33 @@ seastar::future<> GossipService::start() {
     log_gossip.info("Starting gossip service on port {}", _config.gossip_port);
     log_gossip.info("Configured peers: {}", _peer_addresses.size());
 
-    try {
-        // Start transport layer (UDP/DTLS)
-        co_await _transport->start(_config.gossip_port);
+    // Start transport layer (UDP/DTLS)
+    co_await _transport->start(_config.gossip_port);
 
-        // Start consensus layer (peer table, quorum)
-        co_await _consensus->start(_peer_addresses);
+    // Start consensus layer (peer table, quorum)
+    co_await _consensus->start(_peer_addresses);
 
-        // Start protocol layer (message handling, reliable delivery)
-        co_await _protocol->start(*_transport, *_consensus, _peer_addresses);
+    // Start protocol layer (message handling, reliable delivery)
+    co_await _protocol->start(*_transport, *_consensus, _peer_addresses);
 
-        // Initiate DTLS handshakes with all configured peers
-        if (_transport->is_dtls_enabled()) {
-            log_gossip.info("Initiating DTLS handshakes with {} peers", _peer_addresses.size());
-            for (const auto& peer : _peer_addresses) {
-                (void)_transport->initiate_handshake(peer);
-            }
+    // Initiate DTLS handshakes with all configured peers
+    if (_transport->is_dtls_enabled()) {
+        log_gossip.info("Initiating DTLS handshakes with {} peers", _peer_addresses.size());
+        for (const auto& peer : _peer_addresses) {
+            (void)_transport->initiate_handshake(peer);
         }
-
-        // Start receive loop in background
-        _receive_loop_future = receive_loop().handle_exception([](auto ep) {
-            try {
-                std::rethrow_exception(ep);
-            } catch (const std::exception& e) {
-                log_gossip.error("Gossip receive loop error: {}", e.what());
-            }
-        });
-
-        log_gossip.info("Gossip service started successfully");
-    } catch (...) {
-        throw;
     }
+
+    // Start receive loop in background
+    _receive_loop_future = receive_loop().handle_exception([](auto ep) {
+        try {
+            std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            log_gossip.error("Gossip receive loop error: {}", e.what());
+        }
+    });
+
+    log_gossip.info("Gossip service started successfully");
 }
 
 seastar::future<> GossipService::stop() {
