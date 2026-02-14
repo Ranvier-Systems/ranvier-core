@@ -92,6 +92,10 @@ enum class NodeType : uint8_t {
     Node256
 };
 
+// Hard Rule #4: Every growing container needs an explicit MAX_SIZE.
+// Prefixes longer than this are split into chains of nodes.
+static constexpr size_t MAX_PREFIX_LENGTH = 256;
+
 // =============================================================================
 // Node Structures
 // =============================================================================
@@ -1007,6 +1011,49 @@ private:
         return make_node<Node256>();
     }
 
+    // Split a node whose prefix exceeds MAX_PREFIX_LENGTH into a chain.
+    // The node keeps the first MAX_PREFIX_LENGTH tokens; excess is pushed
+    // into a new child node linked via the first excess token as edge key.
+    void split_long_prefix(Node* node) {
+        while (node->prefix.size() > MAX_PREFIX_LENGTH) {
+            TokenId edge_key = node->prefix[MAX_PREFIX_LENGTH];
+            auto new_child = make_node<Node4>();
+
+            // Move the excess suffix (after edge key) to child prefix
+            if (MAX_PREFIX_LENGTH + 1 < node->prefix.size()) {
+                new_child->prefix.assign(
+                    node->prefix.begin() + MAX_PREFIX_LENGTH + 1,
+                    node->prefix.end()
+                );
+            }
+
+            // Transfer leaf data to child
+            new_child->leaf_value = node->leaf_value;
+            new_child->origin = node->origin;
+            new_child->last_accessed = node->last_accessed;
+
+            // Transfer LRU position to child
+            if (node->leaf_value.has_value()) {
+                new_child->lru_prev = node->lru_prev;
+                new_child->lru_next = node->lru_next;
+                if (node->lru_prev) node->lru_prev->lru_next = new_child.get();
+                if (node->lru_next) node->lru_next->lru_prev = new_child.get();
+                if (lru_head_ == node) lru_head_ = new_child.get();
+                if (lru_tail_ == node) lru_tail_ = new_child.get();
+                node->lru_prev = nullptr;
+                node->lru_next = nullptr;
+            }
+            node->leaf_value = std::nullopt;
+
+            // Move existing children to new_child
+            move_children_to_new_node(node, new_child.get());
+
+            // Truncate parent prefix and add child
+            node->prefix.resize(MAX_PREFIX_LENGTH);
+            add_single_child_after_split(node, edge_key, std::move(new_child));
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Split Operation
     // -------------------------------------------------------------------------
@@ -1049,6 +1096,11 @@ private:
         // Truncate parent prefix and add single child
         node->prefix.resize(split_point);
         add_single_child_after_split(node, edge_key, std::move(new_child));
+
+        // Rule #4: bound prefix length (defense-in-depth for split results)
+        if (node->prefix.size() > MAX_PREFIX_LENGTH) {
+            split_long_prefix(node);
+        }
     }
 
     void move_children_to_new_node(Node* src, Node* dest) {
@@ -1379,6 +1431,10 @@ private:
             new_child->leaf_value = backend;
             new_child->origin = origin;
             lru_push_front(new_child.get());
+            // Rule #4: bound prefix length to prevent pathological memory usage
+            if (new_child->prefix.size() > MAX_PREFIX_LENGTH) {
+                split_long_prefix(new_child.get());
+            }
             node = add_child(std::move(node), next_key, std::move(new_child));
             return {std::move(node), true};
         }
