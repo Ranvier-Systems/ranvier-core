@@ -533,18 +533,19 @@ private:
 
     // Evict the oldest connection across all pools
     void evict_oldest_global() {
-        seastar::socket_address* oldest_addr = nullptr;
+        auto oldest_it = _pools.end();
         typename Clock::time_point oldest_time = Clock::now();
 
-        for (auto& [addr, pool] : _pools) {
+        for (auto it = _pools.begin(); it != _pools.end(); ++it) {
+            auto& pool = it->second;
             if (!pool.empty() && pool.front().last_used < oldest_time) {
                 oldest_time = pool.front().last_used;
-                oldest_addr = const_cast<seastar::socket_address*>(&addr);
+                oldest_it = it;
             }
         }
 
-        if (oldest_addr) {
-            auto& pool = _pools[*oldest_addr];
+        if (oldest_it != _pools.end()) {
+            auto& pool = oldest_it->second;
             if (!pool.empty()) {
                 auto oldest = std::move(pool.front());
                 pool.pop_front();
