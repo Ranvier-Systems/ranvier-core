@@ -624,13 +624,13 @@ private:
                 if (n->keys[idx] == key) [[likely]] {
                     return n->children[idx].get();
                 }
-                // Collision case: key_byte matches but full key differs
-                // Fall back to linear search for the correct entry
-                if (n->keys[idx] != Node256::EMPTY_KEY) {
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == key) {
-                            return n->children[i].get();
-                        }
+                // Collision case: preferred slot doesn't hold our key.
+                // Always linear scan — the entry may be displaced to any slot
+                // (the preferred slot could be empty if the original occupant
+                // was evicted, but displaced entries from collisions still exist).
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        return n->children[i].get();
                     }
                 }
                 return nullptr;
@@ -676,13 +676,11 @@ private:
                     n->keys[idx] = Node256::EMPTY_KEY;
                     return std::move(n->children[idx]);
                 }
-                // Collision case: linear search
-                if (n->keys[idx] != Node256::EMPTY_KEY) {
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == key) {
-                            n->keys[i] = Node256::EMPTY_KEY;
-                            return std::move(n->children[i]);
-                        }
+                // Collision case: always linear scan — entry may be displaced
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        n->keys[i] = Node256::EMPTY_KEY;
+                        return std::move(n->children[i]);
                     }
                 }
                 break;
