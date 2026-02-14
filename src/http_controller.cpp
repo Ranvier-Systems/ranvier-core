@@ -416,28 +416,34 @@ future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionB
         co_return false;
     }
 
-    // Build HTTP request with tracing headers for backend
-    sstring http_req =
+    // Build HTTP request headers with sanitized values to prevent CRLF injection.
+    // Host is derived from the target address (not hardcoded to localhost).
+    // Headers and body are written separately to avoid doubling memory for large payloads.
+    sstring host_value = to_sstring(ctx.current_addr);
+    sstring safe_request_id = sstring(sanitize_header_value(ctx.request_id));
+
+    sstring http_headers =
         "POST " + sstring(ctx.endpoint) + " HTTP/1.1\r\n"
-        "Host: localhost\r\n"
+        "Host: " + host_value + "\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: " + to_sstring(ctx.forwarded_body.size()) + "\r\n"
-        "X-Request-ID: " + ctx.request_id + "\r\n";
+        "X-Request-ID: " + safe_request_id + "\r\n";
 
-    // Add traceparent header if tracing is enabled
+    // Add traceparent header if tracing is enabled (sanitize to prevent injection)
     if (!ctx.backend_traceparent.empty()) {
-        http_req += "traceparent: " + ctx.backend_traceparent + "\r\n";
+        http_headers += "traceparent: " + sstring(sanitize_header_value(ctx.backend_traceparent)) + "\r\n";
     }
 
-    http_req += "Connection: keep-alive\r\n\r\n" + ctx.forwarded_body;
+    http_headers += "Connection: keep-alive\r\n\r\n";
 
     log_proxy.info("[{}] Sending request to backend ({} bytes)",
                   ctx.request_id, ctx.forwarded_body.size());
 
-    // Send request with broken pipe/connection reset handling
+    // Send headers and body separately to avoid concatenating large payloads
     std::exception_ptr rethrow_exception;
     try {
-        co_await bundle.out.write(http_req);
+        co_await bundle.out.write(http_headers);
+        co_await bundle.out.write(ctx.forwarded_body);
         co_await bundle.out.flush();
         co_return true;
     } catch (...) {
