@@ -2041,8 +2041,15 @@ void RouterService::run_draining_reaper() {
             _pool_cleanup_callback(addr);
         }
 
-        // Fire-and-forget the unregister (runs asynchronously)
-        (void)unregister_backend_global(id);
+        // Unregister from all shards asynchronously; log on failure
+        // (Rule #9: every catch must log at warn level)
+        (void)unregister_backend_global(id).handle_exception([id](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_router.warn("Failed to unregister drained backend {}: {}", id, e.what());
+            }
+        });
     }
 }
 
