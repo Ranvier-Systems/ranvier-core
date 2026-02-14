@@ -344,6 +344,7 @@ public:
         size_t backends_rejected;            // Connections not pooled due to backend limit
         size_t connections_created;          // Total new connections opened
         size_t connections_reused;           // Total connections served from pool
+        size_t global_evictions;            // Times global eviction scan ran (O(B) path)
     };
 
     Stats stats() const {
@@ -357,7 +358,8 @@ public:
             _connections_reaped_max_age,
             _backends_rejected,
             _connections_created,
-            _connections_reused
+            _connections_reused,
+            _global_evictions
         };
     }
 
@@ -490,6 +492,7 @@ private:
     size_t _backends_rejected = 0;
     size_t _connections_created = 0;
     size_t _connections_reused = 0;
+    size_t _global_evictions = 0;
     seastar::timer<> _reaper_timer;
 
     // RAII gate for timer callback lifetime safety (Rule #5).
@@ -531,8 +534,12 @@ private:
         arm_reaper_timer();
     }
 
-    // Evict the oldest connection across all pools
+    // Evict the oldest connection across all pools.
+    // O(B) where B = number of backends. Bounded by max_backends (default 1000).
+    // Only runs when at max_total_connections capacity, which the reaper timer
+    // (every 15s) prevents in practice. Monitor via _global_evictions counter.
     void evict_oldest_global() {
+        _global_evictions++;
         auto oldest_it = _pools.end();
         typename Clock::time_point oldest_time = Clock::now();
 
@@ -551,6 +558,11 @@ private:
                 pool.pop_front();
                 _total_idle_connections--;
                 close_bundle_async(std::move(oldest));
+
+                // Clean up empty map entry to shrink future scans (Rule #4)
+                if (pool.empty()) {
+                    _pools.erase(oldest_it);
+                }
             }
         }
     }

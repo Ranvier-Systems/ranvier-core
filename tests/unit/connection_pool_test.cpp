@@ -627,6 +627,7 @@ TEST_F(ConnectionPoolStatsTest, InitialStatsAreZero) {
     EXPECT_EQ(s.backends_rejected, 0u);
     EXPECT_EQ(s.connections_created, 0u);
     EXPECT_EQ(s.connections_reused, 0u);
+    EXPECT_EQ(s.global_evictions, 0u);
 }
 
 TEST_F(ConnectionPoolStatsTest, StatsTrackPutAndCleanup) {
