@@ -26,6 +26,7 @@ This document identifies missing features and optimizations required to promote 
 14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
 15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
 16. [Radix Tree Review (2026-02-14)](#16-radix-tree-review-2026-02-14)
+17. [Connection Pool Review (2026-02-14)](#17-connection-pool-review-2026-02-14)
 
 ---
 
@@ -2563,6 +2564,75 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
   _Location:_ `src/http_controller.cpp` (lines 1871-1986, 2005-2077)
   _Complexity:_ Low
   _Priority:_ P3 — Defensive correctness; prevents OOM on large trees
+
+---
+
+## 17. Connection Pool Review (2026-02-14)
+
+Deep-dive review of `src/connection_pool.hpp` across correctness, performance, and maintainability.
+
+### 17.1 Silent Exception Swallowing in `BasicConnectionBundle::close()` (Rule #9)
+
+- [x] **Log exceptions in `BasicConnectionBundle::close()` instead of silently discarding them**
+  _Justification:_ Line 76 uses `.handle_exception([](auto) {})` which silently swallows all exceptions during stream close. This violates Hard Rule #9 (every catch block must log at warn level). A failed close could indicate a networking issue, resource leak, or Seastar internal error—all invisible today. The connection pool reaper and eviction paths funnel through `close()`, so a systematic close failure would be completely silent.
+  _What to change:_ Replace the empty handler with one that logs at warn level: `.handle_exception([addr = this->addr](auto ep) { log_pool.warn("Failed to close connection to {}: {}", addr, ep); })`. Capture `addr` by value since the bundle may be destroyed by the time the handler runs.
+  _Location:_ `src/connection_pool.hpp:76`
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness; violations of Rule #9 hide operational issues
+
+### 17.2 Fragile `const_cast` in `evict_oldest_global()`
+
+- [x] **Remove `const_cast` in `evict_oldest_global()` by storing the iterator or address by value**
+  _Justification:_ Line 525 uses `const_cast<seastar::socket_address*>(&addr)` to capture a pointer to a map key during iteration, then dereferences it after the loop to index back into the map. While safe in single-threaded Seastar code today (no `co_await` between capture and use), this pattern is fragile: any future modification that inserts/erases map entries between the scan and the lookup would invalidate the pointer. `const_cast` on map keys is a well-known anti-pattern because it circumvents the const-correctness that protects key integrity.
+  _What to change:_ Replace `seastar::socket_address* oldest_addr` with a `decltype(_pools)::iterator oldest_it = _pools.end()` and track the iterator directly. The lookup at line 530 becomes `auto& pool = oldest_it->second;` with no `const_cast` needed.
+  _Location:_ `src/connection_pool.hpp:518-538`
+  _Complexity:_ Low
+  _Priority:_ P3 — Maintainability; eliminates a dangerous pattern before it becomes a real bug
+
+### 17.3 Manual `_total_idle_connections` Counter is Drift-Prone
+
+- [x] **Replace manual `_total_idle_connections` tracking with a derived or RAII-guarded counter**
+  _Justification:_ The `_total_idle_connections` counter is manually incremented in `put()` (line 324) and decremented in four separate locations: `get()` (line 194), `put()` per-host eviction (line 308), `evict_oldest_global()` (line 534), `cleanup_expired()` (line 410), and `clear_pool()` (line 367). Any missed or double decrement silently corrupts capacity enforcement—the global eviction in `put()` uses this counter to decide when to evict (line 314), so drift means either premature eviction (lost connections) or unbounded growth (OOM). The scattered nature of these updates makes it easy to introduce drift during future modifications.
+  _What to change:_ Option A (simple): Add a `debug_validate_counter()` method that walks all pools and asserts the sum matches `_total_idle_connections`; call it at the end of `put()`, `get()`, and `cleanup_expired()` in debug builds. Option B (structural): Compute the count on demand by summing `pool.size()` across all entries. This is O(B) where B is number of backends, but `evict_oldest_global()` already does an O(B) scan, so the marginal cost is low. Option C: Wrap the deque in a thin container that increments/decrements the shared counter on push/pop.
+  _Location:_ `src/connection_pool.hpp` (all methods that modify `_total_idle_connections`)
+  _Complexity:_ Medium
+  _Priority:_ P2 — Correctness; silent counter drift causes incorrect capacity enforcement
+
+### 17.4 `evict_oldest_global()` is O(B) on the `put()` Hot Path
+
+- [x] **Avoid O(B) scan in `evict_oldest_global()` by maintaining a sorted eviction index**
+  _Justification:_ When the pool is at `max_total_connections` capacity, every `put()` call triggers `evict_oldest_global()` (line 316), which iterates over all backend pools to find the one with the globally oldest front element (line 522-527). With `max_backends = 1000`, this is 1000 iterations per `put()` at capacity. In steady-state high-load scenarios (many backends, pool at capacity), this becomes a non-trivial reactor stall on the hot proxy path.
+  _What to change:_ Maintain a `std::set` or min-heap of `(last_used, socket_address)` pairs updated on `put()` and `get()`. Eviction becomes O(log B) instead of O(B). Alternatively, accept the O(B) cost but document it as a known limitation, since the reaper timer (every 15s) keeps the pool below capacity in practice, making this path rare.
+  _Location:_ `src/connection_pool.hpp:518-538`
+  _Complexity:_ Medium
+  _Priority:_ P3 — Performance; only matters at sustained high connection churn with many backends
+
+### 17.5 Replace `std::unordered_map` with `absl::flat_hash_map`
+
+- [x] **Switch `_pools` from `std::unordered_map` to `absl::flat_hash_map`**
+  _Justification:_ The project already depends on Abseil (`absl::flat_hash_map` is used elsewhere). `std::unordered_map` uses node-based storage (one heap allocation per entry), causing poor cache locality during iteration. `absl::flat_hash_map` uses open addressing with flat storage, providing better cache behavior for both lookup (`get()`, `put()` call `find()`) and iteration (`evict_oldest_global()`, `cleanup_expired()`). The connection pool's `get()` and `put()` are on the hot proxy path, so even small lookup improvements compound.
+  _What to change:_ Replace `std::unordered_map<seastar::socket_address, std::deque<Bundle>>` with `absl::flat_hash_map<seastar::socket_address, std::deque<Bundle>>`. Verify `seastar::socket_address` has an appropriate `AbslHashValue` overload or provide one. Update includes.
+  _Location:_ `src/connection_pool.hpp:471`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; incremental improvement on hot path
+
+### 17.6 `BasicConnectionBundle::close()` Self-Referencing Continuation is an API Footgun
+
+- [x] **Make `BasicConnectionBundle::close()` safe for direct callers or mark it private**
+  _Justification:_ The `close()` method at line 74 chains `.then([this] { return in.close(); })`, capturing `this` in a Seastar continuation. This is only safe when the bundle is heap-allocated with a lifetime extending beyond the future (as `AsyncClosePolicy` does by moving to `unique_ptr` and capturing it in `.finally()`). If any caller invokes `close()` on a stack-local or member bundle that is destroyed before the continuation runs, the `[this]` capture becomes dangling—a use-after-free. The current code is safe because all close paths go through `close_bundle_async()` → `AsyncClosePolicy`, but the public `close()` method doesn't communicate this lifetime requirement.
+  _What to change:_ Option A: Change `close()` to take a `seastar::lw_shared_ptr<BasicConnectionBundle>` and capture it in the continuation (self-preventing destruction). Option B: Remove `close()` from the public API entirely—make `AsyncClosePolicy` a friend and `close()` private, forcing all callers through `close_bundle_async()`. Option C: At minimum, add a prominent `/// @warning` doc comment stating the lifetime requirement.
+  _Location:_ `src/connection_pool.hpp:71-77`
+  _Complexity:_ Low (Option C) to Medium (Option A/B)
+  _Priority:_ P3 — Maintainability; prevents future misuse as the codebase grows
+
+### 17.7 Add `connections_created` and `connections_reused` Counters for Operational Visibility
+
+- [x] **Track connection reuse ratio with `connections_created` and `connections_reused` stats**
+  _Justification:_ The pool tracks `dead_connections_reaped`, `connections_reaped_max_age`, and `backends_rejected` but has no counter for total connections created (`create_connection()` calls) or successful pool reuses (the early-return path in `get()`). Without these, operators cannot determine the pool's hit rate—a critical metric for tuning `max_connections_per_host`, `idle_timeout`, and `max_connection_age`. A pool with <50% reuse rate suggests misconfigured timeouts or backend instability.
+  _What to change:_ Add `size_t _connections_created = 0` (increment in `create_connection()`) and `size_t _connections_reused = 0` (increment in the reuse path of `get()`, line 237). Expose both in `Stats`. Optionally add `_connection_create_failures` for failed `seastar::connect()` calls.
+  _Location:_ `src/connection_pool.hpp` (Stats struct, `create_connection()`, `get()`)
+  _Complexity:_ Low
+  _Priority:_ P2 — Observability; essential for production tuning and incident response
 
 ---
 

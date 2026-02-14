@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cassert>
 #include <deque>
 #include <memory>
-#include <unordered_map>
 #include <chrono>
 #include <string>
 #include <system_error>
+
+#include <absl/container/flat_hash_map.h>
 
 #include <seastar/core/gate.hh>
 #include <seastar/core/iostream.hh>
@@ -67,13 +69,24 @@ struct BasicConnectionBundle {
         , created_at(Clock::now())
         , last_used(Clock::now()) {}
 
-    // Close the connection
+    /// Close the connection streams (output first, then input).
+    ///
+    /// @warning This method captures `this` in a Seastar continuation chain.
+    /// The caller MUST ensure the bundle outlives the returned future.
+    /// Safe patterns:
+    ///   - `co_await bundle.close()` — coroutine frame keeps bundle alive
+    ///   - `AsyncClosePolicy` — moves bundle to heap via unique_ptr
+    /// Unsafe pattern:
+    ///   - `(void)bundle.close()` on a stack/member bundle — use-after-free
     seastar::future<> close() {
         if (!is_valid) return seastar::make_ready_future<>();
         is_valid = false;
         return out.close().then([this] {
             return in.close();
-        }).handle_exception([](auto) {}); // Ignore errors on close
+        }).handle_exception([addr = this->addr](auto ep) {
+            // Rule #9: every catch must log at warn level
+            log_pool.warn("Failed to close connection to {}: {}", addr, ep);
+        });
     }
 
     // Check if connection has been idle too long
@@ -233,7 +246,9 @@ public:
                 if (!request_id.empty()) {
                     log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
                 }
+                _connections_reused++;
                 bundle.touch();
+                debug_validate_idle_count();
                 return seastar::make_ready_future<Bundle>(std::move(bundle));
             }
 
@@ -245,6 +260,7 @@ public:
         if (!request_id.empty()) {
             log_pool.debug("[{}] Creating new connection to {}", request_id, addr);
         }
+        debug_validate_idle_count();
         return create_connection(addr, request_id);
     }
 
@@ -322,6 +338,7 @@ public:
         }
         pool.push_back(std::move(bundle));
         _total_idle_connections++;
+        debug_validate_idle_count();
     }
 
     // Get pool statistics
@@ -334,6 +351,9 @@ public:
         size_t dead_connections_reaped;      // Total dead connections detected and closed
         size_t connections_reaped_max_age;   // Connections closed due to exceeding max age
         size_t backends_rejected;            // Connections not pooled due to backend limit
+        size_t connections_created;          // Total new connections opened
+        size_t connections_reused;           // Total connections served from pool
+        size_t global_evictions;            // Times global eviction scan ran (O(B) path)
     };
 
     Stats stats() const {
@@ -345,7 +365,10 @@ public:
             _config.max_backends,
             _dead_connections_reaped,
             _connections_reaped_max_age,
-            _backends_rejected
+            _backends_rejected,
+            _connections_created,
+            _connections_reused,
+            _global_evictions
         };
     }
 
@@ -370,6 +393,7 @@ public:
         if (closed > 0) {
             log_pool.info("Cleared {} pooled connections for removed backend {}", closed, addr);
         }
+        debug_validate_idle_count();
         return closed;
     }
 
@@ -430,6 +454,7 @@ public:
             log_pool.trace("Removed empty pool entry for {}", addr);
         }
 
+        debug_validate_idle_count();
         return closed;
     }
 
@@ -438,6 +463,7 @@ private:
     // Shared by get() (pool miss) and get_fresh() (bypassing pool).
     seastar::future<Bundle> create_connection(seastar::socket_address addr,
                                               const std::string& request_id) {
+        _connections_created++;
         return seastar::connect(addr).then([this, addr, request_id](seastar::connected_socket fd) {
             fd.set_nodelay(true);
 
@@ -468,11 +494,14 @@ private:
     }
 
     ConnectionPoolConfig _config;
-    std::unordered_map<seastar::socket_address, std::deque<Bundle>> _pools;
+    absl::flat_hash_map<seastar::socket_address, std::deque<Bundle>> _pools;
     size_t _total_idle_connections = 0;
     size_t _dead_connections_reaped = 0;
     size_t _connections_reaped_max_age = 0;
     size_t _backends_rejected = 0;
+    size_t _connections_created = 0;
+    size_t _connections_reused = 0;
+    size_t _global_evictions = 0;
     seastar::timer<> _reaper_timer;
 
     // RAII gate for timer callback lifetime safety (Rule #5).
@@ -514,27 +543,47 @@ private:
         arm_reaper_timer();
     }
 
-    // Evict the oldest connection across all pools
+    // Evict the oldest connection across all pools.
+    // O(B) where B = number of backends. Bounded by max_backends (default 1000).
+    // Only runs when at max_total_connections capacity, which the reaper timer
+    // (every 15s) prevents in practice. Monitor via _global_evictions counter.
     void evict_oldest_global() {
-        seastar::socket_address* oldest_addr = nullptr;
+        _global_evictions++;
+        auto oldest_it = _pools.end();
         typename Clock::time_point oldest_time = Clock::now();
 
-        for (auto& [addr, pool] : _pools) {
+        for (auto it = _pools.begin(); it != _pools.end(); ++it) {
+            auto& pool = it->second;
             if (!pool.empty() && pool.front().last_used < oldest_time) {
                 oldest_time = pool.front().last_used;
-                oldest_addr = const_cast<seastar::socket_address*>(&addr);
+                oldest_it = it;
             }
         }
 
-        if (oldest_addr) {
-            auto& pool = _pools[*oldest_addr];
+        if (oldest_it != _pools.end()) {
+            auto& pool = oldest_it->second;
             if (!pool.empty()) {
                 auto oldest = std::move(pool.front());
                 pool.pop_front();
                 _total_idle_connections--;
                 close_bundle_async(std::move(oldest));
+                // Note: don't erase empty map entries here — put() may hold a
+                // reference to this pool. cleanup_expired() handles empty entries.
             }
         }
+    }
+
+    // Debug-only: validate _total_idle_connections matches actual pool contents.
+    // Catches counter drift from missed increment/decrement paths.
+    void debug_validate_idle_count() const {
+#ifndef NDEBUG
+        size_t actual = 0;
+        for (const auto& [addr, pool] : _pools) {
+            actual += pool.size();
+        }
+        assert(actual == _total_idle_connections &&
+               "connection_pool: _total_idle_connections out of sync with actual pool sizes");
+#endif
     }
 
     // Close a connection bundle via the configured close policy.
