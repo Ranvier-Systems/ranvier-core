@@ -11,6 +11,8 @@
 #include <functional>
 #include <cassert>
 
+#include <absl/container/inlined_vector.h>
+
 #include "types.hpp"
 #include "node_slab.hpp"
 
@@ -90,16 +92,28 @@ enum class NodeType : uint8_t {
     Node256
 };
 
+// Hard Rule #4: Every growing container needs an explicit MAX_SIZE.
+// Prefixes longer than this are split into chains of nodes.
+static constexpr size_t MAX_PREFIX_LENGTH = 256;
+
 // =============================================================================
 // Node Structures
 // =============================================================================
 
 struct Node {
     NodeType type;
-    std::vector<TokenId> prefix;
+    // Inline storage for up to 8 tokens eliminates heap allocation for short
+    // prefixes (the common case after path compression splits).  Falls back to
+    // heap transparently for longer prefixes.
+    absl::InlinedVector<TokenId, 8> prefix;
     std::optional<BackendId> leaf_value;
     RouteOrigin origin = RouteOrigin::LOCAL;
     std::chrono::steady_clock::time_point last_accessed;
+
+    // Intrusive LRU list pointers (only meaningful for leaf nodes).
+    // Maintained by RadixTree — do not modify directly.
+    Node* lru_prev = nullptr;  // Toward head (more recent)
+    Node* lru_next = nullptr;  // Toward tail (older)
 
     explicit Node(NodeType t) : type(t), last_accessed(std::chrono::steady_clock::now()) {}
     virtual ~Node() = default;
@@ -365,7 +379,7 @@ private:
             case NodeType::Node48: result.type = "Node48"; break;
             case NodeType::Node256: result.type = "Node256"; break;
         }
-        result.prefix = node->prefix;
+        result.prefix.assign(node->prefix.begin(), node->prefix.end());
         result.backend = node->leaf_value;
         result.origin = (node->origin == RouteOrigin::LOCAL) ? "LOCAL" : "REMOTE";
         result.last_accessed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -407,21 +421,23 @@ public:
     //   while (tree->route_count() >= max_routes) tree->evict_oldest();
     //
     bool evict_oldest() {
-        Node* oldest = find_oldest_leaf(root_.get(), std::nullopt);
-        if (oldest && oldest->leaf_value.has_value()) {
-            oldest->leaf_value = std::nullopt;
-            if (route_count_ > 0) route_count_--;
-            return true;
-        }
-        return false;
+        if (!lru_tail_) return false;
+        Node* oldest = lru_tail_;
+        lru_remove(oldest);
+        oldest->leaf_value = std::nullopt;
+        if (route_count_ > 0) route_count_--;
+        return true;
     }
 
     bool evict_oldest_remote() {
-        Node* oldest = find_oldest_leaf(root_.get(), RouteOrigin::REMOTE);
-        if (oldest && oldest->leaf_value.has_value()) {
-            oldest->leaf_value = std::nullopt;
-            if (route_count_ > 0) route_count_--;
-            return true;
+        // Scan from tail (oldest) looking for a REMOTE route.
+        for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
+            if (n->origin == RouteOrigin::REMOTE) {
+                lru_remove(n);
+                n->leaf_value = std::nullopt;
+                if (route_count_ > 0) route_count_--;
+                return true;
+            }
         }
         return evict_oldest();
     }
@@ -469,6 +485,11 @@ private:
     uint32_t block_alignment_;
     size_t route_count_ = 0;
 
+    // Intrusive LRU doubly-linked list of leaf nodes.
+    // lru_head_ = most recently accessed, lru_tail_ = oldest (eviction target).
+    Node* lru_head_ = nullptr;
+    Node* lru_tail_ = nullptr;
+
     // -------------------------------------------------------------------------
     // Slab Allocator Access
     // -------------------------------------------------------------------------
@@ -500,6 +521,112 @@ private:
     }
 
     // -------------------------------------------------------------------------
+    // Intrusive LRU List Operations
+    // -------------------------------------------------------------------------
+    //
+    // O(1) LRU maintenance for leaf nodes.  Only nodes with leaf_value are
+    // linked.  The list is ordered by access time: head = most recent,
+    // tail = oldest (eviction candidate).
+    //
+
+    // Unlink a node from the LRU list (safe to call on unlinked nodes).
+    void lru_remove(Node* node) {
+        if (!node) return;
+        if (node->lru_prev) {
+            node->lru_prev->lru_next = node->lru_next;
+        } else if (lru_head_ == node) {
+            lru_head_ = node->lru_next;
+        }
+        if (node->lru_next) {
+            node->lru_next->lru_prev = node->lru_prev;
+        } else if (lru_tail_ == node) {
+            lru_tail_ = node->lru_prev;
+        }
+        node->lru_prev = nullptr;
+        node->lru_next = nullptr;
+    }
+
+    // Insert a node at the head of the LRU list (most recently accessed).
+    void lru_push_front(Node* node) {
+        node->lru_prev = nullptr;
+        node->lru_next = lru_head_;
+        if (lru_head_) {
+            lru_head_->lru_prev = node;
+        }
+        lru_head_ = node;
+        if (!lru_tail_) {
+            lru_tail_ = node;
+        }
+    }
+
+    // Move an existing node to the head (touch on access).
+    void lru_touch(Node* node) {
+        if (!node || node == lru_head_) return;
+        lru_remove(node);
+        lru_push_front(node);
+    }
+
+    // -------------------------------------------------------------------------
+    // Small-Node Template Helpers
+    // -------------------------------------------------------------------------
+    //
+    // Node4, Node16, and Node48 all use parallel keys/children vectors with
+    // identical access patterns.  These template helpers eliminate duplication
+    // across the per-type switch branches.  Node256 (direct-index array) is
+    // always handled separately.
+
+    // Linear-scan find on any node with .keys / .children vectors.
+    template<typename SmallNodeT>
+    static Node* find_child_keyed(SmallNodeT* n, TokenId key) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) return n->children[i].get();
+        }
+        return nullptr;
+    }
+
+    // Move child out of a keyed node (leaves stale entry for set_child to update).
+    template<typename SmallNodeT>
+    static NodePtr extract_child_keyed(SmallNodeT* n, TokenId key) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) return std::move(n->children[i]);
+        }
+        return nullptr;
+    }
+
+    // Replace existing child in a keyed node.
+    template<typename SmallNodeT>
+    static void set_child_keyed(SmallNodeT* n, TokenId key, NodePtr child) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) {
+                n->children[i] = std::move(child);
+                return;
+            }
+        }
+    }
+
+    // Visit all children of a keyed node.
+    template<typename SmallNodeT, typename Callback>
+    static void visit_children_keyed(SmallNodeT* n, Callback&& callback) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            callback(n->keys[i], n->children[i].get());
+        }
+    }
+
+    // Erase child by key from a keyed node (used by compaction).
+    template<typename SmallNodeT>
+    static NodeType remove_child_keyed(SmallNodeT* n, TokenId key) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            if (n->keys[i] == key) {
+                NodeType removed_type = n->children[i]->type;
+                n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
+                n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
+                return removed_type;
+            }
+        }
+        return NodeType::Node4; // Fallback (shouldn't happen)
+    }
+
+    // -------------------------------------------------------------------------
     // Node Visitor Helpers
     // -------------------------------------------------------------------------
 
@@ -507,32 +634,20 @@ private:
     template<typename Callback>
     static void visit_children(Node* node, Callback&& callback) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    callback(n->keys[i], n->children[i].get());
-                }
+            case NodeType::Node4:
+                visit_children_keyed(static_cast<Node4*>(node), callback);
                 break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    callback(n->keys[i], n->children[i].get());
-                }
+            case NodeType::Node16:
+                visit_children_keyed(static_cast<Node16*>(node), callback);
                 break;
-            }
-            case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    callback(n->keys[i], n->children[i].get());
-                }
+            case NodeType::Node48:
+                visit_children_keyed(static_cast<Node48*>(node), callback);
                 break;
-            }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
                     if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) {
-                        callback(n->keys[i], n->children[i].get());  // Use stored full key
+                        callback(n->keys[i], n->children[i].get());
                     }
                 }
                 break;
@@ -581,22 +696,10 @@ private:
     // Find child by key - hot path, optimized for common cases
     Node* find_child(Node* node, TokenId key) const {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                // Small node: linear scan is cache-friendly
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return n->children[i].get();
-                }
-                return nullptr;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                // Medium node: linear scan, SIMD-friendly in future
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return n->children[i].get();
-                }
-                return nullptr;
-            }
+            case NodeType::Node4:
+                return find_child_keyed(static_cast<Node4*>(node), key);
+            case NodeType::Node16:
+                return find_child_keyed(static_cast<Node16*>(node), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 // O(1) index lookup with full key verification
@@ -624,13 +727,13 @@ private:
                 if (n->keys[idx] == key) [[likely]] {
                     return n->children[idx].get();
                 }
-                // Collision case: key_byte matches but full key differs
-                // Fall back to linear search for the correct entry
-                if (n->keys[idx] != Node256::EMPTY_KEY) {
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == key) {
-                            return n->children[i].get();
-                        }
+                // Collision case: preferred slot doesn't hold our key.
+                // Always linear scan — the entry may be displaced to any slot
+                // (the preferred slot could be empty if the original occupant
+                // was evicted, but displaced entries from collisions still exist).
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        return n->children[i].get();
                     }
                 }
                 return nullptr;
@@ -641,20 +744,10 @@ private:
 
     NodePtr extract_child(Node* node, TokenId key) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return std::move(n->children[i]);
-                }
-                break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) return std::move(n->children[i]);
-                }
-                break;
-            }
+            case NodeType::Node4:
+                return extract_child_keyed(static_cast<Node4*>(node), key);
+            case NodeType::Node16:
+                return extract_child_keyed(static_cast<Node16*>(node), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
@@ -673,16 +766,14 @@ private:
                 auto* n = static_cast<Node256*>(node);
                 uint8_t idx = key_byte(key);
                 if (n->keys[idx] == key) {
-                    n->keys[idx] = Node256::EMPTY_KEY;
+                    // Move child out but preserve the key so set_child() can
+                    // find this slot again (matches Node4/Node16/Node48 behavior).
                     return std::move(n->children[idx]);
                 }
-                // Collision case: linear search
-                if (n->keys[idx] != Node256::EMPTY_KEY) {
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == key) {
-                            n->keys[i] = Node256::EMPTY_KEY;
-                            return std::move(n->children[i]);
-                        }
+                // Collision case: always linear scan — entry may be displaced
+                for (int i = 0; i < 256; i++) {
+                    if (n->keys[i] == key) {
+                        return std::move(n->children[i]);
                     }
                 }
                 break;
@@ -693,26 +784,12 @@ private:
 
     void set_child(Node* node, TokenId key, NodePtr child) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        n->children[i] = std::move(child);
-                        return;
-                    }
-                }
-                break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        n->children[i] = std::move(child);
-                        return;
-                    }
-                }
-                break;
-            }
+            case NodeType::Node4:
+                set_child_keyed(static_cast<Node4*>(node), key, std::move(child));
+                return;
+            case NodeType::Node16:
+                set_child_keyed(static_cast<Node16*>(node), key, std::move(child));
+                return;
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 uint8_t idx = n->index[key_byte(key)];
@@ -771,11 +848,25 @@ private:
     //   - No atomic refcounting (unlike std::shared_ptr)
     //
 
-    static void copy_node_metadata(Node* dest, Node* src) {
+    // Transfer metadata and LRU list position from src to dest.
+    // src's leaf_value and LRU pointers are cleared after transfer.
+    void transfer_node_metadata(Node* dest, Node* src) {
         dest->prefix = std::move(src->prefix);
         dest->leaf_value = src->leaf_value;
         dest->origin = src->origin;
         dest->last_accessed = src->last_accessed;
+
+        // Splice dest into src's position in the LRU list
+        if (src->leaf_value.has_value()) {
+            dest->lru_prev = src->lru_prev;
+            dest->lru_next = src->lru_next;
+            if (src->lru_prev) src->lru_prev->lru_next = dest;
+            if (src->lru_next) src->lru_next->lru_prev = dest;
+            if (lru_head_ == src) lru_head_ = dest;
+            if (lru_tail_ == src) lru_tail_ = dest;
+            src->lru_prev = nullptr;
+            src->lru_next = nullptr;
+        }
     }
 
     NodePtr add_child(NodePtr parent, TokenId key, NodePtr child) {
@@ -843,7 +934,7 @@ private:
         auto n16_ptr = make_node<Node16>();
         auto* n16 = static_cast<Node16*>(n16_ptr.get());
 
-        copy_node_metadata(n16, n4);
+        transfer_node_metadata(n16, n4);
         n16->keys = std::move(n4->keys);
         n16->children = std::move(n4->children);
         n16->keys.push_back(key);
@@ -857,7 +948,7 @@ private:
         auto n48_ptr = make_node<Node48>();
         auto* n48 = static_cast<Node48*>(n48_ptr.get());
 
-        copy_node_metadata(n48, n16);
+        transfer_node_metadata(n48, n16);
         for (size_t i = 0; i < n16->keys.size(); i++) {
             uint8_t key_idx = key_byte(n16->keys[i]);
             // Only set index if slot is empty (first key with this key_byte wins)
@@ -884,7 +975,7 @@ private:
         auto n256_ptr = make_node<Node256>();
         auto* n256 = static_cast<Node256*>(n256_ptr.get());
 
-        copy_node_metadata(n256, n48);
+        transfer_node_metadata(n256, n48);
 
         // Copy existing children, handling potential collisions
         for (size_t i = 0; i < n48->keys.size(); i++) {
@@ -934,6 +1025,49 @@ private:
         return make_node<Node256>();
     }
 
+    // Split a node whose prefix exceeds MAX_PREFIX_LENGTH into a chain.
+    // The node keeps the first MAX_PREFIX_LENGTH tokens; excess is pushed
+    // into a new child node linked via the first excess token as edge key.
+    void split_long_prefix(Node* node) {
+        while (node->prefix.size() > MAX_PREFIX_LENGTH) {
+            TokenId edge_key = node->prefix[MAX_PREFIX_LENGTH];
+            auto new_child = make_node<Node4>();
+
+            // Move the excess suffix (after edge key) to child prefix
+            if (MAX_PREFIX_LENGTH + 1 < node->prefix.size()) {
+                new_child->prefix.assign(
+                    node->prefix.begin() + MAX_PREFIX_LENGTH + 1,
+                    node->prefix.end()
+                );
+            }
+
+            // Transfer leaf data to child
+            new_child->leaf_value = node->leaf_value;
+            new_child->origin = node->origin;
+            new_child->last_accessed = node->last_accessed;
+
+            // Transfer LRU position to child
+            if (node->leaf_value.has_value()) {
+                new_child->lru_prev = node->lru_prev;
+                new_child->lru_next = node->lru_next;
+                if (node->lru_prev) node->lru_prev->lru_next = new_child.get();
+                if (node->lru_next) node->lru_next->lru_prev = new_child.get();
+                if (lru_head_ == node) lru_head_ = new_child.get();
+                if (lru_tail_ == node) lru_tail_ = new_child.get();
+                node->lru_prev = nullptr;
+                node->lru_next = nullptr;
+            }
+            node->leaf_value = std::nullopt;
+
+            // Move existing children to new_child
+            move_children_to_new_node(node, new_child.get());
+
+            // Truncate parent prefix and add child
+            node->prefix.resize(MAX_PREFIX_LENGTH);
+            add_single_child_after_split(node, edge_key, std::move(new_child));
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Split Operation
     // -------------------------------------------------------------------------
@@ -953,10 +1087,21 @@ private:
             );
         }
 
-        // Transfer leaf data to child
+        // Transfer leaf data to child (including LRU position)
         new_child->leaf_value = node->leaf_value;
         new_child->origin = node->origin;
         new_child->last_accessed = node->last_accessed;
+        if (node->leaf_value.has_value()) {
+            // Replace node's position in the LRU list with new_child
+            new_child->lru_prev = node->lru_prev;
+            new_child->lru_next = node->lru_next;
+            if (node->lru_prev) node->lru_prev->lru_next = new_child.get();
+            if (node->lru_next) node->lru_next->lru_prev = new_child.get();
+            if (lru_head_ == node) lru_head_ = new_child.get();
+            if (lru_tail_ == node) lru_tail_ = new_child.get();
+            node->lru_prev = nullptr;
+            node->lru_next = nullptr;
+        }
         node->leaf_value = std::nullopt;
 
         // Move children to new node
@@ -965,6 +1110,11 @@ private:
         // Truncate parent prefix and add single child
         node->prefix.resize(split_point);
         add_single_child_after_split(node, edge_key, std::move(new_child));
+
+        // Rule #4: bound prefix length (defense-in-depth for split results)
+        if (node->prefix.size() > MAX_PREFIX_LENGTH) {
+            split_long_prefix(node);
+        }
     }
 
     void move_children_to_new_node(Node* src, Node* dest) {
@@ -1084,20 +1234,21 @@ private:
         }
     }
 
+    // Append a key+child to a keyed node (used after split when capacity is guaranteed).
+    template<typename SmallNodeT>
+    static void append_child_keyed(SmallNodeT* n, TokenId key, NodePtr child) {
+        n->keys.push_back(key);
+        n->children.push_back(std::move(child));
+    }
+
     void add_single_child_after_split(Node* node, TokenId key, NodePtr child) {
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                n->keys.push_back(key);
-                n->children.push_back(std::move(child));
+            case NodeType::Node4:
+                append_child_keyed(static_cast<Node4*>(node), key, std::move(child));
                 break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                n->keys.push_back(key);
-                n->children.push_back(std::move(child));
+            case NodeType::Node16:
+                append_child_keyed(static_cast<Node16*>(node), key, std::move(child));
                 break;
-            }
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
                 n->index[key_byte(key)] = 0;
@@ -1191,6 +1342,7 @@ private:
                     // Prefix mismatch - return best match so far
                     if (best_match_node) {
                         best_match_node->last_accessed = std::chrono::steady_clock::now();
+                        lru_touch(best_match_node);
                     }
                     result.backend = best_match;
                     return result;
@@ -1205,6 +1357,7 @@ private:
             if (match_len < prefix_len) {
                 if (best_match_node) {
                     best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    lru_touch(best_match_node);
                 }
                 result.backend = best_match;
                 return result;
@@ -1229,9 +1382,10 @@ private:
             tokens = tokens.subspan(1);
         }
 
-        // Touch LRU timestamp for matched node
+        // Touch LRU for matched node
         if (best_match_node) {
             best_match_node->last_accessed = std::chrono::steady_clock::now();
+            lru_touch(best_match_node);
         }
         result.backend = best_match;
         return result;
@@ -1268,6 +1422,11 @@ private:
             node->leaf_value = backend;
             node->origin = origin;
             node->last_accessed = std::chrono::steady_clock::now();
+            if (is_new) {
+                lru_push_front(node.get());
+            } else {
+                lru_touch(node.get());
+            }
             return {std::move(node), is_new};
         }
 
@@ -1285,6 +1444,11 @@ private:
             }
             new_child->leaf_value = backend;
             new_child->origin = origin;
+            lru_push_front(new_child.get());
+            // Rule #4: bound prefix length to prevent pathological memory usage
+            if (new_child->prefix.size() > MAX_PREFIX_LENGTH) {
+                split_long_prefix(new_child.get());
+            }
             node = add_child(std::move(node), next_key, std::move(new_child));
             return {std::move(node), true};
         }
@@ -1319,6 +1483,7 @@ private:
                     // Prefix mismatch - return best match so far
                     if (best_match_node) {
                         best_match_node->last_accessed = std::chrono::steady_clock::now();
+                        lru_touch(best_match_node);
                     }
                     return best_match;
                 }
@@ -1329,6 +1494,7 @@ private:
             if (match_len < prefix_len) {
                 if (best_match_node) {
                     best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    lru_touch(best_match_node);
                 }
                 return best_match;
             }
@@ -1352,9 +1518,10 @@ private:
             tokens = tokens.subspan(1);
         }
 
-        // Touch LRU timestamp for matched node
+        // Touch LRU for matched node
         if (best_match_node) {
             best_match_node->last_accessed = std::chrono::steady_clock::now();
+            lru_touch(best_match_node);
         }
         return best_match;
     }
@@ -1392,6 +1559,7 @@ private:
         if (!node) return;
 
         if (node->leaf_value.has_value() && node->last_accessed < cutoff) {
+            lru_remove(node);
             node->leaf_value = std::nullopt;
             removed++;
         }
@@ -1401,38 +1569,13 @@ private:
         });
     }
 
-    Node* find_oldest_leaf(Node* node, std::optional<RouteOrigin> filter_origin) {
-        if (!node) return nullptr;
-
-        Node* oldest = nullptr;
-        auto oldest_time = std::chrono::steady_clock::time_point::max();
-
-        find_oldest_recursive(node, oldest, oldest_time, filter_origin);
-        return oldest;
-    }
-
-    void find_oldest_recursive(Node* node, Node*& oldest,
-                               std::chrono::steady_clock::time_point& oldest_time,
-                               std::optional<RouteOrigin> filter_origin) {
-        if (!node) return;
-
-        bool matches_filter = !filter_origin.has_value() || node->origin == filter_origin.value();
-        if (node->leaf_value.has_value() && matches_filter && node->last_accessed < oldest_time) {
-            oldest_time = node->last_accessed;
-            oldest = node;
-        }
-
-        visit_children(node, [&](TokenId, Node* child) {
-            find_oldest_recursive(child, oldest, oldest_time, filter_origin);
-        });
-    }
-
     void remove_by_backend_recursive(Node* node, BackendId backend, RouteOrigin origin, size_t& removed) {
         if (!node) return;
 
         if (node->leaf_value.has_value() &&
             node->leaf_value.value() == backend &&
             node->origin == origin) {
+            lru_remove(node);
             node->leaf_value = std::nullopt;
             removed++;
         }
@@ -1479,6 +1622,22 @@ private:
         return false;
     }
 
+    // Compact helper for keyed node types (Node4/Node16/Node48).
+    template<typename SmallNodeT>
+    void compact_children_keyed(SmallNodeT* n, CompactionStats& stats,
+                                std::vector<TokenId>& keys_to_remove) {
+        for (size_t i = 0; i < n->keys.size(); i++) {
+            Node* child = n->children[i].get();
+            compact_children(child, stats);
+            if (should_shrink(child)) {
+                n->children[i] = shrink_node(std::move(n->children[i]), stats);
+            }
+            if (is_node_empty(n->children[i].get())) {
+                keys_to_remove.push_back(n->keys[i]);
+            }
+        }
+    }
+
     // Recursively compact children of a node, removing empty ones
     void compact_children(Node* node, CompactionStats& stats) {
         if (!node) return;
@@ -1488,51 +1647,15 @@ private:
         keys_to_remove.reserve(8); // Bounded allocation (Rule #4)
 
         switch (node->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    Node* child = n->children[i].get();
-                    // Recurse first (post-order traversal)
-                    compact_children(child, stats);
-                    // Check if child should be shrunk
-                    if (should_shrink(child)) {
-                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
-                    }
-                    // Mark for removal if empty
-                    if (is_node_empty(n->children[i].get())) {
-                        keys_to_remove.push_back(n->keys[i]);
-                    }
-                }
+            case NodeType::Node4:
+                compact_children_keyed(static_cast<Node4*>(node), stats, keys_to_remove);
                 break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    Node* child = n->children[i].get();
-                    compact_children(child, stats);
-                    if (should_shrink(child)) {
-                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
-                    }
-                    if (is_node_empty(n->children[i].get())) {
-                        keys_to_remove.push_back(n->keys[i]);
-                    }
-                }
+            case NodeType::Node16:
+                compact_children_keyed(static_cast<Node16*>(node), stats, keys_to_remove);
                 break;
-            }
-            case NodeType::Node48: {
-                auto* n = static_cast<Node48*>(node);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    Node* child = n->children[i].get();
-                    compact_children(child, stats);
-                    if (should_shrink(child)) {
-                        n->children[i] = shrink_node(std::move(n->children[i]), stats);
-                    }
-                    if (is_node_empty(n->children[i].get())) {
-                        keys_to_remove.push_back(n->keys[i]);
-                    }
-                }
+            case NodeType::Node48:
+                compact_children_keyed(static_cast<Node48*>(node), stats, keys_to_remove);
                 break;
-            }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
@@ -1543,7 +1666,7 @@ private:
                             n->children[i] = shrink_node(std::move(n->children[i]), stats);
                         }
                         if (is_node_empty(n->children[i].get())) {
-                            keys_to_remove.push_back(static_cast<TokenId>(i));
+                            keys_to_remove.push_back(n->keys[i]);
                         }
                     }
                 }
@@ -1562,30 +1685,10 @@ private:
     // Remove a child by key, returns the type of the removed node
     NodeType remove_child(Node* parent, TokenId key) {
         switch (parent->type) {
-            case NodeType::Node4: {
-                auto* n = static_cast<Node4*>(parent);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        NodeType removed_type = n->children[i]->type;
-                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
-                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
-                        return removed_type;
-                    }
-                }
-                break;
-            }
-            case NodeType::Node16: {
-                auto* n = static_cast<Node16*>(parent);
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        NodeType removed_type = n->children[i]->type;
-                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
-                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
-                        return removed_type;
-                    }
-                }
-                break;
-            }
+            case NodeType::Node4:
+                return remove_child_keyed(static_cast<Node4*>(parent), key);
+            case NodeType::Node16:
+                return remove_child_keyed(static_cast<Node16*>(parent), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(parent);
                 uint8_t indexed_pos = n->index[key_byte(key)];
@@ -1698,7 +1801,7 @@ private:
     NodePtr shrink_to_node4(NodePtr node) {
         auto n4_ptr = make_node<Node4>();
         auto* n4 = static_cast<Node4*>(n4_ptr.get());
-        copy_node_metadata(n4, node.get());
+        transfer_node_metadata(n4, node.get());
 
         // Move up to 4 children
         size_t count = 0;
@@ -1739,7 +1842,7 @@ private:
     NodePtr shrink_to_node16(NodePtr node) {
         auto n16_ptr = make_node<Node16>();
         auto* n16 = static_cast<Node16*>(n16_ptr.get());
-        copy_node_metadata(n16, node.get());
+        transfer_node_metadata(n16, node.get());
 
         // Move up to 16 children
         size_t count = 0;
@@ -1772,7 +1875,7 @@ private:
     NodePtr shrink_to_node48(NodePtr node) {
         auto n48_ptr = make_node<Node48>();
         auto* n48 = static_cast<Node48*>(n48_ptr.get());
-        copy_node_metadata(n48, node.get());
+        transfer_node_metadata(n48, node.get());
 
         // Only Node256 can shrink to Node48
         if (node->type == NodeType::Node256) {
