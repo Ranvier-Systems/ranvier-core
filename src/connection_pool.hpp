@@ -237,6 +237,7 @@ public:
                 if (!request_id.empty()) {
                     log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
                 }
+                _connections_reused++;
                 bundle.touch();
                 debug_validate_idle_count();
                 return seastar::make_ready_future<Bundle>(std::move(bundle));
@@ -341,6 +342,8 @@ public:
         size_t dead_connections_reaped;      // Total dead connections detected and closed
         size_t connections_reaped_max_age;   // Connections closed due to exceeding max age
         size_t backends_rejected;            // Connections not pooled due to backend limit
+        size_t connections_created;          // Total new connections opened
+        size_t connections_reused;           // Total connections served from pool
     };
 
     Stats stats() const {
@@ -352,7 +355,9 @@ public:
             _config.max_backends,
             _dead_connections_reaped,
             _connections_reaped_max_age,
-            _backends_rejected
+            _backends_rejected,
+            _connections_created,
+            _connections_reused
         };
     }
 
@@ -447,6 +452,7 @@ private:
     // Shared by get() (pool miss) and get_fresh() (bypassing pool).
     seastar::future<Bundle> create_connection(seastar::socket_address addr,
                                               const std::string& request_id) {
+        _connections_created++;
         return seastar::connect(addr).then([this, addr, request_id](seastar::connected_socket fd) {
             fd.set_nodelay(true);
 
@@ -482,6 +488,8 @@ private:
     size_t _dead_connections_reaped = 0;
     size_t _connections_reaped_max_age = 0;
     size_t _backends_rejected = 0;
+    size_t _connections_created = 0;
+    size_t _connections_reused = 0;
     seastar::timer<> _reaper_timer;
 
     // RAII gate for timer callback lifetime safety (Rule #5).
