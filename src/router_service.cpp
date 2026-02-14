@@ -296,6 +296,39 @@ struct ShardLocalState {
         }
     }
 
+    // ========================================================================
+    // Live Backend Helpers (shared filter: not dead, not missing, not draining)
+    // ========================================================================
+
+    // Return sorted vector of live backend IDs.
+    // Used by get_backend_for_prefix() and get_backend_by_hash().
+    std::vector<BackendId> get_live_backends() const {
+        std::vector<BackendId> result;
+        for (BackendId id : backend_ids) {
+            if (dead_backends.contains(id)) continue;
+            auto it = backends.find(id);
+            if (it == backends.end()) continue;
+            if (it->second.is_draining) continue;
+            result.push_back(id);
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
+    // Return live backends with BackendInfo pointers for weight/priority access.
+    // Used by get_random_backend().
+    std::vector<std::pair<BackendId, const BackendInfo*>> get_live_backend_infos() const {
+        std::vector<std::pair<BackendId, const BackendInfo*>> result;
+        for (BackendId id : backend_ids) {
+            if (dead_backends.contains(id)) continue;
+            auto it = backends.find(id);
+            if (it == backends.end()) continue;
+            if (it->second.is_draining) continue;
+            result.emplace_back(id, &it->second);
+        }
+        return result;
+    }
+
     // Destructor ensures proper cleanup order
     ~ShardLocalState() {
         // Explicit destruction order: tree before slab
@@ -1108,24 +1141,13 @@ std::optional<BackendId> RouterService::get_random_backend() {
         return std::nullopt;
     }
 
-    // Collect live backends grouped by priority
+    // Collect live backends with weight/priority info, grouped by priority
     // Priority 0 = highest, backends with lower priority number are tried first
+    auto live_infos = state.get_live_backend_infos();
     std::map<uint32_t, std::vector<std::pair<BackendId, uint32_t>>> priority_groups;
-
-    for (BackendId id : state.backend_ids) {
-        if (state.dead_backends.contains(id)) {
-            continue;  // Skip dead backends
-        }
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) {
-            continue;
-        }
-        const auto& info = it->second;
-        if (info.is_draining) {
-            continue;  // Skip draining backends for new requests
-        }
-        if (info.weight > 0) {
-            priority_groups[info.priority].emplace_back(id, info.weight);
+    for (const auto& [id, info] : live_infos) {
+        if (info->weight > 0) {
+            priority_groups[info->priority].emplace_back(id, info->weight);
         }
     }
 
@@ -1191,28 +1213,10 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         return {};
     }
 
-    // Collect live backends (not dead, not draining)
-    std::vector<BackendId> live_backends;
-    for (BackendId id : state.backend_ids) {
-        if (state.dead_backends.contains(id)) {
-            continue;  // Skip dead backends
-        }
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) {
-            continue;
-        }
-        if (it->second.is_draining) {
-            continue;  // Skip draining backends
-        }
-        live_backends.push_back(id);
-    }
-
+    auto live_backends = state.get_live_backends();
     if (live_backends.empty()) {
         return {};
     }
-
-    // Sort for deterministic ordering across shards
-    std::sort(live_backends.begin(), live_backends.end());
 
     // Determine prefix length for hash fallback:
     // 1. If prefix_boundary is valid (> 0 and <= tokens.size()), use it
@@ -1314,28 +1318,10 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
         return std::nullopt;
     }
 
-    // Collect live backends (not dead, not draining)
-    std::vector<BackendId> live_backends;
-    for (BackendId id : state.backend_ids) {
-        if (state.dead_backends.contains(id)) {
-            continue;
-        }
-        auto it = state.backends.find(id);
-        if (it == state.backends.end()) {
-            continue;
-        }
-        if (it->second.is_draining) {
-            continue;
-        }
-        live_backends.push_back(id);
-    }
-
+    auto live_backends = state.get_live_backends();
     if (live_backends.empty()) {
         return std::nullopt;
     }
-
-    // Sort for deterministic ordering across shards
-    std::sort(live_backends.begin(), live_backends.end());
 
     // Extract prefix (first N tokens)
     size_t prefix_len = std::min(tokens.size(), state.config.prefix_token_length);
