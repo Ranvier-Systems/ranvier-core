@@ -19,7 +19,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <map>
 #include <random>
 #include <sstream>
 
@@ -1141,47 +1140,45 @@ std::optional<BackendId> RouterService::get_random_backend() {
         return std::nullopt;
     }
 
-    // Collect live backends with weight/priority info, grouped by priority
-    // Priority 0 = highest, backends with lower priority number are tried first
     auto live_infos = state.get_live_backend_infos();
-    std::map<uint32_t, std::vector<std::pair<BackendId, uint32_t>>> priority_groups;
+
+    // Pass 1: find the highest priority group (lowest priority number)
+    // and accumulate its total weight — no heap allocation needed.
+    uint32_t min_priority = std::numeric_limits<uint32_t>::max();
     for (const auto& [id, info] : live_infos) {
-        if (info->weight > 0) {
-            priority_groups[info->priority].emplace_back(id, info->weight);
+        if (info->weight > 0 && info->priority < min_priority) {
+            min_priority = info->priority;
         }
     }
 
-    if (priority_groups.empty()) {
-        return std::nullopt;  // No live backends available
+    if (min_priority == std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;  // No live backends with weight > 0
     }
 
-    // Get the highest priority group (lowest priority number)
-    const auto& candidates = priority_groups.begin()->second;
-
-    // Calculate total weight
     uint64_t total_weight = 0;
-    for (const auto& [id, weight] : candidates) {
-        total_weight += weight;
+    for (const auto& [id, info] : live_infos) {
+        if (info->priority == min_priority && info->weight > 0) {
+            total_weight += info->weight;
+        }
     }
 
-    if (total_weight == 0) {
-        return std::nullopt;
-    }
-
-    // Weighted random selection
+    // Pass 2: weighted random selection over the highest-priority candidates
     std::uniform_int_distribution<uint64_t> dist(0, total_weight - 1);
     uint64_t roll = dist(state.rng);
 
     uint64_t cumulative = 0;
-    for (const auto& [id, weight] : candidates) {
-        cumulative += weight;
+    BackendId last_candidate = 0;
+    for (const auto& [id, info] : live_infos) {
+        if (info->priority != min_priority || info->weight == 0) continue;
+        cumulative += info->weight;
+        last_candidate = id;
         if (roll < cumulative) {
             return id;
         }
     }
 
     // Fallback (shouldn't reach here)
-    return candidates.back().first;
+    return last_candidate;
 }
 
 // ============================================================================
