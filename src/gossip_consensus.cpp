@@ -39,9 +39,14 @@ seastar::future<> GossipConsensus::start(const std::vector<seastar::socket_addre
         co_return;
     }
 
-    // Initialize peer table with all initial peers
+    // Initialize peer table with initial peers (bounded by MAX_PEERS, Rule #4)
     auto now = seastar::lowres_clock::now();
     for (const auto& peer : initial_peers) {
+        if (_peer_table.size() >= MAX_PEERS) {
+            log_gossip_consensus().warn("Peer table at capacity ({}), ignoring remaining {} initial peers",
+                                        MAX_PEERS, initial_peers.size() - _peer_table.size());
+            break;
+        }
         _peer_table[peer] = {now, true, std::nullopt};
     }
 
@@ -122,35 +127,23 @@ void GossipConsensus::associate_backend(const seastar::socket_address& peer, Bac
 }
 
 void GossipConsensus::add_peer(const seastar::socket_address& peer) {
-    if (_peer_table.find(peer) == _peer_table.end()) {
-        _peer_table[peer] = {seastar::lowres_clock::now(), true, std::nullopt};
-        log_gossip_consensus().info("Peer added: {}", peer);
+    if (_peer_table.find(peer) != _peer_table.end()) {
+        return;  // Already tracked
     }
+    if (_peer_table.size() >= MAX_PEERS) {
+        ++_peer_table_overflow;
+        log_gossip_consensus().warn("Peer table at capacity ({}), rejecting peer: {}", MAX_PEERS, peer);
+        return;
+    }
+    _peer_table[peer] = {seastar::lowres_clock::now(), true, std::nullopt};
+    log_gossip_consensus().info("Peer added: {}", peer);
 }
 
 void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
     auto it = _peer_table.find(peer);
     if (it != _peer_table.end()) {
-        // Prune routes for removed peer if it had an associated backend.
-        // Each shard invokes its own locally-registered callback to avoid
-        // broadcasting std::function across shards (cross-shard free risk).
         if (it->second.associated_backend && s_local_prune_callback) {
-            BackendId b_id = *it->second.associated_backend;
-            (void)seastar::parallel_for_each(
-                boost::irange<unsigned>(0, seastar::smp::count),
-                [b_id](unsigned shard_id) {
-                    return seastar::smp::submit_to(shard_id, [b_id] {
-                        if (s_local_prune_callback) {
-                            return s_local_prune_callback(b_id);
-                        }
-                        return seastar::make_ready_future<>();
-                    });
-                }).handle_exception([b_id](auto ep) {
-                    try { std::rethrow_exception(ep); }
-                    catch (const std::exception& e) {
-                        log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
-                    }
-                });
+            broadcast_prune(*it->second.associated_backend);
         }
         _peer_table.erase(it);
         log_gossip_consensus().info("Peer removed: {}", peer);
@@ -163,10 +156,16 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
     std::vector<seastar::socket_address> newly_added;
     auto now = seastar::lowres_clock::now();
 
-    // Build set of new peers for lookup
+    // Build set of new peers for lookup (bounded by MAX_PEERS, Rule #4)
     std::unordered_map<seastar::socket_address, PeerState> new_peer_table;
 
     for (const auto& peer : new_peers) {
+        if (new_peer_table.size() >= MAX_PEERS) {
+            ++_peer_table_overflow;
+            log_gossip_consensus().warn("Peer table at capacity ({}), ignoring remaining {} discovered peers",
+                                        MAX_PEERS, new_peers.size() - new_peer_table.size());
+            break;
+        }
         auto it = _peer_table.find(peer);
         if (it != _peer_table.end()) {
             // Preserve existing state
@@ -184,25 +183,8 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
         if (new_peer_table.find(peer) == new_peer_table.end()) {
             log_gossip_consensus().info("DNS discovery: peer removed: {}", peer);
 
-            // Prune routes for removed peers if they had an associated backend.
-            // Each shard invokes its own locally-registered callback.
             if (state.associated_backend && s_local_prune_callback) {
-                BackendId b_id = *state.associated_backend;
-                (void)seastar::parallel_for_each(
-                    boost::irange<unsigned>(0, seastar::smp::count),
-                    [b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [b_id] {
-                            if (s_local_prune_callback) {
-                                return s_local_prune_callback(b_id);
-                            }
-                            return seastar::make_ready_future<>();
-                        });
-                    }).handle_exception([b_id](auto ep) {
-                        try { std::rethrow_exception(ep); }
-                        catch (const std::exception& e) {
-                            log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
-                        }
-                    });
+                broadcast_prune(*state.associated_backend);
             }
         }
     }
@@ -241,26 +223,8 @@ void GossipConsensus::check_liveness() {
             state.is_alive = false;
             log_gossip_consensus().warn("Peer marked dead: socket_address={}", addr);
 
-            // Prune routes for dead peer if it had an associated backend.
-            // Broadcast only the scalar BackendId; each shard invokes its
-            // own locally-registered callback.
             if (state.associated_backend && s_local_prune_callback) {
-                BackendId b_id = *state.associated_backend;
-
-                (void)seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),
-                    [b_id](unsigned shard_id) {
-                        return seastar::smp::submit_to(shard_id, [b_id] {
-                            if (s_local_prune_callback) {
-                                return s_local_prune_callback(b_id);
-                            }
-                            return seastar::make_ready_future<>();
-                        });
-                    }).handle_exception([b_id](auto ep) {
-                        try { std::rethrow_exception(ep); }
-                        catch (const std::exception& e) {
-                            log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
-                        }
-                    });
+                broadcast_prune(*state.associated_backend);
             }
         }
 
@@ -343,55 +307,31 @@ void GossipConsensus::check_quorum() {
     }
 }
 
-void GossipConsensus::update_quorum_state() {
-    // Only run on shard 0 since it manages the peer table
-    if (seastar::this_shard_id() != 0) {
+void GossipConsensus::broadcast_prune(BackendId b_id) {
+    // Gate-protect so stop() waits for in-flight prune operations (Rule #5).
+    // The holder is moved into .finally() to span the full async lifetime.
+    seastar::gate::holder holder;
+    try {
+        holder = _timer_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
         return;
     }
 
-    size_t total_nodes = _peer_table.size() + 1;  // +1 for self
-    size_t alive_nodes = _stats_cluster_peers_alive + 1;  // +1 for self
-    size_t required = quorum_required();
-
-    QuorumState new_state = (alive_nodes >= required) ? QuorumState::HEALTHY : QuorumState::DEGRADED;
-
-    if (new_state != _quorum_state) {
-        ++_quorum_transitions;
-
-        if (new_state == QuorumState::DEGRADED) {
-            _quorum_warning_active = false;
-            log_gossip_consensus().error("QUORUM LOST: Cluster entering DEGRADED mode. "
-                                         "Only {}/{} nodes reachable (need {} for quorum). "
-                                         "New route writes will be rejected to prevent split-brain divergence.",
-                                         alive_nodes, total_nodes, required);
-        } else {
-            log_gossip_consensus().info("QUORUM RESTORED: Cluster returning to HEALTHY mode. "
-                                        "{}/{} nodes reachable (need {} for quorum). "
-                                        "Route writes re-enabled.",
-                                        alive_nodes, total_nodes, required);
-        }
-
-        _quorum_state = new_state;
-        _stats_quorum_state = (new_state == QuorumState::HEALTHY) ? 1 : 0;
-    }
-
-    // Check for warning threshold
-    if (_config.quorum_warning_threshold > 0 && new_state == QuorumState::HEALTHY) {
-        size_t margin = alive_nodes - required;
-        bool should_warn = margin <= _config.quorum_warning_threshold;
-
-        if (should_warn && !_quorum_warning_active) {
-            _quorum_warning_active = true;
-            log_gossip_consensus().warn("QUORUM WARNING: Only {} node(s) above quorum threshold "
-                                        "(alive={}, required={}, total={}). Cluster at risk of split-brain.",
-                                        margin, alive_nodes, required, total_nodes);
-        } else if (!should_warn && _quorum_warning_active) {
-            _quorum_warning_active = false;
-            log_gossip_consensus().info("QUORUM WARNING CLEARED: Cluster has sufficient margin "
-                                        "(alive={}, required={}, total={}).",
-                                        alive_nodes, required, total_nodes);
-        }
-    }
+    (void)seastar::parallel_for_each(
+        boost::irange<unsigned>(0, seastar::smp::count),
+        [b_id](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [b_id] {
+                if (s_local_prune_callback) {
+                    return s_local_prune_callback(b_id);
+                }
+                return seastar::make_ready_future<>();
+            });
+        }).handle_exception([b_id](auto ep) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) {
+                log_gossip_consensus().error("Route prune callback failed for backend {}: {}", b_id, e.what());
+            }
+        }).finally([holder = std::move(holder)] {});
 }
 
 void GossipConsensus::start_resync() {

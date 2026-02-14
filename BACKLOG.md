@@ -26,6 +26,8 @@ This document identifies missing features and optimizations required to promote 
 14. [Router Service Review (2026-02-14)](#14-router-service-review-2026-02-14)
 15. [HTTP Controller Review (2026-02-14)](#15-http-controller-review-2026-02-14)
 16. [Radix Tree Review (2026-02-14)](#16-radix-tree-review-2026-02-14)
+17. [Connection Pool Review (2026-02-14)](#17-connection-pool-review-2026-02-14)
+18. [Gossip Service Review (2026-02-14)](#18-gossip-service-review-2026-02-14)
 
 ---
 
@@ -2287,66 +2289,73 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
 
 ### 15.1 Implement or Remove Dead P2C Cross-Shard Dispatch
 
-- [ ] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
+- [x] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
   _Justification:_ The P2C algorithm selects a target shard, but the result is only logged — the request is always processed on the local shard. There is no `smp::submit_to(target_shard, ...)` anywhere in `http_controller.cpp`. The `_requests_cross_shard_dispatch` counter increments, but no actual cross-shard dispatch occurs. The entire P2C load balancing feature (`LoadBalancingSettings`, `ShardLoadBalancer` integration, cross-shard dispatch metrics) is dead code that gives the appearance of load balancing without providing it.
   _What to change:_ **Option A (implement):** Add `smp::submit_to(target_shard, ...)` to actually dispatch requests cross-shard when P2C selects a remote shard. Requires `cross_shard_request.hpp` / `foreign_ptr` for safe data transfer per Hard Rule #14. **Option B (remove):** Delete `select_target_shard()`, `LoadBalancingSettings`, `_load_balancer`, `_lb_config`, and the cross-shard dispatch metrics to eliminate dead code.
   _Location:_ `src/http_controller.cpp` (lines 725-731, 1839-1864), `src/http_controller.hpp` (lines 55-60, 247-248)
   _Complexity:_ High (Option A), Low (Option B)
   _Priority:_ P1 — Dead code that misleads operators into believing load balancing is active
+  _Completed:_ 2026-02-14 — Chose modified Option B: disabled by default, documented as advisory-only, removed misleading call from handle_proxy
 
 ### 15.2 Escape User-Controlled Strings in JSON Error Responses
 
-- [ ] **Extract `escape_json_string` into a shared utility and use it for all JSON string interpolation**
+- [x] **Extract `escape_json_string` into a shared utility and use it for all JSON string interpolation**
   _Justification:_ Multiple error responses interpolate external strings directly into JSON without escaping. If any of these strings contain `"`, `\`, or control characters, the response becomes malformed JSON. The codebase already has an `escape_json_string` lambda at line 1738, but it is local to `handle_keys_reload`. Affected lines: 181 (auth info), 803 (token error), 1071 (route error message), 1448 (validation error).
   _What to change:_ Move `escape_json_string` from the local lambda in `handle_keys_reload` to a utility function in `parse_utils.hpp`. Apply it to all JSON string interpolation sites. Alternatively, use RapidJSON (already a dependency) for response construction.
   _Location:_ `src/http_controller.cpp` (lines 181, 803, 1071, 1448, 1738), `src/parse_utils.hpp`
   _Complexity:_ Low
   _Priority:_ P2 — Correctness; malformed JSON responses on certain inputs
+  _Completed:_ 2026-02-14 — Moved to parse_utils.hpp, applied to all 4 sites, removed local lambda
 
 ### 15.3 Replace `std::atomic` Counters With Plain `uint64_t`
 
-- [ ] **Remove unnecessary `std::atomic` from shard-local metric counters in `HttpController`**
+- [x] **Remove unnecessary `std::atomic` from shard-local metric counters in `HttpController`**
   _Justification:_ In Seastar's shared-nothing model, each `HttpController` instance lives on exactly one shard. The four atomic counters (`_requests_rejected_concurrency`, `_requests_rejected_persistence`, `_requests_local_dispatch`, `_requests_cross_shard_dispatch`) are only ever incremented from that shard's reactor thread. No cross-shard code reads them. Using `std::atomic` adds unnecessary memory fence overhead and contradicts Hard Rule #0/#1.
   _What to change:_ Replace `std::atomic<uint64_t>` with plain `uint64_t` for all four counters. If metrics scraping needs cross-shard access, use `smp::submit_to` to gather them.
   _Location:_ `src/http_controller.hpp` (lines 259-264)
   _Complexity:_ Low
   _Priority:_ P3 — Code hygiene and minor performance improvement
+  _Completed:_ 2026-02-14 — Also converted _draining from std::atomic<bool> to plain bool, removed <atomic> include
 
 ### 15.4 Sanitize Header Values and Fix Hardcoded Host in Backend Request Construction
 
-- [ ] **Sanitize outgoing header values and derive Host from target address**
+- [x] **Sanitize outgoing header values and derive Host from target address**
   _Justification:_ `send_backend_request()` builds the HTTP request via raw string concatenation. The `Host` header is hardcoded to `localhost`. `ctx.request_id` and `ctx.backend_traceparent` originate from client headers and are injected without CRLF injection checks — a crafted `X-Request-ID` containing `\r\n` could inject arbitrary headers. The body is also concatenated into the header string, doubling memory for large payloads.
   _What to change:_ (1) Strip `\r` and `\n` from `request_id` and `backend_traceparent` before interpolation. (2) Derive the `Host` header from `ctx.current_addr`. (3) Write headers and body as two separate `write()` calls to avoid the double-copy for large payloads.
   _Location:_ `src/http_controller.cpp` (lines 420-432)
   _Complexity:_ Low
   _Priority:_ P2 — Header injection risk and correctness
+  _Completed:_ 2026-02-14 — Added sanitize_header_value() to parse_utils.hpp, derived Host from ctx.current_addr, split write
 
 ### 15.5 Optimize Per-Chunk Flush in SSE Streaming Loop
 
-- [ ] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
+- [x] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
   _Justification:_ Every chunk received from the backend triggers a `write()` + `flush()` to the client. For streaming LLM responses with many small SSE events (10-50 bytes per token), this produces one syscall per token. While low-latency delivery is intentional for SSE, a more nuanced approach could batch flushes when multiple chunks are available in the same reactor tick.
   _What to change:_ Remove the per-chunk `flush()` and rely on Seastar's internal output stream buffering, or implement a configurable flush strategy: immediate for `[DONE]` events, batched otherwise (e.g., flush every 10ms via a timer or after N bytes accumulated).
   _Location:_ `src/http_controller.cpp` (lines 602-603)
   _Complexity:_ Medium
   _Priority:_ P3 — Performance; most impactful at high token throughput
+  _Completed:_ 2026-02-14 — Flush on first write (TTFT) and on done; intermediate writes use Seastar buffering
 
 ### 15.6 Add Explicit `stop()` Method for Orderly Shutdown
 
-- [ ] **Add `seastar::future<> stop()` to `HttpController` for clean lifecycle management**
+- [x] **Add `seastar::future<> stop()` to `HttpController` for clean lifecycle management**
   _Justification:_ `HttpController` is used as `seastar::sharded<HttpController>`, so Seastar calls `.stop()` on each shard during shutdown. The class has no `stop()` method and relies on the default (ready future). However, `_rate_limiter.start()` is called in `register_routes()` and only stopped in `wait_for_drain()`. If teardown skips `wait_for_drain()`, the rate limiter timer could fire after destruction. Per Hard Rule #5 (timer gate guards) and #6 (deregister metrics in stop).
   _What to change:_ Add `seastar::future<> stop()` that: (1) calls `_rate_limiter.stop()`, (2) closes `_request_gate` if not already closed, (3) ensures orderly cleanup regardless of whether `wait_for_drain()` was called.
   _Location:_ `src/http_controller.hpp` (class declaration), `src/http_controller.cpp` (new method)
   _Complexity:_ Low
   _Priority:_ P2 — Defensive correctness; prevents use-after-free on abnormal shutdown paths
+  _Completed:_ 2026-02-14 — Added stop() with _stopped guard for double-stop safety (wait_for_drain + stop)
 
 ### 15.7 Bound Recursive JSON Serialization in Admin Endpoints
 
-- [ ] **Add depth and size limits to `dump_node_to_json` and admin dump handlers**
+- [x] **Add depth and size limits to `dump_node_to_json` and admin dump handlers**
   _Justification:_ The tree dump handler recursively serializes the entire radix tree into a `std::ostringstream` with no upper bound. For production systems with tens of thousands of routes, this could produce multi-MB JSON responses. The recursive `dump_node_to_json` also risks stack overflow for deeply nested trees. `handle_dump_cluster` and `handle_dump_backends` have similar unbounded output.
   _What to change:_ (1) Add a `max_depth` parameter to `dump_node_to_json` (default: 32) to bound recursion. (2) Add a `?limit=N` query parameter to cap the number of nodes returned. (3) Consider streaming JSON output for large responses rather than building the entire string in memory.
   _Location:_ `src/http_controller.cpp` (lines 1871-1986, 2005-2077)
   _Complexity:_ Low
   _Priority:_ P3 — Defensive correctness; prevents OOM on large trees
+  _Completed:_ 2026-02-14 — Added remaining_depth param (default 32), children_truncated field, ?max_depth=N query param
 
 ---
 
@@ -2497,72 +2506,150 @@ Second review pass of `src/router_service.cpp` and `src/router_service.hpp` afte
 
 ---
 
-## 15. HTTP Controller Review (2026-02-14)
+## 17. Connection Pool Review (2026-02-14)
 
-Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines). Full analysis in `.dev-context/http-controller-review.md`.
+Deep-dive review of `src/connection_pool.hpp` across correctness, performance, and maintainability.
 
-### 15.1 Implement or Remove Dead P2C Cross-Shard Dispatch
+### 17.1 Silent Exception Swallowing in `BasicConnectionBundle::close()` (Rule #9)
 
-- [ ] **`select_target_shard()` computes a P2C target shard but never dispatches to it**
-  _Justification:_ The P2C algorithm selects a target shard, but the result is only logged — the request is always processed on the local shard. There is no `smp::submit_to(target_shard, ...)` anywhere in `http_controller.cpp`. The `_requests_cross_shard_dispatch` counter increments, but no actual cross-shard dispatch occurs. The entire P2C load balancing feature (`LoadBalancingSettings`, `ShardLoadBalancer` integration, cross-shard dispatch metrics) is dead code that gives the appearance of load balancing without providing it.
-  _What to change:_ **Option A (implement):** Add `smp::submit_to(target_shard, ...)` to actually dispatch requests cross-shard when P2C selects a remote shard. Requires `cross_shard_request.hpp` / `foreign_ptr` for safe data transfer per Hard Rule #14. **Option B (remove):** Delete `select_target_shard()`, `LoadBalancingSettings`, `_load_balancer`, `_lb_config`, and the cross-shard dispatch metrics to eliminate dead code.
-  _Location:_ `src/http_controller.cpp` (lines 725-731, 1839-1864), `src/http_controller.hpp` (lines 55-60, 247-248)
-  _Complexity:_ High (Option A), Low (Option B)
-  _Priority:_ P1 — Dead code that misleads operators into believing load balancing is active
-
-### 15.2 Escape User-Controlled Strings in JSON Error Responses
-
-- [ ] **Extract `escape_json_string` into a shared utility and use it for all JSON string interpolation**
-  _Justification:_ Multiple error responses interpolate external strings directly into JSON without escaping. If any of these strings contain `"`, `\`, or control characters, the response becomes malformed JSON. The codebase already has an `escape_json_string` lambda at line 1738, but it is local to `handle_keys_reload`. Affected lines: 181 (auth info), 803 (token error), 1071 (route error message), 1448 (validation error).
-  _What to change:_ Move `escape_json_string` from the local lambda in `handle_keys_reload` to a utility function in `parse_utils.hpp`. Apply it to all JSON string interpolation sites. Alternatively, use RapidJSON (already a dependency) for response construction.
-  _Location:_ `src/http_controller.cpp` (lines 181, 803, 1071, 1448, 1738), `src/parse_utils.hpp`
+- [x] **Log exceptions in `BasicConnectionBundle::close()` instead of silently discarding them**
+  _Justification:_ Line 76 uses `.handle_exception([](auto) {})` which silently swallows all exceptions during stream close. This violates Hard Rule #9 (every catch block must log at warn level). A failed close could indicate a networking issue, resource leak, or Seastar internal error—all invisible today. The connection pool reaper and eviction paths funnel through `close()`, so a systematic close failure would be completely silent.
+  _What to change:_ Replace the empty handler with one that logs at warn level: `.handle_exception([addr = this->addr](auto ep) { log_pool.warn("Failed to close connection to {}: {}", addr, ep); })`. Capture `addr` by value since the bundle may be destroyed by the time the handler runs.
+  _Location:_ `src/connection_pool.hpp:76`
   _Complexity:_ Low
-  _Priority:_ P2 — Correctness; malformed JSON responses on certain inputs
+  _Priority:_ P2 — Correctness; violations of Rule #9 hide operational issues
 
-### 15.3 Replace `std::atomic` Counters With Plain `uint64_t`
+### 17.2 Fragile `const_cast` in `evict_oldest_global()`
 
-- [ ] **Remove unnecessary `std::atomic` from shard-local metric counters in `HttpController`**
-  _Justification:_ In Seastar's shared-nothing model, each `HttpController` instance lives on exactly one shard. The four atomic counters (`_requests_rejected_concurrency`, `_requests_rejected_persistence`, `_requests_local_dispatch`, `_requests_cross_shard_dispatch`) are only ever incremented from that shard's reactor thread. No cross-shard code reads them. Using `std::atomic` adds unnecessary memory fence overhead and contradicts Hard Rule #0/#1.
-  _What to change:_ Replace `std::atomic<uint64_t>` with plain `uint64_t` for all four counters. If metrics scraping needs cross-shard access, use `smp::submit_to` to gather them.
-  _Location:_ `src/http_controller.hpp` (lines 259-264)
+- [x] **Remove `const_cast` in `evict_oldest_global()` by storing the iterator or address by value**
+  _Justification:_ Line 525 uses `const_cast<seastar::socket_address*>(&addr)` to capture a pointer to a map key during iteration, then dereferences it after the loop to index back into the map. While safe in single-threaded Seastar code today (no `co_await` between capture and use), this pattern is fragile: any future modification that inserts/erases map entries between the scan and the lookup would invalidate the pointer. `const_cast` on map keys is a well-known anti-pattern because it circumvents the const-correctness that protects key integrity.
+  _What to change:_ Replace `seastar::socket_address* oldest_addr` with a `decltype(_pools)::iterator oldest_it = _pools.end()` and track the iterator directly. The lookup at line 530 becomes `auto& pool = oldest_it->second;` with no `const_cast` needed.
+  _Location:_ `src/connection_pool.hpp:518-538`
   _Complexity:_ Low
-  _Priority:_ P3 — Code hygiene and minor performance improvement
+  _Priority:_ P3 — Maintainability; eliminates a dangerous pattern before it becomes a real bug
 
-### 15.4 Sanitize Header Values and Fix Hardcoded Host in Backend Request Construction
+### 17.3 Manual `_total_idle_connections` Counter is Drift-Prone
 
-- [ ] **Sanitize outgoing header values and derive Host from target address**
-  _Justification:_ `send_backend_request()` builds the HTTP request via raw string concatenation. The `Host` header is hardcoded to `localhost`. `ctx.request_id` and `ctx.backend_traceparent` originate from client headers and are injected without CRLF injection checks — a crafted `X-Request-ID` containing `\r\n` could inject arbitrary headers. The body is also concatenated into the header string, doubling memory for large payloads.
-  _What to change:_ (1) Strip `\r` and `\n` from `request_id` and `backend_traceparent` before interpolation. (2) Derive the `Host` header from `ctx.current_addr`. (3) Write headers and body as two separate `write()` calls to avoid the double-copy for large payloads.
-  _Location:_ `src/http_controller.cpp` (lines 420-432)
-  _Complexity:_ Low
-  _Priority:_ P2 — Header injection risk and correctness
-
-### 15.5 Optimize Per-Chunk Flush in SSE Streaming Loop
-
-- [ ] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
-  _Justification:_ Every chunk received from the backend triggers a `write()` + `flush()` to the client. For streaming LLM responses with many small SSE events (10-50 bytes per token), this produces one syscall per token. While low-latency delivery is intentional for SSE, a more nuanced approach could batch flushes when multiple chunks are available in the same reactor tick.
-  _What to change:_ Remove the per-chunk `flush()` and rely on Seastar's internal output stream buffering, or implement a configurable flush strategy: immediate for `[DONE]` events, batched otherwise (e.g., flush every 10ms via a timer or after N bytes accumulated).
-  _Location:_ `src/http_controller.cpp` (lines 602-603)
+- [x] **Replace manual `_total_idle_connections` tracking with a derived or RAII-guarded counter**
+  _Justification:_ The `_total_idle_connections` counter is manually incremented in `put()` (line 324) and decremented in four separate locations: `get()` (line 194), `put()` per-host eviction (line 308), `evict_oldest_global()` (line 534), `cleanup_expired()` (line 410), and `clear_pool()` (line 367). Any missed or double decrement silently corrupts capacity enforcement—the global eviction in `put()` uses this counter to decide when to evict (line 314), so drift means either premature eviction (lost connections) or unbounded growth (OOM). The scattered nature of these updates makes it easy to introduce drift during future modifications.
+  _What to change:_ Option A (simple): Add a `debug_validate_counter()` method that walks all pools and asserts the sum matches `_total_idle_connections`; call it at the end of `put()`, `get()`, and `cleanup_expired()` in debug builds. Option B (structural): Compute the count on demand by summing `pool.size()` across all entries. This is O(B) where B is number of backends, but `evict_oldest_global()` already does an O(B) scan, so the marginal cost is low. Option C: Wrap the deque in a thin container that increments/decrements the shared counter on push/pop.
+  _Location:_ `src/connection_pool.hpp` (all methods that modify `_total_idle_connections`)
   _Complexity:_ Medium
-  _Priority:_ P3 — Performance; most impactful at high token throughput
+  _Priority:_ P2 — Correctness; silent counter drift causes incorrect capacity enforcement
 
-### 15.6 Add Explicit `stop()` Method for Orderly Shutdown
+### 17.4 `evict_oldest_global()` is O(B) on the `put()` Hot Path
 
-- [ ] **Add `seastar::future<> stop()` to `HttpController` for clean lifecycle management**
-  _Justification:_ `HttpController` is used as `seastar::sharded<HttpController>`, so Seastar calls `.stop()` on each shard during shutdown. The class has no `stop()` method and relies on the default (ready future). However, `_rate_limiter.start()` is called in `register_routes()` and only stopped in `wait_for_drain()`. If teardown skips `wait_for_drain()`, the rate limiter timer could fire after destruction. Per Hard Rule #5 (timer gate guards) and #6 (deregister metrics in stop).
-  _What to change:_ Add `seastar::future<> stop()` that: (1) calls `_rate_limiter.stop()`, (2) closes `_request_gate` if not already closed, (3) ensures orderly cleanup regardless of whether `wait_for_drain()` was called.
-  _Location:_ `src/http_controller.hpp` (class declaration), `src/http_controller.cpp` (new method)
+- [x] **Avoid O(B) scan in `evict_oldest_global()` by maintaining a sorted eviction index**
+  _Justification:_ When the pool is at `max_total_connections` capacity, every `put()` call triggers `evict_oldest_global()` (line 316), which iterates over all backend pools to find the one with the globally oldest front element (line 522-527). With `max_backends = 1000`, this is 1000 iterations per `put()` at capacity. In steady-state high-load scenarios (many backends, pool at capacity), this becomes a non-trivial reactor stall on the hot proxy path.
+  _What to change:_ Maintain a `std::set` or min-heap of `(last_used, socket_address)` pairs updated on `put()` and `get()`. Eviction becomes O(log B) instead of O(B). Alternatively, accept the O(B) cost but document it as a known limitation, since the reaper timer (every 15s) keeps the pool below capacity in practice, making this path rare.
+  _Location:_ `src/connection_pool.hpp:518-538`
+  _Complexity:_ Medium
+  _Priority:_ P3 — Performance; only matters at sustained high connection churn with many backends
+
+### 17.5 Replace `std::unordered_map` with `absl::flat_hash_map`
+
+- [x] **Switch `_pools` from `std::unordered_map` to `absl::flat_hash_map`**
+  _Justification:_ The project already depends on Abseil (`absl::flat_hash_map` is used elsewhere). `std::unordered_map` uses node-based storage (one heap allocation per entry), causing poor cache locality during iteration. `absl::flat_hash_map` uses open addressing with flat storage, providing better cache behavior for both lookup (`get()`, `put()` call `find()`) and iteration (`evict_oldest_global()`, `cleanup_expired()`). The connection pool's `get()` and `put()` are on the hot proxy path, so even small lookup improvements compound.
+  _What to change:_ Replace `std::unordered_map<seastar::socket_address, std::deque<Bundle>>` with `absl::flat_hash_map<seastar::socket_address, std::deque<Bundle>>`. Verify `seastar::socket_address` has an appropriate `AbslHashValue` overload or provide one. Update includes.
+  _Location:_ `src/connection_pool.hpp:471`
   _Complexity:_ Low
-  _Priority:_ P2 — Defensive correctness; prevents use-after-free on abnormal shutdown paths
+  _Priority:_ P3 — Performance; incremental improvement on hot path
 
-### 15.7 Bound Recursive JSON Serialization in Admin Endpoints
+### 17.6 `BasicConnectionBundle::close()` Self-Referencing Continuation is an API Footgun
 
-- [ ] **Add depth and size limits to `dump_node_to_json` and admin dump handlers**
-  _Justification:_ The tree dump handler recursively serializes the entire radix tree into a `std::ostringstream` with no upper bound. For production systems with tens of thousands of routes, this could produce multi-MB JSON responses. The recursive `dump_node_to_json` also risks stack overflow for deeply nested trees. `handle_dump_cluster` and `handle_dump_backends` have similar unbounded output.
-  _What to change:_ (1) Add a `max_depth` parameter to `dump_node_to_json` (default: 32) to bound recursion. (2) Add a `?limit=N` query parameter to cap the number of nodes returned. (3) Consider streaming JSON output for large responses rather than building the entire string in memory.
-  _Location:_ `src/http_controller.cpp` (lines 1871-1986, 2005-2077)
+- [x] **Make `BasicConnectionBundle::close()` safe for direct callers or mark it private**
+  _Justification:_ The `close()` method at line 74 chains `.then([this] { return in.close(); })`, capturing `this` in a Seastar continuation. This is only safe when the bundle is heap-allocated with a lifetime extending beyond the future (as `AsyncClosePolicy` does by moving to `unique_ptr` and capturing it in `.finally()`). If any caller invokes `close()` on a stack-local or member bundle that is destroyed before the continuation runs, the `[this]` capture becomes dangling—a use-after-free. The current code is safe because all close paths go through `close_bundle_async()` → `AsyncClosePolicy`, but the public `close()` method doesn't communicate this lifetime requirement.
+  _What to change:_ Option A: Change `close()` to take a `seastar::lw_shared_ptr<BasicConnectionBundle>` and capture it in the continuation (self-preventing destruction). Option B: Remove `close()` from the public API entirely—make `AsyncClosePolicy` a friend and `close()` private, forcing all callers through `close_bundle_async()`. Option C: At minimum, add a prominent `/// @warning` doc comment stating the lifetime requirement.
+  _Location:_ `src/connection_pool.hpp:71-77`
+  _Complexity:_ Low (Option C) to Medium (Option A/B)
+  _Priority:_ P3 — Maintainability; prevents future misuse as the codebase grows
+
+### 17.7 Add `connections_created` and `connections_reused` Counters for Operational Visibility
+
+- [x] **Track connection reuse ratio with `connections_created` and `connections_reused` stats**
+  _Justification:_ The pool tracks `dead_connections_reaped`, `connections_reaped_max_age`, and `backends_rejected` but has no counter for total connections created (`create_connection()` calls) or successful pool reuses (the early-return path in `get()`). Without these, operators cannot determine the pool's hit rate—a critical metric for tuning `max_connections_per_host`, `idle_timeout`, and `max_connection_age`. A pool with <50% reuse rate suggests misconfigured timeouts or backend instability.
+  _What to change:_ Add `size_t _connections_created = 0` (increment in `create_connection()`) and `size_t _connections_reused = 0` (increment in the reuse path of `get()`, line 237). Expose both in `Stats`. Optionally add `_connection_create_failures` for failed `seastar::connect()` calls.
+  _Location:_ `src/connection_pool.hpp` (Stats struct, `create_connection()`, `get()`)
   _Complexity:_ Low
-  _Priority:_ P3 — Defensive correctness; prevents OOM on large trees
+  _Priority:_ P2 — Observability; essential for production tuning and incident response
+
+---
+
+## 18. Gossip Service Review (2026-02-14)
+
+Code review of `gossip_service.{hpp,cpp}` and its three sub-modules (`gossip_consensus`, `gossip_protocol`, `gossip_transport`). Findings span correctness, performance, and maintainability.
+
+### 18.1 Fire-and-Forget Route Prune Futures Bypass the Gate (Rule #5)
+
+- [x] **Gate-protect the route prune `parallel_for_each` futures instead of discarding them**
+  _Justification:_ In three locations — `check_liveness()` (line 250), `remove_peer()` (line 139), and `update_peer_list()` (line 191) — the route pruning operation is dispatched as `(void)seastar::parallel_for_each(...)`, discarding the returned future. These fire-and-forget async operations are not covered by any gate, so they can continue executing after `GossipConsensus::stop()` returns and the object is destroyed. The `parallel_for_each` lambda captures `b_id` by value (safe), but the `.handle_exception` lambda calls `log_gossip_consensus()` which accesses a static logger (safe), so the immediate crash risk is limited. However, the `s_local_prune_callback` invoked on each shard could itself capture state from a service that has already been stopped. This is a latent use-after-free that will surface when callback implementations become more complex.
+  _What to change:_ Acquire a `_timer_gate.hold()` at the start of each pruning dispatch and move the holder into `.finally()` on the outermost future. This ensures `stop()` (which closes `_timer_gate`) waits for all in-flight prune operations. Alternatively, collect the prune futures into a member `std::vector<seastar::future<>>` and drain them in `stop()`.
+  _Location:_ `src/gossip_consensus.cpp:139-153`, `191-206`, `248-264`
+  _Complexity:_ Low
+  _Priority:_ P1 — Correctness; violates Rule #5 (gate guards for async lifetime)
+
+### 18.2 Unbounded `_peer_table` Violates Rule #4
+
+- [x] **Add a MAX_PEERS bound to the peer table and DNS discovery insertion paths**
+  _Justification:_ `_peer_table` (`std::unordered_map<socket_address, PeerState>`) has no maximum size. The `add_peer()`, `update_peer_list()`, and initial population in `start()` all insert without a size check. A misconfigured or malicious DNS discovery response could return thousands of addresses, growing memory unbounded. Other gossip containers (`_received_seq_sets`, `_pending_acks`, `_peer_seq_counters`) already have `MAX_DEDUP_PEERS` and `MAX_PENDING_ACKS` bounds (Rule #4 compliance), but the authoritative peer table does not.
+  _What to change:_ Add `static constexpr size_t MAX_PEERS = 1000;` (or configurable). Check size in `add_peer()` and `update_peer_list()` before inserting new entries. Log a warning and increment an overflow counter when the limit is reached. The existing `MAX_DEDUP_PEERS = 10000` in `GossipProtocol` should arguably be derived from `MAX_PEERS` rather than independently defined.
+  _Location:_ `src/gossip_consensus.hpp:191`, `src/gossip_consensus.cpp:124-129`, `160-223`
+  _Complexity:_ Low
+  _Priority:_ P2 — Correctness; violates Rule #4 (bounded containers)
+
+### 18.3 Dead `update_quorum_state()` Diverges From Active `check_quorum()`
+
+- [x] **Remove dead `update_quorum_state()` or unify with `check_quorum()`**
+  _Justification:_ `update_quorum_state()` (line 346) is declared private, defined at ~50 LOC, but never called anywhere in the codebase. It uses `_stats_cluster_peers_alive` (binary alive/dead) for quorum calculation, while the active `check_quorum()` uses `peers_recently_seen` (time-windowed). These two functions produce different quorum decisions for the same cluster state. If a future developer calls `update_quorum_state()` thinking it's interchangeable with `check_quorum()`, the cluster will exhibit inconsistent quorum behavior — one path could report HEALTHY while the other reports DEGRADED for the same peer table.
+  _What to change:_ Option A (preferred): Delete `update_quorum_state()` entirely — it's dead code, and `check_quorum()` is the authoritative quorum path. Option B: If both alive-count and recently-seen semantics are needed, parameterize a single `evaluate_quorum(size_t alive_count)` method and call it from both sites with the appropriate count.
+  _Location:_ `src/gossip_consensus.hpp:219`, `src/gossip_consensus.cpp:346-395`
+  _Complexity:_ Low
+  _Priority:_ P2 — Maintainability; dead code with divergent logic is a latent correctness risk
+
+### 18.4 `process_retries()` Gate Holder Does Not Cover Fire-and-Forget Sends (Rule #5)
+
+- [x] **Extend the gate holder lifetime in `process_retries()` to cover the send futures**
+  _Justification:_ `process_retries()` (line 764) acquires a `_transport->timer_gate().hold()` at the top, then iterates pending ACKs and fires `(void)_transport->send(peer, pending.serialized_packet)` for each retry. The gate holder is scoped to the synchronous function body; it is destroyed when `process_retries()` returns. But the send futures are fire-and-forget — they execute asynchronously after the function returns. If `GossipTransport::stop()` closes the timer gate and destroys the channel while these sends are in-flight, the send futures may access a destroyed `_channel`. In practice Seastar's UDP send likely resolves with an exception on a closed channel, but this violates the gate pattern (Rule #5) and is unsafe if the transport's shutdown sequence changes.
+  _What to change:_ Collect the retry send futures into a local vector and return `seastar::when_all_succeed(...)` from `process_retries()`, or move the gate holder into a `.finally()` on the aggregated future. This requires changing the retry timer callback to handle the returned future (e.g., `(void)process_retries().handle_exception(...)`).
+  _Location:_ `src/gossip_protocol.cpp:764-832`
+  _Complexity:_ Medium
+  _Priority:_ P2 — Correctness; violates Rule #5 (gate guards must scope to full async lifetime)
+
+### 18.5 O(N) Peer Address Lookup on Every Incoming Packet
+
+- [x] **Replace `std::find()` on `_peer_addresses` vector with an `absl::flat_hash_set` for O(1) peer validation**
+  _Justification:_ `handle_packet()` (line 430) validates the source address of every incoming UDP packet with `std::find(_peer_addresses->begin(), _peer_addresses->end(), src_addr)`. This is O(N) where N is the number of configured peers. While current cluster sizes are small (3-10 nodes), this is the hot path for packet reception — every heartbeat, route announcement, and ACK hits this linear scan. With DNS discovery enabled and larger clusters, this becomes a measurable cost per packet. The project already depends on Abseil.
+  _What to change:_ Maintain a `absl::flat_hash_set<seastar::socket_address>` (or `std::unordered_set`) alongside the `_peer_addresses` vector. Update it in `refresh_peers()` when the peer list changes. Replace `std::find()` with a set lookup. The vector is still needed for iteration (heartbeat broadcast, etc.), so keep both.
+  _Location:_ `src/gossip_protocol.cpp:430-434`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; linear scan on hot path scales poorly with cluster size
+
+### 18.6 Per-Peer Token Vector Copy in `broadcast_route()`
+
+- [x] **Serialize the route packet once and reuse across peers, stamping only the per-peer sequence number**
+  _Justification:_ `broadcast_route()` (line 335) uses `parallel_for_each` with a lambda that captures `tokens` by value. Inside the lambda, line 339 performs `pkt.tokens = std::vector<TokenId>(tokens.begin(), tokens.end())` — an explicit copy for each peer. For a cluster of N peers, this creates N+1 copies of the token vector (1 capture + N per-peer). With MAX_TOKENS=256 and sizeof(TokenId)=4, each copy is up to 1KB. The serialization at line 347 (`pkt.serialize()`) is also repeated N times. Since the packet differs only in `seq_num` (4 bytes at offset 2-5), the bulk of serialization is redundant work.
+  _What to change:_ Serialize the packet once outside the loop with `seq_num=0`. Inside the per-peer lambda, copy the pre-serialized buffer and stamp the peer-specific `seq_num` at bytes 2-5. This eliminates N-1 token vector copies and N-1 serialization passes.
+  _Location:_ `src/gossip_protocol.cpp:335-376`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; redundant copies and serialization on broadcast path
+
+### 18.7 Triplicated Route Prune Broadcast Code
+
+- [x] **Extract route prune dispatch into a `broadcast_prune(BackendId)` helper method**
+  _Justification:_ The identical ~12-line pattern of `parallel_for_each(irange(0, smp::count), [b_id](shard) { submit_to(shard, [b_id] { s_local_prune_callback(b_id); }); }).handle_exception(...)` appears verbatim in three methods: `check_liveness()`, `remove_peer()`, and `update_peer_list()`. This DRY violation means any fix to the prune dispatch (e.g., adding gate protection per 18.1, changing error handling, adding metrics) must be applied in three places. A missed update creates behavioral divergence.
+  _What to change:_ Extract a private `seastar::future<> broadcast_prune(BackendId b_id)` method on `GossipConsensus`. Call it from all three sites. This also simplifies applying the gate fix from 18.1 in a single location.
+  _Location:_ `src/gossip_consensus.cpp:139-153`, `191-206`, `248-264`
+  _Complexity:_ Low
+  _Priority:_ P3 — Maintainability; DRY violation across three call sites
+
+### 18.8 No-Op `catch (...) { throw; }` Blocks Violate Rule #9
+
+- [x] **Remove empty catch-rethrow blocks in `GossipService::start()` and `GossipTransport::start()`**
+  _Justification:_ `GossipService::start()` (line 227-229) and `GossipTransport::start()` (line 45-47) both contain `catch (...) { throw; }` blocks that catch all exceptions and immediately rethrow without logging. These are no-ops — the exception would propagate identically without the try-catch. They add cognitive noise and violate Rule #9 (every catch block must log at warn level). If the intent was to add logging or cleanup later, the empty block is a "TODO" that was never completed.
+  _What to change:_ Option A (preferred): Remove the try-catch blocks entirely — the exception propagates naturally. Option B: If cleanup is needed on failure (e.g., setting `_running = false`), add meaningful cleanup and a `log_gossip.error(...)` call before rethrowing.
+  _Location:_ `src/gossip_service.cpp:227-229`, `src/gossip_transport.cpp:45-47`
+  _Complexity:_ Low
+  _Priority:_ P3 — Maintainability; dead code violating Rule #9
 
 ---
 
