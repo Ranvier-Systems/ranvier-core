@@ -2,10 +2,62 @@
 
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace ranvier {
+
+/**
+ * Sanitize a string for use as an HTTP header value.
+ * Strips CR (\r) and LF (\n) characters to prevent header injection attacks.
+ *
+ * @param input The raw header value (may contain user-controlled content)
+ * @return Sanitized string safe for header interpolation
+ */
+inline std::string sanitize_header_value(std::string_view input) {
+    std::string result;
+    result.reserve(input.size());
+    for (char c : input) {
+        if (c != '\r' && c != '\n') {
+            result += c;
+        }
+    }
+    return result;
+}
+
+/**
+ * Escape a string for safe inclusion in a JSON string value.
+ * Handles double quotes, backslashes, control characters per RFC 8259.
+ *
+ * @param s The raw string to escape
+ * @return JSON-safe escaped string (without surrounding quotes)
+ */
+inline std::string escape_json_string(const std::string& s) {
+    std::string result;
+    result.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    result += buf;
+                } else {
+                    result += c;
+                }
+        }
+    }
+    return result;
+}
 
 /**
  * Safe integer parsing utilities using std::from_chars.

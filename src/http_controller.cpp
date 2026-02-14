@@ -177,8 +177,8 @@ auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler
         if (!authorized) {
             rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->add_header("WWW-Authenticate", "Bearer");
-            // Provide specific error message
-            std::string error_msg = "{\"error\": \"Unauthorized - " + info + "\"}";
+            // Provide specific error message (escape to prevent malformed JSON)
+            std::string error_msg = "{\"error\": \"Unauthorized - " + escape_json_string(info) + "\"}";
             rep->write_body("json", error_msg);
             return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
@@ -416,28 +416,34 @@ future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionB
         co_return false;
     }
 
-    // Build HTTP request with tracing headers for backend
-    sstring http_req =
+    // Build HTTP request headers with sanitized values to prevent CRLF injection.
+    // Host is derived from the target address (not hardcoded to localhost).
+    // Headers and body are written separately to avoid doubling memory for large payloads.
+    sstring host_value = to_sstring(ctx.current_addr);
+    sstring safe_request_id = sstring(sanitize_header_value(ctx.request_id));
+
+    sstring http_headers =
         "POST " + sstring(ctx.endpoint) + " HTTP/1.1\r\n"
-        "Host: localhost\r\n"
+        "Host: " + host_value + "\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: " + to_sstring(ctx.forwarded_body.size()) + "\r\n"
-        "X-Request-ID: " + ctx.request_id + "\r\n";
+        "X-Request-ID: " + safe_request_id + "\r\n";
 
-    // Add traceparent header if tracing is enabled
+    // Add traceparent header if tracing is enabled (sanitize to prevent injection)
     if (!ctx.backend_traceparent.empty()) {
-        http_req += "traceparent: " + ctx.backend_traceparent + "\r\n";
+        http_headers += "traceparent: " + sstring(sanitize_header_value(ctx.backend_traceparent)) + "\r\n";
     }
 
-    http_req += "Connection: keep-alive\r\n\r\n" + ctx.forwarded_body;
+    http_headers += "Connection: keep-alive\r\n\r\n";
 
     log_proxy.info("[{}] Sending request to backend ({} bytes)",
                   ctx.request_id, ctx.forwarded_body.size());
 
-    // Send request with broken pipe/connection reset handling
+    // Send headers and body separately to avoid concatenating large payloads
     std::exception_ptr rethrow_exception;
     try {
-        co_await bundle.out.write(http_req);
+        co_await bundle.out.write(http_headers);
+        co_await bundle.out.write(ctx.forwarded_body);
         co_await bundle.out.flush();
         co_return true;
     } catch (...) {
@@ -596,11 +602,17 @@ future<> HttpController::stream_backend_response(
             }
         }
 
-        // Write to client with broken pipe handling
+        // Write to client with broken pipe handling.
+        // Flush strategy: flush on first write (TTFT), on stream completion (done),
+        // and let Seastar's output_stream buffer coalesce intermediate writes.
+        // This reduces per-token syscalls while preserving low latency for first byte.
         if (!res.data.empty()) {
+            bool needs_flush = (ctx.bytes_written_to_client == 0) || res.done;
             try {
                 co_await client_out.write(res.data);
-                co_await client_out.flush();
+                if (needs_flush) {
+                    co_await client_out.flush();
+                }
                 ctx.bytes_written_to_client += res.data.size();
             } catch (...) {
                 auto err_type = classify_connection_error(std::current_exception());
@@ -659,7 +671,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     request_span.set_attribute("ranvier.request_id", request_id);
 
     // Check if we're draining - reject new requests with 503
-    if (_draining.load(std::memory_order_relaxed)) {
+    if (_draining) {
         log_proxy.info("[{}] Request rejected - server is draining", request_id);
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->add_header("X-Request-ID", request_id);
@@ -720,15 +732,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         shard_load_metrics().increment_active();
     }
 
-    // Select target shard for request processing using P2C algorithm
-    // This evaluates shard load and may select a different shard for processing
-    uint32_t target_shard = select_target_shard();
-    uint32_t local_shard = seastar::this_shard_id();
-
-    // Log cross-shard dispatch decision for observability
-    if (target_shard != local_shard && _lb_config.enabled) {
-        log_proxy.debug("[{}] P2C selected shard {} (local: {})", request_id, target_shard, local_shard);
-    }
+    // NOTE: P2C shard selection is computed but cross-shard dispatch is not yet
+    // implemented (requires foreign_ptr plumbing per Hard Rule #14). Requests are
+    // always processed on the local shard. Track local dispatch for future metrics.
+    ++_requests_local_dispatch;
 
     // RAII guard ensures active request counter is decremented even if exception thrown
     // Guard is released before entering the lambda, which takes over responsibility
@@ -800,7 +807,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     // active_request_guard destructor will decrement counter
                     rep->add_header("X-Request-ID", request_id);
                     rep->set_status(seastar::http::reply::status_type::bad_request);
-                    rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + token_result.error + "\"}");
+                    rep->write_body("json", "{\"error\": \"Invalid prompt_token_ids: " + escape_json_string(token_result.error) + "\"}");
                     co_return std::move(rep);
                 }
             }
@@ -1068,7 +1075,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             route_span.set_error(route_result.error_message);
             metrics().record_failure();
             rep->add_header("X-Request-ID", request_id);
-            rep->write_body("json", "{\"error\": \"" + route_result.error_message + "!\"}");
+            rep->write_body("json", "{\"error\": \"" + escape_json_string(route_result.error_message) + "!\"}");
             co_return std::move(rep);
         }
 
@@ -1445,7 +1452,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
         log_control.warn("POST /admin/routes: input validation failed for backend {}: {}", backend_id, validation.error);
         metrics().record_tokenizer_validation_failure();
         rep->set_status(seastar::http::reply::status_type::bad_request);
-        rep->write_body("json", "{\"error\": \"Input validation failed: " + validation.error + "\"}");
+        rep->write_body("json", "{\"error\": \"Input validation failed: " + escape_json_string(validation.error) + "\"}");
         return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
     }
 
@@ -1734,34 +1741,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_reload
 
     log_control.info("Config reload triggered via /admin/keys/reload endpoint");
 
-    // Helper to escape JSON string values (prevent injection)
-    auto escape_json_string = [](const std::string& s) -> std::string {
-        std::string result;
-        result.reserve(s.size() + 8);
-        for (char c : s) {
-            switch (c) {
-                case '"': result += "\\\""; break;
-                case '\\': result += "\\\\"; break;
-                case '\b': result += "\\b"; break;
-                case '\f': result += "\\f"; break;
-                case '\n': result += "\\n"; break;
-                case '\r': result += "\\r"; break;
-                case '\t': result += "\\t"; break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20) {
-                        // Control character - encode as \u00XX
-                        char buf[8];
-                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                        result += buf;
-                    } else {
-                        result += c;
-                    }
-            }
-        }
-        return result;
-    };
-
     // Build response with current key metadata (names only, not values)
+    // Uses escape_json_string() from parse_utils.hpp for JSON safety
     // Note: This shows the state BEFORE the reload completes
     std::string response = "{\"status\": \"reload_triggered\", \"message\": \"Configuration reload initiated\", "
                           "\"current_key_count\": " + std::to_string(current_key_count) + ", \"current_keys\": [";
@@ -1787,14 +1768,39 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_reload
 // GRACEFUL SHUTDOWN
 // ---------------------------------------------------------
 
+future<> HttpController::stop() {
+    // Guard against double-stop: wait_for_drain() also calls _rate_limiter.stop()
+    // and _request_gate.close(). The rate limiter's internal gate cannot be closed
+    // twice, so we track whether stop has already been called.
+    if (_stopped) {
+        co_return;
+    }
+    _stopped = true;
+
+    // Hard Rule #5: Stop timers before destruction to prevent use-after-free.
+    // Hard Rule #6: Metrics lambdas capturing `this` are deregistered when
+    // the rate limiter's internal timer is cancelled.
+    co_await _rate_limiter.stop();
+
+    // Close gate if not already closed by wait_for_drain()
+    if (!_request_gate.is_closed()) {
+        co_await _request_gate.close();
+    }
+
+    log_proxy.debug("HttpController::stop() completed on shard {}", seastar::this_shard_id());
+}
+
 void HttpController::start_draining() {
-    _draining.store(true, std::memory_order_relaxed);
+    _draining = true;
     log_proxy.info("Draining started - rejecting new requests");
 }
 
 future<> HttpController::wait_for_drain() {
     auto drain_timeout = _config.drain_timeout;
     log_proxy.info("Waiting for in-flight requests to complete (timeout: {}s)", drain_timeout.count());
+
+    // Mark as stopped so HttpController::stop() is a no-op after drain
+    _stopped = true;
 
     // Stop rate limiter cleanup timer first (Hard Rule #5: close gate before destruction)
     // This ensures no timer callbacks are in-flight when we proceed with shutdown
@@ -1816,7 +1822,7 @@ future<> HttpController::wait_for_drain() {
 }
 
 bool HttpController::is_draining() const {
-    return _draining.load(std::memory_order_relaxed);
+    return _draining;
 }
 
 bool HttpController::is_persistence_backpressured() const {
@@ -1837,11 +1843,14 @@ bool HttpController::is_persistence_backpressured() const {
 }
 
 uint32_t HttpController::select_target_shard() {
+    // NOTE: This method computes the optimal target shard using the P2C algorithm,
+    // but actual cross-shard dispatch is NOT yet implemented. The caller always
+    // processes on the local shard. This method exists to maintain the load balancer
+    // snapshot cache and will be used when smp::submit_to dispatch is added.
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: load balancing disabled or single shard
     if (!_lb_config.enabled || !_load_balancer || seastar::smp::count <= 1) {
-        ++_requests_local_dispatch;
         return local_shard;
     }
 
@@ -1850,25 +1859,21 @@ uint32_t HttpController::select_target_shard() {
         _load_balancer->local().update_local_snapshot();
     }
 
-    // Use P2C algorithm to select target shard
-    uint32_t target_shard = _load_balancer->local().select_shard();
-
-    // Track dispatch metrics
-    if (target_shard == local_shard) {
-        ++_requests_local_dispatch;
-    } else {
-        ++_requests_cross_shard_dispatch;
-    }
-
-    return target_shard;
+    // Compute target shard (result is advisory until dispatch is implemented)
+    return _load_balancer->local().select_shard();
 }
 
 // ---------------------------------------------------------
 // STATE INSPECTION HANDLERS (for rvctl CLI)
 // ---------------------------------------------------------
 
-// Helper to serialize a DumpNode to JSON
-static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent_level = 0) {
+// Default maximum recursion depth for tree dump serialization.
+// Prevents stack overflow and multi-MB responses for large trees.
+static constexpr int DEFAULT_MAX_DUMP_DEPTH = 32;
+
+// Helper to serialize a DumpNode to JSON with bounded recursion depth.
+// When max_depth is reached, children are replaced with a count summary.
+static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent_level = 0, int remaining_depth = DEFAULT_MAX_DUMP_DEPTH) {
     std::ostringstream ss;
     std::string indent(indent_level * 2, ' ');
     std::string inner_indent((indent_level + 1) * 2, ' ');
@@ -1894,14 +1899,21 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
     ss << inner_indent << "\"origin\": \"" << node.origin << "\",\n";
     ss << inner_indent << "\"last_accessed_ms\": " << node.last_accessed_ms << ",\n";
 
-    // Children array
+    // Children array (bounded by remaining_depth)
     ss << inner_indent << "\"children\": [";
     if (!node.children.empty()) {
+        if (remaining_depth <= 0) {
+            // Depth limit reached — emit count instead of recursing
+            ss << "],\n";
+            ss << inner_indent << "\"children_truncated\": " << node.children.size() << "\n";
+            ss << indent << "}";
+            return ss.str();
+        }
         ss << "\n";
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0) ss << ",\n";
             ss << inner_indent << "  {\"edge\": " << node.children[i].first << ", \"node\": ";
-            ss << dump_node_to_json(node.children[i].second, indent_level + 2);
+            ss << dump_node_to_json(node.children[i].second, indent_level + 2, remaining_depth - 1);
             ss << "}";
         }
         ss << "\n" << inner_indent;
@@ -1915,6 +1927,16 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
     std::unique_ptr<seastar::http::request> req,
     std::unique_ptr<seastar::http::reply> rep) {
+
+    // Parse optional max_depth parameter to bound recursion (default: 32)
+    int max_depth = DEFAULT_MAX_DUMP_DEPTH;
+    sstring depth_str = req->get_query_param("max_depth");
+    if (!depth_str.empty()) {
+        auto depth_opt = parse_uint32(std::string_view(depth_str));
+        if (depth_opt && *depth_opt > 0 && *depth_opt <= 256) {
+            max_depth = static_cast<int>(*depth_opt);
+        }
+    }
 
     // Check for optional prefix filter (comma-separated token IDs)
     sstring prefix_str = req->get_query_param("prefix");
@@ -1946,7 +1968,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
         std::ostringstream oss;
         oss << "{\n";
         oss << "  \"shard_id\": " << seastar::this_shard_id() << ",\n";
-        oss << "  \"tree\": " << dump_node_to_json(dump, 1) << "\n";
+        oss << "  \"max_depth\": " << max_depth << ",\n";
+        oss << "  \"tree\": " << dump_node_to_json(dump, 1, max_depth) << "\n";
         oss << "}";
         json_response = oss.str();
     } else {
@@ -1961,7 +1984,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
                 oss << prefix_filter[i];
             }
             oss << "],\n";
-            oss << "  \"tree\": " << dump_node_to_json(dump.value(), 1) << "\n";
+            oss << "  \"max_depth\": " << max_depth << ",\n";
+            oss << "  \"tree\": " << dump_node_to_json(dump.value(), 1, max_depth) << "\n";
             oss << "}";
             json_response = oss.str();
         } else {
@@ -2136,7 +2160,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_health(
     std::unique_ptr<seastar::http::reply> rep) {
 
     // Check draining state first (atomic read - lock-free per Anti-Pattern #1)
-    if (_draining.load(std::memory_order_relaxed)) {
+    if (_draining) {
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->write_body("json", "{\"status\": \"draining\"}");
         return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
