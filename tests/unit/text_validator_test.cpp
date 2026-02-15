@@ -256,3 +256,47 @@ TEST_F(TextValidatorEdgeCaseTest, OneOverLimit) {
     auto result = TextValidator::validate_for_tokenizer(over, 100);
     EXPECT_FALSE(result.valid);
 }
+
+// =============================================================================
+// skip_utf8 Parameter Tests
+// =============================================================================
+
+class TextValidatorSkipUtf8Test : public ::testing::Test {};
+
+TEST_F(TextValidatorSkipUtf8Test, SkipUtf8StillChecksLength) {
+    std::string long_input(1000, 'x');
+    auto result = TextValidator::validate_for_tokenizer(long_input, 500, /*skip_utf8=*/true);
+    EXPECT_FALSE(result.valid);
+    EXPECT_NE(result.error.find("length"), std::string::npos);
+}
+
+TEST_F(TextValidatorSkipUtf8Test, SkipUtf8StillChecksNullBytes) {
+    std::string_view with_null("Hello\0World", 11);
+    auto result = TextValidator::validate_for_tokenizer(with_null, 0, /*skip_utf8=*/true);
+    EXPECT_FALSE(result.valid);
+    EXPECT_NE(result.error.find("null byte"), std::string::npos);
+}
+
+TEST_F(TextValidatorSkipUtf8Test, SkipUtf8AcceptsInvalidUtf8) {
+    // Invalid UTF-8 should pass when skip_utf8=true (caller guarantees validity)
+    auto result = TextValidator::validate_for_tokenizer("\xFF\xFE", 0, /*skip_utf8=*/true);
+    EXPECT_TRUE(result.valid);
+}
+
+TEST_F(TextValidatorSkipUtf8Test, NoSkipRejectsInvalidUtf8) {
+    // Same invalid UTF-8 should fail when skip_utf8=false (default)
+    auto result = TextValidator::validate_for_tokenizer("\xFF\xFE", 0, /*skip_utf8=*/false);
+    EXPECT_FALSE(result.valid);
+    EXPECT_NE(result.error.find("UTF-8"), std::string::npos);
+}
+
+TEST_F(TextValidatorSkipUtf8Test, SkipUtf8ValidInputStillPasses) {
+    auto result = TextValidator::validate_for_tokenizer("Hello, 世界! 🌍", 0, /*skip_utf8=*/true);
+    EXPECT_TRUE(result.valid);
+}
+
+TEST_F(TextValidatorSkipUtf8Test, DefaultSkipUtf8IsFalse) {
+    // Verify default behavior (skip_utf8=false) still rejects invalid UTF-8
+    auto result = TextValidator::validate_for_tokenizer("\xFF\xFE");
+    EXPECT_FALSE(result.valid);
+}
