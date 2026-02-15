@@ -18,16 +18,6 @@
 
 set -euo pipefail
 
-# macOS ships without `timeout`; use `gtimeout` from coreutils if available
-if ! command -v timeout &>/dev/null; then
-    if command -v gtimeout &>/dev/null; then
-        timeout() { gtimeout "$@"; }
-    else
-        echo "ERROR: 'timeout' not found. On macOS run: brew install coreutils"
-        exit 125
-    fi
-fi
-
 THRESHOLD_MS="${1:-100}"
 COMPOSE_FILE="docker-compose.test.yml"
 RESULTS_DIR="$(mktemp -d)/benchmark-results"
@@ -54,16 +44,7 @@ if ! docker compose -f "$COMPOSE_FILE" up -d --wait; then
     exit 125
 fi
 
-# Wait for health checks
-echo "Waiting for services..."
-sleep 10
-for i in 1 2 3; do
-    if ! timeout 30 bash -c "until curl -sf http://172.28.2.$i:8080/health > /dev/null 2>&1; do sleep 1; done"; then
-        echo "ranvier$i failed health check — skipping"
-        docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
-        exit 125
-    fi
-done
+# docker compose --wait already ensures all health checks pass
 
 # Step 3: Run the benchmark
 echo "Running benchmark (${BENCHMARK_USERS} users, ${BENCHMARK_DURATION})..."
