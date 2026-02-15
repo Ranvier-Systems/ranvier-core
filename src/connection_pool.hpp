@@ -190,70 +190,65 @@ public:
     // GET: Reuse existing or create new connection
     // request_id: Optional request ID for tracing (empty string if not tracing)
     // Performs liveness checks on pooled connections before returning them
+    //
+    // Hot path: uses operator[] for single-lookup access. Auto-inserting an
+    // empty deque (~64 bytes) for a new address is harmless — bounded by
+    // max_backends via put(), and empty entries are reaped by cleanup_expired().
     seastar::future<Bundle> get(seastar::socket_address addr,
                                            const std::string& request_id = "") {
-        // Use find() instead of operator[] to avoid auto-inserting empty map
-        // entries for unknown addresses (Rule #4: bounded containers)
-        auto pool_it = _pools.find(addr);
+        auto& pool = _pools[addr];
 
-        if (pool_it != _pools.end()) {
-            auto& pool = pool_it->second;
+        // Try to find a valid, non-expired, live connection (LIFO for cache locality)
+        while (!pool.empty()) {
+            auto bundle = std::move(pool.back());
+            pool.pop_back();
+            _total_idle_connections--;
 
-            // Try to find a valid, non-expired, live connection (LIFO for cache locality)
-            while (!pool.empty()) {
-                auto bundle = std::move(pool.back());
-                pool.pop_back();
-                _total_idle_connections--;
-
-                // Skip expired connections (idle too long)
-                if (bundle.is_expired(_config.idle_timeout)) {
-                    if (!request_id.empty()) {
-                        log_pool.debug("[{}] Closing expired pooled connection to {}",
-                                       request_id, addr);
-                    }
-                    _dead_connections_reaped++;
-                    // Move to heap to keep alive during async close
-                    close_bundle_async(std::move(bundle));
-                    continue;
-                }
-
-                // Skip connections that exceeded max age (TTL)
-                if (bundle.is_too_old(_config.max_connection_age)) {
-                    if (!request_id.empty()) {
-                        log_pool.debug("[{}] Closing max-age pooled connection to {} (created too long ago)",
-                                       request_id, addr);
-                    }
-                    _dead_connections_reaped++;
-                    _connections_reaped_max_age++;
-                    // Move to heap to keep alive during async close
-                    close_bundle_async(std::move(bundle));
-                    continue;
-                }
-
-                // Zombie/half-open detection: check if backend sent FIN
-                if (bundle.is_half_open()) {
-                    if (!request_id.empty()) {
-                        log_pool.debug("[{}] Closing half-open connection to {} (backend closed)",
-                                       request_id, addr);
-                    }
-                    _dead_connections_reaped++;
-                    // Move to heap to keep alive during async close
-                    close_bundle_async(std::move(bundle));
-                    continue;
-                }
-
-                // Connection passed liveness checks
+            // Skip expired connections (idle too long)
+            if (bundle.is_expired(_config.idle_timeout)) {
                 if (!request_id.empty()) {
-                    log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
+                    log_pool.debug("[{}] Closing expired pooled connection to {}",
+                                   request_id, addr);
                 }
-                _connections_reused++;
-                bundle.touch();
-                debug_validate_idle_count();
-                return seastar::make_ready_future<Bundle>(std::move(bundle));
+                _dead_connections_reaped++;
+                // Move to heap to keep alive during async close
+                close_bundle_async(std::move(bundle));
+                continue;
             }
 
-            // All connections were stale - remove empty map entry (Rule #4)
-            _pools.erase(pool_it);
+            // Skip connections that exceeded max age (TTL)
+            if (bundle.is_too_old(_config.max_connection_age)) {
+                if (!request_id.empty()) {
+                    log_pool.debug("[{}] Closing max-age pooled connection to {} (created too long ago)",
+                                   request_id, addr);
+                }
+                _dead_connections_reaped++;
+                _connections_reaped_max_age++;
+                // Move to heap to keep alive during async close
+                close_bundle_async(std::move(bundle));
+                continue;
+            }
+
+            // Zombie/half-open detection: check if backend sent FIN
+            if (bundle.is_half_open()) {
+                if (!request_id.empty()) {
+                    log_pool.debug("[{}] Closing half-open connection to {} (backend closed)",
+                                   request_id, addr);
+                }
+                _dead_connections_reaped++;
+                // Move to heap to keep alive during async close
+                close_bundle_async(std::move(bundle));
+                continue;
+            }
+
+            // Connection passed liveness checks
+            if (!request_id.empty()) {
+                log_pool.debug("[{}] Reusing pooled connection to {}", request_id, addr);
+            }
+            _connections_reused++;
+            bundle.touch();
+            debug_validate_idle_count();
+            return seastar::make_ready_future<Bundle>(std::move(bundle));
         }
 
         // No pooled connection available, create new one
@@ -301,18 +296,18 @@ public:
 
         bundle.touch();
 
-        // Rule #4: Check MAX_BACKENDS before inserting new map entry
-        auto pool_it = _pools.find(bundle.addr);
-        if (pool_it == _pools.end()) {
-            if (_pools.size() >= _config.max_backends) {
-                // Too many unique backends - reject pooling this connection
-                log_pool.warn("Backend limit reached ({} backends), not pooling connection to {}",
-                              _pools.size(), bundle.addr);
-                _backends_rejected++;
-                close_bundle_async(std::move(bundle));
-                return;
-            }
-            pool_it = _pools.emplace(bundle.addr, std::deque<Bundle>{}).first;
+        // Rule #4: Bound total unique backend addresses in the pool map.
+        // Single lookup via try_emplace: finds existing or inserts empty deque.
+        // Only check max_backends when a new entry was actually inserted.
+        auto [pool_it, inserted] = _pools.try_emplace(bundle.addr);
+        if (inserted && _pools.size() > _config.max_backends) {
+            // Undo the insert — too many unique backends
+            _pools.erase(pool_it);
+            log_pool.warn("Backend limit reached ({} backends), not pooling connection to {}",
+                          _config.max_backends, bundle.addr);
+            _backends_rejected++;
+            close_bundle_async(std::move(bundle));
+            return;
         }
         auto& pool = pool_it->second;
 
