@@ -1076,3 +1076,305 @@ TEST_F(RequestRewriterTest, BPEBoundaryAlignmentEmptyContent) {
         << "full_text: \"" << *full_text << "\"\n"
         << "system_text + \\n: \"" << system_with_newline << "\"";
 }
+
+// =============================================================================
+// extract_text_with_boundary_info tests
+// =============================================================================
+// Tests the consolidated single-pass extraction that produces text +
+// boundary metadata, eliminating redundant JSON re-parsing on the hot path.
+
+TEST_F(RequestRewriterTest, BoundaryInfoFromPromptField) {
+    std::string body = R"({"prompt": "Hello, world!", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->text, "Hello, world!");
+    EXPECT_TRUE(result->from_prompt);
+    EXPECT_FALSE(result->has_system_prefix);
+    EXPECT_FALSE(result->has_system_messages);
+    EXPECT_TRUE(result->formatted_messages.empty());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoFromMessages) {
+    std::string body = R"({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->text, "You are a helpful assistant.\nWhat is 2+2?");
+    EXPECT_FALSE(result->from_prompt);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixContiguous) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->has_system_messages);
+    EXPECT_TRUE(result->has_system_prefix);
+
+    // system_prefix_end should point to after "You are helpful.\n"
+    std::string expected_prefix = "You are helpful.\n";
+    EXPECT_EQ(result->system_prefix_end, expected_prefix.size());
+    EXPECT_EQ(result->text.substr(0, result->system_prefix_end), expected_prefix);
+
+    // system_text should match extract_system_messages output
+    EXPECT_EQ(result->system_text, "You are helpful.");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixMultipleContiguous) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->has_system_prefix);
+
+    std::string expected_prefix = "You are helpful.\nBe concise.\n";
+    EXPECT_EQ(result->system_prefix_end, expected_prefix.size());
+    EXPECT_EQ(result->text.substr(0, result->system_prefix_end), expected_prefix);
+    EXPECT_EQ(result->system_text, "You are helpful.\nBe concise.");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixInterleaved) {
+    // System messages are NOT contiguous — has_system_prefix should be false
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "First system."},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "Second system."},
+            {"role": "user", "content": "World"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->has_system_messages);
+    EXPECT_FALSE(result->has_system_prefix);  // Not contiguous
+
+    // system_text should still contain all system messages
+    EXPECT_EQ(result->system_text, "First system.\nSecond system.");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoNoSystemMessages) {
+    std::string body = R"({
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result->has_system_messages);
+    EXPECT_FALSE(result->has_system_prefix);
+    EXPECT_TRUE(result->system_text.empty());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoAllSystemMessages) {
+    // All messages are system — no useful prefix boundary
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "First"},
+            {"role": "system", "content": "Second"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->has_system_messages);
+    EXPECT_FALSE(result->has_system_prefix);  // No non-system message to mark boundary
+    EXPECT_EQ(result->system_text, "First\nSecond");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoFormattedMessages) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "Be helpful"},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->formatted_messages.size(), 3);
+
+    // Verify formatted message format matches extract_message_boundaries
+    EXPECT_EQ(result->formatted_messages[0].text, "<|system|>\nBe helpful");
+    EXPECT_TRUE(result->formatted_messages[0].is_system);
+
+    EXPECT_EQ(result->formatted_messages[1].text, "<|user|>\nHi");
+    EXPECT_FALSE(result->formatted_messages[1].is_system);
+
+    EXPECT_EQ(result->formatted_messages[2].text, "<|assistant|>\nHello!");
+    EXPECT_FALSE(result->formatted_messages[2].is_system);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoInvalidJson) {
+    std::string body = "not valid json";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoEmptyMessages) {
+    std::string body = R"({"messages": []})";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoNoContent) {
+    std::string body = R"({"model": "gpt-4", "max_tokens": 100})";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoMessagesWithoutRole) {
+    // Messages without role should be included in text but not in formatted_messages
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "System msg"},
+            {"content": "No role msg"},
+            {"role": "user", "content": "User msg"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    // Combined text includes all messages with content
+    EXPECT_EQ(result->text, "System msg\nNo role msg\nUser msg");
+
+    // Formatted messages only include messages WITH role
+    ASSERT_EQ(result->formatted_messages.size(), 2);
+    EXPECT_EQ(result->formatted_messages[0].text, "<|system|>\nSystem msg");
+    EXPECT_EQ(result->formatted_messages[1].text, "<|user|>\nUser msg");
+
+    // The role-less message is non-system, so it ends the system prefix.
+    // The system message IS contiguous at the start — has_system_prefix is true.
+    EXPECT_TRUE(result->has_system_prefix);
+    EXPECT_TRUE(result->has_system_messages);
+    // Prefix covers "System msg\n" (before the role-less message)
+    EXPECT_EQ(result->text.substr(0, result->system_prefix_end), "System msg\n");
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoConsistentWithExtractText) {
+    // Verify that text matches extract_text output for various inputs
+    std::vector<std::string> bodies = {
+        R"({"prompt": "Hello"})",
+        R"({"messages": [{"role": "user", "content": "Hello"}]})",
+        R"({"messages": [
+            {"role": "system", "content": "Sys"},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hey"}
+        ]})",
+    };
+
+    for (const auto& body : bodies) {
+        auto old_result = RequestRewriter::extract_text(body);
+        auto new_result = RequestRewriter::extract_text_with_boundary_info(body);
+
+        if (old_result.has_value()) {
+            ASSERT_TRUE(new_result.has_value()) << "body: " << body;
+            EXPECT_EQ(new_result->text, *old_result) << "body: " << body;
+        } else {
+            EXPECT_FALSE(new_result.has_value()) << "body: " << body;
+        }
+    }
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoConsistentWithExtractSystemMessages) {
+    // Verify system_text matches extract_system_messages output
+    std::vector<std::string> bodies = {
+        R"({"messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"}
+        ]})",
+        R"({"messages": [
+            {"role": "system", "content": "First."},
+            {"role": "system", "content": "Second."},
+            {"role": "user", "content": "Hello"}
+        ]})",
+        R"({"messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"}
+        ]})",
+    };
+
+    for (const auto& body : bodies) {
+        auto old_result = RequestRewriter::extract_system_messages(body);
+        auto new_result = RequestRewriter::extract_text_with_boundary_info(body);
+
+        ASSERT_TRUE(new_result.has_value()) << "body: " << body;
+        if (old_result.has_value()) {
+            EXPECT_EQ(new_result->system_text, *old_result) << "body: " << body;
+            EXPECT_TRUE(new_result->has_system_messages) << "body: " << body;
+        } else {
+            EXPECT_TRUE(new_result->system_text.empty()) << "body: " << body;
+            EXPECT_FALSE(new_result->has_system_messages) << "body: " << body;
+        }
+    }
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoPrefixMatchesBPEAlignment) {
+    // The key property: when has_system_prefix is true,
+    // text.substr(0, system_prefix_end) == system_text + "\n"
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "What is 2+2?"}
+        ]
+    })";
+
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->has_system_prefix);
+
+    // Verify the fundamental BPE alignment property
+    std::string prefix = result->text.substr(0, result->system_prefix_end);
+    std::string expected = result->system_text + "\n";
+    EXPECT_EQ(prefix, expected)
+        << "prefix: \"" << prefix << "\"\n"
+        << "system_text + \\n: \"" << expected << "\"";
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoEmptyPrompt) {
+    std::string body = R"({"prompt": ""})";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->text, "");
+    EXPECT_TRUE(result->from_prompt);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoUnicodeContent) {
+    std::string body = R"({
+        "messages": [
+            {"role": "system", "content": "你是一个有帮助的助手。🤖"},
+            {"role": "user", "content": "Hello"}
+        ]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->has_system_prefix);
+    EXPECT_EQ(result->system_text, "你是一个有帮助的助手。🤖");
+
+    // Verify BPE alignment with Unicode
+    std::string prefix = result->text.substr(0, result->system_prefix_end);
+    EXPECT_EQ(prefix, result->system_text + "\n");
+}

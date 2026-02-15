@@ -67,6 +67,54 @@ public:
     //   The extracted text, or nullopt if no tokenizable content found
     static std::optional<std::string> extract_text(std::string_view body);
 
+    // Result of combined text extraction with pre-computed boundary metadata.
+    // Produced by a single JSON parse, eliminating redundant re-parsing
+    // that would occur when calling extract_text(), extract_system_messages(),
+    // and extract_message_boundaries() separately.
+    struct TextWithBoundaryInfo {
+        std::string text;                    // Full combined text for tokenization
+
+        // True if text came from "prompt" field (no message structure)
+        bool from_prompt = false;
+
+        // System message prefix boundary.
+        // When system messages are contiguous at the start of the messages array,
+        // text.substr(0, system_prefix_end) == (system_messages + "\n").
+        // This enables tokenizing the prefix substring directly without
+        // re-extracting and re-tokenizing system messages.
+        bool has_system_prefix = false;      // True if contiguous system msgs at start
+        size_t system_prefix_end = 0;        // Char offset in text (includes trailing "\n")
+
+        // System message text for non-contiguous fallback.
+        // Pre-extracted during JSON parsing to avoid re-parsing later.
+        // Matches extract_system_messages() output format.
+        std::string system_text;             // System content joined by "\n" (empty if none)
+        bool has_system_messages = false;
+
+        // Per-message formatted strings for multi-depth boundary computation.
+        // Pre-computed during JSON parsing to avoid re-parsing.
+        // Each string is "<|role|>\ncontent" matching extract_message_boundaries format.
+        struct FormattedMessage {
+            std::string text;                // "<|role|>\ncontent"
+            bool is_system;
+        };
+        std::vector<FormattedMessage> formatted_messages;
+    };
+
+    // Extract text with boundary metadata in a single JSON parse.
+    //
+    // This consolidates extract_text(), extract_system_messages(), and the
+    // JSON parsing portion of extract_message_boundaries() into one pass.
+    // On the hot path, this eliminates 1-2 redundant JSON re-parses per request.
+    //
+    // Parameters:
+    //   body: Request body (JSON string)
+    //
+    // Returns:
+    //   TextWithBoundaryInfo with combined text and boundary metadata,
+    //   or nullopt if no tokenizable content found
+    static std::optional<TextWithBoundaryInfo> extract_text_with_boundary_info(std::string_view body);
+
     // Extract only system message content from a chat completion request
     //
     // For prefix-aware routing, we need to identify the "shared prefix" boundary.
@@ -296,6 +344,121 @@ inline std::optional<std::string> RequestRewriter::extract_text(std::string_view
     }
 
     return std::nullopt;
+}
+
+inline std::optional<RequestRewriter::TextWithBoundaryInfo>
+RequestRewriter::extract_text_with_boundary_info(std::string_view body) {
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+
+    if (doc.HasParseError() || !doc.IsObject()) {
+        return std::nullopt;
+    }
+
+    // Check for "prompt" field first (completion API style)
+    if (doc.HasMember("prompt") && doc["prompt"].IsString()) {
+        TextWithBoundaryInfo result;
+        result.text = std::string(doc["prompt"].GetString(), doc["prompt"].GetStringLength());
+        result.from_prompt = true;
+        // No system message concept for prompt-style requests
+        return result;
+    }
+
+    // Check for "messages" field (chat completion API style)
+    if (!doc.HasMember("messages") || !doc["messages"].IsArray()) {
+        return std::nullopt;
+    }
+
+    const auto& messages = doc["messages"];
+    if (messages.Size() == 0) {
+        return std::nullopt;
+    }
+
+    TextWithBoundaryInfo result;
+    result.from_prompt = false;
+
+    std::string& combined = result.text;
+    std::string& system_text = result.system_text;
+
+    bool in_system_prefix = true;        // Still processing leading system messages
+    bool found_any_system = false;
+    bool system_contiguous = true;       // All system msgs are at the start
+    size_t system_prefix_end_candidate = 0;
+
+    for (rapidjson::SizeType i = 0; i < messages.Size(); ++i) {
+        const auto& msg = messages[i];
+        if (!msg.IsObject()) continue;
+
+        // Get role (may be absent)
+        std::string role_str;
+        bool has_role = false;
+        if (msg.HasMember("role") && msg["role"].IsString()) {
+            role_str = std::string(msg["role"].GetString(), msg["role"].GetStringLength());
+            has_role = true;
+        }
+
+        // Get content
+        if (!msg.HasMember("content")) continue;
+        const auto& content = msg["content"];
+        if (!content.IsString()) continue;
+
+        std::string_view content_sv(content.GetString(), content.GetStringLength());
+        bool is_system = has_role && (role_str == "system");
+
+        // Add separator to combined text (same logic as extract_text)
+        if (!combined.empty()) {
+            combined += "\n";
+        }
+
+        // Track system prefix boundary
+        if (is_system) {
+            found_any_system = true;
+            if (!in_system_prefix) {
+                // System message after a non-system message → not contiguous
+                system_contiguous = false;
+            }
+            // Accumulate system text (matching extract_system_messages format)
+            if (!system_text.empty()) {
+                system_text += "\n";
+            }
+            system_text.append(content_sv.data(), content_sv.size());
+        } else {
+            if (in_system_prefix && found_any_system) {
+                // First non-system message after system messages.
+                // The separator "\n" was already appended to combined above,
+                // so combined.size() is right after the "\n" = start of this message's content.
+                // This is exactly the system prefix end offset.
+                system_prefix_end_candidate = combined.size();
+            }
+            in_system_prefix = false;
+        }
+
+        // Add content to combined text
+        combined.append(content_sv.data(), content_sv.size());
+
+        // Build formatted message for multi-depth (only if role is present,
+        // matching extract_message_boundaries behavior)
+        if (has_role) {
+            std::string formatted = "<|" + role_str + "|>\n";
+            formatted.append(content_sv.data(), content_sv.size());
+            result.formatted_messages.push_back({std::move(formatted), is_system});
+        }
+    }
+
+    result.has_system_messages = found_any_system;
+
+    // Set system prefix boundary only if system messages are contiguous at the start
+    // and there was at least one non-system message after them
+    if (found_any_system && system_contiguous && system_prefix_end_candidate > 0) {
+        result.has_system_prefix = true;
+        result.system_prefix_end = system_prefix_end_candidate;
+    }
+
+    if (combined.empty()) {
+        return std::nullopt;
+    }
+
+    return result;
 }
 
 inline std::optional<std::string> RequestRewriter::extract_system_messages(std::string_view body) {
