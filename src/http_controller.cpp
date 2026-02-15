@@ -770,6 +770,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     bool used_client_tokens = false;
     size_t prefix_boundary = 0;  // Token count of shared prefix (system messages)
 
+    // Text extraction result with boundary metadata — populated during tokenization,
+    // reused during boundary detection to avoid redundant JSON re-parsing.
+    std::optional<RequestRewriter::TextWithBoundaryInfo> text_extraction;
+
     // Timing: capture tokenization start
     auto tokenization_start = std::chrono::steady_clock::now();
 
@@ -816,18 +820,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // If no client tokens, tokenize locally
         if (!used_client_tokens) {
             // Extract text from request body for tokenization (prompt or messages content)
-            // This ensures we tokenize exactly what we use for routing, not metadata
-            // Uses string_view for zero-copy extraction
-            auto extracted_text = RequestRewriter::extract_text(body_view);
-            std::string_view text_to_tokenize = extracted_text.has_value()
-                ? extracted_text.value()
+            // This ensures we tokenize exactly what we use for routing, not metadata.
+            // Uses extract_text_with_boundary_info() for a single JSON parse that also
+            // pre-computes system message boundary metadata, eliminating redundant
+            // JSON re-parsing in the boundary detection phase below.
+            text_extraction = RequestRewriter::extract_text_with_boundary_info(body_view);
+            std::string_view text_to_tokenize = text_extraction.has_value()
+                ? std::string_view(text_extraction->text)
                 : body_view;
 
             // Validate input before passing to tokenizer to prevent crashes
             // The tokenizer (Rust FFI) can segfault on malformed input
             // If text was extracted from parsed JSON, UTF-8 is already validated
             // by RapidJSON — skip the redundant O(N) byte-by-byte scan
-            bool json_validated = extracted_text.has_value();
+            bool json_validated = text_extraction.has_value();
             auto validation = TextValidator::validate_for_tokenizer(
                 text_to_tokenize, TextValidator::DEFAULT_MAX_LENGTH, json_validated);
 
@@ -933,83 +939,119 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     }
 
     // Option 2: Automatic message boundary detection
+    // Uses pre-computed metadata from text_extraction (populated during tokenization)
+    // to avoid redundant JSON re-parsing. Falls back to extract_text_with_boundary_info()
+    // if text_extraction was not populated (e.g., client-provided tokens path).
     if (!prefix_boundary_set && _config.enable_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
+        // Lazily compute text extraction if not already done (client-tokens path)
+        if (!text_extraction.has_value()) {
+            text_extraction = RequestRewriter::extract_text_with_boundary_info(body_view);
+        }
+
         // For multi-depth routing, calculate boundaries at each message
-        if (_config.enable_multi_depth_routing) {
-            auto tokenize_fn = [this](const std::string& text) -> size_t {
+        // using pre-formatted message strings from the initial JSON parse
+        if (_config.enable_multi_depth_routing && text_extraction.has_value() &&
+            !text_extraction->formatted_messages.empty()) {
+            size_t cumulative_tokens = 0;
+            bool found_non_system = false;
+            size_t system_boundary = 0;
+
+            for (const auto& msg : text_extraction->formatted_messages) {
+                size_t msg_token_count = 0;
                 try {
                     // Use cached tokenization for message boundaries (high hit rate for role tags)
-                    auto [result_tokens, cache_hit] = _tokenizer.local().encode_cached(text);
+                    auto [msg_tokens, cache_hit] = _tokenizer.local().encode_cached(msg.text);
                     if (cache_hit) {
                         metrics().record_tokenization_cache_hit();
                     } else {
                         metrics().record_tokenization_cache_miss();
                     }
-                    return result_tokens.size();
+                    msg_token_count = msg_tokens.size();
                 } catch (...) {
-                    return 0;
+                    // Individual message tokenization failed — skip this message
+                    continue;
                 }
-            };
-            auto msg_boundaries = RequestRewriter::extract_message_boundaries(body_view, tokenize_fn);
-            if (msg_boundaries.has_value() && !msg_boundaries->boundaries.empty()) {
-                // Use all message boundaries for multi-depth storage
-                for (size_t b : msg_boundaries->boundaries) {
-                    if (b > 0 && b < tokens.size()) {
-                        prefix_boundaries.push_back(b);
-                    }
+
+                // Track system boundary: cumulative count BEFORE first non-system message
+                if (!found_non_system && !msg.is_system) {
+                    system_boundary = cumulative_tokens;
+                    found_non_system = true;
                 }
-                if (!prefix_boundaries.empty()) {
-                    prefix_boundary = msg_boundaries->system_boundary;
-                    if (prefix_boundary == 0 && !prefix_boundaries.empty()) {
-                        prefix_boundary = prefix_boundaries.front();
-                    }
-                    prefix_boundary_set = true;
-                    metrics().record_prefix_boundary_used();
-                    log_proxy.debug("[{}] Identified {} message boundaries for multi-depth routing",
-                                    request_id, prefix_boundaries.size());
+
+                cumulative_tokens += msg_token_count;
+
+                // Store boundary after each message
+                if (cumulative_tokens > 0 && cumulative_tokens < tokens.size()) {
+                    prefix_boundaries.push_back(cumulative_tokens);
                 }
+            }
+
+            // If all messages were system messages, system_boundary is at the end
+            if (!found_non_system && cumulative_tokens > 0) {
+                system_boundary = cumulative_tokens;
+            }
+
+            if (!prefix_boundaries.empty()) {
+                prefix_boundary = system_boundary;
+                if (prefix_boundary == 0 && !prefix_boundaries.empty()) {
+                    prefix_boundary = prefix_boundaries.front();
+                }
+                prefix_boundary_set = true;
+                metrics().record_prefix_boundary_used();
+                log_proxy.debug("[{}] Identified {} message boundaries for multi-depth routing",
+                                request_id, prefix_boundaries.size());
             }
         }
 
         // Fallback: single boundary from system messages
-        if (!prefix_boundary_set) {
-            auto system_messages = RequestRewriter::extract_system_messages(body_view);
-            if (system_messages.has_value() && !system_messages->empty()) {
-                try {
-                    // IMPORTANT: Add trailing newline to match how extract_text formats messages.
-                    // BPE tokenizers may tokenize "helpful" differently than "helpful\n" due to
-                    // subword boundaries. By including the separator, we ensure the token sequence
-                    // matches the prefix of the full text tokenization.
-                    auto system_text = *system_messages + "\n";
-                    // Use cached tokenization (system messages have ~90%+ cache hit rate)
-                    auto [system_tokens, cache_hit] = _tokenizer.local().encode_cached(system_text);
-                    if (cache_hit) {
-                        metrics().record_tokenization_cache_hit();
-                    } else {
-                        metrics().record_tokenization_cache_miss();
-                    }
-                    // Only use as boundary if system tokens meet minimum threshold
-                    // and are shorter than full tokens (otherwise it's not a prefix)
-                    if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
-                        system_tokens.size() < tokens.size()) {
-                        prefix_boundary = system_tokens.size();
-                        prefix_boundary_set = true;
-                        metrics().record_prefix_boundary_used();
-                        log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
-                                        request_id, prefix_boundary);
-                    } else {
-                        metrics().record_prefix_boundary_skipped();
-                    }
-                } catch (...) {
-                    // System message tokenization failed - not fatal, just skip prefix boundary
-                    metrics().record_prefix_boundary_skipped();
-                    log_proxy.debug("[{}] System message tokenization failed, using default prefix",
-                                    request_id);
+        // Uses pre-extracted system message metadata instead of re-parsing JSON
+        if (!prefix_boundary_set && text_extraction.has_value() &&
+            text_extraction->has_system_messages) {
+            try {
+                // Build the system prefix text for tokenization.
+                // When system messages are contiguous at the start, we use the
+                // prefix substring of the already-extracted combined text directly.
+                // Otherwise, use the pre-extracted system text with trailing newline.
+                // Both approaches match the BPE boundary alignment property:
+                // system_text + "\n" is a text prefix of the full combined text.
+                std::string system_prefix_text;
+                if (text_extraction->has_system_prefix) {
+                    // Contiguous system messages: use prefix substring directly
+                    system_prefix_text = text_extraction->text.substr(
+                        0, text_extraction->system_prefix_end);
+                } else {
+                    // Non-contiguous (interleaved) system messages: use pre-extracted text
+                    system_prefix_text = text_extraction->system_text + "\n";
                 }
-            } else {
-                // No system messages found
+
+                // Use cached tokenization (system messages have ~90%+ cache hit rate)
+                auto [system_tokens, cache_hit] = _tokenizer.local().encode_cached(system_prefix_text);
+                if (cache_hit) {
+                    metrics().record_tokenization_cache_hit();
+                } else {
+                    metrics().record_tokenization_cache_miss();
+                }
+                // Only use as boundary if system tokens meet minimum threshold
+                // and are shorter than full tokens (otherwise it's not a prefix)
+                if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
+                    system_tokens.size() < tokens.size()) {
+                    prefix_boundary = system_tokens.size();
+                    prefix_boundary_set = true;
+                    metrics().record_prefix_boundary_used();
+                    log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
+                                    request_id, prefix_boundary);
+                } else {
+                    metrics().record_prefix_boundary_skipped();
+                }
+            } catch (...) {
+                // System message tokenization failed - not fatal, just skip prefix boundary
                 metrics().record_prefix_boundary_skipped();
+                log_proxy.debug("[{}] System message tokenization failed, using default prefix",
+                                request_id);
             }
+        } else if (!prefix_boundary_set) {
+            // No system messages found or extraction failed
+            metrics().record_prefix_boundary_skipped();
         }
     }
 
