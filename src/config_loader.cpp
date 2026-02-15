@@ -145,11 +145,11 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_LOAD_AWARE_ROUTING")) {
         routing.load_aware_routing = (*v == "1" || *v == "true" || *v == "yes");
     }
-    if (auto v = get_env_as<uint64_t>("RANVIER_QUEUE_DEPTH_THRESHOLD")) {
-        routing.queue_depth_threshold = *v;
+    if (auto v = get_env_as<double>("RANVIER_LOAD_IMBALANCE_FACTOR")) {
+        routing.load_imbalance_factor = *v;
     }
-    if (auto v = get_env_as<uint64_t>("RANVIER_QUEUE_DIFF_THRESHOLD")) {
-        routing.queue_diff_threshold = *v;
+    if (auto v = get_env_as<uint64_t>("RANVIER_LOAD_IMBALANCE_FLOOR")) {
+        routing.load_imbalance_floor = *v;
     }
 
     // Timeout overrides
@@ -609,11 +609,11 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["load_aware_routing"]) {
                 config.routing.load_aware_routing = r["load_aware_routing"].as<bool>();
             }
-            if (r["queue_depth_threshold"]) {
-                config.routing.queue_depth_threshold = r["queue_depth_threshold"].as<uint64_t>();
+            if (r["load_imbalance_factor"]) {
+                config.routing.load_imbalance_factor = r["load_imbalance_factor"].as<double>();
             }
-            if (r["queue_diff_threshold"]) {
-                config.routing.queue_diff_threshold = r["queue_diff_threshold"].as<uint64_t>();
+            if (r["load_imbalance_floor"]) {
+                config.routing.load_imbalance_floor = r["load_imbalance_floor"].as<uint64_t>();
             }
         }
 

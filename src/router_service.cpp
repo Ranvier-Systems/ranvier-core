@@ -154,10 +154,10 @@ struct ShardLocalState {
         RoutingConfig::RoutingMode routing_mode = RoutingConfig::RoutingMode::PREFIX;
         size_t prefix_token_length = 128;
         uint32_t block_alignment = 16;
-        // Load-aware routing configuration
+        // Load-aware routing configuration (relative threshold)
         bool load_aware_routing = true;           // Enable load-aware backend selection
-        uint64_t queue_depth_threshold = 4;       // Max in-flight before considering alternatives
-        uint64_t queue_diff_threshold = 2;        // Min load difference to justify cache miss
+        double load_imbalance_factor = 2.0;       // Divert when preferred > factor * median load
+        uint64_t load_imbalance_floor = 2;        // Additive floor to prevent flapping at low load
     } config;
 
     // ========================================================================
@@ -192,8 +192,8 @@ struct ShardLocalState {
         config.block_alignment = cfg.block_alignment;
         // Load-aware routing configuration
         config.load_aware_routing = cfg.load_aware_routing;
-        config.queue_depth_threshold = cfg.queue_depth_threshold;
-        config.queue_diff_threshold = cfg.queue_diff_threshold;
+        config.load_imbalance_factor = cfg.load_imbalance_factor;
+        config.load_imbalance_floor = cfg.load_imbalance_floor;
 
         // Seed RNG with random device and time for better entropy
         std::random_device rd;
@@ -212,8 +212,8 @@ struct ShardLocalState {
         config.block_alignment = cfg.block_alignment;
         // Load-aware routing configuration
         config.load_aware_routing = cfg.load_aware_routing;
-        config.queue_depth_threshold = cfg.queue_depth_threshold;
-        config.queue_diff_threshold = cfg.queue_diff_threshold;
+        config.load_imbalance_factor = cfg.load_imbalance_factor;
+        config.load_imbalance_floor = cfg.load_imbalance_floor;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -421,9 +421,12 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
     return {best_id, best_load};
 }
 
-// Check if preferred backend is overloaded and find a less-loaded alternative.
-// Returns the backend to use: either the preferred backend or a less-loaded alternative.
-// Updates stats and metrics if diversion occurs.
+// Check if preferred backend is significantly more loaded than its peers and
+// find a less-loaded alternative if so.
+//
+// Uses a RELATIVE threshold: the preferred backend is "overloaded" when its
+// queue depth exceeds (median_load * factor + floor). This auto-adapts to any
+// workload, model size, or cluster size — no per-model tuning needed.
 //
 // Called once per request from get_backend_for_prefix(), after the final backend
 // has been selected by either the ART or hash path. This single call site avoids
@@ -438,9 +441,10 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
 // Rule #1: Lock-free - shard-local state, no synchronization needed
 //
 // Performance notes:
-// - Early exits minimize work in the common case (not overloaded)
+// - Early exits minimize work in the common case (balanced load)
 // - Config values cached in shard-local state (no cross-shard access)
 // - All reads are shard-local plain integers (no atomics needed)
+// - Median computed via nth_element (O(n), n is typically <16 backends)
 static BackendId apply_load_aware_selection(
     BackendId preferred_id,
     const std::vector<BackendId>& live_backends,
@@ -452,34 +456,62 @@ static BackendId apply_load_aware_selection(
         return preferred_id;
     }
 
-    // Cache config values locally to avoid repeated struct access
-    const uint64_t queue_threshold = g_shard_state->config.queue_depth_threshold;
-    const uint64_t diff_threshold = g_shard_state->config.queue_diff_threshold;
-
-    // Check preferred backend's load
-    uint64_t preferred_load = get_backend_load(preferred_id);
-    if (preferred_load <= queue_threshold) {
-        return preferred_id;  // Not overloaded - fast path
-    }
-
-    // Preferred backend overloaded - find alternative
-    auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
-
-    // Validate we found a viable alternative with significant load difference
-    if (least_loaded_id == 0 || preferred_load - least_load <= diff_threshold) {
+    // Need at least 2 backends for load comparison to make sense
+    if (live_backends.size() < 2) {
         return preferred_id;
     }
 
-    // Significant difference - divert to less-loaded backend
+    // Cache config values locally to avoid repeated struct access
+    const double factor = g_shard_state->config.load_imbalance_factor;
+    const uint64_t floor = g_shard_state->config.load_imbalance_floor;
+
+    // Check preferred backend's load
+    uint64_t preferred_load = get_backend_load(preferred_id);
+
+    // Fast path: zero load is never overloaded
+    if (preferred_load == 0) {
+        return preferred_id;
+    }
+
+    // Collect loads from all live backends to compute median.
+    // live_backends.size() is typically <16, so stack allocation is fine.
+    // Rule #4: bounded by live_backends.size() (already bounded upstream).
+    std::vector<uint64_t> loads;
+    loads.reserve(live_backends.size());
+    for (BackendId id : live_backends) {
+        loads.push_back(get_backend_load(id));
+    }
+
+    // Compute median via nth_element (O(n), partial sort)
+    size_t mid = loads.size() / 2;
+    std::nth_element(loads.begin(), loads.begin() + static_cast<ptrdiff_t>(mid), loads.end());
+    uint64_t median = loads[mid];
+
+    // Relative threshold: divert only if preferred is significantly above median
+    // The floor prevents flapping when all backends are at low/zero load
+    uint64_t threshold = static_cast<uint64_t>(static_cast<double>(median) * factor) + floor;
+    if (preferred_load <= threshold) {
+        return preferred_id;
+    }
+
+    // Preferred backend is a genuine outlier — find the least-loaded alternative
+    auto [least_loaded_id, least_load] = get_least_loaded_backend(live_backends);
+
+    // No viable alternative found
+    if (least_loaded_id == 0) {
+        return preferred_id;
+    }
+
+    // Divert to less-loaded backend
     g_shard_state->stats.load_aware_fallbacks++;
     if (g_metrics) {
         metrics().record_load_aware_fallback();
     }
 
-    log_router.debug("[{}] Load-aware routing: {} preferred backend {} has {} in-flight, "
-                     "routing to {} with {} in-flight",
+    log_router.debug("[{}] Load-aware routing: {} preferred backend {} has {} in-flight "
+                     "(median={}, threshold={}), routing to {} with {} in-flight",
                      request_id, source, preferred_id, preferred_load,
-                     least_loaded_id, least_load);
+                     median, threshold, least_loaded_id, least_load);
 
     return least_loaded_id;
 }
