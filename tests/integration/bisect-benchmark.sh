@@ -18,16 +18,6 @@
 
 set -euo pipefail
 
-# macOS ships without `timeout`; use `gtimeout` from coreutils if available
-if ! command -v timeout &>/dev/null; then
-    if command -v gtimeout &>/dev/null; then
-        timeout() { gtimeout "$@"; }
-    else
-        echo "ERROR: 'timeout' not found. On macOS run: brew install coreutils"
-        exit 125
-    fi
-fi
-
 THRESHOLD_MS="${1:-100}"
 COMPOSE_FILE="docker-compose.test.yml"
 RESULTS_DIR="$(mktemp -d)/benchmark-results"
