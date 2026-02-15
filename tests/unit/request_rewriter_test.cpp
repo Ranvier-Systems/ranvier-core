@@ -1264,9 +1264,12 @@ TEST_F(RequestRewriterTest, BoundaryInfoMessagesWithoutRole) {
     EXPECT_EQ(result->formatted_messages[0].text, "<|system|>\nSystem msg");
     EXPECT_EQ(result->formatted_messages[1].text, "<|user|>\nUser msg");
 
-    // The role-less message breaks the system prefix
-    EXPECT_FALSE(result->has_system_prefix);
+    // The role-less message is non-system, so it ends the system prefix.
+    // The system message IS contiguous at the start — has_system_prefix is true.
+    EXPECT_TRUE(result->has_system_prefix);
     EXPECT_TRUE(result->has_system_messages);
+    // Prefix covers "System msg\n" (before the role-less message)
+    EXPECT_EQ(result->text.substr(0, result->system_prefix_end), "System msg\n");
 }
 
 TEST_F(RequestRewriterTest, BoundaryInfoConsistentWithExtractText) {
