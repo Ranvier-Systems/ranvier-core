@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -82,56 +81,59 @@ public:
     };
 
     // Manual increment/decrement for active requests
+    // No atomics needed: shard-local data, one thread per shard (Seastar shared-nothing).
+    // Cross-shard reads go through submit_to() which provides the memory barrier.
     void increment_active() {
-        _active_requests.fetch_add(1, std::memory_order_relaxed);
+        ++_active_requests;
     }
     void decrement_active() {
-        _active_requests.fetch_sub(1, std::memory_order_relaxed);
+        --_active_requests;
     }
 
     // Manual increment/decrement for queued requests
     void increment_queued() {
-        _queued_requests.fetch_add(1, std::memory_order_relaxed);
+        ++_queued_requests;
     }
     void decrement_queued() {
-        _queued_requests.fetch_sub(1, std::memory_order_relaxed);
+        --_queued_requests;
     }
 
     // Record a completed request (for throughput tracking)
     void record_request_completed() {
-        _total_requests.fetch_add(1, std::memory_order_relaxed);
+        ++_total_requests;
     }
 
     // Get current metrics
     uint64_t active_requests() const {
-        return _active_requests.load(std::memory_order_relaxed);
+        return _active_requests;
     }
     uint64_t queued_requests() const {
-        return _queued_requests.load(std::memory_order_relaxed);
+        return _queued_requests;
     }
     uint64_t total_requests() const {
-        return _total_requests.load(std::memory_order_relaxed);
+        return _total_requests;
     }
     uint32_t shard_id() const {
         return _shard_id;
     }
 
     // Create a snapshot for cross-shard communication
+    // Called on the owning shard (via submit_to), so direct reads are safe
     ShardLoadSnapshot snapshot() const {
         return ShardLoadSnapshot{
             _shard_id,
-            _active_requests.load(std::memory_order_relaxed),
-            _queued_requests.load(std::memory_order_relaxed),
-            _total_requests.load(std::memory_order_relaxed),
+            _active_requests,
+            _queued_requests,
+            _total_requests,
             std::chrono::steady_clock::now()
         };
     }
 
 private:
     uint32_t _shard_id;
-    std::atomic<uint64_t> _active_requests;
-    std::atomic<uint64_t> _queued_requests;
-    std::atomic<uint64_t> _total_requests;
+    uint64_t _active_requests;
+    uint64_t _queued_requests;
+    uint64_t _total_requests;
 };
 
 // Thread-local shard load metrics instance
