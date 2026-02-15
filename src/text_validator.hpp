@@ -32,22 +32,27 @@ public:
      *
      * @param text The text to validate
      * @param max_length Maximum allowed length in bytes (0 = no limit)
+     * @param skip_utf8 If true, skip the O(N) byte-by-byte UTF-8 validation.
+     *        Use when the text was already parsed as valid JSON (which implies
+     *        valid UTF-8 for string content). Null-byte and length checks still run.
      * @return ValidationResult with valid=true if safe, or error message if not
      */
-    static ValidationResult validate_for_tokenizer(std::string_view text, size_t max_length = 0) {
+    static ValidationResult validate_for_tokenizer(std::string_view text, size_t max_length = 0,
+                                                    bool skip_utf8 = false) {
         // Check length limit first (cheapest check)
         if (max_length > 0 && text.size() > max_length) {
             return {false, "Input exceeds maximum length (" + std::to_string(text.size()) +
                           " > " + std::to_string(max_length) + " bytes)"};
         }
 
-        // Check for null bytes
+        // Check for null bytes (uses memchr internally — fast)
         if (text.find('\0') != std::string_view::npos) {
             return {false, "Input contains null byte"};
         }
 
-        // Validate UTF-8 encoding
-        if (!is_valid_utf8(text)) {
+        // Validate UTF-8 encoding unless caller guarantees validity
+        // (e.g., text extracted from a successfully-parsed JSON document)
+        if (!skip_utf8 && !is_valid_utf8(text)) {
             return {false, "Input contains invalid UTF-8"};
         }
 

@@ -825,8 +825,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
             // Validate input before passing to tokenizer to prevent crashes
             // The tokenizer (Rust FFI) can segfault on malformed input
+            // If text was extracted from parsed JSON, UTF-8 is already validated
+            // by RapidJSON — skip the redundant O(N) byte-by-byte scan
+            bool json_validated = extracted_text.has_value();
             auto validation = TextValidator::validate_for_tokenizer(
-                text_to_tokenize, TextValidator::DEFAULT_MAX_LENGTH);
+                text_to_tokenize, TextValidator::DEFAULT_MAX_LENGTH, json_validated);
 
             if (!validation.valid) {
                 log_proxy.warn("[{}] Input validation failed, falling back to round-robin routing: {}",
