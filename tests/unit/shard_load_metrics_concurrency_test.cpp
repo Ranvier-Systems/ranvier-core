@@ -296,8 +296,9 @@ TEST_F(ShardLoadMetricsConcurrencyTest, SnapshotDuringConcurrentUpdates) {
                 if (std::isnan(snap.load_score()) || std::isinf(snap.load_score())) {
                     return;  // Fail: corrupted snapshot
                 }
-                // active and queued grow monotonically in this loop
-                if (snap.active_requests != static_cast<uint64_t>(i + 1)) {
+                // After increment but before decrement: active=1, queued=1, total=i+1
+                if (snap.active_requests != 1u || snap.queued_requests != 1u ||
+                    snap.total_requests != static_cast<uint64_t>(i + 1)) {
                     return;
                 }
 
