@@ -425,6 +425,10 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
 // Returns the backend to use: either the preferred backend or a less-loaded alternative.
 // Updates stats and metrics if diversion occurs.
 //
+// Called once per request from get_backend_for_prefix(), after the final backend
+// has been selected by either the ART or hash path. This single call site avoids
+// redundant O(N) scans and keeps load-balancing logic in one place.
+//
 // Parameters:
 //   preferred_id: The backend selected by ART or hash
 //   live_backends: List of available backends to consider
@@ -1180,6 +1184,14 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // 3. If no match in ART, we use consistent hashing on the prefix for
     //    deterministic routing. The route will be learned after success.
 
+    // Track which branch selected the backend for the single load-aware call below
+    BackendId selected = 0;
+    bool art_hit = false;
+    const char* source = "hash";
+    // Hash values only computed in the hash fallback path; declared here for debug logging
+    uint64_t prefix_hash = 0;
+    int32_t hash_index = 0;
+
     // Step 1: Try ART lookup for longest prefix match
     RadixTree* tree = state.tree.get();
     if (tree) {
@@ -1198,46 +1210,49 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     metrics().record_cache_hit();
                 }
 
-                // Apply load-aware selection (may divert to less-loaded backend)
-                BackendId final_backend = apply_load_aware_selection(
-                    art_backend, live_backends, request_id, "ART");
-
-                if (!request_id.empty() && final_backend == art_backend) {
-                    log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
-                                     request_id, tokens.size(), art_backend);
-                }
-                return {final_backend, true};
+                selected = art_backend;
+                art_hit = true;
+                source = "ART";
+            } else {
+                // Backend is dead/draining, fall through to hash-based selection
+                log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
+                                 request_id, art_backend);
             }
-            // Backend is dead/draining, fall through to hash-based selection
-            log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
-                             request_id, art_backend);
         }
     }
 
     // Step 2: No ART match (or backend unavailable) - use consistent hashing
-    // This provides deterministic routing for new prefixes
-    // Uses prefix_boundary if provided (system message only) for multi-node consistency
-    uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-    int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
-    BackendId selected = live_backends[index];
+    if (!art_hit) {
+        // This provides deterministic routing for new prefixes
+        // Uses prefix_boundary if provided (system message only) for multi-node consistency
+        prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+        hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
+        selected = live_backends[hash_index];
 
-    // This is a cache miss - the route will be learned after successful response
-    state.stats.cache_misses++;
-    state.stats.prefix_affinity_routes++;
-    if (g_metrics) {
-        metrics().record_cache_miss();
+        // This is a cache miss - the route will be learned after successful response
+        state.stats.cache_misses++;
+        state.stats.prefix_affinity_routes++;
+        if (g_metrics) {
+            metrics().record_cache_miss();
+        }
     }
 
-    // Apply load-aware selection (may divert to less-loaded backend)
+    // Step 3: Apply load-aware selection once, regardless of ART or hash path.
+    // This avoids duplicate call sites and ensures consistent load-balancing behavior.
     BackendId final_backend = apply_load_aware_selection(
-        selected, live_backends, request_id, "hash");
+        selected, live_backends, request_id, source);
 
     if (!request_id.empty() && final_backend == selected) {
-        log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
-                         request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
+        if (art_hit) {
+            log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
+                             request_id, tokens.size(), selected);
+        } else {
+            log_router.debug("[{}] Prefix affinity (hash): {} tokens, hash={}, index={}/{} -> backend {}",
+                             request_id, prefix_len, prefix_hash, hash_index, live_backends.size(), selected);
+        }
     }
 
-    return {final_backend, false};
+    return {final_backend, art_hit};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
