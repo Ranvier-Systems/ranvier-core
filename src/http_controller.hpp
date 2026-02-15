@@ -179,7 +179,10 @@ public:
 
     // Set optional async persistence manager (call before serving requests)
     // Uses fire-and-forget queueing to avoid blocking the reactor
-    void set_persistence(AsyncPersistenceManager* manager) { _persistence = manager; }
+    void set_persistence(AsyncPersistenceManager* manager) {
+        _persistence = manager;
+        _persistence_backpressure_active = (manager != nullptr && _config.backpressure.enable_persistence_backpressure);
+    }
 
     // Set optional shard load balancer (call before serving requests)
     // Enables cross-shard request dispatch using Power of Two Choices algorithm
@@ -201,6 +204,8 @@ public:
             config.circuit_breaker.recovery_timeout,
             config.circuit_breaker.enabled
         });
+        // Update cached persistence backpressure flag
+        _persistence_backpressure_active = (_persistence != nullptr && config.backpressure.enable_persistence_backpressure);
         // Update load balancer config
         _lb_config.enabled = config.load_balancing.enabled;
         _lb_config.min_load_difference = config.load_balancing.min_load_difference;
@@ -248,6 +253,7 @@ private:
     RateLimiter _rate_limiter;
     CircuitBreaker _circuit_breaker;
     AsyncPersistenceManager* _persistence;  // Async persistence (fire-and-forget, non-blocking)
+    bool _persistence_backpressure_active{false};  // Cached: persistence != null && backpressure enabled
     ConfigReloadCallback _config_reload_callback;  // Callback for config hot-reload
 
     // Shard load balancing (P2C algorithm)
