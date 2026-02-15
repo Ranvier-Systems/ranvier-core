@@ -709,8 +709,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         co_return std::move(rep);
     }
 
-    // Backpressure: check persistence queue depth
-    if (is_persistence_backpressured()) {
+    // Backpressure: check persistence queue depth (skipped when persistence is not active)
+    if (_persistence_backpressure_active && is_persistence_backpressured()) {
         ++_requests_rejected_persistence;
         log_proxy.warn("[{}] Request rejected - persistence queue backpressure", request_id);
         metrics().record_backpressure_rejection();
