@@ -762,7 +762,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         co_return std::move(rep);
     }
 
-    // Timing: capture routing decision start
+    // Phase-snapshot timing: capture a single clock read at each phase transition
+    // and compute all latency deltas from these snapshots. This reduces per-request
+    // steady_clock::now() calls on the hot path (each costs 10-100 CPU cycles
+    // depending on clock source). Snapshots: routing_start, post_tokenize,
+    // post_route, connect_start, connect_end, first_byte, backend_end.
     auto routing_start = std::chrono::steady_clock::now();
 
     // Get tokens for routing - either from client or by tokenizing locally
@@ -774,8 +778,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // reused during boundary detection to avoid redundant JSON re-parsing.
     std::optional<RequestRewriter::TextWithBoundaryInfo> text_extraction;
 
-    // Timing: capture tokenization start
-    auto tokenization_start = std::chrono::steady_clock::now();
+    // NOTE: tokenization_start collapsed into routing_start (phase-snapshot
+    // optimization — only variable declarations between them, ~0 cycles).
 
     // OPTIMIZATION: Skip tokenization entirely in RANDOM routing mode
     // Random routing ignores tokens completely, so tokenization is wasted work.
@@ -1055,10 +1059,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
-    // Timing: record tokenization latency
-    auto tokenization_end = std::chrono::steady_clock::now();
+    // Phase snapshot: post-tokenize (also serves as ART lookup baseline)
+    auto post_tokenize = std::chrono::steady_clock::now();
     metrics().record_tokenization_latency(
-        MetricsService::to_seconds(tokenization_end - tokenization_start));
+        MetricsService::to_seconds(post_tokenize - routing_start));
 
     // Prepare forwarded body based on endpoint:
     // - /v1/completions: vLLM supports prompt_token_ids, forward them for efficiency
@@ -1106,11 +1110,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
         // Unified routing decision - all mode logic is encapsulated in RouterService
         // Pass prefix_boundary for consistent hash fallback across cluster nodes
-        auto art_lookup_start = std::chrono::steady_clock::now();
+        // NOTE: art_lookup_start collapsed into post_tokenize (phase-snapshot
+        // optimization — body prep between them is ~100ns, well within first
+        // histogram bucket of 100μs).
         auto route_result = _router.route_request(tokens, request_id, prefix_boundary);
-        auto art_lookup_end = std::chrono::steady_clock::now();
-        metrics().record_art_lookup_latency(
-            MetricsService::to_seconds(art_lookup_end - art_lookup_start));
         routing_mode_str = route_result.routing_mode;
         route_span.set_attribute("ranvier.routing_mode", route_result.routing_mode);
         route_span.set_attribute("ranvier.cache_hit", route_result.cache_hit);
@@ -1131,10 +1134,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         route_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
     } // route_span ends here
 
-    // Timing: record routing decision latency (post-routing timestamp)
-    auto routing_end = std::chrono::steady_clock::now();
+    // Phase snapshot: post-route (replaces separate art_lookup_end and routing_end)
+    auto post_route = std::chrono::steady_clock::now();
+    metrics().record_art_lookup_latency(
+        MetricsService::to_seconds(post_route - post_tokenize));
     metrics().record_routing_latency(
-        MetricsService::to_seconds(routing_end - routing_start));
+        MetricsService::to_seconds(post_route - routing_start));
 
     // Circuit breaker check - try fallback if circuit is open
     if (!_circuit_breaker.allow_request(target_id)) {
