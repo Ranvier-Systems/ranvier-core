@@ -1,17 +1,19 @@
 /**
- * Unit tests for Load-Aware Routing
+ * Unit tests for Load-Aware Routing (Relative Threshold)
  *
  * Tests the load-aware backend selection logic that routes requests to less-loaded
- * backends when the prefix-preferred backend is overloaded. This prevents hot spots
- * and reduces tail latency under heavy load.
+ * backends when the prefix-preferred backend is a genuine outlier compared to its
+ * peers. Uses a relative threshold (median * factor + floor) that auto-adapts to
+ * any workload, model size, or cluster size.
  *
  * Key properties tested:
- * - Load below threshold returns preferred backend
- * - Load above threshold with no alternative returns preferred
- * - Load above threshold with available alternative returns least-loaded
- * - Load difference below diff_threshold returns preferred (marginal improvement)
- * - Multiple backends at same load returns deterministic selection
+ * - Balanced load returns preferred backend (no flapping)
+ * - Genuine outlier is diverted to least-loaded alternative
+ * - Equal load across backends never triggers diversion
+ * - Floor prevents flapping at low/zero load
+ * - Single backend always returns preferred
  * - Config disabled always returns preferred
+ * - Draining/dead backends are skipped
  * - BackendRequestGuard correctly increments/decrements counters
  *
  * These tests verify the load-aware routing algorithm in isolation, using
@@ -20,6 +22,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <map>
@@ -78,11 +81,11 @@ struct TestBackendInfo {
     }
 };
 
-// Simulated config for testing
+// Simulated config for testing (relative threshold)
 struct TestLoadAwareConfig {
     bool load_aware_routing = true;
-    uint64_t queue_depth_threshold = 4;
-    uint64_t queue_diff_threshold = 2;
+    double load_imbalance_factor = 2.0;    // Divert when preferred > factor * median
+    uint64_t load_imbalance_floor = 2;     // Additive floor to prevent flapping at low load
 };
 
 // =============================================================================
@@ -147,10 +150,12 @@ inline std::pair<BackendId, uint64_t> get_least_loaded_backend(
 }
 
 /**
- * Apply load-aware selection to choose between preferred backend and alternatives.
- * This is the core algorithm being tested.
+ * Apply load-aware selection using relative threshold (median-based).
  *
- * Returns the backend to use: either preferred_id or a less-loaded alternative.
+ * Preferred is "overloaded" when its queue depth exceeds:
+ *   median_load * factor + floor
+ *
+ * This auto-adapts to any workload, model size, or cluster size.
  */
 inline BackendId apply_load_aware_selection(
     const std::map<BackendId, TestBackendInfo>& backends,
@@ -163,21 +168,45 @@ inline BackendId apply_load_aware_selection(
         return preferred_id;
     }
 
-    // Check preferred backend's load
-    uint64_t preferred_load = get_backend_load(backends, preferred_id);
-    if (preferred_load <= config.queue_depth_threshold) {
-        return preferred_id;  // Not overloaded - fast path
-    }
-
-    // Preferred backend overloaded - find alternative
-    auto [least_loaded_id, least_load] = get_least_loaded_backend(backends, live_backends);
-
-    // Validate we found a viable alternative with significant load difference
-    if (least_loaded_id == 0 || preferred_load - least_load <= config.queue_diff_threshold) {
+    // Need at least 2 backends for load comparison
+    if (live_backends.size() < 2) {
         return preferred_id;
     }
 
-    // Significant difference - divert to less-loaded backend
+    // Check preferred backend's load
+    uint64_t preferred_load = get_backend_load(backends, preferred_id);
+
+    // Fast path: zero load is never overloaded
+    if (preferred_load == 0) {
+        return preferred_id;
+    }
+
+    // Collect loads from all live backends to compute median
+    std::vector<uint64_t> loads;
+    loads.reserve(live_backends.size());
+    for (BackendId id : live_backends) {
+        loads.push_back(get_backend_load(backends, id));
+    }
+
+    // Compute median via nth_element (O(n), partial sort)
+    size_t mid = loads.size() / 2;
+    std::nth_element(loads.begin(), loads.begin() + static_cast<ptrdiff_t>(mid), loads.end());
+    uint64_t median = loads[mid];
+
+    // Relative threshold: divert only if preferred is significantly above median
+    uint64_t threshold = static_cast<uint64_t>(static_cast<double>(median) * config.load_imbalance_factor)
+                         + config.load_imbalance_floor;
+    if (preferred_load <= threshold) {
+        return preferred_id;
+    }
+
+    // Preferred is a genuine outlier — find least-loaded alternative
+    auto [least_loaded_id, least_load] = get_least_loaded_backend(backends, live_backends);
+
+    if (least_loaded_id == 0) {
+        return preferred_id;
+    }
+
     return least_loaded_id;
 }
 
@@ -267,10 +296,10 @@ private:
 class LoadAwareRoutingTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Default configuration
+        // Default configuration: factor=2.0, floor=2
         config.load_aware_routing = true;
-        config.queue_depth_threshold = 4;
-        config.queue_diff_threshold = 2;
+        config.load_imbalance_factor = 2.0;
+        config.load_imbalance_floor = 2;
 
         // Set up default backends
         backends.clear();
@@ -298,80 +327,30 @@ protected:
 };
 
 // =============================================================================
-// Load-Aware Routing Tests
+// Load-Aware Routing Tests (Relative Threshold)
 // =============================================================================
 
-TEST_F(LoadAwareRoutingTest, BelowThresholdReturnsPreferred) {
-    // Backend 1 has load below threshold (4)
+TEST_F(LoadAwareRoutingTest, ZeroLoadReturnsPreferred) {
+    // All backends at 0 load — fast path
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 1);
+}
+
+TEST_F(LoadAwareRoutingTest, BalancedLoadReturnsPreferred) {
+    // All backends at equal load — median=3, threshold=3*2+2=8
+    // preferred_load=3 <= 8, so return preferred
     backends[1].active_requests.store(3, std::memory_order_relaxed);
-    backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[2].active_requests.store(3, std::memory_order_relaxed);
+    backends[3].active_requests.store(3, std::memory_order_relaxed);
 
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should return preferred backend even though backend 2 has lower load
-    EXPECT_EQ(result, 1);
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 1);
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 2, live_backends), 2);
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 3, live_backends), 3);
 }
 
-TEST_F(LoadAwareRoutingTest, AboveThresholdNoAlternativeReturnsPreferred) {
-    // All backends are heavily loaded
-    backends[1].active_requests.store(10, std::memory_order_relaxed);
-    backends[2].active_requests.store(9, std::memory_order_relaxed);
-    backends[3].active_requests.store(9, std::memory_order_relaxed);
-
-    // Load difference is only 1, which is <= diff_threshold (2)
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    EXPECT_EQ(result, 1);
-}
-
-TEST_F(LoadAwareRoutingTest, AboveThresholdReturnsLeastLoaded) {
-    // Backend 1 is heavily overloaded, backend 2 has much lower load
-    backends[1].active_requests.store(10, std::memory_order_relaxed);  // Preferred
-    backends[2].active_requests.store(2, std::memory_order_relaxed);   // Much lower
-    backends[3].active_requests.store(5, std::memory_order_relaxed);
-
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should route to backend 2 (load difference 10-2=8 > diff_threshold 2)
-    EXPECT_EQ(result, 2);
-}
-
-TEST_F(LoadAwareRoutingTest, MarginalDifferenceReturnsPreferred) {
-    // Backend 1 is above threshold, but difference to best is <= diff_threshold
-    backends[1].active_requests.store(6, std::memory_order_relaxed);  // Preferred
-    backends[2].active_requests.store(5, std::memory_order_relaxed);  // Difference = 1
-    backends[3].active_requests.store(5, std::memory_order_relaxed);
-
-    // Difference of 1 is <= diff_threshold (2), so cache miss not justified
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    EXPECT_EQ(result, 1);
-}
-
-TEST_F(LoadAwareRoutingTest, ExactlyAtThresholdReturnsPreferred) {
-    // Backend 1 load equals threshold exactly
-    backends[1].active_requests.store(4, std::memory_order_relaxed);  // == threshold
-    backends[2].active_requests.store(0, std::memory_order_relaxed);
-
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should return preferred (load <= threshold)
-    EXPECT_EQ(result, 1);
-}
-
-TEST_F(LoadAwareRoutingTest, JustAboveThresholdWithGoodAlternative) {
-    // Backend 1 just above threshold (5 > 4), with a good alternative
-    backends[1].active_requests.store(5, std::memory_order_relaxed);
-    backends[2].active_requests.store(0, std::memory_order_relaxed);  // Difference = 5 > 2
-
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should route to backend 2
-    EXPECT_EQ(result, 2);
-}
-
-TEST_F(LoadAwareRoutingTest, EqualLoadDeterministicSelection) {
-    // All backends have equal load above threshold
+TEST_F(LoadAwareRoutingTest, EqualHighLoadNeverDiverts) {
+    // All backends at high equal load — median=10, threshold=10*2+2=22
+    // No backend is an outlier — should never divert
     backends[1].active_requests.store(10, std::memory_order_relaxed);
     backends[2].active_requests.store(10, std::memory_order_relaxed);
     backends[3].active_requests.store(10, std::memory_order_relaxed);
@@ -379,64 +358,92 @@ TEST_F(LoadAwareRoutingTest, EqualLoadDeterministicSelection) {
     BackendId result1 = apply_load_aware_selection(backends, config, 1, live_backends);
     BackendId result2 = apply_load_aware_selection(backends, config, 1, live_backends);
 
-    // Should be deterministic (same result each time)
-    EXPECT_EQ(result1, result2);
-    // Should return preferred since no better alternative
     EXPECT_EQ(result1, 1);
+    EXPECT_EQ(result2, 1);  // Deterministic
+}
+
+TEST_F(LoadAwareRoutingTest, MildImbalanceBelowThreshold) {
+    // Loads: [6, 5, 5] — median=5, threshold=5*2+2=12
+    // preferred_load=6 <= 12, so return preferred
+    backends[1].active_requests.store(6, std::memory_order_relaxed);
+    backends[2].active_requests.store(5, std::memory_order_relaxed);
+    backends[3].active_requests.store(5, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 1);
+}
+
+TEST_F(LoadAwareRoutingTest, GenuineOutlierDiverts) {
+    // Loads: [20, 2, 5] — median=5, threshold=5*2+2=12
+    // preferred_load=20 > 12, divert to least loaded
+    backends[1].active_requests.store(20, std::memory_order_relaxed);
+    backends[2].active_requests.store(2, std::memory_order_relaxed);
+    backends[3].active_requests.store(5, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 2);  // Least loaded
+}
+
+TEST_F(LoadAwareRoutingTest, ExactlyAtThresholdReturnsPreferred) {
+    // Loads: [12, 5, 5] — median=5, threshold=5*2+2=12
+    // preferred_load=12 <= 12, return preferred
+    backends[1].active_requests.store(12, std::memory_order_relaxed);
+    backends[2].active_requests.store(5, std::memory_order_relaxed);
+    backends[3].active_requests.store(5, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 1);
+}
+
+TEST_F(LoadAwareRoutingTest, JustAboveThresholdDiverts) {
+    // Loads: [13, 5, 5] — median=5, threshold=5*2+2=12
+    // preferred_load=13 > 12, divert
+    backends[1].active_requests.store(13, std::memory_order_relaxed);
+    backends[2].active_requests.store(5, std::memory_order_relaxed);
+    backends[3].active_requests.store(5, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_NE(result, 1);
+}
+
+TEST_F(LoadAwareRoutingTest, FloorPreventsFlappingAtLowLoad) {
+    // Loads: [1, 0, 0] — median=0, threshold=0*2+2=2
+    // preferred_load=1 <= 2, return preferred (floor prevents diversion)
+    backends[1].active_requests.store(1, std::memory_order_relaxed);
+    backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[3].active_requests.store(0, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 1);
+}
+
+TEST_F(LoadAwareRoutingTest, FloorExceededAtLowMedian) {
+    // Loads: [5, 0, 0] — median=0, threshold=0*2+2=2
+    // preferred_load=5 > 2, divert
+    backends[1].active_requests.store(5, std::memory_order_relaxed);
+    backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[3].active_requests.store(0, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_NE(result, 1);
 }
 
 TEST_F(LoadAwareRoutingTest, DisabledAlwaysReturnsPreferred) {
     config.load_aware_routing = false;
 
-    // Even with very high load difference
     backends[1].active_requests.store(100, std::memory_order_relaxed);
     backends[2].active_requests.store(0, std::memory_order_relaxed);
 
     BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should always return preferred when disabled
     EXPECT_EQ(result, 1);
 }
 
-TEST_F(LoadAwareRoutingTest, SkipsDrainingBackends) {
-    // Backend 1 is overloaded, backend 2 is draining (should be skipped)
-    backends[1].active_requests.store(10, std::memory_order_relaxed);
-    backends[2].active_requests.store(0, std::memory_order_relaxed);
-    backends[2].is_draining = true;
-    backends[3].active_requests.store(5, std::memory_order_relaxed);
+TEST_F(LoadAwareRoutingTest, SingleBackendReturnsPreferred) {
+    // Only one backend — can't compare
+    backends[1].active_requests.store(100, std::memory_order_relaxed);
 
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should skip backend 2 (draining) and use backend 3 if difference is sufficient
-    // Difference 10-5=5 > 2, so should route to backend 3
-    EXPECT_EQ(result, 3);
-}
-
-TEST_F(LoadAwareRoutingTest, SkipsDeadBackends) {
-    // Backend 1 is overloaded, backend 2 is dead (should be skipped)
-    backends[1].active_requests.store(10, std::memory_order_relaxed);
-    backends[2].active_requests.store(0, std::memory_order_relaxed);
-    backends[2].is_dead = true;
-    backends[3].active_requests.store(3, std::memory_order_relaxed);
-
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // Should skip backend 2 (dead) and use backend 3
-    // Difference 10-3=7 > 2, so should route to backend 3
-    EXPECT_EQ(result, 3);
-}
-
-TEST_F(LoadAwareRoutingTest, AllAlternativesDrainingReturnsPreferred) {
-    // Backend 1 is overloaded, all alternatives are draining
-    backends[1].active_requests.store(10, std::memory_order_relaxed);
-    backends[2].active_requests.store(0, std::memory_order_relaxed);
-    backends[2].is_draining = true;
-    backends[3].active_requests.store(0, std::memory_order_relaxed);
-    backends[3].is_draining = true;
-
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-
-    // No viable alternatives, should return preferred
+    std::vector<BackendId> single = {1};
+    BackendId result = apply_load_aware_selection(backends, config, 1, single);
     EXPECT_EQ(result, 1);
 }
 
@@ -445,53 +452,131 @@ TEST_F(LoadAwareRoutingTest, EmptyLiveBackendsReturnsPreferred) {
 
     std::vector<BackendId> empty_backends;
     BackendId result = apply_load_aware_selection(backends, config, 1, empty_backends);
+    EXPECT_EQ(result, 1);
+}
 
+TEST_F(LoadAwareRoutingTest, SkipsDrainingBackends) {
+    // Loads: [20, 0(draining), 5] — median=5 (from loads [20, 0, 5])
+    // threshold=5*2+2=12, preferred_load=20 > 12
+    // But backend 2 is draining, so least-loaded viable is backend 3
+    backends[1].active_requests.store(20, std::memory_order_relaxed);
+    backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[2].is_draining = true;
+    backends[3].active_requests.store(5, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 3);
+}
+
+TEST_F(LoadAwareRoutingTest, SkipsDeadBackends) {
+    // Backend 2 is dead, should be skipped by get_least_loaded_backend
+    backends[1].active_requests.store(20, std::memory_order_relaxed);
+    backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[2].is_dead = true;
+    backends[3].active_requests.store(3, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 3);
+}
+
+TEST_F(LoadAwareRoutingTest, AllAlternativesDrainingReturnsPreferred) {
+    // Backend 1 is outlier, but all alternatives are draining
+    backends[1].active_requests.store(20, std::memory_order_relaxed);
+    backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[2].is_draining = true;
+    backends[3].active_requests.store(0, std::memory_order_relaxed);
+    backends[3].is_draining = true;
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
     EXPECT_EQ(result, 1);
 }
 
 TEST_F(LoadAwareRoutingTest, PreferredNotInLiveBackends) {
     // Preferred backend not in live list (edge case)
-    backends[1].active_requests.store(10, std::memory_order_relaxed);
+    // preferred_load = get_backend_load(1) = 20
+    // live_backends = {2}, loads = [0], median = 0, threshold = 0*2+2 = 2
+    // 20 > 2, so divert to backend 2
+    backends[1].active_requests.store(20, std::memory_order_relaxed);
     backends[2].active_requests.store(0, std::memory_order_relaxed);
 
-    std::vector<BackendId> only_backend2 = {2};
-    // Backend 1 is preferred but not in live list
-    // get_backend_load will return 10 for backend 1
-    // Least loaded from {2} is backend 2 with load 0
-    // Difference 10-0=10 > 2, so should return backend 2
+    std::vector<BackendId> only_backend2 = {2, 3};
     BackendId result = apply_load_aware_selection(backends, config, 1, only_backend2);
-
-    EXPECT_EQ(result, 2);
+    EXPECT_NE(result, 1);
 }
 
-TEST_F(LoadAwareRoutingTest, ZeroThresholdAlwaysConsidersAlternatives) {
-    config.queue_depth_threshold = 0;  // Any load triggers consideration
+TEST_F(LoadAwareRoutingTest, HighFactorReducesSensitivity) {
+    config.load_imbalance_factor = 10.0;
 
+    // Loads: [20, 5, 5] — median=5, threshold=5*10+2=52
+    // preferred_load=20 <= 52, no diversion
+    backends[1].active_requests.store(20, std::memory_order_relaxed);
+    backends[2].active_requests.store(5, std::memory_order_relaxed);
+    backends[3].active_requests.store(5, std::memory_order_relaxed);
+
+    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(result, 1);
+}
+
+TEST_F(LoadAwareRoutingTest, ZeroFloorMakesFactorDominant) {
+    config.load_imbalance_floor = 0;
+
+    // Loads: [1, 0, 0] — median=0, threshold=0*2+0=0
+    // preferred_load=1 > 0, divert (no floor protection)
     backends[1].active_requests.store(1, std::memory_order_relaxed);
     backends[2].active_requests.store(0, std::memory_order_relaxed);
+    backends[3].active_requests.store(0, std::memory_order_relaxed);
 
-    // Load 1 > threshold 0, difference 1-0=1 <= diff_threshold 2
-    // So should still return preferred (marginal difference)
     BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-    EXPECT_EQ(result, 1);
-
-    // With larger difference
-    backends[1].active_requests.store(5, std::memory_order_relaxed);
-    // Difference 5-0=5 > 2, should route to backend 2
-    result = apply_load_aware_selection(backends, config, 1, live_backends);
-    EXPECT_EQ(result, 2);
+    EXPECT_NE(result, 1);
 }
 
-TEST_F(LoadAwareRoutingTest, HighDiffThresholdReducesFallbacks) {
-    config.queue_diff_threshold = 100;  // Very high threshold
+// =============================================================================
+// Threshold Auto-Scaling Tests
+// =============================================================================
+// These verify the key property: threshold scales with workload automatically
 
-    backends[1].active_requests.store(50, std::memory_order_relaxed);
-    backends[2].active_requests.store(0, std::memory_order_relaxed);
+TEST_F(LoadAwareRoutingTest, ThresholdScalesWithLoad_Low) {
+    // Low load: 10 users / 8 backends ≈ 1.25 req/GPU
+    // Loads: [2, 1, 1] — median=1, threshold=1*2+2=4
+    // preferred_load=2 <= 4, no diversion
+    backends[1].active_requests.store(2, std::memory_order_relaxed);
+    backends[2].active_requests.store(1, std::memory_order_relaxed);
+    backends[3].active_requests.store(1, std::memory_order_relaxed);
 
-    // Difference 50-0=50 <= diff_threshold 100, no fallback
-    BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 1);
+}
 
-    EXPECT_EQ(result, 1);
+TEST_F(LoadAwareRoutingTest, ThresholdScalesWithLoad_Medium) {
+    // Medium load: 20 users / 8 backends ≈ 2.5 req/GPU
+    // Loads: [4, 2, 3] — median=3, threshold=3*2+2=8
+    // preferred_load=4 <= 8, no diversion (this was the flapping zone before!)
+    backends[1].active_requests.store(4, std::memory_order_relaxed);
+    backends[2].active_requests.store(2, std::memory_order_relaxed);
+    backends[3].active_requests.store(3, std::memory_order_relaxed);
+
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 1);
+}
+
+TEST_F(LoadAwareRoutingTest, ThresholdScalesWithLoad_High) {
+    // High load: 30 users / 8 backends ≈ 3.75 req/GPU
+    // Loads: [5, 3, 4] — median=4, threshold=4*2+2=10
+    // preferred_load=5 <= 10, no diversion (balanced)
+    backends[1].active_requests.store(5, std::memory_order_relaxed);
+    backends[2].active_requests.store(3, std::memory_order_relaxed);
+    backends[3].active_requests.store(4, std::memory_order_relaxed);
+
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 1);
+}
+
+TEST_F(LoadAwareRoutingTest, ThresholdScalesWithLoad_GenuineHotspot) {
+    // High load but with genuine hot spot
+    // Loads: [15, 3, 4] — median=4, threshold=4*2+2=10
+    // preferred_load=15 > 10, divert
+    backends[1].active_requests.store(15, std::memory_order_relaxed);
+    backends[2].active_requests.store(3, std::memory_order_relaxed);
+    backends[3].active_requests.store(4, std::memory_order_relaxed);
+
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 2);
 }
 
 // =============================================================================
@@ -687,8 +772,8 @@ class LoadAwareIntegrationTest : public ::testing::Test {
 protected:
     void SetUp() override {
         config.load_aware_routing = true;
-        config.queue_depth_threshold = 4;
-        config.queue_diff_threshold = 2;
+        config.load_imbalance_factor = 2.0;
+        config.load_imbalance_floor = 2;
 
         backends.clear();
         backends[1] = TestBackendInfo(0);
@@ -707,16 +792,17 @@ TEST_F(LoadAwareIntegrationTest, SimulatedLoadBuildupCausesFallback) {
     // Simulate requests accumulating on backend 1
     std::vector<TestBackendRequestGuard> guards;
 
-    // Add requests one by one until we hit threshold
+    // Add requests one by one until backend 1 is a genuine outlier
+    // With 0 load on others: median=0, threshold=0*2+2=2
+    // Need preferred_load > 2 to trigger
     for (int i = 0; i < 5; ++i) {
         guards.emplace_back(backends, 1);
     }
-    // Backend 1 now has 5 active requests (above threshold 4)
+    // Backend 1 now has 5 active requests, others have 0
+    // median=0, threshold=0*2+2=2, 5 > 2 → divert
 
     BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
 
-    // Should fall back to a less-loaded backend (2 or 3 with 0 load)
-    // Difference 5-0=5 > diff_threshold 2
     EXPECT_NE(result, 1);
     EXPECT_TRUE(result == 2 || result == 3);
 }
@@ -734,42 +820,54 @@ TEST_F(LoadAwareIntegrationTest, LoadReleaseTriggersPreferedReturn) {
     }
     // Guards destroyed, load released
 
-    // Now backend 1 should have 0 load
     EXPECT_EQ(backends[1].active_requests.load(), 0u);
 
     BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
-    EXPECT_EQ(result, 1);  // Preferred backend returned
+    EXPECT_EQ(result, 1);  // Preferred backend returned (zero load → fast path)
 }
 
 TEST_F(LoadAwareIntegrationTest, BalancedLoadNoFallback) {
-    // All backends have equal load below threshold
+    // All backends have equal load — never diverts regardless of load level
     backends[1].active_requests.store(3, std::memory_order_relaxed);
     backends[2].active_requests.store(3, std::memory_order_relaxed);
     backends[3].active_requests.store(3, std::memory_order_relaxed);
 
-    // Each backend as preferred should return itself
+    // median=3, threshold=3*2+2=8, preferred_load=3 <= 8
     EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 1);
     EXPECT_EQ(apply_load_aware_selection(backends, config, 2, live_backends), 2);
     EXPECT_EQ(apply_load_aware_selection(backends, config, 3, live_backends), 3);
 }
 
+TEST_F(LoadAwareIntegrationTest, BalancedHighLoadNoFallback) {
+    // Even at very high equal load, no diversion
+    backends[1].active_requests.store(50, std::memory_order_relaxed);
+    backends[2].active_requests.store(50, std::memory_order_relaxed);
+    backends[3].active_requests.store(50, std::memory_order_relaxed);
+
+    // median=50, threshold=50*2+2=102, preferred_load=50 <= 102
+    EXPECT_EQ(apply_load_aware_selection(backends, config, 1, live_backends), 1);
+}
+
 TEST_F(LoadAwareIntegrationTest, GradualLoadImbalance) {
-    // Test gradual load imbalance detection
-    for (uint64_t load = 0; load <= 10; ++load) {
+    // Test that diversion triggers smoothly as imbalance grows
+    // Others at 3, median=3, threshold=3*2+2=8
+    backends[2].active_requests.store(3, std::memory_order_relaxed);
+    backends[3].active_requests.store(3, std::memory_order_relaxed);
+
+    for (uint64_t load = 0; load <= 12; ++load) {
         backends[1].active_requests.store(load, std::memory_order_relaxed);
-        backends[2].active_requests.store(0, std::memory_order_relaxed);
 
         BackendId result = apply_load_aware_selection(backends, config, 1, live_backends);
 
-        if (load <= config.queue_depth_threshold) {
-            // Below threshold, always return preferred
+        // Median depends on all 3 loads. With loads [load, 3, 3]:
+        // For load <= 3: median=3, threshold=3*2+2=8, load <= 8 → preferred
+        // For load=4..8: median=3, threshold=8, load <= 8 → preferred
+        // For load=9..12: median=3, threshold=8, load > 8 → divert
+        // (Note: when load >= 3, sorted=[3, 3, load], median=3)
+        if (load <= 8) {
             EXPECT_EQ(result, 1) << "Load " << load << " should return preferred";
-        } else if (load - 0 <= config.queue_diff_threshold) {
-            // Above threshold but difference not significant
-            EXPECT_EQ(result, 1) << "Load " << load << " has marginal difference";
         } else {
-            // Above threshold with significant difference
-            EXPECT_EQ(result, 2) << "Load " << load << " should fallback to backend 2";
+            EXPECT_NE(result, 1) << "Load " << load << " should divert";
         }
     }
 }

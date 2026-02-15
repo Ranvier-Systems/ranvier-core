@@ -114,11 +114,16 @@ struct RoutingConfig {
     // Load-Aware Routing
     // =========================================================================
     // When enabled, considers backend queue depth before routing to the
-    // prefix-preferred backend. If the preferred backend is overloaded,
-    // routes to a less-loaded alternative (accepting potential cache miss).
+    // prefix-preferred backend. If the preferred backend is significantly more
+    // loaded than its peers, routes to the least-loaded alternative (accepting
+    // potential cache miss).
+    //
+    // Uses a relative threshold: preferred is "overloaded" when its queue depth
+    // exceeds (median_load * load_imbalance_factor + load_imbalance_floor).
+    // This auto-adapts to any workload, model size, or cluster size.
     bool load_aware_routing = true;           // Enable load-aware backend selection
-    uint64_t queue_depth_threshold = 4;       // Max in-flight before considering alternatives
-    uint64_t queue_diff_threshold = 2;        // Min load difference to justify cache miss
+    double load_imbalance_factor = 2.0;       // Divert when preferred > factor * median load
+    uint64_t load_imbalance_floor = 2;        // Additive floor to prevent flapping at low load
 
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
