@@ -828,7 +828,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             // Uses extract_text_with_boundary_info() for a single JSON parse that also
             // pre-computes system message boundary metadata, eliminating redundant
             // JSON re-parsing in the boundary detection phase below.
-            text_extraction = RequestRewriter::extract_text_with_boundary_info(body_view);
+            // Only request formatted_messages when multi-depth routing needs them —
+            // skips N per-message string allocations on the common path.
+            text_extraction = RequestRewriter::extract_text_with_boundary_info(
+                body_view, _config.enable_multi_depth_routing);
             std::string_view text_to_tokenize = text_extraction.has_value()
                 ? std::string_view(text_extraction->text)
                 : body_view;
@@ -949,7 +952,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     if (!prefix_boundary_set && _config.enable_prefix_boundary && !tokens.empty() && !tokenization_skipped) {
         // Lazily compute text extraction if not already done (client-tokens path)
         if (!text_extraction.has_value()) {
-            text_extraction = RequestRewriter::extract_text_with_boundary_info(body_view);
+            text_extraction = RequestRewriter::extract_text_with_boundary_info(
+                body_view, _config.enable_multi_depth_routing);
         }
 
         // For multi-depth routing, calculate boundaries at each message

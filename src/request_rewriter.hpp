@@ -102,6 +102,9 @@ public:
     };
 
     // Extract text with boundary metadata in a single JSON parse.
+    // When need_formatted_messages is false, the formatted_messages vector is
+    // not populated — avoiding per-message string allocations and vector growth
+    // that are wasted when multi-depth routing is disabled (the default).
     //
     // This consolidates extract_text(), extract_system_messages(), and the
     // JSON parsing portion of extract_message_boundaries() into one pass.
@@ -113,7 +116,8 @@ public:
     // Returns:
     //   TextWithBoundaryInfo with combined text and boundary metadata,
     //   or nullopt if no tokenizable content found
-    static std::optional<TextWithBoundaryInfo> extract_text_with_boundary_info(std::string_view body);
+    static std::optional<TextWithBoundaryInfo> extract_text_with_boundary_info(
+        std::string_view body, bool need_formatted_messages = true);
 
     // Extract only system message content from a chat completion request
     //
@@ -347,7 +351,7 @@ inline std::optional<std::string> RequestRewriter::extract_text(std::string_view
 }
 
 inline std::optional<RequestRewriter::TextWithBoundaryInfo>
-RequestRewriter::extract_text_with_boundary_info(std::string_view body) {
+RequestRewriter::extract_text_with_boundary_info(std::string_view body, bool need_formatted_messages) {
     rapidjson::Document doc;
     doc.Parse(body.data(), body.size());
 
@@ -385,15 +389,20 @@ RequestRewriter::extract_text_with_boundary_info(std::string_view body) {
     bool system_contiguous = true;       // All system msgs are at the start
     size_t system_prefix_end_candidate = 0;
 
+    if (need_formatted_messages) {
+        result.formatted_messages.reserve(messages.Size());
+    }
+
     for (rapidjson::SizeType i = 0; i < messages.Size(); ++i) {
         const auto& msg = messages[i];
         if (!msg.IsObject()) continue;
 
-        // Get role (may be absent)
-        std::string role_str;
+        // Get role as string_view — avoids heap allocation per message.
+        // The underlying RapidJSON string is valid for the lifetime of doc.
+        std::string_view role_sv;
         bool has_role = false;
         if (msg.HasMember("role") && msg["role"].IsString()) {
-            role_str = std::string(msg["role"].GetString(), msg["role"].GetStringLength());
+            role_sv = std::string_view(msg["role"].GetString(), msg["role"].GetStringLength());
             has_role = true;
         }
 
@@ -403,7 +412,7 @@ RequestRewriter::extract_text_with_boundary_info(std::string_view body) {
         if (!content.IsString()) continue;
 
         std::string_view content_sv(content.GetString(), content.GetStringLength());
-        bool is_system = has_role && (role_str == "system");
+        bool is_system = has_role && (role_sv == "system");
 
         // Add separator to combined text (same logic as extract_text)
         if (!combined.empty()) {
@@ -436,11 +445,16 @@ RequestRewriter::extract_text_with_boundary_info(std::string_view body) {
         // Add content to combined text
         combined.append(content_sv.data(), content_sv.size());
 
-        // Build formatted message for multi-depth (only if role is present,
-        // matching extract_message_boundaries behavior)
-        if (has_role) {
-            std::string formatted = "<|" + role_str + "|>\n";
-            formatted.append(content_sv.data(), content_sv.size());
+        // Build formatted message for multi-depth routing only when requested.
+        // Skipping this avoids N string allocations + vector growth per request
+        // when multi-depth routing is disabled (the common case).
+        if (need_formatted_messages && has_role) {
+            std::string formatted;
+            formatted.reserve(role_sv.size() + content_sv.size() + 5);  // "<|" + role + "|>\n" + content
+            formatted.append("<|");
+            formatted.append(role_sv);
+            formatted.append("|>\n");
+            formatted.append(content_sv);
             result.formatted_messages.push_back({std::move(formatted), is_system});
         }
     }
