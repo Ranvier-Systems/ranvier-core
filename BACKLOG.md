@@ -2660,7 +2660,7 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.1 UTF-8 Validation Scans Entire Request Body Per-Request
 
-- [ ] **Move UTF-8 validation to JSON parse boundary; remove redundant scan before tokenizer**
+- [x] **Move UTF-8 validation to JSON parse boundary; remove redundant scan before tokenizer**
   _Justification:_ `TextValidator::validate_for_tokenizer()` is called at line 828 of `http_controller.cpp`, immediately before tokenization. It performs a byte-by-byte UTF-8 validation pass over the full text (`is_valid_utf8()` at `text_validator.hpp:68-112`). This is O(text_length) with high branch density — for a typical 50–100KB prompt, that's 50–100K branch-heavy iterations on every request. The text has already been parsed as valid JSON (which implies valid UTF-8 for string values), so this is a redundant validation. The null-byte scan (`text.find('\0')`) is also O(N) but cheaper due to memchr optimization.
   _What to change:_ Option A (preferred): Remove the `validate_for_tokenizer()` call entirely — JSON parsing already guarantees valid UTF-8 string content. Option B: If defense-in-depth is desired, validate once during JSON body parsing in the request handler and cache a `utf8_validated` flag on the request context, skipping re-validation at the tokenizer input. Option C: Replace the byte-by-byte loop with a SIMD UTF-8 validator (e.g., simdutf library) for ~10x throughput.
   _Location:_ `src/http_controller.cpp:828-829`, `src/text_validator.hpp:37-112`
@@ -2669,7 +2669,7 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.2 Prefix Boundary Detection Triggers Extra Tokenization Passes
 
-- [ ] **Pre-compute prefix boundary during initial tokenization instead of re-tokenizing**
+- [x] **Pre-compute prefix boundary during initial tokenization instead of re-tokenizing**
   _Justification:_ The prefix boundary detection logic (`http_controller.cpp:886-1011`) calls `_tokenizer.local().encode_cached()` a second time (line 982) to tokenize the system message separately, after the full prompt was already tokenized at line 843. With multi-depth routing enabled, additional `encode_cached()` calls occur at line 939 for each message boundary. Even with tokenizer cache hits, each call involves a Rust FFI round-trip through tokenizers-cpp. The initial tokenization already processes the full text — the boundary could be computed from that result by tracking message offsets during JSON parsing.
   _What to change:_ During the initial `extract_text_for_tokenization()` call, also record the character offset where system messages end. After the single tokenization pass, use that offset to find the corresponding token boundary (binary search on token offsets or linear scan of token positions). This eliminates all secondary `encode_cached()` calls. The `RequestRewriter::extract_system_messages()` JSON parsing at line 973 can be folded into the existing body parsing.
   _Location:_ `src/http_controller.cpp:886-1011` (boundary detection), `843` (initial tokenization), `939` (multi-depth), `982` (system message)
@@ -2678,7 +2678,7 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.3 Load-Aware Backend Selection Iterates All Backends Twice Per Request
 
-- [ ] **Short-circuit load-aware selection and avoid duplicate calls in route_request()**
+- [x] **Short-circuit load-aware selection and avoid duplicate calls in route_request()**
   _Justification:_ `apply_load_aware_selection()` (`router_service.cpp:440-481`) is called twice in `route_request()`: once after an ART hit (line 1202) and once after hash fallback (line 1232). Each invocation performs a `flat_hash_map` lookup for the preferred backend's load, then iterates all live backends via `get_least_loaded_backend()` to find the minimum. With 8 backends, that's 16+ map lookups and comparisons per request. The function also reads two config values and may record a metric (atomic increment). When load-aware routing is disabled, the early-return is cheap (config check + return), but the function is still called twice.
   _What to change:_ Option A: Call `apply_load_aware_selection()` once after the final backend is selected (whether from ART or hash), not in both branches. Option B: Cache the least-loaded backend per scheduling quantum (e.g., every 100µs or every N requests) rather than recomputing from scratch on every request — backend loads change slowly relative to request rate. Option C: Replace the O(N) linear scan with a pre-maintained min-heap or sorted structure updated on load change events.
   _Location:_ `src/router_service.cpp:440-481` (function), `1202-1203` (first call), `1232-1233` (second call)
@@ -2687,7 +2687,7 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.4 Excessive Metrics Recording with Clock Reads on Hot Path
 
-- [ ] **Reduce per-request clock reads by batching latency measurements**
+- [x] **Reduce per-request clock reads by batching latency measurements**
   _Justification:_ The `handle_proxy()` method in `http_controller.cpp` (starting at line 646) contains approximately 63 `metrics().record_*()` calls. Of these, 11 are latency-recording methods (`metrics_service.hpp:383-444`) that each call `steady_clock::now()` internally for histogram observation. Each clock read costs 10–100 CPU cycles depending on the platform's clock source (TSC vs HPET). With 5–8 latency recordings per request on the typical path (routing, tokenization, ART lookup, connect, response, backend total, first-byte, request total), the cumulative cost is 50–800 cycles per request. The non-latency metric recordings (atomic counter increments) are individually cheap (~5 cycles each) but 40+ per request adds up.
   _What to change:_ Option A: Take a single `steady_clock::now()` snapshot at each phase transition (request start, post-tokenize, post-route, post-connect, first-byte, request-end) and compute all latency deltas from these 5–6 snapshots. This replaces ~8 clock reads with ~6. Option B: Record latencies only on sampled requests (e.g., every 100th) for histogram accuracy with less overhead. Option C: Consolidate related counter increments into a single struct update per phase.
   _Location:_ `src/http_controller.cpp:646+` (handle_proxy), `src/metrics_service.hpp:383-444` (latency recording methods)
@@ -2696,7 +2696,7 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.5 Gate/Semaphore/Backpressure Checks Before Request Processing
 
-- [ ] **Reorder admission checks and evaluate whether all three are needed simultaneously**
+- [x] **Reorder admission checks and evaluate whether all three are needed simultaneously**
   _Justification:_ Every request entering `handle_proxy()` performs three admission checks before any useful work: gate hold (atomic CAS, line 686), semaphore try_get_units (atomic CAS, line 699), and persistence backpressure check (line 713). The gate and semaphore are necessary for correctness (shutdown safety and concurrency limits). The persistence backpressure check queries whether the async persistence layer is behind; this is only relevant when persistence is enabled, which is a minority of deployments. All three checks execute unconditionally.
   _What to change:_ Option A: Guard the persistence backpressure check behind `if (_persistence_enabled)` to skip it in the common case. Option B: Combine gate + semaphore into a single admission operation if Seastar supports it (gate::hold already implies the service is running). Option C: Profile whether the atomic CAS operations are contended under load — if not, the overhead is negligible and this item is low priority.
   _Location:_ `src/http_controller.cpp:684-716`
@@ -2705,7 +2705,7 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.6 Shard Load Metrics Use Atomics on Shard-Local Data
 
-- [ ] **Replace atomic operations with plain integers for shard-local load tracking**
+- [x] **Replace atomic operations with plain integers for shard-local load tracking**
   _Justification:_ `shard_load_metrics.hpp` declares `_active_requests`, `_queued_requests`, and `_total_requests` as `std::atomic<uint64_t>` (lines 132–134). These are accessed via `increment_active()` / `decrement_active()` (lines 85–90) using `memory_order_relaxed` atomics. The shard load metrics object is shard-local (one per Seastar shard), so there is no cross-thread access — the atomics are unnecessary. Each `fetch_add`/`fetch_sub` is ~5 cycles on x86 even with relaxed ordering, and they execute at least twice per request (increment at line 732, decrement at lines 1202/1221/1246/1340/1411, plus `record_request_completed()` at line 1412). On a shared-nothing architecture, plain `uint64_t` with `++`/`--` would be sufficient and ~1 cycle each.
   _What to change:_ Replace `std::atomic<uint64_t>` with `uint64_t` for all three counters. Replace `fetch_add(1, memory_order_relaxed)` with `++` and `fetch_sub(1, memory_order_relaxed)` with `--`. Replace `load(memory_order_relaxed)` with direct reads. Verify that cross-shard reads (if any, e.g., from the load-aware selection in `router_service.cpp`) go through `submit_to()` which provides the necessary memory barrier.
   _Location:_ `src/shard_load_metrics.hpp:85-103` (methods), `132-134` (fields); `src/http_controller.cpp:732` (increment), `1202/1221/1246/1340/1411` (decrement)

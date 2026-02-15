@@ -1175,7 +1175,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Create BackendRequestGuard to track in-flight requests per backend
     // This RAII guard increments active_requests on construction and decrements on destruction.
     // The guard will be captured in the streaming lambda to survive the entire request lifecycle.
-    // Rule #1: Lock-free - uses atomic increment/decrement with relaxed ordering.
+    // Rule #1: Lock-free - shard-local plain uint64_t increment/decrement.
     BackendRequestGuard backend_guard(target_id);
 
     // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
