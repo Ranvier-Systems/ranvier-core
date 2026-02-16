@@ -17,6 +17,7 @@
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <random>
 
@@ -158,6 +159,10 @@ struct ShardLocalState {
         bool load_aware_routing = true;           // Enable load-aware backend selection
         double load_imbalance_factor = 2.0;       // Divert when preferred > factor * median load
         uint64_t load_imbalance_floor = 2;        // Additive floor to prevent flapping at low load
+        // Hash strategy configuration
+        RoutingConfig::HashStrategy hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+        double bounded_load_epsilon = 0.25;
+        uint64_t p2c_load_bias = 2;
     } config;
 
     // ========================================================================
@@ -194,6 +199,10 @@ struct ShardLocalState {
         config.load_aware_routing = cfg.load_aware_routing;
         config.load_imbalance_factor = cfg.load_imbalance_factor;
         config.load_imbalance_floor = cfg.load_imbalance_floor;
+        // Hash strategy configuration
+        config.hash_strategy = cfg.hash_strategy;
+        config.bounded_load_epsilon = cfg.bounded_load_epsilon;
+        config.p2c_load_bias = cfg.p2c_load_bias;
 
         // Seed RNG with random device and time for better entropy
         std::random_device rd;
@@ -214,6 +223,10 @@ struct ShardLocalState {
         config.load_aware_routing = cfg.load_aware_routing;
         config.load_imbalance_factor = cfg.load_imbalance_factor;
         config.load_imbalance_floor = cfg.load_imbalance_floor;
+        // Hash strategy configuration
+        config.hash_strategy = cfg.hash_strategy;
+        config.bounded_load_epsilon = cfg.bounded_load_epsilon;
+        config.p2c_load_bias = cfg.p2c_load_bias;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -517,6 +530,133 @@ static BackendId apply_load_aware_selection(
 }
 
 // ============================================================================
+// Hash Strategy: Bounded-Load Consistent Hashing
+// ============================================================================
+// Mirrokni, Thorup, Zadimoghaddam (Google, 2018).
+// Caps each backend at ceil(avg_load * (1 + epsilon)). When the primary
+// jump-hash bucket exceeds capacity, probe subsequent buckets until one
+// with headroom is found. Falls back to least-loaded on full saturation.
+//
+// This replaces apply_load_aware_selection() for BOUNDED_LOAD strategy —
+// load awareness is built into the hash selection itself.
+//
+// Rule #1: Lock-free — all reads are shard-local plain integers.
+// Rule #4: probe loop bounded by live_backends.size().
+static BackendId bounded_load_select(
+    uint64_t prefix_hash,
+    const std::vector<BackendId>& live_backends,
+    double epsilon,
+    const std::string& request_id)
+{
+    const auto n = static_cast<int32_t>(live_backends.size());
+    if (n <= 0) return 0;
+    if (n == 1) return live_backends[0];
+
+    // Compute total in-flight across all live backends for average
+    uint64_t total_load = 0;
+    for (BackendId id : live_backends) {
+        total_load += get_backend_load(id);
+    }
+    double avg = static_cast<double>(total_load) / static_cast<double>(n);
+    // Cap: at least 1 to avoid starving all backends when idle
+    uint64_t cap = std::max(static_cast<uint64_t>(1),
+                            static_cast<uint64_t>(std::ceil(avg * (1.0 + epsilon))));
+
+    // Probe from primary hash bucket, then sequential offsets
+    for (int32_t probe = 0; probe < n; ++probe) {
+        int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
+        BackendId candidate = live_backends[idx];
+        uint64_t load = get_backend_load(candidate);
+        if (load < cap) {
+            if (probe > 0) {
+                // Diverted from primary — record as load-aware fallback
+                g_shard_state->stats.load_aware_fallbacks++;
+                if (g_metrics) {
+                    metrics().record_load_aware_fallback();
+                }
+                log_router.debug("[{}] Bounded-load: primary over cap ({}>{}), "
+                                 "probe {} -> backend {} (load={})",
+                                 request_id, get_backend_load(live_backends[jump_consistent_hash(prefix_hash, n)]),
+                                 cap, probe, candidate, load);
+            }
+            return candidate;
+        }
+    }
+
+    // All backends at or above cap — fall back to least-loaded
+    auto [least_id, least_load] = get_least_loaded_backend(live_backends);
+    if (least_id != 0) {
+        g_shard_state->stats.load_aware_fallbacks++;
+        if (g_metrics) {
+            metrics().record_load_aware_fallback();
+        }
+        log_router.debug("[{}] Bounded-load: all over cap ({}), least-loaded -> backend {} (load={})",
+                         request_id, cap, least_id, least_load);
+        return least_id;
+    }
+
+    // Absolute fallback: primary bucket
+    return live_backends[jump_consistent_hash(prefix_hash, n)];
+}
+
+// ============================================================================
+// Hash Strategy: Power of Two Choices (P2C) with Primary Affinity Bias
+// ============================================================================
+// Hashes to two candidate backends. Always prefers the primary (hash-selected)
+// backend unless the secondary is significantly less loaded (by p2c_load_bias).
+// This preserves cache affinity when load is balanced but breaks affinity
+// gracefully under hot-spotting.
+//
+// Proven to reduce max load from O(log n) to O(log log n).
+//
+// The secondary candidate uses the request_id hash as a salt to break
+// deterministic collisions (all same-prefix requests getting the same
+// secondary). For ART hits, request_salt provides the diversification.
+//
+// Rule #1: Lock-free — shard-local reads only.
+static BackendId p2c_select(
+    uint64_t prefix_hash,
+    uint64_t request_salt,
+    const std::vector<BackendId>& live_backends,
+    uint64_t load_bias,
+    const std::string& request_id)
+{
+    const auto n = static_cast<int32_t>(live_backends.size());
+    if (n <= 0) return 0;
+    if (n == 1) return live_backends[0];
+
+    int32_t primary_idx = jump_consistent_hash(prefix_hash, n);
+    // XOR with salt to get a different bucket for the secondary choice
+    int32_t secondary_idx = jump_consistent_hash(prefix_hash ^ request_salt, n);
+
+    // If same bucket, step to next (wrap around)
+    if (secondary_idx == primary_idx) {
+        secondary_idx = (primary_idx + 1) % n;
+    }
+
+    BackendId primary = live_backends[primary_idx];
+    BackendId secondary = live_backends[secondary_idx];
+
+    uint64_t p_load = get_backend_load(primary);
+    uint64_t s_load = get_backend_load(secondary);
+
+    // Prefer primary for cache affinity — only switch if secondary is
+    // clearly less loaded (by at least load_bias)
+    if (s_load + load_bias < p_load) {
+        g_shard_state->stats.load_aware_fallbacks++;
+        if (g_metrics) {
+            metrics().record_load_aware_fallback();
+        }
+        log_router.debug("[{}] P2C: primary backend {} has {} in-flight, "
+                         "secondary backend {} has {} (bias={}), switching",
+                         request_id, primary, p_load, secondary, s_load, load_bias);
+        return secondary;
+    }
+
+    return primary;
+}
+
+// ============================================================================
 // Route Batching Helpers
 // ============================================================================
 
@@ -596,6 +736,19 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     // Initialize shard 0's ShardLocalState
     g_shard_state = std::make_unique<ShardLocalState>();
     g_shard_state->init(routing_config);
+
+    // Log active hash strategy for operational visibility
+    const char* strategy_name = "jump";
+    switch (routing_config.hash_strategy) {
+    case RoutingConfig::HashStrategy::BOUNDED_LOAD: strategy_name = "bounded_load"; break;
+    case RoutingConfig::HashStrategy::P2C:          strategy_name = "p2c"; break;
+    case RoutingConfig::HashStrategy::MODULAR:      strategy_name = "modular"; break;
+    case RoutingConfig::HashStrategy::JUMP:
+    default:                                        strategy_name = "jump"; break;
+    }
+    log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={})",
+                    strategy_name, routing_config.bounded_load_epsilon,
+                    routing_config.p2c_load_bias);
 
     // Create GossipService if cluster mode is enabled
     if (_cluster_config.enabled) {
@@ -1253,15 +1406,48 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    // Step 2: No ART match (or backend unavailable) - use consistent hashing
+    // Step 2: No ART match (or backend unavailable) — hash fallback.
+    // Dispatch to configured hash strategy.
     if (!art_hit) {
-        // This provides deterministic routing for new prefixes
-        // Uses prefix_boundary if provided (system message only) for multi-node consistency
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-        hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
-        selected = live_backends[hash_index];
 
-        // This is a cache miss - the route will be learned after successful response
+        switch (state.config.hash_strategy) {
+        case RoutingConfig::HashStrategy::BOUNDED_LOAD:
+            // Bounded-load has built-in load awareness — no separate step 3 needed
+            selected = bounded_load_select(prefix_hash, live_backends,
+                                           state.config.bounded_load_epsilon, request_id);
+            break;
+
+        case RoutingConfig::HashStrategy::P2C: {
+            // Use FNV-1a of request_id as salt (or prefix_hash rotated if no request_id)
+            uint64_t salt = prefix_hash;
+            if (!request_id.empty()) {
+                salt = FNV_OFFSET_BASIS;
+                for (char c : request_id) {
+                    salt ^= static_cast<uint8_t>(c);
+                    salt *= FNV_PRIME;
+                }
+            }
+            selected = p2c_select(prefix_hash, salt, live_backends,
+                                  state.config.p2c_load_bias, request_id);
+            break;
+        }
+
+        case RoutingConfig::HashStrategy::MODULAR:
+            // Simple modular hash — for benchmarking baseline only
+            selected = live_backends[static_cast<int32_t>(prefix_hash %
+                           static_cast<uint64_t>(live_backends.size()))];
+            break;
+
+        case RoutingConfig::HashStrategy::JUMP:
+        default:
+            // Original jump consistent hash
+            hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
+            selected = live_backends[hash_index];
+            break;
+        }
+
+        // This is a cache miss — the route will be learned after successful response
         state.stats.cache_misses++;
         state.stats.prefix_affinity_routes++;
         if (g_metrics) {
@@ -1269,10 +1455,58 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    // Step 3: Apply load-aware selection once, regardless of ART or hash path.
-    // This avoids duplicate call sites and ensures consistent load-balancing behavior.
-    BackendId final_backend = apply_load_aware_selection(
-        selected, live_backends, request_id, source);
+    // Step 3: Apply load-aware override.
+    // BOUNDED_LOAD and P2C have load awareness built in for both ART and hash paths.
+    // JUMP and MODULAR use the legacy median-based threshold.
+    BackendId final_backend = selected;
+    switch (state.config.hash_strategy) {
+    case RoutingConfig::HashStrategy::BOUNDED_LOAD: {
+        // For ART hits under bounded-load, check if the ART-selected backend
+        // exceeds the capacity cap. If so, fall back to bounded-load selection.
+        if (art_hit) {
+            uint64_t total_load = 0;
+            for (BackendId id : live_backends) {
+                total_load += get_backend_load(id);
+            }
+            double avg = static_cast<double>(total_load) / static_cast<double>(live_backends.size());
+            uint64_t cap = std::max(static_cast<uint64_t>(1),
+                                    static_cast<uint64_t>(std::ceil(avg * (1.0 + state.config.bounded_load_epsilon))));
+            uint64_t sel_load = get_backend_load(selected);
+            if (sel_load >= cap) {
+                prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+                final_backend = bounded_load_select(prefix_hash, live_backends,
+                                                    state.config.bounded_load_epsilon, request_id);
+            }
+        }
+        // Hash path: already handled in step 2
+        break;
+    }
+    case RoutingConfig::HashStrategy::P2C:
+        // For ART hits under P2C, check if ART-selected backend is overloaded
+        // vs a random alternative. Use same bias threshold.
+        if (art_hit && live_backends.size() >= 2) {
+            auto [least_id, least_load] = get_least_loaded_backend(live_backends);
+            uint64_t sel_load = get_backend_load(selected);
+            if (least_id != 0 && least_load + state.config.p2c_load_bias < sel_load) {
+                final_backend = least_id;
+                g_shard_state->stats.load_aware_fallbacks++;
+                if (g_metrics) {
+                    metrics().record_load_aware_fallback();
+                }
+                log_router.debug("[{}] P2C (ART override): backend {} has {} in-flight, "
+                                 "least-loaded backend {} has {} (bias={})",
+                                 request_id, selected, sel_load, least_id, least_load,
+                                 state.config.p2c_load_bias);
+            }
+        }
+        break;
+    case RoutingConfig::HashStrategy::JUMP:
+    case RoutingConfig::HashStrategy::MODULAR:
+    default:
+        // Legacy median-based load-aware override for both ART and hash paths
+        final_backend = apply_load_aware_selection(selected, live_backends, request_id, source);
+        break;
+    }
 
     if (!request_id.empty() && final_backend == selected) {
         if (art_hit) {
@@ -1311,14 +1545,46 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
         return live_backends[0];
     }
 
-    // Consistent hash on prefix tokens
+    // Consistent hash on prefix tokens — dispatch to configured strategy
     uint64_t prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-    int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
-    BackendId selected = live_backends[index];
+    BackendId selected;
+
+    switch (state.config.hash_strategy) {
+    case RoutingConfig::HashStrategy::BOUNDED_LOAD:
+        selected = bounded_load_select(prefix_hash, live_backends,
+                                       state.config.bounded_load_epsilon, request_id);
+        break;
+
+    case RoutingConfig::HashStrategy::P2C: {
+        uint64_t salt = prefix_hash;
+        if (!request_id.empty()) {
+            salt = FNV_OFFSET_BASIS;
+            for (char c : request_id) {
+                salt ^= static_cast<uint8_t>(c);
+                salt *= FNV_PRIME;
+            }
+        }
+        selected = p2c_select(prefix_hash, salt, live_backends,
+                              state.config.p2c_load_bias, request_id);
+        break;
+    }
+
+    case RoutingConfig::HashStrategy::MODULAR:
+        selected = live_backends[static_cast<int32_t>(prefix_hash %
+                       static_cast<uint64_t>(live_backends.size()))];
+        break;
+
+    case RoutingConfig::HashStrategy::JUMP:
+    default: {
+        int32_t index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
+        selected = live_backends[index];
+        break;
+    }
+    }
 
     if (!request_id.empty()) {
-        log_router.debug("[{}] Hash routing: {} tokens, hash={}, index={}/{} -> backend {}",
-                         request_id, prefix_len, prefix_hash, index, live_backends.size(), selected);
+        log_router.debug("[{}] Hash routing: {} tokens, hash={} -> backend {}",
+                         request_id, prefix_len, prefix_hash, selected);
     }
 
     // No ART involvement - no cache_hit/miss tracking for stats

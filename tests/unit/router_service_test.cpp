@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -54,6 +55,7 @@ protected:
         cfg_.block_alignment = 1;
         cfg_.backend_drain_timeout = std::chrono::seconds(2);
         cfg_.load_aware_routing = false;  // Deterministic tests
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;  // Deterministic: no load-aware hash
 
         router_ = std::make_unique<RouterService>(cfg_);
     }
@@ -941,6 +943,9 @@ TEST(RoutingConfigTest, DefaultValues) {
     EXPECT_EQ(cfg.prefix_token_length, 128u);
     EXPECT_EQ(cfg.block_alignment, 16u);
     EXPECT_TRUE(cfg.is_prefix_mode());
+    EXPECT_EQ(cfg.hash_strategy, RoutingConfig::HashStrategy::BOUNDED_LOAD);
+    EXPECT_DOUBLE_EQ(cfg.bounded_load_epsilon, 0.25);
+    EXPECT_EQ(cfg.p2c_load_bias, 2u);
 }
 
 // =============================================================================
@@ -973,4 +978,371 @@ TEST(BackendStateTest, FieldAssignment) {
     EXPECT_EQ(bs.id, 1);
     EXPECT_EQ(bs.port, 8080);
     EXPECT_FALSE(bs.is_draining);
+}
+
+// =============================================================================
+// 21. Hash Strategy: Bounded-Load Consistent Hashing
+// =============================================================================
+
+class BoundedLoadTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = false;  // Not used by bounded_load
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+        cfg_.bounded_load_epsilon = 0.25;
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+
+    void register_four_backends() {
+        RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+        RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+        RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+        RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080));
+    }
+};
+
+TEST_F(BoundedLoadTest, BasicRoutingWorks) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {100, 200, 300, 400, 500};
+
+    auto result = router_->route_request(tokens);
+    EXPECT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.routing_mode, "prefix");
+}
+
+TEST_F(BoundedLoadTest, DeterministicWhenUnloaded) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Without load, same tokens should hash to same backend
+    auto first = router_->get_backend_for_prefix(tokens);
+    auto second = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(first.backend_id.has_value());
+    ASSERT_TRUE(second.backend_id.has_value());
+    EXPECT_EQ(first.backend_id.value(), second.backend_id.value());
+}
+
+TEST_F(BoundedLoadTest, DivertsWhenOverCapacity) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Find which backend the hash prefers
+    auto preferred = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(preferred.backend_id.has_value());
+    BackendId preferred_id = preferred.backend_id.value();
+
+    // Load that backend heavily (create guards that increment active_requests)
+    // With 4 backends, 0 load avg, cap = max(1, ceil(0 * 1.25)) = 1
+    // So even 1 in-flight should trigger probing
+    BackendRequestGuard g1(preferred_id);
+    BackendRequestGuard g2(preferred_id);
+    BackendRequestGuard g3(preferred_id);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // With 3 in-flight on preferred and 0 on others, avg=0.75, cap=max(1, ceil(0.75*1.25))=1
+    // preferred has 3 >= 1, so it should divert
+    EXPECT_NE(result.backend_id.value(), preferred_id);
+}
+
+TEST_F(BoundedLoadTest, SpreadLoadAcrossBackends) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Simulate 20 concurrent requests all with same prefix.
+    // Bounded-load should spread them across backends, not pile on one.
+    std::vector<BackendRequestGuard> guards;
+    std::map<BackendId, int> counts;
+
+    for (int i = 0; i < 20; ++i) {
+        auto result = router_->get_backend_for_prefix(tokens);
+        ASSERT_TRUE(result.backend_id.has_value());
+        BackendId id = result.backend_id.value();
+        counts[id]++;
+        guards.emplace_back(id);
+    }
+
+    // With 4 backends and 20 requests, ideal distribution is 5 each.
+    // With epsilon=0.25, cap = ceil(avg * 1.25).
+    // No single backend should have more than ~40% of requests.
+    for (auto& [id, count] : counts) {
+        EXPECT_LE(count, 8) << "Backend " << id << " has " << count
+                            << "/20 requests — bounded-load should prevent this";
+    }
+
+    // Should use at least 3 of 4 backends
+    EXPECT_GE(counts.size(), 3u) << "Bounded-load should spread across most backends";
+}
+
+TEST_F(BoundedLoadTest, ARTHitRespectedWhenUnderCap) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Insert ART route to backend 3
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_TRUE(result.art_hit);
+}
+
+TEST_F(BoundedLoadTest, ARTHitOverriddenWhenOverCap) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Insert ART route to backend 3
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    // Load backend 3 heavily
+    BackendRequestGuard g1(3);
+    BackendRequestGuard g2(3);
+    BackendRequestGuard g3(3);
+    BackendRequestGuard g4(3);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Backend 3 has 4 in-flight, avg=1.0, cap=max(1, ceil(1.0*1.25))=2
+    // 4 >= 2, so bounded-load should divert
+    EXPECT_NE(result.backend_id.value(), 3)
+        << "Bounded-load should override ART hit when backend is over cap";
+}
+
+// =============================================================================
+// 22. Hash Strategy: Power of Two Choices (P2C)
+// =============================================================================
+
+class P2CTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = false;  // Not used by P2C
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+        cfg_.p2c_load_bias = 2;
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+
+    void register_four_backends() {
+        RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+        RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+        RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+        RouterService::register_backend_for_testing(4, make_addr("10.0.0.4", 8080));
+    }
+};
+
+TEST_F(P2CTest, BasicRoutingWorks) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {100, 200, 300, 400, 500};
+
+    auto result = router_->route_request(tokens);
+    EXPECT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.routing_mode, "prefix");
+}
+
+TEST_F(P2CTest, PrefersLessLoadedSecondary) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Find primary backend
+    auto preferred = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(preferred.backend_id.has_value());
+    BackendId primary = preferred.backend_id.value();
+
+    // Load the primary heavily (more than p2c_load_bias=2 above secondary)
+    BackendRequestGuard g1(primary);
+    BackendRequestGuard g2(primary);
+    BackendRequestGuard g3(primary);
+    BackendRequestGuard g4(primary);
+    BackendRequestGuard g5(primary);
+
+    // With primary at 5 and all others at 0, and bias=2:
+    // s_load(0) + bias(2) < p_load(5) => true => switch to secondary
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_NE(result.backend_id.value(), primary)
+        << "P2C should switch to less-loaded secondary when primary is heavily loaded";
+}
+
+TEST_F(P2CTest, SticksWithPrimaryWhenLoadBalanced) {
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Find primary backend
+    auto preferred = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(preferred.backend_id.has_value());
+    BackendId primary = preferred.backend_id.value();
+
+    // Load primary with just 1 in-flight (bias=2, so s_load(0) + 2 < 1 is false)
+    BackendRequestGuard g1(primary);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary)
+        << "P2C should stick with primary when load difference is within bias";
+}
+
+// =============================================================================
+// 23. Hash Strategy: Modular Hash (Benchmark Baseline)
+// =============================================================================
+
+class ModularHashTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = false;
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::MODULAR;
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+};
+
+TEST_F(ModularHashTest, BasicRoutingWorks) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    std::vector<int32_t> tokens = {100, 200, 300, 400};
+    auto result = router_->route_request(tokens);
+    EXPECT_TRUE(result.backend_id.has_value());
+}
+
+TEST_F(ModularHashTest, DeterministicRouting) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+    auto first = router_->get_backend_for_prefix(tokens);
+    auto second = router_->get_backend_for_prefix(tokens);
+
+    ASSERT_TRUE(first.backend_id.has_value());
+    ASSERT_TRUE(second.backend_id.has_value());
+    EXPECT_EQ(first.backend_id.value(), second.backend_id.value());
+}
+
+// =============================================================================
+// 24. Hash Strategy: Jump (backward compatibility)
+// =============================================================================
+
+class JumpHashStrategyTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = false;
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+};
+
+TEST_F(JumpHashStrategyTest, BackwardCompatible) {
+    // JUMP strategy should behave identically to the original pre-strategy code
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080));
+
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    auto first = router_->get_backend_for_prefix(tokens);
+    auto second = router_->get_backend_for_prefix(tokens);
+
+    ASSERT_TRUE(first.backend_id.has_value());
+    ASSERT_TRUE(second.backend_id.has_value());
+    EXPECT_EQ(first.backend_id.value(), second.backend_id.value());
+    EXPECT_FALSE(first.art_hit);
+}
+
+TEST_F(JumpHashStrategyTest, UsesLoadAwareLegacyPath) {
+    // With JUMP strategy and load_aware_routing=true, should use median threshold
+    cfg_.load_aware_routing = true;
+    cfg_.load_imbalance_factor = 2.0;
+    cfg_.load_imbalance_floor = 2;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080));
+
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+}
+
+// =============================================================================
+// 25. Hash Strategy Configuration
+// =============================================================================
+
+TEST(HashStrategyConfigTest, DefaultIsBoundedLoad) {
+    RoutingConfig cfg;
+    EXPECT_EQ(cfg.hash_strategy, RoutingConfig::HashStrategy::BOUNDED_LOAD);
+}
+
+TEST(HashStrategyConfigTest, EnumValues) {
+    // Verify all enum values are distinct
+    EXPECT_NE(static_cast<int>(RoutingConfig::HashStrategy::JUMP),
+              static_cast<int>(RoutingConfig::HashStrategy::BOUNDED_LOAD));
+    EXPECT_NE(static_cast<int>(RoutingConfig::HashStrategy::P2C),
+              static_cast<int>(RoutingConfig::HashStrategy::MODULAR));
+    EXPECT_NE(static_cast<int>(RoutingConfig::HashStrategy::BOUNDED_LOAD),
+              static_cast<int>(RoutingConfig::HashStrategy::P2C));
 }

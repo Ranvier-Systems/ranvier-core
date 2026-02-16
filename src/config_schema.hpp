@@ -91,6 +91,36 @@ struct RoutingConfig {
     RoutingMode routing_mode = RoutingMode::PREFIX;  // Default: prefix-affinity with ART
     size_t prefix_token_length = 128;  // Number of tokens to use as routing key (default: 128)
 
+    // =========================================================================
+    // Hash Strategy (controls consistent hash fallback behavior)
+    // =========================================================================
+    // Determines how the hash fallback selects backends when ART has no match.
+    // Also controls load-aware override behavior for both ART hits and hash misses.
+    //
+    // - JUMP:         Original jump consistent hash (Lamping & Veach 2014).
+    //                 Uses separate load_aware_routing threshold for load balancing.
+    // - BOUNDED_LOAD: Jump hash + capacity cap (Mirrokni et al. 2018).
+    //                 Each backend capped at ceil(avg_load * (1 + epsilon)).
+    //                 Subsumes load_aware_routing — no separate threshold needed.
+    // - P2C:          Power-of-two-choices with primary affinity bias.
+    //                 Hashes to 2 candidates, prefers primary unless secondary
+    //                 is significantly less loaded. Proven O(log log n) max load.
+    // - MODULAR:      Simple modular hash (key % num_backends). For benchmarking
+    //                 only — reshuffles ALL keys on topology changes.
+    enum class HashStrategy { JUMP, BOUNDED_LOAD, P2C, MODULAR };
+    HashStrategy hash_strategy = HashStrategy::BOUNDED_LOAD;  // Default: bounded-load
+
+    // Bounded-load epsilon: capacity headroom factor.
+    // Each backend accepts at most ceil(avg_load * (1 + epsilon)) in-flight requests.
+    // Lower epsilon = tighter balance but more affinity breaks.
+    // Typical values: 0.25 (tight), 0.5 (moderate), 1.0 (loose).
+    double bounded_load_epsilon = 0.25;
+
+    // P2C load bias: minimum load difference to prefer secondary over primary.
+    // Higher bias = stronger affinity to primary (hash-preferred) backend.
+    // Only switch to secondary when: secondary_load + p2c_load_bias < primary_load.
+    uint64_t p2c_load_bias = 2;
+
     // Prefix boundary detection for multi-turn conversations
     // When enabled, system messages are tokenized separately to identify the "shared prefix"
     // boundary. Routes are stored at this boundary instead of prefix_token_length, improving

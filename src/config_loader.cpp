@@ -151,6 +151,24 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_LOAD_IMBALANCE_FLOOR")) {
         routing.load_imbalance_floor = *v;
     }
+    // Hash strategy configuration
+    if (auto v = get_env("RANVIER_HASH_STRATEGY")) {
+        if (*v == "jump") {
+            routing.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+        } else if (*v == "bounded_load") {
+            routing.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+        } else if (*v == "p2c") {
+            routing.hash_strategy = RoutingConfig::HashStrategy::P2C;
+        } else if (*v == "modular") {
+            routing.hash_strategy = RoutingConfig::HashStrategy::MODULAR;
+        }
+    }
+    if (auto v = get_env_as<double>("RANVIER_BOUNDED_LOAD_EPSILON")) {
+        routing.bounded_load_epsilon = *v;
+    }
+    if (auto v = get_env_as<uint64_t>("RANVIER_P2C_LOAD_BIAS")) {
+        routing.p2c_load_bias = *v;
+    }
 
     // Timeout overrides
     if (auto v = get_env_as<int>("RANVIER_CONNECT_TIMEOUT")) {
@@ -615,6 +633,25 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["load_imbalance_floor"]) {
                 config.routing.load_imbalance_floor = r["load_imbalance_floor"].as<uint64_t>();
             }
+            // Hash strategy
+            if (r["hash_strategy"]) {
+                std::string strategy = r["hash_strategy"].as<std::string>();
+                if (strategy == "jump") {
+                    config.routing.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+                } else if (strategy == "bounded_load") {
+                    config.routing.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+                } else if (strategy == "p2c") {
+                    config.routing.hash_strategy = RoutingConfig::HashStrategy::P2C;
+                } else if (strategy == "modular") {
+                    config.routing.hash_strategy = RoutingConfig::HashStrategy::MODULAR;
+                }
+            }
+            if (r["bounded_load_epsilon"]) {
+                config.routing.bounded_load_epsilon = r["bounded_load_epsilon"].as<double>();
+            }
+            if (r["p2c_load_bias"]) {
+                config.routing.p2c_load_bias = r["p2c_load_bias"].as<uint64_t>();
+            }
         }
 
         // Timeouts section
@@ -965,6 +1002,11 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.routing.backend_drain_timeout.count() == 0) {
         return "routing.backend_drain_timeout must be positive";
+    }
+
+    // Validate hash strategy settings
+    if (config.routing.bounded_load_epsilon < 0.0 || config.routing.bounded_load_epsilon > 10.0) {
+        return "routing.bounded_load_epsilon must be between 0.0 and 10.0";
     }
 
     // Validate timeout settings
