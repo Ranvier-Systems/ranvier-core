@@ -530,6 +530,76 @@ static BackendId apply_load_aware_selection(
 }
 
 // ============================================================================
+// Route Batching Helpers
+// ============================================================================
+
+// Apply a batch of remote routes to the local shard's RadixTree.
+// This function runs on each shard and processes all routes in the batch.
+// Called via smp::submit_to from flush_route_batch().
+static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute>& batch) {
+    if (!g_shard_state) return;
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
+    if (!tree) return;
+
+    for (const auto& route : batch) {
+        // LRU eviction: prefer evicting REMOTE routes first when at capacity
+        if (state.config.max_routes > 0) {
+            while (tree->route_count() >= state.config.max_routes) {
+                if (tree->evict_oldest_remote()) {
+                    state.stats.routes_evicted++;
+                } else {
+                    break;  // No more routes to evict
+                }
+            }
+        }
+
+        // Insert with REMOTE origin (learned from cluster gossip)
+        tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
+    }
+}
+
+// FNV-1a hash constants for 64-bit
+constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+
+// Jump consistent hash (Lamping & Veach, 2014).
+// Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
+// removing a bucket remaps only ~1/n keys.  This preserves KV-cache affinity
+// during backend topology changes, unlike modular hashing which reshuffles all.
+inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
+    int64_t b = -1, j = 0;
+    while (j < num_buckets) {
+        b = j;
+        key = key * 2862933555777941757ULL + 1;
+        j = static_cast<int64_t>(
+            static_cast<double>(b + 1) *
+            (static_cast<double>(1LL << 31) /
+             static_cast<double>((key >> 33) + 1)));
+    }
+    return static_cast<int32_t>(b);
+}
+
+// Hash function for prefix tokens using FNV-1a
+// Aligns to block_alignment boundary for vLLM compatibility
+inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
+    // Align to block_alignment boundary
+    size_t aligned_len = (count / block_alignment) * block_alignment;
+    if (aligned_len == 0) aligned_len = count;
+
+    uint64_t hash = FNV_OFFSET_BASIS;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
+    size_t byte_len = aligned_len * sizeof(int32_t);
+
+    for (size_t i = 0; i < byte_len; ++i) {
+        hash ^= data[i];
+        hash *= FNV_PRIME;
+    }
+
+    return hash;
+}
+
+// ============================================================================
 // Hash Strategy: Bounded-Load Consistent Hashing
 // ============================================================================
 // Mirrokni, Thorup, Zadimoghaddam (Google, 2018).
@@ -654,76 +724,6 @@ static BackendId p2c_select(
     }
 
     return primary;
-}
-
-// ============================================================================
-// Route Batching Helpers
-// ============================================================================
-
-// Apply a batch of remote routes to the local shard's RadixTree.
-// This function runs on each shard and processes all routes in the batch.
-// Called via smp::submit_to from flush_route_batch().
-static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute>& batch) {
-    if (!g_shard_state) return;
-    auto& state = shard_state();
-    RadixTree* tree = state.tree.get();
-    if (!tree) return;
-
-    for (const auto& route : batch) {
-        // LRU eviction: prefer evicting REMOTE routes first when at capacity
-        if (state.config.max_routes > 0) {
-            while (tree->route_count() >= state.config.max_routes) {
-                if (tree->evict_oldest_remote()) {
-                    state.stats.routes_evicted++;
-                } else {
-                    break;  // No more routes to evict
-                }
-            }
-        }
-
-        // Insert with REMOTE origin (learned from cluster gossip)
-        tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
-    }
-}
-
-// FNV-1a hash constants for 64-bit
-constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
-constexpr uint64_t FNV_PRIME = 1099511628211ULL;
-
-// Jump consistent hash (Lamping & Veach, 2014).
-// Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
-// removing a bucket remaps only ~1/n keys.  This preserves KV-cache affinity
-// during backend topology changes, unlike modular hashing which reshuffles all.
-inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
-    int64_t b = -1, j = 0;
-    while (j < num_buckets) {
-        b = j;
-        key = key * 2862933555777941757ULL + 1;
-        j = static_cast<int64_t>(
-            static_cast<double>(b + 1) *
-            (static_cast<double>(1LL << 31) /
-             static_cast<double>((key >> 33) + 1)));
-    }
-    return static_cast<int32_t>(b);
-}
-
-// Hash function for prefix tokens using FNV-1a
-// Aligns to block_alignment boundary for vLLM compatibility
-inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
-    // Align to block_alignment boundary
-    size_t aligned_len = (count / block_alignment) * block_alignment;
-    if (aligned_len == 0) aligned_len = count;
-
-    uint64_t hash = FNV_OFFSET_BASIS;
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
-    size_t byte_len = aligned_len * sizeof(int32_t);
-
-    for (size_t i = 0; i < byte_len; ++i) {
-        hash ^= data[i];
-        hash *= FNV_PRIME;
-    }
-
-    return hash;
 }
 
 RouterService::RouterService() : RouterService(RoutingConfig{}) {}
