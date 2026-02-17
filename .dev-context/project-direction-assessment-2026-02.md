@@ -146,14 +146,30 @@ Deep knowledge of KV cache dynamics, GPU scheduling, prefix-aware routing, Seast
 
 ---
 
+## Project Origin and What It Changes
+
+The project was never primarily a product bet. The original motivation was building something high-performance in C++ with Seastar — a Redis-style clone was the first idea, then pivoted to AI routing on the assumption that C++ would have a meaningful performance edge over Python or Go equivalents.
+
+That assumption was technically correct but commercially irrelevant. The C++ implementation *is* faster: sub-50μs radix tree lookups, zero-copy SSE streaming, lock-free cross-shard dispatch. A Go equivalent would be 2-10x slower on the routing hot path. But the routing hot path is ~0.001% of end-to-end request latency when GPU inference takes 2-10 seconds. Users can't feel the difference between 50μs and 500μs routing when they're waiting 4 seconds for tokens.
+
+This reframes the assessment:
+
+- **The project succeeded at its actual goal.** Deep Seastar systems programming, shared-nothing architecture, cross-language FFI, reactor-safe patterns — all of this was learned and battle-tested. The 16 Hard Rules document alone represents months of hard-won knowledge.
+- **The AI routing use case was the vehicle, not the destination.** The competitive landscape analysis matters for deciding what to build *next*, not for judging what was built.
+- **The performance edge applies to different problems.** Seastar's advantages are real for data plane workloads (millions of ops/sec, microsecond latency budgets). The mistake was applying it to a control plane problem where the bottleneck is elsewhere.
+
+This also explains why a Rust rewrite for the local proxy makes sense without feeling like waste: the algorithms transfer (radix tree, priority scheduling), the domain knowledge transfers (KV cache dynamics, inference engine behavior, BERT classification landscape), and the operational patterns transfer (FFI safety, allocator isolation). What doesn't transfer — and shouldn't — is the Seastar runtime, because the local proxy genuinely doesn't need shared-nothing, thread-per-core architecture.
+
+---
+
 ## Conclusion
 
 The previous assessment was correct on the strategic direction, but too dismissive on the classification question. BERT-based intent classification is adoptable — the tokenizer FFI already proves the pattern — and should absolutely be used in any new product. The gap is not "can Ranvier do ML-based classification?" (yes) but "should it compete with vLLM-SR on cloud routing?" (no).
 
-The local developer proxy with embedded BERT classification, auto-discovery, and agent scheduling remains the most defensible product. Build it in Rust with Candle. Ship the C++ codebase as a reference implementation. Use the domain expertise — not necessarily the Seastar code — as the foundation for what comes next.
+The local developer proxy with embedded BERT classification, auto-discovery, and agent scheduling remains the most defensible product. Build it in Rust with Candle. Ship the C++ codebase as a reference implementation and engineering content. The code was the vehicle for learning; the expertise — Seastar internals, inference engine architecture, BERT classification, KV cache dynamics — is the lasting asset.
 
 ---
 
 *Assessment date: 2026-02-17*
-*Revised: 2026-02-17 — Added vLLM-SR architecture analysis, BERT classification feasibility, corrected engine-agnostic assessment*
+*Revised: 2026-02-17 — Added vLLM-SR architecture analysis, BERT classification feasibility, corrected engine-agnostic assessment, project origin context*
 *Based on competitive landscape research through February 2026*
