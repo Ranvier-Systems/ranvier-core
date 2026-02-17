@@ -148,15 +148,15 @@ Deep knowledge of KV cache dynamics, GPU scheduling, prefix-aware routing, Seast
 
 ## Project Origin and What It Changes
 
-The project was never primarily a product bet. The original motivation was building something high-performance in C++ with Seastar — a Redis-style clone was the first idea, then pivoted to AI routing on the assumption that C++ would have a meaningful performance edge over Python or Go equivalents.
+The project had dual motivations: building deep C++ systems programming expertise with Seastar, and shipping a real product. A Redis-style clone was the first idea, then pivoted to AI routing on the assumption that C++ would have a meaningful performance edge over Python or Go equivalents — a reasonable bet that could produce both the learning and the product.
 
 That assumption was technically correct but commercially irrelevant. The C++ implementation *is* faster: sub-50μs radix tree lookups, zero-copy SSE streaming, lock-free cross-shard dispatch. A Go equivalent would be 2-10x slower on the routing hot path. But the routing hot path is ~0.001% of end-to-end request latency when GPU inference takes 2-10 seconds. Users can't feel the difference between 50μs and 500μs routing when they're waiting 4 seconds for tokens.
 
 This reframes the assessment:
 
-- **The project succeeded at its actual goal.** Deep Seastar systems programming, shared-nothing architecture, cross-language FFI, reactor-safe patterns — all of this was learned and battle-tested. The 16 Hard Rules document alone represents months of hard-won knowledge.
-- **The AI routing use case was the vehicle, not the destination.** The competitive landscape analysis matters for deciding what to build *next*, not for judging what was built.
-- **The performance edge applies to different problems.** Seastar's advantages are real for data plane workloads (millions of ops/sec, microsecond latency budgets). The mistake was applying it to a control plane problem where the bottleneck is elsewhere.
+- **The systems programming goal succeeded.** Deep Seastar internals, shared-nothing architecture, cross-language FFI, reactor-safe patterns — all battle-tested. The 16 Hard Rules alone represent months of hard-won knowledge.
+- **The product goal was reasonable but the market moved.** Prefix-aware routing for LLMs was a real gap when the project started. The competitive landscape closed that gap faster than expected — vLLM-SR, llm-d, and SGLang all shipped overlapping features within a few months.
+- **The performance edge is real but mismatched to the problem.** Seastar's advantages matter for data plane workloads (millions of ops/sec, microsecond latency budgets). AI routing turned out to be a control plane problem where the bottleneck is GPU inference, not routing decisions.
 
 This also explains why a Rust rewrite for the local proxy makes sense without feeling like waste: the algorithms transfer (radix tree, priority scheduling), the domain knowledge transfers (KV cache dynamics, inference engine behavior, BERT classification landscape), and the operational patterns transfer (FFI safety, allocator isolation). What doesn't transfer — and shouldn't — is the Seastar runtime, because the local proxy genuinely doesn't need shared-nothing, thread-per-core architecture.
 
