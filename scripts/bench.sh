@@ -49,6 +49,7 @@ DEFAULT_WARMUP_DURATION="1m"
 DEFAULT_WARMUP_USERS="2"
 DEFAULT_STOP_TIMEOUT="90"
 DEFAULT_MAX_TOKENS="100"
+DEFAULT_VLLM_VERSION="0.15.1"
 GHCR_IMAGE="ghcr.io/ranvier-systems/ranvier:latest"
 
 # Colors
@@ -257,6 +258,8 @@ BENCHMARK OPTIONS:
     --no-load-aware     Disable load-aware backend selection. Routes always go to the
                         cached backend regardless of queue depth. Useful for A/B testing
                         cache hit rates vs load balancing trade-offs.
+    --vllm-version VER  Pin vLLM to a specific version (default: ${DEFAULT_VLLM_VERSION}).
+                        Ensures reproducible benchmarks across instances.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
                         Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
     --tp N              Tensor parallelism size per vLLM instance (default: auto).
@@ -432,6 +435,7 @@ LOAD_AWARE=true
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 MAX_TOKENS="$DEFAULT_MAX_TOKENS"
+VLLM_VERSION="$DEFAULT_VLLM_VERSION"
 TP_SIZE=1
 GPU_MEM_UTIL="0.85"
 
@@ -464,6 +468,7 @@ while [[ $# -gt 0 ]]; do
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
         --gpu-mem-util)   GPU_MEM_UTIL="$2"; shift 2 ;;
+        --vllm-version)   VLLM_VERSION="$2"; shift 2 ;;
         --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
@@ -761,23 +766,29 @@ if [[ "$SETUP_ONLY" = true ]]; then
 
     # Install vLLM (for running LLM backends)
     if ! command -v vllm &> /dev/null && ! python3 -c "import vllm" 2>/dev/null; then
-        log_info "Installing vLLM (this may take a few minutes)..."
+        log_info "Installing vLLM v${VLLM_VERSION} (this may take a few minutes)..."
         if command -v pip3 &> /dev/null; then
             PIP="pip3"
         elif command -v pip &> /dev/null; then
             PIP="pip"
         else
             log_warn "pip not found - skipping vLLM installation"
-            log_info "Install manually: pip install vllm 'numpy<2' tokenizers"
+            log_info "Install manually: pip install 'vllm==${VLLM_VERSION}' 'numpy<2' tokenizers"
             PIP=""
         fi
         if [[ -n "$PIP" ]]; then
-            $PIP install vllm 2>&1 | tail -5
+            $PIP install "vllm==${VLLM_VERSION}" 2>&1 | tail -5
             $PIP install "numpy<2" 2>&1 | tail -2  # vLLM compatibility fix
-            log_ok "vLLM installed"
+            log_ok "vLLM v${VLLM_VERSION} installed"
         fi
     else
-        log_ok "vLLM already installed"
+        INSTALLED_VLLM=$(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+        if [[ "$INSTALLED_VLLM" != "$VLLM_VERSION" ]]; then
+            log_warn "vLLM version mismatch: installed=$INSTALLED_VLLM, expected=$VLLM_VERSION"
+            log_info "Run with --install-deps to install the pinned version, or use --vllm-version $INSTALLED_VLLM"
+        else
+            log_ok "vLLM v${INSTALLED_VLLM} already installed"
+        fi
     fi
 
     # Install tokenizers (for client-side tokenization option)
@@ -873,9 +884,9 @@ if [[ "$INSTALL_DEPS" = true ]]; then
         exit 1
     fi
 
-    log_info "Installing vLLM (this may take a few minutes)..."
-    $PIP install vllm 2>&1 | tail -5
-    log_ok "vLLM installed"
+    log_info "Installing vLLM v${VLLM_VERSION} (this may take a few minutes)..."
+    $PIP install "vllm==${VLLM_VERSION}" 2>&1 | tail -5
+    log_ok "vLLM v${VLLM_VERSION} installed"
 
     # numpy<2 compatibility fix for vLLM
     log_info "Installing numpy<2 (vLLM compatibility fix)..."
@@ -921,6 +932,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Load-Aware:      $LOAD_AWARE"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
+    echo "  vLLM Version:    $VLLM_VERSION"
     echo "  Skip vLLM:       $SKIP_VLLM"
     if [[ ${#VLLM_ENDPOINTS[@]} -gt 0 ]]; then
         echo "  vLLM Endpoints:  ${VLLM_ENDPOINTS[*]}"
@@ -1289,6 +1301,7 @@ run_benchmark() {
         fi
         echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${NC}"
         echo "  Model:        $MODEL"
+        echo "  vLLM:         v${VLLM_VERSION}"
         echo "  Backends:     $NUM_BACKENDS"
         if [[ "$TP_SIZE" -gt 1 ]]; then
             echo "  Tensor Par:   $TP_SIZE GPUs/backend"

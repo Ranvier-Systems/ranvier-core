@@ -28,7 +28,7 @@ services:
   # ============================================================================
 
   vllm-backend1:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.15.1
     container_name: vllm-backend1
     runtime: nvidia
     deploy:
@@ -68,7 +68,7 @@ services:
       - single-gpu
 
   vllm-backend2:
-    image: vllm/vllm-openai:latest
+    image: vllm/vllm-openai:v0.15.1
     container_name: vllm-backend2
     runtime: nvidia
     deploy:
