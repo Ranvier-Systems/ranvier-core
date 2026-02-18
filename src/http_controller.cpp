@@ -852,11 +852,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 tokens.clear();
             } else {
                 try {
-                    // Use async cached tokenization with cross-shard dispatch
-                    // On cache hit: returns immediately (no async overhead)
-                    // On cache miss: may dispatch to least-loaded shard via P2C,
-                    //   freeing this reactor to handle other requests during FFI.
-                    auto tok_result = co_await _tokenizer.local().encode_cached_async(text_to_tokenize);
+                    // Use threaded async tokenization to avoid reactor stalls:
+                    //   1. Cache hit: returns immediately (no async overhead)
+                    //   2. Thread pool (if enabled): offloads FFI to worker thread
+                    //   3. Cross-shard dispatch: P2C to least-loaded shard
+                    //   4. Local fallback: blocks reactor (last resort)
+                    auto tok_result = co_await _tokenizer.local().encode_threaded_async(text_to_tokenize);
                     tokens = std::move(tok_result.tokens);
 
                     // Set tracing attributes based on tokenization source
