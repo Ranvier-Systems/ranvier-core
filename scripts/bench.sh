@@ -694,6 +694,11 @@ if [[ "$LOG_ALL" = true ]]; then
     echo "User: $(whoami)"
     echo "PWD: $(pwd)"
     echo "Command: $ORIGINAL_CMD"
+    echo "Git Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    echo "vLLM Version: $VLLM_VERSION"
+    echo "---------------------------------------------"
+    echo "Ranvier Environment Overrides:"
+    env | grep '^RANVIER_' | sort || echo "  (none)"
     echo "============================================="
     echo ""
 fi
@@ -1314,6 +1319,12 @@ run_benchmark() {
         echo "  Users:        $USERS"
         echo "  Routing:      $ROUTING_MODE"
         echo "  Prompt Dist:  $PROMPT_DIST"
+        echo "  Git Commit:   $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+        # Show non-default Ranvier env overrides
+        RANVIER_OVERRIDES=$(env | grep '^RANVIER_' | grep -v 'ROUTING_MODE' | sort | tr '\n' ', ' | sed 's/,$//')
+        if [[ -n "$RANVIER_OVERRIDES" ]]; then
+            echo "  Env Overrides: $RANVIER_OVERRIDES"
+        fi
         echo -e "${CYAN}══════════════════════════════════════════════════${NC}"
         echo ""
     } >&2
@@ -1571,9 +1582,14 @@ if [[ "$COMPARE" = true ]]; then
 
     # Run automatic comparison analysis
     COMPARE_OUTPUT="${OUTPUT_DIR}/compare_$(date +%Y%m%d_%H%M%S).txt"
-    # Log the original command at the top of the compare file for reproducibility
-    echo "Command: $ORIGINAL_CMD" > "$COMPARE_OUTPUT"
-    echo "" >> "$COMPARE_OUTPUT"
+    # Log run configuration at the top of the compare file for reproducibility
+    {
+        echo "Command: $ORIGINAL_CMD"
+        echo "Git Commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+        echo "vLLM Version: $VLLM_VERSION"
+        echo "Ranvier Env: $(env | grep '^RANVIER_' | sort | tr '\n' ' ')"
+        echo ""
+    } > "$COMPARE_OUTPUT"
     if [[ -f "tests/integration/results_parser.py" ]]; then
         log_info "Running comparison analysis..."
         if python3 tests/integration/results_parser.py compare \
