@@ -155,7 +155,7 @@ services:
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
       # Tokenizer thread pool - offloads tokenization from Seastar reactor
-      - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-false}
+      - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -204,7 +204,7 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       - RAYON_NUM_THREADS=1
-      - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-false}
+      - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -253,7 +253,7 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
       - RAYON_NUM_THREADS=1
-      - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-false}
+      - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
