@@ -2735,15 +2735,10 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.9 Thread Pool Burst-Routing Can Cause Transient Hot-Spotting
 
-- [ ] **Mitigate burst routing decisions after concurrent thread pool completions**
-  _Justification:_ With the tokenizer thread pool enabled, multiple requests tokenize concurrently (~10-12ms each). When they complete, all results return to the reactor at roughly the same time, causing a burst of routing decisions. The bounded-load hash selects backends based on current load counters, but these counters only update when the request reaches the backend — not at routing time. During a burst, several requests may route to the same "best" backend before the load signal propagates, creating a transient hot-spot. This explains why the thread pool produces excellent results 3 out of 4 runs but occasionally hot-spots (+111% P99) on the 13B 20-user config.
-  _What to change:_ Options:
-  (a) **Speculative load increment**: Increment the backend's load counter at routing time (optimistically), then decrement if the request fails to connect. This gives subsequent routing decisions in the same burst an updated load view. Simplest fix with highest impact.
-  (b) **Stagger completions**: Add small random jitter (0-2ms) to thread pool completion delivery so routing decisions are spread over time. Reduces burst density.
-  (c) **Reduce tokenization latency**: Faster tokenization means shorter burst windows. Tokenizer warm-up, LRU cache sizing, or faster FFI could reduce the 10-12ms window.
-  _Location:_ `src/http_controller.cpp:860` (co_await tokenize), `src/router_service.cpp:444-485` (load-aware selection), `src/shard_load_metrics.hpp` (load counters)
-  _Complexity:_ Low (option a), Low (option b), Medium (option c)
-  _Priority:_ P2 — Reliability; intermittent hot-spotting at medium concurrency (20 users) undermines benchmark consistency
+- [x] **Mitigate burst routing decisions after concurrent thread pool completions**
+  _Status:_ **Done (option a).** Moved `BackendRequestGuard` creation from post-address-lookup to immediately after routing decision in `http_controller.cpp`. The guard's constructor increments `active_requests` speculatively, so the next routing decision in the same burst sees the updated load counter. RAII handles cleanup on error paths; circuit breaker fallback uses move-assignment to swap targets.
+  _Changes:_ `src/http_controller.cpp` — guard creation moved ~40 lines earlier (from after address lookup to after `route_request()` returns). No API changes to `BackendRequestGuard`, `route_request()`, or load metrics.
+  _Remaining options (b) and (c) are deferred — speculative increment addresses the root cause directly._
 
 ### 20.10 Pin tokenizers-cpp Dependency to Specific Commit
 
