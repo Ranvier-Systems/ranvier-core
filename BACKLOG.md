@@ -2721,6 +2721,18 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
   _Complexity:_ Low (testing only)
   _Priority:_ P3 — Investigation; unlikely to be a factor but easy to rule out
 
+### 20.8 Client-Token Path Redundant JSON Parse
+
+- [ ] **Optimize `extract_prompt_token_ids()` to avoid full JSON parse**
+  _Justification:_ When clients send pre-tokenized `prompt_token_ids`, the `extract_prompt_token_ids()` function parses the entire request body with RapidJSON (`doc.Parse(body.data(), body.size())`) just to extract the token array. For large requests with long system prompts, this is a full JSON parse of potentially tens of KB. The body is also parsed again downstream for forwarding/rewriting, making this parse redundant. Benchmark shows 0.35ms on the client-token path — 34x faster than server-side tokenization (12ms) but still the dominant cost on this path.
+  _What to change:_ Options ranked by impact:
+  (a) **Share the parse**: Parse the body once early in the request handler, pass the `rapidjson::Document` to both `extract_prompt_token_ids()` and downstream rewriting. Eliminates one full parse.
+  (b) **Targeted extraction**: Use a SAX-style or on-demand parser to scan only for the `"prompt_token_ids"` key without parsing the entire document.
+  (c) **SIMD token validation**: Replace the per-element bounds-checking loop (lines 731-755) with SIMD range checks — process 8-16 token IDs per instruction instead of one-by-one branch-heavy iteration.
+  _Location:_ `src/request_rewriter.hpp:693-760` (implementation), `src/http_controller.cpp:801` (call site)
+  _Complexity:_ Low (option a), Medium (options b/c)
+  _Priority:_ P3 — Performance; 0.35ms is already fast but becomes significant at high concurrency with client-side tokenization
+
 ---
 
 ## References
