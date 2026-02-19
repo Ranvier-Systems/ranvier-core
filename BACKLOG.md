@@ -2733,6 +2733,31 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
   _Complexity:_ Low (option a), Medium (options b/c)
   _Priority:_ P3 — Performance; 0.35ms is already fast but becomes significant at high concurrency with client-side tokenization
 
+### 20.9 Thread Pool Burst-Routing Can Cause Transient Hot-Spotting
+
+- [ ] **Mitigate burst routing decisions after concurrent thread pool completions**
+  _Justification:_ With the tokenizer thread pool enabled, multiple requests tokenize concurrently (~10-12ms each). When they complete, all results return to the reactor at roughly the same time, causing a burst of routing decisions. The bounded-load hash selects backends based on current load counters, but these counters only update when the request reaches the backend — not at routing time. During a burst, several requests may route to the same "best" backend before the load signal propagates, creating a transient hot-spot. This explains why the thread pool produces excellent results 3 out of 4 runs but occasionally hot-spots (+111% P99) on the 13B 20-user config.
+  _What to change:_ Options:
+  (a) **Speculative load increment**: Increment the backend's load counter at routing time (optimistically), then decrement if the request fails to connect. This gives subsequent routing decisions in the same burst an updated load view. Simplest fix with highest impact.
+  (b) **Stagger completions**: Add small random jitter (0-2ms) to thread pool completion delivery so routing decisions are spread over time. Reduces burst density.
+  (c) **Reduce tokenization latency**: Faster tokenization means shorter burst windows. Tokenizer warm-up, LRU cache sizing, or faster FFI could reduce the 10-12ms window.
+  _Location:_ `src/http_controller.cpp:860` (co_await tokenize), `src/router_service.cpp:444-485` (load-aware selection), `src/shard_load_metrics.hpp` (load counters)
+  _Complexity:_ Low (option a), Low (option b), Medium (option c)
+  _Priority:_ P2 — Reliability; intermittent hot-spotting at medium concurrency (20 users) undermines benchmark consistency
+
+### 20.10 Pin tokenizers-cpp Dependency to Specific Commit
+
+- [ ] **Pin tokenizers-cpp to a known-good commit hash for reproducible builds**
+  _Justification:_ The tokenizers-cpp dependency is fetched via CMake FetchContent with `GIT_TAG main`, meaning each build gets whatever is at HEAD. This creates non-reproducible builds — a tokenizer behavior change upstream could silently alter tokenization results, routing decisions, and benchmark numbers. The Dockerfiles (`Dockerfile.base`, `Dockerfile.production.fast`) also clone from main without pinning. Combined with the unpinned vLLM dependency (now fixed in bench.sh), this was a second source of cross-instance variance. The CMakeLists.txt already notes that older tags (v0.1.0, v0.1.1) have API incompatibilities, and there's a known crash in tokenizers 0.21.4 `NormalizedString::slice`.
+  _What to change:_
+  (a) Replace `GIT_TAG main` with a specific commit hash in `CMakeLists.txt:157` (e.g., `GIT_TAG abc1234`)
+  (b) Pin the same commit in `Dockerfile.base` (line 72, `git clone` → `git checkout <hash>`)
+  (c) Pin the same commit in `Dockerfile.production.fast` (line 29)
+  (d) Document the pinned version and how to update it
+  _Location:_ `CMakeLists.txt:151-158` (FetchContent), `Dockerfile.base:71-72` (clone), `Dockerfile.production.fast:29` (env)
+  _Complexity:_ Low
+  _Priority:_ P1 — Reproducibility; unpinned dependencies undermine benchmark validity and production stability
+
 ---
 
 ## References
