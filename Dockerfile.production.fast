@@ -26,6 +26,7 @@ COPY assets/ ./assets/
 # Build Ranvier using pre-built/pre-cloned dependencies from base image
 # FETCHCONTENT_SOURCE_DIR_* tells CMake to use local dirs instead of cloning
 # CARGO_TARGET_DIR reuses pre-built Rust artifacts from base image
+# tokenizers-cpp version is pinned in Dockerfile.base (see BACKLOG.md §20.10)
 ENV CARGO_TARGET_DIR=/deps/tokenizers-cpp/rust/target
 RUN mkdir -p build && cd build && \
     cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \

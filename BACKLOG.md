@@ -2747,16 +2747,20 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
 
 ### 20.10 Pin tokenizers-cpp Dependency to Specific Commit
 
-- [ ] **Pin tokenizers-cpp to a known-good commit hash for reproducible builds**
-  _Justification:_ The tokenizers-cpp dependency is fetched via CMake FetchContent with `GIT_TAG main`, meaning each build gets whatever is at HEAD. This creates non-reproducible builds — a tokenizer behavior change upstream could silently alter tokenization results, routing decisions, and benchmark numbers. The Dockerfiles (`Dockerfile.base`, `Dockerfile.production.fast`) also clone from main without pinning. Combined with the unpinned vLLM dependency (now fixed in bench.sh), this was a second source of cross-instance variance. The CMakeLists.txt already notes that older tags (v0.1.0, v0.1.1) have API incompatibilities, and there's a known crash in tokenizers 0.21.4 `NormalizedString::slice`.
-  _What to change:_
-  (a) Replace `GIT_TAG main` with a specific commit hash in `CMakeLists.txt:157` (e.g., `GIT_TAG abc1234`)
-  (b) Pin the same commit in `Dockerfile.base` (line 72, `git clone` → `git checkout <hash>`)
-  (c) Pin the same commit in `Dockerfile.production.fast` (line 29)
-  (d) Document the pinned version and how to update it
-  _Location:_ `CMakeLists.txt:151-158` (FetchContent), `Dockerfile.base:71-72` (clone), `Dockerfile.production.fast:29` (env)
-  _Complexity:_ Low
-  _Priority:_ P1 — Reproducibility; unpinned dependencies undermine benchmark validity and production stability
+- [x] **Pin tokenizers-cpp to a known-good commit hash for reproducible builds**
+  _Status:_ **Done.** Pinned to `34885cfd7b9ef27b859c28a41e71413dd31926f5` (2026-01-23, CMake compat + HF tokenizer 0.21.2).
+  _Changes made:_
+  (a) `CMakeLists.txt`: `GIT_TAG main` → `GIT_TAG 34885cfd7b9ef27b859c28a41e71413dd31926f5`
+  (b) `Dockerfile.base`: Added `git checkout 34885cfd7b9ef27b859c28a41e71413dd31926f5` after clone
+  (c) `Dockerfile.production.fast`: No clone — inherits from base image; added comment noting this
+  (d) Update procedure documented below
+
+  **Updating pinned tokenizers-cpp:**
+  1. Check upstream: `git ls-remote https://github.com/mlc-ai/tokenizers-cpp HEAD`
+  2. Review changes since pin: `https://github.com/mlc-ai/tokenizers-cpp/compare/34885cfd...main`
+  3. Update the commit hash in both `CMakeLists.txt` (GIT_TAG) and `Dockerfile.base` (git checkout)
+  4. Rebuild base image: `docker build -f Dockerfile.base -t ranvier-base:latest .`
+  5. Run full test suite and benchmarks to validate
 
 ---
 

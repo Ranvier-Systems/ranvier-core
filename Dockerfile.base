@@ -68,8 +68,11 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
 # See: Rule #15 in .dev-context/claude-context.md
 WORKDIR /deps
 ENV CARGO_TARGET_DIR=/deps/tokenizers-cpp/rust/target
+# Pinned commit: 2026-01-23 (CMake compat + HF tokenizer 0.21.2)
+# To update: see "Updating pinned tokenizers-cpp" in BACKLOG.md §20.10.
 RUN git clone https://github.com/mlc-ai/tokenizers-cpp.git && \
     cd tokenizers-cpp && \
+    git checkout 34885cfd7b9ef27b859c28a41e71413dd31926f5 && \
     git submodule update --init --recursive && \
     # Patch Cargo.toml: Add tikv-jemallocator dependency
     sed -i 's/\[dependencies\]/[dependencies]\ntikv-jemallocator = "0.6"/' rust/Cargo.toml && \
