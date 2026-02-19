@@ -149,13 +149,15 @@ if(Seastar_FOUND)
     message(STATUS "OpenSSL libraries: ${OPENSSL_LIBRARIES}")
 
     # Tokenizers-CPP Configuration (Downloads it automatically)
-    # Note: Using main branch. Older tags (v0.1.0, v0.1.1) have API incompatibilities
-    # with the tokenizers crate version that Cargo resolves to.
-    # There's a known crash in tokenizers 0.21.4 NormalizedString::slice - see issue tracking.
+    # Pinned to a specific commit for reproducible builds. Older tags (v0.1.0,
+    # v0.1.1) have API incompatibilities with the tokenizers crate version that
+    # Cargo resolves to. There's a known crash in tokenizers 0.21.4
+    # NormalizedString::slice — this pin uses HF tokenizer 0.21.2.
+    # To update: see "Updating pinned tokenizers-cpp" in BACKLOG.md §20.10.
     FetchContent_Declare(
       tokenizers_cpp
       GIT_REPOSITORY https://github.com/mlc-ai/tokenizers-cpp
-      GIT_TAG        main
+      GIT_TAG        34885cfd7b9ef27b859c28a41e71413dd31926f5  # 2026-01-23 (CMake compat + HF 0.21.2)
     )
     # Suppress warnings from third-party code compiled within tokenizers_cpp
     # (vendored protobuf-lite emits -Warray-bounds false positives with GCC 12+)
