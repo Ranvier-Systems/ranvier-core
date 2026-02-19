@@ -1139,6 +1139,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         route_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
     } // route_span ends here
 
+    // Speculative load increment: create BackendRequestGuard immediately after routing
+    // so that concurrent routing decisions (e.g., thread pool burst completions) see
+    // updated load counters. Without this, requests completing tokenization at the same
+    // time all see load=0 and pile onto the same backend (transient hot-spot).
+    // RAII ensures cleanup on any early-return error path below.
+    BackendRequestGuard backend_guard(target_id);
+
     // Phase snapshot: post-route (replaces separate art_lookup_end and routing_end)
     auto post_route = std::chrono::steady_clock::now();
     metrics().record_art_lookup_latency(
@@ -1153,12 +1160,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         auto fallback = get_fallback_backend(target_id);
         if (fallback.has_value()) {
             target_id = fallback.value();
+            // Move-assign new guard: decrements old backend, increments new one
+            backend_guard = BackendRequestGuard(target_id);
             metrics().record_fallback();
             log_proxy.info("[{}] Using fallback backend {}", request_id, target_id);
         } else {
             log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
             metrics().record_failure();
-            // active_request_guard destructor will decrement counter
+            // backend_guard + active_request_guard destructors handle cleanup
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"All backends unavailable (circuit breaker open)\"}");
             co_return std::move(rep);
@@ -1169,19 +1178,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     if (!target_addr_opt.has_value()) {
         log_proxy.warn("[{}] Backend {} IP not found", request_id, target_id);
         metrics().record_failure();
-        // active_request_guard destructor will decrement counter
+        // backend_guard + active_request_guard destructors handle cleanup
         rep->add_header("X-Request-ID", request_id);
         rep->write_body("json", "{\"error\": \"Backend IP not found\"}");
         co_return std::move(rep);
     }
     socket_address target_addr = target_addr_opt.value();
     log_proxy.info("[{}] Routing to backend {} at {}", request_id, target_id, target_addr);
-
-    // Create BackendRequestGuard to track in-flight requests per backend
-    // This RAII guard increments active_requests on construction and decrements on destruction.
-    // The guard will be captured in the streaming lambda to survive the entire request lifecycle.
-    // Rule #1: Lock-free - shard-local plain uint64_t increment/decrement.
-    BackendRequestGuard backend_guard(target_id);
 
     // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
     // Capture config for the lambda
