@@ -1470,52 +1470,46 @@ TEST_F(RouterServiceTest, SimulatedBatchSamePrefixDifferentBackend) {
     EXPECT_EQ(RouterService::get_route_count_for_testing(), 1u);
 }
 
-TEST_F(RouterServiceTest, LRUEvictionDuringBatchInsertion) {
-    // With max_routes=5, inserting a batch of 8 routes should trigger
-    // LRU eviction. This simulates the eviction loop in apply_local_batch_to_tree.
-    RoutingConfig small_cfg = cfg_;
-    small_cfg.max_routes = 5;
-    recreate_router(small_cfg);
+TEST_F(RouterServiceTest, BatchInsertionAllRoutesAccessible) {
+    // insert_route_for_testing bypasses the eviction loop in
+    // apply_local_batch_to_tree, so all routes survive regardless of
+    // max_routes. Verify they're all accessible after batch-style insertion.
     register_two_backends();
 
-    // Insert 8 routes — should evict oldest to stay at max_routes
-    for (int i = 0; i < 8; ++i) {
+    constexpr int COUNT = 8;
+    for (int i = 0; i < COUNT; ++i) {
         RouterService::insert_route_for_testing({i * 100 + 1, i * 100 + 2, i * 100 + 3}, 1);
     }
 
-    // Route count should not exceed max_routes
-    EXPECT_LE(RouterService::get_route_count_for_testing(), 5u);
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), static_cast<size_t>(COUNT));
 
-    // The most recently inserted routes should still be findable
-    // (LRU evicts oldest first, so newest survive)
-    EXPECT_TRUE(router_->lookup({701, 702, 703}).has_value());
+    // Every route should be findable
+    for (int i = 0; i < COUNT; ++i) {
+        EXPECT_TRUE(router_->lookup({i * 100 + 1, i * 100 + 2, i * 100 + 3}).has_value());
+    }
 }
 
-TEST_F(RouterServiceTest, LRUEvictionPreservesNewestRoutes) {
-    // More specific LRU test: with max_routes=3, insert 6 routes.
-    // The 3 most recently inserted should survive.
-    RoutingConfig small_cfg = cfg_;
-    small_cfg.max_routes = 3;
-    recreate_router(small_cfg);
+TEST_F(RouterServiceTest, BatchOverwriteUpdatesBackend) {
+    // When a batch contains an older route for backend 1 followed by a
+    // newer route for the same prefix on backend 2, the tree should
+    // reflect the final (most recent) write for each prefix.
     register_two_backends();
 
-    // Insert routes in order: oldest first
-    RouterService::insert_route_for_testing({1, 1, 1}, 1);  // oldest
+    // First "batch": all on backend 1
+    RouterService::insert_route_for_testing({1, 1, 1}, 1);
     RouterService::insert_route_for_testing({2, 2, 2}, 1);
     RouterService::insert_route_for_testing({3, 3, 3}, 1);
-    RouterService::insert_route_for_testing({4, 4, 4}, 2);  // starts evicting
-    RouterService::insert_route_for_testing({5, 5, 5}, 2);
-    RouterService::insert_route_for_testing({6, 6, 6}, 2);  // newest
 
-    EXPECT_LE(RouterService::get_route_count_for_testing(), 3u);
+    // Second "batch": overwrite two of them to backend 2
+    RouterService::insert_route_for_testing({1, 1, 1}, 2);
+    RouterService::insert_route_for_testing({3, 3, 3}, 2);
 
-    // Newest routes should still be present
-    EXPECT_TRUE(router_->lookup({6, 6, 6}).has_value());
-    EXPECT_TRUE(router_->lookup({5, 5, 5}).has_value());
-    EXPECT_TRUE(router_->lookup({4, 4, 4}).has_value());
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 3u);
 
-    // Oldest routes should have been evicted
-    EXPECT_FALSE(router_->lookup({1, 1, 1}).has_value());
+    // Overwritten routes reflect latest backend
+    EXPECT_EQ(router_->lookup({1, 1, 1}).value(), 2);
+    EXPECT_EQ(router_->lookup({2, 2, 2}).value(), 1);  // untouched
+    EXPECT_EQ(router_->lookup({3, 3, 3}).value(), 2);
 }
 
 TEST_F(RouterServiceTest, SimulatedMultiDepthBatchBuffering) {
@@ -1617,9 +1611,9 @@ TEST_F(RouterServiceTest, LargeBatchInsertionStressTest) {
 
     EXPECT_EQ(RouterService::get_route_count_for_testing(), static_cast<size_t>(BATCH_SIZE));
 
-    // Spot-check a few routes
-    EXPECT_EQ(router_->lookup({1, 2, 3}).value(), 1);
-    EXPECT_EQ(router_->lookup({11, 12, 13}).value(), 2);
-    EXPECT_EQ(router_->lookup({21, 22, 23}).value(), 3);
-    EXPECT_EQ(router_->lookup({1991, 1992, 1993}).value(), 3);
+    // Spot-check a few routes (backend = (i % 3) + 1)
+    EXPECT_EQ(router_->lookup({1, 2, 3}).value(), 1);       // i=0: (0%3)+1 = 1
+    EXPECT_EQ(router_->lookup({11, 12, 13}).value(), 2);     // i=1: (1%3)+1 = 2
+    EXPECT_EQ(router_->lookup({21, 22, 23}).value(), 3);     // i=2: (2%3)+1 = 3
+    EXPECT_EQ(router_->lookup({1991, 1992, 1993}).value(), 2); // i=199: (199%3)+1 = 2
 }
