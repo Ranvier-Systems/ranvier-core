@@ -293,7 +293,7 @@ Requests/sec                      6.76         7.29         +0.53 (+7.8%) ✓ BE
 
 The benchmark **fails** if:
 - P99 TTFT exceeds the threshold (`P99_LATENCY_THRESHOLD_MS`, default 100ms)
-- Any `router_cluster_sync_errors` occur during the run
+- Any `router_cluster_sync_invalid` or `router_cluster_sync_untrusted` errors occur during the run
 
 ### Interactive Mode
 
