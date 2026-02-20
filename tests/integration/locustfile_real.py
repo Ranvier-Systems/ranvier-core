@@ -214,9 +214,10 @@ def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
     The prefix_token_count tells Ranvier how many tokens constitute the
     "shared prefix" (system messages) for prefix-aware routing.
 
-    IMPORTANT: The tokenization format must match what Ranvier's extract_text()
-    produces: raw content concatenated with "\n" separators, followed by a
-    trailing "\n" to match the BPE boundary alignment fix.
+    IMPORTANT: The tokenization format must match what Ranvier's
+    extract_system_messages() produces: raw content concatenated with "\n"
+    separators between messages, with NO trailing newline.
+    See src/request_rewriter.hpp extract_system_messages().
 
     Returns None if:
     - Client tokenization is disabled
@@ -238,10 +239,11 @@ def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
         if not system_parts:
             return None
 
-        # Format must match Ranvier's extract_text() + "\n" for BPE boundary alignment
-        # - Multiple system messages: "content1\ncontent2\n"
-        # - Single system message: "content\n"
-        system_text = "\n".join(system_parts) + "\n"
+        # Format must match Ranvier's extract_system_messages():
+        # - Multiple system messages: "content1\ncontent2"
+        # - Single system message: "content"
+        # No trailing "\n" — separators between messages only.
+        system_text = "\n".join(system_parts)
         encoding = _tokenizer.encode(system_text)
         return len(encoding.ids)
     except Exception as e:
@@ -2125,8 +2127,8 @@ def fnv1a_hash_tokens(token_ids: List[int], prefix_len: int,
                       block_alignment: int = DEFAULT_BLOCK_ALIGNMENT) -> int:
     """Compute FNV-1a hash on prefix tokens, matching Ranvier's hash_prefix().
 
-    This replicates the exact hash computation from src/router_service.cpp:244
-    to predict which backend the server would route to.
+    This replicates the exact hash computation from src/router_service.cpp
+    hash_prefix() to predict which backend the server would route to.
 
     Args:
         token_ids: List of token IDs (int32)
@@ -2168,6 +2170,13 @@ def predict_backend_from_hash(token_ids: List[int], num_backends: int,
     This replicates Ranvier's hash fallback logic for when X-Backend-ID is missing.
     Only accurate when BENCHMARK_MODE is 'prefix' or 'hash' (not 'random').
 
+    IMPORTANT: The modular routing formula (hash % num_backends) only matches the
+    server when Ranvier is configured with HashStrategy::MODULAR. The server supports
+    four strategies (MODULAR, JUMP, BOUNDED_LOAD, P2C); the default is JUMP consistent
+    hash which uses a different selection algorithm. Predictions will be inaccurate for
+    non-MODULAR strategies. When X-Backend-ID is present in the response, that value
+    is always preferred over this prediction.
+
     Args:
         token_ids: Full list of token IDs for the request
         num_backends: Number of registered backends
@@ -2176,7 +2185,7 @@ def predict_backend_from_hash(token_ids: List[int], num_backends: int,
                            Otherwise, uses DEFAULT_PREFIX_TOKEN_LENGTH (128).
 
     Returns:
-        Predicted backend ID (1-indexed)
+        Predicted backend ID (1-indexed, only accurate for MODULAR hash strategy)
     """
     if not token_ids or num_backends <= 0:
         return 1  # Fallback to first backend
@@ -2855,15 +2864,21 @@ def register_backends_on_all_nodes():
 
 
 def capture_initial_sync_errors():
-    """Capture initial sync error counts from all nodes."""
+    """Capture initial sync error counts from all nodes.
+
+    Tracks two Prometheus counters from gossip_service.cpp:
+    - router_cluster_sync_invalid: malformed gossip packets received
+    - router_cluster_sync_untrusted: packets received from unknown peers
+    """
     global _initial_sync_errors
     _initial_sync_errors = {}
 
     for i, metrics_url in enumerate(RANVIER_METRICS):
-        value = get_metric_value(metrics_url, "router_cluster_sync_errors")
         node_name = f"node{i + 1}"
-        _initial_sync_errors[node_name] = value if value is not None else 0.0
-        logger.info(f"Initial sync errors on {node_name}: {_initial_sync_errors[node_name]}")
+        invalid = get_metric_value(metrics_url, "router_cluster_sync_invalid") or 0.0
+        untrusted = get_metric_value(metrics_url, "router_cluster_sync_untrusted") or 0.0
+        _initial_sync_errors[node_name] = {"invalid": invalid, "untrusted": untrusted}
+        logger.info(f"Initial sync errors on {node_name}: invalid={invalid}, untrusted={untrusted}")
 
 
 def check_sync_errors() -> Tuple[bool, str]:
@@ -2872,16 +2887,20 @@ def check_sync_errors() -> Tuple[bool, str]:
 
     for i, metrics_url in enumerate(RANVIER_METRICS):
         node_name = f"node{i + 1}"
-        current_value = get_metric_value(metrics_url, "router_cluster_sync_errors")
+        invalid = get_metric_value(metrics_url, "router_cluster_sync_invalid")
+        untrusted = get_metric_value(metrics_url, "router_cluster_sync_untrusted")
 
-        if current_value is None:
-            continue
+        initial = _initial_sync_errors.get(node_name, {"invalid": 0.0, "untrusted": 0.0})
 
-        initial_value = _initial_sync_errors.get(node_name, 0.0)
-        delta = current_value - initial_value
+        if invalid is not None:
+            delta = invalid - initial["invalid"]
+            if delta > 0:
+                errors_found.append(f"{node_name}: {delta} new invalid sync packets")
 
-        if delta > 0:
-            errors_found.append(f"{node_name}: {delta} new sync errors")
+        if untrusted is not None:
+            delta = untrusted - initial["untrusted"]
+            if delta > 0:
+                errors_found.append(f"{node_name}: {delta} new untrusted sync packets")
 
     if errors_found:
         return False, f"Sync errors detected: {', '.join(errors_found)}"

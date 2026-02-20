@@ -120,15 +120,21 @@ def register_backends_on_all_nodes():
 
 
 def capture_initial_sync_errors():
-    """Capture initial sync error counts from all nodes."""
+    """Capture initial sync error counts from all nodes.
+
+    Tracks two Prometheus counters from gossip_service.cpp:
+    - router_cluster_sync_invalid: malformed gossip packets received
+    - router_cluster_sync_untrusted: packets received from unknown peers
+    """
     global _initial_sync_errors
     _initial_sync_errors = {}
 
     for i, metrics_url in enumerate(RANVIER_METRICS):
-        value = get_metric_value(metrics_url, "router_cluster_sync_errors")
         node_name = f"node{i + 1}"
-        _initial_sync_errors[node_name] = value if value is not None else 0.0
-        logger.info(f"Initial sync errors on {node_name}: {_initial_sync_errors[node_name]}")
+        invalid = get_metric_value(metrics_url, "router_cluster_sync_invalid") or 0.0
+        untrusted = get_metric_value(metrics_url, "router_cluster_sync_untrusted") or 0.0
+        _initial_sync_errors[node_name] = {"invalid": invalid, "untrusted": untrusted}
+        logger.info(f"Initial sync errors on {node_name}: invalid={invalid}, untrusted={untrusted}")
 
 
 def check_sync_errors() -> tuple[bool, str]:
@@ -141,16 +147,20 @@ def check_sync_errors() -> tuple[bool, str]:
 
     for i, metrics_url in enumerate(RANVIER_METRICS):
         node_name = f"node{i + 1}"
-        current_value = get_metric_value(metrics_url, "router_cluster_sync_errors")
+        invalid = get_metric_value(metrics_url, "router_cluster_sync_invalid")
+        untrusted = get_metric_value(metrics_url, "router_cluster_sync_untrusted")
 
-        if current_value is None:
-            continue
+        initial = _initial_sync_errors.get(node_name, {"invalid": 0.0, "untrusted": 0.0})
 
-        initial_value = _initial_sync_errors.get(node_name, 0.0)
-        delta = current_value - initial_value
+        if invalid is not None:
+            delta = invalid - initial["invalid"]
+            if delta > 0:
+                errors_found.append(f"{node_name}: {delta} new invalid sync packets")
 
-        if delta > 0:
-            errors_found.append(f"{node_name}: {delta} new sync errors")
+        if untrusted is not None:
+            delta = untrusted - initial["untrusted"]
+            if delta > 0:
+                errors_found.append(f"{node_name}: {delta} new untrusted sync packets")
 
     if errors_found:
         return False, f"Sync errors detected: {', '.join(errors_found)}"
