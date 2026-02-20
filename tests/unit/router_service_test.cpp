@@ -1346,3 +1346,280 @@ TEST(HashStrategyConfigTest, EnumValues) {
     EXPECT_NE(static_cast<int>(RoutingConfig::HashStrategy::BOUNDED_LOAD),
               static_cast<int>(RoutingConfig::HashStrategy::P2C));
 }
+
+// =============================================================================
+// 26. Local Route Batching (PendingLocalRoute + Simulated Batch Application)
+// =============================================================================
+// Tests for the local route batching system introduced to eliminate per-request
+// SMP storms. Actual async batch/flush/timer functions require a Seastar reactor,
+// so we verify:
+//   - PendingLocalRoute struct construction and move semantics
+//   - Batch config constant relationships (local + remote share RouteBatchConfig)
+//   - Simulated batch application to the local tree (what apply_local_batch_to_tree does)
+//   - LRU eviction behavior during batch insertion
+//   - Multi-depth route buffering observable via lookup
+
+TEST_F(RouterServiceTest, PendingLocalRouteStructure) {
+    PendingLocalRoute route;
+    route.tokens = {10, 20, 30, 40, 50};
+    route.backend = 7;
+
+    EXPECT_EQ(route.tokens.size(), 5u);
+    EXPECT_EQ(route.backend, 7);
+
+    // Move semantics: vector should transfer ownership
+    PendingLocalRoute moved = std::move(route);
+    EXPECT_EQ(moved.tokens.size(), 5u);
+    EXPECT_EQ(moved.backend, 7);
+}
+
+TEST_F(RouterServiceTest, PendingLocalRouteEmptyTokens) {
+    PendingLocalRoute route;
+    route.tokens = {};
+    route.backend = 1;
+
+    EXPECT_TRUE(route.tokens.empty());
+    EXPECT_EQ(route.backend, 1);
+}
+
+TEST_F(RouterServiceTest, PendingLocalRouteLargeTokenVector) {
+    PendingLocalRoute route;
+    route.tokens.resize(10000, 42);
+    route.backend = 3;
+
+    EXPECT_EQ(route.tokens.size(), 10000u);
+
+    PendingLocalRoute moved = std::move(route);
+    EXPECT_EQ(moved.tokens.size(), 10000u);
+    EXPECT_EQ(moved.backend, 3);
+}
+
+TEST_F(RouterServiceTest, BatchConfigLocalAndRemoteShareConstants) {
+    // Local and remote batching share the same RouteBatchConfig constants.
+    // Verify the invariants that both systems depend on.
+    EXPECT_EQ(RouteBatchConfig::MAX_BATCH_SIZE, 100u);
+    EXPECT_EQ(RouteBatchConfig::MAX_BUFFER_SIZE, 10000u);
+    EXPECT_EQ(RouteBatchConfig::OVERFLOW_DROP_COUNT, 1000u);
+    EXPECT_EQ(RouteBatchConfig::FLUSH_INTERVAL.count(), 10);
+
+    // Buffer must hold at least one full batch
+    EXPECT_GE(RouteBatchConfig::MAX_BUFFER_SIZE, RouteBatchConfig::MAX_BATCH_SIZE);
+
+    // Drop count must not exceed buffer size (would erase past end)
+    EXPECT_LE(RouteBatchConfig::OVERFLOW_DROP_COUNT, RouteBatchConfig::MAX_BUFFER_SIZE);
+
+    // Drop count should be meaningful (at least 1)
+    EXPECT_GE(RouteBatchConfig::OVERFLOW_DROP_COUNT, 1u);
+}
+
+TEST_F(RouterServiceTest, SimulatedLocalBatchApplication) {
+    // Simulate what apply_local_batch_to_tree() does: insert a batch of routes
+    // into the local RadixTree and verify they're all findable via lookup.
+    register_three_backends();
+
+    // Simulate a batch of locally-learned routes
+    std::vector<std::pair<std::vector<int32_t>, BackendId>> local_batch = {
+        {{1, 2, 3, 4, 5}, 1},
+        {{6, 7, 8, 9, 10}, 2},
+        {{11, 12, 13, 14, 15}, 3},
+        {{16, 17, 18, 19, 20}, 1},
+        {{21, 22, 23, 24, 25}, 2},
+    };
+
+    for (const auto& [tokens, backend] : local_batch) {
+        RouterService::insert_route_for_testing(tokens, backend);
+    }
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 5u);
+    EXPECT_EQ(router_->lookup({1, 2, 3, 4, 5}).value(), 1);
+    EXPECT_EQ(router_->lookup({6, 7, 8, 9, 10}).value(), 2);
+    EXPECT_EQ(router_->lookup({11, 12, 13, 14, 15}).value(), 3);
+    EXPECT_EQ(router_->lookup({16, 17, 18, 19, 20}).value(), 1);
+    EXPECT_EQ(router_->lookup({21, 22, 23, 24, 25}).value(), 2);
+}
+
+TEST_F(RouterServiceTest, SimulatedBatchDeduplicationEffect) {
+    // When the same prefix is learned multiple times for the same backend,
+    // the tree should contain only one route (last write wins in the tree).
+    // This simulates what happens when deduplicate_local_batch has collisions.
+    register_two_backends();
+
+    // Insert the same route 5 times (simulating duplicates in a batch)
+    for (int i = 0; i < 5; ++i) {
+        RouterService::insert_route_for_testing({1, 2, 3, 4, 5}, 1);
+    }
+
+    // Tree should have exactly 1 route (same prefix overwrites)
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 1u);
+    EXPECT_EQ(router_->lookup({1, 2, 3, 4, 5}).value(), 1);
+}
+
+TEST_F(RouterServiceTest, SimulatedBatchSamePrefixDifferentBackend) {
+    // When the same prefix is learned for different backends (e.g., during
+    // rebalancing), the last write should win. This matches the behavior
+    // in apply_local_batch_to_tree where routes are inserted sequentially.
+    register_two_backends();
+
+    RouterService::insert_route_for_testing({1, 2, 3, 4, 5}, 1);
+    EXPECT_EQ(router_->lookup({1, 2, 3, 4, 5}).value(), 1);
+
+    RouterService::insert_route_for_testing({1, 2, 3, 4, 5}, 2);
+    EXPECT_EQ(router_->lookup({1, 2, 3, 4, 5}).value(), 2);
+
+    // Still only 1 route in the tree (same prefix, overwritten)
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 1u);
+}
+
+TEST_F(RouterServiceTest, LRUEvictionDuringBatchInsertion) {
+    // With max_routes=5, inserting a batch of 8 routes should trigger
+    // LRU eviction. This simulates the eviction loop in apply_local_batch_to_tree.
+    RoutingConfig small_cfg = cfg_;
+    small_cfg.max_routes = 5;
+    recreate_router(small_cfg);
+    register_two_backends();
+
+    // Insert 8 routes — should evict oldest to stay at max_routes
+    for (int i = 0; i < 8; ++i) {
+        RouterService::insert_route_for_testing({i * 100 + 1, i * 100 + 2, i * 100 + 3}, 1);
+    }
+
+    // Route count should not exceed max_routes
+    EXPECT_LE(RouterService::get_route_count_for_testing(), 5u);
+
+    // The most recently inserted routes should still be findable
+    // (LRU evicts oldest first, so newest survive)
+    EXPECT_TRUE(router_->lookup({701, 702, 703}).has_value());
+}
+
+TEST_F(RouterServiceTest, LRUEvictionPreservesNewestRoutes) {
+    // More specific LRU test: with max_routes=3, insert 6 routes.
+    // The 3 most recently inserted should survive.
+    RoutingConfig small_cfg = cfg_;
+    small_cfg.max_routes = 3;
+    recreate_router(small_cfg);
+    register_two_backends();
+
+    // Insert routes in order: oldest first
+    RouterService::insert_route_for_testing({1, 1, 1}, 1);  // oldest
+    RouterService::insert_route_for_testing({2, 2, 2}, 1);
+    RouterService::insert_route_for_testing({3, 3, 3}, 1);
+    RouterService::insert_route_for_testing({4, 4, 4}, 2);  // starts evicting
+    RouterService::insert_route_for_testing({5, 5, 5}, 2);
+    RouterService::insert_route_for_testing({6, 6, 6}, 2);  // newest
+
+    EXPECT_LE(RouterService::get_route_count_for_testing(), 3u);
+
+    // Newest routes should still be present
+    EXPECT_TRUE(router_->lookup({6, 6, 6}).has_value());
+    EXPECT_TRUE(router_->lookup({5, 5, 5}).has_value());
+    EXPECT_TRUE(router_->lookup({4, 4, 4}).has_value());
+
+    // Oldest routes should have been evicted
+    EXPECT_FALSE(router_->lookup({1, 1, 1}).has_value());
+}
+
+TEST_F(RouterServiceTest, SimulatedMultiDepthBatchBuffering) {
+    // Simulate what learn_route_global_multi does: insert routes at multiple
+    // prefix boundaries for the same token sequence. Each boundary creates a
+    // separate route at a different prefix length.
+    register_two_backends();
+
+    // Full token sequence
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+    // Simulate boundaries at positions 3, 6, and 10
+    // This creates 3 routes with different prefix lengths
+    std::vector<int32_t> prefix_3(tokens.begin(), tokens.begin() + 3);   // {10, 20, 30}
+    std::vector<int32_t> prefix_6(tokens.begin(), tokens.begin() + 6);   // {10, 20, 30, 40, 50, 60}
+    std::vector<int32_t> prefix_10(tokens.begin(), tokens.begin() + 10); // full sequence
+
+    RouterService::insert_route_for_testing(prefix_3, 1);
+    RouterService::insert_route_for_testing(prefix_6, 1);
+    RouterService::insert_route_for_testing(prefix_10, 1);
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 3u);
+
+    // All three prefixes should resolve to the correct backend
+    EXPECT_EQ(router_->lookup(prefix_3).value(), 1);
+    EXPECT_EQ(router_->lookup(prefix_6).value(), 1);
+    EXPECT_EQ(router_->lookup(prefix_10).value(), 1);
+}
+
+TEST_F(RouterServiceTest, SimulatedMultiDepthWithDifferentBackends) {
+    // Multi-depth routes where different conversation depths route to
+    // different backends (e.g., system message cached on backend 1,
+    // but user turn cached on backend 2).
+    register_two_backends();
+
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50, 60, 70, 80};
+
+    // Simulate: system prefix on backend 1, full conversation on backend 2
+    std::vector<int32_t> system_prefix(tokens.begin(), tokens.begin() + 4);
+    std::vector<int32_t> full_prefix(tokens.begin(), tokens.begin() + 8);
+
+    RouterService::insert_route_for_testing(system_prefix, 1);
+    RouterService::insert_route_for_testing(full_prefix, 2);
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 2u);
+    EXPECT_EQ(router_->lookup(system_prefix).value(), 1);
+    EXPECT_EQ(router_->lookup(full_prefix).value(), 2);
+}
+
+TEST_F(RouterServiceTest, SimulatedBatchWithDeadBackendRoutes) {
+    // Routes learned for a backend that is later marked dead should
+    // not be returned by lookup (existing dead-backend test behavior
+    // should still hold after batch insertion).
+    register_two_backends();
+
+    // Simulate batch: routes to backend 1 and backend 2
+    RouterService::insert_route_for_testing({1, 2, 3}, 1);
+    RouterService::insert_route_for_testing({4, 5, 6}, 2);
+
+    // Mark backend 1 as dead
+    RouterService::mark_backend_dead_for_testing(1);
+
+    // Route to dead backend should return nullopt
+    EXPECT_FALSE(router_->lookup({1, 2, 3}).has_value());
+    // Route to live backend should still work
+    EXPECT_EQ(router_->lookup({4, 5, 6}).value(), 2);
+}
+
+TEST_F(RouterServiceTest, SimulatedBatchWithDrainingBackendRoutes) {
+    // Routes learned for a draining backend should be skipped by
+    // prefix routing (hash fallback to other backends).
+    register_two_backends();
+
+    // Simulate batch application
+    RouterService::insert_route_for_testing({1, 2, 3}, 1);
+    RouterService::insert_route_for_testing({4, 5, 6}, 2);
+
+    // Mark backend 1 as draining
+    RouterService::set_backend_draining_for_testing(1);
+
+    // Prefix routing should skip draining backend
+    auto result = router_->get_backend_for_prefix({1, 2, 3});
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);  // Falls back to backend 2
+    EXPECT_FALSE(result.art_hit);              // ART hit skipped due to draining
+}
+
+TEST_F(RouterServiceTest, LargeBatchInsertionStressTest) {
+    // Simulate a large batch (exceeding MAX_BATCH_SIZE) to verify the tree
+    // handles many insertions correctly. In production, flush_local_route_batch
+    // processes up to MAX_BATCH_SIZE routes per flush.
+    register_three_backends();
+
+    constexpr int BATCH_SIZE = 200;  // 2x MAX_BATCH_SIZE
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        BackendId backend = static_cast<BackendId>((i % 3) + 1);
+        RouterService::insert_route_for_testing({i * 10 + 1, i * 10 + 2, i * 10 + 3}, backend);
+    }
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), static_cast<size_t>(BATCH_SIZE));
+
+    // Spot-check a few routes
+    EXPECT_EQ(router_->lookup({1, 2, 3}).value(), 1);
+    EXPECT_EQ(router_->lookup({11, 12, 13}).value(), 2);
+    EXPECT_EQ(router_->lookup({21, 22, 23}).value(), 3);
+    EXPECT_EQ(router_->lookup({1991, 1992, 1993}).value(), 3);
+}
