@@ -29,6 +29,8 @@ This document identifies missing features and optimizations required to promote 
 17. [Router Service Review Pass 2 (2026-02-14)](#17-router-service-review-pass-2-2026-02-14)
 18. [Connection Pool Review (2026-02-14)](#18-connection-pool-review-2026-02-14)
 19. [Gossip Service Review (2026-02-14)](#19-gossip-service-review-2026-02-14)
+20. [Hot-Path Performance Audit (2026-02-15)](#20-hot-path-performance-audit-2026-02-15)
+21. [Request Lifecycle Performance Analysis (2026-02-20)](#21-request-lifecycle-performance-analysis-2026-02-20)
 
 ---
 
@@ -2756,6 +2758,102 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
   3. Update the commit hash in both `CMakeLists.txt` (GIT_TAG) and `Dockerfile.base` (git checkout)
   4. Rebuild base image: `docker build -f Dockerfile.base -t ranvier-base:latest .`
   5. Run full test suite and benchmarks to validate
+
+---
+
+## 21. Request Lifecycle Performance Analysis (2026-02-20)
+
+End-to-end trace of an LLM inference request through all phases documented in `docs/internals/request-lifecycle.md`. Identifies 10 potential performance issues ranked by severity, with mitigations. See `docs/internals/request-lifecycle-perf-analysis.md` for the full analysis.
+
+### 21.1 Batch Locally-Learned Routes Instead of Per-Request Broadcast
+
+- [ ] **Accumulate learned routes in shard-local buffer and flush periodically instead of per-request cross-shard broadcast**
+  _Justification:_ Every successful proxied request triggers `learn_route_global()` which calls `smp::submit_to` to every shard plus shard 0 for gossip — `O(shards + 1)` cross-shard messages, each allocating a `foreign_ptr<vector<int32_t>>`. On an 8-core system this is 9 SMP messages and 9 heap allocations per request. Under load with low ART hit rates (cold start, new prompts), this creates an SMP message storm that competes with actual request processing. The `flush_route_batch()` pattern already exists for remote (gossip-received) routes — it accumulates routes in `_pending_remote_routes` on shard 0 and flushes periodically via `_batch_flush_timer` (see `RouteBatchConfig` in `router_service.hpp`). The same pattern does not exist for locally-learned routes.
+  _What to change:_ (a) Add a shard-local `_pending_local_routes` buffer (bounded, similar to `_pending_remote_routes` with `RouteBatchConfig::MAX_BUFFER_SIZE`). (b) Change `learn_route_global()` to push `{tokens, backend_id, prefix_boundary}` into the shard-local buffer instead of broadcasting immediately. (c) Add a shard-local flush timer (or piggyback on the existing timer if running on shard 0) that drains `_pending_local_routes` and does a single `parallel_for_each(all shards)` broadcast per batch. (d) Keep the gossip `submit_to(0)` in the flush (it needs shard 0). (e) Deduplicate within the batch before broadcasting (same prefix+backend → skip). (f) Preserve gate-holder safety (Rule #5) and foreign_ptr patterns (Rule #14). Each shard learns routes independently, so the buffer must be shard-local (no cross-shard access). Only the flush broadcasts cross-shard.
+  _Location:_ `src/router_service.cpp:1619-1750`, `src/router_service.hpp`
+  _Complexity:_ Medium
+  _Priority:_ P1 — Performance; O(shards) SMP messages per request on the hot path
+
+### 21.2 Cap Reactor-Blocking Tokenization Fallback
+
+- [ ] **Gate local tokenization fallback with a shard-local semaphore to prevent reactor stalls**
+  _Justification:_ When both the thread pool queue is full (Priority 1) and cross-shard dispatch declines (Priority 2), `encode_threaded_async()` at line 352 falls back to `tokenize_locally()` — a synchronous Rust FFI call that blocks the Seastar reactor for 5–13ms. All other requests on that shard stall: no reads, no writes, no timer callbacks. On a system handling 1000 req/s across 8 cores, a 10ms stall on one shard delays ~12 requests. Under load spikes (thread pool saturation + cross-shard backpressure), multiple shards can hit it simultaneously.
+  _What to change:_ (a) Add a shard-local `seastar::semaphore _local_tokenize_sem{1}` (or configurable, default 1) that gates Priority 3. (b) Before calling `tokenize_locally()`, attempt `try_wait(_local_tokenize_sem, 1)`. If it fails (another local tokenization is already in progress), return an empty `TokenizationResult` — the caller in `http_controller.cpp` will fall back to hash/random routing. (c) Add `_local_tokenize_sem.signal(1)` after `tokenize_locally()` returns (use RAII or scope guard for exception safety). (d) Add a Prometheus counter `ranvier_tokenizer_local_fallback_rejected` for when the semaphore is full. Expose `_cross_shard_local_fallbacks` as a counter if not already. Note: `tokenize_locally()` is synchronous (Rust FFI), so you cannot use `seastar::get_units()` (async wait) — the caller must fail fast with `try_wait()`.
+  _Location:_ `src/tokenizer_service.cpp:295-374`, `src/tokenizer_service.hpp`
+  _Complexity:_ Low
+  _Priority:_ P1 — Performance; 5–13ms reactor stall per shard on fallback path
+
+### 21.3 Replace `std::mutex` in Async Persistence with Lock-Free Queue
+
+- [ ] **Replace mutex-guarded deque in `AsyncPersistenceManager` with a lock-free SPSC ring buffer**
+  _Justification:_ `try_enqueue()` at line 202 acquires `std::lock_guard<std::mutex>` on the Seastar reactor thread. The same mutex is contended by `extract_batch()` (called from the persistence worker's `std::thread`), creating cross-thread contention on the reactor. Even a brief lock hold on the reactor violates Seastar's shared-nothing model (Hard Rule #1 — no locks on the reactor). Current queue operations under `_queue_mutex`: `try_enqueue()` (reactor thread, hot path), `extract_batch()` (worker thread, periodic), `drain_queue()` (worker thread, shutdown), `queue_clear_all()` (reactor thread, admin endpoint).
+  _What to change:_ (a) Replace `std::deque<PersistenceOp> _queue` + `std::mutex _queue_mutex` with a bounded SPSC ring buffer. The reactor thread is the sole producer; the persistence worker is the sole consumer. Options: implement a simple `std::array`-based ring buffer with atomic head/tail indices, or use a well-tested lock-free queue. (b) `try_enqueue()` becomes a lock-free CAS on the tail index. Return false if full (existing drop behavior). (c) `extract_batch()` becomes a lock-free drain of up to `max_batch_size` elements from the head. (d) Handle `queue_clear_all()` carefully — set an atomic flag that the worker thread checks before processing. (e) Keep `_queue_size` atomic counter for metrics (already exists). (f) Remove `_queue_mutex` entirely. Note: `PersistenceOp` is a `std::variant` of several op types. The ring buffer must support move-only types. Pre-allocate to `max_queue_depth` (config, default 10,000).
+  _Location:_ `src/async_persistence.cpp:202-246`, `src/async_persistence.hpp`
+  _Complexity:_ Medium
+  _Priority:_ P2 — Performance; reactor-thread mutex contention violates shared-nothing model
+
+### 21.4 Avoid Heap Copy of Text for Tokenizer Cache Insertion
+
+- [ ] **Eliminate redundant `std::string` copy captured in thread-pool tokenization continuation**
+  _Justification:_ At line 325, the thread-pool tokenization path captures `text_copy = std::string(text)` in the `.then()` continuation lambda solely for cache insertion after tokenization completes. For a typical 4KB request body, this is a guaranteed heap allocation on every cache-miss tokenization dispatched to the thread pool. With 80–90% cache hit rates for system messages, this primarily affects user messages — but those are exactly the requests that take the full 5–13ms tokenization path, adding allocation pressure to an already-expensive operation.
+  _What to change:_ (a) Examine the cache's `insert()` and `lookup()` signatures. If the cache uses hash-based lookup internally, compute the hash before dispatch (on the reactor, which already has the `string_view`) and pass only the hash + a pre-hashed key to the continuation. (b) If the cache API requires the full string for insertion (stores the key), consider having the thread pool worker do the cache insertion (it already has a local copy of the text for FFI per Rule #15). Ensure the thread pool worker's cache access is shard-safe. (c) Alternatively, return the text copy from the thread pool submission alongside the tokens, reusing the copy already made for FFI safety. The goal is to avoid a second copy in the continuation.
+  _Location:_ `src/tokenizer_service.cpp:324-339`
+  _Complexity:_ Low
+  _Priority:_ P2 — Performance; ~4KB heap allocation per cache-miss tokenization
+
+### 21.5 Reduce `sstring` Reallocations in StreamParser
+
+- [ ] **Pre-size the `_accum` buffer or switch to a chunk chain to reduce reallocations during streaming**
+  _Justification:_ `StreamParser::push()` at line 57 appends each network chunk to `_accum` (a `seastar::sstring`). After exceeding the 15-byte SSO threshold (virtually every HTTP response), each append may trigger a reallocation + copy. A 100KB response in 50 chunks causes ~6–8 reallocations. The compaction at line 114 adds another `memmove` when read position exceeds 50% of the buffer, which is correct but doubles the copy work after each compaction cycle.
+  _What to change:_ (a) During `parse_headers()` (line 133), if a `Content-Length` header is present, extract it and pre-size `_accum` to at least that value. This eliminates all reallocations for non-streaming (non-chunked) responses. (b) For chunked responses (no Content-Length), pre-size `_accum` to `StreamParserConfig::initial_output_reserve` (4096) on first push. (c) Note: `seastar::sstring` does not have `reserve()`. You may need to switch `_accum` to `std::string` (which does have `reserve()`), or use a `seastar::temporary_buffer<char>` chain that avoids copying entirely. (d) If switching to a chain, `compact_if_needed()` is replaced by dropping consumed chunks. Measure tradeoff: the chain avoids copies but complicates parsing when a token (e.g., `\r\n`) spans two chunks.
+  _Location:_ `src/stream_parser.cpp:57`, `src/stream_parser.hpp`
+  _Complexity:_ Medium
+  _Priority:_ P3 — Performance; 6–8 reallocations per response, each O(N) copy
+
+### 21.6 Release Concurrency Semaphore During Connection Retry Backoff
+
+- [ ] **Release semaphore unit before retry sleep to prevent dead-backend retries from exhausting concurrency**
+  _Justification:_ At line 391, `co_await seastar::sleep(ctx.current_backoff)` pauses the request during connection retry. The request holds a concurrency semaphore unit (acquired at line 699 via `try_get_units(_request_semaphore, 1)`) for the entire retry duration. Under default config (max_retries=3, initial_backoff=100ms, multiplier=2x), a connection to a dead backend holds resources for up to 700ms. With a concurrency limit of 128, just 128 requests hitting a dead backend simultaneously exhaust the semaphore, causing all subsequent requests to get 503 — even requests targeting healthy backends.
+  _What to change:_ (a) Release the semaphore unit before the retry sleep and re-acquire after waking. This requires passing the semaphore units into `establish_backend_connection()` or restructuring the retry loop. The re-acquire must handle the case where the semaphore is now full (return 503 rather than blocking). (b) Alternative simpler approach: check the circuit breaker state before retrying. If `_circuit_breaker.state(ctx.current_backend) == CircuitState::OPEN` after `record_failure()`, skip remaining retries and fall back immediately. This short-circuits the retry loop without changing semaphore semantics. (c) Add a metric `ranvier_proxy_retry_semaphore_releases` to track frequency.
+  _Location:_ `src/http_controller.cpp:330-407` (establish_backend_connection), `699` (semaphore acquire)
+  _Complexity:_ Medium
+  _Priority:_ P2 — Reliability; dead-backend cascading 503 under concurrency pressure
+
+### 21.7 Deduplicate Route Learning Before Cross-Shard Broadcast
+
+- [ ] **Short-circuit route learning with shard-local ART lookup to skip redundant broadcasts**
+  _Justification:_ Route learning at `http_controller.cpp:582-601` fires on every successful 2xx response. If 100 requests share the same system prompt (common in RAG workloads), the same prefix→backend route is broadcast 100 times: 100 cross-shard broadcasts + 100 persistence enqueues. The ART `insert()` is idempotent (overwrites), so 99 broadcasts produce no new state. Compounds with Issue 21.1 if route batching is not yet implemented.
+  _What to change:_ (a) Add a short-circuit at the top of `learn_route_global()` (after prefix truncation at line 1654, so the lookup uses the same effective prefix): check if the route already exists with the same backend via `RadixTree::lookup()` (O(k), shard-local, no SMP message). If it matches, return early. (b) Also skip the `_persistence->queue_save_route()` call in `http_controller.cpp:600` when the route is already known. (c) Add a counter `_routes_deduped` for observability. Note: benign TOCTOU race exists (another shard could evict the route between check and insert), but redundant inserts are safe — the goal is to eliminate the common case.
+  _Location:_ `src/router_service.cpp:1619-1670`, `src/http_controller.cpp:582-601`
+  _Complexity:_ Low
+  _Priority:_ P2 — Performance; eliminates ~99% redundant broadcasts for repeated prompts
+
+### 21.8 Build Backend HTTP Headers Without Intermediate String Allocations
+
+- [ ] **Replace `sstring` concatenation with `fmt::format` or pre-reserved append for HTTP header construction**
+  _Justification:_ At lines 425–437, backend request headers are built via repeated `sstring` concatenation (`+` operator). Each `+` allocates a new `sstring`, copies left and right operands, and frees the old buffer. For 6 concatenation steps, that is 5 intermediate allocations. This runs on every proxied request.
+  _What to change:_ (a) Replace with `fmt::format()` (Seastar includes fmt) for a single allocation. (b) Handle the conditional `traceparent` header (line 433–435) — either include it in the format with a conditional, or append it separately. (c) Append `"Connection: keep-alive\r\n\r\n"` (line 437) in the same operation. (d) Note: `fmt::format` returns `std::string` — verify that `bundle.out.write()` accepts it or convert to `sstring`. No behavior change — same header order, same values.
+  _Location:_ `src/http_controller.cpp:425-437`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; 5 temporary sstring allocations per request
+
+### 21.9 Skip JSON Parse When Client Provides Tokens and Prefix Boundary
+
+- [ ] **Avoid `extract_text_with_boundary_info()` JSON parse when client provides both tokens and prefix boundary**
+  _Justification:_ At line 833, `extract_text_with_boundary_info()` is called unconditionally for all non-client-token requests. At line 953–957, it is called again if `text_extraction` was not populated (client-tokens path) and prefix boundary detection is enabled. The client-tokens path can still trigger a ~500µs JSON parse for boundary detection even though the client already provided both `prompt_token_ids` and `prefix_token_count`.
+  _What to change:_ (a) In the client-tokens path, if `_config.enable_prefix_boundary` is enabled, eagerly call `extract_text_with_boundary_info()` after determining `used_client_tokens=true`, and cache the result in `text_extraction`. (b) Alternatively, add a fast path: if the client provides both `prompt_token_ids` AND `prefix_token_count` (already checked at line 935), skip the JSON parse entirely — both pieces of information needed for routing are already available. (c) The goal: when client provides both fields, zero JSON parsing should occur.
+  _Location:_ `src/http_controller.cpp:795-957`
+  _Complexity:_ Low
+  _Priority:_ P3 — Performance; ~500µs JSON parse wasted when client provides all needed data
+
+### 21.10 Capture `lowres_clock::now()` Once Per Streaming Loop Iteration
+
+- [ ] **Cache `lowres_clock::now()` at the top of the streaming loop to eliminate duplicate call**
+  _Justification:_ At lines 476 and 487 in `stream_backend_response()`, `lowres_clock::now()` is called twice within 10 lines. `lowres_clock` updates at ~100Hz (10ms resolution), so consecutive calls return the same value. This repeats for every chunk in the streaming loop (potentially hundreds of chunks per response).
+  _What to change:_ Add `auto now = lowres_clock::now();` at the top of the while loop body (before line 476). Replace both `lowres_clock::now()` calls with `now`. No behavioral change.
+  _Location:_ `src/http_controller.cpp:474-488`
+  _Complexity:_ Trivial
+  _Priority:_ P4 — Cleanup; negligible performance impact, improves code clarity
 
 ---
 
