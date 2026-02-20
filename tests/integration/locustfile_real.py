@@ -2112,9 +2112,11 @@ _file_prompts = _FilePromptsProxy()
 
 
 # ============================================================================
-# FNV-1a Hash for Backend Prediction
+# Hash-Based Backend Prediction
 # ============================================================================
-# Replicates Ranvier's hash_prefix() logic from src/router_service.cpp
+# Replicates Ranvier's two-stage routing pipeline from src/router_service.cpp:
+#   Stage 1: hash_prefix()          — FNV-1a fingerprint of prefix tokens
+#   Stage 2: jump_consistent_hash() — maps fingerprint to a backend bucket
 # Used to predict backend routing when X-Backend-ID header is missing
 
 FNV_OFFSET_BASIS = 14695981039346656037
@@ -2163,19 +2165,40 @@ def fnv1a_hash_tokens(token_ids: List[int], prefix_len: int,
     return hash_val
 
 
+def jump_consistent_hash(key: int, num_buckets: int) -> int:
+    """Jump consistent hash (Lamping & Veach, 2014).
+
+    Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
+    removing a bucket remaps only ~1/n keys.  Matches the C++ implementation
+    in src/router_service.cpp.
+
+    Args:
+        key: 64-bit unsigned hash value
+        num_buckets: Number of buckets (must be > 0)
+
+    Returns:
+        Bucket index in [0, num_buckets)
+    """
+    b, j = -1, 0
+    while j < num_buckets:
+        b = j
+        key = (key * 2862933555777941757 + 1) & 0xFFFFFFFFFFFFFFFF
+        j = int((b + 1) * (float(1 << 31) / float((key >> 33) + 1)))
+    return b
+
+
 def predict_backend_from_hash(token_ids: List[int], num_backends: int,
                               prefix_token_count: Optional[int] = None) -> int:
     """Predict which backend the server would route to using consistent hash.
 
-    This replicates Ranvier's hash fallback logic for when X-Backend-ID is missing.
-    Only accurate when BENCHMARK_MODE is 'prefix' or 'hash' (not 'random').
+    Replicates Ranvier's two-stage hash fallback (used when X-Backend-ID is
+    missing): stage 1 computes an FNV-1a fingerprint of the prefix tokens
+    (hash_prefix), stage 2 maps that fingerprint to a backend using JUMP
+    consistent hash (the server default).
 
-    IMPORTANT: The modular routing formula (hash % num_backends) only matches the
-    server when Ranvier is configured with HashStrategy::MODULAR. The server supports
-    four strategies (MODULAR, JUMP, BOUNDED_LOAD, P2C); the default is JUMP consistent
-    hash which uses a different selection algorithm. Predictions will be inaccurate for
-    non-MODULAR strategies. When X-Backend-ID is present in the response, that value
-    is always preferred over this prediction.
+    Only accurate for JUMP and MODULAR strategies.  BOUNDED_LOAD and P2C
+    incorporate live load data that the client cannot replicate.  When
+    X-Backend-ID is present in the response, that value is always preferred.
 
     Args:
         token_ids: Full list of token IDs for the request
@@ -2185,7 +2208,7 @@ def predict_backend_from_hash(token_ids: List[int], num_backends: int,
                            Otherwise, uses DEFAULT_PREFIX_TOKEN_LENGTH (128).
 
     Returns:
-        Predicted backend ID (1-indexed, only accurate for MODULAR hash strategy)
+        Predicted backend ID (1-indexed)
     """
     if not token_ids or num_backends <= 0:
         return 1  # Fallback to first backend
@@ -2197,7 +2220,9 @@ def predict_backend_from_hash(token_ids: List[int], num_backends: int,
         prefix_len = min(DEFAULT_PREFIX_TOKEN_LENGTH, len(token_ids))
 
     prefix_hash = fnv1a_hash_tokens(token_ids, prefix_len)
-    return (prefix_hash % num_backends) + 1  # Backend IDs are 1-indexed
+    # Stage 2: JUMP consistent hash (server default), then map 0-indexed to 1-indexed
+    bucket = jump_consistent_hash(prefix_hash, num_backends)
+    return bucket + 1  # Backend IDs are 1-indexed
 
 
 def estimate_tokens(text: str) -> int:
