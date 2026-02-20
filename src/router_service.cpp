@@ -48,7 +48,8 @@
 //   - This prevents Prometheus scrapes during shutdown
 //
 // Rule #14 (Cross-Shard Dispatch):
-//   - learn_route_global(), flush_route_batch() broadcast to all shards
+//   - flush_local_route_batch(), flush_route_batch() broadcast to all shards
+//   - learn_route_global() buffers locally; flush broadcasts in batches
 //   - Uses foreign_ptr pattern: wrap in foreign_ptr → submit_to → local copy
 //   - NEVER move heap-owning types directly across shards
 //
@@ -1684,10 +1685,8 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 }
 
 // ============================================================================
-// learn_route_global() - Cross-Shard Route Propagation
-// ============================================================================
-//
 // learn_route_global() - Batched Local Route Learning
+// ============================================================================
 //
 // Instead of immediately broadcasting to all shards (O(shards) SMP messages
 // per request), this function buffers the route in the shard-local
@@ -2223,9 +2222,8 @@ seastar::future<> RouterService::flush_local_route_batch() {
     // across shards. The batch is allocated on the calling shard. Each target
     // shard receives a foreign_ptr-wrapped copy, reads from it, and creates
     // LOCAL allocations. foreign_ptr destructor returns cleanup to source shard.
-    return seastar::do_with(std::move(holder), std::move(batch), should_gossip, this_shard,
-        [](seastar::gate::holder&, std::vector<PendingLocalRoute>& batch,
-           bool should_gossip, unsigned this_shard) {
+    return seastar::do_with(std::move(holder), std::move(batch),
+        [should_gossip, this_shard](seastar::gate::holder&, std::vector<PendingLocalRoute>& batch) {
             // Broadcast to all OTHER shards
             auto shard_future = seastar::parallel_for_each(
                 boost::irange(0u, seastar::smp::count),
@@ -2258,8 +2256,8 @@ seastar::future<> RouterService::flush_local_route_batch() {
             // Gossip: submit batch to shard 0 for cluster broadcast
             seastar::future<> gossip_future = seastar::make_ready_future<>();
             if (should_gossip && !batch.empty()) {
-                auto gossip_ptr = std::make_unique<std::vector<PendingLocalRoute>>(batch);
-                auto foreign_gossip = seastar::make_foreign(std::move(gossip_ptr));
+                auto gossip_batch = std::make_unique<std::vector<PendingLocalRoute>>(batch);
+                auto foreign_gossip = seastar::make_foreign(std::move(gossip_batch));
 
                 gossip_future = seastar::smp::submit_to(0,
                     [foreign_gossip = std::move(foreign_gossip)]() mutable {
