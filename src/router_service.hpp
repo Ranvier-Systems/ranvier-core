@@ -23,11 +23,24 @@ namespace ranvier {
 // ============================================================================
 // Route Batching Types
 // ============================================================================
-// These types support batching of remote route updates to prevent "SMP storms"
-// when receiving high volumes of route announcements via cluster gossip.
+// These types support batching of route updates to prevent "SMP storms."
+//
+// Two batching systems exist:
+//   1. Remote route batching: Routes from gossip peers buffer on shard 0
+//      (_pending_remote_routes in RouterService) and flush periodically.
+//   2. Local route batching: Routes learned from proxied requests buffer
+//      on each shard independently (pending_local_routes in ShardLocalState)
+//      and flush periodically. This avoids O(shards) SMP messages per request.
 
 // A pending remote route waiting to be batched and broadcast to all shards
 struct PendingRemoteRoute {
+    std::vector<int32_t> tokens;
+    BackendId backend;
+};
+
+// A pending locally-learned route waiting to be batched and broadcast
+// Stored in shard-local buffers, flushed by per-shard timers
+struct PendingLocalRoute {
     std::vector<int32_t> tokens;
     BackendId backend;
 };
@@ -311,6 +324,25 @@ public:
 
     // Stop the draining reaper timer (call before shutdown)
     void stop_draining_reaper();
+
+    // ---- Local Route Batching (shard-local, no cross-shard access on enqueue) ----
+
+    // Start per-shard local batch flush timers (call via smp::invoke_on_all)
+    static void start_local_batch_timer();
+
+    // Stop per-shard local batch flush timers and drain pending routes
+    // (call via smp::invoke_on_all during shutdown)
+    static seastar::future<> stop_local_batch_timer();
+
+    // Flush locally-buffered routes to all shards (runs on calling shard)
+    // Deduplicates within the batch, broadcasts via parallel_for_each,
+    // and submits gossip batch to shard 0
+    static seastar::future<> flush_local_route_batch();
+
+    // Buffer a locally-learned route for batched broadcast
+    // Pushes into the shard-local buffer; triggers immediate flush if full
+    // Returns a ready future (never blocks on cross-shard dispatch)
+    static seastar::future<> buffer_local_route(std::vector<int32_t> tokens, BackendId backend);
 
     // Static: Only uses thread_local g_shard_state, safe to call from any shard
     static seastar::future<> remove_routes_for_backend(BackendId b_id);

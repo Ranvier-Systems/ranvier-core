@@ -48,7 +48,8 @@
 //   - This prevents Prometheus scrapes during shutdown
 //
 // Rule #14 (Cross-Shard Dispatch):
-//   - learn_route_global(), flush_route_batch() broadcast to all shards
+//   - flush_local_route_batch(), flush_route_batch() broadcast to all shards
+//   - learn_route_global() buffers locally; flush broadcasts in batches
 //   - Uses foreign_ptr pattern: wrap in foreign_ptr → submit_to → local copy
 //   - NEVER move heap-owning types directly across shards
 //
@@ -125,6 +126,11 @@ struct ShardLocalState {
         uint64_t compaction_runs = 0;
         // Load-aware routing stats
         uint64_t load_aware_fallbacks = 0;       // Times we chose non-preferred backend due to load
+        // Local route batching stats (per-shard)
+        uint64_t local_routes_batched = 0;        // Routes added to local buffer
+        uint64_t local_batch_flushes = 0;          // Number of local flush operations
+        uint64_t local_routes_deduplicated = 0;    // Routes skipped by dedup within batch
+        uint64_t local_routes_dropped_overflow = 0; // Routes dropped due to buffer overflow
 
         void reset() {
             cache_hits = 0;
@@ -141,6 +147,10 @@ struct ShardLocalState {
             compaction_bytes_reclaimed = 0;
             compaction_runs = 0;
             load_aware_fallbacks = 0;
+            local_routes_batched = 0;
+            local_batch_flushes = 0;
+            local_routes_deduplicated = 0;
+            local_routes_dropped_overflow = 0;
         }
     } stats;
 
@@ -176,6 +186,28 @@ struct ShardLocalState {
     std::function<void(BackendId)> circuit_cleanup_callback;
 
     // ========================================================================
+    // Local Route Batching (shard-local, no cross-shard access on enqueue)
+    // ========================================================================
+    // Buffer for locally-learned routes pending batch broadcast.
+    // Each shard accumulates routes independently; only the flush broadcasts
+    // cross-shard, amortizing O(shards) SMP messages across the batch.
+    std::vector<PendingLocalRoute> pending_local_routes;
+
+    // Per-shard timer that flushes the local route buffer periodically
+    seastar::timer<> local_flush_timer;
+
+    // Per-shard gate for local flush timer callbacks (Rule #5)
+    // stop_local_batch_timer() closes the gate before cancelling the timer
+    seastar::gate local_flush_gate;
+
+    // Gossip pointer (set on shard 0 only; nullptr on other shards)
+    // Used by flush_local_route_batch() to broadcast routes to cluster peers
+    GossipService* gossip_ptr = nullptr;
+
+    // Whether gossip is enabled (set on all shards during init for fast checks)
+    bool gossip_enabled = false;
+
+    // ========================================================================
     // Lifecycle Methods
     // ========================================================================
 
@@ -203,6 +235,9 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
+
+        // Pre-allocate local route batch buffer to avoid reallocations during operation
+        pending_local_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
 
         // Seed RNG with random device and time for better entropy
         std::random_device rd;
@@ -240,6 +275,11 @@ struct ShardLocalState {
         backends.clear();
         backend_ids.clear();
         dead_backends.clear();
+
+        // Clear local route batch buffer
+        pending_local_routes.clear();
+        gossip_ptr = nullptr;
+        gossip_enabled = false;
 
         // Reset statistics
         stats.reset();
@@ -922,7 +962,32 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // Counter: requests diverted to less-loaded backends
         seastar::metrics::make_counter("router_load_aware_fallbacks_total",
             [] { return g_shard_state ? g_shard_state->stats.load_aware_fallbacks : 0UL; },
-            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth"))
+            seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth")),
+
+        // ====================================================================
+        // Local Route Batching Metrics
+        // ====================================================================
+
+        // Counter: routes buffered into local batch (before dedup/broadcast)
+        seastar::metrics::make_counter("router_local_routes_batched_total",
+            [] { return g_shard_state ? g_shard_state->stats.local_routes_batched : 0UL; },
+            seastar::metrics::description("Total number of locally-learned routes buffered for batch broadcast")),
+
+        // Counter: flush operations performed
+        seastar::metrics::make_counter("router_local_batch_flushes_total",
+            [] { return g_shard_state ? g_shard_state->stats.local_batch_flushes : 0UL; },
+            seastar::metrics::description("Total number of local route batch flush operations")),
+
+        // Counter: routes eliminated by dedup within batches
+        seastar::metrics::make_counter("router_local_routes_deduplicated_total",
+            [] { return g_shard_state ? g_shard_state->stats.local_routes_deduplicated : 0UL; },
+            seastar::metrics::description("Total number of duplicate routes eliminated within local batches")),
+
+        // Counter: routes dropped due to local buffer overflow
+        seastar::metrics::make_counter("router_local_routes_dropped_overflow_total",
+            [] { return g_shard_state ? g_shard_state->stats.local_routes_dropped_overflow : 0UL; },
+            seastar::metrics::description("Total number of locally-learned routes dropped due to buffer overflow"))
+
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
     });
@@ -932,14 +997,28 @@ seastar::future<> RouterService::initialize_shards() {
     // Initialize ShardLocalState on all other shards with the config from shard 0
     // Shard 0 is already initialized in the constructor
     RoutingConfig cfg = _config;  // Copy config for cross-shard transfer
+    bool has_gossip = (_gossip != nullptr);
 
     return seastar::parallel_for_each(boost::irange(1u, seastar::smp::count),
-        [cfg](unsigned shard_id) {
-            return seastar::smp::submit_to(shard_id, [cfg] {
+        [cfg, has_gossip](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id, [cfg, has_gossip] {
                 // Initialize ShardLocalState with unified init() method
                 g_shard_state = std::make_unique<ShardLocalState>();
                 g_shard_state->init(cfg);
+                // Set gossip_enabled flag on all shards (gossip_ptr only on shard 0)
+                g_shard_state->gossip_enabled = has_gossip;
                 return seastar::make_ready_future<>();
+            });
+        }).then([this] {
+            // Set up shard 0's gossip state (shard 0 was initialized in constructor)
+            if (g_shard_state) {
+                g_shard_state->gossip_enabled = (_gossip != nullptr);
+                g_shard_state->gossip_ptr = _gossip.get();
+            }
+
+            // Start per-shard local batch flush timers on ALL shards
+            return seastar::smp::invoke_on_all([] {
+                start_local_batch_timer();
             });
         });
 }
@@ -1000,14 +1079,27 @@ seastar::future<> RouterService::stop() {
     _metrics.clear();  // Deregister all metrics lambdas - prevents use-after-free
 
     // ==========================================================================
-    // Rule #5: Close timer gate before cancelling timers
+    // Stop per-shard local batch flush timers first
     // ==========================================================================
     //
-    // Timer callbacks capture 'this'. If a callback is already queued when we
-    // cancel the timer, it may still execute with a dangling pointer. The gate
-    // ensures we wait for any in-flight callbacks to complete before proceeding.
+    // Local batch timers are shard-local (in ShardLocalState), not owned by
+    // RouterService. Stop them on all shards before proceeding with the rest
+    // of the shutdown sequence. This ensures no new cross-shard broadcasts
+    // are initiated from local batch flushes during shutdown.
     //
-    return _timer_gate.close().then([this] {
+    return seastar::smp::invoke_on_all([] {
+        return stop_local_batch_timer();
+    }).then([this] {
+        // ==========================================================================
+        // Rule #5: Close timer gate before cancelling timers
+        // ==========================================================================
+        //
+        // Timer callbacks capture 'this'. If a callback is already queued when we
+        // cancel the timer, it may still execute with a dangling pointer. The gate
+        // ensures we wait for any in-flight callbacks to complete before proceeding.
+        //
+        return _timer_gate.close();
+    }).then([this] {
         // Gate closed - no in-flight TTL callbacks, safe to cancel timer
         stop_ttl_timer();
         stop_draining_reaper();
@@ -1593,42 +1685,24 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
 }
 
 // ============================================================================
-// learn_route_global() - Cross-Shard Route Propagation
+// learn_route_global() - Batched Local Route Learning
 // ============================================================================
 //
-// HARD RULE #14 (Cross-Shard Dispatch):
-// This function broadcasts a learned route to ALL shards using smp::submit_to.
-// Cross-shard memory safety is critical:
+// Instead of immediately broadcasting to all shards (O(shards) SMP messages
+// per request), this function buffers the route in the shard-local
+// pending_local_routes buffer. The per-shard flush timer (or buffer-full
+// trigger) drains the buffer and broadcasts in a single batch.
 //
-//   - The `tokens` vector is allocated on the calling shard
-//   - Moving it directly to another shard would cause wrong-shard deallocation
-//   - We use foreign_ptr to wrap copies for safe cross-shard transfer:
-//     1. Create std::unique_ptr<vector> with copy of tokens
-//     2. Wrap in seastar::make_foreign() - tracks home shard
-//     3. Pass foreign_ptr to target shard via submit_to
-//     4. Target shard reads from foreign_ptr, creates LOCAL allocation
-//     5. When foreign_ptr destructs, cleanup returns to home shard
+// This reduces SMP message traffic from O(shards) per request to
+// O(shards) per batch, dramatically reducing SMP contention under load.
 //
-// This pattern is used twice:
-//   1. Gossip broadcast to shard 0 (GossipService only exists there)
-//   2. Parallel broadcast to all local shards for ART insertion
-//
-// The function is async (returns future<>) because smp::submit_to is non-blocking
-// but the caller may want to wait for propagation to complete.
+// Validation (prefix truncation, max_route_tokens) is still performed
+// inline before buffering. Gossip and cross-shard broadcast are deferred
+// to flush_local_route_batch().
 //
 seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
                                                        const std::string& request_id,
                                                        size_t prefix_boundary) {
-    // Rule #5: Acquire gate holder to protect 'this' captures in gossip submit_to lambdas.
-    // The holder must live for the entire async lifetime (moved into when_all_succeed below).
-    // If the gate is closed (shutdown in progress), skip route learning gracefully.
-    seastar::gate::holder holder;
-    try {
-        holder = _timer_gate.hold();
-    } catch (const seastar::gate_closed_exception&) {
-        return seastar::make_ready_future<>();
-    }
-
     // Determine effective prefix length for route storage:
     // 1. If prefix_boundary > 0 and valid, use it (truncate to shared prefix like system messages)
     // 2. Otherwise, fall back to config.prefix_token_length (default: 128)
@@ -1668,85 +1742,19 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
         return seastar::make_ready_future<>();
     }
 
-    // Log route learning with request_id on shard 0 before broadcasting
+    // Log route learning with request_id before buffering
     if (!request_id.empty()) {
         if (used_shared_prefix) {
-            log_router.info("[{}] Learning route: {} tokens (shared_prefix) -> backend {}",
+            log_router.info("[{}] Buffering route: {} tokens (shared_prefix) -> backend {}",
                             request_id, tokens.size(), backend);
         } else {
-            log_router.info("[{}] Learning route: {} tokens (default_prefix) -> backend {}",
+            log_router.info("[{}] Buffering route: {} tokens (default_prefix) -> backend {}",
                             request_id, tokens.size(), backend);
         }
     }
 
-    // Broadcast to cluster peers if gossip is enabled
-    // NOTE: GossipService only exists on shard 0, so we must submit_to(0) to avoid
-    // cross-shard access violations (the gate holder would be created on the wrong shard)
-    //
-    // MEMORY SAFETY: Use foreign_ptr to safely pass tokens to shard 0.
-    // The tokens vector is allocated on the calling shard (could be any shard).
-    // foreign_ptr ensures proper deallocation on the source shard.
-    seastar::future<> gossip_future = seastar::make_ready_future<>();
-    if (_gossip) {
-        auto tokens_ptr = std::make_unique<std::vector<int32_t>>(tokens);
-        auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
-
-        gossip_future = seastar::smp::submit_to(0, [this, foreign_tokens = std::move(foreign_tokens), backend]() mutable {
-            if (_gossip->is_enabled()) {
-                // Create local copy on shard 0
-                std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
-                return _gossip->broadcast_route(local_tokens, backend);
-            }
-            return seastar::make_ready_future<>();
-        });
-    }
-
-    // Broadcast to all local shards with LOCAL origin
-    //
-    // CRITICAL MEMORY SAFETY: Use foreign_ptr to safely pass tokens across shards.
-    // Each shard gets a copy wrapped in foreign_ptr. The target shard reads from
-    // foreign_ptr and creates LOCAL allocations. When foreign_ptr is destroyed,
-    // it returns to shard 0 for proper deallocation.
-    auto shard_future = seastar::do_with(std::move(tokens), [backend](std::vector<int32_t>& tokens) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &tokens] (unsigned shard_id) {
-            // Create a copy wrapped in foreign_ptr for this shard
-            auto tokens_ptr = std::make_unique<std::vector<int32_t>>(tokens);
-            auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
-
-            return seastar::smp::submit_to(shard_id, [backend, foreign_tokens = std::move(foreign_tokens)]() mutable {
-                // Force local allocation on THIS shard
-                std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
-
-                if (!g_shard_state) return seastar::make_ready_future<>();
-                auto& state = shard_state();
-                RadixTree* tree = state.tree.get();
-                if (!tree) return seastar::make_ready_future<>();
-
-                // LRU eviction: if at capacity, evict oldest routes first
-                if (state.config.max_routes > 0) {
-                    while (tree->route_count() >= state.config.max_routes) {
-                        if (tree->evict_oldest()) {
-                            state.stats.routes_evicted++;
-                        } else {
-                            break;  // No more routes to evict
-                        }
-                    }
-                }
-
-                // Insert with LOCAL origin (direct request on this node)
-                tree->insert(local_tokens, backend, RouteOrigin::LOCAL);
-                return seastar::make_ready_future<>();
-            });
-        });
-    });
-
-    // Wait for both gossip broadcast and shard updates.
-    // Keep gate holder alive for the full async lifetime via do_with.
-    return seastar::do_with(std::move(holder),
-        [gossip_future = std::move(gossip_future), shard_future = std::move(shard_future)]
-        (seastar::gate::holder&) mutable {
-            return seastar::when_all_succeed(std::move(gossip_future), std::move(shard_future)).discard_result();
-        });
+    // Buffer the route for batched broadcast (no SMP messages on hot path)
+    return buffer_local_route(std::move(tokens), backend);
 }
 
 seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> tokens, BackendId backend,
@@ -1754,17 +1762,15 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
                                                            const std::vector<size_t>& prefix_boundaries) {
     // Multi-depth route learning: store routes at each provided boundary
     // This enables cache reuse at any conversation depth (Option C)
+    //
+    // Batched version: Instead of broadcasting each boundary to all shards
+    // immediately, buffer all boundaries into the shard-local pending_local_routes
+    // buffer. The per-shard flush timer handles cross-shard broadcast and gossip.
 
-    // Rule #5: Acquire gate holder to protect 'this' captures in gossip submit_to lambdas.
-    seastar::gate::holder holder;
-    try {
-        holder = _timer_gate.hold();
-    } catch (const seastar::gate_closed_exception&) {
-        return seastar::make_ready_future<>();
-    }
+    if (!g_shard_state) return seastar::make_ready_future<>();
 
     // Use shard-local config for lock-free, hot-reloadable access (same as learn_route_global)
-    const size_t max_route_tokens = g_shard_state ? g_shard_state->config.max_route_tokens : 0;
+    const size_t max_route_tokens = g_shard_state->config.max_route_tokens;
 
     if (prefix_boundaries.empty()) {
         // No boundaries provided - fall back to single-depth learning
@@ -1792,87 +1798,46 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
             if (i > 0) boundaries_str += ",";
             boundaries_str += std::to_string(valid_boundaries[i]);
         }
-        log_router.info("[{}] Learning multi-depth routes: {} boundaries [{}] -> backend {}",
+        log_router.info("[{}] Buffering multi-depth routes: {} boundaries [{}] -> backend {}",
                         request_id, valid_boundaries.size(), boundaries_str, backend);
     }
 
     // Record metric for multi-depth routes
-    if (g_shard_state) {
-        shard_state().stats.multi_depth_routes_stored += valid_boundaries.size();
-    }
+    auto& state = shard_state();
+    state.stats.multi_depth_routes_stored += valid_boundaries.size();
 
-    // Learn a route at each boundary depth
-    std::vector<seastar::future<>> futures;
-    futures.reserve(valid_boundaries.size());
-
+    // Push all boundaries into the shard-local buffer directly.
+    // This is O(1) per push (shard-local vector append, no futures).
+    // The flush timer or buffer-full check handles cross-shard broadcast.
     for (size_t boundary : valid_boundaries) {
-        // Create a prefix at this boundary
-        std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + boundary);
-
         // Validate token count (using shard-local config)
-        if (max_route_tokens > 0 && prefix.size() > max_route_tokens) {
+        if (max_route_tokens > 0 && boundary > max_route_tokens) {
             continue;  // Skip this boundary if it exceeds the limit
         }
 
-        // Broadcast to all local shards
-        futures.push_back(
-            seastar::do_with(std::move(prefix), [backend](std::vector<int32_t>& prefix_tokens) {
-                return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [backend, &prefix_tokens](unsigned shard_id) {
-                    auto tokens_ptr = std::make_unique<std::vector<int32_t>>(prefix_tokens);
-                    auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
+        // Enforce hard buffer limit (Rule #4: bounded containers)
+        if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BUFFER_SIZE) {
+            size_t drop_count = std::min(RouteBatchConfig::OVERFLOW_DROP_COUNT,
+                                         state.pending_local_routes.size());
+            state.pending_local_routes.erase(
+                state.pending_local_routes.begin(),
+                state.pending_local_routes.begin() + static_cast<ptrdiff_t>(drop_count));
+            state.stats.local_routes_dropped_overflow += drop_count;
+            log_router.warn("Shard {}: Local route buffer overflow during multi-depth, "
+                           "dropped {} oldest routes", seastar::this_shard_id(), drop_count);
+        }
 
-                    return seastar::smp::submit_to(shard_id, [backend, foreign_tokens = std::move(foreign_tokens)]() mutable {
-                        std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
-
-                        if (!g_shard_state) return seastar::make_ready_future<>();
-                        auto& state = shard_state();
-                        RadixTree* tree = state.tree.get();
-                        if (!tree) return seastar::make_ready_future<>();
-
-                        // LRU eviction if at capacity
-                        if (state.config.max_routes > 0) {
-                            while (tree->route_count() >= state.config.max_routes) {
-                                if (tree->evict_oldest()) {
-                                    state.stats.routes_evicted++;
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-
-                        tree->insert(local_tokens, backend, RouteOrigin::LOCAL);
-                        return seastar::make_ready_future<>();
-                    });
-                });
-            })
-        );
+        std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + boundary);
+        state.pending_local_routes.push_back(PendingLocalRoute{std::move(prefix), backend});
+        state.stats.local_routes_batched++;
     }
 
-    // Gossip: broadcast the deepest boundary only (full context)
-    // Other depths are local optimizations that peers will compute themselves
-    seastar::future<> gossip_future = seastar::make_ready_future<>();
-    if (_gossip && !valid_boundaries.empty()) {
-        size_t deepest = valid_boundaries.back();  // Already sorted
-        std::vector<int32_t> deepest_prefix(tokens.begin(), tokens.begin() + deepest);
-        auto tokens_ptr = std::make_unique<std::vector<int32_t>>(std::move(deepest_prefix));
-        auto foreign_tokens = seastar::make_foreign(std::move(tokens_ptr));
-
-        gossip_future = seastar::smp::submit_to(0, [this, foreign_tokens = std::move(foreign_tokens), backend]() mutable {
-            if (_gossip->is_enabled()) {
-                std::vector<int32_t> local_tokens(foreign_tokens->begin(), foreign_tokens->end());
-                return _gossip->broadcast_route(local_tokens, backend);
-            }
-            return seastar::make_ready_future<>();
-        });
+    // Trigger immediate flush if buffer is full after all pushes
+    if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
+        return flush_local_route_batch();
     }
 
-    futures.push_back(std::move(gossip_future));
-
-    // Keep gate holder alive for the full async lifetime via do_with.
-    return seastar::do_with(std::move(holder), std::move(futures),
-        [](seastar::gate::holder&, std::vector<seastar::future<>>& futures) {
-            return seastar::when_all_succeed(futures.begin(), futures.end()).discard_result();
-        });
+    return seastar::make_ready_future<>();
 }
 
 // ============================================================================
@@ -2090,6 +2055,305 @@ seastar::future<> RouterService::flush_route_batch() {
                         return seastar::make_ready_future<>();
                     });
             });
+    });
+}
+
+// ============================================================================
+// Local Route Batching Implementation
+// ============================================================================
+//
+// Locally-learned routes (from proxied requests) are buffered per-shard and
+// flushed periodically, eliminating the O(shards) SMP messages that
+// learn_route_global() previously sent on every request.
+//
+// Each shard independently:
+//   1. Accumulates routes in pending_local_routes (shard-local, no locks)
+//   2. Flushes on timer tick or when buffer is full
+//   3. Deduplicates within the batch (same tokens+backend → skip)
+//   4. Applies batch to local tree directly (no SMP for self)
+//   5. Broadcasts batch to all other shards via parallel_for_each
+//   6. Submits batch to shard 0 for gossip (if enabled)
+
+// Apply a batch of locally-learned routes to the local shard's RadixTree.
+// Similar to apply_route_batch_to_local_tree but uses LOCAL origin.
+static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batch) {
+    if (!g_shard_state) return;
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
+    if (!tree) return;
+
+    for (const auto& route : batch) {
+        // LRU eviction: if at capacity, evict oldest routes first
+        if (state.config.max_routes > 0) {
+            while (tree->route_count() >= state.config.max_routes) {
+                if (tree->evict_oldest()) {
+                    state.stats.routes_evicted++;
+                } else {
+                    break;  // No more routes to evict
+                }
+            }
+        }
+
+        // Insert with LOCAL origin (direct request on this node)
+        tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
+    }
+}
+
+// FNV-1a hash over raw token bytes (no block alignment, used only for dedup)
+static uint64_t hash_tokens_for_dedup(const std::vector<int32_t>& tokens) {
+    uint64_t hash = FNV_OFFSET_BASIS;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens.data());
+    size_t byte_len = tokens.size() * sizeof(int32_t);
+    for (size_t i = 0; i < byte_len; ++i) {
+        hash ^= data[i];
+        hash *= FNV_PRIME;
+    }
+    return hash;
+}
+
+// Dedup key: combines token hash with backend ID
+struct LocalRouteDedup {
+    uint64_t token_hash;
+    BackendId backend;
+
+    bool operator==(const LocalRouteDedup& o) const {
+        return token_hash == o.token_hash && backend == o.backend;
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const LocalRouteDedup& k) {
+        return H::combine(std::move(h), k.token_hash, k.backend);
+    }
+};
+
+// Remove duplicate (same prefix + same backend) entries from a local batch.
+// Keeps the first occurrence of each unique (tokens, backend) pair.
+// Uses FNV-1a hash of tokens as proxy for equality (collision probability
+// is negligible for the bounded batch sizes we operate on).
+static size_t deduplicate_local_batch(std::vector<PendingLocalRoute>& batch) {
+    if (batch.size() <= 1) return 0;
+
+    absl::flat_hash_set<LocalRouteDedup> seen;
+    seen.reserve(batch.size());
+    size_t write = 0;
+    for (size_t read = 0; read < batch.size(); ++read) {
+        LocalRouteDedup key{hash_tokens_for_dedup(batch[read].tokens), batch[read].backend};
+        if (seen.insert(key).second) {
+            if (write != read) {
+                batch[write] = std::move(batch[read]);
+            }
+            ++write;
+        }
+    }
+    size_t removed = batch.size() - write;
+    batch.resize(write);
+    return removed;
+}
+
+seastar::future<> RouterService::buffer_local_route(std::vector<int32_t> tokens, BackendId backend) {
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    auto& state = shard_state();
+
+    // Enforce hard buffer limit to prevent OOM (Rule #4: bounded containers)
+    // Strategy: batch-drop oldest routes (same pattern as remote route batching)
+    if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BUFFER_SIZE) {
+        size_t drop_count = std::min(RouteBatchConfig::OVERFLOW_DROP_COUNT,
+                                     state.pending_local_routes.size());
+        state.pending_local_routes.erase(
+            state.pending_local_routes.begin(),
+            state.pending_local_routes.begin() + static_cast<ptrdiff_t>(drop_count));
+        state.stats.local_routes_dropped_overflow += drop_count;
+
+        log_router.warn("Shard {}: Local route buffer overflow, dropped {} oldest routes "
+                       "(total dropped: {})",
+                       seastar::this_shard_id(), drop_count,
+                       state.stats.local_routes_dropped_overflow);
+    }
+
+    state.pending_local_routes.push_back(PendingLocalRoute{std::move(tokens), backend});
+    state.stats.local_routes_batched++;
+
+    // Flush immediately if buffer is full (don't wait for timer)
+    if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
+        log_router.debug("Shard {}: Local batch buffer full ({} routes), triggering immediate flush",
+                         seastar::this_shard_id(), state.pending_local_routes.size());
+        return flush_local_route_batch();
+    }
+
+    return seastar::make_ready_future<>();
+}
+
+seastar::future<> RouterService::flush_local_route_batch() {
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    auto& state = shard_state();
+
+    // Rule #5: Acquire shard-local gate holder to prevent use-after-free during shutdown
+    seastar::gate::holder holder;
+    try {
+        holder = state.local_flush_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return seastar::make_ready_future<>();
+    }
+
+    if (state.pending_local_routes.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    // Atomically take ownership of pending routes
+    auto batch = std::move(state.pending_local_routes);
+    state.stats.local_batch_flushes++;
+
+    // Deduplicate: same (token_hash, backend) → keep first, skip rest
+    size_t deduped = deduplicate_local_batch(batch);
+    state.stats.local_routes_deduplicated += deduped;
+
+    log_router.debug("Shard {}: Flushing local batch of {} routes ({} deduplicated) to {} shards",
+                     seastar::this_shard_id(), batch.size(), deduped, seastar::smp::count);
+
+    // Apply to local tree directly (no SMP needed for THIS shard)
+    apply_local_batch_to_tree(batch);
+
+    bool should_gossip = state.gossip_enabled;
+    unsigned this_shard = seastar::this_shard_id();
+
+    // Broadcast batch to all other shards + gossip via shard 0
+    //
+    // CRITICAL MEMORY SAFETY (Rule #14): Use foreign_ptr to safely pass data
+    // across shards. The batch is allocated on the calling shard. Each target
+    // shard receives a foreign_ptr-wrapped copy, reads from it, and creates
+    // LOCAL allocations. foreign_ptr destructor returns cleanup to source shard.
+    return seastar::do_with(std::move(holder), std::move(batch),
+        [should_gossip, this_shard](seastar::gate::holder&, std::vector<PendingLocalRoute>& batch) {
+            // Broadcast to all OTHER shards
+            auto shard_future = seastar::parallel_for_each(
+                boost::irange(0u, seastar::smp::count),
+                [&batch, this_shard](unsigned shard_id) {
+                    if (shard_id == this_shard) {
+                        // Already applied to local tree above
+                        return seastar::make_ready_future<>();
+                    }
+
+                    // Wrap batch copy in foreign_ptr for safe cross-shard transfer
+                    auto batch_ptr = std::make_unique<std::vector<PendingLocalRoute>>(batch);
+                    auto foreign_batch = seastar::make_foreign(std::move(batch_ptr));
+
+                    return seastar::smp::submit_to(shard_id,
+                        [foreign_batch = std::move(foreign_batch)]() mutable {
+                            // Force local allocation on THIS shard by copying from foreign_ptr
+                            std::vector<PendingLocalRoute> local_batch;
+                            local_batch.reserve(foreign_batch->size());
+                            for (const auto& route : *foreign_batch) {
+                                local_batch.push_back(PendingLocalRoute{
+                                    std::vector<int32_t>(route.tokens.begin(), route.tokens.end()),
+                                    route.backend
+                                });
+                            }
+                            apply_local_batch_to_tree(local_batch);
+                            return seastar::make_ready_future<>();
+                        });
+                });
+
+            // Gossip: submit batch to shard 0 for cluster broadcast
+            seastar::future<> gossip_future = seastar::make_ready_future<>();
+            if (should_gossip && !batch.empty()) {
+                auto gossip_batch = std::make_unique<std::vector<PendingLocalRoute>>(batch);
+                auto foreign_gossip = seastar::make_foreign(std::move(gossip_batch));
+
+                gossip_future = seastar::smp::submit_to(0,
+                    [foreign_gossip = std::move(foreign_gossip)]() mutable {
+                        if (!g_shard_state || !g_shard_state->gossip_ptr) {
+                            return seastar::make_ready_future<>();
+                        }
+                        auto* gossip = g_shard_state->gossip_ptr;
+                        if (!gossip->is_enabled()) {
+                            return seastar::make_ready_future<>();
+                        }
+
+                        // Create local copies of each route and broadcast via gossip
+                        // Use parallel_for_each to avoid sequential-await (Rule #2)
+                        auto local_routes = std::make_unique<std::vector<PendingLocalRoute>>();
+                        local_routes->reserve(foreign_gossip->size());
+                        for (const auto& route : *foreign_gossip) {
+                            local_routes->push_back(PendingLocalRoute{
+                                std::vector<int32_t>(route.tokens.begin(), route.tokens.end()),
+                                route.backend
+                            });
+                        }
+
+                        return seastar::do_with(std::move(local_routes),
+                            [gossip](std::unique_ptr<std::vector<PendingLocalRoute>>& routes) {
+                                return seastar::parallel_for_each(
+                                    routes->begin(), routes->end(),
+                                    [gossip](const PendingLocalRoute& route) {
+                                        return gossip->broadcast_route(route.tokens, route.backend);
+                                    });
+                            });
+                    });
+            }
+
+            return seastar::when_all_succeed(
+                std::move(shard_future), std::move(gossip_future)).discard_result();
+        });
+}
+
+// ============================================================================
+// Local Batch Flush Timer (per-shard)
+// ============================================================================
+//
+// HARD RULE #5 (Timer Ownership):
+// The timer callback accesses shard-local state (g_shard_state) to call
+// flush_local_route_batch(). Safety is ensured by stop_local_batch_timer():
+//   1. Closes local_flush_gate - waits for in-flight flushes to complete
+//   2. Cancels timer - prevents new callbacks
+//   3. Drains remaining buffer with one final flush
+//
+
+void RouterService::start_local_batch_timer() {
+    if (!g_shard_state) return;
+    auto& state = shard_state();
+
+    state.local_flush_timer.set_callback([] {
+        // Timer callbacks can't return futures, so handle errors inline
+        (void)flush_local_route_batch().handle_exception([](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_router.error("Shard {}: Local route batch flush failed: {}",
+                                 seastar::this_shard_id(), e.what());
+            }
+        });
+    });
+
+    state.local_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
+    log_router.info("Shard {}: Local route batch flush timer started (interval: {}ms)",
+                    seastar::this_shard_id(), RouteBatchConfig::FLUSH_INTERVAL.count());
+}
+
+seastar::future<> RouterService::stop_local_batch_timer() {
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    auto& state = shard_state();
+
+    // Shutdown sequence:
+    // 1. Close gate - waits for any in-flight flush callbacks to complete
+    // 2. Cancel timer - prevents new callbacks
+    // 3. Final flush - drains any remaining buffered routes
+    return state.local_flush_gate.close().then([] {
+        if (!g_shard_state) return seastar::make_ready_future<>();
+        g_shard_state->local_flush_timer.cancel();
+
+        // Final flush of any remaining routes (gate is closed, so flush_local_route_batch
+        // will skip the gate check - we do a manual drain here instead)
+        if (g_shard_state->pending_local_routes.empty()) {
+            return seastar::make_ready_future<>();
+        }
+
+        log_router.info("Shard {}: Draining {} remaining local routes on shutdown",
+                        seastar::this_shard_id(), g_shard_state->pending_local_routes.size());
+
+        // Apply remaining routes to local tree only (skip cross-shard broadcast during shutdown)
+        apply_local_batch_to_tree(g_shard_state->pending_local_routes);
+        g_shard_state->pending_local_routes.clear();
+        return seastar::make_ready_future<>();
     });
 }
 

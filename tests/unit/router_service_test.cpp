@@ -1346,3 +1346,181 @@ TEST(HashStrategyConfigTest, EnumValues) {
     EXPECT_NE(static_cast<int>(RoutingConfig::HashStrategy::BOUNDED_LOAD),
               static_cast<int>(RoutingConfig::HashStrategy::P2C));
 }
+
+// =============================================================================
+// 26. Local Route Batching (PendingLocalRoute + Simulated Batch Application)
+// =============================================================================
+// Tests for the local route batching system introduced to eliminate per-request
+// SMP storms. Actual async batch/flush/timer functions require a Seastar reactor,
+// so we verify:
+//   - PendingLocalRoute struct construction and move semantics
+//   - Simulated batch application to the local tree (what apply_local_batch_to_tree does)
+//   - Overwrite semantics when batches contain duplicate or conflicting prefixes
+//   - Multi-depth route buffering observable via lookup
+
+TEST_F(RouterServiceTest, PendingLocalRouteStructure) {
+    PendingLocalRoute route;
+    route.tokens = {10, 20, 30, 40, 50};
+    route.backend = 7;
+
+    EXPECT_EQ(route.tokens.size(), 5u);
+    EXPECT_EQ(route.backend, 7);
+
+    // Move semantics: vector should transfer ownership
+    PendingLocalRoute moved = std::move(route);
+    EXPECT_EQ(moved.tokens.size(), 5u);
+    EXPECT_EQ(moved.backend, 7);
+}
+
+TEST_F(RouterServiceTest, SimulatedLocalBatchApplication) {
+    // Simulate what apply_local_batch_to_tree() does: insert a batch of routes
+    // into the local RadixTree and verify they're all findable via lookup.
+    register_three_backends();
+
+    // Simulate a batch of locally-learned routes
+    std::vector<std::pair<std::vector<int32_t>, BackendId>> local_batch = {
+        {{1, 2, 3, 4, 5}, 1},
+        {{6, 7, 8, 9, 10}, 2},
+        {{11, 12, 13, 14, 15}, 3},
+        {{16, 17, 18, 19, 20}, 1},
+        {{21, 22, 23, 24, 25}, 2},
+    };
+
+    for (const auto& [tokens, backend] : local_batch) {
+        RouterService::insert_route_for_testing(tokens, backend);
+    }
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 5u);
+    EXPECT_EQ(router_->lookup({1, 2, 3, 4, 5}).value(), 1);
+    EXPECT_EQ(router_->lookup({6, 7, 8, 9, 10}).value(), 2);
+    EXPECT_EQ(router_->lookup({11, 12, 13, 14, 15}).value(), 3);
+    EXPECT_EQ(router_->lookup({16, 17, 18, 19, 20}).value(), 1);
+    EXPECT_EQ(router_->lookup({21, 22, 23, 24, 25}).value(), 2);
+}
+
+TEST_F(RouterServiceTest, SimulatedBatchDeduplicationEffect) {
+    // When the same prefix is inserted multiple times for the same backend,
+    // the tree should contain only one route (the tree overwrites on same
+    // prefix). This confirms that even without deduplicate_local_batch
+    // pre-filtering, the tree stays compact.
+    register_two_backends();
+
+    // Insert the same route 5 times (simulating duplicates in a batch)
+    for (int i = 0; i < 5; ++i) {
+        RouterService::insert_route_for_testing({1, 2, 3, 4, 5}, 1);
+    }
+
+    // Tree should have exactly 1 route (same prefix overwrites)
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 1u);
+    EXPECT_EQ(router_->lookup({1, 2, 3, 4, 5}).value(), 1);
+}
+
+TEST_F(RouterServiceTest, BatchInsertionAllRoutesAccessible) {
+    // insert_route_for_testing bypasses the eviction loop in
+    // apply_local_batch_to_tree, so all routes survive regardless of
+    // max_routes. Verify they're all accessible after batch-style insertion.
+    register_two_backends();
+
+    constexpr int COUNT = 8;
+    for (int i = 0; i < COUNT; ++i) {
+        RouterService::insert_route_for_testing({i * 100 + 1, i * 100 + 2, i * 100 + 3}, 1);
+    }
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), static_cast<size_t>(COUNT));
+
+    // Every route should be findable
+    for (int i = 0; i < COUNT; ++i) {
+        EXPECT_TRUE(router_->lookup({i * 100 + 1, i * 100 + 2, i * 100 + 3}).has_value());
+    }
+}
+
+TEST_F(RouterServiceTest, BatchOverwriteUpdatesBackend) {
+    // When a batch contains an older route for backend 1 followed by a
+    // newer route for the same prefix on backend 2, the tree should
+    // reflect the final (most recent) write for each prefix.
+    register_two_backends();
+
+    // First "batch": all on backend 1
+    RouterService::insert_route_for_testing({1, 1, 1}, 1);
+    RouterService::insert_route_for_testing({2, 2, 2}, 1);
+    RouterService::insert_route_for_testing({3, 3, 3}, 1);
+
+    // Second "batch": overwrite two of them to backend 2
+    RouterService::insert_route_for_testing({1, 1, 1}, 2);
+    RouterService::insert_route_for_testing({3, 3, 3}, 2);
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 3u);
+
+    // Overwritten routes reflect latest backend
+    EXPECT_EQ(router_->lookup({1, 1, 1}).value(), 2);
+    EXPECT_EQ(router_->lookup({2, 2, 2}).value(), 1);  // untouched
+    EXPECT_EQ(router_->lookup({3, 3, 3}).value(), 2);
+}
+
+TEST_F(RouterServiceTest, SimulatedMultiDepthBatchBuffering) {
+    // Simulate what learn_route_global_multi does: insert routes at multiple
+    // prefix boundaries for the same token sequence. Each boundary creates a
+    // separate route at a different prefix length.
+    register_two_backends();
+
+    // Full token sequence
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+
+    // Simulate boundaries at positions 3, 6, and 10
+    // This creates 3 routes with different prefix lengths
+    std::vector<int32_t> prefix_3(tokens.begin(), tokens.begin() + 3);   // {10, 20, 30}
+    std::vector<int32_t> prefix_6(tokens.begin(), tokens.begin() + 6);   // {10, 20, 30, 40, 50, 60}
+    std::vector<int32_t> prefix_10(tokens.begin(), tokens.begin() + 10); // full sequence
+
+    RouterService::insert_route_for_testing(prefix_3, 1);
+    RouterService::insert_route_for_testing(prefix_6, 1);
+    RouterService::insert_route_for_testing(prefix_10, 1);
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 3u);
+
+    // All three prefixes should resolve to the correct backend
+    EXPECT_EQ(router_->lookup(prefix_3).value(), 1);
+    EXPECT_EQ(router_->lookup(prefix_6).value(), 1);
+    EXPECT_EQ(router_->lookup(prefix_10).value(), 1);
+}
+
+TEST_F(RouterServiceTest, SimulatedMultiDepthWithDifferentBackends) {
+    // Multi-depth routes where different conversation depths route to
+    // different backends (e.g., system message cached on backend 1,
+    // but user turn cached on backend 2).
+    register_two_backends();
+
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50, 60, 70, 80};
+
+    // Simulate: system prefix on backend 1, full conversation on backend 2
+    std::vector<int32_t> system_prefix(tokens.begin(), tokens.begin() + 4);
+    std::vector<int32_t> full_prefix(tokens.begin(), tokens.begin() + 8);
+
+    RouterService::insert_route_for_testing(system_prefix, 1);
+    RouterService::insert_route_for_testing(full_prefix, 2);
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), 2u);
+    EXPECT_EQ(router_->lookup(system_prefix).value(), 1);
+    EXPECT_EQ(router_->lookup(full_prefix).value(), 2);
+}
+
+TEST_F(RouterServiceTest, LargeBatchInsertionStressTest) {
+    // Simulate a large batch (exceeding MAX_BATCH_SIZE) to verify the tree
+    // handles many insertions correctly. In production, flush_local_route_batch
+    // processes up to MAX_BATCH_SIZE routes per flush.
+    register_three_backends();
+
+    constexpr int BATCH_SIZE = 200;  // 2x MAX_BATCH_SIZE
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        BackendId backend = static_cast<BackendId>((i % 3) + 1);
+        RouterService::insert_route_for_testing({i * 10 + 1, i * 10 + 2, i * 10 + 3}, backend);
+    }
+
+    EXPECT_EQ(RouterService::get_route_count_for_testing(), static_cast<size_t>(BATCH_SIZE));
+
+    // Spot-check a few routes (backend = (i % 3) + 1)
+    EXPECT_EQ(router_->lookup({1, 2, 3}).value(), 1);       // i=0: (0%3)+1 = 1
+    EXPECT_EQ(router_->lookup({11, 12, 13}).value(), 2);     // i=1: (1%3)+1 = 2
+    EXPECT_EQ(router_->lookup({21, 22, 23}).value(), 3);     // i=2: (2%3)+1 = 3
+    EXPECT_EQ(router_->lookup({1991, 1992, 1993}).value(), 2); // i=199: (199%3)+1 = 2
+}
