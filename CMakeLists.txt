@@ -320,6 +320,17 @@ target_link_libraries(radix_tree_test
 )
 gtest_discover_tests(radix_tree_test)
 
+# ChatTemplate Unit Tests (Pure C++, header-only)
+add_executable(chat_template_test
+  tests/unit/chat_template_test.cpp
+)
+target_include_directories(chat_template_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(chat_template_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(chat_template_test)
+
 # TextValidator Unit Tests (Pure C++, header-only)
 add_executable(text_validator_test
   tests/unit/text_validator_test.cpp
