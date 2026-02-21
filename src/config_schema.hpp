@@ -169,10 +169,18 @@ struct RoutingConfig {
     // stagger mitigates this — but client-tokenize needs explicit sync.
     //
     // The broadcast interval controls the trade-off between SMP overhead and
-    // load visibility freshness. At 5ms, a 4-shard system generates 12 SMP
-    // messages per interval (each shard broadcasts to 3 others).
-    bool cross_shard_load_sync = true;                                     // Enable cross-shard load broadcasts
-    std::chrono::milliseconds cross_shard_load_sync_interval{5};           // Broadcast interval (ms)
+    // load visibility freshness. Each broadcast generates O(shards²) SMP
+    // messages (each shard sends to all others + foreign_ptr destructor
+    // returns). At 100ms default, an 8-shard system generates ~1,120 SMP
+    // messages/sec. At 5ms, that becomes ~24,000/sec — enough to congest
+    // the reactor and inflate alien::run_on() completion latency (e.g.,
+    // tokenization P50 from 12ms to 40ms).
+    //
+    // Disabled by default until validated in production benchmarks.
+    // Enable via RANVIER_CROSS_SHARD_LOAD_SYNC=true with an appropriate
+    // interval for your shard count and request rate.
+    bool cross_shard_load_sync = false;                                    // Enable cross-shard load broadcasts
+    std::chrono::milliseconds cross_shard_load_sync_interval{100};         // Broadcast interval (ms)
 
     // =========================================================================
     // Route Batch Flush Interval
