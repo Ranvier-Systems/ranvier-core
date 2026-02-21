@@ -1,6 +1,7 @@
 #pragma once
 
 #include "async_persistence.hpp"
+#include "chat_template.hpp"
 #include "circuit_breaker.hpp"
 #include "config.hpp"
 #include "connection_pool.hpp"
@@ -136,6 +137,7 @@ struct HttpControllerConfig {
     size_t min_prefix_boundary_tokens = 4;      // Minimum system message tokens for prefix boundary
     bool accept_client_prefix_boundary = false; // Accept client-provided prefix_token_count
     bool enable_multi_depth_routing = false;    // Enable multi-depth route storage (Option C)
+    ChatTemplate chat_template;                 // Pre-compiled chat template for vLLM-aligned tokenization
     uint32_t max_stale_retries = 1;              // Max retries for empty backend responses on stale pooled connections (0 = disabled)
 
     // Helper methods for routing mode checks

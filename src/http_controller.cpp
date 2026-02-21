@@ -830,8 +830,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             // JSON re-parsing in the boundary detection phase below.
             // Only request formatted_messages when multi-depth routing needs them —
             // skips N per-message string allocations on the common path.
+            // The chat template controls message formatting (e.g. llama3, chatml)
+            // so that tokenized output aligns with vLLM's apply_chat_template().
             text_extraction = RequestRewriter::extract_text_with_boundary_info(
-                body_view, _config.enable_multi_depth_routing);
+                body_view, _config.enable_multi_depth_routing, _config.chat_template);
             std::string_view text_to_tokenize = text_extraction.has_value()
                 ? std::string_view(text_extraction->text)
                 : body_view;
@@ -954,7 +956,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // Lazily compute text extraction if not already done (client-tokens path)
         if (!text_extraction.has_value()) {
             text_extraction = RequestRewriter::extract_text_with_boundary_info(
-                body_view, _config.enable_multi_depth_routing);
+                body_view, _config.enable_multi_depth_routing, _config.chat_template);
         }
 
         // For multi-depth routing, calculate boundaries at each message
@@ -1019,10 +1021,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             try {
                 // Build the system prefix text for tokenization.
                 // When system messages are contiguous at the start, we use the
-                // prefix substring of the already-extracted combined text directly.
-                // Otherwise, use the pre-extracted system text with trailing newline.
-                // Both approaches match the BPE boundary alignment property:
-                // system_text + "\n" is a text prefix of the full combined text.
+                // prefix substring of the already-extracted combined text directly
+                // (this includes chat-template formatting if configured).
+                // Otherwise, use the pre-extracted raw system text as an approximation.
                 std::string system_prefix_text;
                 if (text_extraction->has_system_prefix) {
                     // Contiguous system messages: use prefix substring directly
@@ -1030,7 +1031,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                         0, text_extraction->system_prefix_end);
                 } else {
                     // Non-contiguous (interleaved) system messages: use pre-extracted text
-                    system_prefix_text = text_extraction->system_text + "\n";
+                    system_prefix_text = text_extraction->system_text;
                 }
 
                 // Use cached tokenization (system messages have ~90%+ cache hit rate)

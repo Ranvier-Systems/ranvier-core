@@ -1123,8 +1123,8 @@ TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixContiguous) {
     EXPECT_TRUE(result->has_system_messages);
     EXPECT_TRUE(result->has_system_prefix);
 
-    // system_prefix_end should point to after "You are helpful.\n"
-    std::string expected_prefix = "You are helpful.\n";
+    // system_prefix_end should point to end of "You are helpful." (before separator)
+    std::string expected_prefix = "You are helpful.";
     EXPECT_EQ(result->system_prefix_end, expected_prefix.size());
     EXPECT_EQ(result->text.substr(0, result->system_prefix_end), expected_prefix);
 
@@ -1145,7 +1145,7 @@ TEST_F(RequestRewriterTest, BoundaryInfoSystemPrefixMultipleContiguous) {
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result->has_system_prefix);
 
-    std::string expected_prefix = "You are helpful.\nBe concise.\n";
+    std::string expected_prefix = "You are helpful.\nBe concise.";
     EXPECT_EQ(result->system_prefix_end, expected_prefix.size());
     EXPECT_EQ(result->text.substr(0, result->system_prefix_end), expected_prefix);
     EXPECT_EQ(result->system_text, "You are helpful.\nBe concise.");
@@ -1268,8 +1268,8 @@ TEST_F(RequestRewriterTest, BoundaryInfoMessagesWithoutRole) {
     // The system message IS contiguous at the start — has_system_prefix is true.
     EXPECT_TRUE(result->has_system_prefix);
     EXPECT_TRUE(result->has_system_messages);
-    // Prefix covers "System msg\n" (before the role-less message)
-    EXPECT_EQ(result->text.substr(0, result->system_prefix_end), "System msg\n");
+    // Prefix covers "System msg" (before the role-less message's separator)
+    EXPECT_EQ(result->text.substr(0, result->system_prefix_end), "System msg");
 }
 
 TEST_F(RequestRewriterTest, BoundaryInfoConsistentWithExtractText) {
@@ -1332,7 +1332,8 @@ TEST_F(RequestRewriterTest, BoundaryInfoConsistentWithExtractSystemMessages) {
 
 TEST_F(RequestRewriterTest, BoundaryInfoPrefixMatchesBPEAlignment) {
     // The key property: when has_system_prefix is true,
-    // text.substr(0, system_prefix_end) == system_text + "\n"
+    // text.substr(0, system_prefix_end) == system_text
+    // (boundary sits right after the last system message's formatted content)
     std::string body = R"({
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
@@ -1345,12 +1346,13 @@ TEST_F(RequestRewriterTest, BoundaryInfoPrefixMatchesBPEAlignment) {
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->has_system_prefix);
 
-    // Verify the fundamental BPE alignment property
+    // Verify the fundamental alignment property:
+    // For the none template, system_text is \n-joined raw content which matches
+    // the combined text prefix (format_none joins messages with \n).
     std::string prefix = result->text.substr(0, result->system_prefix_end);
-    std::string expected = result->system_text + "\n";
-    EXPECT_EQ(prefix, expected)
+    EXPECT_EQ(prefix, result->system_text)
         << "prefix: \"" << prefix << "\"\n"
-        << "system_text + \\n: \"" << expected << "\"";
+        << "system_text: \"" << result->system_text << "\"";
 }
 
 TEST_F(RequestRewriterTest, BoundaryInfoEmptyPrompt) {
@@ -1374,7 +1376,7 @@ TEST_F(RequestRewriterTest, BoundaryInfoUnicodeContent) {
     EXPECT_TRUE(result->has_system_prefix);
     EXPECT_EQ(result->system_text, "你是一个有帮助的助手。🤖");
 
-    // Verify BPE alignment with Unicode
+    // Verify alignment with Unicode
     std::string prefix = result->text.substr(0, result->system_prefix_end);
-    EXPECT_EQ(prefix, result->system_text + "\n");
+    EXPECT_EQ(prefix, result->system_text);
 }

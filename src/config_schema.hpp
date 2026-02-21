@@ -200,6 +200,13 @@ struct TimeoutConfig {
 struct AssetsConfig {
     std::string tokenizer_path = "assets/gpt2.json";
 
+    // Chat template format for message tokenization.
+    // Controls how chat messages are formatted before tokenization so that
+    // Ranvier's token sequences match what vLLM produces via apply_chat_template().
+    // Values: "none" (legacy \n-joined), "llama3", "chatml", "mistral"
+    // IMPORTANT: Must match the model family of the tokenizer JSON.
+    std::string chat_template_format = "none";
+
     // Tokenization cache settings (optimization for repeated texts like system messages)
     // Expected hit rates: system messages 80-90%, role tags 95%+
     bool tokenization_cache_enabled = true;    // Enable LRU cache for tokenization results

@@ -187,6 +187,7 @@ void RanvierConfig::apply_env_overrides() {
 
     // Assets overrides
     if (auto v = get_env("RANVIER_TOKENIZER_PATH")) assets.tokenizer_path = *v;
+    if (auto v = get_env("RANVIER_CHAT_TEMPLATE_FORMAT")) assets.chat_template_format = *v;
     if (auto v = get_env("RANVIER_TOKENIZATION_CACHE_ENABLED")) {
         assets.tokenization_cache_enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
@@ -688,6 +689,7 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
         if (yaml["assets"]) {
             YAML::Node a = yaml["assets"];
             if (a["tokenizer_path"]) config.assets.tokenizer_path = a["tokenizer_path"].as<std::string>();
+            if (a["chat_template_format"]) config.assets.chat_template_format = a["chat_template_format"].as<std::string>();
             // Tokenization cache settings
             if (a["tokenization_cache_enabled"]) {
                 config.assets.tokenization_cache_enabled = a["tokenization_cache_enabled"].as<bool>();

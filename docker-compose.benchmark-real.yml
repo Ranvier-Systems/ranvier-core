@@ -152,6 +152,10 @@ services:
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       # Multi-depth route storage: stores routes at each message boundary (Option C)
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
+      # Chat template format for tokenization alignment with vLLM.
+      # Must match the model family of RANVIER_TOKENIZER_PATH.
+      # Values: "none" (default), "llama3", "chatml", "mistral"
+      - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       # Disable Rust/Rayon parallelism - worker threads conflict with Seastar's per-shard allocator
       - RAYON_NUM_THREADS=1
       # Tokenizer thread pool - offloads tokenization from Seastar reactor
@@ -203,6 +207,7 @@ services:
       - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
+      - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
@@ -252,6 +257,7 @@ services:
       - RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY=${RANVIER_ACCEPT_CLIENT_PREFIX_BOUNDARY:-1}
       - RANVIER_ROUTING_MODE=${RANVIER_ROUTING_MODE:-prefix}
       - RANVIER_ENABLE_MULTI_DEPTH_ROUTING=${RANVIER_ENABLE_MULTI_DEPTH_ROUTING:-false}
+      - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
@@ -320,6 +326,8 @@ services:
       - BACKEND8_PORT=${BACKEND8_PORT:-8000}
       # Model name must match vLLM's loaded model
       - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
+      # Chat template format — must match RANVIER_CHAT_TEMPLATE_FORMAT on server
+      - CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       # Benchmark settings
       - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
       - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
@@ -374,6 +382,8 @@ services:
       - VLLM_ENDPOINT_1=http://172.29.1.10:8000
       # Model name must match vLLM's loaded model
       - VLLM_MODEL=${VLLM_MODEL:-meta-llama/Llama-3.2-1B-Instruct}
+      # Chat template format — must match RANVIER_CHAT_TEMPLATE_FORMAT on server
+      - CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       # Benchmark settings
       - P99_LATENCY_THRESHOLD_MS=${P99_LATENCY_THRESHOLD_MS:-5000}
       - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}

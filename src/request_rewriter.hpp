@@ -22,6 +22,8 @@
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
 
+#include "chat_template.hpp"
+
 namespace ranvier {
 
 // Result of request rewriting
@@ -79,11 +81,11 @@ public:
 
         // System message prefix boundary.
         // When system messages are contiguous at the start of the messages array,
-        // text.substr(0, system_prefix_end) == (system_messages + "\n").
+        // text.substr(0, system_prefix_end) gives the formatted system content.
         // This enables tokenizing the prefix substring directly without
         // re-extracting and re-tokenizing system messages.
         bool has_system_prefix = false;      // True if contiguous system msgs at start
-        size_t system_prefix_end = 0;        // Char offset in text (includes trailing "\n")
+        size_t system_prefix_end = 0;        // Char offset in text after last system message
 
         // System message text for non-contiguous fallback.
         // Pre-extracted during JSON parsing to avoid re-parsing later.
@@ -93,9 +95,12 @@ public:
 
         // Per-message formatted strings for multi-depth boundary computation.
         // Pre-computed during JSON parsing to avoid re-parsing.
-        // Each string is "<|role|>\ncontent" matching extract_message_boundaries format.
+        // Format depends on chat_template:
+        //   none:   "<|role|>\ncontent" (legacy)
+        //   llama3: "<|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>"
+        //   chatml: "<|im_start|>role\ncontent<|im_end|>\n"
         struct FormattedMessage {
-            std::string text;                // "<|role|>\ncontent"
+            std::string text;
             bool is_system;
         };
         std::vector<FormattedMessage> formatted_messages;
@@ -110,14 +115,23 @@ public:
     // JSON parsing portion of extract_message_boundaries() into one pass.
     // On the hot path, this eliminates 1-2 redundant JSON re-parses per request.
     //
+    // The chat_template parameter controls how messages are formatted in the
+    // combined text.  When set to a model-specific template (llama3, chatml,
+    // mistral), the combined text matches vLLM's apply_chat_template() output,
+    // producing token sequences aligned with vLLM's APC block hashes.
+    //
     // Parameters:
     //   body: Request body (JSON string)
+    //   need_formatted_messages: Whether to populate formatted_messages
+    //   chat_template: Template format for message formatting (default: none)
     //
     // Returns:
     //   TextWithBoundaryInfo with combined text and boundary metadata,
     //   or nullopt if no tokenizable content found
     static std::optional<TextWithBoundaryInfo> extract_text_with_boundary_info(
-        std::string_view body, bool need_formatted_messages = true);
+        std::string_view body,
+        bool need_formatted_messages = true,
+        const ChatTemplate& chat_template = ChatTemplate{});
 
     // Extract only system message content from a chat completion request
     //
@@ -351,7 +365,10 @@ inline std::optional<std::string> RequestRewriter::extract_text(std::string_view
 }
 
 inline std::optional<RequestRewriter::TextWithBoundaryInfo>
-RequestRewriter::extract_text_with_boundary_info(std::string_view body, bool need_formatted_messages) {
+RequestRewriter::extract_text_with_boundary_info(
+        std::string_view body,
+        bool need_formatted_messages,
+        const ChatTemplate& chat_template) {
     rapidjson::Document doc;
     doc.Parse(body.data(), body.size());
 
@@ -388,6 +405,7 @@ RequestRewriter::extract_text_with_boundary_info(std::string_view body, bool nee
     bool found_any_system = false;
     bool system_contiguous = true;       // All system msgs are at the start
     size_t system_prefix_end_candidate = 0;
+    bool is_first_message = true;        // For chat template BOS handling
 
     if (need_formatted_messages) {
         result.formatted_messages.reserve(messages.Size());
@@ -414,19 +432,16 @@ RequestRewriter::extract_text_with_boundary_info(std::string_view body, bool nee
         std::string_view content_sv(content.GetString(), content.GetStringLength());
         bool is_system = has_role && (role_sv == "system");
 
-        // Add separator to combined text (same logic as extract_text)
-        if (!combined.empty()) {
-            combined += "\n";
-        }
-
-        // Track system prefix boundary
+        // Track system messages and detect the prefix boundary.
+        bool capture_boundary_before_this_msg = false;
         if (is_system) {
             found_any_system = true;
             if (!in_system_prefix) {
-                // System message after a non-system message → not contiguous
                 system_contiguous = false;
             }
-            // Accumulate system text (matching extract_system_messages format)
+            // Accumulate raw system text for routing key (always \n-joined,
+            // independent of chat template — routing keys must be stable
+            // across template changes)
             if (!system_text.empty()) {
                 system_text += "\n";
             }
@@ -434,30 +449,43 @@ RequestRewriter::extract_text_with_boundary_info(std::string_view body, bool nee
         } else {
             if (in_system_prefix && found_any_system) {
                 // First non-system message after system messages.
-                // The separator "\n" was already appended to combined above,
-                // so combined.size() is right after the "\n" = start of this message's content.
-                // This is exactly the system prefix end offset.
-                system_prefix_end_candidate = combined.size();
+                // We'll capture the boundary offset right before appending
+                // this message to combined.
+                capture_boundary_before_this_msg = true;
             }
             in_system_prefix = false;
         }
 
-        // Add content to combined text
-        combined.append(content_sv.data(), content_sv.size());
+        // Capture boundary BEFORE format_message() appends the first non-system
+        // message.  For all formats, this is the char offset right after the
+        // last system message's formatted output (closing token or raw content).
+        if (capture_boundary_before_this_msg) {
+            system_prefix_end_candidate = combined.size();
+        }
+
+        // Append formatted message to combined text.
+        // ChatTemplate handles all formats uniformly — none (legacy \n-joining),
+        // llama3, chatml, and mistral.
+        chat_template.format_message(combined,
+                                     has_role ? role_sv : std::string_view("user"),
+                                     content_sv,
+                                     is_first_message);
 
         // Build formatted message for multi-depth routing only when requested.
         // Skipping this avoids N string allocations + vector growth per request
         // when multi-depth routing is disabled (the common case).
         if (need_formatted_messages && has_role) {
-            std::string formatted;
-            formatted.reserve(role_sv.size() + content_sv.size() + 5);  // "<|" + role + "|>\n" + content
-            formatted.append("<|");
-            formatted.append(role_sv);
-            formatted.append("|>\n");
-            formatted.append(content_sv);
-            result.formatted_messages.push_back({std::move(formatted), is_system});
+            result.formatted_messages.push_back({
+                chat_template.format_single_message(role_sv, content_sv),
+                is_system
+            });
         }
+
+        is_first_message = false;
     }
+
+    // Append generation prompt (no-op for none and mistral formats)
+    chat_template.append_generation_prompt(combined);
 
     result.has_system_messages = found_any_system;
 
