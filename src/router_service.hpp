@@ -334,6 +334,16 @@ public:
     // (call via smp::invoke_on_all during shutdown)
     static seastar::future<> stop_local_batch_timer();
 
+    // ---- Cross-Shard Load Synchronization (per-shard) ----
+
+    // Start per-shard load sync timers (call via smp::invoke_on_all)
+    // Each shard periodically broadcasts its active_requests snapshot to all
+    // other shards, giving routing decisions a global view of backend load.
+    static void start_load_sync_timer();
+
+    // Stop per-shard load sync timers (call via smp::invoke_on_all during shutdown)
+    static seastar::future<> stop_load_sync_timer();
+
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,
     // and submits gossip batch to shard 0
