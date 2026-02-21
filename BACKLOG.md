@@ -2759,6 +2759,20 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
   4. Rebuild base image: `docker build -f Dockerfile.base -t ranvier-base:latest .`
   5. Run full test suite and benchmarks to validate
 
+### 20.11 Cross-Shard Speculative Load Synchronization for Burst Routing
+
+- [ ] **Propagate speculative load increments across shards to prevent cross-shard burst-routing hot-spotting**
+  _Justification:_ The speculative load increment (20.9) increments `BackendInfo::active_requests` in `g_shard_state->backends` — a `thread_local` structure visible only to the current shard. When routing decisions happen near-simultaneously on different shards (e.g., client-side tokenization where routing overhead is 0.4ms, or high-concurrency bursts), each shard independently picks the "best" backend without seeing the other shards' speculative increments. This causes multiple shards to route to the same backend in the same flush interval, creating hot-spotting.
+  _Evidence:_ On bb20555, server-tokenize 13B 30u 30m shows P99 -51.3% (excellent), but client-tokenize 13B 30u 10m shows P99 +18.3% (hot-spotting). The only difference is tokenization latency: server-side ~10-12ms provides natural stagger between routing decisions, while client-side 0.4ms causes near-simultaneous cross-shard routing. The batched local route learning (21.1) compounds this — per-request SMP broadcast was replaced with periodic flush, reducing inter-shard synchronization frequency.
+  _Options:_
+  (a) **Lightweight cross-shard load hint broadcast:** After speculative increment, fire-and-forget `smp::submit_to` a load delta to other shards. Adds O(shards) SMP messages per routing decision — partially undoes 21.1 savings but only for load counters (not route tables). Could batch: accumulate deltas for 1-2ms then broadcast.
+  (b) **Periodic global load snapshot:** A timer (every 5-10ms) on each shard broadcasts its `active_requests` map to all shards via SMP. Shards merge the global view into routing decisions. Fixed SMP overhead regardless of request rate. Simpler but less responsive than (a).
+  (c) **Jittered routing with load-awareness:** Add small random delay (0-2ms) to routing decisions when client tokens are present, artificially reintroducing stagger. Crude but zero cross-shard overhead. Could be conditional on detecting client-tokenize path (`prompt_token_ids` present).
+  (d) **Power-of-two-choices with global load:** Instead of picking the single best backend, sample two random backends from the prefix match set and pick the one with lower load. Reduces hot-spotting probability from O(1) to O(1/backends) with no cross-shard communication needed.
+  _Location:_ `src/router_service.cpp` (routing logic), `src/router_service.hpp` (`BackendRequestGuard`, `ShardLocalState`)
+  _Complexity:_ Medium (a/b), Low (c/d)
+  _Priority:_ P2 — Performance; affects client-tokenize and high-concurrency burst scenarios. Server-side tokenization naturally mitigates via stagger.
+
 ---
 
 ## 21. Request Lifecycle Performance Analysis (2026-02-20)
