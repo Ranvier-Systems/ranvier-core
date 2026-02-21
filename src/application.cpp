@@ -617,14 +617,6 @@ seastar::future<> Application::startup() {
                     t.set_thread_pool_ref(&_tokenizer_thread_pool);
                 });
             }).then([this] {
-                // Configure local fallback semaphore and register metrics
-                auto max_concurrent = _config.assets.tokenizer_local_fallback_max_concurrent;
-                return _tokenizer.invoke_on_all(
-                    [max_concurrent](TokenizerService& t) {
-                        t.configure_local_fallback(max_concurrent);
-                        t.register_metrics();
-                    });
-            }).then([this] {
                 // Now we can clear the cached JSON
                 _tokenizer_json.clear();
                 _tokenizer_json.shrink_to_fit();

@@ -10,9 +10,6 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <seastar/core/future.hh>
-#include <seastar/core/metrics.hh>
-#include <seastar/core/metrics_registration.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <tokenizers_cpp.h>
@@ -192,14 +189,6 @@ public:
     // Call after thread pool workers are started
     void set_thread_pool_ref(seastar::sharded<TokenizerThreadPool>* thread_pool);
 
-    // Configure the shard-local semaphore that gates Priority 3 (local fallback)
-    // in encode_threaded_async(). Default is 1 concurrent local tokenization.
-    // Setting to 0 effectively disables the local fallback entirely.
-    void configure_local_fallback(size_t max_concurrent);
-
-    // Register Prometheus metrics for this service (call once per shard after start)
-    void register_metrics();
-
     // The main API: Text -> Integers (uncached, direct FFI call)
     // Accepts string_view for zero-copy tokenization from temporary_buffer
     // NOT thread-safe - must only be called from the owning shard
@@ -252,9 +241,6 @@ public:
     uint64_t cross_shard_local_fallbacks() const { return _cross_shard_local_fallbacks; }
     bool cross_shard_enabled() const { return _cross_shard_config.enabled; }
 
-    // Local fallback semaphore statistics (for metrics)
-    uint64_t local_fallback_rejected() const { return _local_fallback_rejected; }
-
     // Thread pool dispatch statistics (for metrics)
     uint64_t thread_pool_dispatches() const { return _thread_pool_dispatches; }
     uint64_t thread_pool_fallbacks() const { return _thread_pool_fallbacks; }
@@ -267,8 +253,6 @@ public:
 
     // Seastar sharded service requirement: stop() must return future<>
     seastar::future<> stop() {
-        // Rule #6: Deregister metrics first to prevent use-after-free
-        _metrics.clear();
         _cache.clear();
         _impl.reset();
         return seastar::make_ready_future<>();
@@ -291,15 +275,6 @@ private:
     seastar::sharded<TokenizerThreadPool>* _thread_pool = nullptr;
     uint64_t _thread_pool_dispatches = 0;    // Cache misses dispatched to thread pool
     uint64_t _thread_pool_fallbacks = 0;     // Thread pool unavailable, fell back to other methods
-
-    // Local fallback semaphore: gates Priority 3 in encode_threaded_async()
-    // Prevents multiple concurrent reactor-blocking tokenize_locally() calls on the same shard.
-    // Default 1: at most one local tokenization in flight per shard.
-    seastar::semaphore _local_tokenize_sem{1};
-    uint64_t _local_fallback_rejected = 0;   // Semaphore was full, returned empty result
-
-    // Prometheus metrics for this service (Rule #6: deregister in stop())
-    seastar::metrics::metric_groups _metrics;
 
     // Select target shard for cross-shard dispatch using P2C
     // Returns local shard ID if cross-shard is disabled or not beneficial
