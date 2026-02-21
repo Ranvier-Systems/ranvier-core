@@ -1684,6 +1684,9 @@ std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<in
     return selected;
 }
 
+// Forward declaration: defined in Local Route Batching Implementation section below.
+static bool push_local_route(ShardLocalState& state, std::vector<int32_t> tokens, BackendId backend);
+
 // ============================================================================
 // learn_route_global() - Batched Local Route Learning
 // ============================================================================
