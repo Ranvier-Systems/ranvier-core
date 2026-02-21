@@ -3,8 +3,7 @@
 # Compares P99 latency and throughput against stored baseline
 #
 # Triggers:
-#   - Push to main branch
-#   - Pull requests to main
+#   - After Docker Publish workflow completes (tests the newly-pushed image)
 #   - Manual trigger (with option to update baseline)
 #
 # Fail conditions:
@@ -16,22 +15,11 @@
 name: Benchmark Regression Test
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'src/**'
-      - 'tests/integration/**'
-      - 'docker-compose.test.yml'
-      - '.github/workflows/benchmark.yml'
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'src/**'
-      - 'tests/integration/**'
-      - 'docker-compose.test.yml'
-      - '.github/workflows/benchmark.yml'
+  # Run after Docker Publish completes so we benchmark the newly-pushed image
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       update_baseline:
@@ -62,6 +50,10 @@ env:
 
 jobs:
   benchmark:
+    # Run on manual dispatch unconditionally, or after a successful Docker Publish
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
