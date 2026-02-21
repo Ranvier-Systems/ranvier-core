@@ -246,11 +246,11 @@ def _format_messages_as_prompt(messages: List[dict], include_generation_prompt: 
         return result
 
     else:
-        # Legacy "none" format
+        # Legacy "none" format — raw content joined with "\n".
+        # Matches C++ format_none() in chat_template.hpp.
         for msg in messages:
-            role = msg.get("role", "user")
             content = msg.get("content", "")
-            parts.append(f"<|{role}|>\n{content}")
+            parts.append(content)
         return "\n".join(parts)
 
 
