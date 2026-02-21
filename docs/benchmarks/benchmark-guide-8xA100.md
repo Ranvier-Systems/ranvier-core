@@ -4,35 +4,55 @@ This guide provides specific test scenarios, expected results, and validation cr
 
 ## TL;DR Results
 
-Prefix-aware routing with load-aware fallback vs round-robin baseline:
+Prefix-aware routing with speculative load increment + batched route learning vs round-robin baseline:
 
-| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
-|-------|----------------|------------------------|-------------|------------|
-| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
-| CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
-| Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
+| Model | Cache Hit Rate | P99 Latency | Throughput | Key Benefit |
+|-------|----------------|-------------|------------|-------------|
+| **CodeLlama-13b** | 12% → **87-89%** | **-24% to -51%** | **+3% to +14%** | P99 + throughput |
+| **Llama-3.1-8B** | 12% → **65-95%** | flat | ~same | Stable, no harm |
+| **Llama-3.1-70B** | 49% → **75%** | flat | -18% | Reliability (0% inc) |
 
-*All results from 30-minute validated runs. 70B on 8xA100 80GB (TP=2, 4 backends, 32K context, 16 users). 13B/8B on 8xA100 40GB (8 backends, 30 users).*
-
-*Results from February 2026 with load-aware routing + stale connection fix.*
+*Results from February 21, 2026 (commit bb20555) on 8xA100 40GB with vLLM v0.15.1 pinned.
+70B on 40GB (TP=4, 2 backends). 13B/8B on 40GB (8 backends). Thread pool enabled, speculative
+load increment, batched route learning.*
 
 **Key wins:**
-- **4-8x more cache hits** — Requests routed to backends with cached KV data
-- **33-44% faster TTFT** — For large prefixes (4K+ tokens), time-to-first-token drops significantly
-- **Up to 85% lower tail latency** — P99 response times improve dramatically for 13B
-- **Up to 22% higher throughput** — Load-aware routing prevents backend hotspots for 13B
+- **4-7x more cache hits** — Requests routed to backends with cached KV data
+- **Up to 51% lower P99 tail latency** — 13B at 30 users shows strongest improvement
+- **Up to 14% higher throughput** — Load-aware routing prevents backend hotspots for 13B
 - **0% incomplete rate** — Stale connection retry ensures every request completes
-- **XLarge benefit scales with model size** — 33% for 13B, 40% for 8B, 44% for 70B
+- **Zero hot-spotting at default prefix ratio** — Speculative load increment prevents burst routing
+- **Stable under stress** — 8B at 64 concurrent users with zero errors
 
-**Works across prefix sharing levels (13B, 20 users, 10m):**
+**Performance at default config (prefix-ratio 0.9):**
 
-| Prefix Sharing | Cache Hit Rate | XLarge Improvement | P99 TTFT |
-|----------------|----------------|--------------------|----------|
-| 90% (default) | 98% | 36% | -79% |
-| 70% | 90% | n/a† | -87% |
-| 50% | 91% | 37% | -76% |
+| Model | Users | Duration | P99 TTFT | Throughput | Cache Hits |
+|-------|-------|----------|----------|------------|------------|
+| 13B | 10 | 10m | **-26.8%** | flat | 87.7% |
+| 13B | 20 | 10m | **-24% to -48%** | +3% to +13% | 87-89% |
+| 13B | 30 | 30m | **-51.3%** | **+13.9%** | 53.6% |
+| 8B | 20 | 10m | flat | -2.8% | 94.6% |
+| 8B | 30 | 30m | flat | -4.6% | 64.9% |
+| 70B | 16 | 15m | +2.6% | -17.7% | 75.4% |
 
-*†XLarge metric unreliable at 0.7 due to tiny miss sample. Benchmarks use synthetic workloads simulating RAG/system-prompt patterns with large prefixes. XLarge improvement varies by instance; P99/throughput improvements are more consistent.*
+**Known limitations at lower prefix sharing (13B 20u 10m):**
+
+| Prefix Sharing | Cache Hit Rate | P99 TTFT | Status |
+|----------------|----------------|----------|--------|
+| 90% (default) | 87-89% | **-24% to -48%** | Stable |
+| 70% | 76.8% | +86.4% | Hot-spotting |
+| 50% | 66.7% | +64.4% | Hot-spotting |
+
+*At prefix ratios below 0.9, more unique prefixes overwhelm the load balancer and cause
+hot-spotting at medium concurrency (20 users). This is a known limitation being tracked
+in backlog item 20.11 (cross-shard speculative load synchronization).*
+
+> **Historical context:** Earlier benchmarks (Instance 3, Feb 10-14) showed stronger results:
+> P99 -79% to -87% for 13B, 97-98% cache hit rates, and no hot-spotting at any prefix ratio.
+> Those runs used per-request SMP route broadcasts (before batched route learning 21.1), which
+> provided tighter cross-shard synchronization. The current architecture trades some cache
+> affinity for lower SMP overhead — a net positive for throughput at default settings, but
+> edge cases (low prefix ratio, client-tokenize, high concurrency) show reduced improvement.
 
 ---
 
@@ -158,10 +178,14 @@ Controls what **percentage of requests share a common system prompt**:
 **How it works:** When generating a prompt, there's a 90% chance (at 0.9) it picks from a pool of shared system prompts. This simulates real-world patterns where many users share the same system prompt (e.g., "You are a helpful assistant...") but have different user queries.
 
 **Measured cache hit rates with prefix-aware routing (Feb 2026):**
-- `--prefix-ratio 0.5` → ~90% cache hit rate
-- `--prefix-ratio 0.7` → ~93% cache hit rate
-- `--prefix-ratio 0.9` → ~97-98% cache hit rate
+- `--prefix-ratio 0.5` → ~67-91% cache hit rate (instance-dependent)
+- `--prefix-ratio 0.7` → ~77-93% cache hit rate (instance-dependent)
+- `--prefix-ratio 0.9` → ~87-98% cache hit rate
 - Round-robin baseline → ~11-13% (1/8 chance with 8 backends)
+
+> **Note:** Cache hit rates at lower prefix ratios vary significantly between instances and
+> code versions. The batched route learning optimization (21.1) trades some cache affinity
+> for reduced SMP overhead, which can lower hit rates at sub-0.9 ratios.
 
 ### Token Size Buckets
 
@@ -237,22 +261,35 @@ The `--client-tokenize` flag moves tokenization from Ranvier to the benchmark cl
 
 ### Trade-offs by Model Size
 
-#### CodeLlama-13b (February 2026 — 30 users, 10 minutes, post-fix)
+#### CodeLlama-13b — Client Tokenization Results
+
+**bb20555 (Feb 21, Instance 5 — 30 users, 10 minutes):**
+
+| Metric | Server Tokenize (30u 30m) | Client Tokenize (30u 10m) | Notes |
+|--------|--------------------------|--------------------------|-------|
+| Routing overhead | ~10ms | ~0.4ms | **25x lower** |
+| P99 TTFT Change | **-51.3%** | +18.3% | Client-tok hot-spots |
+| Throughput change | **+13.9%** | +5.6% | Server-tok better |
+| Cache Hit Rate | 53.6% | 54.0% | Same |
+
+> **Warning:** On bb20555, client tokenization causes **hot-spotting** at 30 users. Without
+> the ~10ms server-side tokenization stagger, cross-shard routing decisions happen
+> near-simultaneously, causing burst routing to the same backends. This is tracked in
+> backlog 20.11 (cross-shard speculative load synchronization).
+
+**Instance 3 (Feb 14, pre-batched-routes — 30 users, 10 minutes):**
 
 | Metric | Server Tokenize | Client Tokenize | Difference |
 |--------|-----------------|-----------------|------------|
 | Routing overhead | ~10ms | ~0.3ms | **32x lower** |
 | Throughput change | +13.7% | **+19.4%** | Better with client tok |
-| XLarge Improvement % | ~36% | 9.6% | Lower (see below) |
-| XLarge Hit P50 | ~890ms | 943ms | ~same |
-| XLarge Miss P50 | ~1300ms | 1043ms | -20% faster misses |
 | P99 TTFT Change | **-79%** | **-83.6%** | Comparable |
 | Cache Hit Rate | 97.6% | 97.4% | Same |
 
-> **Note:** With the stale connection fix, client tokenization now shows its true benefit:
-> **+19.4% throughput** (vs +13.7% server-side) and **-83.6% P99** (vs -79% server-side).
-> Pre-fix data showed -6.4% throughput and -30% P99 due to stale connections disproportionately
-> affecting the prefix-aware side.
+> **Note:** On Instance 3 (with per-request SMP broadcast), client tokenization performed
+> excellently: **+19.4% throughput** and **-83.6% P99**. The per-request SMP broadcast
+> kept all shards synchronized, preventing the cross-shard burst routing that causes
+> hot-spotting on bb20555.
 
 #### Llama-3.1-8B (January 2026 — 20 users, 30 minutes)
 
@@ -341,30 +378,30 @@ With client tokenization, **cache misses also get faster** because the server sk
   --prefix-ratio 0.9
 ```
 
-**Expected Results (8B model, 8x A100, load-aware routing + stale connection fix):**
+**Expected Results (8B model, 8x A100, bb20555+ with speculative load increment):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
-| Cache Hit Rate | ~12% | ~98% | 8x more cache hits |
-| XLarge Improvement | ~0% | **~32%** | Consistent across instances |
+| Cache Hit Rate | ~12% | ~65-95% | Instance/config dependent |
+| P99 TTFT | ~500-600ms | ~500-600ms | Flat for 8B (too fast) |
 | Incomplete Rate | 0% | 0% | Fixed by stale connection retry |
-| Throughput | ~44 req/s | ~44 req/s | ~same for 8B |
+| Throughput | ~44-50 req/s | ~44-47 req/s | ~same for 8B |
 
 **For 13B models, expect larger improvements (especially P99 and throughput):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
-| XLarge Improvement | ~0% | **~33-39%** | Instance-dependent |
-| Overall P99 TTFT | ~4500-6800ms | ~940-1000ms | **-79 to -85%** tail latency |
-| Throughput | ~14-36 req/s | ~15-44 req/s | **+14-22%** higher |
+| Cache Hit Rate | ~12% | ~54-89% | Varies with concurrency |
+| Overall P99 TTFT | ~4500-6800ms | ~2500-3500ms | **-24% to -51%** tail latency |
+| Throughput | ~14-36 req/s | ~15-41 req/s | **+3-14%** higher |
 
 **How to interpret:**
-- **Cache hit rate** is the headline metric (12% → 98%) — always consistent
-- **P99 tail latency** is the strongest win for 13B — consistently -79% or better
-- **Per-bucket improvement** shows XLarge benefit (~32-39%)
+- **Cache hit rate** improves 4-7x over round-robin — always a significant gain
+- **P99 tail latency** is the strongest win for 13B — -24% to -51% at default prefix ratio
 - **Incomplete rate** should be 0% — if you see >1%, check for connection pool issues
 - **Overall TTFT** may look worse for 8B due to small prefix overhead in aggregate
 - Focus on **Large/XLarge buckets** where caching matters most
+- Results are instance-dependent; 13B benefits most under sustained load (30u 30m)
 
 ---
 
@@ -383,22 +420,22 @@ With client tokenization, **cache misses also get faster** because the server sk
   --prefix-ratio 0.85
 ```
 
-**Measured Results (February 2026, 8B, 64 users, 15m, prefix-only, post-fix):**
+**Measured Results (February 2026, 8B, 64 users, 15m, prefix-only):**
 
-| Metric | Result | Alert Threshold |
-|--------|--------|-----------------|
-| Error Rate | **0%** | > 5% |
-| P99 TTFT | **600ms** | > 5000ms |
-| Requests/sec | **22.0** (successful TTFT) | < 2.0 |
-| Cache Hit Rate | **98.0%** | < 40% |
-| XLarge Improvement | **29.0%** | |
-| Incomplete Rate | **0%** | |
-| Validation | **PASSED** | |
+| Metric | Instance 3 (Feb 14) | Instance 5 (Feb 21, bb20555) | Alert Threshold |
+|--------|---------------------|------------------------------|-----------------|
+| Error Rate | **0%** | **0%** | > 5% |
+| P99 TTFT | **600ms** | **1700ms** | > 5000ms |
+| Requests/sec | **22.0** | **24.1** | < 2.0 |
+| Cache Hit Rate | **98.0%** | **40.5%** | < 40% |
+| Incomplete Rate | **0%** | **0%** | |
+| Validation | **PASSED** | **PASSED** | |
 
-**Notes:** XLarge improvement is lower than 20-user runs (~32-40%) because contention compresses
-the hit/miss gap — even cache hits wait in backend queues at 64 users. Load distribution was
-virtually even (~6600 across 3 Ranvier nodes). All 19,841 requests completed with zero errors
-and zero incomplete. Post-fix run shows higher XLarge (29% vs pre-fix 18%) and 0% incomplete.
+**Notes:** The bb20555 run shows lower cache hit rate (40.5% vs 98.0%) at 64 users — the
+batched route learning flush interval (10ms) allows more cross-shard routing divergence under
+high concurrency. Despite lower cache affinity, the system remains completely stable: zero
+errors, zero incompletes, and near-perfect 3-way node balance (7256/7235/7213). This validates
+that the speculative load increment prevents hot-spotting even at extreme concurrency.
 
 **Monitoring Commands:**
 ```bash
@@ -502,7 +539,9 @@ tail -f /tmp/vllm_gpu*.log
   --prompt-dist stress
 ```
 
-**Expected:** Higher cache benefit than 8B (~35% XLarge TTFT improvement, up to -87% P99 and +27% throughput at 30 users). Requires `--max-model-len 8192` on 40GB GPUs to fit in memory.
+**Expected:** Higher cache benefit than 8B. At default prefix ratio 0.9: P99 -24% to -51%,
+throughput +3% to +14% at 10-30 users. Best results under sustained high concurrency (30u 30m).
+Requires `--max-model-len 8192` on 40GB GPUs to fit in memory.
 
 #### 6d. Large Model (70B parameters)
 
@@ -677,22 +716,23 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 70B (TP=4) | 16 | 15m | XLarge | ~2108ms | ~1069ms | ~49% | Feb 2026, 40GB A100s, 2 backends, 4K context |
 
 **Key insights:**
-- **P99 tail latency is the strongest win** — -79% or better for 13B
-- **XLarge improvement typically 32-39%** — consistent across instances post-fix
+- **P99 tail latency is the strongest win for 13B** — -24% to -51% on bb20555, -79% to -85% on Instance 3
 - **0% incomplete rate** — stale connection retry (Feb 9 fix) eliminated phantom timeouts
+- **Results are instance/architecture dependent** — cache hit rates range 54-98% across runs
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
 - **Small prefixes have overhead** — Routing cost exceeds cache benefit
 - **Larger models amplify benefits** — 13B sees bigger throughput/P99 gains than 8B
-- **Throughput improves for 13B** — +14-15% with 0% wasted connections
+- **Throughput improves for 13B** — +3% to +22% depending on instance and concurrency
+- **Batched route learning trades cache affinity for SMP efficiency** — lower cache hit rates but less overhead
 
 ### Cache Hit Rate
 
-| Prefix Ratio | Round-Robin | Prefix-Aware | Source |
-|--------------|-------------|--------------|--------|
-| 0.5 (50% shared) | ~11% | **~90%** | Feb 2026 measured |
-| 0.7 (70% shared) | ~13% | **~93%** | Feb 2026 measured |
-| 0.9 (90% shared) | ~12% | **~97-98%** | Feb 2026 measured |
-| 0.95 (95% shared) | ~12.5% | ~98%+ | Estimated |
+| Prefix Ratio | Round-Robin | Prefix-Aware (Instance 3) | Prefix-Aware (bb20555) | Notes |
+|--------------|-------------|--------------------------|----------------------|-------|
+| 0.5 (50% shared) | ~11% | **~91%** | **~67%** | Lower with batched routes |
+| 0.7 (70% shared) | ~13% | **~90%** | **~77%** | Lower with batched routes |
+| 0.9 (90% shared) | ~12% | **~97-98%** | **~87-95%** | Still strong |
+| 0.95 (95% shared) | ~12.5% | ~98%+ | ~95%+ | Estimated |
 
 ### Throughput Scaling
 
@@ -707,7 +747,85 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 ## Real Benchmark Results
 
-### February 2026 — With Load-Aware Routing + Stale Connection Fix
+### February 21, 2026 — bb20555: Speculative Load Increment + Batched Route Learning
+
+> **Commit:** bb20555. **vLLM:** v0.15.1 (pinned). **Instance:** Lambda Labs 8xA100 40GB.
+>
+> This run includes all optimizations: speculative load increment (20.9), batched local
+> route learning (21.1), tokenizer thread pool (enabled by default), and pinned vLLM version.
+> Full `bench-runner.sh --suite all` execution.
+
+#### Core Results (prefix-ratio 0.9, default config)
+
+**CodeLlama-13b:**
+
+| Config | P99 TTFT Change | Throughput | Cache Hit Rate | Status |
+|--------|-----------------|------------|----------------|--------|
+| 10u 10m | **-26.8%** | flat | 87.7% | Stable |
+| 20u 10m run 1 | **-47.5%** | +3.2% | 86.8% | Stable |
+| 20u 10m run 2 | **-23.8%** | +12.8% | 89.1% | Stable |
+| 30u 30m | **-51.3%** | **+13.9%** | 53.6% | Excellent |
+
+**Llama-3.1-8B:**
+
+| Config | P99 TTFT Change | Throughput | Cache Hit Rate | Status |
+|--------|-----------------|------------|----------------|--------|
+| 20u 10m | flat | -2.8% | 94.6% | Neutral |
+| 30u 30m | flat | -4.6% | 64.9% | Slight negative |
+| 64u 15m (stress) | — | 65.1 tok/s | 40.5% | Stable (standalone) |
+| 20u 10m 16K pfx | 0.0% | -5.2% | 96.2% | Neutral |
+
+**Llama-3.1-70B (TP=4, 2 backends, 40GB):**
+
+| Config | P99 TTFT Change | Throughput | Cache Hit Rate | Incompletes |
+|--------|-----------------|------------|----------------|-------------|
+| 16u 15m | +2.6% | -17.7% | 75.4% | 26 → **0** |
+
+70B continues the reliability pattern — incompletes eliminated (0.6% → 0%) at the cost of
+throughput. The 40GB TP=4 config only provides 2 backends, limiting routing surface.
+
+#### Variant Configurations
+
+**Prefix ratio sensitivity (13B 20u 10m):**
+
+| Prefix Ratio | P99 TTFT | Throughput | Cache Hits | Status |
+|--------------|----------|------------|------------|--------|
+| 0.9 (default) | **-24% to -48%** | +3% to +13% | 87-89% | Stable |
+| 0.7 | +86.4% | flat | 76.8% | **Hot-spotting** |
+| 0.5 | +64.4% | -8.4% | 66.7% | **Hot-spotting** |
+
+At prefix ratios below 0.9, more unique prefixes cause unpredictable load distribution.
+The speculative load increment (shard-local) cannot prevent cross-shard burst routing when
+prefix diversity is high. This is tracked in backlog 20.11.
+
+**Client-side tokenization (13B 30u 10m):**
+
+| Mode | P99 TTFT | Throughput | Cache Hits | Status |
+|------|----------|------------|------------|--------|
+| Server tokenize (30u 30m) | **-51.3%** | **+13.9%** | 53.6% | Excellent |
+| Client tokenize (30u 10m) | +18.3% | +5.6% | 54.0% | **Hot-spotting** |
+
+Client-tokenize removes the natural ~10ms stagger from server-side tokenization. Without
+this stagger, cross-shard routing decisions happen near-simultaneously, causing burst routing
+to the same backends. Tracked in backlog 20.11.
+
+#### Comparison with Instance 3 (Feb 10-14) Results
+
+Cache hit rates are systematically lower on bb20555 vs Instance 3 (87-89% vs 97-98% for
+13B 20u). The primary architectural change is batched route learning (21.1) — routes flush
+every 10ms instead of per-request SMP broadcast. This reduces cross-shard synchronization
+frequency, which lowers cache affinity but eliminates SMP overhead on the hot path.
+
+P99 improvements are also weaker (-24% to -51% vs -79% to -85%) but still positive for the
+primary use case. Throughput improvements are comparable (+3% to +14% vs +14% to +22%).
+
+The most significant regression is at lower prefix ratios (0.7, 0.5) which now show hot-spotting
+instead of the -76% to -87% P99 improvements previously documented. Instance variance,
+different GPU thermals, and the batched route learning change all contribute.
+
+---
+
+### February 2026 — With Load-Aware Routing + Stale Connection Fix (Instance 3)
 
 > Load-aware routing (added Feb 2026) prevents backend hotspots by checking queue depth
 > before routing. If the prefix-preferred backend is overloaded, requests fall back to the
@@ -857,7 +975,24 @@ catastrophic. The 80GB test (4 backends) is the reliable reference.
 
 #### Complete Results Matrix (All Runs)
 
-**Post-fix runs (0% incomplete rate):**
+**bb20555 runs (Feb 21, 2026 — speculative load increment + batched route learning):**
+
+| Model | Users | Duration | P99 TTFT Change | Throughput | Cache Hit Rate | Incomplete | Instance |
+|-------|-------|----------|-----------------|------------|----------------|------------|----------|
+| **13B** | **30** | **30m** | **-51.3%** | **+13.9%** | 53.6% | **0%** | 5 |
+| **13B** | **20** | **10m** | **-47.5%** | +3.2% | 86.8% | **0%** | 5 |
+| **13B** | **20** | **10m** | **-23.8%** | +12.8% | 89.1% | **0%** | 5 |
+| **13B** | **10** | **10m** | **-26.8%** | flat | 87.7% | **0%** | 5 |
+| **8B** | **20** | **10m** | flat | -2.8% | 94.6% | **0%** | 5 |
+| **8B** | **30** | **30m** | flat | -4.6% | 64.9% | **0%** | 5 |
+| 8B (64u stress) | 64 | 15m | — | 65.1 tok/s | 40.5% | 0% | 5 |
+| 8B (16K pfx) | 20 | 10m | 0.0% | -5.2% | 96.2% | 0% | 5 |
+| 70B (TP=4, 40GB) | 16 | 15m | +2.6% | -17.7% | 75.4% | 0% (RR: 0.6%) | 5 |
+| 13B (ratio 0.7) | 20 | 10m | +86.4% | flat | 76.8% | 0% | 5 |
+| 13B (ratio 0.5) | 20 | 10m | +64.4% | -8.4% | 66.7% | 0% | 5 |
+| 13B (client tok) | 30 | 10m | +18.3% | +5.6% | 54.0% | 0% | 5 |
+
+**Instance 3 post-fix runs (Feb 10-14, 2026 — 0% incomplete rate, pre-batched-routes):**
 
 | Model | Users | Duration | XLarge Improvement | P99 TTFT Change | Throughput | Cache Hit Rate | Incomplete | Instance |
 |-------|-------|----------|-------------------|-----------------|------------|----------------|------------|----------|
@@ -988,12 +1123,14 @@ Prefix Ratio: 0.9
 
 ### Interpretation
 
-1. **Cache hit rate is the headline**: 12% → 98% means nearly every request benefits from cached KV
+1. **Cache hit rate always improves**: 12% → 54-98% depending on config and instance
 2. **Per-bucket improvement is the real metric**: Overall TTFT can be misleading due to small prefix overhead
-3. **P99 tail latency is the strongest win**: -85% under sustained 30-minute load, with round-robin failing validation
-4. **Throughput improves for larger models**: +22% for 13B because requests aren't stuck behind overloaded backends
-5. **XLarge improvement varies by instance**: Use 30-minute validated runs (33% for 13B, 40% for 8B) as the reliable reference
-6. **Benefit scales with model size**: 70B shows 44% XLarge improvement (highest of any model). P99/throughput are flat because 70B is compute-bound, not queue-bound — the benefit is per-request, not aggregate
+3. **P99 tail latency is the strongest win for 13B**: -24% to -85% depending on architecture version
+4. **Throughput improves for 13B**: +3% to +22% depending on instance and concurrency level
+5. **Results are instance/architecture dependent**: Cache hit rates, P99 improvements, and hot-spotting behavior vary
+6. **Default prefix ratio (0.9) is the reliable operating point**: Lower ratios may hot-spot on current architecture
+7. **8B is routing-neutral**: Inference too fast for cache savings to matter in aggregate TTFT
+8. **70B benefit is reliability, not speed**: Incompletes eliminated, but throughput cost from cache affinity
 
 ### Value Proposition
 
@@ -1001,54 +1138,86 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Performance by Model Size and Load
 
-| Model | Load | Users | Duration | XLarge TTFT Improvement | Cache Hit Rate | P99 TTFT Change | Notes |
-|-------|------|-------|----------|-------------------------|----------------|-----------------|-------|
-| **Llama-3.1-70B** | **Heavy** | **16** | **30m** | **43.8%** | 97.8% | 0% | Feb 2026, TP=2, 80GB, 4 backends |
-| **CodeLlama-13b** | **Heavy** | **30** | **30m** | **32.8%** | 97.5% | **-85.3%** | Feb 2026, post-fix |
-| **CodeLlama-13b** | **Moderate** | **20** | **10m** | **35.9%** | 97.6% | **-78.7%** | Feb 2026, post-fix |
-| **CodeLlama-13b** | **Normal** | **10** | **10m** | **39.4%** | 96.8% | **-79.1%** | Feb 2026, post-fix |
-| **Llama-3.1-8B** | **Heavy** | **30** | **30m** | **40.5%** | 98.0% | +6.5% | Feb 2026, post-fix |
-| **Llama-3.1-8B** | **Moderate** | **20** | **10m** | **31.6%** | 98.1% | -13.8% | Feb 2026, post-fix |
-| CodeLlama-13b | Heavy | 30 | 30m | 35.0% | 97.9% | -87.0% | Feb 2026, pre-fix |
-| Llama-3.1-8B | Heavy | 30 | 30m | 30.9% | 98.1% | +10.6% | Feb 2026, pre-fix |
-| CodeLlama-13b | Moderate | 20 | 30m | 38.9% | 97.6% | — | Jan 2026 |
-| CodeLlama-13b | Normal | 10 | 10m | 48.2% | 96.4% | — | Jan 2026 |
-| CodeLlama-13b | Heavy | 30 | 10m | 42.9% | 97.5% | — | Jan 2026 |
-| Llama-3.1-8B | Moderate | 20 | 30m | 43.7% | 97.8% | — | Jan 2026 |
-| Llama-3.1-8B | Normal | 10 | 10m | 42.7% | 95.6% | — | Jan 2026 |
-| Llama-3.1-8B | Heavy | 30 | 10m | 25.9% | 97.8% | — | Jan 2026 |
+**bb20555 (Feb 21, Instance 5 — latest architecture):**
+
+| Model | Load | Users | Duration | Cache Hit Rate | P99 TTFT Change | Throughput | Notes |
+|-------|------|-------|----------|----------------|-----------------|------------|-------|
+| **CodeLlama-13b** | **Heavy** | **30** | **30m** | 53.6% | **-51.3%** | **+13.9%** | Best sustained result |
+| **CodeLlama-13b** | **Moderate** | **20** | **10m** | 87-89% | **-24% to -48%** | +3% to +13% | Consistent across runs |
+| **CodeLlama-13b** | **Normal** | **10** | **10m** | 87.7% | **-26.8%** | flat | Stable |
+| **Llama-3.1-8B** | **Heavy** | **30** | **30m** | 64.9% | flat | -4.6% | Routing-neutral |
+| **Llama-3.1-8B** | **Moderate** | **20** | **10m** | 94.6% | flat | -2.8% | Routing-neutral |
+| **Llama-3.1-70B** | **Moderate** | **16** | **15m** | 75.4% | +2.6% | -17.7% | Reliability (0% inc) |
+
+**Instance 3 (Feb 10-14 — pre-batched-routes, higher cache affinity):**
+
+| Model | Load | Users | Duration | Cache Hit Rate | P99 TTFT Change | Throughput | Notes |
+|-------|------|-------|----------|----------------|-----------------|------------|-------|
+| **Llama-3.1-70B** | **Heavy** | **16** | **30m** | 97.8% | 0% | 0% | TP=2, 80GB, 4 backends |
+| **CodeLlama-13b** | **Heavy** | **30** | **30m** | 97.5% | **-85.3%** | **+22.3%** | |
+| **CodeLlama-13b** | **Moderate** | **20** | **10m** | 97.6% | **-78.7%** | **+13.7%** | |
+| **CodeLlama-13b** | **Normal** | **10** | **10m** | 96.8% | **-79.1%** | **+14.6%** | |
+| **Llama-3.1-8B** | **Heavy** | **30** | **30m** | 98.0% | +6.5% | -1.1% | |
+| **Llama-3.1-8B** | **Moderate** | **20** | **10m** | 98.1% | -13.8% | -1.2% | |
+
+<details>
+<summary>Earlier results (Jan 2026, pre-fix — click to expand)</summary>
+
+| Model | Load | Users | Duration | Cache Hit Rate | Notes |
+|-------|------|-------|----------|----------------|-------|
+| CodeLlama-13b | Heavy | 30 | 30m | 97.9% | Pre-fix |
+| Llama-3.1-8B | Heavy | 30 | 30m | 98.1% | Pre-fix |
+| CodeLlama-13b | Moderate | 20 | 30m | 97.6% | Jan 2026 |
+| CodeLlama-13b | Normal | 10 | 10m | 96.4% | Jan 2026 |
+| CodeLlama-13b | Heavy | 30 | 10m | 97.5% | Jan 2026 |
+| Llama-3.1-8B | Moderate | 20 | 30m | 97.8% | Jan 2026 |
+| Llama-3.1-8B | Normal | 10 | 10m | 95.6% | Jan 2026 |
+| Llama-3.1-8B | Heavy | 30 | 10m | 97.8% | Jan 2026 |
+
+</details>
 
 **Key takeaways:**
-- **XLarge improvement scales with model size** — 28-40% for 8B/13B, 44% for 70B
-- **P99 tail latency** is the strongest win for 13B (-85%); 70B and 8B are flat (compute-bound, not queue-bound)
-- **Throughput increases** +14-22% for 13B with 0% wasted connections (post-fix)
-- **Cache hit rate** is excellent (96-98%) regardless of load, model, or instance
-- **Backend count matters for 70B** — TP=4 (2 backends, 40GB) causes 64% timeouts; TP=2 (4 backends, 80GB) works cleanly
-- **0% incomplete rate** after stale connection retry fix (Feb 9, 2026)
+- **P99 tail latency** is the strongest win for 13B — -24% to -51% (bb20555), -79% to -85% (Instance 3)
+- **Throughput increases** for 13B across both architectures (+3-14% on bb20555, +14-22% on Instance 3)
+- **Cache hit rates** are always much higher than round-robin — 54-98% vs 11-13% baseline
+- **8B is routing-neutral** — inference too fast (~1400ms) for cache savings to matter in aggregate
+- **70B benefit is reliability** — incompletes eliminated, but throughput drops with cache affinity
+- **Backend count matters for 70B** — TP=4 (2 backends, 40GB) limits routing surface
+- **0% incomplete rate** on all post-fix runs (Feb 9, 2026 onwards)
 
 #### Impact of Prefix Sharing Ratio
 
 Not all workloads have 90% prefix sharing. These tests show how improvement scales
-(CodeLlama-13b, 20 users, 10 minutes, February 2026):
+(CodeLlama-13b, 20 users, 10 minutes):
 
-| Prefix Ratio | Cache Hit Rate | XLarge Improvement | P99 TTFT Change | Throughput | Validation |
-|--------------|----------------|--------------------|-----------------|------------|------------|
-| 0.9 (default) | 97.6% | 35.9% | -78.7% | +13.7% | PASSED (post-fix) |
-| 0.7 | 90.0% | n/a† | -86.9% | +31.5% | PASSED (post-fix) |
-| 0.5 | 91.0% | 37.3% | -76.1% | +10.0% | PASSED (post-fix) |
+**bb20555 (Feb 21, Instance 5 — speculative load increment + batched route learning):**
 
-†XLarge improvement at 0.7 reported -1144% due to very few XLarge misses (P50 64ms from
-tiny sample). The hit P50 of 798ms is reliable; the miss sample is too small.
+| Prefix Ratio | Cache Hit Rate | P99 TTFT Change | Throughput | Validation |
+|--------------|----------------|-----------------|------------|------------|
+| 0.9 (default) | 87-89% | **-24% to -48%** | +3% to +13% | PASSED |
+| 0.7 | 76.8% | +86.4% (hot-spotting) | flat | PASSED→FAILED |
+| 0.5 | 66.7% | +64.4% (hot-spotting) | -8.4% | PASSED→FAILED |
+
+**Instance 3 (Feb 10-14 — per-request SMP broadcast, pre-batched-routes):**
+
+| Prefix Ratio | Cache Hit Rate | P99 TTFT Change | Throughput | Validation |
+|--------------|----------------|-----------------|------------|------------|
+| 0.9 (default) | 97.6% | -78.7% | +13.7% | PASSED |
+| 0.7 | 90.0% | -86.9% | +31.5% | PASSED |
+| 0.5 | 91.0% | -76.1% | +10.0% | PASSED |
 
 **Key findings:**
-- **Improvement holds up remarkably well** across prefix ratios — even at 50% sharing, the
-  system delivers 91% cache hit rate and 37% XLarge improvement
-- **P99 tail latency improvement is consistent** — -76% to -87% regardless of prefix ratio
-- **Throughput improves at all levels** — +10% to +32%, with the strongest gains at moderate
-  ratios where load-aware routing prevents more backend pile-ups
-
-This demonstrates prefix-aware routing benefits workloads even when prefix sharing is
-moderate — you don't need 90%+ sharing to see real gains.
+- **At 0.9 prefix ratio**, prefix-aware routing consistently delivers P99 improvements and
+  positive or neutral throughput. This is the recommended operating point.
+- **At lower prefix ratios (0.5-0.7)**, results are highly instance/architecture dependent.
+  Instance 3 (with per-request SMP broadcast) showed strong improvements at all ratios.
+  bb20555 (with batched route learning) shows hot-spotting at these ratios — more unique
+  prefixes overwhelm the shard-local speculative load increment (backlog 20.11).
+- **Cache hit rates are always much higher than round-robin** — even bb20555 at 0.5 ratio
+  achieves 66.7% vs ~11% baseline. The benefit is real, but load distribution suffers.
+- **Recommendation:** Use `--prefix-ratio 0.9` (default) for production workloads. If your
+  workload has lower natural prefix sharing, monitor for hot-spotting via node request
+  distribution in Prometheus metrics.
 
 #### When Prefix-Aware Routing Helps (and When It Doesn't)
 
@@ -1102,7 +1271,24 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 
 ### Completed (February 2026)
 
-**Post-fix (stale connection retry, Feb 9):**
+**bb20555 full suite (Feb 21, Instance 5 — speculative load increment + batched route learning):**
+
+| # | Config | Status | Result |
+|---|--------|--------|--------|
+| 1 | 13B, 20u, 10m | **Done (2x)** | P99 -47.5%/-23.8%, throughput +3%/+13%, 87-89% cache |
+| 2 | 8B, 20u, 10m | **Done** | P99 flat, throughput -2.8%, 94.6% cache |
+| 3 | 13B, 10u, 10m | **Done** | P99 -26.8%, throughput flat, 87.7% cache |
+| 4 | 13B, 30u, 30m (validated) | **Done** | P99 **-51.3%**, throughput **+13.9%**, 53.6% cache |
+| 5 | 8B, 30u, 30m (validated) | **Done** | P99 flat, throughput -4.6%, 64.9% cache |
+| 6 | 13B, prefix ratio 0.7 | **Done** | P99 +86.4% **hot-spotting**, 76.8% cache |
+| 7 | 13B, prefix ratio 0.5 | **Done** | P99 +64.4% **hot-spotting**, 66.7% cache |
+| 8 | 13B, client tokenization | **Done** | P99 +18.3% hot-spotting, throughput +5.6%, 54% cache |
+| 9 | 8B, 64u, 15m stress test | **Done** | P99 1700ms, 24.1 req/s, 40.5% cache, 0 errors |
+| 10 | 70B, 16u, 15m (TP=4, 40GB) | **Done** | P99 +2.6%, throughput -17.7%, incompletes 0.6%→0% |
+| 11 | 8B, 20u, 10m, 16K prefix | **Done** | P99 0%, throughput -5.2%, 96.2% cache |
+
+<details>
+<summary>Instance 3 post-fix results (Feb 10-14, pre-batched-routes — click to expand)</summary>
 
 | # | Config | Status | Result |
 |---|--------|--------|--------|
@@ -1120,23 +1306,33 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 | 10b | 70B, 16u, 15m (TP=2, 80GB) | **Done** | XLarge 48.0%, P99 -33.3%, 0% incomplete both sides |
 | 10c | 70B, 16u, 30m (TP=2, 80GB) | **Done** | XLarge 43.8%, P99 ~same (sustained), 0% incomplete |
 
-**Pre-fix (runs 4-11 collected before stale connection fix — TTFT metrics valid):**
+</details>
+
+<details>
+<summary>Pre-fix results (before stale connection retry — click to expand)</summary>
 
 | # | Config | Status | Result |
 |---|--------|--------|--------|
-| ~~4~~ | ~~13B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 35.0%, P99 -87.0%~~ (re-run above) |
-| ~~5~~ | ~~8B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 30.9%~~ (re-run above) |
-| ~~6~~ | ~~13B, prefix ratio 0.7~~ | ~~Done~~ | ~~XLarge 33.4%, P99 -76.3%~~ (re-run above) |
-| ~~7~~ | ~~13B, prefix ratio 0.5~~ | ~~Done~~ | ~~XLarge 43.5%, P99 -81.8%~~ (re-run above) |
-| ~~8~~ | ~~13B, client tokenization~~ | ~~Done~~ | ~~XLarge 24.8%, P99 -30.0%~~ (re-run above) |
-| ~~9~~ | ~~8B, 64u, 15m stress test~~ | ~~Done~~ | ~~XLarge 18.0%, 0 errors~~ (re-run above) |
-| ~~11~~ | ~~8B, 20u, 10m, 16K prefix~~ | ~~Done~~ | ~~XLarge 43.6%, P99 -24.6%~~ (re-run above) |
+| ~~4~~ | ~~13B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 35.0%, P99 -87.0%~~ |
+| ~~5~~ | ~~8B, 30u, 30m (validated)~~ | ~~Done~~ | ~~XLarge 30.9%~~ |
+| ~~6~~ | ~~13B, prefix ratio 0.7~~ | ~~Done~~ | ~~XLarge 33.4%, P99 -76.3%~~ |
+| ~~7~~ | ~~13B, prefix ratio 0.5~~ | ~~Done~~ | ~~XLarge 43.5%, P99 -81.8%~~ |
+| ~~8~~ | ~~13B, client tokenization~~ | ~~Done~~ | ~~XLarge 24.8%, P99 -30.0%~~ |
+| ~~9~~ | ~~8B, 64u, 15m stress test~~ | ~~Done~~ | ~~XLarge 18.0%, 0 errors~~ |
+| ~~11~~ | ~~8B, 20u, 10m, 16K prefix~~ | ~~Done~~ | ~~XLarge 43.6%, P99 -24.6%~~ |
+
+</details>
 
 ### All Benchmarks Complete
 
-All benchmark configurations have been run with the stale connection fix (Feb 9, 2026).
-Every run shows 0% incomplete rate on the prefix-aware side. The 70B model was tested on
-both 40GB A100s (TP=4, 2 backends) and 80GB A100s (TP=2, 4 backends, 32K context).
+Three full benchmark rounds have been completed:
+1. **Pre-fix** (Jan-Feb 2026, Instance 1-2) — baseline with stale connection issues (30-37% incomplete)
+2. **Post-fix** (Feb 10-14, Instance 3) — stale connection retry fixed, per-request SMP broadcast
+3. **bb20555** (Feb 21, Instance 5) — speculative load increment + batched route learning + vLLM v0.15.1 pinned
+
+Every run on bb20555 shows 0% incomplete rate. Default config (prefix-ratio 0.9) delivers
+consistent P99 improvements for 13B (-24% to -51%). Lower prefix ratios and client-tokenize
+show hot-spotting — tracked in backlog 20.11 (cross-shard speculative load synchronization).
 
 ---
 
