@@ -78,6 +78,11 @@ Environment Variables:
                                   on both Ranvier and vLLM.
         TOKENIZER_PATH          - Path to tokenizer JSON file (default: assets/gpt2.json)
                                   If file doesn't exist, falls back to loading from VLLM_MODEL
+        CHAT_TEMPLATE_FORMAT    - Chat template format for tokenization (default: none)
+                                  Must match RANVIER_CHAT_TEMPLATE_FORMAT on the server.
+                                  Values: "none" (legacy), "llama3", "chatml", "mistral"
+                                  When set, tokenize_messages() and messages_to_prompt()
+                                  format messages according to the model's chat template.
 
 Usage:
     # 8 backends on same host with sequential ports (simplest for multi-GPU):
@@ -148,6 +153,7 @@ from locust.runners import MasterRunner, WorkerRunner
 # Install with: pip install tokenizers
 _tokenizer = None
 _client_tokenize_enabled = False
+_chat_template_format = os.environ.get("CHAT_TEMPLATE_FORMAT", "none").lower()
 
 def _init_client_tokenizer():
     """Initialize client-side tokenizer if CLIENT_TOKENIZE is enabled."""
@@ -181,8 +187,78 @@ def _init_client_tokenizer():
         logger.warning(f"Failed to initialize client tokenizer: {e}")
         return False
 
+def _format_messages_as_prompt(messages: List[dict], include_generation_prompt: bool = True) -> str:
+    """Format chat messages into a prompt string using the configured chat template.
+
+    The format is controlled by the CHAT_TEMPLATE_FORMAT env var:
+      - "none" (default): Legacy format "<|role|>\\ncontent" joined with "\\n"
+      - "llama3": Llama 3 format with <|start_header_id|>, <|eot_id|>, etc.
+      - "chatml": ChatML format with <|im_start|>, <|im_end|>
+      - "mistral": Mistral Instruct format with [INST]/[/INST]
+
+    Must match RANVIER_CHAT_TEMPLATE_FORMAT on the server side.
+    See src/chat_template.hpp for the C++ implementation.
+    """
+    fmt = _chat_template_format
+    parts: List[str] = []
+
+    if fmt == "llama3" or fmt == "llama-3" or fmt == "llama":
+        for idx, msg in enumerate(messages):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if idx == 0:
+                parts.append(f"<|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>")
+            else:
+                parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>")
+        if include_generation_prompt:
+            parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        return "".join(parts)
+
+    elif fmt == "chatml" or fmt == "qwen" or fmt == "deepseek":
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        if include_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+
+    elif fmt == "mistral":
+        result = ""
+        for idx, msg in enumerate(messages):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                if idx == 0:
+                    result += "<s>"
+                result += f"[INST] {content}\n\n"
+            elif role == "user":
+                if result.endswith("\n\n"):
+                    # Continuing after system message
+                    result += f"{content} [/INST]"
+                elif idx == 0:
+                    result += f"<s>[INST] {content} [/INST]"
+                else:
+                    result += f"[INST] {content} [/INST]"
+            else:
+                # assistant
+                result += f"{content}</s>"
+        return result
+
+    else:
+        # Legacy "none" format
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"<|{role}|>\n{content}")
+        return "\n".join(parts)
+
+
 def tokenize_messages(messages: List[dict]) -> Optional[List[int]]:
     """Tokenize chat messages and return token IDs.
+
+    Uses the chat template format configured via CHAT_TEMPLATE_FORMAT env var
+    so that token IDs match what Ranvier produces server-side.
 
     Returns None if client tokenization is disabled or fails.
     """
@@ -190,16 +266,7 @@ def tokenize_messages(messages: List[dict]) -> Optional[List[int]]:
         return None
 
     try:
-        # Convert messages to a single string (chat template style)
-        # This matches how vLLM/HuggingFace typically process chat messages
-        text_parts = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            text_parts.append(f"<|{role}|>\n{content}")
-        text = "\n".join(text_parts)
-
-        # Tokenize
+        text = _format_messages_as_prompt(messages)
         encoding = _tokenizer.encode(text)
         return encoding.ids
     except Exception as e:
@@ -214,10 +281,10 @@ def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
     The prefix_token_count tells Ranvier how many tokens constitute the
     "shared prefix" (system messages) for prefix-aware routing.
 
-    IMPORTANT: The tokenization format must match what Ranvier's
-    extract_system_messages() produces: raw content concatenated with "\n"
-    separators between messages, with NO trailing newline.
-    See src/request_rewriter.hpp extract_system_messages().
+    When using a chat template format, the system prefix includes the
+    template's wrapping tokens (e.g. <|start_header_id|>, <|eot_id|> for
+    llama3).  This matches what Ranvier's extract_text_with_boundary_info()
+    produces with the same chat template configured.
 
     Returns None if:
     - Client tokenization is disabled
@@ -228,22 +295,23 @@ def tokenize_system_messages(messages: List[dict]) -> Optional[int]:
         return None
 
     try:
-        # Extract system message content only (matching Ranvier's extract_system_messages)
-        system_parts = []
-        for msg in messages:
-            if msg.get("role") == "system":
-                content = msg.get("content", "")
-                if content:
-                    system_parts.append(content)
+        # Extract only system messages
+        system_msgs = [msg for msg in messages if msg.get("role") == "system"
+                       and msg.get("content")]
 
-        if not system_parts:
+        if not system_msgs:
             return None
 
-        # Format must match Ranvier's extract_system_messages():
-        # - Multiple system messages: "content1\ncontent2"
-        # - Single system message: "content"
-        # No trailing "\n" — separators between messages only.
-        system_text = "\n".join(system_parts)
+        fmt = _chat_template_format
+        if fmt == "none" or fmt == "":
+            # Legacy format: raw content concatenated with "\n" separators.
+            # Must match Ranvier's extract_system_messages() output.
+            system_text = "\n".join(msg["content"] for msg in system_msgs)
+        else:
+            # Chat template format: format system messages using the template.
+            # Include wrapping tokens but NOT the generation prompt.
+            system_text = _format_messages_as_prompt(system_msgs, include_generation_prompt=False)
+
         encoding = _tokenizer.encode(system_text)
         return len(encoding.ids)
     except Exception as e:
@@ -256,12 +324,7 @@ def messages_to_prompt(messages: List[dict]) -> str:
 
     Uses the same format as tokenize_messages for consistency.
     """
-    text_parts = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        text_parts.append(f"<|{role}|>\n{content}")
-    return "\n".join(text_parts)
+    return _format_messages_as_prompt(messages)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -3261,6 +3324,7 @@ def on_test_start(environment, **kwargs):
     if _init_client_tokenizer():
         logger.info("Client-side tokenization ENABLED")
         logger.info("  Endpoint: /v1/completions (supports prompt_token_ids)")
+        logger.info("  Chat template: %s", _chat_template_format)
         logger.info("  Ranvier: uses client tokens for routing (bypasses local tokenization)")
         logger.info("  vLLM: skips tokenization (uses prompt_token_ids directly)")
         logger.info("  Prefix hints: prefix_token_count sent for system messages")

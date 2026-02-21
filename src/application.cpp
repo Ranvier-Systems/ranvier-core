@@ -71,6 +71,11 @@ seastar::future<> Application::init_tokenizer() {
                 // Cache JSON for loading on each shard
                 _tokenizer_json = std::string(buf.get(), buf.size());
                 log_main.info("Tokenizer JSON loaded: {} bytes", _tokenizer_json.size());
+                auto tpl_fmt = parse_chat_template_format(_config.assets.chat_template_format);
+                if (tpl_fmt != ChatTemplateFormat::none) {
+                    log_main.info("Chat template format: {} (tokenization will match vLLM)",
+                                  chat_template_format_name(tpl_fmt));
+                }
 
                 // Start sharded tokenizer service (one instance per core for thread safety)
                 return _tokenizer.start().then([this] {
@@ -125,6 +130,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.min_prefix_boundary_tokens = config.routing.min_prefix_boundary_tokens;
     cfg.accept_client_prefix_boundary = config.routing.accept_client_prefix_boundary;
     cfg.enable_multi_depth_routing = config.routing.enable_multi_depth_routing;
+    cfg.chat_template = ChatTemplate(parse_chat_template_format(config.assets.chat_template_format));
     // Timeout settings
     cfg.connect_timeout = config.timeouts.connect_timeout;
     cfg.request_timeout = config.timeouts.request_timeout;

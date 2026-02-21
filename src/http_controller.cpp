@@ -830,8 +830,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             // JSON re-parsing in the boundary detection phase below.
             // Only request formatted_messages when multi-depth routing needs them —
             // skips N per-message string allocations on the common path.
+            // The chat template controls message formatting (e.g. llama3, chatml)
+            // so that tokenized output aligns with vLLM's apply_chat_template().
             text_extraction = RequestRewriter::extract_text_with_boundary_info(
-                body_view, _config.enable_multi_depth_routing);
+                body_view, _config.enable_multi_depth_routing, _config.chat_template);
             std::string_view text_to_tokenize = text_extraction.has_value()
                 ? std::string_view(text_extraction->text)
                 : body_view;
@@ -954,7 +956,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // Lazily compute text extraction if not already done (client-tokens path)
         if (!text_extraction.has_value()) {
             text_extraction = RequestRewriter::extract_text_with_boundary_info(
-                body_view, _config.enable_multi_depth_routing);
+                body_view, _config.enable_multi_depth_routing, _config.chat_template);
         }
 
         // For multi-depth routing, calculate boundaries at each message
