@@ -93,7 +93,7 @@ inline std::string_view chat_template_format_name(ChatTemplateFormat fmt) {
 // ---------------------------------------------------------------------------
 class ChatTemplate {
 public:
-    explicit ChatTemplate(ChatTemplateFormat fmt = ChatTemplateFormat::none)
+    ChatTemplate(ChatTemplateFormat fmt = ChatTemplateFormat::none)
         : _format(fmt) {}
 
     ChatTemplateFormat format() const { return _format; }
