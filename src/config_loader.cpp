@@ -202,6 +202,10 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_TOKENIZER_THREAD_POOL_MAX_TEXT")) {
         assets.tokenizer_thread_pool_max_text = *v;
     }
+    // Local fallback semaphore override
+    if (auto v = get_env_as<size_t>("RANVIER_TOKENIZER_LOCAL_FALLBACK_MAX_CONCURRENT")) {
+        assets.tokenizer_local_fallback_max_concurrent = *v;
+    }
 
     // TLS overrides
     if (auto v = get_env("RANVIER_TLS_ENABLED")) {
@@ -691,6 +695,9 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (a["tokenizer_thread_pool_max_text"]) {
                 config.assets.tokenizer_thread_pool_max_text = a["tokenizer_thread_pool_max_text"].as<size_t>();
+            }
+            if (a["tokenizer_local_fallback_max_concurrent"]) {
+                config.assets.tokenizer_local_fallback_max_concurrent = a["tokenizer_local_fallback_max_concurrent"].as<size_t>();
             }
         }
 

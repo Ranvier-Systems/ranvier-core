@@ -2779,12 +2779,13 @@ End-to-end trace of an LLM inference request through all phases documented in `d
 
 ### 21.2 Cap Reactor-Blocking Tokenization Fallback
 
-- [ ] **Gate local tokenization fallback with a shard-local semaphore to prevent reactor stalls**
+- [x] **Gate local tokenization fallback with a shard-local semaphore to prevent reactor stalls**
   _Justification:_ When both the thread pool queue is full (Priority 1) and cross-shard dispatch declines (Priority 2), `encode_threaded_async()` at line 352 falls back to `tokenize_locally()` — a synchronous Rust FFI call that blocks the Seastar reactor for 5–13ms. All other requests on that shard stall: no reads, no writes, no timer callbacks. On a system handling 1000 req/s across 8 cores, a 10ms stall on one shard delays ~12 requests. Under load spikes (thread pool saturation + cross-shard backpressure), multiple shards can hit it simultaneously.
   _What to change:_ (a) Add a shard-local `seastar::semaphore _local_tokenize_sem{1}` (or configurable, default 1) that gates Priority 3. (b) Before calling `tokenize_locally()`, attempt `try_wait(_local_tokenize_sem, 1)`. If it fails (another local tokenization is already in progress), return an empty `TokenizationResult` — the caller in `http_controller.cpp` will fall back to hash/random routing. (c) Add `_local_tokenize_sem.signal(1)` after `tokenize_locally()` returns (use RAII or scope guard for exception safety). (d) Add a Prometheus counter `ranvier_tokenizer_local_fallback_rejected` for when the semaphore is full. Expose `_cross_shard_local_fallbacks` as a counter if not already. Note: `tokenize_locally()` is synchronous (Rust FFI), so you cannot use `seastar::get_units()` (async wait) — the caller must fail fast with `try_wait()`.
   _Location:_ `src/tokenizer_service.cpp:295-374`, `src/tokenizer_service.hpp`
   _Complexity:_ Low
   _Priority:_ P1 — Performance; 5–13ms reactor stall per shard on fallback path
+  _Completed:_ 2026-02-21
 
 ### 21.3 Replace `std::mutex` in Async Persistence with Lock-Free Queue
 

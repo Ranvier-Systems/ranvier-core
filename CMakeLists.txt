@@ -815,6 +815,24 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(tokenizer_thread_pool_test)
 
+    # TokenizerService Unit Tests (Requires Seastar types for semaphore, metrics)
+    # Tests semaphore-gated local tokenization fallback (Backlog 21.2),
+    # counter bookkeeping, configuration, and Seastar API contract assumptions.
+    add_executable(tokenizer_service_test
+      tests/unit/tokenizer_service_test.cpp
+      src/tokenizer_service.cpp
+      src/tokenizer_thread_pool.cpp
+    )
+    target_include_directories(tokenizer_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(tokenizer_service_test
+      PRIVATE
+      Seastar::seastar
+      tokenizers_cpp
+      absl::flat_hash_map
+      GTest::gtest_main
+    )
+    gtest_discover_tests(tokenizer_service_test)
+
     # RouterService Integration Tests (Seastar-dependent)
     # Tests the core routing brain: route learning, TTL, backend lifecycle, draining mode.
     # Links against multiple src/*.cpp files for full RouterService + GossipService compilation.
