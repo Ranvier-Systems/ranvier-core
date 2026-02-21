@@ -844,6 +844,35 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     g_shard_state = std::make_unique<ShardLocalState>();
     g_shard_state->init(routing_config);
 
+    // Read RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS env var (default: 10ms)
+    // Parsed once on shard 0, distributed to all shards in initialize_shards()
+    const char* flush_env = std::getenv("RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS");
+    if (flush_env && flush_env[0] != '\0') {
+        auto parsed = parse_uint32(flush_env);
+        if (parsed.has_value()) {
+            uint32_t val = *parsed;
+            if (val < 1 || val > 1000) {
+                log_router.warn("RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS={} out of range [1, 1000], "
+                               "using default {}ms", val,
+                               RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count());
+            } else {
+                _flush_interval = std::chrono::milliseconds{val};
+                if (val < 2) {
+                    log_router.warn("RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS={}: values below 2ms "
+                                   "may cause high SMP overhead on multi-core systems", val);
+                } else if (val > 50) {
+                    log_router.warn("RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS={}: values above 50ms "
+                                   "may cause stale routes and reduced cache hit rates", val);
+                }
+                log_router.info("Route batch flush interval configured: {}ms", val);
+            }
+        } else {
+            log_router.warn("RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS='{}' is not a valid integer, "
+                           "using default {}ms", flush_env,
+                           RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count());
+        }
+    }
+
     // Log active hash strategy for operational visibility
     const char* strategy_name = "jump";
     switch (routing_config.hash_strategy) {
@@ -1095,8 +1124,10 @@ seastar::future<> RouterService::initialize_shards() {
             }
 
             // Start per-shard local batch flush timers on ALL shards
-            return seastar::smp::invoke_on_all([] {
-                start_local_batch_timer();
+            // Pass the configured flush interval (read once on shard 0, consistent across shards)
+            auto interval = _flush_interval;
+            return seastar::smp::invoke_on_all([interval] {
+                start_local_batch_timer(interval);
             });
         }).then([] {
             // Start per-shard cross-shard load sync timers on ALL shards
@@ -2059,9 +2090,9 @@ void RouterService::start_batch_flush_timer() {
         });
     });
 
-    _batch_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
+    _batch_flush_timer.arm_periodic(_flush_interval);
     log_router.info("Route batch flush timer started (interval: {}ms, max_batch: {}, max_buffer: {})",
-                    RouteBatchConfig::FLUSH_INTERVAL.count(),
+                    _flush_interval.count(),
                     RouteBatchConfig::MAX_BATCH_SIZE,
                     RouteBatchConfig::MAX_BUFFER_SIZE);
 }
@@ -2404,7 +2435,7 @@ seastar::future<> RouterService::flush_local_route_batch() {
 //   3. Drains remaining buffer with one final flush
 //
 
-void RouterService::start_local_batch_timer() {
+void RouterService::start_local_batch_timer(std::chrono::milliseconds flush_interval) {
     if (!g_shard_state) return;
     auto& state = shard_state();
 
@@ -2420,9 +2451,9 @@ void RouterService::start_local_batch_timer() {
         });
     });
 
-    state.local_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
+    state.local_flush_timer.arm_periodic(flush_interval);
     log_router.info("Shard {}: Local route batch flush timer started (interval: {}ms)",
-                    seastar::this_shard_id(), RouteBatchConfig::FLUSH_INTERVAL.count());
+                    seastar::this_shard_id(), flush_interval.count());
 }
 
 seastar::future<> RouterService::stop_local_batch_timer() {

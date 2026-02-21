@@ -59,8 +59,9 @@ struct RouteBatchConfig {
     // Drop count chosen to clear ~10% of buffer, reducing drop frequency while preserving recency
     static constexpr size_t OVERFLOW_DROP_COUNT = 1000;
 
-    // Timer interval for periodic flushes (ensures bounded latency)
-    static constexpr std::chrono::milliseconds FLUSH_INTERVAL{10};
+    // Default timer interval for periodic flushes (ensures bounded latency)
+    // Configurable via RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS env var (1-1000ms)
+    static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{10};
 };
 
 // Forward declaration
@@ -328,7 +329,8 @@ public:
     // ---- Local Route Batching (shard-local, no cross-shard access on enqueue) ----
 
     // Start per-shard local batch flush timers (call via smp::invoke_on_all)
-    static void start_local_batch_timer();
+    // flush_interval: configured interval from RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
+    static void start_local_batch_timer(std::chrono::milliseconds flush_interval);
 
     // Stop per-shard local batch flush timers and drain pending routes
     // (call via smp::invoke_on_all during shutdown)
@@ -433,6 +435,10 @@ private:
 
     // Counter for routes dropped due to buffer overflow (for metrics and rate-limited logging)
     uint64_t _routes_dropped_overflow = 0;
+
+    // Route batch flush interval, configurable via RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
+    // Read once during construction, distributed to all shards via initialize_shards()
+    std::chrono::milliseconds _flush_interval{RouteBatchConfig::DEFAULT_FLUSH_INTERVAL};
 
     // Callback for pool cleanup when a backend is fully removed
     PoolCleanupCallback _pool_cleanup_callback;
