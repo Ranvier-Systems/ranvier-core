@@ -2197,8 +2197,11 @@ seastar::future<> RouterService::flush_local_route_batch() {
         return seastar::make_ready_future<>();
     }
 
-    // Atomically take ownership of pending routes
+    // Atomically take ownership of pending routes.
+    // Re-reserve immediately so the buffer doesn't regrow through multiple
+    // reallocations (0→1→2→4→...→128) on the next fill cycle.
     auto batch = std::move(state.pending_local_routes);
+    state.pending_local_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
     state.stats.local_batch_flushes++;
 
     // Deduplicate: same (token_hash, backend) → keep first, skip rest
