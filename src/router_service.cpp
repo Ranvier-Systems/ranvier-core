@@ -131,9 +131,6 @@ struct ShardLocalState {
         uint64_t local_batch_flushes = 0;          // Number of local flush operations
         uint64_t local_routes_deduplicated = 0;    // Routes skipped by dedup within batch
         uint64_t local_routes_dropped_overflow = 0; // Routes dropped due to buffer overflow
-        // Cross-shard load sync stats
-        uint64_t load_sync_broadcasts = 0;         // Number of load snapshot broadcasts sent
-        uint64_t load_sync_snapshots_received = 0; // Number of snapshots received from other shards
 
         void reset() {
             cache_hits = 0;
@@ -154,8 +151,6 @@ struct ShardLocalState {
             local_batch_flushes = 0;
             local_routes_deduplicated = 0;
             local_routes_dropped_overflow = 0;
-            load_sync_broadcasts = 0;
-            load_sync_snapshots_received = 0;
         }
     } stats;
 
@@ -178,9 +173,6 @@ struct ShardLocalState {
         RoutingConfig::HashStrategy hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
         double bounded_load_epsilon = 0.25;
         uint64_t p2c_load_bias = 2;
-        // Cross-shard load sync configuration
-        bool cross_shard_load_sync = true;
-        std::chrono::milliseconds cross_shard_load_sync_interval{5};
     } config;
 
     // ========================================================================
@@ -216,36 +208,6 @@ struct ShardLocalState {
     bool gossip_enabled = false;
 
     // ========================================================================
-    // Cross-Shard Load Synchronization
-    // ========================================================================
-    // Each shard periodically broadcasts its active_requests snapshot to all
-    // other shards. This gives routing decisions a global load view, preventing
-    // multiple shards from routing to the same "least loaded" backend when they
-    // each only see their own shard's counters.
-    //
-    // Storage: per-source-shard snapshots, indexed by shard_id.
-    // On each broadcast, the receiving shard overwrites its entry for the source
-    // shard and recomputes the aggregated cross_shard_load map.
-    //
-    // cross_shard_load[backend_id] = sum of active_requests from ALL OTHER shards
-    // This is added to the local active_requests in get_backend_load() to give
-    // a global estimate.
-
-    // Per-source-shard load snapshots: shard_load_snapshots[source_shard][backend_id] = active_requests
-    // Outer vector sized to smp::count during init; inner maps updated on each broadcast.
-    std::vector<absl::flat_hash_map<BackendId, uint64_t>> shard_load_snapshots;
-
-    // Aggregated cross-shard load: sum of all other shards' active_requests per backend.
-    // Recomputed from shard_load_snapshots on each snapshot receive.
-    absl::flat_hash_map<BackendId, uint64_t> cross_shard_load;
-
-    // Per-shard timer that broadcasts load snapshots periodically
-    seastar::timer<> load_sync_timer;
-
-    // Per-shard gate for load sync timer callbacks (Rule #5)
-    seastar::gate load_sync_gate;
-
-    // ========================================================================
     // Lifecycle Methods
     // ========================================================================
 
@@ -273,14 +235,6 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
-        // Cross-shard load sync configuration
-        config.cross_shard_load_sync = cfg.cross_shard_load_sync;
-        config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
-
-        // Pre-allocate cross-shard load snapshot storage (one entry per shard)
-        // Resized to smp::count so we can index by shard_id without bounds checks.
-        // Each entry starts empty; populated on first broadcast receive.
-        shard_load_snapshots.resize(seastar::smp::count);
 
         // Pre-allocate local route batch buffer to avoid reallocations during operation
         pending_local_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
@@ -308,9 +262,6 @@ struct ShardLocalState {
         config.hash_strategy = cfg.hash_strategy;
         config.bounded_load_epsilon = cfg.bounded_load_epsilon;
         config.p2c_load_bias = cfg.p2c_load_bias;
-        // Cross-shard load sync configuration
-        config.cross_shard_load_sync = cfg.cross_shard_load_sync;
-        config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -329,12 +280,6 @@ struct ShardLocalState {
         pending_local_routes.clear();
         gossip_ptr = nullptr;
         gossip_enabled = false;
-
-        // Clear cross-shard load sync state
-        for (auto& snapshot : shard_load_snapshots) {
-            snapshot.clear();
-        }
-        cross_shard_load.clear();
 
         // Reset statistics
         stats.reset();
@@ -490,19 +435,7 @@ uint64_t get_backend_load(BackendId id) {
         return 0;
     }
 
-    uint64_t local_load = it->second.active_requests;
-
-    // Add cross-shard load hints if sync is enabled.
-    // cross_shard_load contains the sum of active_requests from all OTHER shards,
-    // giving routing decisions a global view of backend utilization.
-    if (g_shard_state->config.cross_shard_load_sync) {
-        auto cs_it = g_shard_state->cross_shard_load.find(id);
-        if (cs_it != g_shard_state->cross_shard_load.end()) {
-            local_load += cs_it->second;
-        }
-    }
-
-    return local_load;
+    return it->second.active_requests;
 }
 
 std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates) {
@@ -1059,18 +992,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // Counter: routes dropped due to local buffer overflow
         seastar::metrics::make_counter("router_local_routes_dropped_overflow_total",
             [] { return g_shard_state ? g_shard_state->stats.local_routes_dropped_overflow : 0UL; },
-            seastar::metrics::description("Total number of locally-learned routes dropped due to buffer overflow")),
-
-        // Cross-shard load sync metrics
-        // Counter: load snapshot broadcasts sent from this shard
-        seastar::metrics::make_counter("router_load_sync_broadcasts_total",
-            [] { return g_shard_state ? g_shard_state->stats.load_sync_broadcasts : 0UL; },
-            seastar::metrics::description("Total number of cross-shard load snapshot broadcasts sent")),
-
-        // Counter: load snapshots received from other shards
-        seastar::metrics::make_counter("router_load_sync_snapshots_received_total",
-            [] { return g_shard_state ? g_shard_state->stats.load_sync_snapshots_received : 0UL; },
-            seastar::metrics::description("Total number of cross-shard load snapshots received from other shards"))
+            seastar::metrics::description("Total number of locally-learned routes dropped due to buffer overflow"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -1105,11 +1027,6 @@ seastar::future<> RouterService::initialize_shards() {
             auto interval = _config.route_batch_flush_interval;
             return seastar::smp::invoke_on_all([interval] {
                 start_local_batch_timer(interval);
-            });
-        }).then([] {
-            // Start per-shard cross-shard load sync timers on ALL shards
-            return seastar::smp::invoke_on_all([] {
-                start_load_sync_timer();
             });
         });
 }
@@ -1180,18 +1097,6 @@ seastar::future<> RouterService::stop() {
     //
     return seastar::smp::invoke_on_all([] {
         return stop_local_batch_timer();
-    }).then([] {
-        // ==========================================================================
-        // Stop per-shard cross-shard load sync timers
-        // ==========================================================================
-        //
-        // Load sync timers are shard-local (in ShardLocalState). Stop them on all
-        // shards before proceeding to prevent stale cross-shard SMP messages during
-        // shutdown.
-        //
-        return seastar::smp::invoke_on_all([] {
-            return stop_load_sync_timer();
-        });
     }).then([this] {
         // ==========================================================================
         // Rule #5: Close timer gate before cancelling timers
@@ -2457,159 +2362,6 @@ seastar::future<> RouterService::stop_local_batch_timer() {
         // Apply remaining routes to local tree only (skip cross-shard broadcast during shutdown)
         apply_local_batch_to_tree(g_shard_state->pending_local_routes);
         g_shard_state->pending_local_routes.clear();
-        return seastar::make_ready_future<>();
-    });
-}
-
-// ============================================================================
-// Cross-Shard Load Synchronization (per-shard)
-// ============================================================================
-//
-// Prevents cross-shard burst-routing hot-spotting by giving each shard a
-// global view of backend load across all shards.
-//
-// Pattern: Each shard periodically snapshots its own active_requests map and
-// broadcasts it to all other shards via fire-and-forget smp::submit_to.
-// On receipt, each shard stores the snapshot indexed by source shard_id and
-// recomputes the aggregated cross_shard_load map.
-//
-// The cross_shard_load map is read by get_backend_load() on the hot path,
-// adding O(1) hash lookup overhead per routing decision.
-//
-// HARD RULE #5 (Timer Ownership):
-// Timer callback accesses g_shard_state. Safety: stop_load_sync_timer() closes
-// load_sync_gate before cancelling the timer, waiting for in-flight broadcasts.
-//
-// HARD RULE #14 (Cross-Shard Dispatch):
-// Load snapshots are small (BackendId -> uint64_t, typically <16 entries).
-// We use foreign_ptr to transfer them safely across shards.
-//
-
-// Receive a load snapshot from another shard and recompute cross_shard_load.
-// Called on the receiving shard via smp::submit_to.
-static void apply_load_snapshot(unsigned source_shard,
-                                const absl::flat_hash_map<BackendId, uint64_t>& snapshot) {
-    if (!g_shard_state) return;
-    auto& state = *g_shard_state;
-
-    // Store the snapshot for this source shard (overwrite previous)
-    if (source_shard >= state.shard_load_snapshots.size()) return;
-    state.shard_load_snapshots[source_shard] = snapshot;
-    state.stats.load_sync_snapshots_received++;
-
-    // Recompute aggregated cross-shard load from all snapshots.
-    // Skip our own shard's entry (we use local active_requests directly).
-    // The snapshot vector is sized to smp::count, so we iterate all shards.
-    unsigned this_shard = seastar::this_shard_id();
-    state.cross_shard_load.clear();
-    for (unsigned s = 0; s < state.shard_load_snapshots.size(); ++s) {
-        if (s == this_shard) continue;
-        for (const auto& [backend_id, load] : state.shard_load_snapshots[s]) {
-            state.cross_shard_load[backend_id] += load;
-        }
-    }
-}
-
-// Broadcast this shard's current active_requests to all other shards.
-// Called from the per-shard load sync timer callback.
-static seastar::future<> broadcast_load_snapshot() {
-    if (!g_shard_state) return seastar::make_ready_future<>();
-    auto& state = *g_shard_state;
-
-    // Rule #5: Acquire gate holder for the async lifetime of this broadcast
-    seastar::gate::holder holder;
-    try {
-        holder = state.load_sync_gate.hold();
-    } catch (const seastar::gate_closed_exception&) {
-        return seastar::make_ready_future<>();
-    }
-
-    // Build snapshot of this shard's active_requests.
-    // Only include backends with non-zero load to minimize transfer size.
-    auto snapshot = std::make_unique<absl::flat_hash_map<BackendId, uint64_t>>();
-    for (const auto& [id, info] : state.backends) {
-        if (info.active_requests > 0) {
-            (*snapshot)[id] = info.active_requests;
-        }
-    }
-
-    state.stats.load_sync_broadcasts++;
-    unsigned this_shard = seastar::this_shard_id();
-
-    // Nothing to broadcast if no load (other shards will age out stale entries
-    // naturally when they receive an empty snapshot on the next interval)
-    // Still broadcast empty snapshots to clear stale data on other shards.
-    auto foreign_snapshot = seastar::make_foreign(std::move(snapshot));
-
-    return seastar::do_with(std::move(holder), std::move(foreign_snapshot),
-        [this_shard](seastar::gate::holder&,
-                     seastar::foreign_ptr<std::unique_ptr<absl::flat_hash_map<BackendId, uint64_t>>>& snapshot) {
-            return seastar::parallel_for_each(
-                boost::irange(0u, seastar::smp::count),
-                [this_shard, &snapshot](unsigned target_shard) {
-                    if (target_shard == this_shard) {
-                        return seastar::make_ready_future<>();
-                    }
-
-                    // Rule #14: Wrap in foreign_ptr, create local copy on target shard
-                    auto copy = std::make_unique<absl::flat_hash_map<BackendId, uint64_t>>(*snapshot);
-                    auto foreign_copy = seastar::make_foreign(std::move(copy));
-
-                    return seastar::smp::submit_to(target_shard,
-                        [source = this_shard, foreign_copy = std::move(foreign_copy)]() mutable {
-                            // Create local allocation on this shard (Rule #14)
-                            absl::flat_hash_map<BackendId, uint64_t> local_snapshot(
-                                foreign_copy->begin(), foreign_copy->end());
-                            apply_load_snapshot(source, local_snapshot);
-                            return seastar::make_ready_future<>();
-                        });
-                });
-        });
-}
-
-void RouterService::start_load_sync_timer() {
-    if (!g_shard_state) return;
-    auto& state = shard_state();
-
-    if (!state.config.cross_shard_load_sync) {
-        log_router.debug("Shard {}: Cross-shard load sync disabled", seastar::this_shard_id());
-        return;
-    }
-
-    // Only meaningful with multiple shards
-    if (seastar::smp::count < 2) {
-        log_router.debug("Shard {}: Cross-shard load sync skipped (single shard)", seastar::this_shard_id());
-        return;
-    }
-
-    state.load_sync_timer.set_callback([] {
-        // Timer callbacks can't return futures, so handle errors inline
-        (void)broadcast_load_snapshot().handle_exception([](std::exception_ptr ep) {
-            try {
-                std::rethrow_exception(ep);
-            } catch (const std::exception& e) {
-                log_router.error("Shard {}: Load sync broadcast failed: {}",
-                                 seastar::this_shard_id(), e.what());
-            }
-        });
-    });
-
-    state.load_sync_timer.arm_periodic(state.config.cross_shard_load_sync_interval);
-    log_router.info("Shard {}: Cross-shard load sync timer started (interval: {}ms)",
-                    seastar::this_shard_id(), state.config.cross_shard_load_sync_interval.count());
-}
-
-seastar::future<> RouterService::stop_load_sync_timer() {
-    if (!g_shard_state) return seastar::make_ready_future<>();
-    auto& state = shard_state();
-
-    // Shutdown sequence:
-    // 1. Close gate - waits for any in-flight broadcast callbacks to complete
-    // 2. Cancel timer - prevents new callbacks
-    return state.load_sync_gate.close().then([] {
-        if (!g_shard_state) return seastar::make_ready_future<>();
-        g_shard_state->load_sync_timer.cancel();
-        log_router.info("Shard {}: Cross-shard load sync timer stopped", seastar::this_shard_id());
         return seastar::make_ready_future<>();
     });
 }

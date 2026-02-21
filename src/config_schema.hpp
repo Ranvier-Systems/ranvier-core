@@ -156,25 +156,6 @@ struct RoutingConfig {
     uint64_t load_imbalance_floor = 2;        // Additive floor to prevent flapping at low load
 
     // =========================================================================
-    // Cross-Shard Load Synchronization
-    // =========================================================================
-    // When enabled, each shard periodically broadcasts its active_requests
-    // snapshot to all other shards. This prevents cross-shard burst-routing
-    // hot-spotting where multiple shards independently pick the same "best"
-    // backend because they only see their own shard's load counters.
-    //
-    // Without this, client-tokenize workloads (0.4ms overhead) cause near-
-    // simultaneous routing decisions across shards, each seeing load=0 for
-    // the same backends. With server-side tokenization (~10-12ms), natural
-    // stagger mitigates this — but client-tokenize needs explicit sync.
-    //
-    // The broadcast interval controls the trade-off between SMP overhead and
-    // load visibility freshness. At 5ms, a 4-shard system generates 12 SMP
-    // messages per interval (each shard broadcasts to 3 others).
-    bool cross_shard_load_sync = true;                                     // Enable cross-shard load broadcasts
-    std::chrono::milliseconds cross_shard_load_sync_interval{5};           // Broadcast interval (ms)
-
-    // =========================================================================
     // Route Batch Flush Interval
     // =========================================================================
     // Controls the periodic flush interval for batched route learning (both
