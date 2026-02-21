@@ -151,6 +151,13 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_LOAD_IMBALANCE_FLOOR")) {
         routing.load_imbalance_floor = *v;
     }
+    // Cross-shard load synchronization
+    if (auto v = get_env("RANVIER_CROSS_SHARD_LOAD_SYNC")) {
+        routing.cross_shard_load_sync = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint64_t>("RANVIER_CROSS_SHARD_LOAD_SYNC_INTERVAL_MS")) {
+        routing.cross_shard_load_sync_interval = std::chrono::milliseconds(*v);
+    }
     // Hash strategy configuration
     if (auto v = get_env("RANVIER_HASH_STRATEGY")) {
         if (*v == "jump") {
@@ -636,6 +643,14 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["load_imbalance_floor"]) {
                 config.routing.load_imbalance_floor = r["load_imbalance_floor"].as<uint64_t>();
+            }
+            // Cross-shard load synchronization
+            if (r["cross_shard_load_sync"]) {
+                config.routing.cross_shard_load_sync = r["cross_shard_load_sync"].as<bool>();
+            }
+            if (r["cross_shard_load_sync_interval_ms"]) {
+                config.routing.cross_shard_load_sync_interval =
+                    std::chrono::milliseconds(r["cross_shard_load_sync_interval_ms"].as<uint64_t>());
             }
             // Hash strategy
             if (r["hash_strategy"]) {
