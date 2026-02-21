@@ -436,10 +436,6 @@ private:
     // Counter for routes dropped due to buffer overflow (for metrics and rate-limited logging)
     uint64_t _routes_dropped_overflow = 0;
 
-    // Route batch flush interval, configurable via RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
-    // Read once during construction, distributed to all shards via initialize_shards()
-    std::chrono::milliseconds _flush_interval{RouteBatchConfig::DEFAULT_FLUSH_INTERVAL};
-
     // Callback for pool cleanup when a backend is fully removed
     PoolCleanupCallback _pool_cleanup_callback;
 
