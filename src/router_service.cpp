@@ -1809,31 +1809,19 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
     // Push all boundaries into the shard-local buffer directly.
     // This is O(1) per push (shard-local vector append, no futures).
     // The flush timer or buffer-full check handles cross-shard broadcast.
+    bool needs_flush = false;
     for (size_t boundary : valid_boundaries) {
         // Validate token count (using shard-local config)
         if (max_route_tokens > 0 && boundary > max_route_tokens) {
             continue;  // Skip this boundary if it exceeds the limit
         }
 
-        // Enforce hard buffer limit (Rule #4: bounded containers)
-        if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BUFFER_SIZE) {
-            size_t drop_count = std::min(RouteBatchConfig::OVERFLOW_DROP_COUNT,
-                                         state.pending_local_routes.size());
-            state.pending_local_routes.erase(
-                state.pending_local_routes.begin(),
-                state.pending_local_routes.begin() + static_cast<ptrdiff_t>(drop_count));
-            state.stats.local_routes_dropped_overflow += drop_count;
-            log_router.warn("Shard {}: Local route buffer overflow during multi-depth, "
-                           "dropped {} oldest routes", seastar::this_shard_id(), drop_count);
-        }
-
         std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + boundary);
-        state.pending_local_routes.push_back(PendingLocalRoute{std::move(prefix), backend});
-        state.stats.local_routes_batched++;
+        needs_flush = push_local_route(state, std::move(prefix), backend);
     }
 
-    // Trigger immediate flush if buffer is full after all pushes
-    if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
+    // Trigger flush only once after all pushes (not per-boundary)
+    if (needs_flush) {
         return flush_local_route_batch();
     }
 
@@ -2150,10 +2138,11 @@ static size_t deduplicate_local_batch(std::vector<PendingLocalRoute>& batch) {
     return removed;
 }
 
-seastar::future<> RouterService::buffer_local_route(std::vector<int32_t> tokens, BackendId backend) {
-    if (!g_shard_state) return seastar::make_ready_future<>();
-    auto& state = shard_state();
-
+// Push a route into the shard-local buffer, handling overflow if needed.
+// Returns true if the buffer is now full and the caller should trigger a flush.
+// This is the single point of truth for overflow+push logic, used by both
+// buffer_local_route() and learn_route_global_multi().
+static bool push_local_route(ShardLocalState& state, std::vector<int32_t> tokens, BackendId backend) {
     // Enforce hard buffer limit to prevent OOM (Rule #4: bounded containers)
     // Strategy: batch-drop oldest routes (same pattern as remote route batching)
     if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BUFFER_SIZE) {
@@ -2173,8 +2162,14 @@ seastar::future<> RouterService::buffer_local_route(std::vector<int32_t> tokens,
     state.pending_local_routes.push_back(PendingLocalRoute{std::move(tokens), backend});
     state.stats.local_routes_batched++;
 
-    // Flush immediately if buffer is full (don't wait for timer)
-    if (state.pending_local_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
+    return state.pending_local_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE;
+}
+
+seastar::future<> RouterService::buffer_local_route(std::vector<int32_t> tokens, BackendId backend) {
+    if (!g_shard_state) return seastar::make_ready_future<>();
+    auto& state = shard_state();
+
+    if (push_local_route(state, std::move(tokens), backend)) {
         log_router.debug("Shard {}: Local batch buffer full ({} routes), triggering immediate flush",
                          seastar::this_shard_id(), state.pending_local_routes.size());
         return flush_local_route_batch();
