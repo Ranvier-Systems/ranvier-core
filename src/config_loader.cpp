@@ -158,6 +158,22 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_CROSS_SHARD_LOAD_SYNC_INTERVAL_MS")) {
         routing.cross_shard_load_sync_interval = std::chrono::milliseconds(*v);
     }
+    // Route batch flush interval
+    if (auto v = get_env_as<uint32_t>("RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS")) {
+        if (*v < 1 || *v > 1000) {
+            std::cerr << "[WARN] RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=" << *v
+                      << " out of range [1, 1000], using default 10ms\n";
+        } else {
+            routing.route_batch_flush_interval = std::chrono::milliseconds(*v);
+            if (*v < 2) {
+                std::cerr << "[WARN] RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=" << *v
+                          << ": values below 2ms may cause high SMP overhead on multi-core systems\n";
+            } else if (*v > 50) {
+                std::cerr << "[WARN] RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=" << *v
+                          << ": values above 50ms may cause stale routes and reduced cache hit rates\n";
+            }
+        }
+    }
     // Hash strategy configuration
     if (auto v = get_env("RANVIER_HASH_STRATEGY")) {
         if (*v == "jump") {
@@ -652,6 +668,10 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["cross_shard_load_sync_interval_ms"]) {
                 config.routing.cross_shard_load_sync_interval =
                     std::chrono::milliseconds(r["cross_shard_load_sync_interval_ms"].as<uint64_t>());
+            }
+            if (r["route_batch_flush_interval_ms"]) {
+                config.routing.route_batch_flush_interval =
+                    std::chrono::milliseconds(r["route_batch_flush_interval_ms"].as<uint32_t>());
             }
             // Hash strategy
             if (r["hash_strategy"]) {

@@ -216,7 +216,7 @@ TEST_F(RouterServiceTest, BatchConfigConstants) {
     EXPECT_GT(RouteBatchConfig::MAX_BUFFER_SIZE, RouteBatchConfig::MAX_BATCH_SIZE);
     EXPECT_GT(RouteBatchConfig::OVERFLOW_DROP_COUNT, 0u);
     EXPECT_LE(RouteBatchConfig::OVERFLOW_DROP_COUNT, RouteBatchConfig::MAX_BUFFER_SIZE);
-    EXPECT_GT(RouteBatchConfig::FLUSH_INTERVAL.count(), 0);
+    EXPECT_GT(RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count(), 0);
 }
 
 TEST_F(RouterServiceTest, PendingRemoteRouteStructure) {

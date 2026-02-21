@@ -33,7 +33,9 @@ struct PendingRemoteRoute {
 // Mirror of RouteBatchConfig from router_service.hpp
 struct RouteBatchConfig {
     static constexpr size_t MAX_BATCH_SIZE = 100;
-    static constexpr std::chrono::milliseconds FLUSH_INTERVAL{10};
+    static constexpr size_t MAX_BUFFER_SIZE = 10000;
+    static constexpr size_t OVERFLOW_DROP_COUNT = 1000;
+    static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{10};
 };
 
 // =============================================================================
@@ -114,18 +116,18 @@ TEST(RouteBatchConfigTest, MaxBatchSizeIsReasonable) {
 
 TEST(RouteBatchConfigTest, FlushIntervalIsReasonable) {
     // FLUSH_INTERVAL should be between 1ms and 1000ms
-    EXPECT_GE(RouteBatchConfig::FLUSH_INTERVAL.count(), 1);
-    EXPECT_LE(RouteBatchConfig::FLUSH_INTERVAL.count(), 1000);
+    EXPECT_GE(RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count(), 1);
+    EXPECT_LE(RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count(), 1000);
 
     // Current value should be 10ms
-    EXPECT_EQ(RouteBatchConfig::FLUSH_INTERVAL.count(), 10);
+    EXPECT_EQ(RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count(), 10);
 }
 
 TEST(RouteBatchConfigTest, FlushIntervalEnsuresBoundedLatency) {
     // At 10ms flush interval with 100 route batch size:
     // - Worst case latency for a single route is 10ms (timer fires)
     // - This is acceptable for cluster route sync
-    EXPECT_LE(RouteBatchConfig::FLUSH_INTERVAL.count(), 100);
+    EXPECT_LE(RouteBatchConfig::DEFAULT_FLUSH_INTERVAL.count(), 100);
 }
 
 // =============================================================================
@@ -285,7 +287,7 @@ TEST(PerformanceCharacteristicsTest, BatchReducesSmpMessages) {
 TEST(PerformanceCharacteristicsTest, WorstCaseLatencyIsBounded) {
     // Worst case: a single route arrives just after a flush
     // It must wait for the next timer tick
-    auto worst_case_latency = RouteBatchConfig::FLUSH_INTERVAL;
+    auto worst_case_latency = RouteBatchConfig::DEFAULT_FLUSH_INTERVAL;
 
     // Should be at most 100ms for acceptable UX
     EXPECT_LE(worst_case_latency.count(), 100);

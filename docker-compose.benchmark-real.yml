@@ -160,6 +160,8 @@ services:
       - RAYON_NUM_THREADS=1
       # Tokenizer thread pool - offloads tokenization from Seastar reactor
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
+      # Route batch flush interval (ms) - lower values improve cache affinity at cost of SMP overhead
+      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -210,6 +212,7 @@ services:
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
+      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -260,6 +263,7 @@ services:
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
+      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.

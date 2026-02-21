@@ -844,6 +844,12 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     g_shard_state = std::make_unique<ShardLocalState>();
     g_shard_state->init(routing_config);
 
+    // Log configured route batch flush interval (parsed from env/YAML by config_loader)
+    if (routing_config.route_batch_flush_interval != RouteBatchConfig::DEFAULT_FLUSH_INTERVAL) {
+        log_router.info("Route batch flush interval configured: {}ms",
+                        routing_config.route_batch_flush_interval.count());
+    }
+
     // Log active hash strategy for operational visibility
     const char* strategy_name = "jump";
     switch (routing_config.hash_strategy) {
@@ -1095,8 +1101,10 @@ seastar::future<> RouterService::initialize_shards() {
             }
 
             // Start per-shard local batch flush timers on ALL shards
-            return seastar::smp::invoke_on_all([] {
-                start_local_batch_timer();
+            // Pass the configured flush interval (from RoutingConfig, consistent across shards)
+            auto interval = _config.route_batch_flush_interval;
+            return seastar::smp::invoke_on_all([interval] {
+                start_local_batch_timer(interval);
             });
         }).then([] {
             // Start per-shard cross-shard load sync timers on ALL shards
@@ -2059,9 +2067,9 @@ void RouterService::start_batch_flush_timer() {
         });
     });
 
-    _batch_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
+    _batch_flush_timer.arm_periodic(_config.route_batch_flush_interval);
     log_router.info("Route batch flush timer started (interval: {}ms, max_batch: {}, max_buffer: {})",
-                    RouteBatchConfig::FLUSH_INTERVAL.count(),
+                    _config.route_batch_flush_interval.count(),
                     RouteBatchConfig::MAX_BATCH_SIZE,
                     RouteBatchConfig::MAX_BUFFER_SIZE);
 }
@@ -2404,7 +2412,7 @@ seastar::future<> RouterService::flush_local_route_batch() {
 //   3. Drains remaining buffer with one final flush
 //
 
-void RouterService::start_local_batch_timer() {
+void RouterService::start_local_batch_timer(std::chrono::milliseconds flush_interval) {
     if (!g_shard_state) return;
     auto& state = shard_state();
 
@@ -2420,9 +2428,9 @@ void RouterService::start_local_batch_timer() {
         });
     });
 
-    state.local_flush_timer.arm_periodic(RouteBatchConfig::FLUSH_INTERVAL);
+    state.local_flush_timer.arm_periodic(flush_interval);
     log_router.info("Shard {}: Local route batch flush timer started (interval: {}ms)",
-                    seastar::this_shard_id(), RouteBatchConfig::FLUSH_INTERVAL.count());
+                    seastar::this_shard_id(), flush_interval.count());
 }
 
 seastar::future<> RouterService::stop_local_batch_timer() {

@@ -174,6 +174,17 @@ struct RoutingConfig {
     bool cross_shard_load_sync = true;                                     // Enable cross-shard load broadcasts
     std::chrono::milliseconds cross_shard_load_sync_interval{5};           // Broadcast interval (ms)
 
+    // =========================================================================
+    // Route Batch Flush Interval
+    // =========================================================================
+    // Controls the periodic flush interval for batched route learning (both
+    // remote gossip routes on shard 0 and per-shard local routes).
+    // Lower values improve cache affinity at the cost of higher SMP overhead.
+    // Valid range: 1-1000ms. Default 10ms matches the batched route learning
+    // introduced in commit b2f8cac. Testing with 2-5ms may recover cache
+    // affinity while still reducing SMP overhead vs per-request broadcast.
+    std::chrono::milliseconds route_batch_flush_interval{10};              // Env: RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
+
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingMode::HASH; }

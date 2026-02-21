@@ -727,7 +727,7 @@ When receiving high volumes of remote route announcements, immediately broadcast
 
 | Trigger | Condition |
 |---------|-----------|
-| Timer | Every 10ms (configurable via `RouteBatchConfig::FLUSH_INTERVAL`) |
+| Timer | Every 10ms by default (configurable via `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS` env var, 1-1000ms) |
 | Buffer full | When buffer reaches 100 routes (configurable via `RouteBatchConfig::MAX_BATCH_SIZE`) |
 
 **Batch Broadcast Flow**:
