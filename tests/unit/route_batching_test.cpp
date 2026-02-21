@@ -33,7 +33,9 @@ struct PendingRemoteRoute {
 // Mirror of RouteBatchConfig from router_service.hpp
 struct RouteBatchConfig {
     static constexpr size_t MAX_BATCH_SIZE = 100;
-    static constexpr std::chrono::milliseconds FLUSH_INTERVAL{10};
+    static constexpr size_t MAX_BUFFER_SIZE = 10000;
+    static constexpr size_t OVERFLOW_DROP_COUNT = 1000;
+    static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{10};
 };
 
 // =============================================================================
