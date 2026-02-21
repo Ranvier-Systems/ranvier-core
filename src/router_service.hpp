@@ -340,8 +340,9 @@ public:
     static seastar::future<> flush_local_route_batch();
 
     // Buffer a locally-learned route for batched broadcast
-    // Pushes into the shard-local buffer; triggers immediate flush if full
-    // Returns a ready future (never blocks on cross-shard dispatch)
+    // Pushes into the shard-local buffer; triggers immediate flush if full.
+    // Returns a ready future unless buffer is full, in which case it
+    // returns the future from flush_local_route_batch().
     static seastar::future<> buffer_local_route(std::vector<int32_t> tokens, BackendId backend);
 
     // Static: Only uses thread_local g_shard_state, safe to call from any shard
