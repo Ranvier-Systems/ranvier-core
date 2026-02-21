@@ -1021,10 +1021,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             try {
                 // Build the system prefix text for tokenization.
                 // When system messages are contiguous at the start, we use the
-                // prefix substring of the already-extracted combined text directly.
-                // Otherwise, use the pre-extracted system text with trailing newline.
-                // Both approaches match the BPE boundary alignment property:
-                // system_text + "\n" is a text prefix of the full combined text.
+                // prefix substring of the already-extracted combined text directly
+                // (this includes chat-template formatting if configured).
+                // Otherwise, use the pre-extracted raw system text as an approximation.
                 std::string system_prefix_text;
                 if (text_extraction->has_system_prefix) {
                     // Contiguous system messages: use prefix substring directly
@@ -1032,7 +1031,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                         0, text_extraction->system_prefix_end);
                 } else {
                     // Non-contiguous (interleaved) system messages: use pre-extracted text
-                    system_prefix_text = text_extraction->system_text + "\n";
+                    system_prefix_text = text_extraction->system_text;
                 }
 
                 // Use cached tokenization (system messages have ~90%+ cache hit rate)

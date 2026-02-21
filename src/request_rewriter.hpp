@@ -81,11 +81,11 @@ public:
 
         // System message prefix boundary.
         // When system messages are contiguous at the start of the messages array,
-        // text.substr(0, system_prefix_end) == (system_messages + "\n").
+        // text.substr(0, system_prefix_end) gives the formatted system content.
         // This enables tokenizing the prefix substring directly without
         // re-extracting and re-tokenizing system messages.
         bool has_system_prefix = false;      // True if contiguous system msgs at start
-        size_t system_prefix_end = 0;        // Char offset in text (includes trailing "\n")
+        size_t system_prefix_end = 0;        // Char offset in text after last system message
 
         // System message text for non-contiguous fallback.
         // Pre-extracted during JSON parsing to avoid re-parsing later.
@@ -456,32 +456,20 @@ RequestRewriter::extract_text_with_boundary_info(
             in_system_prefix = false;
         }
 
-        // Append formatted message to combined text.
-        // With chat_template=none, this is the legacy "\n"-joined behavior.
-        // With a model template, this produces chat-template-formatted text.
-        if (chat_template.is_none()) {
-            // Legacy: raw content with "\n" separator
-            if (!combined.empty()) {
-                combined += "\n";
-            }
-            // Capture boundary AFTER separator, BEFORE content — matches
-            // original behavior where system_prefix_end includes the trailing "\n".
-            if (capture_boundary_before_this_msg) {
-                system_prefix_end_candidate = combined.size();
-            }
-            combined.append(content_sv.data(), content_sv.size());
-        } else {
-            // Capture boundary BEFORE the formatted message wrapper.
-            // For chat templates, each message is self-contained, so the
-            // boundary sits right after the last system message's closing token.
-            if (capture_boundary_before_this_msg) {
-                system_prefix_end_candidate = combined.size();
-            }
-            chat_template.format_message(combined,
-                                         has_role ? role_sv : std::string_view("user"),
-                                         content_sv,
-                                         is_first_message);
+        // Capture boundary BEFORE format_message() appends the first non-system
+        // message.  For all formats, this is the char offset right after the
+        // last system message's formatted output (closing token or raw content).
+        if (capture_boundary_before_this_msg) {
+            system_prefix_end_candidate = combined.size();
         }
+
+        // Append formatted message to combined text.
+        // ChatTemplate handles all formats uniformly — none (legacy \n-joining),
+        // llama3, chatml, and mistral.
+        chat_template.format_message(combined,
+                                     has_role ? role_sv : std::string_view("user"),
+                                     content_sv,
+                                     is_first_message);
 
         // Build formatted message for multi-depth routing only when requested.
         // Skipping this avoids N string allocations + vector growth per request
@@ -496,10 +484,8 @@ RequestRewriter::extract_text_with_boundary_info(
         is_first_message = false;
     }
 
-    // Append generation prompt for chat templates (prompts assistant response)
-    if (!chat_template.is_none()) {
-        chat_template.append_generation_prompt(combined);
-    }
+    // Append generation prompt (no-op for none and mistral formats)
+    chat_template.append_generation_prompt(combined);
 
     result.has_system_messages = found_any_system;
 
