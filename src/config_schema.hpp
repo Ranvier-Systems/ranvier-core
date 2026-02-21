@@ -194,6 +194,13 @@ struct AssetsConfig {
     size_t tokenizer_thread_pool_queue_size = 256;  // Max pending jobs per shard (Rule #4)
     size_t tokenizer_thread_pool_min_text = 256;    // Min text length for thread pool dispatch
     size_t tokenizer_thread_pool_max_text = 65536;  // Max text length for thread pool dispatch
+
+    // Local fallback semaphore: max concurrent reactor-blocking tokenizations per shard.
+    // When both thread pool and cross-shard dispatch are unavailable, tokenize_locally()
+    // blocks the reactor for 5-13ms. This semaphore limits concurrent local tokenizations
+    // to prevent compounding stalls. If full, the request falls back to hash/random routing.
+    // Default 1: at most one reactor-blocking tokenization per shard at a time.
+    size_t tokenizer_local_fallback_max_concurrent = 1;
 };
 
 // =============================================================================

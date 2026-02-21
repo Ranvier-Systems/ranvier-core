@@ -3,6 +3,7 @@
 
 #include <stdexcept>
 
+#include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
 namespace ranvier {
@@ -152,6 +153,25 @@ void TokenizerService::set_thread_pool_ref(seastar::sharded<TokenizerThreadPool>
     log_tokenizer.info("Thread pool ref set on shard {} (pool={})",
                        seastar::this_shard_id(),
                        thread_pool != nullptr);
+}
+
+void TokenizerService::configure_local_fallback(size_t max_concurrent) {
+    _local_tokenize_sem = seastar::semaphore(max_concurrent);
+    log_tokenizer.info("Local tokenization fallback semaphore configured on shard {} "
+                       "(max_concurrent={})",
+                       seastar::this_shard_id(), max_concurrent);
+}
+
+void TokenizerService::register_metrics() {
+    namespace sm = seastar::metrics;
+    _metrics.add_group("ranvier_tokenizer", {
+        sm::make_counter("local_fallback_rejected", _local_fallback_rejected,
+            sm::description("Local tokenization fallback rejected by semaphore "
+                            "(another local tokenization already in progress)")),
+        sm::make_counter("local_fallbacks", _cross_shard_local_fallbacks,
+            sm::description("Tokenization performed locally on the reactor "
+                            "(blocking fallback path)")),
+    });
 }
 
 bool TokenizerService::should_dispatch_cross_shard(size_t text_length) const {
@@ -349,7 +369,17 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
         return encode_cached_async(text);
     }
 
-    // Priority 3: Local tokenization (blocks reactor)
+    // Priority 3: Local tokenization (blocks reactor) — gated by semaphore
+    // tokenize_locally() is a synchronous Rust FFI call (5-13ms). The semaphore
+    // limits concurrent local tokenizations per shard to prevent compounding
+    // reactor stalls. If the semaphore is full, return empty result so the
+    // caller falls back to hash/random routing.
+    if (!_local_tokenize_sem.try_wait(1)) {
+        ++_local_fallback_rejected;
+        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+    }
+    // Scope guard: signal semaphore after tokenize_locally() returns (exception safety)
+    auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
     return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
 }
 
