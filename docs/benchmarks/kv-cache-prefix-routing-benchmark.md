@@ -11,9 +11,21 @@
 
 ## Executive Summary
 
-Prefix-affinity routing provides **4-8x better cache hit rate** and **up to 85% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes.
+Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 51% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes.
 
-### Results Summary (30-minute validated, February 2026)
+### Results Summary (February 21, 2026 — bb20555, full suite)
+
+| Model | Cache Hit Rate | P99 Latency | Throughput | Key Benefit |
+|-------|----------------|-------------|------------|-------------|
+| **CodeLlama-13b** | 12% → **54-89%** | **-24% to -51%** | **+3% to +14%** | P99 + throughput |
+| **Llama-3.1-8B** | 12% → **65-95%** | flat | ~same | Stable, no harm |
+| **Llama-3.1-70B** | 49% → **75%** | flat | -18% | Reliability (0% inc) |
+
+*All on 40GB A100s. vLLM v0.15.1 pinned. Thread pool enabled, speculative load increment,
+batched route learning. 70B on TP=4 (2 backends). 13B/8B on 8 backends.*
+
+<details>
+<summary>Previous best results (Instance 3, Feb 10-14 — click to expand)</summary>
 
 | Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
 |-------|----------------|-------------------------|-------------|------------|
@@ -21,7 +33,10 @@ Prefix-affinity routing provides **4-8x better cache hit rate** and **up to 85% 
 | CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
 | Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
 
-*70B on 80GB A100s (TP=2, 4 backends, 32K context). 13B/8B on 40GB A100s (8 backends).*
+*70B on 80GB A100s (TP=2, 4 backends, 32K context). 13B/8B on 40GB A100s (8 backends).
+Pre-batched-route-learning architecture with per-request SMP broadcast.*
+
+</details>
 
 ## Test Configuration
 
@@ -182,15 +197,19 @@ This header is invaluable for debugging configuration mismatches between client 
 
 ## Conclusions
 
-1. **Prefix-affinity routing is essential for KV cache optimization** — 4-8x better cache utilization translates directly to lower latency and higher throughput.
+1. **Prefix-affinity routing is essential for KV cache optimization** — 4-7x better cache utilization translates directly to lower latency and higher throughput.
 
-2. **Benefits scale with model size** — 70B shows 44% XLarge TTFT improvement, 13B shows 33%, 8B shows 40%. Larger models save more computation per cache hit.
+2. **13B is the sweet spot for aggregate metrics** — Queue buildup under load makes routing dramatically effective: P99 -24% to -51% (bb20555), up to -85% (Instance 3). Throughput improves +3% to +22%.
 
-3. **13B is the sweet spot for aggregate metrics** — Queue buildup under load makes routing dramatically effective: -85% P99 tail latency, +22% throughput. 70B is compute-bound (flat P99/throughput), 8B is fast enough that queues don't build.
+3. **Tail latency improves under sustained load** — P99 improvements are strongest at high concurrency and long duration (13B 30u 30m: -51.3% on bb20555).
 
-4. **Tail latency improves dramatically** — P99 latency drops up to 85% for 13B because cache behavior is predictable, not random.
+4. **8B is routing-neutral** — Inference too fast (~1400ms) for cache savings to affect aggregate TTFT. No harm, but no benefit.
 
-5. **Memory efficiency** — With prefix-affinity, each backend only needs to cache its assigned prefixes rather than potentially caching all prefixes.
+5. **70B benefit is reliability** — Incompletes eliminated (0.6% → 0%), but throughput cost from concentrating load for cache affinity.
+
+6. **Memory efficiency** — With prefix-affinity, each backend only needs to cache its assigned prefixes rather than potentially caching all prefixes.
+
+7. **Prefix ratio 0.9 is the reliable operating point** — Lower ratios (0.5-0.7) may cause hot-spotting depending on architecture version and concurrency.
 
 See the [Benchmark Guide for 8x A100](benchmark-guide-8xA100.md) for full methodology, per-run data, and detailed analysis.
 

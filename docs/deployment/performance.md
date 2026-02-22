@@ -71,15 +71,17 @@ The streaming response path uses optimized buffer management to minimize allocat
 
 #### Real vLLM Backend (8x A100, February 2026)
 
-| Model | XLarge TTFT Improvement | P99 Latency | Throughput | Cache Hit Rate |
-|-------|-------------------------|-------------|------------|----------------|
-| **Llama-3.1-70B** (80GB, TP=2) | **44%** | ~same | ~same | 98% |
-| **CodeLlama-13b** (40GB) | **33%** | **-85%** | **+22%** | 98% |
-| **Llama-3.1-8B** (40GB) | **40%** | +6.5% | ~same | 98% |
+**Latest results (bb20555, Feb 21 — speculative load increment + batched route learning):**
 
-*30-minute validated runs with load-aware routing + stale connection fix. See [Benchmark Guide](../benchmarks/benchmark-guide-8xA100.md) for full details.*
+| Model | P99 Latency | Throughput | Cache Hit Rate | Key Benefit |
+|-------|-------------|------------|----------------|-------------|
+| **CodeLlama-13b** (40GB) | **-24% to -51%** | **+3% to +14%** | 54-89% | P99 + throughput |
+| **Llama-3.1-8B** (40GB) | flat | ~same | 65-95% | Stable, no harm |
+| **Llama-3.1-70B** (40GB, TP=4) | flat | -18% | 75% | Reliability (0% inc) |
 
-**Key insight**: Benefits scale with model size — larger models save more computation per cache hit. 13B is the sweet spot for aggregate metrics (-85% P99 tail latency, +22% throughput). 70B shows the highest per-request benefit (44% TTFT) but is compute-bound rather than queue-bound under sustained load.
+*vLLM v0.15.1 pinned, thread pool enabled, prefix-ratio 0.9. See [Benchmark Guide](../benchmarks/benchmark-guide-8xA100.md) for full details.*
+
+**Key insight**: 13B is the sweet spot for aggregate metrics (P99 -24% to -51%, throughput +3% to +14%). 8B is routing-neutral (too fast). 70B benefit is reliability (incompletes eliminated) at the cost of throughput. Results are instance-dependent; cache hit rates range 54-98% across runs.
 
 ---
 
@@ -253,22 +255,23 @@ avg(ranvier_radix_tree_average_prefix_skip_length)
 
 For production LLM workloads with large context windows, see our [detailed benchmark guide](../benchmarks/benchmark-guide-8xA100.md) comparing routing modes on 8x A100 GPUs with Llama-3.1-8B, CodeLlama-13b, and Llama-3.1-70B.
 
-### Summary Results (8x A100, 30-minute validated, February 2026)
+### Summary Results (8x A100, February 21, 2026 — bb20555)
 
-| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
-|-------|----------------|-------------------------|-------------|------------|
-| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
-| CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
-| Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
+| Model | Cache Hit Rate | P99 Latency | Throughput | Key Benefit |
+|-------|----------------|-------------|------------|-------------|
+| **CodeLlama-13b** | 12% → **54-89%** | **-24% to -51%** | **+3% to +14%** | P99 + throughput |
+| **Llama-3.1-8B** | 12% → **65-95%** | flat | ~same | Stable |
+| **Llama-3.1-70B** | 49% → **75%** | flat | -18% | Reliability (0% inc) |
 
 ### Key Findings
 
-- **4-8x better cache hit rate** with prefix-affinity routing (12-25% → 98%)
-- **33-44% TTFT improvement** for XLarge prefixes (4K-8K tokens) across model sizes
-- **Up to 85% lower P99 tail latency** — 13B is the sweet spot due to queue-bound behavior
-- **Up to 22% higher throughput** — Load-aware routing prevents backend hotspots for 13B
-- **Benefits scale with model size**: 70B shows 44% XLarge TTFT, 13B shows 33%, 8B shows 40%
+- **4-7x better cache hit rate** with prefix-affinity routing (12% → 54-95%)
+- **Up to 51% lower P99 tail latency** — 13B at 30 users 30 minutes is the sweet spot
+- **Up to 14% higher throughput** — Load-aware routing prevents backend hotspots for 13B
 - **0% incomplete rate** with stale connection retry (was 30-37% before fix)
+- **8B is routing-neutral** — inference too fast for cache savings to affect aggregate TTFT
+- **70B benefit is reliability** — incompletes eliminated at cost of throughput
+- **Prefix ratio 0.9 recommended** — lower ratios may cause hot-spotting
 - **Small prefix overhead**: Routing cost exceeds cache benefit for <500 token prefixes
 
 ### Routing Modes
