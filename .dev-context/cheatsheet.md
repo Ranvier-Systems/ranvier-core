@@ -1,4 +1,29 @@
+# From VS Code:
 Rebuild Container: Press Cmd + Shift + P -> Dev Containers: Rebuild Container.
+
+# Build and run unit tests from dev container
+make test-unit 2>&1 |tee make.out
+
+# Check build for errors and warnings (should build clean)
+grep "error:" make.out
+grep "warning:" make.out
+
+# Run validation suite (all 4 tests)
+make validate
+
+# Run integration tests (graceful shutdown, peer discovery, negative paths, etc.)
+# Run from terminal directly, not from dev container
+# Note: These require a running multi-node cluster (Docker Compose), which is why they're separate from make validate (single-process, no Docker needed)
+make test-integration
+
+# Add useful aliases
+set -o vi
+alias h=history
+alias lt='ls -ltr'
+alias today='/bin/date +%Y%m%d'
+
+
+=====
 
 mkdir build && cd build
 cmake .. -G Ninja
@@ -2289,7 +2314,7 @@ alias today='/bin/date +%Y%m%d'
 docker compose -f docker-compose.benchmark-real.yml up -d ranvier1 ranvier2 ranvier3
 
 export RANVIER_ROUTING_MODE=prefix
-export BENCHMARK_MODE=prefix 
+export BENCHMARK_MODE=prefix
 
 export NUM_BACKENDS=8
 export BACKEND_BASE_IP=172.17.0.1
@@ -2318,10 +2343,10 @@ Cluster Status
 
 Peer Table
 ────────────────────────────────────────────────────────────
-           Address          │   Status   │    Last Seen   
+           Address          │   Status   │    Last Seen
   ──────────────────────────┼────────────┼────────────────
-       172.29.2.3:9190      │ ALIVE │   20469d ago   
-       172.29.2.2:9190      │ ALIVE │   20469d ago   
+       172.29.2.3:9190      │ ALIVE │   20469d ago
+       172.29.2.2:9190      │ ALIVE │   20469d ago
 
 ubuntu@150-136-208-179:~$ ./ranvier-core/tools/rvctl --url http://localhost:8081 inspect backends
 
@@ -2330,10 +2355,10 @@ ubuntu@150-136-208-179:~$ ./ranvier-core/tools/rvctl --url http://localhost:8081
 ===
 ubuntu@150-136-208-179:~/ranvier-core$ docker compose -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real down
 [+] Running 4/4
- ✔ Container ranvier-bench2                          Removed                                                                                                                                           2.0s 
- ✔ Container ranvier-bench3                          Removed                                                                                                                                           1.8s 
- ✔ Container ranvier-bench1                          Removed                                                                                                                                           2.1s 
- ✔ Network ranvier-benchmark-real_ranvier-benchmark  Removed                                                                                                                                           0.2s 
+ ✔ Container ranvier-bench2                          Removed                                                                                                                                           2.0s
+ ✔ Container ranvier-bench3                          Removed                                                                                                                                           1.8s
+ ✔ Container ranvier-bench1                          Removed                                                                                                                                           2.1s
+ ✔ Network ranvier-benchmark-real_ranvier-benchmark  Removed                                                                                                                                           0.2s
 
 
 
@@ -2399,7 +2424,7 @@ Cluster Status
 
 Peer Table
 ────────────────────────────────────────────────────────────
-           Address          │   Status   │    Last Seen   
+           Address          │   Status   │    Last Seen
   ──────────────────────────┼────────────┼────────────────
        172.29.2.3:9190      │ ALIVE │     0s ago      (backend 6)
        172.29.2.2:9190      │ ALIVE │     0s ago      (backend 8)
@@ -2408,7 +2433,7 @@ Fetching backends from http://localhost:8081...
 
 Backend Status (Shard 1)
 ================================================================================
-  ID │        Address        │ Weight │ Priority │     Status     
+  ID │        Address        │ Weight │ Priority │     Status
 ─────┼───────────────────────┼────────┼──────────┼────────────────
    4 │    172.17.0.1:8003    │    100 │        0 │ HEALTHY
    6 │    172.17.0.1:8005    │    100 │        0 │ HEALTHY
