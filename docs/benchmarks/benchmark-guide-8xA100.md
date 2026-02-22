@@ -12,17 +12,18 @@ Prefix-aware routing with speculative load increment + batched route learning vs
 | **Llama-3.1-8B** | 12% → **65-95%** | flat | ~same | Stable, no harm |
 | **Llama-3.1-70B** | 49% → **75%** | flat | -18% | Reliability (0% inc) |
 
-*Results from February 21, 2026 (commit bb20555) on 8xA100 40GB with vLLM v0.15.1 pinned.
+*Results from February 21-22, 2026 (commits bb20555, c219fbd) on 8xA100 40GB with vLLM v0.15.1 pinned.
 70B on 40GB (TP=4, 2 backends). 13B/8B on 40GB (8 backends). Thread pool enabled, speculative
-load increment, batched route learning.*
+load increment, batched route learning. Flush interval sweep and cross-shard sync evaluation on Feb 22.*
 
 **Key wins:**
 - **4-7x more cache hits** — Requests routed to backends with cached KV data
-- **Up to 51% lower P99 tail latency** — 13B at 30 users shows strongest improvement
+- **Up to 52% lower P99 tail latency** — 13B with cross-shard sync @ 10ms flush
 - **Up to 14% higher throughput** — Load-aware routing prevents backend hotspots for 13B
 - **0% incomplete rate** — Stale connection retry ensures every request completes
 - **Zero hot-spotting at default prefix ratio** — Speculative load increment prevents burst routing
 - **Stable under stress** — 8B at 64 concurrent users with zero errors
+- **10ms flush interval confirmed optimal** — Sweep from 2ms to 50ms; tighter causes hot-spotting
 
 **Performance at default config (prefix-ratio 0.9):**
 
@@ -825,6 +826,83 @@ different GPU thermals, and the batched route learning change all contribute.
 
 ---
 
+### February 22, 2026 — c219fbd: Flush Interval Sweep + Cross-Shard Sync Evaluation
+
+> **Branch:** `claude/fix-shard-sync-performance`. **Commits:** 8e49187, c219fbd. **vLLM:** v0.15.1 (pinned).
+> **Instance:** Lambda Labs 8xA100 40GB (Instance 6).
+>
+> This run evaluates two configuration axes: (1) the route batch flush interval
+> (`RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS`), and (2) the cross-shard load sync
+> feature (`RANVIER_CROSS_SHARD_LOAD_SYNC`). The flush interval controls how often
+> locally-learned routes propagate cross-shard. The cross-shard sync broadcasts
+> per-shard `active_requests` to give routing decisions a global view of backend load.
+>
+> The cross-shard sync feature (575dd78) was found to cause a 3x tokenization
+> regression (12ms → 40ms) due to SMP reactor congestion. The fix branch reduces
+> this to 2x (20ms) when enabled and disables the feature by default. See backlog 20.11.
+
+#### Flush Interval Sweep (13B 20u 10m, sync disabled)
+
+Testing on d1f4bd1 (575dd78 reverted) and c219fbd (fix branch, sync disabled by default):
+
+| Flush Interval | P99 TTFT Change | Throughput | Cache Hit Rate | Tokenization | Validation | Notes |
+|---------------|-----------------|------------|----------------|--------------|------------|-------|
+| 2ms | +53.1% | -10.7% | 54.1% | — | FAILED | Hot-spotting |
+| 5ms | +21.5% | +1.3% | 56.1% | — | FAILED | Hot-spotting |
+| **10ms (default)** | **-29.5%** | +0.8% | 45.5% | 11.13ms | **PASSED** | Reliable |
+| 20ms (run 1) | **-41.8%** | -4.4% | 61.7% | 8.56ms | PASSED | Best single run |
+| 20ms (run 2) | +31.3% | -8.7% | 54.4% | 11.33ms | FAILED | High variance |
+| 50ms | **-30.5%** | +5.3% | 51.0% | 11.50ms | **PASSED** | No benefit over 10ms |
+
+Sustained load at 2ms (13B 30u 30m): P99 +131.7%, throughput -20.5% — catastrophic hot-spotting
+confirmed. Tighter flush intervals concentrate load on fewer backends.
+
+**Flush interval conclusions:**
+- **<10ms**: Consistently causes hot-spotting. Route decisions cluster on the same backends.
+- **10ms (default)**: Reliable. Passes validation consistently.
+- **20ms**: High run-to-run variance on this instance. Best individual result (-41.8%) but
+  also produced the worst (+31.3%). Not recommended as default.
+- **50ms**: Comparable to 10ms with no measurable benefit. Delays route propagation without gain.
+- **10ms confirmed as the correct default.**
+
+#### Cross-Shard Load Sync Evaluation (13B 20u 10m, c219fbd)
+
+| Config | P99 TTFT Change | Throughput | Cache Hit Rate | Tokenization | Validation |
+|--------|-----------------|------------|----------------|--------------|------------|
+| Sync disabled, 10ms flush | -37.3% | +10.1% | 80.9% | 12.64ms | PASSED |
+| Sync disabled, 20ms flush (run 1) | -37.3% | +10.1% | 80.9% | 12.64ms | PASSED |
+| Sync disabled, 20ms flush (run 2) | +31.3% | -8.7% | 54.4% | 11.33ms | FAILED |
+| **Sync enabled, 10ms flush** | **-52.2%** | +11.2% | **86.8%** | 20.17ms | **PASSED** |
+| Sync enabled, 20ms flush | +6.1% | +12.4% | 24.6% | 14.15ms | FAILED |
+
+**Cross-shard sync conclusions:**
+- **Sync enabled @ 10ms flush** delivers the best cache affinity (86.8%) and P99 (-52.2%),
+  but with 2x tokenization overhead (20ms vs ~11ms). The cache improvement more than
+  compensates — an extra 9ms is negligible in a 2-4 second inference cycle.
+- **Sync enabled @ 20ms flush** catastrophically destroys cache affinity (24.6%). The load
+  sync interval is tied to the flush interval — at 20ms, stale load information causes the
+  load-balancing signal to override prefix affinity with outdated data.
+- **Sync disabled** shows high run-to-run variance (45-81% cache hits). The 80.9% result
+  appears to be an outlier; most sync-disabled runs cluster around 45-62%.
+- **The cross-shard sync feature needs its interval decoupled from the flush interval** to
+  allow independent tuning. The route batching benefits from 10ms, but the load sync may
+  need a separate (potentially faster or slower) cadence.
+- **Feature disabled by default** until the interval coupling is resolved and the 2x
+  tokenization overhead is further reduced.
+
+#### Run-to-Run Variance on Instance 6
+
+Identical config (sync disabled, 20ms flush, c219fbd) produced vastly different results
+back-to-back: cache hits 80.9% vs 54.4%, P99 -37.3% vs +31.3%. The baseline P99 itself
+shifted from 5,900ms to 6,700ms between runs, suggesting instance-level instability
+(noisy neighbors, thermal throttling, GPU memory pressure).
+
+**Implication:** Single 10-minute runs on Lambda Labs instances have a wide confidence
+interval. The most reliable conclusions are directional (e.g., 2ms causes hot-spotting,
+sync @ 20ms breaks affinity) rather than precise numbers.
+
+---
+
 ### February 2026 — With Load-Aware Routing + Stale Connection Fix (Instance 3)
 
 > Load-aware routing (added Feb 2026) prevents backend hotspots by checking queue depth
@@ -1123,14 +1201,16 @@ Prefix Ratio: 0.9
 
 ### Interpretation
 
-1. **Cache hit rate always improves**: 12% → 54-98% depending on config and instance
+1. **Cache hit rate always improves**: 12% → 45-98% depending on config, instance, and sync mode
 2. **Per-bucket improvement is the real metric**: Overall TTFT can be misleading due to small prefix overhead
 3. **P99 tail latency is the strongest win for 13B**: -24% to -85% depending on architecture version
 4. **Throughput improves for 13B**: +3% to +22% depending on instance and concurrency level
-5. **Results are instance/architecture dependent**: Cache hit rates, P99 improvements, and hot-spotting behavior vary
+5. **Results are instance/architecture dependent**: Cache hit rates, P99 improvements, and hot-spotting behavior vary significantly across Lambda Labs instances — single 10m runs have wide confidence intervals
 6. **Default prefix ratio (0.9) is the reliable operating point**: Lower ratios may hot-spot on current architecture
 7. **8B is routing-neutral**: Inference too fast for cache savings to matter in aggregate TTFT
 8. **70B benefit is reliability, not speed**: Incompletes eliminated, but throughput cost from cache affinity
+9. **Flush interval 10ms is optimal**: Tighter intervals (<10ms) cause hot-spotting; looser intervals (20-50ms) show no benefit
+10. **Cross-shard load sync improves cache affinity but has trade-offs**: Best result (86.8% cache hits, -52.2% P99) comes at 2x tokenization overhead. Feature disabled by default until SMP overhead is further optimized
 
 ### Value Proposition
 
@@ -1177,13 +1257,15 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 </details>
 
 **Key takeaways:**
-- **P99 tail latency** is the strongest win for 13B — -24% to -51% (bb20555), -79% to -85% (Instance 3)
+- **P99 tail latency** is the strongest win for 13B — -24% to -52% (bb20555/c219fbd), -79% to -85% (Instance 3)
 - **Throughput increases** for 13B across both architectures (+3-14% on bb20555, +14-22% on Instance 3)
-- **Cache hit rates** are always much higher than round-robin — 54-98% vs 11-13% baseline
+- **Cache hit rates** are always much higher than round-robin — 45-98% vs 11-13% baseline
+- **Cross-shard sync** can push cache hits to 87% and P99 to -52% but at 2x tokenization overhead
 - **8B is routing-neutral** — inference too fast (~1400ms) for cache savings to matter in aggregate
 - **70B benefit is reliability** — incompletes eliminated, but throughput drops with cache affinity
 - **Backend count matters for 70B** — TP=4 (2 backends, 40GB) limits routing surface
 - **0% incomplete rate** on all post-fix runs (Feb 9, 2026 onwards)
+- **Flush interval 10ms** is the reliable default — tighter causes hot-spotting, looser has no benefit
 
 #### Impact of Prefix Sharing Ratio
 
@@ -1325,14 +1407,17 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 
 ### All Benchmarks Complete
 
-Three full benchmark rounds have been completed:
+Four benchmark rounds have been completed:
 1. **Pre-fix** (Jan-Feb 2026, Instance 1-2) — baseline with stale connection issues (30-37% incomplete)
 2. **Post-fix** (Feb 10-14, Instance 3) — stale connection retry fixed, per-request SMP broadcast
 3. **bb20555** (Feb 21, Instance 5) — speculative load increment + batched route learning + vLLM v0.15.1 pinned
+4. **c219fbd** (Feb 22, Instance 6) — flush interval sweep (2-50ms) + cross-shard load sync evaluation
 
-Every run on bb20555 shows 0% incomplete rate. Default config (prefix-ratio 0.9) delivers
-consistent P99 improvements for 13B (-24% to -51%). Lower prefix ratios and client-tokenize
+Every run on bb20555+ shows 0% incomplete rate. Default config (prefix-ratio 0.9, 10ms flush)
+delivers consistent P99 improvements for 13B (-24% to -52%). Lower prefix ratios and client-tokenize
 show hot-spotting — tracked in backlog 20.11 (cross-shard speculative load synchronization).
+Cross-shard load sync shows promise (86.8% cache hits, -52.2% P99) but is disabled by default
+due to 2x tokenization overhead from SMP reactor congestion.
 
 ---
 

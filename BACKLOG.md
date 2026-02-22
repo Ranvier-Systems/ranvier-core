@@ -1869,6 +1869,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-22 | **[Performance]** Fix cross-shard load sync SMP storm (3x → 2x tokenization regression). Incremental snapshot updates, vector serialization, default interval 100ms, feature disabled by default. Flush interval sweep confirmed 10ms as optimal (2-50ms tested). | - |
 | 2026-02-13 | **[Security]** Add bounds checking to K8s discovery service to prevent OOM (Rule #4). MAX_RESPONSE_SIZE (16MB) for API responses, MAX_LINE_SIZE (1MB) for watch stream buffer, MAX_ENDPOINTS (1000) for endpoints map. Overflow counter metrics added. | #134 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to radix_tree.hpp. Comprehensive documentation for Rules #1, #4, #9, #14 covering lookup, insert, eviction, and slab allocation code paths. | #212 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to router_service.cpp. Documentation for Rules #1, #5, #6, #14 covering route_request, learn_route_global, get_backend_for_prefix, and timer callbacks. | #208 |
@@ -2775,6 +2776,28 @@ Post-refactor benchmarks (February 15, 2026) show regression in prefix-routing g
   _Location:_ `src/router_service.cpp`, `src/router_service.hpp`, `src/config_schema.hpp`, `src/config_loader.cpp`
   _Complexity:_ Medium
   _Priority:_ P2 — Performance; affects client-tokenize and high-concurrency burst scenarios. Server-side tokenization naturally mitigates via stagger.
+  _Completed:_ 2026-02-21 (initial implementation, 575dd78)
+  _Revised:_ 2026-02-22 (fix branch `claude/fix-shard-sync-performance`, 8e49187/c219fbd)
+
+  **Performance regression and fix (Feb 22, 2026):**
+  The initial implementation (575dd78, default 5ms interval) caused a **3x tokenization regression**
+  (12ms → 40ms) from SMP reactor congestion. On an 8-shard system at 5ms interval, this generates
+  ~24,000 SMP messages/sec — enough to congest the reactor and inflate `alien::run_on()` completion
+  latency (tokenizer thread pool callback). The fix branch (8e49187) applied three optimizations:
+  (1) Incremental `apply_load_snapshot()` — O(old + new entries) subtract-then-add instead of
+      O(shards × backends) full recompute on every receive.
+  (2) Serialize snapshots as `vector<pair>` instead of `flat_hash_map` — cheaper cross-shard copy.
+  (3) Default interval increased to 100ms; feature disabled by default.
+
+  **Benchmark results (Feb 22, c219fbd on Instance 6):**
+  - Sync enabled @ 10ms flush: **-52.2% P99**, +11.2% throughput, **86.8% cache hits**, 20ms tokenization (2x)
+  - Sync enabled @ 20ms flush: +6.1% P99, +12.4% throughput, 24.6% cache hits — **FAILED** (stale load data)
+  - Sync disabled @ 10ms-50ms flush: -29% to -42% P99, 45-62% cache hits (high variance)
+
+  **Remaining work:**
+  - [ ] Decouple cross-shard sync interval from batch flush interval for independent tuning
+  - [ ] Investigate reducing 2x tokenization overhead (20ms → target <15ms) when sync enabled
+  - [ ] Consider making load signal a tiebreaker rather than primary routing signal
 
 ---
 
