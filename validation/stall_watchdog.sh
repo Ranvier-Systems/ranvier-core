@@ -5,12 +5,17 @@
 # Launches Ranvier with aggressive Seastar stall detection to catch any
 # reactor stalls that would indicate blocking operations on the hot path.
 #
+# Startup stalls are excluded: tokenizer initialization (Rust FFI parsing
+# of tokenizer JSON on each shard) blocks the reactor for 50-200ms per
+# shard, which is expected and not a hot-path issue. The stall count is
+# snapshotted after warmup; only stalls during load generation are counted.
+#
 # Seastar Flags Used:
 #   --task-quota-ms 0.1       : Task time slice of 100μs (catches micro-stalls)
 #
 # Exit Codes:
-#   0 - No stalls detected
-#   1 - Stalls detected or test failed
+#   0 - No stalls detected during load
+#   1 - Stalls detected during load or test failed
 # =============================================================================
 
 set -euo pipefail
@@ -233,17 +238,26 @@ LUAEOF
 
 analyze_stalls() {
     local log_file="$1"
+    local pre_load_stalls="${2:-0}"
 
     log_info "Analyzing stall log..."
 
-    # Count stall occurrences
-    local stall_count
-    stall_count=$(grep -c "Reactor stall" "$log_file" 2>/dev/null) || stall_count=0
+    # Count total stall occurrences across the entire run
+    local total_stalls
+    total_stalls=$(grep -c "Reactor stall" "$log_file" 2>/dev/null) || total_stalls=0
 
-    log_info "Found $stall_count reactor stall(s)"
+    # Only count stalls that occurred during the load period.
+    # Startup stalls (tokenizer FFI initialization, DB setup) are expected
+    # and not indicative of hot-path issues.
+    local load_stalls=$((total_stalls - pre_load_stalls))
+    if [[ $load_stalls -lt 0 ]]; then
+        load_stalls=0
+    fi
 
-    if [[ "$stall_count" -gt "$STALL_THRESHOLD" ]]; then
-        log_error "STALL THRESHOLD EXCEEDED: $stall_count > $STALL_THRESHOLD"
+    log_info "Total reactor stalls: $total_stalls (startup: $pre_load_stalls, during load: $load_stalls)"
+
+    if [[ "$load_stalls" -gt "$STALL_THRESHOLD" ]]; then
+        log_error "STALL THRESHOLD EXCEEDED: $load_stalls during load > $STALL_THRESHOLD"
 
         # Extract stall details
         log_info "Stall details:"
@@ -269,17 +283,19 @@ analyze_stalls() {
         log_warn "Found $sleep_count potential blocking calls"
     fi
 
-    log_success "No reactor stalls detected within threshold"
+    log_success "No reactor stalls detected during load (within threshold)"
     return 0
 }
 
 generate_report() {
-    local stall_count="$1"
-    local status="$2"
+    local load_stall_count="$1"
+    local startup_stall_count="$2"
+    local status="$3"
 
     cat <<EOF
 {
-  "stall_count": $stall_count,
+  "stall_count": $load_stall_count,
+  "startup_stalls": $startup_stall_count,
   "threshold": $STALL_THRESHOLD,
   "task_quota_ms": $TASK_QUOTA_MS,
   "load_duration": "$LOAD_DURATION",
@@ -318,6 +334,16 @@ main() {
     log_info "Warmup period: ${WARMUP_SECONDS}s"
     sleep "$WARMUP_SECONDS"
 
+    # Snapshot stall count before load generation.
+    # Startup stalls are expected (tokenizer FFI initialization on each shard
+    # parses the tokenizer JSON via Rust, which blocks the reactor for 50-200ms).
+    # These are NOT hot-path issues and should not fail the test.
+    local pre_load_stalls
+    pre_load_stalls=$(grep -c "Reactor stall" "$STALL_LOG_FILE" 2>/dev/null) || pre_load_stalls=0
+    if [[ "$pre_load_stalls" -gt 0 ]]; then
+        log_info "Startup stalls detected: $pre_load_stalls (excluded from threshold check)"
+    fi
+
     # Generate load
     generate_load "$LOAD_DURATION"
 
@@ -326,17 +352,21 @@ main() {
     kill -TERM "$ranvier_pid" 2>/dev/null || true
     sleep 3
 
-    # Analyze results
-    local stall_count
-    stall_count=$(grep -c "Reactor stall" "$STALL_LOG_FILE" 2>/dev/null) || stall_count=0
+    # Analyze results — only count stalls during load (not startup)
+    local total_stalls
+    total_stalls=$(grep -c "Reactor stall" "$STALL_LOG_FILE" 2>/dev/null) || total_stalls=0
+    local load_stalls=$((total_stalls - pre_load_stalls))
+    if [[ $load_stalls -lt 0 ]]; then
+        load_stalls=0
+    fi
 
-    if analyze_stalls "$STALL_LOG_FILE"; then
+    if analyze_stalls "$STALL_LOG_FILE" "$pre_load_stalls"; then
         log_success "STALL WATCHDOG TEST: PASSED"
-        generate_report "$stall_count" "PASS"
+        generate_report "$load_stalls" "$pre_load_stalls" "PASS"
         exit 0
     else
         log_error "STALL WATCHDOG TEST: FAILED"
-        generate_report "$stall_count" "FAIL"
+        generate_report "$load_stalls" "$pre_load_stalls" "FAIL"
         exit 1
     fi
 }
