@@ -16,6 +16,10 @@ make validate
 # Note: These require a running multi-node cluster (Docker Compose), which is why they're separate from make validate (single-process, no Docker needed)
 make test-integration
 
+# Run Locust load test with mock backends for local load testing
+# Note: Uses docker-compose.yml with the benchmark profile, builds images inline (including Ranvier from source unless SKIP_BUILD=1), and writes reports to benchmark-reports/
+make benchmark
+
 # Add useful aliases
 set -o vi
 alias h=history
