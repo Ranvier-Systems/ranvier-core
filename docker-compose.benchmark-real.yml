@@ -162,6 +162,8 @@ services:
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       # Route batch flush interval (ms) - lower values improve cache affinity at cost of SMP overhead
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
+      # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -213,6 +215,8 @@ services:
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
+      # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -264,6 +268,8 @@ services:
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
+      # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
+      - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.

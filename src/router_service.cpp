@@ -179,8 +179,8 @@ struct ShardLocalState {
         double bounded_load_epsilon = 0.25;
         uint64_t p2c_load_bias = 2;
         // Cross-shard load sync configuration
-        bool cross_shard_load_sync = true;
-        std::chrono::milliseconds cross_shard_load_sync_interval{5};
+        bool cross_shard_load_sync = false;
+        std::chrono::milliseconds cross_shard_load_sync_interval{100};
     } config;
 
     // ========================================================================
@@ -224,8 +224,10 @@ struct ShardLocalState {
     // each only see their own shard's counters.
     //
     // Storage: per-source-shard snapshots, indexed by shard_id.
-    // On each broadcast, the receiving shard overwrites its entry for the source
-    // shard and recomputes the aggregated cross_shard_load map.
+    // On each broadcast, the receiving shard subtracts the old snapshot for the
+    // source shard from cross_shard_load, stores the new snapshot, and adds the
+    // new values — an incremental O(backends) update instead of a full O(shards
+    // * backends) recomputation.
     //
     // cross_shard_load[backend_id] = sum of active_requests from ALL OTHER shards
     // This is added to the local active_requests in get_backend_load() to give
@@ -236,7 +238,7 @@ struct ShardLocalState {
     std::vector<absl::flat_hash_map<BackendId, uint64_t>> shard_load_snapshots;
 
     // Aggregated cross-shard load: sum of all other shards' active_requests per backend.
-    // Recomputed from shard_load_snapshots on each snapshot receive.
+    // Updated incrementally on each snapshot receive (subtract old, add new).
     absl::flat_hash_map<BackendId, uint64_t> cross_shard_load;
 
     // Per-shard timer that broadcasts load snapshots periodically
@@ -527,14 +529,12 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
             continue;
         }
 
-        uint64_t load = it->second.active_requests;
+        // Use get_backend_load() which includes cross-shard load hints
+        // when sync is enabled, giving a global view of backend utilization.
+        uint64_t load = get_backend_load(id);
         if (load < best_load) {
             best_load = load;
             best_id = id;
-            // Early exit: 0 is the minimum possible load, can't do better
-            if (load == 0) {
-                break;
-            }
         }
     }
 
@@ -2485,33 +2485,54 @@ seastar::future<> RouterService::stop_local_batch_timer() {
 // We use foreign_ptr to transfer them safely across shards.
 //
 
-// Receive a load snapshot from another shard and recompute cross_shard_load.
-// Called on the receiving shard via smp::submit_to.
+// Receive a load snapshot from another shard and update cross_shard_load
+// incrementally. Called on the receiving shard via smp::submit_to.
+//
+// Incremental update: subtract the OLD snapshot for source_shard from the
+// aggregate, then add the NEW snapshot. This is O(old_entries + new_entries)
+// instead of O(shards * backends) for a full recomputation on every receive.
 static void apply_load_snapshot(unsigned source_shard,
-                                const absl::flat_hash_map<BackendId, uint64_t>& snapshot) {
+                                const std::vector<std::pair<BackendId, uint64_t>>& snapshot_pairs) {
     if (!g_shard_state) return;
     auto& state = *g_shard_state;
 
-    // Store the snapshot for this source shard (overwrite previous)
     if (source_shard >= state.shard_load_snapshots.size()) return;
-    state.shard_load_snapshots[source_shard] = snapshot;
     state.stats.load_sync_snapshots_received++;
 
-    // Recompute aggregated cross-shard load from all snapshots.
-    // Skip our own shard's entry (we use local active_requests directly).
-    // The snapshot vector is sized to smp::count, so we iterate all shards.
-    unsigned this_shard = seastar::this_shard_id();
-    state.cross_shard_load.clear();
-    for (unsigned s = 0; s < state.shard_load_snapshots.size(); ++s) {
-        if (s == this_shard) continue;
-        for (const auto& [backend_id, load] : state.shard_load_snapshots[s]) {
-            state.cross_shard_load[backend_id] += load;
+    // Step 1: Subtract old snapshot values from cross_shard_load
+    auto& old_snapshot = state.shard_load_snapshots[source_shard];
+    for (const auto& [backend_id, old_load] : old_snapshot) {
+        auto it = state.cross_shard_load.find(backend_id);
+        if (it != state.cross_shard_load.end()) {
+            if (it->second <= old_load) {
+                state.cross_shard_load.erase(it);
+            } else {
+                it->second -= old_load;
+            }
         }
+    }
+
+    // Step 2: Store new snapshot (convert pairs to map)
+    old_snapshot.clear();
+    for (const auto& [backend_id, load] : snapshot_pairs) {
+        old_snapshot[backend_id] = load;
+    }
+
+    // Step 3: Add new snapshot values to cross_shard_load
+    for (const auto& [backend_id, load] : old_snapshot) {
+        state.cross_shard_load[backend_id] += load;
     }
 }
 
 // Broadcast this shard's current active_requests to all other shards.
 // Called from the per-shard load sync timer callback.
+//
+// Optimization: Serialize snapshot as vector<pair<BackendId, uint64_t>> (POD
+// pairs, cheaper to copy than flat_hash_map). A single foreign_ptr wraps the
+// snapshot and is shared read-only across the parallel_for_each on the sending
+// shard. Each target shard receives a foreign_ptr to its own copy and reads
+// directly from it — one allocation per target instead of two, and one
+// foreign_ptr destructor return instead of N-1.
 static seastar::future<> broadcast_load_snapshot() {
     if (!g_shard_state) return seastar::make_ready_future<>();
     auto& state = *g_shard_state;
@@ -2524,26 +2545,27 @@ static seastar::future<> broadcast_load_snapshot() {
         return seastar::make_ready_future<>();
     }
 
-    // Build snapshot of this shard's active_requests.
+    // Build snapshot as flat vector of pairs (cheaper to copy than hash map).
     // Only include backends with non-zero load to minimize transfer size.
-    auto snapshot = std::make_unique<absl::flat_hash_map<BackendId, uint64_t>>();
+    using SnapshotVec = std::vector<std::pair<BackendId, uint64_t>>;
+    auto snapshot = std::make_unique<SnapshotVec>();
     for (const auto& [id, info] : state.backends) {
         if (info.active_requests > 0) {
-            (*snapshot)[id] = info.active_requests;
+            snapshot->emplace_back(id, info.active_requests);
         }
     }
 
     state.stats.load_sync_broadcasts++;
     unsigned this_shard = seastar::this_shard_id();
 
-    // Nothing to broadcast if no load (other shards will age out stale entries
-    // naturally when they receive an empty snapshot on the next interval)
-    // Still broadcast empty snapshots to clear stale data on other shards.
+    // Wrap in foreign_ptr for safe cross-shard read access (Rule #14).
+    // The parallel_for_each runs on THIS shard; it reads from the foreign_ptr
+    // to create per-target copies. Only one foreign_ptr destructor return.
     auto foreign_snapshot = seastar::make_foreign(std::move(snapshot));
 
     return seastar::do_with(std::move(holder), std::move(foreign_snapshot),
         [this_shard](seastar::gate::holder&,
-                     seastar::foreign_ptr<std::unique_ptr<absl::flat_hash_map<BackendId, uint64_t>>>& snapshot) {
+                     seastar::foreign_ptr<std::unique_ptr<SnapshotVec>>& snapshot) {
             return seastar::parallel_for_each(
                 boost::irange(0u, seastar::smp::count),
                 [this_shard, &snapshot](unsigned target_shard) {
@@ -2551,16 +2573,18 @@ static seastar::future<> broadcast_load_snapshot() {
                         return seastar::make_ready_future<>();
                     }
 
-                    // Rule #14: Wrap in foreign_ptr, create local copy on target shard
-                    auto copy = std::make_unique<absl::flat_hash_map<BackendId, uint64_t>>(*snapshot);
+                    // Rule #14: Create a copy for the target shard wrapped in
+                    // foreign_ptr. The target reads directly from the foreign_ptr
+                    // data (safe for read-only access) and passes it to
+                    // apply_load_snapshot which builds a local map.
+                    auto copy = std::make_unique<SnapshotVec>(*snapshot);
                     auto foreign_copy = seastar::make_foreign(std::move(copy));
 
                     return seastar::smp::submit_to(target_shard,
                         [source = this_shard, foreign_copy = std::move(foreign_copy)]() mutable {
-                            // Create local allocation on this shard (Rule #14)
-                            absl::flat_hash_map<BackendId, uint64_t> local_snapshot(
-                                foreign_copy->begin(), foreign_copy->end());
-                            apply_load_snapshot(source, local_snapshot);
+                            // Read from foreign_ptr (safe) and apply snapshot.
+                            // apply_load_snapshot builds a local map internally.
+                            apply_load_snapshot(source, *foreign_copy);
                             return seastar::make_ready_future<>();
                         });
                 });
