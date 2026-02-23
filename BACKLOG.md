@@ -31,6 +31,7 @@ This document identifies missing features and optimizations required to promote 
 19. [Gossip Service Review (2026-02-14)](#19-gossip-service-review-2026-02-14)
 20. [Hot-Path Performance Audit (2026-02-15)](#20-hot-path-performance-audit-2026-02-15)
 21. [Request Lifecycle Performance Analysis (2026-02-20)](#21-request-lifecycle-performance-analysis-2026-02-20)
+22. [Code Modularity (Low Priority)](#22-code-modularity-low-priority)
 
 ---
 
@@ -2898,6 +2899,47 @@ End-to-end trace of an LLM inference request through all phases documented in `d
   _Location:_ `src/http_controller.cpp:474-488`
   _Complexity:_ Trivial
   _Priority:_ P4 — Cleanup; negligible performance impact, improves code clarity
+
+---
+
+## 22. Code Modularity (Low Priority)
+
+Internal refactors that improve separation of concerns. No user-facing behavior change.
+
+### 22.1 Extract BackendRegistry Interface from RouterService
+
+- [ ] **Decouple HealthService and K8sDiscoveryService from RouterService**
+  _Justification:_ HealthService and K8sDiscoveryService take `RouterService&` directly. They only use `get_all_backend_ids()`, `get_backend_address()`, and `set_backend_status()`. Extracting a `BackendRegistry` interface makes both services independently testable without constructing a full RouterService.
+  _What to change:_ Define a `BackendRegistry` abstract class with the three methods above. Have RouterService implement it. Change HealthService and K8sDiscoveryService constructors to accept `BackendRegistry&`.
+  _Location:_ `src/health_service.hpp`, `src/k8s_discovery_service.hpp`, `src/router_service.hpp`
+  _Complexity:_ Low
+  _Priority:_ P4 — Testability improvement
+
+### 22.2 Split config_schema.hpp into Infrastructure and Product Configs
+
+- [ ] **Separate generic infrastructure configs from routing-specific configs**
+  _Justification:_ `config_schema.hpp` is 618 lines mixing infrastructure configs (ServerConfig, PoolConfig, HealthConfig, TlsConfig, AuthConfig, etc.) with Ranvier-specific configs (RoutingConfig, AssetsConfig). Splitting reduces cognitive load and makes infrastructure configs independently reusable.
+  _What to change:_ Move infrastructure config structs to `config_infra.hpp`. Keep RoutingConfig and AssetsConfig in `config_schema.hpp`. RanvierConfig includes both headers.
+  _Location:_ `src/config_schema.hpp`
+  _Complexity:_ Low
+  _Priority:_ P4 — Code organization
+
+### 22.3 Split MetricsService into Helpers and Ranvier-Specific Counters
+
+- [ ] **Extract generic histogram/counter patterns from Ranvier-specific metrics**
+  _Justification:_ `metrics_service.hpp` is 620 lines mixing reusable patterns (MetricHistogram class, bucket definitions, per-backend metrics map) with Ranvier-specific counters (tokenization, ART, prefix boundary). Splitting makes the generic patterns reusable and reduces file size.
+  _What to change:_ Move MetricHistogram, bucket helpers, and the bounded per-backend metrics pattern to `metrics_helpers.hpp`. Keep Ranvier-specific counters in `metrics_service.hpp`.
+  _Location:_ `src/metrics_service.hpp`
+  _Complexity:_ Low
+  _Priority:_ P4 — Code organization
+
+### 22.4 Template ShardedConfig on Config Type
+
+- [ ] **Make ShardedConfig generic instead of hardcoded to RanvierConfig**
+  _Justification:_ Trivial change (`ShardedConfig<T>` with backward-compatible alias `using ShardedConfig = BasicShardedConfig<RanvierConfig>`). Follows the existing pattern used by ConnectionPool, CircuitBreaker, and RateLimiter.
+  _Location:_ `src/sharded_config.hpp`
+  _Complexity:_ Trivial
+  _Priority:_ P4 — Consistency with existing template patterns
 
 ---
 
