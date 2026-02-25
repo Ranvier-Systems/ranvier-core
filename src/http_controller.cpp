@@ -416,13 +416,14 @@ future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionB
         co_return false;
     }
 
-    // Build HTTP request headers with sanitized values to prevent CRLF injection.
+    // Build HTTP request with sanitized values to prevent CRLF injection.
     // Host is derived from the target address (not hardcoded to localhost).
-    // Headers and body are written separately to avoid doubling memory for large payloads.
+    // Headers and body are sent as a single write to avoid splitting them across
+    // TCP segments, which would add latency waiting for the body to arrive.
     sstring host_value = to_sstring(ctx.current_addr);
     sstring safe_request_id = sstring(sanitize_header_value(ctx.request_id));
 
-    sstring http_headers =
+    sstring http_req =
         "POST " + sstring(ctx.endpoint) + " HTTP/1.1\r\n"
         "Host: " + host_value + "\r\n"
         "Content-Type: application/json\r\n"
@@ -431,19 +432,18 @@ future<bool> HttpController::send_backend_request(ProxyContext& ctx, ConnectionB
 
     // Add traceparent header if tracing is enabled (sanitize to prevent injection)
     if (!ctx.backend_traceparent.empty()) {
-        http_headers += "traceparent: " + sstring(sanitize_header_value(ctx.backend_traceparent)) + "\r\n";
+        http_req += "traceparent: " + sstring(sanitize_header_value(ctx.backend_traceparent)) + "\r\n";
     }
 
-    http_headers += "Connection: keep-alive\r\n\r\n";
+    http_req += "Connection: keep-alive\r\n\r\n" + ctx.forwarded_body;
 
     log_proxy.info("[{}] Sending request to backend ({} bytes)",
                   ctx.request_id, ctx.forwarded_body.size());
 
-    // Send headers and body separately to avoid concatenating large payloads
+    // Single write ensures headers + body go in one TCP segment
     std::exception_ptr rethrow_exception;
     try {
-        co_await bundle.out.write(http_headers);
-        co_await bundle.out.write(ctx.forwarded_body);
+        co_await bundle.out.write(http_req);
         co_await bundle.out.flush();
         co_return true;
     } catch (...) {
@@ -602,17 +602,11 @@ future<> HttpController::stream_backend_response(
             }
         }
 
-        // Write to client with broken pipe handling.
-        // Flush strategy: flush on first write (TTFT), on stream completion (done),
-        // and let Seastar's output_stream buffer coalesce intermediate writes.
-        // This reduces per-token syscalls while preserving low latency for first byte.
+        // Write to client with broken pipe handling
         if (!res.data.empty()) {
-            bool needs_flush = (ctx.bytes_written_to_client == 0) || res.done;
             try {
                 co_await client_out.write(res.data);
-                if (needs_flush) {
-                    co_await client_out.flush();
-                }
+                co_await client_out.flush();
                 ctx.bytes_written_to_client += res.data.size();
             } catch (...) {
                 auto err_type = classify_connection_error(std::current_exception());

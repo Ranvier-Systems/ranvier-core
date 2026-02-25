@@ -1870,6 +1870,7 @@ _Move completed items here with completion date and PR reference._
 
 | Date | Item | PR |
 |------|------|----|
+| 2026-02-25 | **[Performance]** Fix 3.3x P50 latency regression from c70f0c1 (#280). Reverted split HTTP write to single concatenated write AND reverted SSE flush strategy (first/last-only → per-chunk). SSE flush is the more likely cause since Seastar output_stream coalesces buffered writes. Bisected from 08c4915→c70f0c1 across 7 iterations. | - |
 | 2026-02-22 | **[Performance]** Fix cross-shard load sync SMP storm (3x → 2x tokenization regression). Incremental snapshot updates, vector serialization, default interval 100ms, feature disabled by default. Flush interval sweep confirmed 10ms as optimal (2-50ms tested). | - |
 | 2026-02-13 | **[Security]** Add bounds checking to K8s discovery service to prevent OOM (Rule #4). MAX_RESPONSE_SIZE (16MB) for API responses, MAX_LINE_SIZE (1MB) for watch stream buffer, MAX_ENDPOINTS (1000) for endpoints map. Overflow counter metrics added. | #134 |
 | 2026-02-01 | **[DX]** Add inline Hard Rule documentation to radix_tree.hpp. Comprehensive documentation for Rules #1, #4, #9, #14 covering lookup, insert, eviction, and slab allocation code paths. | #212 |
@@ -2331,15 +2332,29 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
   _Complexity:_ Low
   _Priority:_ P2 — Header injection risk and correctness
   _Completed:_ 2026-02-14 — Added sanitize_header_value() to parse_utils.hpp, derived Host from ctx.current_addr, split write
+  **REGRESSION (found 2026-02-25):** Commit c70f0c1 (#280) caused a **3.3x P50 latency
+  regression** (780ms → 2,600ms baseline). Bisected from 08c4915 (good) → c70f0c1 (regressed)
+  across 7 test iterations. Two changes from this commit are suspects:
+  1. Split write (headers/body as separate `co_await bundle.out.write()` calls) — reverted to
+     single concatenated write.
+  2. SSE flush strategy (flush only on first/last chunk instead of every chunk) — reverted to
+     per-chunk flush.
+  Note: Seastar's output_stream buffers writes until flush(), so the split write likely coalesces
+  into a single TCP send. The SSE flush change is the more likely cause.
+  **Fix:** Reverted both: single write for request sending, per-chunk flush for SSE streaming.
+  The header sanitization and Host derivation fixes are preserved.
 
 ### 15.5 Optimize Per-Chunk Flush in SSE Streaming Loop
 
-- [x] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
+- [ ] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
   _Justification:_ Every chunk received from the backend triggers a `write()` + `flush()` to the client. For streaming LLM responses with many small SSE events (10-50 bytes per token), this produces one syscall per token. While low-latency delivery is intentional for SSE, a more nuanced approach could batch flushes when multiple chunks are available in the same reactor tick.
   _What to change:_ Remove the per-chunk `flush()` and rely on Seastar's internal output stream buffering, or implement a configurable flush strategy: immediate for `[DONE]` events, batched otherwise (e.g., flush every 10ms via a timer or after N bytes accumulated).
   _Location:_ `src/http_controller.cpp` (lines 602-603)
   _Complexity:_ Medium
   _Priority:_ P3 — Performance; most impactful at high token throughput
+  **REVERTED (2026-02-25):** The first/last-only flush strategy (implemented in c70f0c1) is
+  suspected of causing the 3.3x P50 latency regression. Reverted to per-chunk flush pending
+  further investigation. A future implementation should benchmark carefully.
   _Completed:_ 2026-02-14 — Flush on first write (TTFT) and on done; intermediate writes use Seastar buffering
 
 ### 15.6 Add Explicit `stop()` Method for Orderly Shutdown
