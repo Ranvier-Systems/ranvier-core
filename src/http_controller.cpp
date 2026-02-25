@@ -603,16 +603,14 @@ future<> HttpController::stream_backend_response(
         }
 
         // Write to client with broken pipe handling.
-        // Flush strategy: flush on first write (TTFT), on stream completion (done),
-        // and let Seastar's output_stream buffer coalesce intermediate writes.
-        // This reduces per-token syscalls while preserving low latency for first byte.
+        // SSE requires per-chunk flush so tokens are delivered to the client in
+        // real-time. Without it, intermediate events sit in Seastar's output_stream
+        // buffer (8KB default) until the buffer fills or the stream completes,
+        // causing multi-second delivery stalls for small SSE events (10-50 bytes).
         if (!res.data.empty()) {
-            bool needs_flush = (ctx.bytes_written_to_client == 0) || res.done;
             try {
                 co_await client_out.write(res.data);
-                if (needs_flush) {
-                    co_await client_out.flush();
-                }
+                co_await client_out.flush();
                 ctx.bytes_written_to_client += res.data.size();
             } catch (...) {
                 auto err_type = classify_connection_error(std::current_exception());
