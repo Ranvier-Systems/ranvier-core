@@ -604,12 +604,16 @@ future<> HttpController::stream_backend_response(
 
         // Write to client with broken pipe handling.
         // Flush after every write to ensure SSE events reach the client promptly.
-        // This is already naturally batched: each bundle.in.read() returns a full
-        // TCP segment which StreamParser::push() decodes into potentially multiple
-        // SSE events concatenated in res.data. So one flush() per read() iteration
-        // sends all events that arrived together — not one syscall per token.
-        // Skipping intermediate flushes causes multi-second stalls because small
-        // SSE events (10-50 bytes each) never fill the 8KB output buffer.
+        // At typical LLM token rates (30-100 tok/s), tokens arrive as individual
+        // TCP segments, so this is effectively one flush per token. When the backend
+        // bursts, multiple events land in one TCP segment and StreamParser::push()
+        // concatenates them into a single res.data — natural batching.
+        //
+        // A timer-based flush (e.g., every 10ms) could reduce steady-state syscalls
+        // but adds per-request timer complexity for a marginal gain. The simpler
+        // per-read flush is correct and safe. Do NOT skip intermediate flushes —
+        // small SSE events (10-50 bytes) never fill the 8KB output buffer, causing
+        // multi-second delivery stalls (see #280 revert).
         if (!res.data.empty()) {
             try {
                 co_await client_out.write(res.data);
