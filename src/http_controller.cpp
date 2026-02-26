@@ -603,16 +603,21 @@ future<> HttpController::stream_backend_response(
         }
 
         // Write to client with broken pipe handling.
-        // Flush strategy: flush on first write (TTFT), on stream completion (done),
-        // and let Seastar's output_stream buffer coalesce intermediate writes.
-        // This reduces per-token syscalls while preserving low latency for first byte.
+        // Flush after every write to ensure SSE events reach the client promptly.
+        // At typical LLM token rates (30-100 tok/s), tokens arrive as individual
+        // TCP segments, so this is effectively one flush per token. When the backend
+        // bursts, multiple events land in one TCP segment and StreamParser::push()
+        // concatenates them into a single res.data — natural batching.
+        //
+        // A timer-based flush (e.g., every 10ms) could reduce steady-state syscalls
+        // but adds per-request timer complexity for a marginal gain. The simpler
+        // per-read flush is correct and safe. Do NOT skip intermediate flushes —
+        // small SSE events (10-50 bytes) never fill the 8KB output buffer, causing
+        // multi-second delivery stalls (see #280 revert).
         if (!res.data.empty()) {
-            bool needs_flush = (ctx.bytes_written_to_client == 0) || res.done;
             try {
                 co_await client_out.write(res.data);
-                if (needs_flush) {
-                    co_await client_out.flush();
-                }
+                co_await client_out.flush();
                 ctx.bytes_written_to_client += res.data.size();
             } catch (...) {
                 auto err_type = classify_connection_error(std::current_exception());

@@ -2334,13 +2334,40 @@ Deep-dive review of `http_controller.hpp` and `http_controller.cpp` (~2500 lines
 
 ### 15.5 Optimize Per-Chunk Flush in SSE Streaming Loop
 
-- [x] **Reduce flush frequency in `stream_backend_response()` to avoid per-token syscalls**
-  _Justification:_ Every chunk received from the backend triggers a `write()` + `flush()` to the client. For streaming LLM responses with many small SSE events (10-50 bytes per token), this produces one syscall per token. While low-latency delivery is intentional for SSE, a more nuanced approach could batch flushes when multiple chunks are available in the same reactor tick.
-  _What to change:_ Remove the per-chunk `flush()` and rely on Seastar's internal output stream buffering, or implement a configurable flush strategy: immediate for `[DONE]` events, batched otherwise (e.g., flush every 10ms via a timer or after N bytes accumulated).
-  _Location:_ `src/http_controller.cpp` (lines 602-603)
-  _Complexity:_ Medium
-  _Priority:_ P3 — Performance; most impactful at high token throughput
-  _Completed:_ 2026-02-14 — Flush on first write (TTFT) and on done; intermediate writes use Seastar buffering
+- [ ] **Reduce flush frequency in `stream_backend_response()` via timer-based coalescing**
+  _Justification:_ Every `bundle.in.read()` iteration triggers `write()` + `flush()` to the client. At typical LLM token rates (30-100 tok/s), each token arrives as a separate TCP segment, so this is effectively **one `sendmsg()` syscall per token** at steady state. Natural TCP batching only helps during bursts (multiple tokens arriving in one segment, which `StreamParser::push()` concatenates into a single `res.data`). At high concurrency (many concurrent streams), the per-token syscall overhead becomes measurable.
+
+  **Previous attempt (2026-02-14, reverted in #280):** Flushed only on first write (TTFT) and `[DONE]`, relying on Seastar's 8KB `output_stream` buffer for intermediate events. This caused a **3.3x TTFT regression** because small SSE events (10-50 bytes each) never fill the 8KB buffer, stalling delivery for seconds until enough tokens accumulate. The regression was caught in production load testing and reverted.
+
+  **Why "just skip flushes" fails:** Seastar's `output_stream` buffers 8KB by default. At 30 bytes/token, that's ~270 tokens (~9 seconds at 30 tok/s) before the buffer auto-flushes. SSE requires real-time delivery, so any approach that removes intermediate flushes without a bounded-latency fallback will break streaming.
+
+  **Why "reactor tick coalescing" is not straightforward:** Seastar provides no primitive to check "is there more work pending in this reactor tick." `seastar::yield()` / `coroutine::maybe_yield()` are control-flow primitives, not introspection tools. You cannot peek at a future's readiness without consuming it, so "read-ahead to decide whether to flush" requires restructuring the entire loop.
+
+  _What to change:_ Implement a **`seastar::timer<seastar::lowres_clock>`** flush strategy:
+  1. On entering the streaming loop, arm a periodic timer (~10ms interval, matching `lowres_clock` resolution).
+  2. In the read loop, call `co_await client_out.write(res.data)` **without** `flush()`.
+  3. The timer callback flushes whatever has accumulated: `(void)client_out.flush().handle_exception(...)` with a `seastar::gate` holder per Rule #5.
+  4. Flush **immediately** on `res.done` (terminal event) and on stream errors/cleanup.
+  5. Disarm the timer on loop exit (before `client_out.close()`).
+
+  _Design constraints:_
+  - The timer is **per-request** (created/destroyed with each `stream_backend_response()` call). This is fine — Seastar's `timer_set` is optimized for frequent create/cancel cycles. See existing patterns: `router_service.cpp:2058` (batch flush), `connection_pool.hpp:500` (reaper timer).
+  - The timer callback is synchronous but `flush()` is async. Use the fire-and-forget pattern with gate guard: `(void)flush().finally([holder = std::move(holder)] {})`.
+  - Must handle the race between timer-initiated flush and loop-initiated close. The gate ensures the flush completes before stream teardown.
+  - Must handle `flush()` failure in the timer callback (client disconnect). Log and set a flag the main loop checks, or let the next `write()` catch the broken pipe.
+  - **10ms worst-case latency** is acceptable for SSE token streaming (human-imperceptible). This coalesces 1-3 tokens per flush at typical rates, reducing syscalls by ~2-3x.
+
+  _Testing requirements (critical — the previous attempt was not adequately tested):_
+  - **TTFT test:** Measure time from first backend token to client receipt. Must be <15ms above baseline (currently ~1ms with per-read flush).
+  - **Stall test:** Stream 100+ tokens at 30 tok/s, verify no token is delayed >20ms from backend receipt to client delivery.
+  - **Burst test:** Send 10 tokens in <1ms from backend, verify they arrive at client in one batch (not 10 separate deliveries).
+  - **Disconnect test:** Client disconnects mid-stream, verify timer is cleaned up and no use-after-free.
+  - **Shutdown test:** Server drains while streams are active, verify gate prevents timer callback after stream teardown.
+
+  _Location:_ `src/http_controller.cpp` (`stream_backend_response()`, currently lines 605-620)
+  _Complexity:_ Medium — per-request timer lifecycle, gate interaction, error propagation from timer callback
+  _Priority:_ P3 — Performance optimization; most impactful at high concurrent stream count
+  _Depends on:_ Stable TTFT measurement infrastructure to validate before/after
 
 ### 15.6 Add Explicit `stop()` Method for Orderly Shutdown
 
