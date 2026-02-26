@@ -603,10 +603,13 @@ future<> HttpController::stream_backend_response(
         }
 
         // Write to client with broken pipe handling.
-        // SSE requires per-chunk flush so tokens are delivered to the client in
-        // real-time. Without it, intermediate events sit in Seastar's output_stream
-        // buffer (8KB default) until the buffer fills or the stream completes,
-        // causing multi-second delivery stalls for small SSE events (10-50 bytes).
+        // Flush after every write to ensure SSE events reach the client promptly.
+        // This is already naturally batched: each bundle.in.read() returns a full
+        // TCP segment which StreamParser::push() decodes into potentially multiple
+        // SSE events concatenated in res.data. So one flush() per read() iteration
+        // sends all events that arrived together — not one syscall per token.
+        // Skipping intermediate flushes causes multi-second stalls because small
+        // SSE events (10-50 bytes each) never fill the 8KB output buffer.
         if (!res.data.empty()) {
             try {
                 co_await client_out.write(res.data);
