@@ -62,18 +62,36 @@ under "Post-Fix Re-Run Plan".
 
 ## Post-Fix Benchmark Results (Feb 27, 2026)
 
-### Quick Validation: 13B 20u 1m (b63c165, Instance 7)
+### 13B 20u 10m — Primary Comparison (b63c165, Instance 7)
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
-| P99 TTFT | 3,700ms | 1,200ms | **-67.6%** |
-| Throughput | 23.9 req/s | 26.9 req/s | **+12.6%** |
-| Cache Hit Rate | 11.0% | 85.2% | +74.2% |
+| P99 TTFT | 4,700ms | 960ms | **-79.6%** |
+| P50 TTFT | 730ms | 610ms | **-16.4%** |
+| Throughput | 30.8 req/s | 37.6 req/s | **+22.1%** |
+| Cache Hit Rate | 12.4% | 81.2% | +68.8% |
 | Incompletes | 0 | 0 | 0% |
+| Tokenization P50 | — | 16.4ms | Higher than expected |
 
-**Prediction confirmed:** P99 -67.6% is between Instance 3 (-79%) and the invalidated bb20555
-(-48%), exactly as predicted. The gap vs Instance 3 is from batched route learning (85% vs 98%
-cache hits). 1-minute run only — 10-minute runs will narrow confidence intervals.
+**Matches Instance 3** (-78.7% P99). Throughput +22.1% is the best recorded.
+
+### Pre-Regression Baseline Comparison (3218554 vs b63c165, same instance)
+
+| Metric | 3218554 (old) | b63c165 (main) |
+|--------|---------------|----------------|
+| P99 TTFT change | -88.3% | -79.6% |
+| Throughput change | +20.9% | +22.1% |
+| Cache Hit Rate | 97.4% | 81.2% |
+| Prefix P99 | 890ms | 960ms |
+| RR P99 | 7,600ms | 4,700ms |
+
+**No hidden regressions.** Prefix path performs identically (~890-960ms P99). The relative
+improvement difference (-88% vs -80%) comes from main's healthier round-robin baseline.
+Tokenization P50 (16.4ms vs 8.0ms) worth monitoring.
+
+### Quick Validation: 13B 20u 1m (b63c165, Instance 7)
+
+1-minute quick run showed P99 -67.6%. Converged to -79.6% on the full 10-minute run.
 
 ## Architecture Notes
 

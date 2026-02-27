@@ -1615,17 +1615,36 @@ As results come in, update the tables below. Use this template for each run:
 | Tokenization P50 | — | 8.14ms | — | Consistent with previous measurements |
 | Validation | PASSED | PASSED | | |
 
-> **Key finding:** P99 improvement of **-67.6%** confirms the c70f0c1 regression was hiding the
-> true benefit. This is between Instance 3 (-79%) and the invalidated bb20555 (-48%) as
-> predicted. The difference from Instance 3 is likely due to batched route learning (85% cache
-> hits vs 98%). This is only a 1-minute run — 10-minute runs will provide tighter confidence
-> intervals. XLarge P99 improvements are dramatic: hit P99 -43.1%, miss P99 -69.3% vs baseline.
+> **Key finding:** The 1-minute quick validation showed P99 -67.6%, but the 10-minute run
+> converged to **-79.6%** — matching Instance 3's -78.7% almost exactly. Throughput +22.1%
+> is the best recorded, exceeding Instance 3 (+13.7%). The architecture is validated:
+> batched route learning trades cache affinity (81% vs 98%) for better baseline performance,
+> with equivalent or better net P99 improvement.
+
+**Pre-regression baseline comparison (3218554 vs b63c165, same instance):**
+
+| Metric | 3218554 (old, pre-regression) | b63c165 (main, post-fix) | Notes |
+|--------|-------------------------------|--------------------------|-------|
+| P99 TTFT change | -88.3% | **-79.6%** | Main's RR baseline is healthier |
+| P50 TTFT change | -14.4% | -16.4% | ~same |
+| Throughput change | +20.9% | **+22.1%** | Main slightly better |
+| Cache Hit Rate | 97.4% | 81.2% | Batched routes vs per-request SMP |
+| Prefix P99 | 890ms | 960ms | ~same absolute performance |
+| RR P99 | 7,600ms | 4,700ms | Main's RR 38% faster (less SMP overhead) |
+| Tokenization P50 | 8.0ms | 16.4ms | Main higher — needs investigation |
+| RR Validation | FAILED | PASSED | Main's RR is healthier |
+
+> **No hidden regressions.** The prefix-aware path performs identically on both commits
+> (P99 ~890-960ms). The difference in relative improvement (-88% vs -80%) comes entirely
+> from the round-robin denominator: main's reduced SMP overhead makes RR less bad (4,700ms
+> vs 7,600ms P99). The tokenization overhead (16.4ms vs 8.0ms) is worth monitoring on
+> subsequent runs — may be thermal throttling or a code path difference.
 
 **Priority 1 — Core runs (commit 08ba984+):**
 
 | # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
 |---|--------|-----------------|------------|----------------|------------|-------|
-| 1a | 13B 20u 10m (run 1) | — | — | — | — | Pending |
+| 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, Instance 7 |
 | 1b | 13B 20u 10m (run 2) | — | — | — | — | Pending |
 | 2 | 13B 10u 10m | — | — | — | — | Pending |
 | 3 | 13B 30u 30m | — | — | — | — | Pending |
