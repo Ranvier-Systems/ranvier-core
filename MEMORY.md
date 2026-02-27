@@ -114,6 +114,29 @@ Tokenization P50 (16.4ms vs 8.0ms) worth monitoring.
 
 ## Architecture Notes
 
+### Tokenization 2x Overhead (8ms → 16ms P50)
+
+Tokenization P50 doubled from ~8ms (commit 3218554) to ~16.5ms (main, b63c165). Root cause
+analysis identified three contributing changes:
+
+| Source | Commit | Impact | Mechanism |
+|--------|--------|--------|-----------|
+| **Message boundary detection** | 1a414c0 | **+4-6ms** | `encode_cached()` called per-message for boundary calculation (http_controller.cpp:975-1003). 3-5 messages per request = 2-4 extra tokenization calls. |
+| **Thread pool round-trip** | 973768d | +2-3ms | SPSC queue → worker → `alien::run_on()` back. Two string copies + token vector copy per request. |
+| **Semaphore gating** | 3841bb7 | +0.5-1ms | `try_wait()`/`signal()` on every cache-miss fallback path. |
+
+**Why it was done:** The thread pool prevents 8ms reactor stalls from the Rust FFI `Encode()`
+call. The chat templates align tokenization output with vLLM's `apply_chat_template()`. The
+semaphore prevents compounding reactor stalls when thread pool queue is full.
+
+**Potential optimizations:**
+- Message boundary detection could use token-count heuristics instead of re-tokenizing
+- Thread pool string copies could be reduced with careful lifetime management
+- Worker spin/sleep (100μs) could be tuned for sustained load
+
+**Key config:** `RANVIER_TOKENIZER_THREAD_POOL_ENABLED=true` (default since 17b1bd9),
+`RANVIER_CHAT_TEMPLATE_FORMAT` controls template format.
+
 ### Key Commits (Benchmark-Relevant)
 
 | Commit | What | Benchmark Impact |
