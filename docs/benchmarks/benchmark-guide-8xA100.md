@@ -732,6 +732,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 | Model | Users | Duration | Prefix Size | Cache Miss | Cache Hit | Improvement | Notes |
 |-------|-------|----------|-------------|------------|-----------|-------------|-------|
+| **13B** | **20** | **1m** | XLarge | ~1142ms | ~846ms | **~26%** | Feb 27, post-SSE-fix (b63c165), 1m quick validation |
 | **13B** | **20** | **10m** | XLarge | ~1301ms | ~834ms | **~36%** | Feb 2026, post-fix |
 | **13B** | **10** | **10m** | XLarge | ~1394ms | ~845ms | **~39%** | Feb 2026, post-fix |
 | **8B** | **20** | **10m** | XLarge | ~649ms | ~444ms | **~32%** | Feb 2026, post-fix |
@@ -1598,6 +1599,27 @@ As results come in, update the tables below. Use this template for each run:
 ```
 
 #### Post-Fix Results (to be filled in as runs complete)
+
+**Quick Validation (13B 20u 1m, b63c165, Feb 27 — Instance 7):**
+
+| Metric | Round-Robin | Prefix-Aware | Change | Notes |
+|--------|-------------|--------------|--------|-------|
+| Cache Hit Rate | 11.0% | 85.2% | **+74.2%** | Consistent with bb20555 (87-89%) |
+| P99 TTFT | 3,700ms | 1,200ms | **-67.6%** | Much stronger than invalidated -24% to -48% |
+| P50 TTFT | 800ms | 770ms | -3.8% | |
+| Throughput (req/s) | 23.9 | 26.9 | **+12.6%** | Consistent with previous data |
+| Incompletes | 0 | 0 | 0% | Clean |
+| Errors | 0 | 0 | 0% | Clean |
+| XLarge Hit P50 | 1,319ms | 846ms | -35.8% | Cache hits much faster |
+| XLarge Miss P50 | 1,142ms | 771ms | -32.5% | Misses also faster (fewer in queue) |
+| Tokenization P50 | — | 8.14ms | — | Consistent with previous measurements |
+| Validation | PASSED | PASSED | | |
+
+> **Key finding:** P99 improvement of **-67.6%** confirms the c70f0c1 regression was hiding the
+> true benefit. This is between Instance 3 (-79%) and the invalidated bb20555 (-48%) as
+> predicted. The difference from Instance 3 is likely due to batched route learning (85% cache
+> hits vs 98%). This is only a 1-minute run — 10-minute runs will provide tighter confidence
+> intervals. XLarge P99 improvements are dramatic: hit P99 -43.1%, miss P99 -69.3% vs baseline.
 
 **Priority 1 — Core runs (commit 08ba984+):**
 

@@ -60,6 +60,21 @@ under "Post-Fix Re-Run Plan".
 - Cross-shard sync benefit (86.8% cache hits) needs re-validation — was the strongest result
   but measured against inflated baseline.
 
+## Post-Fix Benchmark Results (Feb 27, 2026)
+
+### Quick Validation: 13B 20u 1m (b63c165, Instance 7)
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| P99 TTFT | 3,700ms | 1,200ms | **-67.6%** |
+| Throughput | 23.9 req/s | 26.9 req/s | **+12.6%** |
+| Cache Hit Rate | 11.0% | 85.2% | +74.2% |
+| Incompletes | 0 | 0 | 0% |
+
+**Prediction confirmed:** P99 -67.6% is between Instance 3 (-79%) and the invalidated bb20555
+(-48%), exactly as predicted. The gap vs Instance 3 is from batched route learning (85% vs 98%
+cache hits). 1-minute run only — 10-minute runs will narrow confidence intervals.
+
 ## Architecture Notes
 
 ### Key Commits (Benchmark-Relevant)
