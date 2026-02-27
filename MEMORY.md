@@ -112,6 +112,40 @@ Tokenization P50 (16.4ms vs 8.0ms) worth monitoring.
 
 1-minute quick run showed P99 -67.6%. Converged to -79.6% on the full 10-minute run.
 
+### 13B 20u 2m — Thread Pool Disabled (b63c165, Instance 7)
+
+Env: `RANVIER_TOKENIZER_THREAD_POOL_ENABLED=false`
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| P99 TTFT | 4,800ms | 960ms | **-80.0%** |
+| P50 TTFT | 800ms | 740ms | **-7.5%** |
+| Throughput | 27.0 req/s | 31.6 req/s | **+17.1%** |
+| Cache Hit Rate | 11.8% | 83.5% | +71.7% |
+| Incompletes | 0 | 0 | 0% |
+| Tokenization P50 | — | 11.2ms | Down from 16.5ms |
+
+**Thread pool overhead confirmed at ~5ms.** Tokenization P50 dropped from 16.5ms → 11.2ms.
+Remaining 11.2ms vs original 8ms (3218554) = message boundary detection overhead (~3ms).
+
+**Cross-run comparison (all 13B 20u, prefix-aware, same instance):**
+
+| Metric | Run 1a (pool on) | Run 1b (pool on) | **Run 3 (pool off)** |
+|--------|:-:|:-:|:-:|
+| P99 TTFT | 960ms | 4,700ms | **960ms** |
+| P50 TTFT | 610ms | 730ms | **740ms** |
+| Throughput | 37.6 req/s | 33.8 req/s | **31.6 req/s** |
+| Tokenization P50 | 16.4ms | 16.7ms | **11.2ms** |
+| Hot-spotting | No | **Yes** | No |
+
+**Notes:** P99 matches best-case (960ms). No hot-spotting. Throughput slightly lower than
+run 1a but run 1a had an unusually strong RR baseline too. The 2-minute duration is shorter
+than the 10-minute runs — a longer run would give more stable throughput numbers.
+
+**Concern:** Reactor stall at 11ms per tokenization. At 20 users this is fine (vLLM inference
+dominates at ~700ms+), but higher concurrency (100+ users) could cascade. Need to test at
+higher load before concluding thread pool should be disabled.
+
 ## Architecture Notes
 
 ### Tokenization 2x Overhead (8ms → 16ms P50)
@@ -119,11 +153,10 @@ Tokenization P50 (16.4ms vs 8.0ms) worth monitoring.
 Tokenization P50 doubled from ~8ms (commit 3218554) to ~16.5ms (main, b63c165). Root cause
 analysis identified three contributing changes:
 
-| Source | Commit | Impact | Mechanism |
-|--------|--------|--------|-----------|
-| **Message boundary detection** | 1a414c0 | **+4-6ms** | `encode_cached()` called per-message for boundary calculation (http_controller.cpp:975-1003). 3-5 messages per request = 2-4 extra tokenization calls. |
-| **Thread pool round-trip** | 973768d | +2-3ms | SPSC queue → worker → `alien::run_on()` back. Two string copies + token vector copy per request. |
-| **Semaphore gating** | 3841bb7 | +0.5-1ms | `try_wait()`/`signal()` on every cache-miss fallback path. |
+| Source | Commit | Impact | Confirmed | Mechanism |
+|--------|--------|--------|-----------|-----------|
+| **Thread pool + semaphore** | 973768d, 3841bb7 | **+5.3ms** | **Yes** (16.5→11.2ms) | SPSC queue, string copies, `alien::run_on()`, semaphore gating. |
+| **Message boundary detection** | 1a414c0 | **+3.2ms** | **Yes** (11.2→8.0ms gap) | `encode_cached()` per-message (http_controller.cpp:975-1003). |
 
 **Why it was done:** The thread pool prevents 8ms reactor stalls from the Rust FFI `Encode()`
 call. The chat templates align tokenization output with vLLM's `apply_chat_template()`. The
