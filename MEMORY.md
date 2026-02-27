@@ -75,6 +75,25 @@ under "Post-Fix Re-Run Plan".
 
 **Matches Instance 3** (-78.7% P99). Throughput +22.1% is the best recorded.
 
+### 13B 20u 10m — Run 2 (b63c165, Instance 7, HOT-SPOTTING)
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| P99 TTFT | 3,500ms | 4,700ms | **+34.3% WORSE** |
+| P50 TTFT | 700ms | 730ms | +4.3% |
+| Throughput | 34.5 req/s | 33.8 req/s | -2.2% |
+| Cache Hit Rate | 12.8% | 78.6% | +65.7% |
+| Tokenization P50 | — | 16.7ms | Consistent with run 1 |
+
+**Hot-spotting on back-to-back run.** Prefix P99 spiked to 4,700ms while RR baseline was
+actually healthier than run 1a (3,500ms vs 4,700ms). Same pattern as c219fbd Instance 6.
+Batched route learning creates variance windows. 3218554 (per-request SMP) had no such issue.
+
+**Key issues identified:**
+1. **Run-to-run variance**: P99 -79.6% vs +34.3% back-to-back on same instance
+2. **Tokenization 2x regression**: 16.5ms on main vs 8.0ms on 3218554, consistent across runs
+3. **Hot-spotting from batched routes**: 10ms flush interval allows cross-shard routing divergence
+
 ### Pre-Regression Baseline Comparison (3218554 vs b63c165, same instance)
 
 | Metric | 3218554 (old) | b63c165 (main) |

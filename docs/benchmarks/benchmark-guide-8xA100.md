@@ -1634,18 +1634,27 @@ As results come in, update the tables below. Use this template for each run:
 | Tokenization P50 | 8.0ms | 16.4ms | Main higher — needs investigation |
 | RR Validation | FAILED | PASSED | Main's RR is healthier |
 
-> **No hidden regressions.** The prefix-aware path performs identically on both commits
-> (P99 ~890-960ms). The difference in relative improvement (-88% vs -80%) comes entirely
-> from the round-robin denominator: main's reduced SMP overhead makes RR less bad (4,700ms
-> vs 7,600ms P99). The tokenization overhead (16.4ms vs 8.0ms) is worth monitoring on
-> subsequent runs — may be thermal throttling or a code path difference.
+> **No hidden regressions in the prefix path.** The prefix-aware path performs identically
+> on both commits (P99 ~890-960ms on clean runs). The difference in relative improvement
+> (-88% vs -80%) comes from the round-robin denominator: main's reduced SMP overhead makes
+> RR less bad (4,700ms vs 7,600ms P99).
+>
+> **However, run-to-run variance is a real issue on main.** Back-to-back 10m runs produced
+> P99 -79.6% (run 1a) and +34.3% (run 1b) — hot-spotting on the second run caused prefix
+> P99 to spike to 4,700ms while the RR baseline was actually healthier (3,500ms). This
+> matches the c219fbd pattern. The batched route learning 10ms flush interval creates
+> windows where cross-shard routing decisions diverge under load, occasionally concentrating
+> traffic on fewer backends. 3218554 (per-request SMP) showed no such variance.
+>
+> **Tokenization overhead is 2x higher on main** (~16.5ms vs 8.0ms on 3218554). Consistent
+> across all main runs — not thermal noise. Needs investigation.
 
 **Priority 1 — Core runs (commit 08ba984+):**
 
 | # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
 |---|--------|-----------------|------------|----------------|------------|-------|
-| 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, Instance 7 |
-| 1b | 13B 20u 10m (run 2) | — | — | — | — | Pending |
+| 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, clean run |
+| 1b | 13B 20u 10m (run 2) | **+34.3%** | -2.2% | 78.6% | PASSED | b63c165, **hot-spotting** — prefix P99 4,700ms |
 | 2 | 13B 10u 10m | — | — | — | — | Pending |
 | 3 | 13B 30u 30m | — | — | — | — | Pending |
 | 4 | 8B 20u 10m | — | — | — | — | Pending |
