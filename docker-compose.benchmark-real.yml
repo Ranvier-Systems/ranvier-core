@@ -164,6 +164,10 @@ services:
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
       - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
+      - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
+      - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
+      - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -217,6 +221,10 @@ services:
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
       - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
+      - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
+      - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
+      - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -270,6 +278,10 @@ services:
       - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
       - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
+      # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
+      - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
+      - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
+      - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
     # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.

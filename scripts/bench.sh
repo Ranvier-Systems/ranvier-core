@@ -258,6 +258,12 @@ BENCHMARK OPTIONS:
     --no-load-aware     Disable load-aware backend selection. Routes always go to the
                         cached backend regardless of queue depth. Useful for A/B testing
                         cache hit rates vs load balancing trade-offs.
+    --load-imbalance-factor F
+                        Divert when preferred > factor * median load (default: 2.0).
+                        Higher values reduce sensitivity (fewer fallbacks).
+    --load-imbalance-floor N
+                        Additive floor to prevent flapping at low load (default: 2).
+                        Threshold = median * factor + floor.
     --vllm-version VER  Pin vLLM to a specific version (default: ${DEFAULT_VLLM_VERSION}).
                         Ensures reproducible benchmarks across instances.
     --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
@@ -432,6 +438,8 @@ LOG_ALL=true  # Enabled by default - benchmarks should always be logged
 CLIENT_TOKENIZE=false
 MULTI_DEPTH=false
 LOAD_AWARE=true
+LOAD_IMBALANCE_FACTOR=""
+LOAD_IMBALANCE_FLOOR=""
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 MAX_TOKENS="$DEFAULT_MAX_TOKENS"
@@ -465,6 +473,8 @@ while [[ $# -gt 0 ]]; do
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --multi-depth)    MULTI_DEPTH=true; shift ;;
         --no-load-aware)  LOAD_AWARE=false; shift ;;
+        --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
+        --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
         --gpu-mem-util)   GPU_MEM_UTIL="$2"; shift 2 ;;
@@ -937,6 +947,8 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Client Tokenize: $CLIENT_TOKENIZE"
     echo "  Multi-Depth:     $MULTI_DEPTH"
     echo "  Load-Aware:      $LOAD_AWARE"
+    [[ -n "$LOAD_IMBALANCE_FACTOR" ]] && echo "  Imbalance Factor: $LOAD_IMBALANCE_FACTOR"
+    [[ -n "$LOAD_IMBALANCE_FLOOR" ]] && echo "  Imbalance Floor:  $LOAD_IMBALANCE_FLOOR"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  vLLM Version:    $VLLM_VERSION"
@@ -1241,10 +1253,20 @@ if [[ "$MULTI_DEPTH" = true ]]; then
     log_info "Multi-depth routing enabled (Option C)"
 fi
 
-# Export load-aware routing setting for docker-compose
+# Export load-aware routing settings for docker-compose
 if [[ "$LOAD_AWARE" = false ]]; then
     export RANVIER_LOAD_AWARE_ROUTING=false
     log_info "Load-aware routing disabled (pure affinity mode)"
+else
+    export RANVIER_LOAD_AWARE_ROUTING=true
+fi
+if [[ -n "$LOAD_IMBALANCE_FACTOR" ]]; then
+    export RANVIER_LOAD_IMBALANCE_FACTOR="$LOAD_IMBALANCE_FACTOR"
+    log_info "Load imbalance factor: $LOAD_IMBALANCE_FACTOR"
+fi
+if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
+    export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
+    log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
 
 # Start Ranvier nodes
