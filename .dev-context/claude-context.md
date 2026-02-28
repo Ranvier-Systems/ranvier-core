@@ -22,6 +22,14 @@ Before writing any code, verify:
 - [ ] Any new timer/callback? Needs gate guard scoped to full async lifetime
 - [ ] Any new metrics lambda capturing `this`? Deregister in `stop()`
 - [ ] Any C API string returns? Null-guard required
+- [ ] Any lambda coroutine passed to `.then()`? Wrap with `seastar::coroutine::lambda()`
+- [ ] Any loop >100 iterations? Insert `maybe_yield()` preemption point
+- [ ] Any returned future not awaited? Must be `co_await`ed or explicitly handled
+- [ ] Any semaphore usage? Must use `with_semaphore()`/`get_units()`, never raw `wait()`/`signal()`
+- [ ] Any `do_with` lambda? Parameters must use `auto&` (with `&`)
+- [ ] Any coroutine parameters? Take by value, not by reference
+- [ ] Any function that might throw before returning a future? Wrap with `futurize_invoke()` or use coroutine
+- [ ] Any `temporary_buffer::share()` stored beyond current request? Must `clone()` instead
 
 ## Architecture Reference
 
@@ -616,7 +624,300 @@ void worker_thread(Job& job) {
 
 ---
 
-### Quick Reference: The 16 Hard Rules
+#### 16. The Lambda-Coroutine-Fiasco Anti-Pattern
+
+**THE PATTERN:** Passing a lambda coroutine as a continuation to Seastar APIs like `.then()`, `parallel_for_each()`, or `with_semaphore()`:
+```cpp
+seastar::future<> f() {
+    return seastar::yield().then([captured_state] () -> seastar::future<> {
+        co_await seastar::sleep(1ms);
+        use(captured_state);  // BUG: use-after-free!
+    });
+}
+```
+
+**THE CONSEQUENCE:** When `.then()` receives the lambda, it moves/copies it into an internal memory area. When `operator()` returns (at the first `co_await`), `.then()` frees that memory area. But the coroutine is still suspended and will later resume, accessing the now-freed captures. This is a **use-after-free** that only manifests when the coroutine actually suspends--ready futures hide the bug during testing.
+
+This is so well-known in the Seastar community that it has its own name: the ["Lambda Coroutine Fiasco"](https://github.com/scylladb/seastar/blob/master/doc/lambda-coroutine-fiasco.md).
+
+**THE LESSON:** *Hard Rule: Wrap lambda coroutines passed to continuation-based APIs with `seastar::coroutine::lambda()`.* This extends the lambda's lifetime until the returned future resolves. In C++23, use `this auto` as the first parameter to copy captures into the coroutine frame.
+
+```cpp
+// CORRECT: wrap with seastar::coroutine::lambda()
+co_await seastar::yield().then(seastar::coroutine::lambda([captured_state] () -> seastar::future<> {
+    co_await seastar::sleep(1ms);
+    use(captured_state);  // Safe: lambda lifetime extended
+}));
+
+// CORRECT (C++23): deducing this copies captures to coroutine frame
+co_await seastar::yield().then([captured_state] (this auto) -> seastar::future<> {
+    co_await seastar::sleep(1ms);
+    use(captured_state);  // Safe: captures copied into frame
+});
+```
+
+**SAFE APIs:** Some Seastar primitives (e.g., coroutine-aware versions) are already safe for lambda coroutines. Check the Seastar docs for each API. When in doubt, always wrap.
+
+**PROMPT GUARD:** "Never pass a lambda coroutine to .then(), parallel_for_each(), or other continuation-based APIs without wrapping it in seastar::coroutine::lambda(). Lambda captures are freed at the first co_await otherwise."
+
+---
+
+#### 17. The Reactor-Stall Anti-Pattern
+
+**THE PATTERN:** Running CPU-intensive work without inserting preemption points:
+```cpp
+// Pattern A: CPU-bound loop
+for (auto& entry : large_map) {
+    process(entry);  // No yield, no co_await
+}
+
+// Pattern B: Recursive .then() chains without preemption
+seastar::future<> drain_loop() {
+    return queue.pop().then([this](auto item) {
+        process(item);
+        return drain_loop();  // No preemption check between .then() continuations
+    });
+}
+```
+
+**THE CONSEQUENCE:** Seastar's cooperative scheduler cannot preempt a running task. If a task runs for more than the task quota (~500μs), it causes a **reactor stall**--all network I/O, timer callbacks, and other request processing on that shard freeze. A 10ms stall on a shard handling Raft heartbeats can trigger leadership elections. At scale, anything above O(log N) complexity per continuation risks stalls.
+
+**THE LESSON:** *Hard Rule: Insert preemption points in any loop that may iterate more than ~100 times or run for >100μs.* Use `seastar::coroutine::maybe_yield` in coroutines, `seastar::maybe_yield()` in future chains, or Seastar's built-in looping constructs (`repeat`, `do_until`) which have built-in preemption checks.
+
+```cpp
+// CORRECT: coroutine with yield points
+for (auto& entry : large_map) {
+    process(entry);
+    co_await seastar::coroutine::maybe_yield();
+}
+
+// CORRECT: use Seastar looping primitives
+return seastar::do_for_each(large_map, [](auto& entry) {
+    process(entry);  // Built-in preemption check between iterations
+});
+```
+
+**NOTE:** This is distinct from Rule #2 (sequential co_await in loops over external resources). Rule #2 is about latency from serialized I/O. This rule is about CPU-bound work starving the reactor even with no I/O at all.
+
+**PROMPT GUARD:** "Any loop that may iterate more than ~100 times must include a preemption point (maybe_yield, co_await, or use a Seastar looping primitive). Recursive .then() chains have NO built-in preemption--use repeat/do_until instead."
+
+---
+
+#### 18. The Discarded-Future Anti-Pattern
+
+**THE PATTERN:** Calling an async function without awaiting or storing its returned future:
+```cpp
+void on_request(Request req) {
+    log_request_async(req);  // Future returned but discarded!
+    process(req);
+}
+
+// Or intentionally ignoring:
+seastar::future<> cleanup() {
+    auto f = remove_temp_files();  // f destroyed without being awaited
+    return seastar::make_ready_future<>();
+}
+```
+
+**THE CONSEQUENCE:** A discarded future silently drops any exception it carries. If the async operation fails, the error vanishes. Seastar detects this and logs a warning ("Exceptional future ignored"), but the damage is already done--the error is lost, and the application may be in an inconsistent state. In debug builds, Seastar may abort on discarded exceptional futures.
+
+**THE LESSON:** *Hard Rule: Every future must be either `co_await`ed, returned, or explicitly acknowledged with `.discard_result()` / `.ignore_ready_future()`.* If you intentionally want fire-and-forget, use a gate-guarded background fiber with its own error handling.
+
+```cpp
+// CORRECT: await it
+co_await log_request_async(req);
+
+// CORRECT: fire-and-forget with gate + error handling
+(void)seastar::with_gate(_gate, [this, req] {
+    return log_request_async(req).handle_exception([](auto ep) {
+        logger.warn("Background log failed: {}", ep);
+    });
+});
+```
+
+**PROMPT GUARD:** "Never discard a Seastar future. Every future must be co_awaited, returned, or explicitly handled. Fire-and-forget operations need gate guards and their own exception handling."
+
+---
+
+#### 19. The Semaphore-Units-Leak Anti-Pattern
+
+**THE PATTERN:** Using separate `semaphore::wait()` and `semaphore::signal()` calls for concurrency control:
+```cpp
+return _sem.wait(1).then([this] {
+    return slow_operation();  // What if this throws synchronously?
+}).finally([this] {
+    _sem.signal(1);
+});
+```
+
+**THE CONSEQUENCE:** If `slow_operation()` throws an exception (not returns a failed future, but *throws*), the `.finally()` continuation is never attached. The semaphore unit is permanently lost. Over time, the available units monotonically decrease until the semaphore is exhausted and all waiters deadlock. This is especially insidious because it only manifests under error conditions, potentially weeks after deployment.
+
+Additionally, requesting more units than the semaphore's total capacity creates a future that can **never** resolve--a permanent deadlock.
+
+**THE LESSON:** *Hard Rule: Never use raw `wait()`/`signal()` pairs. Use `with_semaphore()` or `get_units()` for exception-safe RAII semantics.* Validate that requested units never exceed total capacity.
+
+```cpp
+// CORRECT: with_semaphore wraps in futurize_invoke (catches sync throws)
+return seastar::with_semaphore(_sem, 1, [this] {
+    return slow_operation();
+});
+
+// CORRECT: RAII units returned automatically on destruction
+auto units = co_await seastar::get_units(_sem, 1);
+co_await slow_operation();
+// units auto-returned when scope exits (even on exception)
+```
+
+**PROMPT GUARD:** "Never use raw semaphore wait()/signal()--use with_semaphore() or get_units() for exception-safe RAII. Validate that requested units never exceed semaphore capacity."
+
+---
+
+#### 20. The do_with-Missing-Reference Anti-Pattern
+
+**THE PATTERN:** Forgetting the `&` in `do_with` lambda parameters, or passing objects by value to async functions called within `do_with`:
+```cpp
+// Bug 1: Missing & -- creates a copy that dies when lambda returns
+return seastar::do_with(std::move(buffer), [](auto obj) {  // BUG: should be auto&
+    return slow_op(obj);
+});
+
+// Bug 2: slow_op takes by value, creating a copy
+seastar::future<> slow_op(std::string text);  // BUG: should be const std::string&
+return seastar::do_with(std::move(text), [](auto& text) {
+    return slow_op(text);  // Implicit copy destroyed before future resolves
+});
+```
+
+**THE CONSEQUENCE:** `do_with` allocates the object on the heap and passes a reference to the lambda. If the lambda parameter isn't a reference (`auto` without `&`), C++ creates a copy that is destroyed when the lambda returns--before the future resolves. This is a use-after-free that the compiler will **not** warn about. Symptoms include intermittent crashes under load, often in completely unrelated code due to heap corruption.
+
+**THE LESSON:** *Hard Rule: Always use `auto&` or explicit `Type&` in `do_with` lambda parameters. Prefer coroutines over `do_with` for new code*--coroutines manage stack variable lifetimes naturally.
+
+```cpp
+// CORRECT: reference parameter
+return seastar::do_with(std::move(buffer), [](auto& obj) {
+    return slow_op(obj);  // obj is the do_with-managed heap object
+});
+
+// BETTER: coroutine (no do_with needed)
+seastar::future<> handle(Buffer buffer) {
+    co_await slow_op(buffer);  // buffer lives on coroutine frame
+}
+```
+
+**PROMPT GUARD:** "Always use auto& (with &) in do_with lambda parameters. Prefer coroutines over do_with for new code--they eliminate this entire class of lifetime bugs."
+
+---
+
+#### 21. The Coroutine-Reference-Parameter Anti-Pattern
+
+**THE PATTERN:** Passing parameters by `const&` or `&` to coroutines, following the normal C++ convention of avoiding copies:
+```cpp
+seastar::future<> process(const std::vector<int>& tokens) {
+    // ... some work ...
+    co_await seastar::sleep(10ms);
+    use(tokens);  // BUG: caller may have destroyed tokens by now!
+}
+
+// Caller:
+auto t = get_tokens();
+process(t);  // Returns future, doesn't wait
+// t destroyed here -- process() has dangling reference
+```
+
+**THE CONSEQUENCE:** A coroutine may suspend and resume long after the caller returns. Any reference parameter becomes dangling if the caller doesn't co_await the returned future before the referenced object's scope ends. Even if the caller does await today, a later refactor may change that. Redpanda's engineering team learned this the hard way and eventually **forbade passing references into coroutines** entirely.
+
+**THE LESSON:** *Hard Rule: Coroutines should take parameters by value (using `std::move` for large objects), not by reference.* Move semantics make this cheap. The only exception is when the coroutine is `co_await`ed in the same expression and the referenced object provably outlives it.
+
+```cpp
+// CORRECT: take by value, move in
+seastar::future<> process(std::vector<int> tokens) {  // By value
+    co_await seastar::sleep(10ms);
+    use(tokens);  // Safe: tokens owned by coroutine frame
+}
+
+// Caller:
+auto t = get_tokens();
+co_await process(std::move(t));  // Moved in, no copy
+```
+
+**PROMPT GUARD:** "Never pass reference parameters to coroutines--take by value and std::move. References become dangling when the coroutine suspends past the caller's scope."
+
+---
+
+#### 22. The Exception-Before-Future Anti-Pattern
+
+**THE PATTERN:** A function that may throw a C++ exception before it returns a future:
+```cpp
+seastar::future<> handle(Request req) {
+    validate(req);  // Throws std::invalid_argument -- never returns a future
+    return do_work(req).finally([] {
+        cleanup();  // Never reached if validate() threw!
+    });
+}
+
+// Caller expects to handle errors via future:
+handle(req).handle_exception([](auto ep) {
+    log_error(ep);  // Never called! Exception propagated as C++ throw, not failed future.
+});
+```
+
+**THE CONSEQUENCE:** Seastar continuations (`.then()`, `.finally()`, `.handle_exception()`) only handle **exceptional futures**, not C++ exceptions thrown before a future is returned. If a function throws before returning any future, the `.finally()` and `.handle_exception()` continuations are never attached. The exception propagates up the call stack as a regular C++ throw, bypassing all future-based error handling. This causes resource leaks (semaphore units, gate holders) and unhandled crashes.
+
+**THE LESSON:** *Hard Rule: Functions returning `seastar::future<>` must not throw--convert all potential throws to failed futures.* Use `seastar::futurize_invoke()` to wrap calls that might throw, or catch and convert in coroutines.
+
+```cpp
+// CORRECT: coroutine naturally converts throws to failed futures
+seastar::future<> handle(Request req) {
+    validate(req);  // If this throws, coroutine machinery wraps it as failed future
+    co_await do_work(req);
+    cleanup();
+}
+
+// CORRECT: futurize_invoke for continuation-style code
+return seastar::futurize_invoke([&] {
+    validate(req);  // Throw caught and converted to failed future
+    return do_work(req);
+}).finally([] {
+    cleanup();  // Always runs now
+});
+```
+
+**PROMPT GUARD:** "Functions returning seastar::future must not throw C++ exceptions--use coroutines (which auto-convert throws) or wrap with futurize_invoke(). Throws before future-return bypass all .then()/.finally()/.handle_exception() chains."
+
+---
+
+#### 23. The Shared-temporary_buffer-Pin Anti-Pattern
+
+**THE PATTERN:** Holding a `share()`d view of a `seastar::temporary_buffer` long-term, after the original request is done:
+```cpp
+seastar::future<> handle_request(temporary_buffer<char> buf) {
+    // Slice out a 32-byte header from a 64KB network buffer
+    auto header = buf.share(0, 32);  // Zero-copy view
+
+    // Store for later use (e.g., in a cache or lookup table)
+    _header_cache[key] = std::move(header);  // BUG: pins entire 64KB allocation!
+}
+```
+
+**THE CONSEQUENCE:** `temporary_buffer::share()` creates a zero-copy view backed by the same underlying allocation. The entire original buffer stays alive as long as *any* shared view exists. A 32-byte cached header silently pins a 64KB network buffer in memory. Under traffic, this causes unexplained memory growth that doesn't correlate with logical data sizes.
+
+**THE LESSON:** *Hard Rule: Never hold `share()`d `temporary_buffer` views beyond the current request.* For long-lived data, `clone()` or copy the bytes into an independent allocation.
+
+```cpp
+// CORRECT: clone for long-term storage
+auto header = buf.share(0, 32);
+_header_cache[key] = header.clone();  // Independent 32-byte allocation
+
+// CORRECT: copy to string for storage
+std::string header_str(buf.get(), 32);
+_header_cache[key] = std::move(header_str);
+```
+
+**PROMPT GUARD:** "Never store shared temporary_buffer views beyond the current request--they pin the entire underlying allocation. Use clone() or copy for long-lived data."
+
+---
+
+### Quick Reference: The 24 Hard Rules
 
 | # | Rule | Violation |
 |---|------|-----------|
@@ -636,3 +937,11 @@ void worker_thread(Job& job) {
 | 13 | Thread-local raw new needs destroy function | `thread_local T* = new T()` without cleanup |
 | 14 | Force local allocation for cross-shard data | Moving `vector`/`string` via `submit_to` |
 | 15 | Reallocate locally before FFI across boundaries | Passing shard-allocated data to Rust/C FFI |
+| 16 | Wrap lambda coroutines with `seastar::coroutine::lambda()` | Lambda coroutine passed to `.then()` without wrapper |
+| 17 | Insert preemption points in loops (>100 iterations) | CPU-bound loop without `maybe_yield()` or Seastar loop primitive |
+| 18 | Every future must be awaited or explicitly handled | Discarded future silently drops errors |
+| 19 | Use `with_semaphore()`/`get_units()`, never raw `wait()`/`signal()` | Semaphore units leak on synchronous throw |
+| 20 | Always use `auto&` in `do_with` lambdas; prefer coroutines | Missing `&` creates copy destroyed before future resolves |
+| 21 | Coroutines take parameters by value, not reference | `const&` parameter dangles when coroutine suspends |
+| 22 | Wrap throws in `futurize_invoke()`; prefer coroutines | Exception thrown before future returned bypasses `.finally()` |
+| 23 | Clone `temporary_buffer` for long-lived data, don't `share()` | Shared view pins entire underlying allocation |
