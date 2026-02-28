@@ -370,6 +370,122 @@ seastar::alien::run_on(alien_instance, target_shard,
 
 The callback is set per-shard via `static thread_local` to ensure lifetime (Rule #13).
 
+## Memory Safety Across Thread Boundaries
+
+Seastar replaces `malloc` globally with a per-shard allocator. Every allocation — even on worker threads — goes through this allocator and is tracked against a specific shard. This creates two hazards when data crosses the reactor/worker boundary:
+
+1. **Foreign memory pinning**: Memory allocated on the reactor (shard N) that is held by the worker thread pins shard N's allocator resources on a foreign thread, preventing normal shard-local reclamation.
+2. **`foreign_malloc` / `do_foreign_free` overhead**: Memory allocated on the worker thread is tracked as a `foreign_malloc`. When the reactor later frees it, Seastar must use `do_foreign_free`, which is slower and, when combined with Rust FFI, can cause memory corruption under stress (SIGSEGV with corrupted pointers).
+
+### Bidirectional Reallocation Pattern
+
+The thread pool avoids both hazards by copying data at each thread boundary crossing:
+
+**Input: reactor → worker** (`tokenizer_thread_pool.cpp:148`)
+
+```cpp
+// Reallocate the string on the worker thread so the reactor shard's
+// per-shard memory isn't held across the FFI call.
+std::string local_text(job.text.data(), job.text.size());
+```
+
+The job already contains an owned `std::string` copy (Rule #14), but that copy was allocated on the reactor's shard. Re-copying on the worker thread ensures the FFI call operates on worker-allocated memory, freeing the reactor's allocation for immediate reclaim.
+
+**Output: worker → reactor** (inside `alien::run_on()`, `tokenizer_thread_pool.cpp:171`)
+
+```cpp
+// Copy tokens into shard-local memory. The captured vector was
+// allocated on the worker thread (foreign_malloc). Copying here
+// keeps the hot path on the shard's own allocator and avoids
+// do_foreign_free overhead on the reactor.
+std::vector<int32_t> local_tokens(tokens.begin(), tokens.end());
+```
+
+The result vector from `Encode()` was allocated on the worker thread. The `alien::run_on()` lambda captures it by move, then immediately copies it into a shard-local vector before passing to the completion callback. This ensures the reactor only ever owns shard-local memory.
+
+### Rust-Side Allocator Isolation (jemalloc)
+
+Even with bidirectional reallocation on the C++ side, the Rust tokenizer library makes its own internal allocations during `Encode()`. Without intervention, these would go through Seastar's global malloc replacement, creating `foreign_malloc` tracking on worker threads and risking corruption when Rust's internal allocator interacts with `do_foreign_free`.
+
+The solution is a build-time patch that gives Rust its own allocator entirely. In `CMakeLists.txt` (lines 173-228) and `Dockerfile.base` (lines 63-83), the build injects `tikv-jemallocator` into the tokenizers-cpp Rust crate:
+
+```toml
+# Cargo.toml (patched)
+[dependencies]
+tikv-jemallocator = "0.6"
+```
+
+```rust
+// lib.rs (patched)
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+```
+
+This gives Rust a completely independent jemalloc instance. All Rust-internal allocations (`Vec`, `String`, `HashMap`, etc.) bypass Seastar's allocator entirely, eliminating any interaction between the two memory systems.
+
+**Trade-offs:**
+
+| Aspect | Impact |
+|--------|--------|
+| Binary size | +~300KB for jemalloc |
+| Memory overhead | Two allocators in process (potential fragmentation) |
+| Maintenance | Inline patching (no fork to maintain) |
+| Safety | Complete memory isolation — no `foreign_malloc` corruption risk from Rust |
+
+> With jemalloc patching in place, the C++ bidirectional reallocation is still maintained as defense-in-depth: it avoids pinning reactor memory on the worker thread and keeps the reactor's hot path on its own shard allocator.
+
+## Local Fallback Semaphore
+
+When both the thread pool and cross-shard dispatch are unavailable (queue full, text out of range, etc.), `encode_threaded_async()` falls through to Priority 4: local tokenization. This calls `tokenize_locally()`, which blocks the reactor for 5-13ms.
+
+Without concurrency control, multiple concurrent requests hitting Priority 4 on the same shard would compound the stall — each blocking call adds another 5-13ms during which the reactor cannot process events. On a busy shard, this can cascade into hundreds of milliseconds of reactor stall.
+
+### Semaphore Gating
+
+A `seastar::semaphore` limits concurrent local tokenizations per shard (`tokenizer_service.hpp:195-198`):
+
+```cpp
+// Configure the shard-local semaphore that gates Priority 4 (local fallback)
+// in encode_threaded_async(). Default is 1 concurrent local tokenization.
+// Setting to 0 effectively disables the local fallback entirely.
+void configure_local_fallback(size_t max_concurrent);
+```
+
+The implementation uses `try_wait()` for non-blocking acquisition (`tokenizer_service.cpp:377-383`):
+
+```cpp
+// Priority 4: Local tokenization (blocks reactor) — gated by semaphore
+if (!_local_tokenize_sem.try_wait(1)) {
+    ++_local_fallback_rejected;
+    return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+}
+// Scope guard: signal semaphore after tokenize_locally() returns (exception safety)
+auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
+return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+```
+
+If the semaphore is already exhausted, the request gets an empty `TokenizationResult` and the caller falls back to hash or random routing (no prefix-affinity, but no reactor stall either).
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `tokenizer_local_fallback_max_concurrent` | `1` | Max concurrent reactor-blocking tokenizations per shard |
+| `RANVIER_TOKENIZER_LOCAL_FALLBACK_MAX_CONCURRENT` | — | Environment variable override |
+
+```yaml
+assets:
+  tokenizer_local_fallback_max_concurrent: 1  # At most one blocking tokenization per shard
+```
+
+### Tuning Guidance
+
+- **Default (1)**: Allows one blocking tokenization at a time. If a second request arrives while the first is blocking, it gets empty tokens and routes via hash/random. This is the safest setting — at most 5-13ms of reactor stall per event.
+- **0**: Disables local fallback entirely. Every cache miss that can't use the thread pool or cross-shard dispatch returns empty tokens. Use this when reactor responsiveness is paramount.
+- **2-3**: Allows limited compounding. Only appropriate if your workload has very low cache miss rates and you want to maximize prefix-affinity coverage at the cost of occasional 10-26ms stalls.
+
 ## References
 
 - [Architecture Overview](../architecture/system-design.md)
