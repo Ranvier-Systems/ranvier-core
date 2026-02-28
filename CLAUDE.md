@@ -11,4 +11,4 @@ Layer 7+ LLM traffic controller. C++20 on Seastar (shared-nothing, thread-per-co
 
 ## Full Context
 
-Read `.dev-context/claude-context.md` for all project context: architecture, source layout, key types, coding conventions, the 16 Hard Rules, dependencies, and workflow prompt templates.
+Read `.dev-context/claude-context.md` for all project context: architecture, source layout, key types, coding conventions, the 24 Hard Rules, dependencies, and workflow prompt templates.
