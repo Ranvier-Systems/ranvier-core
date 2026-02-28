@@ -283,7 +283,7 @@ The `.dev-context/` directory contains specialized prompt templates for differen
 |--------|----------|
 | `claude-prompt.md` | Starting any general task |
 | `claude-impl-prompt.md` | Implementing a feature (staged: plan, code, optimize) |
-| `claude-review-prompt.md` | Self-reviewing code against the 16 Hard Rules |
+| `claude-review-prompt.md` | Self-reviewing code against the 24 Hard Rules |
 | `claude-debug-prompt.md` | Triaging a build/runtime failure |
 | `claude-doc-prompt.md` | Writing tests and updating docs post-implementation |
 | `claude-planning-prompt.md` | Decomposing a feature into atomic steps |
@@ -297,11 +297,11 @@ The `.dev-context/` directory contains specialized prompt templates for differen
 
 ---
 
-## Anti-Patterns & Lessons Learned
+## Hard Rules
 
-### Security Audit Post-Mortem (2026-01-11)
+The following anti-patterns have been identified through security audits, production incident analysis, and study of ScyllaDB's Seastar experience. Each represents a "seemingly reasonable" approach that violates our Seastar/shared-nothing architecture or creates latent bugs. **Every rule applies to all new and modified code.**
 
-The following patterns were identified during an adversarial security audit. Each represents a "seemingly reasonable" approach that violates our Seastar/shared-nothing architecture or creates latent bugs in a 12k LOC C++20 codebase.
+For additional Seastar pitfalls not yet elevated to Hard Rules, see `.dev-context/seastar-pitfalls-reference.md`.
 
 ---
 

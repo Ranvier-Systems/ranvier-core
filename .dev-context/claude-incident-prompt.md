@@ -19,7 +19,7 @@
 - [ ] All requests
 - [ ] Specific request pattern: [which]
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 24 Hard Rules.
 
 ---
 

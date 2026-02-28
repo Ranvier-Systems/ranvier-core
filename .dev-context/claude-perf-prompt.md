@@ -16,7 +16,7 @@
 - [ ] Metrics showing bottleneck
 - [ ] Anecdotal observation
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 24 Hard Rules.
 
 ---
 

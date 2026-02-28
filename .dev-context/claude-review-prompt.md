@@ -1,7 +1,7 @@
 I have written code for:
 <INSERT_TASK_NAME>
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 24 Hard Rules.
 
 ---
 
@@ -32,6 +32,14 @@ Run through each of the Hard Rules. For each rule, provide one of:
 | 13 | Thread-local raw new has destroy function | | |
 | 14 | Force local allocation for cross-shard data | | |
 | 15 | Reallocate locally before FFI across boundaries | | |
+| 16 | Wrap lambda coroutines with `seastar::coroutine::lambda()` | | |
+| 17 | Insert preemption points in loops (>100 iterations) | | |
+| 18 | Every future must be awaited or explicitly handled | | |
+| 19 | Use `with_semaphore()`/`get_units()`, never raw `wait()`/`signal()` | | |
+| 20 | Always use `auto&` in `do_with` lambdas; prefer coroutines | | |
+| 21 | Coroutines take parameters by value, not reference | | |
+| 22 | Wrap throws in `futurize_invoke()`; prefer coroutines | | |
+| 23 | Clone `temporary_buffer` for long-lived data, don't `share()` | | |
 
 ## ADDITIONAL CHECKS
 
