@@ -104,6 +104,15 @@ Performance optimizations for the hot path: tokenization, routing, and response 
   _Location:_ `src/application.hpp`, `src/application.cpp`
   _Complexity:_ Low
 
+- [ ] **Partial tokenization for routing decisions**
+  _Justification:_ Tokenization accounts for ~10.6ms of ~10.62ms total routing decision time (99.9% of overhead). The ART lookup itself is <0.01ms. Currently the full prompt is tokenized, but routing only needs enough tokens to match against the prefix tree depth. Truncating the input to a byte budget before tokenizing could significantly reduce per-request tokenization cost.
+  _Nuance:_ The system supports rewriting with tokenized output depending on the endpoint, so partial tokenization must not interfere with downstream token reuse. May require a two-phase approach: partial tokenization for routing, full tokenization deferred to the forwarding path only when needed.
+  _Current mitigation:_ Tokenization is offloaded to a dedicated thread pool (not blocking the reactor), so the 10.6ms wall-clock time does not stall the event loop. Real overhead is thread pool queue contention + context switch, much less than 10ms.
+  _Benchmark evidence:_ 30m run (b63c165, 2026-02-28) — CodeLlama-13b, 20 users, 8 GPUs. Routing decision P50: 10.62ms (tokenization: 10.61ms, ART: 0.01ms). Despite this overhead, P99 TTFT improved 78.2% (4500ms → 980ms) and cache hit rate improved from 12.5% to 73.9%.
+  _Location:_ `src/tokenizer_service.hpp`, `src/tokenizer_service.cpp`, `src/http_controller.cpp`
+  _Complexity:_ Medium
+  _Priority:_ P3 — Optimization. Not urgent given thread pool offloading and dominant TTFT improvement.
+
 ### 1.2 Zero-Copy SSE Parsing Refinements
 
 - [x] **Optimize StreamParser with read-position tracking** ✓

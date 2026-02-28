@@ -11,7 +11,22 @@
 
 ## Executive Summary
 
-Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 51% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes.
+Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 78% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes. Validated stable over 30-minute sustained load (b63c165).
+
+### Validated 30-Minute Run (February 28, 2026 — b63c165)
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| **Cache Hit Rate** | 12.5% | **73.9%** | **+61.5pp (+493%)** |
+| **P99 TTFT** | 4500ms | **980ms** | **-78.2%** |
+| **P50 TTFT** | 780ms | **750ms** | -3.8% |
+| **Throughput** | 30.6 req/s | **33.5 req/s** | **+9.6%** |
+| **Large Prefix P99 (hit)** | 4317ms | **906ms** | **-79.0%** |
+| **Errors / Timeouts** | 0 | 0 | — |
+| **Total Requests** | 9,510 | 10,354 | +8.9% |
+
+*CodeLlama-13b, 20 users, 30m duration, 8x GPU, `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default).
+vLLM v0.15.1. Routing overhead: 10.62ms (tokenization: 10.61ms, ART lookup: 0.01ms) — offloaded to thread pool, not blocking reactor.*
 
 ### Results Summary (February 21, 2026 — bb20555, full suite)
 
