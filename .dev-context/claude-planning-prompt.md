@@ -1,7 +1,7 @@
 I am STARTING A PLANNING SESSION for the following feature:
 <INSERT_FEATURE_DESCRIPTION>
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
 ---
 

@@ -32,6 +32,7 @@ This document identifies missing features and optimizations required to promote 
 20. [Hot-Path Performance Audit (2026-02-15)](#20-hot-path-performance-audit-2026-02-15)
 21. [Request Lifecycle Performance Analysis (2026-02-20)](#21-request-lifecycle-performance-analysis-2026-02-20)
 22. [Code Modularity (Low Priority)](#22-code-modularity-low-priority)
+23. [Hard Rules Compliance Audit (2026-02-28)](#23-hard-rules-compliance-audit-2026-02-28)
 
 ---
 
@@ -2967,6 +2968,74 @@ Internal refactors that improve separation of concerns. No user-facing behavior 
   _Location:_ `src/sharded_config.hpp`
   _Complexity:_ Trivial
   _Priority:_ P4 — Consistency with existing template patterns
+
+---
+
+## 23. Hard Rules Compliance Audit (2026-02-28)
+
+Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seastar production experience). Rules 0-15 were audited during previous reviews; rules 16-23 have never been checked against existing code.
+
+**Approach:** Component-by-component, all rules per component. Each component is audited in a single session checking all 8 new rules, since rule violations interact within a component and fixes are more coherent with full component context.
+
+**Phase 1 — Mechanical grep pass (all components, fast)**
+
+- [ ] **Scan for lambda coroutines passed to `.then()` without `seastar::coroutine::lambda()` wrapper (Rule 16)**
+  _Pattern:_ `.then([` near `co_await` inside the lambda body
+  _Scope:_ All `src/**/*.{hpp,cpp}`
+  _Priority:_ P1 — Use-after-free, ASAN may miss
+
+- [ ] **Scan for loops without `maybe_yield()` preemption points (Rule 17)**
+  _Pattern:_ `for (` loops without `maybe_yield` in body, particularly over containers that could exceed ~100 iterations
+  _Scope:_ All `src/**/*.{hpp,cpp}`
+  _Priority:_ P2 — Reactor stalls
+
+- [ ] **Scan for raw `semaphore::wait()`/`signal()` pairs (Rule 19)**
+  _Pattern:_ `_sem.wait(` or `.signal(` without corresponding `get_units` or `with_semaphore`
+  _Scope:_ All `src/**/*.{hpp,cpp}`
+  _Priority:_ P1 — Eventual deadlock
+
+- [ ] **Scan for `do_with` lambdas missing `&` on parameters (Rule 20)**
+  _Pattern:_ `do_with(` ... `](auto ` without `&`
+  _Scope:_ All `src/**/*.{hpp,cpp}`
+  _Priority:_ P1 — Use-after-free
+
+- [ ] **Scan for coroutines taking reference parameters (Rule 21)**
+  _Pattern:_ `future<>` functions with `const&` or `&` params
+  _Scope:_ All `src/**/*.{hpp,cpp}`
+  _Priority:_ P2 — Dangling reference on suspend
+
+- [ ] **Scan for `temporary_buffer::share()` stored to member variables (Rule 23)**
+  _Pattern:_ `.share(` assigned to `_member` or stored in containers
+  _Scope:_ All `src/**/*.{hpp,cpp}`
+  _Priority:_ P2 — Silent memory bloat
+
+**Phase 2 — Component deep audit (all new rules per component)**
+
+Rules 18 (discarded futures) and 22 (exception-before-future) require understanding async flow and cannot be reliably grepped. These are checked during the component audit along with a second pass on all other new rules.
+
+- [ ] **Audit `http_controller.{hpp,cpp}`**
+  _Justification:_ Highest traffic, most async complexity, most likely to have discarded futures and coroutine ref params
+  _Priority:_ P1
+
+- [ ] **Audit `application.{hpp,cpp}`**
+  _Justification:_ Lifecycle orchestration, shutdown ordering, gate/timer patterns
+  _Priority:_ P1
+
+- [ ] **Audit `gossip_service.{hpp,cpp}`, `gossip_protocol.{hpp,cpp}`, `gossip_transport.{hpp,cpp}`, `gossip_consensus.{hpp,cpp}`**
+  _Justification:_ Cross-shard communication, timers, background fibers
+  _Priority:_ P1
+
+- [ ] **Audit `tokenizer_service.{hpp,cpp}`, `tokenizer_thread_pool.{hpp,cpp}`**
+  _Justification:_ FFI boundary, prior allocator corruption issues
+  _Priority:_ P2
+
+- [ ] **Audit `router_service.{hpp,cpp}`, `radix_tree.hpp`, `node_slab.{hpp,cpp}`**
+  _Justification:_ CPU-bound potential (ART traversal), preemption relevance
+  _Priority:_ P2
+
+- [ ] **Audit remaining services (`sqlite_persistence`, `async_persistence`, `health_service`, `k8s_discovery_service`, `connection_pool`, `circuit_breaker`, `rate_limiter`, `stream_parser`, `shard_load_balancer`)**
+  _Justification:_ Lower complexity but still need coverage
+  _Priority:_ P3
 
 ---
 

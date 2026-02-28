@@ -5,7 +5,7 @@ I am requesting a HOLISTIC SYSTEM AUDIT.
 - <TASK_2>
 - <TASK_3>
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
 ---
 
@@ -17,7 +17,7 @@ I am requesting a HOLISTIC SYSTEM AUDIT.
 - Any direct cross-layer calls bypassing the service layer?
 
 ### 2. Hard Rules Compliance
-Scan the recently changed files for violations of the 16 Hard Rules.
+Scan the recently changed files for violations of the Hard Rules.
 
 ### 3. Async Integrity
 - Any hidden blocking calls?

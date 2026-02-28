@@ -3,7 +3,7 @@ I have implemented the code for:
 
 The final logic is verified. Now complete the maintenance tasks.
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 16 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
 ---
 
