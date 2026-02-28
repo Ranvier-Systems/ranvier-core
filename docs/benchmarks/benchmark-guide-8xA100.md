@@ -1656,9 +1656,29 @@ As results come in, update the tables below. Use this template for each run:
 | 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, clean run |
 | 1b | 13B 20u 10m (run 2) | **+34.3%** | -2.2% | 78.6% | PASSED | b63c165, **hot-spotting** — prefix P99 4,700ms |
 | 2 | 13B 10u 10m | — | — | — | — | Pending |
-| 3 | 13B 30u 30m | — | — | — | — | Pending |
+| 3 | 13B 30u 30m | **+84.6%** | +3.7% | 64.0% | FAILED | d6b97a6, **miss tail blowout** — prefix P99 7,200ms (hit P99 1,237ms, miss P99 9,477ms) |
 | 4 | 8B 20u 10m | — | — | — | — | Pending |
 | 5 | 8B 30u 30m | — | — | — | — | Pending |
+
+> **Run #3 analysis (13B 30u 30m, d6b97a6):** The 30-user sustained load reveals a concurrency
+> threshold for the current architecture. Cache affinity drops to 64% (vs 97.5% on Instance 3
+> with per-request SMP), meaning 36% of requests are cache misses that land on hot backends
+> already serving cache-hit traffic. The cache-hit path remains excellent (Hit P50 621ms, Hit P99
+> 1,237ms — **68% better** than round-robin Hit P99 3,856ms), but cache-miss tail explodes
+> (Miss P99 9,477ms vs RR Miss P99 3,886ms) as misses queue behind hits on popular-prefix
+> backends. Overall P99 blows out to 7,200ms (RR was 3,900ms), failing validation.
+>
+> **Comparison to validated runs:**
+> - **20u 30m (b63c165):** 73.9% hits, P99 980ms (**-78.2%**) — clean, passes validation
+> - **20u 10m (b63c165 run 1a):** 81.2% hits, P99 -79.6% — matches Instance 3
+> - **30u 30m (Instance 3):** 97.5% hits, P99 1,000ms (**-85.3%**) — per-request SMP kept all shards synchronized
+>
+> The batched route learning architecture works well at ≤20 users but degrades at 30u because
+> the 10ms flush interval allows cross-shard routing divergence that compounds under sustained
+> high concurrency. The miss tail blowout is the specific failure mode: the BOUNDED_LOAD
+> strategy treats all in-flight requests equally, but a cache miss on a hot backend waits much
+> longer than a cache hit. Potential fix: weight in-flight requests by expected completion time,
+> or reduce the load imbalance factor dynamically when miss rate is high.
 
 **Priority 2 — Flush interval sweep (13B 20u 10m, sync disabled):**
 

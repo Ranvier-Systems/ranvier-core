@@ -11,7 +11,7 @@
 
 ## Executive Summary
 
-Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 78% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes. Validated stable over 30-minute sustained load (b63c165).
+Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 78% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes. Validated stable over 30-minute sustained load at moderate concurrency (20 users / 8 GPUs). At high concurrency (30 users), cache-hit latency still improves 68% but overall P99 degrades due to cache-miss tail — see [High-Concurrency Limitation](#high-concurrency-limitation-30-users-d6b97a6).
 
 ### Validated 30-Minute Run (February 28, 2026 — b63c165)
 
@@ -28,30 +28,35 @@ Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 78% 
 *CodeLlama-13b, 20 users, 30m duration, 8x GPU, `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default).
 vLLM v0.15.1. Routing overhead: 10.62ms (tokenization: 10.61ms, ART lookup: 0.01ms) — offloaded to thread pool, not blocking reactor.*
 
-### Results Summary (February 21, 2026 — bb20555, full suite)
+### Results Summary (Validated Data)
 
 | Model | Cache Hit Rate | P99 Latency | Throughput | Key Benefit |
 |-------|----------------|-------------|------------|-------------|
-| **CodeLlama-13b** | 12% → **54-89%** | **-24% to -51%** | **+3% to +14%** | P99 + throughput |
-| **Llama-3.1-8B** | 12% → **65-95%** | flat | ~same | Stable, no harm |
-| **Llama-3.1-70B** | 49% → **75%** | flat | -18% | Reliability (0% inc) |
+| **CodeLlama-13b** | 12% → **74-98%** | **-78% to -85%** | **+10% to +22%** | P99 + throughput |
+| **Llama-3.1-8B** | 12% → **98%** | flat | ~same | Stable, no harm |
+| **Llama-3.1-70B** | 25% → **98%** | flat (sustained) | ~same | Per-request cache (44% XLarge) |
 
-*All on 40GB A100s. vLLM v0.15.1 pinned. Thread pool enabled, speculative load increment,
-batched route learning. 70B on TP=4 (2 backends). 13B/8B on 8 backends.*
+*13B ranges: 74% cache hits / -78% P99 (current arch, 20u 30m, b63c165) to 98% / -85%
+(Instance 3, per-request SMP). 8B/70B from Instance 3 (Feb 10-14, 2026). All on 8xA100
+with vLLM v0.15.1. 70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).*
 
-<details>
-<summary>Previous best results (Instance 3, Feb 10-14 — click to expand)</summary>
+### High-Concurrency Limitation (30 users, d6b97a6)
 
-| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
-|-------|----------------|-------------------------|-------------|------------|
-| **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
-| CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
-| Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
+At 30 concurrent users, the batched route learning architecture shows degraded cache affinity:
 
-*70B on 80GB A100s (TP=2, 4 backends, 32K context). 13B/8B on 40GB A100s (8 backends).
-Pre-batched-route-learning architecture with per-request SMP broadcast.*
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| **Cache Hit Rate** | 12.0% | **64.0%** | **+52.0pp (+434%)** |
+| **P50 TTFT** | 750ms | **700ms** | -6.7% |
+| **P99 TTFT** | 3,900ms | 7,200ms | **+84.6% (WORSE)** |
+| **Cache Hit P99** | 3,856ms | **1,237ms** | **-67.9%** |
+| **Cache Miss P99** | 3,886ms | 9,477ms | **+143.9% (WORSE)** |
+| **Throughput** | 49.1 req/s | 51.0 req/s | +3.7% |
+| **Errors / Timeouts** | 0 | 0 | — |
 
-</details>
+*CodeLlama-13b, 30 users, 30m duration, 8x GPU. The cache-hit path remains excellent
+(Hit P99 1,237ms, 68% better than RR), but cache-miss tail explodes as misses queue behind
+hits on popular-prefix backends. See [Benchmark Guide](benchmark-guide-8xA100.md#post-fix-results-to-be-filled-in-as-runs-complete) for detailed analysis.*
 
 ## Test Configuration
 
@@ -214,13 +219,13 @@ This header is invaluable for debugging configuration mismatches between client 
 
 1. **Prefix-affinity routing is essential for KV cache optimization** — 4-7x better cache utilization translates directly to lower latency and higher throughput.
 
-2. **13B is the sweet spot for aggregate metrics** — Queue buildup under load makes routing dramatically effective: P99 -24% to -51% (bb20555), up to -85% (Instance 3). Throughput improves +3% to +22%.
+2. **13B is the sweet spot for aggregate metrics** — Queue buildup under moderate load makes routing dramatically effective: P99 -78% to -85% at 10-20 users. Throughput improves +10% to +22%.
 
-3. **Tail latency improves under sustained load** — P99 improvements are strongest at high concurrency and long duration (13B 30u 30m: -51.3% on bb20555).
+3. **Moderate concurrency is the sweet spot** — At 20 users / 8 GPUs, P99 improves -78% (b63c165 validated). At 30 users, cache affinity drops to 64% and cache-miss tail blows out, making overall P99 worse despite excellent cache-hit latency (Hit P99 1,237ms, -68%).
 
 4. **8B is routing-neutral** — Inference too fast (~1400ms) for cache savings to affect aggregate TTFT. No harm, but no benefit.
 
-5. **70B benefit is reliability** — Incompletes eliminated (0.6% → 0%), but throughput cost from concentrating load for cache affinity.
+5. **70B benefit is per-request cache efficiency** — XLarge requests 44% faster on cache hit. Incompletes eliminated (0.6% → 0%). Throughput flat under sustained load (compute-bound, not queue-bound).
 
 6. **Memory efficiency** — With prefix-affinity, each backend only needs to cache its assigned prefixes rather than potentially caching all prefixes.
 
