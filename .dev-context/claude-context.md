@@ -283,7 +283,7 @@ The `.dev-context/` directory contains specialized prompt templates for differen
 |--------|----------|
 | `claude-prompt.md` | Starting any general task |
 | `claude-impl-prompt.md` | Implementing a feature (staged: plan, code, optimize) |
-| `claude-review-prompt.md` | Self-reviewing code against the 24 Hard Rules |
+| `claude-review-prompt.md` | Self-reviewing code against the Hard Rules |
 | `claude-debug-prompt.md` | Triaging a build/runtime failure |
 | `claude-doc-prompt.md` | Writing tests and updating docs post-implementation |
 | `claude-planning-prompt.md` | Decomposing a feature into atomic steps |
@@ -917,7 +917,7 @@ _header_cache[key] = std::move(header_str);
 
 ---
 
-### Quick Reference: The 24 Hard Rules
+### Quick Reference: Hard Rules
 
 | # | Rule | Violation |
 |---|------|-----------|

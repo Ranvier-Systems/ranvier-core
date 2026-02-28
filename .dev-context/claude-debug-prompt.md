@@ -7,7 +7,7 @@ I have a BUILD/RUNTIME FAILURE.
 <PASTE_ERROR_LOG>
 ```
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 24 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
 ---
 

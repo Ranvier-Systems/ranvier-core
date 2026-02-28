@@ -5,7 +5,7 @@ I am requesting a POST-MORTEM PATTERN EXTRACTION.
 - <ISSUE_2>
 - <ISSUE_3>
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 24 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
 ---
 

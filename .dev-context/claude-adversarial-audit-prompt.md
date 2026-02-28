@@ -1,6 +1,6 @@
 I am requesting an ADVERSARIAL SYSTEM AUDIT of the source files under src/
 
-> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the 24 Hard Rules.
+> Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
 ---
 
