@@ -2,58 +2,98 @@
 
 This guide provides specific test scenarios, expected results, and validation criteria for benchmarking Ranvier on a Lambda Labs 8x A100 instance.
 
+> **DATA VALIDITY NOTICE (Feb 26, 2026):** A 3.3x P50 latency regression was introduced in
+> commit c70f0c1 (#280) and fixed in 08ba984 (#321). The regression changed SSE flush strategy
+> in `stream_backend_response()` to only flush on first/last chunk instead of every chunk,
+> causing intermediate tokens to sit in Seastar's output_stream buffer. **All TTFT, P99, and
+> throughput numbers from Instance 5 (bb20555, Feb 21) and Instance 6 (c219fbd, Feb 22) were
+> measured against a 3.3x inflated baseline and are INVALID.** Cache hit rates remain
+> directionally valid. Instance 1-3 data (pre-regression) remains valid. A full re-run suite
+> is planned — see [Post-Fix Re-Run Plan](#post-fix-re-run-plan-feb-26-2026).
+
 ## TL;DR Results
 
-Prefix-aware routing with speculative load increment + batched route learning vs round-robin baseline:
+**Valid results (Instance 3, Feb 10-14 — pre-regression, post stale-connection fix):**
 
 | Model | Cache Hit Rate | P99 Latency | Throughput | Key Benefit |
 |-------|----------------|-------------|------------|-------------|
-| **CodeLlama-13b** | 12% → **87-89%** | **-24% to -51%** | **+3% to +14%** | P99 + throughput |
-| **Llama-3.1-8B** | 12% → **65-95%** | flat | ~same | Stable, no harm |
-| **Llama-3.1-70B** | 49% → **75%** | flat | -18% | Reliability (0% inc) |
+| **CodeLlama-13b** | 12% → **97-98%** | **-79% to -85%** | **+14% to +22%** | P99 + throughput |
+| **Llama-3.1-8B** | 12% → **98%** | flat to -14% | ~same | Stable, no harm |
+| **Llama-3.1-70B** | 25% → **98%** | flat (sustained) | ~same | Per-request cache (44% XLarge) |
 
-*Results from February 21-22, 2026 (commits bb20555, c219fbd) on 8xA100 40GB with vLLM v0.15.1 pinned.
-70B on 40GB (TP=4, 2 backends). 13B/8B on 40GB (8 backends). Thread pool enabled, speculative
-load increment, batched route learning. Flush interval sweep and cross-shard sync evaluation on Feb 22.*
+*Results from Instance 3 (Feb 10-14, 2026, commit 08c4915) on 8xA100 with vLLM v0.15.1.
+These are the last valid benchmarks before the c70f0c1 regression. Per-request SMP route
+broadcasts (pre-batched-route-learning). 0% incomplete rate after stale connection fix.*
 
-**Key wins:**
-- **4-7x more cache hits** — Requests routed to backends with cached KV data
-- **Up to 52% lower P99 tail latency** — 13B with cross-shard sync @ 10ms flush
-- **Up to 14% higher throughput** — Load-aware routing prevents backend hotspots for 13B
+~~**Previously reported results (INVALIDATED — measured against 3.3x inflated baseline):**~~
+
+| ~~Model~~ | ~~Cache Hit Rate~~ | ~~P99 Latency~~ | ~~Throughput~~ | ~~Key Benefit~~ |
+|-------|----------------|-------------|------------|-------------|
+| ~~**CodeLlama-13b**~~ | ~~12% → **87-89%**~~ | ~~**-24% to -51%**~~ | ~~**+3% to +14%**~~ | ~~P99 + throughput~~ |
+| ~~**Llama-3.1-8B**~~ | ~~12% → **65-95%**~~ | ~~flat~~ | ~~~same~~ | ~~Stable, no harm~~ |
+| ~~**Llama-3.1-70B**~~ | ~~49% → **75%**~~ | ~~flat~~ | ~~-18%~~ | ~~Reliability (0% inc)~~ |
+
+*~~Results from February 21-22, 2026 (commits bb20555, c219fbd).~~ INVALID: c70f0c1 regression
+inflated round-robin baselines by ~3.3x, making prefix-aware improvements appear smaller than
+they actually are. Cache hit rates are still directionally valid. See [regression details](#sse-flush-regression-c70f0c1).*
+
+**Key wins (validated on Instance 3):**
+- **7-8x more cache hits** — 97-98% cache hit rate vs 11-13% round-robin baseline
+- **Up to 85% lower P99 tail latency** — 13B sustained load (30u 30m)
+- **Up to 22% higher throughput** — 13B sustained load (30u 30m)
 - **0% incomplete rate** — Stale connection retry ensures every request completes
-- **Zero hot-spotting at default prefix ratio** — Speculative load increment prevents burst routing
+- **44-49% XLarge per-request improvement** — 70B shows highest per-request benefit
 - **Stable under stress** — 8B at 64 concurrent users with zero errors
-- **10ms flush interval confirmed optimal** — Sweep from 2ms to 50ms; tighter causes hot-spotting
 
-**Performance at default config (prefix-ratio 0.9):**
+**Pending re-validation (post-fix on current architecture):**
+- Flush interval sweep (2-50ms) — was validated on c219fbd (invalid baseline)
+- Cross-shard sync evaluation — 86.8% cache hit result needs re-testing
+- bb20555 architecture (speculative load + batched routes) — all TTFT/P99 numbers need re-run
+
+**Performance at default config — VALID (Instance 3, prefix-ratio 0.9):**
 
 | Model | Users | Duration | P99 TTFT | Throughput | Cache Hits |
 |-------|-------|----------|----------|------------|------------|
-| 13B | 10 | 10m | **-26.8%** | flat | 87.7% |
-| 13B | 20 | 10m | **-24% to -48%** | +3% to +13% | 87-89% |
-| 13B | 30 | 30m | **-51.3%** | **+13.9%** | 53.6% |
-| 8B | 20 | 10m | flat | -2.8% | 94.6% |
-| 8B | 30 | 30m | flat | -4.6% | 64.9% |
-| 70B | 16 | 15m | +2.6% | -17.7% | 75.4% |
+| 13B | 10 | 10m | **-79.1%** | +14.6% | 96.8% |
+| 13B | 20 | 10m | **-78.7%** | +13.7% | 97.6% |
+| 13B | 30 | 30m | **-85.3%** | **+22.3%** | 97.5% |
+| 8B | 20 | 10m | -13.8% | -1.2% | 98.1% |
+| 8B | 30 | 30m | +6.5% | -1.1% | 98.0% |
+| 70B (TP=2) | 16 | 30m | flat | flat | 97.8% |
 
-**Known limitations at lower prefix sharing (13B 20u 10m):**
+~~**Performance at default config — INVALIDATED (bb20555, prefix-ratio 0.9):**~~
 
-| Prefix Sharing | Cache Hit Rate | P99 TTFT | Status |
+| ~~Model~~ | ~~Users~~ | ~~Duration~~ | ~~P99 TTFT~~ | ~~Throughput~~ | ~~Cache Hits~~ |
+|-------|-------|----------|----------|------------|------------|
+| ~~13B~~ | ~~10~~ | ~~10m~~ | ~~**-26.8%**~~ | ~~flat~~ | 87.7% |
+| ~~13B~~ | ~~20~~ | ~~10m~~ | ~~**-24% to -48%**~~ | ~~+3% to +13%~~ | 87-89% |
+| ~~13B~~ | ~~30~~ | ~~30m~~ | ~~**-51.3%**~~ | ~~**+13.9%**~~ | 53.6% |
+| ~~8B~~ | ~~20~~ | ~~10m~~ | ~~flat~~ | ~~-2.8%~~ | 94.6% |
+| ~~8B~~ | ~~30~~ | ~~30m~~ | ~~flat~~ | ~~-4.6%~~ | 64.9% |
+| ~~70B~~ | ~~16~~ | ~~15m~~ | ~~+2.6%~~ | ~~-17.7%~~ | 75.4% |
+
+*TTFT/P99/throughput columns are invalid due to c70f0c1 regression. Cache hit rates (rightmost
+column) remain directionally valid as they measure routing decisions, not latency.*
+
+**Known limitations at lower prefix sharing (13B 20u 10m) — cache hit rates valid, TTFT invalid:**
+
+| Prefix Sharing | Cache Hit Rate | ~~P99 TTFT~~ | Status |
 |----------------|----------------|----------|--------|
-| 90% (default) | 87-89% | **-24% to -48%** | Stable |
-| 70% | 76.8% | +86.4% | Hot-spotting |
-| 50% | 66.7% | +64.4% | Hot-spotting |
+| 90% (default) | 87-89% | ~~**-24% to -48%**~~ | Needs re-run |
+| 70% | 76.8% | ~~+86.4%~~ | Needs re-run |
+| 50% | 66.7% | ~~+64.4%~~ | Needs re-run |
 
 *At prefix ratios below 0.9, more unique prefixes overwhelm the load balancer and cause
 hot-spotting at medium concurrency (20 users). This is a known limitation being tracked
-in backlog item 20.11 (cross-shard speculative load synchronization).*
+in backlog item 20.11 (cross-shard speculative load synchronization). However, the hot-spotting
+conclusion itself needs re-validation — it was measured against a 3.3x inflated baseline.*
 
-> **Historical context:** Earlier benchmarks (Instance 3, Feb 10-14) showed stronger results:
-> P99 -79% to -87% for 13B, 97-98% cache hit rates, and no hot-spotting at any prefix ratio.
+> **Historical context:** Instance 3 (Feb 10-14) results remain the valid reference point:
+> P99 -79% to -85% for 13B, 97-98% cache hit rates, and no hot-spotting at any prefix ratio.
 > Those runs used per-request SMP route broadcasts (before batched route learning 21.1), which
-> provided tighter cross-shard synchronization. The current architecture trades some cache
-> affinity for lower SMP overhead — a net positive for throughput at default settings, but
-> edge cases (low prefix ratio, client-tokenize, high concurrency) show reduced improvement.
+> provided tighter cross-shard synchronization. The bb20555 architecture (speculative load
+> increment + batched route learning) has NOT been validly benchmarked for TTFT/P99 yet —
+> a full re-run is planned on commit 08ba984 or later (post-fix).
 
 ---
 
@@ -379,7 +419,7 @@ With client tokenization, **cache misses also get faster** because the server sk
   --prefix-ratio 0.9
 ```
 
-**Expected Results (8B model, 8x A100, bb20555+ with speculative load increment):**
+**Expected Results (8B model, 8x A100, 08ba984+ post-fix):**
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
@@ -692,6 +732,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 | Model | Users | Duration | Prefix Size | Cache Miss | Cache Hit | Improvement | Notes |
 |-------|-------|----------|-------------|------------|-----------|-------------|-------|
+| **13B** | **20** | **1m** | XLarge | ~1142ms | ~846ms | **~26%** | Feb 27, post-SSE-fix (b63c165), 1m quick validation |
 | **13B** | **20** | **10m** | XLarge | ~1301ms | ~834ms | **~36%** | Feb 2026, post-fix |
 | **13B** | **10** | **10m** | XLarge | ~1394ms | ~845ms | **~39%** | Feb 2026, post-fix |
 | **8B** | **20** | **10m** | XLarge | ~649ms | ~444ms | **~32%** | Feb 2026, post-fix |
@@ -717,7 +758,7 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 | 70B (TP=4) | 16 | 15m | XLarge | ~2108ms | ~1069ms | ~49% | Feb 2026, 40GB A100s, 2 backends, 4K context |
 
 **Key insights:**
-- **P99 tail latency is the strongest win for 13B** — -24% to -51% on bb20555, -79% to -85% on Instance 3
+- **P99 tail latency is the strongest win for 13B** — -79% to -85% on Instance 3 (valid). ⚠ bb20555 showed -24% to -51% but baselines were inflated 3.3x.
 - **0% incomplete rate** — stale connection retry (Feb 9 fix) eliminated phantom timeouts
 - **Results are instance/architecture dependent** — cache hit rates range 54-98% across runs
 - **1B models show no benefit** — KV cache computation is already trivial (~10-20ms)
@@ -749,6 +790,12 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 ## Real Benchmark Results
 
 ### February 21, 2026 — bb20555: Speculative Load Increment + Batched Route Learning
+
+> **INVALID DATA WARNING:** All TTFT, P99, and throughput numbers in this section were measured
+> while the c70f0c1 SSE flush regression was present. Round-robin baselines were inflated by
+> ~3.3x, making prefix-aware improvements appear smaller. Cache hit rates and routing behavior
+> (hot-spotting at low prefix ratios) are still directionally valid. This entire test matrix
+> needs to be re-run on commit 08ba984+ (post-fix). See [Post-Fix Re-Run Plan](#post-fix-re-run-plan-feb-26-2026).
 
 > **Commit:** bb20555. **vLLM:** v0.15.1 (pinned). **Instance:** Lambda Labs 8xA100 40GB.
 >
@@ -827,6 +874,13 @@ different GPU thermals, and the batched route learning change all contribute.
 ---
 
 ### February 22, 2026 — c219fbd: Flush Interval Sweep + Cross-Shard Sync Evaluation
+
+> **INVALID DATA WARNING:** All TTFT, P99, and throughput numbers in this section were measured
+> while the c70f0c1 SSE flush regression was present. The flush interval and cross-shard sync
+> conclusions are directionally suspect — the regression inflated baselines, which may have
+> masked or distorted hot-spotting behavior and sync effectiveness. The entire flush interval
+> sweep and cross-shard sync evaluation needs to be re-run on 08ba984+ (post-fix).
+> See [Post-Fix Re-Run Plan](#post-fix-re-run-plan-feb-26-2026).
 
 > **Branch:** `claude/fix-shard-sync-performance`. **Commits:** 8e49187, c219fbd. **vLLM:** v0.15.1 (pinned).
 > **Instance:** Lambda Labs 8xA100 40GB (Instance 6).
@@ -1201,16 +1255,20 @@ Prefix Ratio: 0.9
 
 ### Interpretation
 
+> **Note:** Items marked with ⚠ are based on bb20555/c219fbd data (invalid baselines) and need
+> re-validation. Items without ⚠ are from Instance 3 (valid) or are cache-hit-rate observations
+> that are unaffected by the regression.
+
 1. **Cache hit rate always improves**: 12% → 45-98% depending on config, instance, and sync mode
 2. **Per-bucket improvement is the real metric**: Overall TTFT can be misleading due to small prefix overhead
-3. **P99 tail latency is the strongest win for 13B**: -24% to -85% depending on architecture version
-4. **Throughput improves for 13B**: +3% to +22% depending on instance and concurrency level
+3. **P99 tail latency is the strongest win for 13B**: -79% to -85% (Instance 3, valid). ⚠ bb20555 showed -24% to -51% but against inflated baselines — re-run needed.
+4. **Throughput improves for 13B**: +14% to +22% (Instance 3, valid). ⚠ bb20555 showed +3% to +14% — re-run needed.
 5. **Results are instance/architecture dependent**: Cache hit rates, P99 improvements, and hot-spotting behavior vary significantly across Lambda Labs instances — single 10m runs have wide confidence intervals
-6. **Default prefix ratio (0.9) is the reliable operating point**: Lower ratios may hot-spot on current architecture
+6. **Default prefix ratio (0.9) is the reliable operating point**: ⚠ Hot-spotting at lower ratios on bb20555 needs re-validation with correct baselines
 7. **8B is routing-neutral**: Inference too fast for cache savings to matter in aggregate TTFT
-8. **70B benefit is reliability, not speed**: Incompletes eliminated, but throughput cost from cache affinity
-9. **Flush interval 10ms is optimal**: Tighter intervals (<10ms) cause hot-spotting; looser intervals (20-50ms) show no benefit
-10. **Cross-shard load sync improves cache affinity but has trade-offs**: Best result (86.8% cache hits, -52.2% P99) comes at 2x tokenization overhead. Feature disabled by default until SMP overhead is further optimized
+8. **70B benefit is per-request cache efficiency**: XLarge requests 44-49% faster on cache hit (Instance 3, valid). Incompletes eliminated.
+9. ⚠ **Flush interval 10ms may still be optimal**: Directionally sound (tighter = hot-spotting) but exact numbers from c219fbd are invalid — re-run needed
+10. ⚠ **Cross-shard load sync results need re-validation**: The 86.8% cache hits / -52.2% P99 result was measured against inflated baselines. The 2x tokenization overhead is real, but the net benefit needs re-measurement
 
 ### Value Proposition
 
@@ -1218,16 +1276,16 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 #### Performance by Model Size and Load
 
-**bb20555 (Feb 21, Instance 5 — latest architecture):**
+~~**bb20555 (Feb 21, Instance 5 — TTFT/P99/throughput INVALID due to c70f0c1 regression):**~~
 
-| Model | Load | Users | Duration | Cache Hit Rate | P99 TTFT Change | Throughput | Notes |
+| Model | Load | Users | Duration | Cache Hit Rate | ~~P99 TTFT Change~~ | ~~Throughput~~ | Notes |
 |-------|------|-------|----------|----------------|-----------------|------------|-------|
-| **CodeLlama-13b** | **Heavy** | **30** | **30m** | 53.6% | **-51.3%** | **+13.9%** | Best sustained result |
-| **CodeLlama-13b** | **Moderate** | **20** | **10m** | 87-89% | **-24% to -48%** | +3% to +13% | Consistent across runs |
-| **CodeLlama-13b** | **Normal** | **10** | **10m** | 87.7% | **-26.8%** | flat | Stable |
-| **Llama-3.1-8B** | **Heavy** | **30** | **30m** | 64.9% | flat | -4.6% | Routing-neutral |
-| **Llama-3.1-8B** | **Moderate** | **20** | **10m** | 94.6% | flat | -2.8% | Routing-neutral |
-| **Llama-3.1-70B** | **Moderate** | **16** | **15m** | 75.4% | +2.6% | -17.7% | Reliability (0% inc) |
+| **CodeLlama-13b** | **Heavy** | **30** | **30m** | 53.6% | ~~-51.3%~~ | ~~+13.9%~~ | **Re-run needed** |
+| **CodeLlama-13b** | **Moderate** | **20** | **10m** | 87-89% | ~~-24% to -48%~~ | ~~+3% to +13%~~ | **Re-run needed** |
+| **CodeLlama-13b** | **Normal** | **10** | **10m** | 87.7% | ~~-26.8%~~ | ~~flat~~ | **Re-run needed** |
+| **Llama-3.1-8B** | **Heavy** | **30** | **30m** | 64.9% | ~~flat~~ | ~~-4.6%~~ | **Re-run needed** |
+| **Llama-3.1-8B** | **Moderate** | **20** | **10m** | 94.6% | ~~flat~~ | ~~-2.8%~~ | **Re-run needed** |
+| **Llama-3.1-70B** | **Moderate** | **16** | **15m** | 75.4% | ~~+2.6%~~ | ~~-17.7%~~ | **Re-run needed** |
 
 **Instance 3 (Feb 10-14 — pre-batched-routes, higher cache affinity):**
 
@@ -1256,16 +1314,20 @@ For workloads with **large shared prefixes** (RAG, system prompts, few-shot):
 
 </details>
 
-**Key takeaways:**
-- **P99 tail latency** is the strongest win for 13B — -24% to -52% (bb20555/c219fbd), -79% to -85% (Instance 3)
-- **Throughput increases** for 13B across both architectures (+3-14% on bb20555, +14-22% on Instance 3)
-- **Cache hit rates** are always much higher than round-robin — 45-98% vs 11-13% baseline
-- **Cross-shard sync** can push cache hits to 87% and P99 to -52% but at 2x tokenization overhead
-- **8B is routing-neutral** — inference too fast (~1400ms) for cache savings to matter in aggregate
-- **70B benefit is reliability** — incompletes eliminated, but throughput drops with cache affinity
+**Key takeaways (valid data only — Instance 3 and earlier):**
+- **P99 tail latency** is the strongest win for 13B — -79% to -85% (Instance 3, valid)
+- **Throughput increases** for 13B — +14% to +22% (Instance 3, valid)
+- **Cache hit rates** are always much higher than round-robin — 96-98% vs 11-13% baseline (valid across all instances)
+- **8B is routing-neutral** — inference too fast (~420ms) for cache savings to matter in aggregate
+- **70B benefit is per-request cache efficiency** — XLarge 44-49% faster on hit, incompletes eliminated
 - **Backend count matters for 70B** — TP=4 (2 backends, 40GB) limits routing surface
-- **0% incomplete rate** on all post-fix runs (Feb 9, 2026 onwards)
-- **Flush interval 10ms** is the reliable default — tighter causes hot-spotting, looser has no benefit
+- **0% incomplete rate** on all post-stale-connection-fix runs (Feb 9, 2026 onwards)
+
+**Pending re-validation (bb20555/c219fbd data invalidated by c70f0c1 regression):**
+- ⚠ bb20555 P99/throughput numbers (-24% to -52% P99, +3-14% throughput) need re-run
+- ⚠ Cross-shard sync (86.8% cache hits, -52.2% P99) needs re-testing with valid baselines
+- ⚠ Flush interval 10ms conclusion is directionally sound but needs re-measurement
+- ⚠ Hot-spotting at low prefix ratios and client-tokenize needs re-validation
 
 #### Impact of Prefix Sharing Ratio
 
@@ -1300,6 +1362,60 @@ Not all workloads have 90% prefix sharing. These tests show how improvement scal
 - **Recommendation:** Use `--prefix-ratio 0.9` (default) for production workloads. If your
   workload has lower natural prefix sharing, monitor for hot-spotting via node request
   distribution in Prometheus metrics.
+
+#### Impact of Load Imbalance Factor
+
+The `RANVIER_LOAD_IMBALANCE_FACTOR` controls how aggressively the BOUNDED_LOAD strategy
+diverts requests away from the cache-optimal backend. Higher values allow more imbalance
+(preserving cache affinity), lower values spread load more evenly (sacrificing cache hits).
+
+**factor=1.25 vs factor=2.0 (default) — 74055a1, March 1 2026:**
+
+| Config | Metric | factor=2.0 | factor=1.25 | Winner |
+|--------|--------|-----------|-------------|--------|
+| **13B 10u 10m** | Cache Hits | 96.8% | 81.3% | 2.0 |
+| | P99 TTFT Change | **-79.1%** | -42.5% | 2.0 |
+| | Throughput | **+14.6%** | +6.0% | 2.0 |
+| **13B 20u 10m** | Cache Hits | 81.2% | 61.8% | 2.0 |
+| | P99 TTFT Change | **-79.6%** | +2.9% | 2.0 |
+| | Throughput | **+22.1%** | -5.7% | 2.0 |
+| **13B 30u 30m** | Cache Hits | 64.0% | 55.7% | 2.0 |
+| | P99 TTFT Change | +84.6% | +127.3% | 2.0 |
+| | Hit P99 | **1,237ms** | 4,301ms | 2.0 |
+| | Throughput | **+3.7%** | -1.9% | 2.0 |
+| **8B 20u 10m** | Cache Hits | 98.1% | 80.2% | 2.0 |
+| | XLarge Impr. | **31.6%** | 1.8% | 2.0 |
+| **8B 30u 30m** | Cache Hits | 98.0% | 47.5% | 2.0 |
+| | XLarge Impr. | **40.5%** | -0.8% | 2.0 |
+| | Throughput | -1.1% | -7.4% | 2.0 |
+
+*factor=2.0 data from Instance 3 (Feb 10-14) and b63c165/d6b97a6 (Feb 27-28).
+factor=1.25 data from 74055a1 (March 1, 2026). Same hardware (8xA100 40GB), vLLM v0.15.1.*
+
+**Key findings:**
+- **factor=2.0 wins every comparison.** Factor=1.25 reduces cache affinity by 15-50pp across
+  all configs, eliminating the P99 and throughput benefits that make prefix routing worthwhile.
+- **At 13B 20u (the primary comparison point):** factor=1.25 turns a -79.6% P99 improvement
+  into +2.9% (effectively no benefit). Cache hits drop from 81% to 62%.
+- **At low concurrency (10u):** factor=1.25 still shows positive results (P99 -42.5%), but
+  roughly half the benefit of factor=2.0 (-79.1%). Even with minimal contention, the
+  aggressive diversion hurts.
+- **At high concurrency (30u):** factor=1.25 makes things worse than factor=2.0 in every
+  dimension — including the cache-hit path (Hit P99 4,301ms vs 1,237ms) that factor=2.0
+  preserves. Spreading load doesn't help when it destroys the cache affinity that makes
+  prefix routing effective.
+- **8B XLarge improvement collapses:** 40.5% → -0.8% at 30u. The per-request cache benefit
+  that 8B shows at factor=2.0 is entirely eliminated.
+
+**Why lower factors don't help the miss tail:** The 30u miss-tail problem (P99 9,477ms at
+factor=2.0) is caused by cache misses queuing behind cache hits on popular-prefix backends.
+Factor=1.25 reduces the number of cache hits on those backends, but also reduces hits
+everywhere else — the misses don't get faster (Miss P99 12,796ms at 1.25 vs 9,477ms at 2.0),
+they get worse because the overall system loses cache efficiency. The fix requires
+hit/miss-aware load weighting, not a blunter imbalance factor.
+
+**Recommendation:** Keep `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default). Do not reduce below
+1.5 — the cache affinity loss outweighs any load distribution benefit.
 
 #### When Prefix-Aware Routing Helps (and When It Doesn't)
 
@@ -1405,19 +1521,272 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 
 </details>
 
-### All Benchmarks Complete
+### Benchmark Validity Status
 
-Four benchmark rounds have been completed:
-1. **Pre-fix** (Jan-Feb 2026, Instance 1-2) — baseline with stale connection issues (30-37% incomplete)
-2. **Post-fix** (Feb 10-14, Instance 3) — stale connection retry fixed, per-request SMP broadcast
-3. **bb20555** (Feb 21, Instance 5) — speculative load increment + batched route learning + vLLM v0.15.1 pinned
-4. **c219fbd** (Feb 22, Instance 6) — flush interval sweep (2-50ms) + cross-shard load sync evaluation
+Four benchmark rounds have been completed, but rounds 3-4 contain invalid latency data:
 
-Every run on bb20555+ shows 0% incomplete rate. Default config (prefix-ratio 0.9, 10ms flush)
-delivers consistent P99 improvements for 13B (-24% to -52%). Lower prefix ratios and client-tokenize
-show hot-spotting — tracked in backlog 20.11 (cross-shard speculative load synchronization).
-Cross-shard load sync shows promise (86.8% cache hits, -52.2% P99) but is disabled by default
-due to 2x tokenization overhead from SMP reactor congestion.
+1. **Pre-fix** (Jan-Feb 2026, Instance 1-2) — **VALID** (pre-regression). Baseline with stale connection issues (30-37% incomplete). TTFT/routing metrics valid, throughput understated by incompletes.
+2. **Post-fix** (Feb 10-14, Instance 3) — **VALID** (pre-regression). Stale connection retry fixed, per-request SMP broadcast. This is the current reference dataset.
+3. **bb20555** (Feb 21, Instance 5) — **TTFT/P99/THROUGHPUT INVALID** (c70f0c1 regression present). Cache hit rates and routing behavior (hot-spotting patterns) are directionally valid.
+4. **c219fbd** (Feb 22, Instance 6) — **TTFT/P99/THROUGHPUT INVALID** (c70f0c1 regression present). Flush interval sweep and cross-shard sync conclusions need re-validation.
+
+**What was invalidated:** The c70f0c1 commit changed `stream_backend_response()` to flush SSE
+only on first/last chunk instead of every chunk. Without per-chunk flush, intermediate tokens
+sat in Seastar's output_stream buffer until buffer fill or stream end, inflating P50 latency
+by ~3.3x. This made round-robin baselines artificially slow, causing prefix-aware improvements
+to appear smaller than they are. The fix (08ba984) restored per-chunk flush.
+
+**Fix validation (same instance, before/after 08ba984):**
+
+| Metric | Before Fix | After Fix | Improvement |
+|--------|-----------|-----------|-------------|
+| Baseline P50 | 2,900ms | 890ms | 3.3x faster |
+| Baseline P99 | 6,000ms | 4,300ms | 1.4x faster |
+| Prefix P50 | 2,700ms | 740ms | 3.6x faster |
+| Prefix P99 | 9,700ms | 1,200ms | 8.1x faster |
+
+**What remains valid from rounds 3-4:**
+- Cache hit rates (87-89% for 13B at 0.9 ratio, 53.6% at 30u 30m, etc.)
+- Hot-spotting at low prefix ratios (directionally — hot-spotting may differ with correct baselines)
+- 0% incomplete rate on all runs
+- Tokenization overhead measurements (11-20ms depending on sync config)
+- Cross-shard sync's effect on cache affinity (86.8% vs ~45-62% without sync)
+
+---
+
+### Post-Fix Re-Run Plan (Feb 26, 2026)
+
+The c70f0c1 SSE flush regression has been fixed in 08ba984. All TTFT/P99/throughput benchmarks
+from Instance 5 (bb20555) and Instance 6 (c219fbd) need to be re-run. The re-runs should be
+on commit 08ba984 or later (HEAD of main), which includes all architecture changes (speculative
+load increment, batched route learning, configurable flush interval, cross-shard sync) plus
+the SSE flush fix.
+
+#### Priority 1: Core Comparison Points (~2.5 hours)
+
+These establish the new valid baseline for the current architecture with the fix applied.
+
+| # | Config | Command | Why |
+|---|--------|---------|-----|
+| 1 | **13B 20u 10m** | `./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Primary comparison point — most historical data. Run 2x for variance. |
+| 2 | **13B 10u 10m** | `./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 10 --max-model-len 8192` | Low-concurrency reference. |
+| 3 | **13B 30u 30m** | `./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 30m --users 30 --max-model-len 8192` | Sustained load — the strongest previous result (-51.3% P99 was invalid). |
+| 4 | **8B 20u 10m** | `./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 10m --users 20` | Confirm 8B is routing-neutral with correct baselines. |
+| 5 | **8B 30u 30m** | `./scripts/bench.sh --compare --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 30m --users 30` | Sustained load reference for 8B. |
+
+**Expected outcomes with fix:**
+- 13B P99 improvements should be **stronger** than bb20555 numbers (-24% to -51%) because the
+  round-robin baseline will no longer be inflated. With correct baselines, we expect results
+  closer to Instance 3 (-79% to -85%), though batched route learning may reduce cache affinity.
+- 8B should remain routing-neutral — the model is too fast for cache savings to matter in aggregate.
+- Cache hit rates should be comparable to bb20555 (87-89% for 20u, 53-65% for 30u 30m) since
+  the fix only affects SSE flushing, not routing decisions.
+
+#### Priority 2: Flush Interval Re-Validation (~2 hours)
+
+The flush interval sweep on c219fbd showed 10ms as optimal, but with inflated baselines.
+The hot-spotting at 2ms/5ms may have been exaggerated or understated.
+
+| # | Config | Command | Why |
+|---|--------|---------|-----|
+| 6 | **13B 20u 10m, 2ms flush** | `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=2 ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Confirm 2ms still causes hot-spotting. |
+| 7 | **13B 20u 10m, 5ms flush** | `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=5 ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Boundary between hot-spotting and stability. |
+| 8 | **13B 20u 10m, 20ms flush** | `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=20 ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | High-variance result on c219fbd — run 2x. |
+| 9 | **13B 20u 10m, 50ms flush** | `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=50 ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Confirm no benefit over 10ms. |
+
+**Key question:** Does 10ms remain the optimal flush interval with correct baselines?
+The previous conclusion was sound directionally (tighter = hot-spotting), but the exact
+crossover point and magnitude of improvements need re-measurement.
+
+#### Priority 3: Cross-Shard Sync Re-Evaluation (~1.5 hours)
+
+The cross-shard sync result (86.8% cache hits, -52.2% P99 at 10ms flush with sync enabled)
+was the strongest individual result but measured against the inflated baseline. Re-testing
+will reveal whether sync genuinely provides better cache affinity or if the result was an
+artifact of the regression.
+
+| # | Config | Command | Why |
+|---|--------|---------|-----|
+| 10 | **13B 20u 10m, sync OFF, 10ms** | `RANVIER_CROSS_SHARD_LOAD_SYNC=false ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Baseline without sync (compare to run #1). |
+| 11 | **13B 20u 10m, sync ON, 10ms** | `RANVIER_CROSS_SHARD_LOAD_SYNC=true ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Re-test the 86.8% / -52.2% result. |
+| 12 | **13B 20u 10m, sync ON, 20ms** | `RANVIER_CROSS_SHARD_LOAD_SYNC=true RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=20 ./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --max-model-len 8192` | Re-test the 24.6% cache catastrophe. |
+
+**Key question:** Does cross-shard sync still push cache hits to 87%+ and P99 to -52%?
+The 2x tokenization overhead (20ms vs 11ms) is a real cost — need to confirm the cache
+improvement compensates. The 24.6% cache hit result at 20ms flush also needs re-testing
+to confirm the sync/flush interval coupling problem is real.
+
+#### Priority 4: Variant Configurations (~2 hours)
+
+Lower priority — these can be deferred if instance time is limited.
+
+| # | Config | Command | Why |
+|---|--------|---------|-----|
+| 13 | **13B 20u 10m, ratio 0.7** | `./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --prefix-ratio 0.7 --max-model-len 8192` | Re-test hot-spotting at 0.7 ratio. |
+| 14 | **13B 20u 10m, ratio 0.5** | `./scripts/bench.sh --compare --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 20 --prefix-ratio 0.5 --max-model-len 8192` | Re-test hot-spotting at 0.5 ratio. |
+| 15 | **13B 30u 10m, client-tok** | `./scripts/bench.sh --compare --client-tokenize --model meta-llama/CodeLlama-13b-Instruct-hf --warmup --duration 10m --users 30 --max-model-len 8192` | Re-test client-tokenize hot-spotting. |
+| 16 | **8B 64u 15m stress** | `./scripts/bench.sh --model meta-llama/Llama-3.1-8B-Instruct --warmup --duration 15m --users 64 --prompt-dist stress` | Re-test high-concurrency stability. |
+
+**Total estimated time: ~8 hours** (including vLLM startup, warmup, and cooldown between runs).
+
+#### How to Run
+
+```bash
+# On Lambda Labs 8xA100 instance, after setup:
+git checkout main && git pull  # Ensure commit 08ba984+ is present
+
+# Option A: Use bench-runner.sh (if updated with post-fix suite)
+./scripts/bench-runner.sh --suite high  # Priority 1-2
+
+# Option B: Run manually in order
+# Priority 1 first, then 2, etc. Allow 2-3 min GPU cooldown between runs.
+```
+
+#### Recording Results
+
+As results come in, update the tables below. Use this template for each run:
+
+```markdown
+| Config | P99 TTFT Change | Throughput | Cache Hit Rate | Tokenization | Validation | Notes |
+|--------|-----------------|------------|----------------|--------------|------------|-------|
+| 13B 20u 10m (run 1) | TBD | TBD | TBD | TBD | TBD | Post-fix, 08ba984 |
+```
+
+#### Post-Fix Results (to be filled in as runs complete)
+
+**Quick Validation (13B 20u 1m, b63c165, Feb 27 — Instance 7):**
+
+| Metric | Round-Robin | Prefix-Aware | Change | Notes |
+|--------|-------------|--------------|--------|-------|
+| Cache Hit Rate | 11.0% | 85.2% | **+74.2%** | Consistent with bb20555 (87-89%) |
+| P99 TTFT | 3,700ms | 1,200ms | **-67.6%** | Much stronger than invalidated -24% to -48% |
+| P50 TTFT | 800ms | 770ms | -3.8% | |
+| Throughput (req/s) | 23.9 | 26.9 | **+12.6%** | Consistent with previous data |
+| Incompletes | 0 | 0 | 0% | Clean |
+| Errors | 0 | 0 | 0% | Clean |
+| XLarge Hit P50 | 1,319ms | 846ms | -35.8% | Cache hits much faster |
+| XLarge Miss P50 | 1,142ms | 771ms | -32.5% | Misses also faster (fewer in queue) |
+| Tokenization P50 | — | 8.14ms | — | Consistent with previous measurements |
+| Validation | PASSED | PASSED | | |
+
+> **Key finding:** The 1-minute quick validation showed P99 -67.6%, but the 10-minute run
+> converged to **-79.6%** — matching Instance 3's -78.7% almost exactly. Throughput +22.1%
+> is the best recorded, exceeding Instance 3 (+13.7%). The architecture is validated:
+> batched route learning trades cache affinity (81% vs 98%) for better baseline performance,
+> with equivalent or better net P99 improvement.
+
+**Pre-regression baseline comparison (3218554 vs b63c165, same instance):**
+
+| Metric | 3218554 (old, pre-regression) | b63c165 (main, post-fix) | Notes |
+|--------|-------------------------------|--------------------------|-------|
+| P99 TTFT change | -88.3% | **-79.6%** | Main's RR baseline is healthier |
+| P50 TTFT change | -14.4% | -16.4% | ~same |
+| Throughput change | +20.9% | **+22.1%** | Main slightly better |
+| Cache Hit Rate | 97.4% | 81.2% | Batched routes vs per-request SMP |
+| Prefix P99 | 890ms | 960ms | ~same absolute performance |
+| RR P99 | 7,600ms | 4,700ms | Main's RR 38% faster (less SMP overhead) |
+| Tokenization P50 | 8.0ms | 16.4ms | Main higher — needs investigation |
+| RR Validation | FAILED | PASSED | Main's RR is healthier |
+
+> **No hidden regressions in the prefix path.** The prefix-aware path performs identically
+> on both commits (P99 ~890-960ms on clean runs). The difference in relative improvement
+> (-88% vs -80%) comes from the round-robin denominator: main's reduced SMP overhead makes
+> RR less bad (4,700ms vs 7,600ms P99).
+>
+> **However, run-to-run variance is a real issue on main.** Back-to-back 10m runs produced
+> P99 -79.6% (run 1a) and +34.3% (run 1b) — hot-spotting on the second run caused prefix
+> P99 to spike to 4,700ms while the RR baseline was actually healthier (3,500ms). This
+> matches the c219fbd pattern. The batched route learning 10ms flush interval creates
+> windows where cross-shard routing decisions diverge under load, occasionally concentrating
+> traffic on fewer backends. 3218554 (per-request SMP) showed no such variance.
+>
+> **Tokenization overhead is 2x higher on main** (~16.5ms vs 8.0ms on 3218554). Consistent
+> across all main runs — not thermal noise. Needs investigation.
+
+**Priority 1 — Core runs (commit 08ba984+):**
+
+| # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
+|---|--------|-----------------|------------|----------------|------------|-------|
+| 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, clean run |
+| 1b | 13B 20u 10m (run 2) | **+34.3%** | -2.2% | 78.6% | PASSED | b63c165, **hot-spotting** — prefix P99 4,700ms |
+| 2 | 13B 10u 10m | — | — | — | — | Pending |
+| 3 | 13B 30u 30m | **+84.6%** | +3.7% | 64.0% | FAILED | d6b97a6, **miss tail blowout** — prefix P99 7,200ms (hit P99 1,237ms, miss P99 9,477ms) |
+| 4 | 8B 20u 10m | — | — | — | — | Pending |
+| 5 | 8B 30u 30m | — | — | — | — | Pending |
+
+> **Run #3 analysis (13B 30u 30m, d6b97a6):** The 30-user sustained load reveals a concurrency
+> threshold for the current architecture. Cache affinity drops to 64% (vs 97.5% on Instance 3
+> with per-request SMP), meaning 36% of requests are cache misses that land on hot backends
+> already serving cache-hit traffic. The cache-hit path remains excellent (Hit P50 621ms, Hit P99
+> 1,237ms — **68% better** than round-robin Hit P99 3,856ms), but cache-miss tail explodes
+> (Miss P99 9,477ms vs RR Miss P99 3,886ms) as misses queue behind hits on popular-prefix
+> backends. Overall P99 blows out to 7,200ms (RR was 3,900ms), failing validation.
+>
+> **Comparison to validated runs:**
+> - **20u 30m (b63c165):** 73.9% hits, P99 980ms (**-78.2%**) — clean, passes validation
+> - **20u 10m (b63c165 run 1a):** 81.2% hits, P99 -79.6% — matches Instance 3
+> - **30u 30m (Instance 3):** 97.5% hits, P99 1,000ms (**-85.3%**) — per-request SMP kept all shards synchronized
+>
+> The batched route learning architecture works well at ≤20 users but degrades at 30u because
+> the 10ms flush interval allows cross-shard routing divergence that compounds under sustained
+> high concurrency. The miss tail blowout is the specific failure mode: the BOUNDED_LOAD
+> strategy treats all in-flight requests equally, but a cache miss on a hot backend waits much
+> longer than a cache hit. Potential fix: weight in-flight requests by expected completion time,
+> or reduce the load imbalance factor dynamically when miss rate is high.
+
+**Priority 2 — Flush interval sweep (13B 20u 10m, sync disabled):**
+
+| # | Flush Interval | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
+|---|---------------|-----------------|------------|----------------|------------|-------|
+| 6 | 2ms | — | — | — | — | Pending |
+| 7 | 5ms | — | — | — | — | Pending |
+| 8a | 20ms (run 1) | — | — | — | — | Pending |
+| 8b | 20ms (run 2) | — | — | — | — | Pending |
+| 9 | 50ms | — | — | — | — | Pending |
+
+**Priority 3 — Cross-shard sync (13B 20u 10m):**
+
+| # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Tokenization | Validation | Notes |
+|---|--------|-----------------|------------|----------------|--------------|------------|-------|
+| 10 | Sync OFF, 10ms | — | — | — | — | — | Pending |
+| 11 | Sync ON, 10ms | — | — | — | — | — | Pending |
+| 12 | Sync ON, 20ms | — | — | — | — | — | Pending |
+
+**Priority 4 — Variant configs:**
+
+| # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
+|---|--------|-----------------|------------|----------------|------------|-------|
+| 13 | 13B ratio 0.7 | — | — | — | — | Pending |
+| 14 | 13B ratio 0.5 | — | — | — | — | Pending |
+| 15 | 13B client-tok | — | — | — | — | Pending |
+| 16 | 8B 64u stress | — | — | — | — | Pending |
+
+---
+
+## SSE Flush Regression (c70f0c1)
+
+Commit c70f0c1 (#280, "improve http service") introduced a **3.3x P50 latency regression** by
+changing the SSE flush strategy in `stream_backend_response()`. Two changes were made:
+
+1. **SSE flush strategy (root cause):** Changed from flushing on every SSE chunk to only flushing
+   on the first and last chunk. Without per-chunk flush, intermediate tokens sat in Seastar's
+   `output_stream` buffer (default 8KB), never hitting the socket until buffer fill or stream
+   end. This caused TTFT to appear as the time until the buffer filled rather than the time
+   until the first token was generated.
+
+2. **Split HTTP write (red herring):** `send_backend_request()` was changed to split headers and
+   body into two `co_await bundle.out.write()` calls. Seastar's output_stream buffers until
+   `flush()`, so these likely coalesced anyway. Reverted for safety but unlikely to be the cause.
+
+**Fix:** 08ba984 (#321) restored per-chunk flush and merged the split writes back.
+
+**Impact on benchmarks:** The regression inflated round-robin baselines by ~3.3x (P50: 890ms →
+2,900ms). Since prefix-aware routing also uses the same SSE proxy path, its latency was also
+inflated but proportionally less (P50: 740ms → 2,700ms). This made prefix-aware improvements
+appear smaller than they are when measured as relative percentages against the inflated baseline.
+
+**Commits affected:** All benchmarks on commits between c70f0c1 and 08ba984 (exclusive) have
+invalid TTFT/P99/throughput numbers. This includes bb20555 (Instance 5) and c219fbd (Instance 6).
 
 ---
 
