@@ -29,7 +29,7 @@ TEST_F(ThreadPoolTokenizationConfigTest, DefaultQueueSize) {
 }
 
 TEST_F(ThreadPoolTokenizationConfigTest, DefaultTextLengthLimits) {
-    EXPECT_EQ(config.min_text_length, 256u);
+    EXPECT_EQ(config.min_text_length, 64u);
     EXPECT_EQ(config.max_text_length, 65536u);
 }
 
