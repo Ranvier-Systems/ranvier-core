@@ -86,6 +86,10 @@ class BenchmarkResults:
     routing_latency_p99_ms: Optional[float] = None
     tokenization_latency_p50_ms: Optional[float] = None
     tokenization_latency_p99_ms: Optional[float] = None
+    primary_tokenization_latency_p50_ms: Optional[float] = None
+    primary_tokenization_latency_p99_ms: Optional[float] = None
+    boundary_detection_latency_p50_ms: Optional[float] = None
+    boundary_detection_latency_p99_ms: Optional[float] = None
     art_lookup_latency_p50_ms: Optional[float] = None
     art_lookup_latency_p99_ms: Optional[float] = None
     connect_latency_p50_ms: Optional[float] = None
@@ -237,6 +241,10 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
         results["routing_latency_p99_ms"] = stats.get("routing_latency_p99_ms")
         results["tokenization_latency_p50_ms"] = stats.get("tokenization_latency_p50_ms")
         results["tokenization_latency_p99_ms"] = stats.get("tokenization_latency_p99_ms")
+        results["primary_tokenization_latency_p50_ms"] = stats.get("primary_tokenization_latency_p50_ms")
+        results["primary_tokenization_latency_p99_ms"] = stats.get("primary_tokenization_latency_p99_ms")
+        results["boundary_detection_latency_p50_ms"] = stats.get("boundary_detection_latency_p50_ms")
+        results["boundary_detection_latency_p99_ms"] = stats.get("boundary_detection_latency_p99_ms")
         results["art_lookup_latency_p50_ms"] = stats.get("art_lookup_latency_p50_ms")
         results["art_lookup_latency_p99_ms"] = stats.get("art_lookup_latency_p99_ms")
         results["connect_latency_p50_ms"] = stats.get("connect_latency_p50_ms")
@@ -526,6 +534,10 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.routing_latency_p99_ms = json_stats.get("routing_latency_p99_ms")
         results.tokenization_latency_p50_ms = json_stats.get("tokenization_latency_p50_ms")
         results.tokenization_latency_p99_ms = json_stats.get("tokenization_latency_p99_ms")
+        results.primary_tokenization_latency_p50_ms = json_stats.get("primary_tokenization_latency_p50_ms")
+        results.primary_tokenization_latency_p99_ms = json_stats.get("primary_tokenization_latency_p99_ms")
+        results.boundary_detection_latency_p50_ms = json_stats.get("boundary_detection_latency_p50_ms")
+        results.boundary_detection_latency_p99_ms = json_stats.get("boundary_detection_latency_p99_ms")
         results.art_lookup_latency_p50_ms = json_stats.get("art_lookup_latency_p50_ms")
         results.art_lookup_latency_p99_ms = json_stats.get("art_lookup_latency_p99_ms")
         results.connect_latency_p50_ms = json_stats.get("connect_latency_p50_ms")
@@ -989,6 +1001,10 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
             ("routing_latency_p99_ms", "Routing Decision P99 (ms)", True),
             ("tokenization_latency_p50_ms", "  - Tokenization P50 (ms)", True),
             ("tokenization_latency_p99_ms", "  - Tokenization P99 (ms)", True),
+            ("primary_tokenization_latency_p50_ms", "    - Primary P50 (ms)", True),
+            ("primary_tokenization_latency_p99_ms", "    - Primary P99 (ms)", True),
+            ("boundary_detection_latency_p50_ms", "    - Boundary Detect P50 (ms)", True),
+            ("boundary_detection_latency_p99_ms", "    - Boundary Detect P99 (ms)", True),
             ("art_lookup_latency_p50_ms", "  - ART Lookup P50 (ms)", True),
             ("art_lookup_latency_p99_ms", "  - ART Lookup P99 (ms)", True),
             ("connect_latency_p50_ms", "Backend Connect P50 (ms)", True),
