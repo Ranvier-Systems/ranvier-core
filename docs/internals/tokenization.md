@@ -254,6 +254,18 @@ stateDiagram-v2
 | `ranvier_tokenizer_thread_pool_worker_running` | Gauge | Worker thread status (1=yes) |
 | `ranvier_tokenizer_thread_pool_enabled` | Gauge | Configuration status |
 
+#### Latency Histograms (MetricsService)
+
+| Metric | Buckets | Description |
+|--------|---------|-------------|
+| `ranvier_router_tokenization_latency_seconds` | 100μs–100ms | Total tokenization latency (end-to-end) |
+| `ranvier_router_primary_tokenization_latency_seconds` | 100μs–100ms | Primary prompt tokenization (excludes boundary detection) |
+| `ranvier_router_boundary_detection_latency_seconds` | 100μs–100ms | Prefix boundary detection (message tokenization for boundaries) |
+| `ranvier_router_routing_latency_seconds` | 100μs–100ms | Routing decision latency (ART lookup + backend selection) |
+| `ranvier_router_art_lookup_latency_seconds` | 100μs–100ms | ART radix tree lookup only |
+
+The primary + boundary split allows operators to identify whether tokenization time is spent on the main prompt encode or on the boundary-detection pass that tokenizes individual messages to find prefix split points.
+
 ### Grafana Query Examples
 
 ```promql
@@ -268,6 +280,14 @@ sum(rate(ranvier_tokenizer_cache_misses[5m]))
 # Queue full fallback rate
 sum(rate(ranvier_tokenizer_thread_pool_jobs_fallback[5m])) /
 sum(rate(ranvier_tokenizer_thread_pool_jobs_submitted[5m]))
+
+# Boundary detection fraction of total tokenization time
+sum(rate(ranvier_router_boundary_detection_latency_seconds_sum[5m])) /
+sum(rate(ranvier_router_tokenization_latency_seconds_sum[5m]))
+
+# Average primary tokenization latency (p50 approximation)
+sum(rate(ranvier_router_primary_tokenization_latency_seconds_sum[5m])) /
+sum(rate(ranvier_router_primary_tokenization_latency_seconds_count[5m]))
 ```
 
 ## Performance Characteristics
