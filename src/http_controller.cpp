@@ -907,6 +907,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     } // tokenization block ends here (tokenize_span goes out of scope)
 
+    // Phase snapshot: post-primary-tokenize (before boundary detection)
+    auto post_primary_tokenize = std::chrono::steady_clock::now();
+
     // Determine shared prefix boundary for routing
     // Priority: 1) Client-provided prefix_token_count/prefix_boundaries, 2) Automatic detection
     bool prefix_boundary_set = false;
@@ -975,14 +978,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             for (const auto& msg : text_extraction->formatted_messages) {
                 size_t msg_token_count = 0;
                 try {
-                    // Use cached tokenization for message boundaries (high hit rate for role tags)
-                    auto [msg_tokens, cache_hit] = _tokenizer.local().encode_cached(msg.text);
-                    if (cache_hit) {
+                    // Use async tokenization to avoid blocking reactor on cache miss.
+                    // Cache hits return immediately (make_ready_future); misses offload
+                    // to thread pool or cross-shard, keeping the reactor free.
+                    auto msg_tok_result = co_await _tokenizer.local().encode_threaded_async(msg.text);
+                    if (msg_tok_result.cache_hit) {
                         metrics().record_tokenization_cache_hit();
                     } else {
                         metrics().record_tokenization_cache_miss();
                     }
-                    msg_token_count = msg_tokens.size();
+                    msg_token_count = msg_tok_result.tokens.size();
                 } catch (...) {
                     // Individual message tokenization failed — skip this message
                     continue;
@@ -1039,13 +1044,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     system_prefix_text = text_extraction->system_text;
                 }
 
-                // Use cached tokenization (system messages have ~90%+ cache hit rate)
-                auto [system_tokens, cache_hit] = _tokenizer.local().encode_cached(system_prefix_text);
-                if (cache_hit) {
+                // Use async tokenization to avoid blocking reactor on cache miss.
+                // System messages have ~90%+ cache hit rate so this is usually instant.
+                auto sys_tok_result = co_await _tokenizer.local().encode_threaded_async(system_prefix_text);
+                if (sys_tok_result.cache_hit) {
                     metrics().record_tokenization_cache_hit();
                 } else {
                     metrics().record_tokenization_cache_miss();
                 }
+                const auto& system_tokens = sys_tok_result.tokens;
                 // Only use as boundary if system tokens meet minimum threshold
                 // and are shorter than full tokens (otherwise it's not a prefix)
                 if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
@@ -1074,6 +1081,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     auto post_tokenize = std::chrono::steady_clock::now();
     metrics().record_tokenization_latency(
         MetricsService::to_seconds(post_tokenize - routing_start));
+    // Split metrics: primary tokenization vs boundary detection overhead.
+    // If P50≈P99 for tokenization, boundary detection is likely the hidden cost.
+    metrics().record_primary_tokenization_latency(
+        MetricsService::to_seconds(post_primary_tokenize - routing_start));
+    metrics().record_boundary_detection_latency(
+        MetricsService::to_seconds(post_tokenize - post_primary_tokenize));
 
     // Prepare forwarded body based on endpoint:
     // - /v1/completions: vLLM supports prompt_token_ids, forward them for efficiency
