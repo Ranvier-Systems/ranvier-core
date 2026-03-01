@@ -1363,6 +1363,60 @@ Not all workloads have 90% prefix sharing. These tests show how improvement scal
   workload has lower natural prefix sharing, monitor for hot-spotting via node request
   distribution in Prometheus metrics.
 
+#### Impact of Load Imbalance Factor
+
+The `RANVIER_LOAD_IMBALANCE_FACTOR` controls how aggressively the BOUNDED_LOAD strategy
+diverts requests away from the cache-optimal backend. Higher values allow more imbalance
+(preserving cache affinity), lower values spread load more evenly (sacrificing cache hits).
+
+**factor=1.25 vs factor=2.0 (default) — 74055a1, March 1 2026:**
+
+| Config | Metric | factor=2.0 | factor=1.25 | Winner |
+|--------|--------|-----------|-------------|--------|
+| **13B 10u 10m** | Cache Hits | 96.8% | 81.3% | 2.0 |
+| | P99 TTFT Change | **-79.1%** | -42.5% | 2.0 |
+| | Throughput | **+14.6%** | +6.0% | 2.0 |
+| **13B 20u 10m** | Cache Hits | 81.2% | 61.8% | 2.0 |
+| | P99 TTFT Change | **-79.6%** | +2.9% | 2.0 |
+| | Throughput | **+22.1%** | -5.7% | 2.0 |
+| **13B 30u 30m** | Cache Hits | 64.0% | 55.7% | 2.0 |
+| | P99 TTFT Change | +84.6% | +127.3% | 2.0 |
+| | Hit P99 | **1,237ms** | 4,301ms | 2.0 |
+| | Throughput | **+3.7%** | -1.9% | 2.0 |
+| **8B 20u 10m** | Cache Hits | 98.1% | 80.2% | 2.0 |
+| | XLarge Impr. | **31.6%** | 1.8% | 2.0 |
+| **8B 30u 30m** | Cache Hits | 98.0% | 47.5% | 2.0 |
+| | XLarge Impr. | **40.5%** | -0.8% | 2.0 |
+| | Throughput | -1.1% | -7.4% | 2.0 |
+
+*factor=2.0 data from Instance 3 (Feb 10-14) and b63c165/d6b97a6 (Feb 27-28).
+factor=1.25 data from 74055a1 (March 1, 2026). Same hardware (8xA100 40GB), vLLM v0.15.1.*
+
+**Key findings:**
+- **factor=2.0 wins every comparison.** Factor=1.25 reduces cache affinity by 15-50pp across
+  all configs, eliminating the P99 and throughput benefits that make prefix routing worthwhile.
+- **At 13B 20u (the primary comparison point):** factor=1.25 turns a -79.6% P99 improvement
+  into +2.9% (effectively no benefit). Cache hits drop from 81% to 62%.
+- **At low concurrency (10u):** factor=1.25 still shows positive results (P99 -42.5%), but
+  roughly half the benefit of factor=2.0 (-79.1%). Even with minimal contention, the
+  aggressive diversion hurts.
+- **At high concurrency (30u):** factor=1.25 makes things worse than factor=2.0 in every
+  dimension — including the cache-hit path (Hit P99 4,301ms vs 1,237ms) that factor=2.0
+  preserves. Spreading load doesn't help when it destroys the cache affinity that makes
+  prefix routing effective.
+- **8B XLarge improvement collapses:** 40.5% → -0.8% at 30u. The per-request cache benefit
+  that 8B shows at factor=2.0 is entirely eliminated.
+
+**Why lower factors don't help the miss tail:** The 30u miss-tail problem (P99 9,477ms at
+factor=2.0) is caused by cache misses queuing behind cache hits on popular-prefix backends.
+Factor=1.25 reduces the number of cache hits on those backends, but also reduces hits
+everywhere else — the misses don't get faster (Miss P99 12,796ms at 1.25 vs 9,477ms at 2.0),
+they get worse because the overall system loses cache efficiency. The fix requires
+hit/miss-aware load weighting, not a blunter imbalance factor.
+
+**Recommendation:** Keep `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default). Do not reduce below
+1.5 — the cache affinity loss outweighs any load distribution benefit.
+
 #### When Prefix-Aware Routing Helps (and When It Doesn't)
 
 Tested with real LMSYS conversation data (natural short-to-medium prompts, 3 shared prefixes):
