@@ -420,3 +420,63 @@ TEST_F(MetricsLifecycleTest, StopAndReinit) {
     auto& m2 = metrics();
     EXPECT_EQ(m2.get_cache_hits(), 0u);
 }
+
+// =============================================================================
+// Tokenization Latency Split Recording Tests
+//
+// Smoke tests for the primary/boundary latency split introduced alongside
+// the thread-pool offload. The underlying histograms are private, so we
+// verify the public API compiles, accepts representative values without
+// crashing, and that both methods coexist on the same MetricsService instance.
+// =============================================================================
+
+class TokenizationLatencySplitTest : public ::testing::Test {
+protected:
+    MetricsService svc;
+};
+
+TEST_F(TokenizationLatencySplitTest, RecordPrimaryTokenizationLatency) {
+    // Typical primary tokenization: 1-10ms range
+    svc.record_primary_tokenization_latency(0.005);
+    svc.record_primary_tokenization_latency(0.010);
+}
+
+TEST_F(TokenizationLatencySplitTest, RecordBoundaryDetectionLatency) {
+    // Boundary detection is typically faster: 0.1-2ms range
+    svc.record_boundary_detection_latency(0.0005);
+    svc.record_boundary_detection_latency(0.002);
+}
+
+TEST_F(TokenizationLatencySplitTest, RecordBothInSequence) {
+    // Mirrors the call pattern in http_controller: primary first, then boundary
+    svc.record_primary_tokenization_latency(0.008);
+    svc.record_boundary_detection_latency(0.001);
+    // Total tokenization latency = primary + boundary
+    svc.record_tokenization_latency(0.009);
+}
+
+TEST_F(TokenizationLatencySplitTest, ZeroLatencyDoesNotCrash) {
+    svc.record_primary_tokenization_latency(0.0);
+    svc.record_boundary_detection_latency(0.0);
+    svc.record_tokenization_latency(0.0);
+}
+
+TEST_F(TokenizationLatencySplitTest, VerySmallLatencyDoesNotCrash) {
+    // Sub-microsecond: below smallest bucket (0.0001s = 100μs)
+    svc.record_primary_tokenization_latency(0.0000001);
+    svc.record_boundary_detection_latency(0.0000001);
+}
+
+TEST_F(TokenizationLatencySplitTest, LargeLatencyDoesNotCrash) {
+    // Pathological case: 100s tokenization (above all buckets)
+    svc.record_primary_tokenization_latency(100.0);
+    svc.record_boundary_detection_latency(100.0);
+}
+
+TEST_F(TokenizationLatencySplitTest, ManyRecordingsDoNotCrash) {
+    // Sustained load: 10k recordings without accumulator overflow
+    for (int i = 0; i < 10000; ++i) {
+        svc.record_primary_tokenization_latency(0.005);
+        svc.record_boundary_detection_latency(0.001);
+    }
+}
