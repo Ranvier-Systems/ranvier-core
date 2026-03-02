@@ -1,4 +1,5 @@
 #include "http_controller.hpp"
+#include "boundary_detector.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
@@ -967,155 +968,53 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 body_view, _config.enable_multi_depth_routing, _config.chat_template);
         }
 
-        // Fast boundary detection: scan token sequence for message start markers.
-        // Instead of re-tokenizing each message individually (~5ms total for
-        // boundary detection), find message boundaries by scanning the full token
-        // array for the start-of-message special token (e.g., <|start_header_id|>
-        // for llama3, <|im_start|> for chatml). Special tokens act as BPE barriers,
-        // so marker positions in the full sequence give exact message boundaries.
-        // Falls through to per-message tokenization for none/mistral templates or
-        // if marker validation fails (e.g., special-token injection in content).
+        // Build config for boundary detection strategies
+        BoundaryDetectionConfig bd_config{
+            _config.enable_multi_depth_routing,
+            _config.min_prefix_boundary_tokens
+        };
+
+        // Strategy 1: Fast marker scan (llama3/chatml — exact boundaries)
         auto boundary_marker = _config.chat_template.message_start_marker();
-        if (!boundary_marker.empty() && text_extraction.has_value() &&
-            text_extraction->total_message_count > 0) {
+        if (!boundary_marker.empty() && text_extraction.has_value()) {
             try {
                 // Resolve marker token ID (cache hit after first request)
                 auto marker_tok = co_await _tokenizer.local().encode_threaded_async(boundary_marker);
                 if (marker_tok.tokens.size() == 1) {
-                    int32_t marker_id = marker_tok.tokens[0];
-
-                    // Scan token sequence for message start markers
-                    std::vector<size_t> marker_pos;
-                    marker_pos.reserve(text_extraction->total_message_count + 2);
-                    for (size_t i = 0; i < tokens.size(); ++i) {
-                        if (tokens[i] == marker_id) {
-                            marker_pos.push_back(i);
-                        }
-                    }
-
-                    // Validate: expect (num_messages + 1) markers (messages + gen prompt).
-                    // Mismatch indicates template mismatch or special-token injection.
-                    size_t expected = text_extraction->total_message_count + 1;
-                    if (marker_pos.size() == expected && marker_pos.size() >= 2) {
-                        size_t bos_offset = marker_pos[0];
-                        size_t sys_count = text_extraction->system_message_count;
-
-                        if (_config.enable_multi_depth_routing) {
-                            // Multi-depth: boundary after each message
-                            for (size_t i = 1; i < marker_pos.size(); ++i) {
-                                size_t boundary = marker_pos[i] - bos_offset;
-                                if (boundary > 0 && boundary < tokens.size()) {
-                                    prefix_boundaries.push_back(boundary);
-                                }
-                            }
-
-                            if (!prefix_boundaries.empty()) {
-                                // System boundary: cumulative tokens before first non-system msg
-                                size_t system_boundary = 0;
-                                if (sys_count > 0 && sys_count < marker_pos.size()) {
-                                    system_boundary = marker_pos[sys_count] - bos_offset;
-                                }
-                                prefix_boundary = system_boundary;
-                                if (prefix_boundary == 0 && !prefix_boundaries.empty()) {
-                                    prefix_boundary = prefix_boundaries.front();
-                                }
-                                prefix_boundary_set = true;
-                                metrics().record_prefix_boundary_used();
-                                log_proxy.debug("[{}] Fast boundary scan: {} boundaries, prefix_boundary={} tokens",
-                                               request_id, prefix_boundaries.size(), prefix_boundary);
-                            }
-                        } else {
-                            // Non-multi-depth: system boundary only
-                            if (text_extraction->has_system_messages && sys_count > 0 &&
-                                sys_count < marker_pos.size()) {
-                                size_t boundary = marker_pos[sys_count] - bos_offset;
-                                if (boundary >= _config.min_prefix_boundary_tokens &&
-                                    boundary < tokens.size()) {
-                                    prefix_boundary = boundary;
-                                    prefix_boundary_set = true;
-                                    metrics().record_prefix_boundary_used();
-                                    log_proxy.debug("[{}] Fast boundary scan: system prefix={} tokens",
-                                                   request_id, prefix_boundary);
-                                } else {
-                                    metrics().record_prefix_boundary_skipped();
-                                }
-                            }
-                        }
-                    }
-                    // If marker count != expected, fall through to per-message tokenization
-                }
-            } catch (...) {
-                // Marker resolution failed — fall through to per-message tokenization
-            }
-        }
-
-        // Proportional boundary estimation: map char offsets to token positions
-        // using the token/char ratio from primary tokenization. Avoids all
-        // re-tokenization (~5ms savings). Works for any template format.
-        // Accuracy: ±2-5 tokens, equivalent to the none-template per-message
-        // tokenization (which uses format_single_message, a different format
-        // than the combined text). For llama3/chatml, the fast scan above
-        // provides exact boundaries, so this is primarily for none/mistral.
-        if (!prefix_boundary_set && text_extraction.has_value() &&
-            !text_extraction->message_char_ends.empty() &&
-            !text_extraction->text.empty()) {
-            double text_len = static_cast<double>(text_extraction->text.size());
-            double token_count = static_cast<double>(tokens.size());
-            size_t sys_count = text_extraction->system_message_count;
-
-            if (_config.enable_multi_depth_routing) {
-                // Multi-depth: estimate boundary after each message
-                for (size_t i = 0; i < text_extraction->message_char_ends.size(); ++i) {
-                    size_t boundary = static_cast<size_t>(
-                        text_extraction->message_char_ends[i] * token_count / text_len);
-                    if (boundary > 0 && boundary < tokens.size()) {
-                        prefix_boundaries.push_back(boundary);
-                    }
-                }
-
-                if (!prefix_boundaries.empty()) {
-                    size_t system_boundary = 0;
-                    if (sys_count > 0 &&
-                        sys_count <= text_extraction->message_char_ends.size()) {
-                        // Char offset after last system message → proportional token pos
-                        system_boundary = static_cast<size_t>(
-                            text_extraction->message_char_ends[sys_count - 1]
-                            * token_count / text_len);
-                    }
-                    prefix_boundary = system_boundary;
-                    if (prefix_boundary == 0 && !prefix_boundaries.empty()) {
-                        prefix_boundary = prefix_boundaries.front();
-                    }
-                    prefix_boundary_set = true;
-                    metrics().record_prefix_boundary_used();
-                    log_proxy.debug("[{}] Proportional boundary estimate: {} boundaries, "
-                                   "prefix_boundary={} tokens (ratio={:.2f})",
-                                   request_id, prefix_boundaries.size(), prefix_boundary,
-                                   token_count / text_len);
-                }
-            } else {
-                // Non-multi-depth: system boundary only
-                if (text_extraction->has_system_messages && sys_count > 0 &&
-                    text_extraction->has_system_prefix) {
-                    size_t boundary = static_cast<size_t>(
-                        text_extraction->system_prefix_end * token_count / text_len);
-                    if (boundary >= _config.min_prefix_boundary_tokens &&
-                        boundary < tokens.size()) {
-                        prefix_boundary = boundary;
+                    auto scan_result = detect_boundaries_by_marker_scan(
+                        tokens, marker_tok.tokens[0], *text_extraction, bd_config);
+                    if (scan_result.detected) {
+                        prefix_boundary = scan_result.prefix_boundary;
+                        prefix_boundaries = std::move(scan_result.prefix_boundaries);
                         prefix_boundary_set = true;
                         metrics().record_prefix_boundary_used();
-                        log_proxy.debug("[{}] Proportional boundary estimate: "
-                                       "system prefix={} tokens (ratio={:.2f})",
-                                       request_id, prefix_boundary,
-                                       token_count / text_len);
-                    } else {
-                        metrics().record_prefix_boundary_skipped();
+                        log_proxy.debug("[{}] Fast boundary scan: {} boundaries, "
+                                       "prefix_boundary={} tokens",
+                                       request_id, prefix_boundaries.size(),
+                                       prefix_boundary);
                     }
                 }
+            } catch (...) {
+                // Marker resolution failed — fall through to next strategy
             }
         }
 
-        // Slow path: per-message tokenization (ultimate fallback when both
+        // Strategy 2: Proportional estimation (none/mistral — approximate)
+        if (!prefix_boundary_set && text_extraction.has_value()) {
+            auto ratio_result = detect_boundaries_by_char_ratio(
+                tokens.size(), *text_extraction, bd_config);
+            if (ratio_result.detected) {
+                prefix_boundary = ratio_result.prefix_boundary;
+                prefix_boundaries = std::move(ratio_result.prefix_boundaries);
+                prefix_boundary_set = true;
+                metrics().record_prefix_boundary_used();
+                log_proxy.debug("[{}] Proportional boundary estimate: {} boundaries, "
+                               "prefix_boundary={} tokens",
+                               request_id, prefix_boundaries.size(), prefix_boundary);
+            }
+        }
+
+        // Strategy 3: Per-message tokenization (ultimate fallback when both
         // fast scan and proportional estimation fail or don't apply)
 
         // For multi-depth routing, calculate boundaries at each message
