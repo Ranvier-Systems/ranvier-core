@@ -93,6 +93,12 @@ public:
         std::string system_text;             // System content joined by "\n" (empty if none)
         bool has_system_messages = false;
 
+        // Message counts for fast boundary detection (always populated).
+        // system_message_count: leading contiguous system messages only.
+        // total_message_count: all messages with valid role+content.
+        size_t system_message_count = 0;
+        size_t total_message_count = 0;
+
         // Per-message formatted strings for multi-depth boundary computation.
         // Pre-computed during JSON parsing to avoid re-parsing.
         // Format depends on chat_template:
@@ -438,6 +444,8 @@ RequestRewriter::extract_text_with_boundary_info(
             found_any_system = true;
             if (!in_system_prefix) {
                 system_contiguous = false;
+            } else {
+                ++result.system_message_count;
             }
             // Accumulate raw system text for routing key (always \n-joined,
             // independent of chat template — routing keys must be stable
@@ -481,6 +489,7 @@ RequestRewriter::extract_text_with_boundary_info(
             });
         }
 
+        ++result.total_message_count;
         is_first_message = false;
     }
 

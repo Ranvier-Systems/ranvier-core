@@ -188,6 +188,18 @@ public:
         }
     }
 
+    // Get the special token that marks the start of each message.
+    // Used by fast boundary detection: instead of re-tokenizing each message
+    // individually (~5ms), scan the full token sequence for this marker (~1μs).
+    // Returns empty string_view for templates without single-token markers.
+    std::string_view message_start_marker() const {
+        switch (_format) {
+            case ChatTemplateFormat::llama3: return "<|start_header_id|>";
+            case ChatTemplateFormat::chatml: return "<|im_start|>";
+            default: return {};
+        }
+    }
+
     // Estimate the extra characters the template adds per message (for reserve).
     size_t overhead_per_message() const {
         switch (_format) {
