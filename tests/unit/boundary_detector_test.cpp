@@ -10,13 +10,13 @@
 using namespace ranvier;
 
 // Helper to build a TextWithBoundaryInfo with common fields.
-static RequestRewriter::TextWithBoundaryInfo make_text_info(
+static TextWithBoundaryInfo make_text_info(
         size_t total_messages,
         size_t system_messages,
         std::vector<size_t> char_ends = {},
         size_t system_prefix_end = 0,
         bool has_system_prefix = false) {
-    RequestRewriter::TextWithBoundaryInfo info;
+    TextWithBoundaryInfo info;
     info.total_message_count = total_messages;
     info.system_message_count = system_messages;
     info.has_system_messages = (system_messages > 0);

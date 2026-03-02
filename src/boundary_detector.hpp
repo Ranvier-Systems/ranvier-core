@@ -23,7 +23,7 @@
 
 #pragma once
 
-#include "request_rewriter.hpp"
+#include "text_boundary_info.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -60,7 +60,7 @@ struct BoundaryDetectionResult {
 inline BoundaryDetectionResult detect_boundaries_by_marker_scan(
         const std::vector<int32_t>& tokens,
         int32_t marker_token_id,
-        const RequestRewriter::TextWithBoundaryInfo& text_info,
+        const TextWithBoundaryInfo& text_info,
         const BoundaryDetectionConfig& config) {
 
     BoundaryDetectionResult result;
@@ -140,7 +140,7 @@ inline BoundaryDetectionResult detect_boundaries_by_marker_scan(
 //   - no valid boundaries after filtering
 inline BoundaryDetectionResult detect_boundaries_by_char_ratio(
         size_t total_token_count,
-        const RequestRewriter::TextWithBoundaryInfo& text_info,
+        const TextWithBoundaryInfo& text_info,
         const BoundaryDetectionConfig& config) {
 
     BoundaryDetectionResult result;
