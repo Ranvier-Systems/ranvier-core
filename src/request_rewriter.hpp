@@ -99,6 +99,13 @@ public:
         size_t system_message_count = 0;
         size_t total_message_count = 0;
 
+        // Cumulative char offsets in `text` after each message (always populated).
+        // message_char_ends[i] = text.size() after formatting message i.
+        // Used for proportional boundary estimation: avoids re-tokenizing each
+        // message by mapping char offsets to token positions via the token/char
+        // ratio from primary tokenization.
+        std::vector<size_t> message_char_ends;
+
         // Per-message formatted strings for multi-depth boundary computation.
         // Pre-computed during JSON parsing to avoid re-parsing.
         // Format depends on chat_template:
@@ -413,6 +420,7 @@ RequestRewriter::extract_text_with_boundary_info(
     size_t system_prefix_end_candidate = 0;
     bool is_first_message = true;        // For chat template BOS handling
 
+    result.message_char_ends.reserve(messages.Size());
     if (need_formatted_messages) {
         result.formatted_messages.reserve(messages.Size());
     }
@@ -478,6 +486,9 @@ RequestRewriter::extract_text_with_boundary_info(
                                      has_role ? role_sv : std::string_view("user"),
                                      content_sv,
                                      is_first_message);
+
+        // Record char offset after this message for proportional boundary estimation
+        result.message_char_ends.push_back(combined.size());
 
         // Build formatted message for multi-depth routing only when requested.
         // Skipping this avoids N string allocations + vector growth per request
