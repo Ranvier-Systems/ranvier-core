@@ -87,6 +87,169 @@ def get_metric_value(metrics_url: str, metric_name: str) -> Optional[float]:
         return None
 
 
+def get_histogram_avg(metrics_url: str, metric_name: str) -> Optional[float]:
+    """Get average value from a Prometheus histogram (sum/count)."""
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        sum_val = None
+        count_val = None
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            if f"{metric_name}_sum" in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    sum_val = float(match.group(1))
+            elif f"{metric_name}_count" in line:
+                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
+                if match:
+                    count_val = float(match.group(1))
+
+        if sum_val is not None and count_val is not None and count_val > 0:
+            return sum_val / count_val
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch histogram from {metrics_url}: {e}")
+        return None
+
+
+def get_histogram_percentile(metrics_url: str, metric_name: str, percentile: float) -> Optional[float]:
+    """Calculate percentile from Prometheus histogram buckets using linear interpolation.
+
+    Reference: https://prometheus.io/docs/practices/histograms/#quantiles
+    """
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+
+        buckets = []
+        bucket_pattern = re.compile(
+            rf'{metric_name}_bucket\{{le="([^"]+)"\}}\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+        )
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            match = bucket_pattern.search(line)
+            if match:
+                le_str = match.group(1)
+                count = float(match.group(2))
+                if le_str == "+Inf":
+                    upper_bound = float("inf")
+                else:
+                    upper_bound = float(le_str)
+                buckets.append((upper_bound, count))
+
+        if not buckets:
+            return None
+
+        buckets.sort(key=lambda x: x[0])
+
+        total_count = buckets[-1][1] if buckets else 0
+        if total_count == 0:
+            return None
+
+        target_count = percentile * total_count
+        prev_bound = 0.0
+        prev_count = 0.0
+
+        for upper_bound, cumulative_count in buckets:
+            if cumulative_count >= target_count:
+                if upper_bound == float("inf"):
+                    return prev_bound
+                bucket_count = cumulative_count - prev_count
+                if bucket_count == 0:
+                    return prev_bound
+                fraction = (target_count - prev_count) / bucket_count
+                return prev_bound + (upper_bound - prev_bound) * fraction
+            prev_bound = upper_bound
+            prev_count = cumulative_count
+
+        for upper_bound, _ in reversed(buckets):
+            if upper_bound != float("inf"):
+                return upper_bound
+        return None
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch histogram percentile from {metrics_url}: {e}")
+        return None
+    except (ValueError, ZeroDivisionError) as e:
+        logger.warning(f"Failed to calculate percentile for {metric_name}: {e}")
+        return None
+
+
+def get_ranvier_latency_breakdown() -> dict:
+    """Get Ranvier's internal latency breakdown from Prometheus metrics.
+
+    Returns P50 and P99 latencies in milliseconds for routing, tokenization
+    (total, primary, boundary detection), ART lookup, and backend connect.
+    """
+    breakdown = {
+        "routing_latency_p50_ms": None,
+        "routing_latency_p99_ms": None,
+        "tokenization_latency_p50_ms": None,
+        "tokenization_latency_p99_ms": None,
+        "primary_tokenization_latency_p50_ms": None,
+        "primary_tokenization_latency_p99_ms": None,
+        "boundary_detection_latency_p50_ms": None,
+        "boundary_detection_latency_p99_ms": None,
+        "art_lookup_latency_p50_ms": None,
+        "art_lookup_latency_p99_ms": None,
+        "connect_latency_p50_ms": None,
+        "connect_latency_p99_ms": None,
+    }
+
+    # Metrics to scrape: (prometheus_name, p50_list, p99_list)
+    metrics_spec = [
+        ("seastar_ranvier_router_routing_latency_seconds", [], []),
+        ("seastar_ranvier_router_tokenization_latency_seconds", [], []),
+        ("seastar_ranvier_router_primary_tokenization_latency_seconds", [], []),
+        ("seastar_ranvier_router_boundary_detection_latency_seconds", [], []),
+        ("seastar_ranvier_backend_connect_duration_seconds", [], []),
+    ]
+
+    for metrics_url in RANVIER_METRICS:
+        for metric_name, p50_vals, p99_vals in metrics_spec:
+            p50 = get_histogram_percentile(metrics_url, metric_name, 0.50)
+            p99 = get_histogram_percentile(metrics_url, metric_name, 0.99)
+            if p50 is not None:
+                p50_vals.append(p50)
+                if p99 is not None:
+                    p99_vals.append(p99)
+            else:
+                avg = get_histogram_avg(metrics_url, metric_name)
+                if avg is not None:
+                    p50_vals.append(avg)
+                    p99_vals.append(avg)
+
+    # Map collected values to breakdown keys (convert seconds to ms)
+    key_map = [
+        ("routing_latency", metrics_spec[0]),
+        ("tokenization_latency", metrics_spec[1]),
+        ("primary_tokenization_latency", metrics_spec[2]),
+        ("boundary_detection_latency", metrics_spec[3]),
+        ("connect_latency", metrics_spec[4]),
+    ]
+    for key_prefix, (_, p50_vals, p99_vals) in key_map:
+        if p50_vals:
+            breakdown[f"{key_prefix}_p50_ms"] = (sum(p50_vals) / len(p50_vals)) * 1000
+        if p99_vals:
+            breakdown[f"{key_prefix}_p99_ms"] = (sum(p99_vals) / len(p99_vals)) * 1000
+
+    # Derived: ART lookup = routing - tokenization
+    if breakdown["routing_latency_p50_ms"] is not None and breakdown["tokenization_latency_p50_ms"] is not None:
+        breakdown["art_lookup_latency_p50_ms"] = max(0, breakdown["routing_latency_p50_ms"] - breakdown["tokenization_latency_p50_ms"])
+    if breakdown["routing_latency_p99_ms"] is not None and breakdown["tokenization_latency_p99_ms"] is not None:
+        breakdown["art_lookup_latency_p99_ms"] = max(0, breakdown["routing_latency_p99_ms"] - breakdown["tokenization_latency_p99_ms"])
+
+    return breakdown
+
+
 def register_backends_on_all_nodes():
     """Register backends on all Ranvier nodes."""
     global _backends_registered
@@ -247,6 +410,36 @@ def on_test_stop(environment, **kwargs):
                     msg = f"P99 latency for {name} is {p99_latency:.2f}ms (exceeds {P99_LATENCY_THRESHOLD_MS}ms)"
                     validation_messages.append(msg)
                     logger.error(f"FAIL: {msg}")
+
+    # Scrape Ranvier internal latency breakdown from Prometheus
+    latency_breakdown = get_ranvier_latency_breakdown()
+
+    # Log latency breakdown table
+    logger.info("Ranvier Internal Latency Breakdown:")
+    logger.info(f"  {'Metric':<40} {'P50 (ms)':>10} {'P99 (ms)':>10}")
+    logger.info(f"  {'-'*40} {'-'*10} {'-'*10}")
+    for key_prefix, label in [
+        ("routing_latency", "Routing (total)"),
+        ("tokenization_latency", "Tokenization (total)"),
+        ("primary_tokenization_latency", "  Primary tokenization"),
+        ("boundary_detection_latency", "  Boundary detection"),
+        ("art_lookup_latency", "ART lookup (derived)"),
+        ("connect_latency", "Backend connect"),
+    ]:
+        p50 = latency_breakdown.get(f"{key_prefix}_p50_ms")
+        p99 = latency_breakdown.get(f"{key_prefix}_p99_ms")
+        p50_str = f"{p50:.3f}" if p50 is not None else "N/A"
+        p99_str = f"{p99:.3f}" if p99 is not None else "N/A"
+        logger.info(f"  {label:<40} {p50_str:>10} {p99_str:>10}")
+
+    # Build summary and emit BENCHMARK_STATS_JSON for results_parser.py
+    summary = {
+        "total_requests": stats.total.num_requests if hasattr(stats, 'total') else 0,
+        "failed_requests": stats.total.num_failures if hasattr(stats, 'total') else 0,
+        "validation_passed": validation_passed,
+    }
+    summary.update(latency_breakdown)
+    logger.info("BENCHMARK_STATS_JSON:" + json.dumps(summary))
 
     # Log summary
     logger.info("=" * 60)

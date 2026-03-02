@@ -23,6 +23,7 @@
 #include <rapidjson/stringbuffer.h>
 
 #include "chat_template.hpp"
+#include "text_boundary_info.hpp"
 
 namespace ranvier {
 
@@ -69,42 +70,10 @@ public:
     //   The extracted text, or nullopt if no tokenizable content found
     static std::optional<std::string> extract_text(std::string_view body);
 
-    // Result of combined text extraction with pre-computed boundary metadata.
-    // Produced by a single JSON parse, eliminating redundant re-parsing
-    // that would occur when calling extract_text(), extract_system_messages(),
-    // and extract_message_boundaries() separately.
-    struct TextWithBoundaryInfo {
-        std::string text;                    // Full combined text for tokenization
-
-        // True if text came from "prompt" field (no message structure)
-        bool from_prompt = false;
-
-        // System message prefix boundary.
-        // When system messages are contiguous at the start of the messages array,
-        // text.substr(0, system_prefix_end) gives the formatted system content.
-        // This enables tokenizing the prefix substring directly without
-        // re-extracting and re-tokenizing system messages.
-        bool has_system_prefix = false;      // True if contiguous system msgs at start
-        size_t system_prefix_end = 0;        // Char offset in text after last system message
-
-        // System message text for non-contiguous fallback.
-        // Pre-extracted during JSON parsing to avoid re-parsing later.
-        // Matches extract_system_messages() output format.
-        std::string system_text;             // System content joined by "\n" (empty if none)
-        bool has_system_messages = false;
-
-        // Per-message formatted strings for multi-depth boundary computation.
-        // Pre-computed during JSON parsing to avoid re-parsing.
-        // Format depends on chat_template:
-        //   none:   "<|role|>\ncontent" (legacy)
-        //   llama3: "<|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>"
-        //   chatml: "<|im_start|>role\ncontent<|im_end|>\n"
-        struct FormattedMessage {
-            std::string text;
-            bool is_system;
-        };
-        std::vector<FormattedMessage> formatted_messages;
-    };
+    // Type alias for backwards compatibility — the struct definition has moved
+    // to text_boundary_info.hpp to avoid pulling rapidjson into consumers that
+    // only need the result type (boundary_detector.hpp, unit tests).
+    using TextWithBoundaryInfo = ranvier::TextWithBoundaryInfo;
 
     // Extract text with boundary metadata in a single JSON parse.
     // When need_formatted_messages is false, the formatted_messages vector is
@@ -407,6 +376,7 @@ RequestRewriter::extract_text_with_boundary_info(
     size_t system_prefix_end_candidate = 0;
     bool is_first_message = true;        // For chat template BOS handling
 
+    result.message_char_ends.reserve(messages.Size());
     if (need_formatted_messages) {
         result.formatted_messages.reserve(messages.Size());
     }
@@ -438,6 +408,8 @@ RequestRewriter::extract_text_with_boundary_info(
             found_any_system = true;
             if (!in_system_prefix) {
                 system_contiguous = false;
+            } else {
+                ++result.system_message_count;
             }
             // Accumulate raw system text for routing key (always \n-joined,
             // independent of chat template — routing keys must be stable
@@ -471,6 +443,9 @@ RequestRewriter::extract_text_with_boundary_info(
                                      content_sv,
                                      is_first_message);
 
+        // Record char offset after this message for proportional boundary estimation
+        result.message_char_ends.push_back(combined.size());
+
         // Build formatted message for multi-depth routing only when requested.
         // Skipping this avoids N string allocations + vector growth per request
         // when multi-depth routing is disabled (the common case).
@@ -481,6 +456,7 @@ RequestRewriter::extract_text_with_boundary_info(
             });
         }
 
+        ++result.total_message_count;
         is_first_message = false;
     }
 

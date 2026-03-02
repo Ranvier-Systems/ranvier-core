@@ -2784,6 +2784,8 @@ def get_ranvier_latency_breakdown() -> dict:
     Returns P50 and P99 latencies in milliseconds for:
     - routing_latency: Time spent making routing decision (includes tokenization + ART lookup)
     - tokenization_latency: Time spent tokenizing the request
+    - primary_tokenization_latency: Time spent on primary prompt tokenization only
+    - boundary_detection_latency: Time spent on prefix boundary detection tokenization
     - art_lookup_latency: Time spent looking up prefix in ART (routing - tokenization)
     - connect_latency: Time to establish backend connection
 
@@ -2795,6 +2797,10 @@ def get_ranvier_latency_breakdown() -> dict:
         "routing_latency_p99_ms": None,
         "tokenization_latency_p50_ms": None,
         "tokenization_latency_p99_ms": None,
+        "primary_tokenization_latency_p50_ms": None,
+        "primary_tokenization_latency_p99_ms": None,
+        "boundary_detection_latency_p50_ms": None,
+        "boundary_detection_latency_p99_ms": None,
         "art_lookup_latency_p50_ms": None,
         "art_lookup_latency_p99_ms": None,
         "connect_latency_p50_ms": None,
@@ -2804,6 +2810,8 @@ def get_ranvier_latency_breakdown() -> dict:
     # Collect percentiles from all nodes
     routing_p50_vals, routing_p99_vals = [], []
     tokenization_p50_vals, tokenization_p99_vals = [], []
+    primary_tok_p50_vals, primary_tok_p99_vals = [], []
+    boundary_det_p50_vals, boundary_det_p99_vals = [], []
     connect_p50_vals, connect_p99_vals = [], []
 
     for metrics_url in RANVIER_METRICS:
@@ -2824,7 +2832,7 @@ def get_ranvier_latency_breakdown() -> dict:
                 routing_p50_vals.append(routing_avg)
                 routing_p99_vals.append(routing_avg)
 
-        # Tokenization latency
+        # Tokenization latency (total: primary + boundary detection)
         tokenization_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_tokenization_latency_seconds", 0.50)
         tokenization_p99 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_tokenization_latency_seconds", 0.99)
         if tokenization_p50 is not None:
@@ -2836,6 +2844,32 @@ def get_ranvier_latency_breakdown() -> dict:
             if tokenization_avg is not None:
                 tokenization_p50_vals.append(tokenization_avg)
                 tokenization_p99_vals.append(tokenization_avg)
+
+        # Primary tokenization latency (prompt tokenization only, excludes boundary detection)
+        primary_tok_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_primary_tokenization_latency_seconds", 0.50)
+        primary_tok_p99 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_primary_tokenization_latency_seconds", 0.99)
+        if primary_tok_p50 is not None:
+            primary_tok_p50_vals.append(primary_tok_p50)
+            if primary_tok_p99 is not None:
+                primary_tok_p99_vals.append(primary_tok_p99)
+        else:
+            primary_tok_avg = get_histogram_avg(metrics_url, "seastar_ranvier_router_primary_tokenization_latency_seconds")
+            if primary_tok_avg is not None:
+                primary_tok_p50_vals.append(primary_tok_avg)
+                primary_tok_p99_vals.append(primary_tok_avg)
+
+        # Boundary detection latency (message tokenization for prefix boundaries)
+        boundary_det_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_boundary_detection_latency_seconds", 0.50)
+        boundary_det_p99 = get_histogram_percentile(metrics_url, "seastar_ranvier_router_boundary_detection_latency_seconds", 0.99)
+        if boundary_det_p50 is not None:
+            boundary_det_p50_vals.append(boundary_det_p50)
+            if boundary_det_p99 is not None:
+                boundary_det_p99_vals.append(boundary_det_p99)
+        else:
+            boundary_det_avg = get_histogram_avg(metrics_url, "seastar_ranvier_router_boundary_detection_latency_seconds")
+            if boundary_det_avg is not None:
+                boundary_det_p50_vals.append(boundary_det_avg)
+                boundary_det_p99_vals.append(boundary_det_avg)
 
         # Backend connect latency
         connect_p50 = get_histogram_percentile(metrics_url, "seastar_ranvier_backend_connect_duration_seconds", 0.50)
@@ -2859,6 +2893,14 @@ def get_ranvier_latency_breakdown() -> dict:
         breakdown["tokenization_latency_p50_ms"] = (sum(tokenization_p50_vals) / len(tokenization_p50_vals)) * 1000
     if tokenization_p99_vals:
         breakdown["tokenization_latency_p99_ms"] = (sum(tokenization_p99_vals) / len(tokenization_p99_vals)) * 1000
+    if primary_tok_p50_vals:
+        breakdown["primary_tokenization_latency_p50_ms"] = (sum(primary_tok_p50_vals) / len(primary_tok_p50_vals)) * 1000
+    if primary_tok_p99_vals:
+        breakdown["primary_tokenization_latency_p99_ms"] = (sum(primary_tok_p99_vals) / len(primary_tok_p99_vals)) * 1000
+    if boundary_det_p50_vals:
+        breakdown["boundary_detection_latency_p50_ms"] = (sum(boundary_det_p50_vals) / len(boundary_det_p50_vals)) * 1000
+    if boundary_det_p99_vals:
+        breakdown["boundary_detection_latency_p99_ms"] = (sum(boundary_det_p99_vals) / len(boundary_det_p99_vals)) * 1000
     if connect_p50_vals:
         breakdown["connect_latency_p50_ms"] = (sum(connect_p50_vals) / len(connect_p50_vals)) * 1000
     if connect_p99_vals:
@@ -3503,6 +3545,22 @@ def on_test_stop(environment, **kwargs):
         p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
         p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
         logger.info(f"  {'  - Tokenization':<25} {p50_str:>10} {p99_str:>10}")
+
+    # Primary tokenization (prompt tokenization, excludes boundary detection)
+    p50 = latency_breakdown.get("primary_tokenization_latency_p50_ms")
+    p99 = latency_breakdown.get("primary_tokenization_latency_p99_ms")
+    if p50 is not None or p99 is not None:
+        p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
+        p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
+        logger.info(f"  {'    - Primary':<25} {p50_str:>10} {p99_str:>10}")
+
+    # Boundary detection (message tokenization for prefix boundaries)
+    p50 = latency_breakdown.get("boundary_detection_latency_p50_ms")
+    p99 = latency_breakdown.get("boundary_detection_latency_p99_ms")
+    if p50 is not None or p99 is not None:
+        p50_str = f"{p50:.2f}ms" if p50 is not None else "N/A"
+        p99_str = f"{p99:.2f}ms" if p99 is not None else "N/A"
+        logger.info(f"  {'    - Boundary Detect':<25} {p50_str:>10} {p99_str:>10}")
 
     # ART Lookup (sub-component of routing)
     p50 = latency_breakdown.get("art_lookup_latency_p50_ms")

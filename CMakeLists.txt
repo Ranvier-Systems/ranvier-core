@@ -331,6 +331,17 @@ target_link_libraries(chat_template_test
 )
 gtest_discover_tests(chat_template_test)
 
+# BoundaryDetector Unit Tests (Pure C++, header-only)
+add_executable(boundary_detector_test
+  tests/unit/boundary_detector_test.cpp
+)
+target_include_directories(boundary_detector_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(boundary_detector_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(boundary_detector_test)
+
 # TextValidator Unit Tests (Pure C++, header-only)
 add_executable(text_validator_test
   tests/unit/text_validator_test.cpp

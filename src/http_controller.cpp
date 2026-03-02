@@ -1,4 +1,5 @@
 #include "http_controller.hpp"
+#include "boundary_detector.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
@@ -907,6 +908,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     } // tokenization block ends here (tokenize_span goes out of scope)
 
+    // Phase snapshot: post-primary-tokenize (before boundary detection)
+    auto post_primary_tokenize = std::chrono::steady_clock::now();
+
     // Determine shared prefix boundary for routing
     // Priority: 1) Client-provided prefix_token_count/prefix_boundaries, 2) Automatic detection
     bool prefix_boundary_set = false;
@@ -964,10 +968,59 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 body_view, _config.enable_multi_depth_routing, _config.chat_template);
         }
 
+        // Build config for boundary detection strategies
+        BoundaryDetectionConfig bd_config{
+            _config.enable_multi_depth_routing,
+            _config.min_prefix_boundary_tokens
+        };
+
+        // Strategy 1: Fast marker scan (llama3/chatml — exact boundaries)
+        auto boundary_marker = _config.chat_template.message_start_marker();
+        if (!boundary_marker.empty() && text_extraction.has_value()) {
+            try {
+                // Resolve marker token ID (cache hit after first request)
+                auto marker_tok = co_await _tokenizer.local().encode_threaded_async(boundary_marker);
+                if (marker_tok.tokens.size() == 1) {
+                    auto scan_result = detect_boundaries_by_marker_scan(
+                        tokens, marker_tok.tokens[0], *text_extraction, bd_config);
+                    if (scan_result.detected) {
+                        prefix_boundary = scan_result.prefix_boundary;
+                        prefix_boundaries = std::move(scan_result.prefix_boundaries);
+                        prefix_boundary_set = true;
+                        metrics().record_prefix_boundary_used();
+                        log_proxy.debug("[{}] Fast boundary scan: {} boundaries, "
+                                       "prefix_boundary={} tokens",
+                                       request_id, prefix_boundaries.size(),
+                                       prefix_boundary);
+                    }
+                }
+            } catch (...) {
+                // Marker resolution failed — fall through to next strategy
+            }
+        }
+
+        // Strategy 2: Proportional estimation (none/mistral — approximate)
+        if (!prefix_boundary_set && text_extraction.has_value()) {
+            auto ratio_result = detect_boundaries_by_char_ratio(
+                tokens.size(), *text_extraction, bd_config);
+            if (ratio_result.detected) {
+                prefix_boundary = ratio_result.prefix_boundary;
+                prefix_boundaries = std::move(ratio_result.prefix_boundaries);
+                prefix_boundary_set = true;
+                metrics().record_prefix_boundary_used();
+                log_proxy.debug("[{}] Proportional boundary estimate: {} boundaries, "
+                               "prefix_boundary={} tokens",
+                               request_id, prefix_boundaries.size(), prefix_boundary);
+            }
+        }
+
+        // Strategy 3: Per-message tokenization (ultimate fallback when both
+        // fast scan and proportional estimation fail or don't apply)
+
         // For multi-depth routing, calculate boundaries at each message
         // using pre-formatted message strings from the initial JSON parse
-        if (_config.enable_multi_depth_routing && text_extraction.has_value() &&
-            !text_extraction->formatted_messages.empty()) {
+        if (!prefix_boundary_set && _config.enable_multi_depth_routing &&
+            text_extraction.has_value() && !text_extraction->formatted_messages.empty()) {
             size_t cumulative_tokens = 0;
             bool found_non_system = false;
             size_t system_boundary = 0;
@@ -975,14 +1028,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             for (const auto& msg : text_extraction->formatted_messages) {
                 size_t msg_token_count = 0;
                 try {
-                    // Use cached tokenization for message boundaries (high hit rate for role tags)
-                    auto [msg_tokens, cache_hit] = _tokenizer.local().encode_cached(msg.text);
-                    if (cache_hit) {
+                    // Use async tokenization to avoid blocking reactor on cache miss.
+                    // Cache hits return immediately (make_ready_future); misses offload
+                    // to thread pool or cross-shard, keeping the reactor free.
+                    auto msg_tok_result = co_await _tokenizer.local().encode_threaded_async(msg.text);
+                    if (msg_tok_result.cache_hit) {
                         metrics().record_tokenization_cache_hit();
                     } else {
                         metrics().record_tokenization_cache_miss();
                     }
-                    msg_token_count = msg_tokens.size();
+                    msg_token_count = msg_tok_result.tokens.size();
                 } catch (...) {
                     // Individual message tokenization failed — skip this message
                     continue;
@@ -1039,13 +1094,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     system_prefix_text = text_extraction->system_text;
                 }
 
-                // Use cached tokenization (system messages have ~90%+ cache hit rate)
-                auto [system_tokens, cache_hit] = _tokenizer.local().encode_cached(system_prefix_text);
-                if (cache_hit) {
+                // Use async tokenization to avoid blocking reactor on cache miss.
+                // System messages have ~90%+ cache hit rate so this is usually instant.
+                auto sys_tok_result = co_await _tokenizer.local().encode_threaded_async(system_prefix_text);
+                if (sys_tok_result.cache_hit) {
                     metrics().record_tokenization_cache_hit();
                 } else {
                     metrics().record_tokenization_cache_miss();
                 }
+                const auto& system_tokens = sys_tok_result.tokens;
                 // Only use as boundary if system tokens meet minimum threshold
                 // and are shorter than full tokens (otherwise it's not a prefix)
                 if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
@@ -1074,6 +1131,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     auto post_tokenize = std::chrono::steady_clock::now();
     metrics().record_tokenization_latency(
         MetricsService::to_seconds(post_tokenize - routing_start));
+    // Split metrics: primary tokenization vs boundary detection overhead.
+    // If P50≈P99 for tokenization, boundary detection is likely the hidden cost.
+    metrics().record_primary_tokenization_latency(
+        MetricsService::to_seconds(post_primary_tokenize - routing_start));
+    metrics().record_boundary_detection_latency(
+        MetricsService::to_seconds(post_tokenize - post_primary_tokenize));
 
     // Prepare forwarded body based on endpoint:
     // - /v1/completions: vLLM supports prompt_token_ids, forward them for efficiency

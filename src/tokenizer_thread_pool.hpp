@@ -56,8 +56,9 @@ struct ThreadPoolTokenizationConfig {
     size_t max_queue_size = 256;
 
     // Minimum text length (bytes) to consider thread pool dispatch.
-    // Short texts tokenize quickly; thread pool overhead may exceed benefit.
-    size_t min_text_length = 256;
+    // Thread pool queue + alien::run_on overhead is ~50-200μs, which is
+    // negligible compared to 5-13ms FFI cost even for short texts.
+    size_t min_text_length = 64;
 
     // Maximum text length (bytes) for thread pool dispatch.
     // Very long texts require large string copies; may be better processed locally.

@@ -237,7 +237,7 @@ struct AssetsConfig {
     // Benchmarks show ~60% P99 TTFT reduction and ~20% throughput improvement.
     bool tokenizer_thread_pool_enabled = true;      // Disable via RANVIER_TOKENIZER_THREAD_POOL_ENABLED=false
     size_t tokenizer_thread_pool_queue_size = 256;  // Max pending jobs per shard (Rule #4)
-    size_t tokenizer_thread_pool_min_text = 256;    // Min text length for thread pool dispatch
+    size_t tokenizer_thread_pool_min_text = 64;     // Min text length for thread pool dispatch (was 256; lowered to cover short prompts)
     size_t tokenizer_thread_pool_max_text = 65536;  // Max text length for thread pool dispatch
 
     // Local fallback semaphore: max concurrent reactor-blocking tokenizations per shard.

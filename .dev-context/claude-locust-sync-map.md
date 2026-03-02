@@ -60,6 +60,8 @@ the full exported name; C++ registers without the prefix.
 |----------------|---------------------------------------|-------------|
 | `seastar_ranvier_router_routing_latency_seconds` | `router_routing_latency_seconds` | metrics_service.hpp |
 | `seastar_ranvier_router_tokenization_latency_seconds` | `router_tokenization_latency_seconds` | metrics_service.hpp |
+| `seastar_ranvier_router_primary_tokenization_latency_seconds` | `router_primary_tokenization_latency_seconds` | metrics_service.hpp |
+| `seastar_ranvier_router_boundary_detection_latency_seconds` | `router_boundary_detection_latency_seconds` | metrics_service.hpp |
 | `seastar_ranvier_backend_connect_duration_seconds` | `backend_connect_duration_seconds` | metrics_service.hpp |
 | `seastar_ranvier_prefix_boundary_used` | `prefix_boundary_used` | metrics_service.hpp |
 | `seastar_ranvier_prefix_boundary_skipped` | `prefix_boundary_skipped` | metrics_service.hpp |

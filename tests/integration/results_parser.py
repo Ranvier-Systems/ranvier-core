@@ -86,6 +86,10 @@ class BenchmarkResults:
     routing_latency_p99_ms: Optional[float] = None
     tokenization_latency_p50_ms: Optional[float] = None
     tokenization_latency_p99_ms: Optional[float] = None
+    primary_tokenization_latency_p50_ms: Optional[float] = None
+    primary_tokenization_latency_p99_ms: Optional[float] = None
+    boundary_detection_latency_p50_ms: Optional[float] = None
+    boundary_detection_latency_p99_ms: Optional[float] = None
     art_lookup_latency_p50_ms: Optional[float] = None
     art_lookup_latency_p99_ms: Optional[float] = None
     connect_latency_p50_ms: Optional[float] = None
@@ -132,13 +136,13 @@ class BenchmarkResults:
 
 def detect_benchmark_type(content: str) -> str:
     """Auto-detect whether this is a mock or real vLLM benchmark."""
-    # Real benchmarks have cache hit/miss tracking
+    # Real benchmarks have cache hit/miss tracking from locustfile_real.py
     if "Cache HIT" in content or "Cache MISS" in content:
-        return "real"
-    if "BENCHMARK_STATS_JSON" in content:
         return "real"
     if "cache_hit_rate" in content.lower():
         return "real"
+    # Note: BENCHMARK_STATS_JSON is emitted by both mock and real locustfiles,
+    # so it is not a reliable signal for benchmark type.
     # Default to mock (simpler format)
     return "mock"
 
@@ -237,6 +241,10 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
         results["routing_latency_p99_ms"] = stats.get("routing_latency_p99_ms")
         results["tokenization_latency_p50_ms"] = stats.get("tokenization_latency_p50_ms")
         results["tokenization_latency_p99_ms"] = stats.get("tokenization_latency_p99_ms")
+        results["primary_tokenization_latency_p50_ms"] = stats.get("primary_tokenization_latency_p50_ms")
+        results["primary_tokenization_latency_p99_ms"] = stats.get("primary_tokenization_latency_p99_ms")
+        results["boundary_detection_latency_p50_ms"] = stats.get("boundary_detection_latency_p50_ms")
+        results["boundary_detection_latency_p99_ms"] = stats.get("boundary_detection_latency_p99_ms")
         results["art_lookup_latency_p50_ms"] = stats.get("art_lookup_latency_p50_ms")
         results["art_lookup_latency_p99_ms"] = stats.get("art_lookup_latency_p99_ms")
         results["connect_latency_p50_ms"] = stats.get("connect_latency_p50_ms")
@@ -501,7 +509,24 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
     results.avg_response_time_ms = agg["avg_response_time_ms"]
     results.requests_per_sec = agg["requests_per_sec"]
 
-    # Real benchmark specific parsing
+    # Parse JSON stats block (emitted by both mock and real locustfiles)
+    json_stats = parse_json_stats(content)
+
+    # Ranvier overhead metrics from Prometheus histograms (available for both types)
+    results.routing_latency_p50_ms = json_stats.get("routing_latency_p50_ms")
+    results.routing_latency_p99_ms = json_stats.get("routing_latency_p99_ms")
+    results.tokenization_latency_p50_ms = json_stats.get("tokenization_latency_p50_ms")
+    results.tokenization_latency_p99_ms = json_stats.get("tokenization_latency_p99_ms")
+    results.primary_tokenization_latency_p50_ms = json_stats.get("primary_tokenization_latency_p50_ms")
+    results.primary_tokenization_latency_p99_ms = json_stats.get("primary_tokenization_latency_p99_ms")
+    results.boundary_detection_latency_p50_ms = json_stats.get("boundary_detection_latency_p50_ms")
+    results.boundary_detection_latency_p99_ms = json_stats.get("boundary_detection_latency_p99_ms")
+    results.art_lookup_latency_p50_ms = json_stats.get("art_lookup_latency_p50_ms")
+    results.art_lookup_latency_p99_ms = json_stats.get("art_lookup_latency_p99_ms")
+    results.connect_latency_p50_ms = json_stats.get("connect_latency_p50_ms")
+    results.connect_latency_p99_ms = json_stats.get("connect_latency_p99_ms")
+
+    # Real benchmark specific parsing (cache stats, token counts, etc.)
     if benchmark_type == "real":
         # Cache TTFT
         cache_ttft = parse_cache_ttft(content)
@@ -510,8 +535,7 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.ttft_cache_miss_p50_ms = cache_ttft["ttft_cache_miss_p50_ms"]
         results.ttft_cache_miss_p99_ms = cache_ttft["ttft_cache_miss_p99_ms"]
 
-        # JSON stats
-        json_stats = parse_json_stats(content)
+        # Cache and token stats from JSON
         results.cache_hits = json_stats.get("cache_hits")
         results.cache_misses = json_stats.get("cache_misses")
         results.cache_hit_rate_pct = json_stats.get("cache_hit_rate_pct")
@@ -520,16 +544,6 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.total_completion_tokens = json_stats.get("total_completion_tokens")
         results.tokens_per_second = json_stats.get("tokens_per_second")
         results.unique_prefixes = json_stats.get("unique_prefixes")
-
-        # Ranvier overhead metrics (P50/P99 percentiles)
-        results.routing_latency_p50_ms = json_stats.get("routing_latency_p50_ms")
-        results.routing_latency_p99_ms = json_stats.get("routing_latency_p99_ms")
-        results.tokenization_latency_p50_ms = json_stats.get("tokenization_latency_p50_ms")
-        results.tokenization_latency_p99_ms = json_stats.get("tokenization_latency_p99_ms")
-        results.art_lookup_latency_p50_ms = json_stats.get("art_lookup_latency_p50_ms")
-        results.art_lookup_latency_p99_ms = json_stats.get("art_lookup_latency_p99_ms")
-        results.connect_latency_p50_ms = json_stats.get("connect_latency_p50_ms")
-        results.connect_latency_p99_ms = json_stats.get("connect_latency_p99_ms")
 
         # Override cache TTFT from JSON if available
         if json_stats.get("ttft_cache_hit_p50_ms"):
@@ -989,6 +1003,10 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
             ("routing_latency_p99_ms", "Routing Decision P99 (ms)", True),
             ("tokenization_latency_p50_ms", "  - Tokenization P50 (ms)", True),
             ("tokenization_latency_p99_ms", "  - Tokenization P99 (ms)", True),
+            ("primary_tokenization_latency_p50_ms", "    - Primary P50 (ms)", True),
+            ("primary_tokenization_latency_p99_ms", "    - Primary P99 (ms)", True),
+            ("boundary_detection_latency_p50_ms", "    - Boundary Detect P50 (ms)", True),
+            ("boundary_detection_latency_p99_ms", "    - Boundary Detect P99 (ms)", True),
             ("art_lookup_latency_p50_ms", "  - ART Lookup P50 (ms)", True),
             ("art_lookup_latency_p99_ms", "  - ART Lookup P99 (ms)", True),
             ("connect_latency_p50_ms", "Backend Connect P50 (ms)", True),
