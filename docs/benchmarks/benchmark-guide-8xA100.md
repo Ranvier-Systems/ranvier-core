@@ -110,6 +110,46 @@ conclusion itself needs re-validation — it was measured against a 3.3x inflate
 *8B/13B benchmarks run on 40GB A100s (8 backends). 70B requires tensor parallelism:
 TP=4 on 40GB (2 backends, 4K context) or TP=2 on 80GB (4 backends, 32K context).*
 
+### CPU Pinning & NUMA Topology
+
+The benchmark compose file pins each Ranvier node to **dedicated, non-overlapping CPU cores**
+via Docker `cpuset` and Seastar `--cpuset`. This is critical for accurate benchmarks because:
+
+1. **No core overlap** — Without pinning, all 3 nodes' Seastar reactors compete for the same
+   cores (default 0-7), causing context switches that defeat Seastar's thread-per-core model.
+2. **NUMA-local L3 cache** — Cores within a NUMA node share an L3 cache. Spreading a single
+   Ranvier node across NUMA boundaries causes remote memory access (~2x latency penalty).
+3. **Deterministic scheduling** — Pinned reactors never get migrated by the scheduler,
+   eliminating a source of tail latency jitter.
+
+**Default core assignments** (env-overridable):
+
+| Node | Docker cpuset | Seastar --cpuset | Env var |
+|------|---------------|------------------|---------|
+| ranvier1 | 0-7 | 0-7 | `RANVIER_CPUSET_1` |
+| ranvier2 | 8-15 | 8-15 | `RANVIER_CPUSET_2` |
+| ranvier3 | 16-23 | 16-23 | `RANVIER_CPUSET_3` |
+
+**Verify your NUMA topology before benchmarking:**
+
+```bash
+# Show NUMA nodes and which cores belong to each
+numactl --hardware
+
+# Example output (dual-socket AMD EPYC):
+#   node 0 cpus: 0-61
+#   node 1 cpus: 62-123
+# → Defaults (0-23) all fit in node 0. No changes needed.
+
+# If your layout differs, override:
+RANVIER_CPUSET_1=0-7 RANVIER_CPUSET_2=8-15 RANVIER_CPUSET_3=16-23 \
+  docker compose -f docker-compose.benchmark-real.yml up -d
+```
+
+> **Note:** Previous benchmarks (before this change) ran without CPU pinning. All 3 nodes
+> likely shared cores 0-7, which may have understated Ranvier's performance due to
+> context-switching overhead and L3 cache thrashing between nodes.
+
 ## Quick Start
 
 ```bash

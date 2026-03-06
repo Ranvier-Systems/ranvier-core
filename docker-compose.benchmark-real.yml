@@ -108,6 +108,12 @@ services:
 
   # ============================================================================
   # RANVIER CLUSTER (3 nodes)
+  #
+  # CPU Pinning (NUMA-aware):
+  #   Each node gets 8 dedicated cores via cpuset to prevent overlap.
+  #   Default ranges assume all 24 cores fit within a single NUMA node.
+  #   Override RANVIER_CPUSET_1/2/3 if your NUMA topology differs.
+  #   Run `numactl --hardware` on the host to check which cores share an L3.
   # ============================================================================
 
   ranvier1:
@@ -116,6 +122,7 @@ services:
       context: .
       dockerfile: Dockerfile.production
     container_name: ranvier-bench1
+    cpuset: ${RANVIER_CPUSET_1:-0-7}
     networks:
       ranvier-benchmark:
         ipv4_address: 172.29.2.1
@@ -168,10 +175,10 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
-    # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
+    # Pin Seastar reactors to the same cores as the Docker cpuset for deterministic scheduling.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
-    command: ["./ranvier_server", "--smp", "8"]
+    command: ["./ranvier_server", "--cpuset", "${RANVIER_CPUSET_1:-0-7}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -185,6 +192,7 @@ services:
       context: .
       dockerfile: Dockerfile.production
     container_name: ranvier-bench2
+    cpuset: ${RANVIER_CPUSET_2:-8-15}
     networks:
       ranvier-benchmark:
         ipv4_address: 172.29.2.2
@@ -225,10 +233,10 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
-    # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
+    # Pin Seastar reactors to the same cores as the Docker cpuset for deterministic scheduling.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
-    command: ["./ranvier_server", "--smp", "8"]
+    command: ["./ranvier_server", "--cpuset", "${RANVIER_CPUSET_2:-8-15}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
@@ -242,6 +250,7 @@ services:
       context: .
       dockerfile: Dockerfile.production
     container_name: ranvier-bench3
+    cpuset: ${RANVIER_CPUSET_3:-16-23}
     networks:
       ranvier-benchmark:
         ipv4_address: 172.29.2.3
@@ -282,10 +291,10 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
-    # Use --smp 8 to leverage multi-core performance with Seastar's per-shard allocator.
+    # Pin Seastar reactors to the same cores as the Docker cpuset for deterministic scheduling.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
-    command: ["./ranvier_server", "--smp", "8"]
+    command: ["./ranvier_server", "--cpuset", "${RANVIER_CPUSET_3:-16-23}"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9180/metrics"]
       interval: 5s
