@@ -1818,7 +1818,8 @@ As results come in, update the tables below. Use this template for each run:
 | 8a | 20ms (run 1) | **-76.9%** | +11.5% | 67.8% | PASSED | 08e5a93, Instance 8; P50 **-6.6%** (tokenization 5.95ms) |
 | 8b | 20ms (run 2) | **-86.3%** | +17.5% | 69.4% | PASSED | 1749f05, Instance 9 + NUMA; P50 **-5.0%** (tokenization 5.82ms); **best result ever** |
 | 9 | 50ms | **-69.7%** | +1.9% | 61.2% | PASSED | 08e5a93, Instance 8; P50 +2.9% (tokenization 6.74ms); cache hit P50 -10.2% |
-| 10ms+NUMA | 10ms (NUMA) | +462.5% | -24.9% | 94.3% | FAILED | 1749f05, Instance 9 + NUMA; **hot-spotting**, XLarge Hit P99 20.5s, 43 unique prefixes |
+| 10ms+NUMA | 10ms (NUMA run 1) | +462.5% | -24.9% | 94.3% | FAILED | 1749f05, Instance 9 + NUMA; **hot-spotting**, XLarge Hit P99 20.5s, 43 unique prefixes |
+| 10ms+NUMA | 10ms (NUMA run 2) | **-71.1%** | +6.3% | 76.9% | PASSED | 1749f05, Instance 9 + NUMA; P50 +4.1% (tokenization 7.16ms); hot-spotting not reproduced |
 
 > **Priority 2 sweep analysis (2ms–50ms flush, #6-9, plus NUMA re-runs):**
 >
@@ -1827,7 +1828,8 @@ As results come in, update the tables below. Use this template for each run:
 > | 2ms (#6) | -63.1% | +8.5% | -3.4% | 79.9% | 7.67ms | 8 |
 > | 5ms (#7) | -70.9% | +2.7% | +0.9% | 77.5% | 5.96ms | 8 |
 > | 10ms (1d) | -66.7% | — | +4.2% | 80.5% | — | 8 |
-> | 10ms+NUMA | **+462.5%** | +14.7% | -24.9% | 94.3% | 7.89ms | 9 NUMA **FAILED** |
+> | 10ms+NUMA (run 1) | **+462.5%** | +14.7% | -24.9% | 94.3% | 7.89ms | 9 NUMA **FAILED** |
+> | 10ms+NUMA (run 2) | -71.1% | +4.1% | +6.3% | 76.9% | 7.16ms | 9 NUMA |
 > | 20ms (#8a) | -76.9% | -6.6% | +11.5% | 67.8% | 5.95ms | 8 |
 > | **20ms (#8b)** | **-86.3%** | **-5.0%** | **+17.5%** | 69.4% | 5.82ms | **9 NUMA** |
 > | 50ms (#9) | -69.7% | +2.9% | +1.9% | 61.2% | 6.74ms | 8 |
@@ -1838,18 +1840,23 @@ As results come in, update the tables below. Use this template for each run:
 > P99 -86.3% (best ever), P50 -5.0%, throughput +17.5% (+432 requests). Cache affinity is
 > stable at 69.4% (vs 67.8% on 8a), confirming 20ms is reproducible across instances.
 >
-> **Critical finding: 10ms + NUMA triggers hot-spotting.** The 10ms NUMA run failed with P99
-> +462.5% (18s!) despite 94.3% cache hits and only 43 unique prefixes. At 10ms flush, NUMA
-> pinning constrains which cores handle routing decisions — smaller batches with fewer routing
-> cores leads to over-concentration on a subset of backends. The 20ms flush interval gives
-> enough batch accumulation to spread load even with NUMA constraints.
+> **10ms + NUMA hot-spotting is transient, not systematic.** The first 10ms NUMA run failed
+> catastrophically (P99 +462.5%, 18s) with 94.3% cache hits concentrated on 43 prefixes. The
+> immediate re-run passed cleanly: P99 -71.1%, 76.9% cache, 100 unique prefixes. This matches
+> the transient hot-spotting pattern seen on Instance 8 (runs 1b/1c vs 1d) — it's a race
+> condition in early route learning, not a NUMA-specific failure mode.
 >
-> **Sweep curve (updated):**
+> However, 10ms remains inferior to 20ms even when it passes: P99 -71.1% vs -86.3%, P50
+> +4.1% vs -5.0%, throughput +6.3% vs +17.5%. The 20ms interval is strictly better and
+> also avoids the transient hot-spotting risk entirely (0 failures in 2 runs vs 1-in-2 at 10ms
+> with NUMA, 2-in-4 at 10ms on Instance 8).
+>
+> **Sweep curve (final):**
 > - **2-5ms:** High cache affinity (77-80%) but P50 regresses (+2.7% to +8.5%).
-> - **10ms:** Works without NUMA, but hot-spots with NUMA pinning.
-> - **20ms (recommended default):** Best across both instances. Load-aware routing
->   benefits outweigh the cache affinity drop (69% vs 80%).
-> - **50ms:** Diminishing returns — stale load signals, excessive prefix diversity per batch.
+> - **10ms:** P99 -67% to -71% when stable, but susceptible to transient hot-spotting.
+> - **20ms (recommended default):** Best P99 (-77% to -86%), only interval with P50
+>   improvement, best throughput (+11% to +17%), zero hot-spotting failures.
+> - **50ms:** Diminishing returns — stale load signals, P99 reverts to -70%.
 >
 > **Recommendation:** Change default `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS` from 10 to 20.
 
