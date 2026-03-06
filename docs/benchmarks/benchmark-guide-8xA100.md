@@ -1815,36 +1815,43 @@ As results come in, update the tables below. Use this template for each run:
 |---|---------------|-----------------|------------|----------------|------------|-------|
 | 6 | 2ms | **-63.1%** | -3.4% | 79.9% | PASSED | 08e5a93, Instance 8; P50 +8.5% (tokenization 7.67ms) |
 | 7 | 5ms | **-70.9%** | +0.9% | 77.5% | PASSED | 08e5a93, Instance 8; P50 +2.7% (tokenization 5.96ms) |
-| 8a | 20ms (run 1) | **-76.9%** | +11.5% | 67.8% | PASSED | 08e5a93, Instance 8; P50 **-6.6%** (tokenization 5.95ms); best P99 and only P50 improvement |
-| 8b | 20ms (run 2) | — | — | — | — | Pending |
+| 8a | 20ms (run 1) | **-76.9%** | +11.5% | 67.8% | PASSED | 08e5a93, Instance 8; P50 **-6.6%** (tokenization 5.95ms) |
+| 8b | 20ms (run 2) | **-86.3%** | +17.5% | 69.4% | PASSED | 1749f05, Instance 9 + NUMA; P50 **-5.0%** (tokenization 5.82ms); **best result ever** |
 | 9 | 50ms | **-69.7%** | +1.9% | 61.2% | PASSED | 08e5a93, Instance 8; P50 +2.9% (tokenization 6.74ms); cache hit P50 -10.2% |
+| 10ms+NUMA | 10ms (NUMA) | +462.5% | -24.9% | 94.3% | FAILED | 1749f05, Instance 9 + NUMA; **hot-spotting**, XLarge Hit P99 20.5s, 43 unique prefixes |
 
-> **Priority 2 sweep analysis (2ms–50ms flush, #6-9):**
+> **Priority 2 sweep analysis (2ms–50ms flush, #6-9, plus NUMA re-runs):**
 >
-> | Flush | P99 | P50 | Throughput | Cache | Tokenization |
-> |-------|-----|-----|------------|-------|--------------|
-> | 2ms (#6) | -63.1% | +8.5% | -3.4% | 79.9% | 7.67ms |
-> | 5ms (#7) | -70.9% | +2.7% | +0.9% | 77.5% | 5.96ms |
-> | 10ms (1d) | -66.7% | — | +4.2% | 80.5% | — |
-> | **20ms (#8a)** | **-76.9%** | **-6.6%** | **+11.5%** | 67.8% | 5.95ms |
-> | 50ms (#9) | -69.7% | +2.9% | +1.9% | 61.2% | 6.74ms |
+> | Flush | P99 | P50 | Throughput | Cache | Tokenization | Instance |
+> |-------|-----|-----|------------|-------|--------------|----------|
+> | 2ms (#6) | -63.1% | +8.5% | -3.4% | 79.9% | 7.67ms | 8 |
+> | 5ms (#7) | -70.9% | +2.7% | +0.9% | 77.5% | 5.96ms | 8 |
+> | 10ms (1d) | -66.7% | — | +4.2% | 80.5% | — | 8 |
+> | 10ms+NUMA | **+462.5%** | +14.7% | -24.9% | 94.3% | 7.89ms | 9 NUMA **FAILED** |
+> | 20ms (#8a) | -76.9% | -6.6% | +11.5% | 67.8% | 5.95ms | 8 |
+> | **20ms (#8b)** | **-86.3%** | **-5.0%** | **+17.5%** | 69.4% | 5.82ms | **9 NUMA** |
+> | 50ms (#9) | -69.7% | +2.9% | +1.9% | 61.2% | 6.74ms | 8 |
 >
-> **Conclusion: 20ms is the optimal flush interval.** The sweep reveals a clear curve:
+> **Conclusion: 20ms confirmed as optimal flush interval.**
 >
-> - **2-5ms:** High cache affinity (77-80%) but P50 regresses. Too-frequent flushing sends
->   small batches before load signals update, producing suboptimal routing.
-> - **10ms (default):** Good baseline, but 20ms is strictly better on every metric.
-> - **20ms (winner):** Best P99 (-76.9%), only P50 improvement (-6.6%), best throughput (+11.5%).
->   Cache drops to 67.8% but load-aware routing more than compensates — requests land on
->   less-loaded backends, reducing queuing delays.
-> - **50ms:** Diminishing returns. Cache drops further to 61.2%, P99 reverts to -69.7%
->   (worse than 5ms/20ms), P50 regresses again (+2.9%). Batches are too large — by the time
->   they flush, load signals are stale again and prefix diversity within the batch is too high
->   for effective affinity.
+> Run 8b on Instance 9 with NUMA pinning (1749f05) reproduced and **exceeded** the 8a result:
+> P99 -86.3% (best ever), P50 -5.0%, throughput +17.5% (+432 requests). Cache affinity is
+> stable at 69.4% (vs 67.8% on 8a), confirming 20ms is reproducible across instances.
 >
-> The 20ms sweet spot balances batch size (enough requests for good load-aware decisions) with
-> signal freshness (backend queue depths are still current). Pending: second 20ms run (8b) to
-> confirm reproducibility, then recommend 20ms as the new default.
+> **Critical finding: 10ms + NUMA triggers hot-spotting.** The 10ms NUMA run failed with P99
+> +462.5% (18s!) despite 94.3% cache hits and only 43 unique prefixes. At 10ms flush, NUMA
+> pinning constrains which cores handle routing decisions — smaller batches with fewer routing
+> cores leads to over-concentration on a subset of backends. The 20ms flush interval gives
+> enough batch accumulation to spread load even with NUMA constraints.
+>
+> **Sweep curve (updated):**
+> - **2-5ms:** High cache affinity (77-80%) but P50 regresses (+2.7% to +8.5%).
+> - **10ms:** Works without NUMA, but hot-spots with NUMA pinning.
+> - **20ms (recommended default):** Best across both instances. Load-aware routing
+>   benefits outweigh the cache affinity drop (69% vs 80%).
+> - **50ms:** Diminishing returns — stale load signals, excessive prefix diversity per batch.
+>
+> **Recommendation:** Change default `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS` from 10 to 20.
 
 **Priority 3 — Cross-shard sync (13B 20u 10m):**
 
