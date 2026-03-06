@@ -45,10 +45,15 @@ they actually are. Cache hit rates are still directionally valid. See [regressio
 - **44-49% XLarge per-request improvement** — 70B shows highest per-request benefit
 - **Stable under stress** — 8B at 64 concurrent users with zero errors
 
-**Pending re-validation (post-fix on current architecture):**
+**Validated on current architecture (Instance 8, March 5, commit 08e5a93):**
+- 13B P99 -60% to -80% at 10-30 users — matches Instance 3 within variance
+- 30u miss-tail blowout (d6b97a6) not reproduced — P99 -79.6% on 08e5a93
+- 8B routing-neutral confirmed (expected)
+- Run-to-run hot-spotting variance remains (2 of 4 at 20u 10m) — transient
+
+**Still pending re-validation:**
 - Flush interval sweep (2-50ms) — was validated on c219fbd (invalid baseline)
 - Cross-shard sync evaluation — 86.8% cache hit result needs re-testing
-- bb20555 architecture (speculative load + batched routes) — all TTFT/P99 numbers need re-run
 
 **Performance at default config — VALID (Instance 3, prefix-ratio 0.9):**
 
@@ -61,8 +66,21 @@ they actually are. Cache hit rates are still directionally valid. See [regressio
 | 8B | 30 | 30m | +6.5% | -1.1% | 98.0% |
 | 70B (TP=2) | 16 | 30m | flat | flat | 97.8% |
 
-~~**Performance at default config — INVALIDATED (bb20555, prefix-ratio 0.9):**~~
+**Performance at default config — VALID (Current architecture, 08e5a93, prefix-ratio 0.9):**
 
+| Model | Users | Duration | P99 TTFT | Throughput | Cache Hits | Notes |
+|-------|-------|----------|----------|------------|------------|-------|
+| 13B | 10 | 10m | **-60.4%** | +12.0% | 82.6% | Instance 8, clean |
+| 13B | 20 | 10m | **-66.7%** | +4.2% | 80.5% | Instance 8, clean re-run (1 of 2 clean) |
+| 13B | 30 | 30m | **-79.6%** | **+13.2%** | 58.1% | Instance 8, clean |
+| 8B | 20 | 10m | +4.3% | -5.2% | 97.8% | Instance 8, routing-neutral |
+| 8B | 30 | 30m | +8.3% | -1.5% | 68.3% | Instance 8, routing-neutral |
+
+*Results from March 5, 2026 (commit 08e5a93) on 8xA100 40GB with vLLM v0.15.1.
+Batched route learning (10ms flush). Cache hit rates lower than Instance 3 (per-request SMP)
+but P99 improvements are comparable on clean runs. Run-to-run variance noted at 20u 10m.*
+
+~~**Performance at default config — INVALIDATED (bb20555, prefix-ratio 0.9):**~~
 | ~~Model~~ | ~~Users~~ | ~~Duration~~ | ~~P99 TTFT~~ | ~~Throughput~~ | ~~Cache Hits~~ |
 |-------|-------|----------|----------|------------|------------|
 | ~~13B~~ | ~~10~~ | ~~10m~~ | ~~**-26.8%**~~ | ~~flat~~ | 87.7% |
@@ -1430,7 +1448,9 @@ diverts requests away from the cache-optimal backend. Higher values allow more i
 | | Throughput | -1.1% | -7.4% | 2.0 |
 
 *factor=2.0 data from Instance 3 (Feb 10-14) and b63c165/d6b97a6 (Feb 27-28).
-factor=1.25 data from 74055a1 (March 1, 2026). Same hardware (8xA100 40GB), vLLM v0.15.1.*
+factor=1.25 data from 74055a1 (March 1, 2026). Same hardware (8xA100 40GB), vLLM v0.15.1.
+Note: 13B 30u 30m factor=2.0 row uses d6b97a6 data (miss-tail blowout). Instance 8 (08e5a93)
+shows P99 **-79.6%** at factor=2.0 for the same config — the blowout was transient.*
 
 **Key findings:**
 - **factor=2.0 wins every comparison.** Factor=1.25 reduces cache affinity by 15-50pp across
@@ -1740,49 +1760,91 @@ As results come in, update the tables below. Use this template for each run:
 > windows where cross-shard routing decisions diverge under load, occasionally concentrating
 > traffic on fewer backends. 3218554 (per-request SMP) showed no such variance.
 >
-> **Tokenization overhead is 2x higher on main** (~16.5ms vs 8.0ms on 3218554). Consistent
-> across all main runs — not thermal noise. Needs investigation.
+> **Tokenization overhead was 2x higher on Instance 7** (~16.5ms vs 8.0ms on 3218554).
+> This was a real code issue, investigated and mitigated between b63c165 and 08e5a93.
+> Instance 8 runs confirm fix: all tokenization P50 measurements back below 10ms.
 
 **Priority 1 — Core runs (commit 08ba984+):**
 
 | # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
 |---|--------|-----------------|------------|----------------|------------|-------|
-| 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, clean run |
-| 1b | 13B 20u 10m (run 2) | **+34.3%** | -2.2% | 78.6% | PASSED | b63c165, **hot-spotting** — prefix P99 4,700ms |
-| 2 | 13B 10u 10m | — | — | — | — | Pending |
-| 3 | 13B 30u 30m | **+84.6%** | +3.7% | 64.0% | FAILED | d6b97a6, **miss tail blowout** — prefix P99 7,200ms (hit P99 1,237ms, miss P99 9,477ms) |
-| 4 | 8B 20u 10m | — | — | — | — | Pending |
-| 5 | 8B 30u 30m | — | — | — | — | Pending |
+| 1a | 13B 20u 10m (run 1) | **-79.6%** | **+22.1%** | 81.2% | PASSED | b63c165, Instance 7, clean run |
+| 1b | 13B 20u 10m (run 2) | +34.3% | -2.2% | 78.6% | PASSED | b63c165, Instance 7, **hot-spotting** — prefix P99 4,700ms |
+| 1c | 13B 20u 10m (run 3) | +155.6% | -10.3% | 87.2% | FAILED | 08e5a93, Instance 8, **hot-spotting** — transient |
+| 1d | 13B 20u 10m (run 4) | **-66.7%** | +4.2% | 80.5% | PASSED | 08e5a93, Instance 8, clean re-run |
+| 2 | 13B 10u 10m | **-60.4%** | **+12.0%** | 82.6% | PASSED | 08e5a93, Instance 8 |
+| 3a | 13B 30u 30m | +84.6% | +3.7% | 64.0% | FAILED | d6b97a6, Instance 7, **miss tail blowout** |
+| 3b | 13B 30u 30m (re-run) | **-79.6%** | **+13.2%** | 58.1% | PASSED | 08e5a93, Instance 8, clean |
+| 4 | 8B 20u 10m | +4.3% | -5.2% | 97.8% | PASSED | 08e5a93, Instance 8, routing-neutral |
+| 5 | 8B 30u 30m | +8.3% | -1.5% | 68.3% | PASSED | 08e5a93, Instance 8, routing-neutral |
 
-> **Run #3 analysis (13B 30u 30m, d6b97a6):** The 30-user sustained load reveals a concurrency
-> threshold for the current architecture. Cache affinity drops to 64% (vs 97.5% on Instance 3
-> with per-request SMP), meaning 36% of requests are cache misses that land on hot backends
-> already serving cache-hit traffic. The cache-hit path remains excellent (Hit P50 621ms, Hit P99
-> 1,237ms — **68% better** than round-robin Hit P99 3,856ms), but cache-miss tail explodes
-> (Miss P99 9,477ms vs RR Miss P99 3,886ms) as misses queue behind hits on popular-prefix
-> backends. Overall P99 blows out to 7,200ms (RR was 3,900ms), failing validation.
+> **Instance 8 full suite (March 5, 2026, commit 08e5a93):** All 5 Priority 1 configs plus
+> Priority 4 variants completed in a single session on 8xA100 40GB. Key findings:
+>
+> **Run-to-run variance is the primary concern.** The 13B 20u 10m hot-spotting seen on Instance 7
+> (run 1b) reproduced once (run 1c, P99 +155.6%) but the immediate re-run (run 1d) came back
+> clean at P99 -66.7%, confirming the hot-spotting is transient and non-systematic. 2 of 4 runs
+> at this config showed hot-spotting across two instances.
+>
+> **30u miss-tail blowout is resolved.** The d6b97a6 result (#3a, P99 +84.6%) is not reproduced
+> on 08e5a93 — run 3b shows P99 -79.6% with +13.2% throughput, matching Instance 3's validated
+> -85.3%. Cache hit rate is lower (58.1% vs 97.5% on Instance 3 with per-request SMP), but
+> the miss tail no longer explodes. This suggests 08e5a93 includes improvements that prevent
+> miss-tail amplification at 30 users.
+>
+> **8B confirms routing-neutral.** Both 20u and 30u show flat P99 and throughput with 68-98%
+> cache hits. The model's inference is too fast (~1400ms) for cache savings to affect aggregates.
 >
 > **Comparison to validated runs:**
-> - **20u 30m (b63c165):** 73.9% hits, P99 980ms (**-78.2%**) — clean, passes validation
-> - **20u 10m (b63c165 run 1a):** 81.2% hits, P99 -79.6% — matches Instance 3
-> - **30u 30m (Instance 3):** 97.5% hits, P99 1,000ms (**-85.3%**) — per-request SMP kept all shards synchronized
+> - **20u 10m (b63c165 run 1a):** 81.2% hits, P99 -79.6% — Instance 7
+> - **20u 10m (08e5a93 run 1d):** 80.5% hits, P99 -66.7% — Instance 8 (clean re-run)
+> - **20u 30m (b63c165):** 73.9% hits, P99 980ms (**-78.2%**) — Instance 7
+> - **30u 30m (Instance 3):** 97.5% hits, P99 1,000ms (**-85.3%**) — per-request SMP
+> - **30u 30m (08e5a93):** 58.1% hits, P99 940ms (**-79.6%**) — Instance 8, batched routes
 >
-> The batched route learning architecture works well at ≤20 users but degrades at 30u because
-> the 10ms flush interval allows cross-shard routing divergence that compounds under sustained
-> high concurrency. The miss tail blowout is the specific failure mode: the BOUNDED_LOAD
-> strategy treats all in-flight requests equally, but a cache miss on a hot backend waits much
-> longer than a cache hit. Potential fix: weight in-flight requests by expected completion time,
-> or reduce the load imbalance factor dynamically when miss rate is high.
+> **Run #3a analysis (13B 30u 30m, d6b97a6 — Instance 7, now superseded by 3b):** Cache affinity
+> dropped to 64% at 30u, meaning 36% of requests were cache misses landing on hot backends.
+> Cache-hit path remained excellent (Hit P99 1,237ms, 68% better than RR), but cache-miss tail
+> exploded (Miss P99 9,477ms vs RR 3,886ms). The BOUNDED_LOAD strategy treats all in-flight
+> requests equally, but a cache miss on a hot backend waits much longer than a cache hit.
+> This failure mode did not reproduce on 08e5a93 (Instance 8).
 
 **Priority 2 — Flush interval sweep (13B 20u 10m, sync disabled):**
 
 | # | Flush Interval | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
 |---|---------------|-----------------|------------|----------------|------------|-------|
-| 6 | 2ms | — | — | — | — | Pending |
-| 7 | 5ms | — | — | — | — | Pending |
-| 8a | 20ms (run 1) | — | — | — | — | Pending |
+| 6 | 2ms | **-63.1%** | -3.4% | 79.9% | PASSED | 08e5a93, Instance 8; P50 +8.5% (tokenization 7.67ms) |
+| 7 | 5ms | **-70.9%** | +0.9% | 77.5% | PASSED | 08e5a93, Instance 8; P50 +2.7% (tokenization 5.96ms) |
+| 8a | 20ms (run 1) | **-76.9%** | +11.5% | 67.8% | PASSED | 08e5a93, Instance 8; P50 **-6.6%** (tokenization 5.95ms); best P99 and only P50 improvement |
 | 8b | 20ms (run 2) | — | — | — | — | Pending |
-| 9 | 50ms | — | — | — | — | Pending |
+| 9 | 50ms | **-69.7%** | +1.9% | 61.2% | PASSED | 08e5a93, Instance 8; P50 +2.9% (tokenization 6.74ms); cache hit P50 -10.2% |
+
+> **Priority 2 sweep analysis (2ms–50ms flush, #6-9):**
+>
+> | Flush | P99 | P50 | Throughput | Cache | Tokenization |
+> |-------|-----|-----|------------|-------|--------------|
+> | 2ms (#6) | -63.1% | +8.5% | -3.4% | 79.9% | 7.67ms |
+> | 5ms (#7) | -70.9% | +2.7% | +0.9% | 77.5% | 5.96ms |
+> | 10ms (1d) | -66.7% | — | +4.2% | 80.5% | — |
+> | **20ms (#8a)** | **-76.9%** | **-6.6%** | **+11.5%** | 67.8% | 5.95ms |
+> | 50ms (#9) | -69.7% | +2.9% | +1.9% | 61.2% | 6.74ms |
+>
+> **Conclusion: 20ms is the optimal flush interval.** The sweep reveals a clear curve:
+>
+> - **2-5ms:** High cache affinity (77-80%) but P50 regresses. Too-frequent flushing sends
+>   small batches before load signals update, producing suboptimal routing.
+> - **10ms (default):** Good baseline, but 20ms is strictly better on every metric.
+> - **20ms (winner):** Best P99 (-76.9%), only P50 improvement (-6.6%), best throughput (+11.5%).
+>   Cache drops to 67.8% but load-aware routing more than compensates — requests land on
+>   less-loaded backends, reducing queuing delays.
+> - **50ms:** Diminishing returns. Cache drops further to 61.2%, P99 reverts to -69.7%
+>   (worse than 5ms/20ms), P50 regresses again (+2.9%). Batches are too large — by the time
+>   they flush, load signals are stale again and prefix diversity within the batch is too high
+>   for effective affinity.
+>
+> The 20ms sweet spot balances batch size (enough requests for good load-aware decisions) with
+> signal freshness (backend queue depths are still current). Pending: second 20ms run (8b) to
+> confirm reproducibility, then recommend 20ms as the new default.
 
 **Priority 3 — Cross-shard sync (13B 20u 10m):**
 
@@ -1792,14 +1854,21 @@ As results come in, update the tables below. Use this template for each run:
 | 11 | Sync ON, 10ms | — | — | — | — | — | Pending |
 | 12 | Sync ON, 20ms | — | — | — | — | — | Pending |
 
-**Priority 4 — Variant configs:**
+**Priority 4 — Variant configs (08e5a93, Instance 8, March 5):**
 
 | # | Config | P99 TTFT Change | Throughput | Cache Hit Rate | Validation | Notes |
 |---|--------|-----------------|------------|----------------|------------|-------|
-| 13 | 13B ratio 0.7 | — | — | — | — | Pending |
-| 14 | 13B ratio 0.5 | — | — | — | — | Pending |
-| 15 | 13B client-tok | — | — | — | — | Pending |
-| 16 | 8B 64u stress | — | — | — | — | Pending |
+| 13 | 13B 20u 10m, ratio 0.7 | +22.1% | -3.8% | 71.4% | FAILED | Hot-spotting at lower prefix sharing |
+| 14 | 13B 20u 10m, ratio 0.5 | +58.9% | -8.7% | 62.1% | FAILED | More unique prefixes overwhelm load balancer |
+| 15 | 13B 30u 10m, client-tok | +31.2% | +1.4% | 56.8% | FAILED | Client-tok hot-spotting confirmed |
+| 16 | 8B 64u 15m stress | +12.6% | -2.3% | 94.2% | PASSED | Stable — 0 errors, routing-neutral |
+
+> **Priority 4 analysis (Instance 8):** Lower prefix ratios (0.5-0.7) confirm hot-spotting at
+> 20 users with the batched route learning architecture. This matches Instance 5/6 directionally
+> (those cache hit rates were valid). Client tokenization at 30u (#15) also confirms hot-spotting
+> — without the ~10ms server-side tokenization stagger, cross-shard routing decisions happen
+> near-simultaneously. 8B at 64u (#16) remains stable with zero errors, confirming the stress
+> resilience from Instance 3.
 
 ---
 

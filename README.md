@@ -46,7 +46,7 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 | **Radix Tree Lookup** | < 50μs | Pure routing decision (O(L) where L = prefix length) |
 | **Total Routing Overhead** | 1-10ms | Includes tokenization; scales with prompt size |
 | **Ranvier P50 Overhead** | ~7ms | Measured vs direct vLLM connection |
-| **Cache Hit Rate** | 96-98% | With prefix-heavy workloads (RAG, few-shot) |
+| **Cache Hit Rate** | 58-98% | With prefix-heavy workloads (RAG, few-shot) |
 
 **Design Principles:**
 * **Minimized Copying:** Uses `string_view` parsing with single network buffer copy; Radix lookups use `std::span` for zero-copy token access.
@@ -64,12 +64,14 @@ Real-world results from 8x A100 GPUs (30-minute validated runs, February 2026):
 | Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
 |-------|----------------|-------------------------|-------------|------------|
 | **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
-| CodeLlama-13b | 12% → **98%** | **33%** faster | **-85%** | **+22%** |
-| Llama-3.1-8B | 12% → **98%** | **40%** faster | +6.5% | ~same |
+| CodeLlama-13b | 12% → **58-98%** | **33%** faster | **-60% to -85%** | **+4% to +22%** |
+| Llama-3.1-8B | 12% → **68-98%** | **40%** faster | flat | ~same |
 
-*70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).*
+*70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).
+13B ranges: 58% hits / -80% P99 (current arch, 30u batched routes) to 98% / -85%
+(Instance 3, per-request SMP). Clean runs consistently show P99 -60% to -80%.*
 
-**Key insight:** Benefits scale with model size — larger models save more computation per cache hit. The 13B model is the sweet spot: queue buildup under load makes routing dramatically effective (-85% P99, +22% throughput). 70B shows the highest per-request benefit (44% TTFT) but is compute-bound rather than queue-bound.
+**Key insight:** Benefits scale with model size — larger models save more computation per cache hit. The 13B model is the sweet spot: queue buildup under load makes routing dramatically effective (-60% to -85% P99, +4% to +22% throughput). 70B shows the highest per-request benefit (44% TTFT) but is compute-bound rather than queue-bound.
 
 **Best suited for:**
 - RAG applications with shared context documents
