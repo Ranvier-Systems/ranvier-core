@@ -291,6 +291,10 @@ OTHER OPTIONS:
     --skip-setup        Skip system configuration (for repeated runs)
     --dry-run           Show what would be done without executing
     --no-log            Disable full output logging (logging is ON by default)
+    --cpuset RANGE      Pin Ranvier nodes to specific CPU cores. Uses numactl to
+                        auto-detect NUMA-local cores by default. Override with a
+                        comma-separated list of 3 ranges: "0-7,8-15,16-23".
+                        Set to "off" to disable CPU pinning entirely.
     --debug             Build with debug symbols (CMAKE_BUILD_TYPE=Debug)
     -h, --help          Show this help message
 
@@ -446,6 +450,7 @@ MAX_TOKENS="$DEFAULT_MAX_TOKENS"
 VLLM_VERSION="$DEFAULT_VLLM_VERSION"
 TP_SIZE=1
 GPU_MEM_UTIL="0.85"
+CPUSET_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -481,6 +486,7 @@ while [[ $# -gt 0 ]]; do
         --vllm-version)   VLLM_VERSION="$2"; shift 2 ;;
         --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
+        --cpuset)          CPUSET_OVERRIDE="$2"; shift 2 ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -1267,6 +1273,67 @@ fi
 if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
+fi
+
+# -------------------------------------------------------------------------
+# NUMA-aware CPU pinning
+# -------------------------------------------------------------------------
+# Each Ranvier node gets 8 dedicated cores. Without pinning, all 3 nodes
+# compete for the same cores, defeating Seastar's thread-per-core model.
+CORES_PER_NODE=8
+TOTAL_CORES_NEEDED=$((CORES_PER_NODE * 3))
+
+if [[ "$CPUSET_OVERRIDE" == "off" ]]; then
+    log_info "CPU pinning disabled (--cpuset off)"
+    # Unset so docker-compose falls back to no restriction
+    unset RANVIER_CPUSET_1 RANVIER_CPUSET_2 RANVIER_CPUSET_3
+elif [[ -n "$CPUSET_OVERRIDE" ]]; then
+    # Manual override: expect "0-7,8-15,16-23"
+    IFS=',' read -ra CPUSETS <<< "$CPUSET_OVERRIDE"
+    if [[ ${#CPUSETS[@]} -ne 3 ]]; then
+        log_error "--cpuset requires exactly 3 comma-separated ranges (got ${#CPUSETS[@]})"
+        log_error "Example: --cpuset 0-7,8-15,16-23"
+        exit 1
+    fi
+    export RANVIER_CPUSET_1="${CPUSETS[0]}"
+    export RANVIER_CPUSET_2="${CPUSETS[1]}"
+    export RANVIER_CPUSET_3="${CPUSETS[2]}"
+    log_ok "CPU pinning (manual): node1=${CPUSETS[0]} node2=${CPUSETS[1]} node3=${CPUSETS[2]}"
+elif command -v numactl &> /dev/null; then
+    # Auto-detect: pick 24 cores from the largest NUMA node
+    BEST_NODE=""
+    BEST_COUNT=0
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^node\ ([0-9]+)\ cpus:\ (.+)$ ]]; then
+            NODE_ID="${BASH_REMATCH[1]}"
+            IFS=' ' read -ra NODE_CPUS <<< "${BASH_REMATCH[2]}"
+            COUNT=${#NODE_CPUS[@]}
+            if (( COUNT > BEST_COUNT )); then
+                BEST_COUNT=$COUNT
+                BEST_NODE=$NODE_ID
+                BEST_CPUS=("${NODE_CPUS[@]}")
+            fi
+        fi
+    done < <(numactl --hardware 2>/dev/null)
+
+    if (( BEST_COUNT >= TOTAL_CORES_NEEDED )); then
+        # Take first 24 cores from the best NUMA node
+        C1_START=${BEST_CPUS[0]}
+        C1_END=${BEST_CPUS[$((CORES_PER_NODE - 1))]}
+        C2_START=${BEST_CPUS[$CORES_PER_NODE]}
+        C2_END=${BEST_CPUS[$((CORES_PER_NODE * 2 - 1))]}
+        C3_START=${BEST_CPUS[$((CORES_PER_NODE * 2))]}
+        C3_END=${BEST_CPUS[$((CORES_PER_NODE * 3 - 1))]}
+        export RANVIER_CPUSET_1="${C1_START}-${C1_END}"
+        export RANVIER_CPUSET_2="${C2_START}-${C2_END}"
+        export RANVIER_CPUSET_3="${C3_START}-${C3_END}"
+        log_ok "CPU pinning (auto, NUMA node $BEST_NODE): node1=${C1_START}-${C1_END} node2=${C2_START}-${C2_END} node3=${C3_START}-${C3_END}"
+    else
+        log_warn "NUMA node $BEST_NODE has only $BEST_COUNT cores (need $TOTAL_CORES_NEEDED). Using defaults 0-7, 8-15, 16-23."
+    fi
+else
+    log_info "numactl not found — using default cpuset ranges (0-7, 8-15, 16-23)"
+    log_info "Install numactl for NUMA-aware auto-pinning: apt install numactl"
 fi
 
 # Start Ranvier nodes
