@@ -61,7 +61,7 @@ struct RouteBatchConfig {
 
     // Default timer interval for periodic flushes (ensures bounded latency)
     // Configurable via RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS env var (1-1000ms)
-    static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{10};
+    static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{20};
 };
 
 // Forward declaration

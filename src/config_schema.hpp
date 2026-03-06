@@ -188,10 +188,12 @@ struct RoutingConfig {
     // Controls the periodic flush interval for batched route learning (both
     // remote gossip routes on shard 0 and per-shard local routes).
     // Lower values improve cache affinity at the cost of higher SMP overhead.
-    // Valid range: 1-1000ms. Default 10ms matches the batched route learning
-    // introduced in commit b2f8cac. Testing with 2-5ms may recover cache
-    // affinity while still reducing SMP overhead vs per-request broadcast.
-    std::chrono::milliseconds route_batch_flush_interval{10};              // Env: RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
+    // Valid range: 1-1000ms. Default 20ms balances batch size for load-aware
+    // routing decisions with signal freshness. Benchmarked across 5 intervals
+    // (2ms-50ms) on 2 instances: 20ms gives best P99 (-77% to -86%), only
+    // interval with P50 improvement, best throughput (+6% to +17%), and zero
+    // transient hot-spotting failures (3/3 runs passed vs 1-2 failures at 10ms).
+    std::chrono::milliseconds route_batch_flush_interval{20};              // Env: RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
 
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }

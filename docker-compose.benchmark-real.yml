@@ -168,7 +168,7 @@ services:
       # Tokenizer thread pool - offloads tokenization from Seastar reactor
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
       # Route batch flush interval (ms) - lower values improve cache affinity at cost of SMP overhead
-      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
+      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
       - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
@@ -226,7 +226,7 @@ services:
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
-      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
+      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
       - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
@@ -284,7 +284,7 @@ services:
       - RANVIER_CHAT_TEMPLATE_FORMAT=${RANVIER_CHAT_TEMPLATE_FORMAT:-none}
       - RAYON_NUM_THREADS=1
       - RANVIER_TOKENIZER_THREAD_POOL_ENABLED=${RANVIER_TOKENIZER_THREAD_POOL_ENABLED:-true}
-      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}
+      - RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS=${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}
       # Cross-shard load sync - broadcasts per-shard active_requests to prevent routing hot-spotting
       - RANVIER_CROSS_SHARD_LOAD_SYNC=${RANVIER_CROSS_SHARD_LOAD_SYNC:-false}
       # Load-aware routing - diverts requests from overloaded backends to less-loaded alternatives
