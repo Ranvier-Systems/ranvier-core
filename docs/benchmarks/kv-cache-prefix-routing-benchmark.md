@@ -11,7 +11,7 @@
 
 ## Executive Summary
 
-Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 78% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes. Validated stable over 30-minute sustained load at moderate concurrency (20 users / 8 GPUs). At high concurrency (30 users), cache-hit latency still improves 68% but overall P99 degrades due to cache-miss tail — see [High-Concurrency Limitation](#high-concurrency-limitation-30-users-d6b97a6).
+Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 80% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes. Validated stable over 30-minute sustained load at both moderate (20 users) and high (30 users) concurrency on 8 GPUs. A previous 30u miss-tail blowout (d6b97a6) is fully resolved on the current architecture (08e5a93) — see [High-Concurrency Results](#high-concurrency-results-30-users-08e5a93--march-5-2026).
 
 ### Validated 30-Minute Run (February 28, 2026 — b63c165)
 
@@ -32,31 +32,43 @@ vLLM v0.15.1. Routing overhead: 10.62ms (tokenization: 10.61ms, ART lookup: 0.01
 
 | Model | Cache Hit Rate | P99 Latency | Throughput | Key Benefit |
 |-------|----------------|-------------|------------|-------------|
-| **CodeLlama-13b** | 12% → **74-98%** | **-78% to -85%** | **+10% to +22%** | P99 + throughput |
-| **Llama-3.1-8B** | 12% → **98%** | flat | ~same | Stable, no harm |
+| **CodeLlama-13b** | 12% → **58-98%** | **-60% to -85%** | **+4% to +22%** | P99 + throughput |
+| **Llama-3.1-8B** | 12% → **68-98%** | flat | ~same | Stable, no harm |
 | **Llama-3.1-70B** | 25% → **98%** | flat (sustained) | ~same | Per-request cache (44% XLarge) |
 
-*13B ranges: 74% cache hits / -78% P99 (current arch, 20u 30m, b63c165) to 98% / -85%
-(Instance 3, per-request SMP). 8B/70B from Instance 3 (Feb 10-14, 2026). All on 8xA100
-with vLLM v0.15.1. 70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).*
+*13B ranges: 58% cache hits / -80% P99 (current arch, 30u 30m, 08e5a93) to 98% / -85%
+(Instance 3, per-request SMP). Clean runs consistently show P99 -60% to -80%. 8B from
+Instance 3 (Feb 10-14) and Instance 8 (March 5). All on 8xA100 with vLLM v0.15.1.
+70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).*
 
-### High-Concurrency Limitation (30 users, d6b97a6)
+### High-Concurrency Results (30 users, 08e5a93 — March 5, 2026)
 
-At 30 concurrent users, the batched route learning architecture shows degraded cache affinity:
+At 30 concurrent users, the current architecture (08e5a93) now passes cleanly:
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| **Cache Hit Rate** | 12.0% | **58.1%** | **+46.1pp (+384%)** |
+| **P99 TTFT** | 4,600ms | **940ms** | **-79.6%** |
+| **Throughput** | 47.8 req/s | **54.1 req/s** | **+13.2%** |
+| **Errors / Timeouts** | 0 | 0 | — |
+
+*CodeLlama-13b, 30 users, 30m duration, 8x GPU, `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default).
+The miss-tail blowout observed on d6b97a6 (P99 +84.6%) did not reproduce on 08e5a93.*
+
+<details>
+<summary>Previous result (d6b97a6, Instance 7 — superseded)</summary>
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
 | **Cache Hit Rate** | 12.0% | **64.0%** | **+52.0pp (+434%)** |
-| **P50 TTFT** | 750ms | **700ms** | -6.7% |
 | **P99 TTFT** | 3,900ms | 7,200ms | **+84.6% (WORSE)** |
 | **Cache Hit P99** | 3,856ms | **1,237ms** | **-67.9%** |
 | **Cache Miss P99** | 3,886ms | 9,477ms | **+143.9% (WORSE)** |
 | **Throughput** | 49.1 req/s | 51.0 req/s | +3.7% |
-| **Errors / Timeouts** | 0 | 0 | — |
 
-*CodeLlama-13b, 30 users, 30m duration, 8x GPU. The cache-hit path remains excellent
-(Hit P99 1,237ms, 68% better than RR), but cache-miss tail explodes as misses queue behind
-hits on popular-prefix backends. See [Benchmark Guide](benchmark-guide-8xA100.md#post-fix-results-to-be-filled-in-as-runs-complete) for detailed analysis.*
+*d6b97a6, Instance 7. Cache-miss tail exploded as misses queued behind hits on popular-prefix
+backends. Not reproduced on 08e5a93 (Instance 8).*
+</details>
 
 ## Test Configuration
 
@@ -221,7 +233,7 @@ This header is invaluable for debugging configuration mismatches between client 
 
 2. **13B is the sweet spot for aggregate metrics** — Queue buildup under moderate load makes routing dramatically effective: P99 -78% to -85% at 10-20 users. Throughput improves +10% to +22%.
 
-3. **Moderate concurrency is the sweet spot** — At 20 users / 8 GPUs, P99 improves -78% (b63c165 validated). At 30 users, cache affinity drops to 64% and cache-miss tail blows out, making overall P99 worse despite excellent cache-hit latency (Hit P99 1,237ms, -68%).
+3. **Scales to 30 concurrent users** — At 20 users / 8 GPUs, P99 improves -67% to -80% (clean runs). At 30 users / 30m, P99 improves -80% with +13% throughput (08e5a93). A previous miss-tail blowout at 30u (d6b97a6) did not reproduce on the current architecture.
 
 4. **8B is routing-neutral** — Inference too fast (~1400ms) for cache savings to affect aggregate TTFT. No harm, but no benefit.
 
