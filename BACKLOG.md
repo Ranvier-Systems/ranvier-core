@@ -3048,6 +3048,33 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
 
 ---
 
+## 23. Shard 0 Role Isolation Analysis (2026-03-06)
+
+Investigation into whether shard 0 should be excluded from data plane traffic, given its exclusive control plane responsibilities (GossipService, GossipConsensus, K8sDiscoveryService, HealthService).
+
+### 23.1 Exclude Shard 0 from P2C Candidate Pool
+
+- [ ] **When cross-shard dispatch is implemented, exclude shard 0 from P2C candidate selection**
+  _Justification:_ Shard 0 runs all control plane services (gossip consensus, K8s discovery, health probes). Under peak data plane load, these compete for reactor time, risking gossip heartbeat deadline misses and delayed health state propagation. Excluding shard 0 from P2C candidates protects control plane latency with minimal data plane capacity loss (~6% on 16-core).
+  _Prerequisite:_ Backlog item 15.1 Option A (implement actual cross-shard dispatch via `smp::submit_to`). Until then, this change has no effect since P2C is advisory-only.
+  _What to change:_ In `shard_load_balancer.hpp`, modify `select_shard_p2c()` candidate generation to exclude shard 0: change `std::uniform_int_distribution<uint32_t> dist(0, _shard_count - 1)` to `dist(1, _shard_count - 1)`. Alternatively, add a configurable `_excluded_shards` set for flexibility. Also update `select_shard_async()` candidate generation to match.
+  _Location:_ `src/shard_load_balancer.hpp` (lines 114, 164-169)
+  _Complexity:_ Low
+  _Priority:_ P2 — Deferred until cross-shard dispatch ships
+
+### 23.2 Hard Shard 0 Isolation (Future — Evidence-Gated)
+
+- [ ] **If shard 0 reactor utilization consistently exceeds 80% while other shards are below 50%, isolate shard 0 from data plane entirely**
+  _Justification:_ In large clusters (8+ nodes, 20+ backends), control plane work becomes non-trivial: gossip protocol traffic scales with cluster size, health probes scale with backend count, K8s watch reconnects can spike during topology changes. If shard 0 becomes a bottleneck, full isolation prevents cascading degradation.
+  _Evidence trigger:_ Monitor `seastar_reactor_utilization` on shard 0 vs other shards under production load. Only proceed if sustained asymmetry is observed.
+  _What to change:_ In `application.cpp:697-699`, conditionally skip data plane route registration on shard 0. Keep `/health` endpoint accessible on shard 0 (or move to all shards). May require Seastar `SO_INCOMING_CPU` tuning to prevent OS from dispatching TCP connections to shard 0.
+  _Location:_ `src/application.cpp` (lines 697-699), `src/http_controller.cpp` (route registration)
+  _Complexity:_ Medium
+  _Priority:_ P3 — Only if evidence warrants; premature on clusters <8 nodes or <16 cores
+  _Tradeoff:_ Permanently loses 1/N data plane capacity (25% on 4-core, 12% on 8-core, 6% on 16-core). Shard 0 would be mostly idle between control plane bursts — wasted core on small deployments.
+
+---
+
 ## References
 
 - [Ranvier Architecture](./architecture.md)
