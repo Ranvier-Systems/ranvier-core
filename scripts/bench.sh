@@ -716,7 +716,7 @@ if [[ "$LOG_ALL" = true ]]; then
     echo "Ranvier Environment Overrides:"
     env | grep '^RANVIER_' | sort || echo "  (none)"
     echo "---------------------------------------------"
-    echo "Route Batch Flush Interval: ${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-10}ms"
+    echo "Route Batch Flush Interval: ${RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS:-20}ms"
     echo "============================================="
     echo ""
 fi
