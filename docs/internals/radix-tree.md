@@ -13,9 +13,10 @@ This document describes the Adaptive Radix Tree implementation used by Ranvier C
 4. [Path Compression & Lazy Expansion](#path-compression--lazy-expansion)
 5. [SIMD Key Search (Roadmap)](#simd-key-search-roadmap)
 6. [Concurrency Model](#concurrency-model)
-7. [Tree Compaction (Memory Reclamation)](#tree-compaction-memory-reclamation)
-8. [Persistence Interface](#persistence-interface)
-9. [Performance Characteristics](#performance-characteristics)
+7. [LRU Eviction](#lru-eviction)
+8. [Tree Compaction (Memory Reclamation)](#tree-compaction-memory-reclamation)
+9. [Persistence Interface](#persistence-interface)
+10. [Performance Characteristics](#performance-characteristics)
 
 ---
 
@@ -50,12 +51,12 @@ flowchart TB
 | **Memory Efficiency** | Adaptive nodes grow only when needed |
 | **Cache Locality** | Path compression reduces pointer chasing |
 | **Lock-Free Reads** | Thread-local trees per Seastar shard |
-| **LRU Eviction** | Timestamp tracking for capacity management |
+| **LRU Eviction** | Intrusive doubly-linked list for O(1) eviction |
 
 ### Source Location
 
 ```
-src/radix_tree.hpp    # Complete implementation (~1600 lines)
+src/radix_tree.hpp    # Complete implementation (~1900 lines)
 src/node_slab.hpp     # Slab allocator interface and NodePtr type alias
 src/node_slab.cpp     # Slab allocator implementation
 src/router_service.cpp # Integration with Seastar shards
@@ -204,10 +205,15 @@ All nodes share a common header defined in the base `Node` struct:
 ```cpp
 struct Node {
     NodeType type;                              // Discriminator for polymorphism
-    std::vector<TokenId> prefix;                // Path compression (see next section)
+    absl::InlinedVector<TokenId, 8> prefix;     // Path compression (inline for ≤8 tokens)
     std::optional<BackendId> leaf_value;        // Route destination if terminal
-    RouteOrigin origin;                         // LOCAL or REMOTE (for eviction priority)
+    RouteOrigin origin = RouteOrigin::LOCAL;    // LOCAL or REMOTE (for eviction priority)
     std::chrono::steady_clock::time_point last_accessed;  // LRU tracking
+
+    // Intrusive LRU list pointers (only meaningful for leaf nodes).
+    // Maintained by RadixTree — do not modify directly.
+    Node* lru_prev = nullptr;  // Toward head (more recent)
+    Node* lru_next = nullptr;  // Toward tail (older)
 };
 ```
 
@@ -386,13 +392,12 @@ Node* find_child(TokenId key) const {
         return children[idx].get();
     }
 
-    // Collision case: key_byte matches but full key differs
-    // Fall back to linear search for the correct entry
-    if (keys[idx] != EMPTY_KEY) {
-        for (int i = 0; i < 256; i++) {
-            if (keys[i] == key) {
-                return children[i].get();
-            }
+    // Always linear scan — the entry may be displaced to any slot
+    // (the preferred slot could be empty if the original occupant
+    // was evicted, but displaced entries from collisions still exist).
+    for (int i = 0; i < 256; i++) {
+        if (keys[i] == key) {
+            return children[i].get();
         }
     }
     return nullptr;
@@ -437,8 +442,8 @@ NodePtr grow_to_node16(NodePtr parent, TokenId key, NodePtr child) {
     auto n16_ptr = make_node<Node16>();  // Slab-allocated
     auto* n16 = static_cast<Node16*>(n16_ptr.get());
 
-    // Migrate metadata (preserves path compression)
-    copy_node_metadata(n16, n4);
+    // Transfer metadata and LRU list position (src is cleared after)
+    transfer_node_metadata(n16, n4);
 
     // Migrate existing children (zero-copy move of NodePtrs)
     n16->keys = std::move(n4->keys);
@@ -495,7 +500,7 @@ Each node stores a `prefix` vector containing tokens that don't branch:
 
 ```cpp
 struct Node {
-    std::vector<TokenId> prefix;  // Compressed path segment
+    absl::InlinedVector<TokenId, 8> prefix;  // Compressed path segment (inline for ≤8 tokens)
     // ...
 };
 ```
@@ -552,18 +557,51 @@ void split_node(Node* node, size_t split_point) {
     // Transfer leaf value and all children to new_child
     new_child->leaf_value = node->leaf_value;
     node->leaf_value = std::nullopt;
-    move_all_children(node, new_child.get());  // Moves unique_ptrs
+    move_children_to_new_node(node, new_child.get());  // Moves unique_ptrs
 
     // Truncate parent prefix to [A, B]
     node->prefix.resize(split_point);
 
-    // Convert parent to Node4 (it now has exactly 1 child)
-    // Add new_child under edge 'C'
-    add_child(node, split_edge_key, std::move(new_child));
+    // Parent retains its type; add new_child under edge 'C'
+    add_single_child_after_split(node, edge_key, std::move(new_child));
 }
 ```
 
 > **Dynamic Node Type Selection:** When splitting, `create_node_for_capacity()` selects the appropriate node type based on how many children need to be moved. A node with 30 children creates a Node48, not a Node4. This prevents data loss and maintains tree invariants.
+
+### Maximum Prefix Length Invariant
+
+Node prefixes are bounded to prevent unbounded memory consumption in a single node:
+
+```cpp
+static constexpr size_t MAX_PREFIX_LENGTH = 256;
+```
+
+When `insert()` or `split_node()` would produce a prefix longer than 256 tokens, `split_long_prefix()` chains the excess into a linked sequence of nodes:
+
+```cpp
+void split_long_prefix(Node* node) {
+    while (node->prefix.size() > MAX_PREFIX_LENGTH) {
+        TokenId edge_key = node->prefix[MAX_PREFIX_LENGTH];
+        auto new_child = make_node<Node4>();
+
+        // Move excess suffix to child prefix
+        new_child->prefix.assign(
+            node->prefix.begin() + MAX_PREFIX_LENGTH + 1,
+            node->prefix.end()
+        );
+
+        // Transfer leaf data, LRU position, and children to child
+        // ... (ownership transfer, LRU splice)
+
+        // Truncate parent and add single child
+        node->prefix.resize(MAX_PREFIX_LENGTH);
+        add_single_child_after_split(node, edge_key, std::move(new_child));
+    }
+}
+```
+
+This ensures no single node's `InlinedVector` grows without bound (Hard Rule #4).
 
 **Split Visualization:**
 
@@ -593,61 +631,65 @@ sequenceDiagram
 The `lookup_recursive()` function uses **iterative traversal** for optimal performance on the hot path:
 
 ```cpp
-std::optional<BackendId> lookup_recursive(
-    Node* node,
-    std::span<const TokenId> tokens)
-{
+std::optional<BackendId> lookup_recursive(Node* node, std::span<const TokenId> tokens) {
     std::optional<BackendId> best_match = std::nullopt;
     Node* best_match_node = nullptr;
 
     // Iterative traversal eliminates function call overhead per tree level
     while (node != nullptr) {
-        // Step 1: Match prefix tokens
-        size_t prefix_len = node->prefix.size();
-        if (prefix_len > tokens.size()) {
-            break;  // Input shorter than prefix
-        }
+        const auto& prefix = node->prefix;
+        size_t prefix_len = prefix.size();
+        size_t tokens_len = tokens.size();
+        size_t match_len = 0;
 
-        // Prefix comparison with early exit on mismatch
-        bool prefix_matches = true;
-        for (size_t i = 0; i < prefix_len; ++i) {
-            if (node->prefix[i] != tokens[i]) {
-                prefix_matches = false;
-                break;
+        // Element-by-element prefix comparison with early return on mismatch
+        while (match_len < prefix_len && match_len < tokens_len) {
+            if (prefix[match_len] != tokens[match_len]) {
+                // Prefix mismatch — return best match so far
+                if (best_match_node) {
+                    best_match_node->last_accessed = std::chrono::steady_clock::now();
+                    lru_touch(best_match_node);
+                }
+                return best_match;
             }
-        }
-        if (!prefix_matches) {
-            break;
+            match_len++;
         }
 
-        // Step 2: Update best match if this node has a leaf value
-        if (node->leaf_value.has_value()) [[likely]] {
+        // Input shorter than prefix — return best match
+        if (match_len < prefix_len) {
+            if (best_match_node) {
+                best_match_node->last_accessed = std::chrono::steady_clock::now();
+                lru_touch(best_match_node);
+            }
+            return best_match;
+        }
+
+        // Update best match if this node has a leaf value
+        if (node->leaf_value.has_value()) {
             best_match = node->leaf_value;
             best_match_node = node;
         }
 
-        // Step 3: Continue to child with remaining tokens
-        tokens = tokens.subspan(prefix_len);
-        if (tokens.empty()) {
-            break;  // Consumed all input tokens
+        // Advance past matched prefix
+        tokens = tokens.subspan(match_len);
+        if (tokens.empty()) [[unlikely]] {
+            break;
         }
 
         node = find_child(node, tokens[0]);
-        if (node != nullptr) {
-            tokens = tokens.subspan(1);  // Consume edge key
-        }
+        tokens = tokens.subspan(1);
     }
 
-    // Deferred LRU update (single write at end)
+    // LRU update at normal exit
     if (best_match_node) {
         best_match_node->last_accessed = std::chrono::steady_clock::now();
+        lru_touch(best_match_node);
     }
-
     return best_match;
 }
 ```
 
-> **Performance Optimization:** The iterative implementation eliminates recursive function call overhead, which saves ~5-10 cycles per tree level. For deep trees (common with long LLM prefixes), this translates to measurable latency reduction. The `[[likely]]` hint helps branch prediction on the common case where nodes have leaf values.
+> **Performance Optimization:** The iterative implementation eliminates recursive function call overhead, which saves ~5-10 cycles per tree level. LRU updates (`last_accessed` + `lru_touch()`) occur at every exit point so the intrusive LRU list stays accurate. The `[[unlikely]]` on the empty-tokens check helps branch prediction since most lookups traverse multiple levels.
 
 ### Cache Efficiency Gains
 
@@ -991,6 +1033,80 @@ REMOTE routes can be evicted more aggressively than LOCAL routes via `evict_olde
 
 ---
 
+## LRU Eviction
+
+The RadixTree maintains an intrusive doubly-linked list of all leaf nodes, ordered by access time. This enables O(1) eviction without scanning the tree.
+
+### Data Structures
+
+```cpp
+// Private members of RadixTree
+Node* lru_head_ = nullptr;  // Most recently accessed leaf
+Node* lru_tail_ = nullptr;  // Oldest leaf (eviction target)
+```
+
+Each `Node` carries intrusive list pointers (see [Node Structures](#node-structures)):
+
+```cpp
+Node* lru_prev = nullptr;  // Toward head (more recent)
+Node* lru_next = nullptr;  // Toward tail (older)
+```
+
+### Operations
+
+| Function | Complexity | Description |
+|----------|------------|-------------|
+| `lru_push_front(node)` | O(1) | Insert node at head (most recent) |
+| `lru_remove(node)` | O(1) | Unlink node from list |
+| `lru_touch(node)` | O(1) | Move node to head (called on lookup hit) |
+| `evict_oldest()` | O(1) | Remove tail node's leaf value |
+| `evict_oldest_remote()` | O(n) worst | Scan from tail for REMOTE route; falls back to `evict_oldest()` |
+
+### Eviction Flow
+
+```cpp
+// evict_oldest() — O(1) via intrusive list tail
+bool evict_oldest() {
+    if (!lru_tail_) return false;
+    Node* oldest = lru_tail_;
+    lru_remove(oldest);
+    oldest->leaf_value = std::nullopt;  // Tombstone
+    if (route_count_ > 0) route_count_--;
+    return true;
+}
+
+// evict_oldest_remote() — prefers REMOTE routes for eviction
+bool evict_oldest_remote() {
+    for (Node* n = lru_tail_; n != nullptr; n = n->lru_prev) {
+        if (n->origin == RouteOrigin::REMOTE) {
+            lru_remove(n);
+            n->leaf_value = std::nullopt;
+            if (route_count_ > 0) route_count_--;
+            return true;
+        }
+    }
+    return evict_oldest();  // No REMOTE routes; evict any
+}
+```
+
+### LRU Touch on Lookup
+
+Every `lookup_recursive()` exit path calls both `last_accessed = now()` and `lru_touch()` on the matched node. This ensures the intrusive list stays sorted by access time without any deferred maintenance.
+
+### Integration with RouterService
+
+```cpp
+// Called before insert() when at capacity
+while (local_tree->route_count() >= local_max_routes) {
+    if (!local_tree->evict_oldest()) break;
+    stats_routes_evicted++;
+}
+```
+
+Tombstoned nodes (leaf cleared, structure intact) are later reclaimed by [Tree Compaction](#tree-compaction-memory-reclamation).
+
+---
+
 ## Tree Compaction (Memory Reclamation)
 
 > **Added in:** v1.0 (PR #155)
@@ -1064,9 +1180,9 @@ flowchart TB
 **Key Implementation Details:**
 
 1. **Post-order traversal**: Children are compacted before parents to ensure accurate emptiness checks
-2. **Shrinking thresholds**: Match growth thresholds in reverse:
-   - Node256 → Node48 when children ≤ 48
-   - Node48 → Node16 when children ≤ 16
+2. **Shrinking thresholds**: Shrink to the smallest type that fits, skipping intermediates:
+   - Node256 → Node4 when children ≤ 4, Node16 when ≤ 16, Node48 when ≤ 48
+   - Node48 → Node4 when children ≤ 4, Node16 when ≤ 16
    - Node16 → Node4 when children ≤ 4
 3. **Root protection**: Root node is never deleted (only shrunk if oversized)
 4. **Bounded allocation**: `keys_to_remove` vector uses `reserve(8)` per Rule #4
@@ -1083,8 +1199,10 @@ struct CompactionStats {
 
 **Bytes Reclaimed Calculation:**
 
+> **Note:** These metric constants differ from the slab slot sizes in `node_slab.hpp` (192, 192, 448, 3200). The values below are the estimated *logical* node sizes used for metrics reporting, while slab slot sizes include alignment padding and header overhead.
+
 ```cpp
-// Estimated byte sizes per node type
+// Estimated byte sizes per node type (in radix_tree.hpp, for metrics)
 static constexpr size_t NODE4_SIZE = 192;
 static constexpr size_t NODE16_SIZE = 384;
 static constexpr size_t NODE48_SIZE = 640;
@@ -1358,7 +1476,7 @@ sequenceDiagram
 |-----------|-----------------|------------------|
 | `lookup()` | O(k) | O(1) |
 | `insert()` | O(k) | O(k) amortized |
-| `evict_oldest()` | O(n) | O(1) |
+| `evict_oldest()` | O(1) | O(1) |
 | `remove_expired()` | O(n) | O(1) |
 
 Where:
@@ -1377,6 +1495,29 @@ From production benchmarks (see `docs/performance.md`):
 | Speedup Factor | 28x with cache hits |
 | Max Routes per Shard | 100,000 (configurable) |
 | Memory per 100K Routes | ~50MB (varies with prefix length) |
+
+### Additional Public API
+
+| Method | Description |
+|--------|-------------|
+| `lookup_instrumented(tokens)` | Returns `LookupResult` with `backend`, `prefix_tokens_skipped`, `nodes_traversed` |
+| `get_tree_stats()` | Returns `TreeStats` with per-node-type counts and prefix length statistics |
+| `for_each_leaf(callback)` | Iterates all leaf nodes (used for persistence serialization) |
+| `dump()` | Serializes entire tree to `DumpNode` for admin API inspection |
+| `dump_with_prefix(prefix)` | Serializes subtree matching a prefix filter |
+| `remove_routes_by_backend(id, origin)` | Removes all routes for a given backend + origin |
+| `remove_expired(cutoff)` | Removes routes with `last_accessed` older than cutoff |
+
+### Block Alignment Truncation
+
+`insert()` silently truncates token spans to the nearest multiple of `block_alignment` (default 16, matching vLLM PagedAttention block size). Tokens beyond that boundary are discarded:
+
+```cpp
+size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
+if (aligned_len == 0) return;  // Too few tokens — skip
+```
+
+This ensures routes align with the backend's KV-cache block boundaries.
 
 ### Configuration Tuning
 
