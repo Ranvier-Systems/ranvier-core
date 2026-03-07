@@ -205,7 +205,8 @@ RANVIER_PREFIX_AFFINITY_ENABLED=true
 RANVIER_PREFIX_TOKEN_LENGTH=128
 
 # Alternative: set routing mode directly
-# "prefix" enables prefix-affinity, "round_robin" disables it
+# "prefix" enables prefix-affinity with ART, "hash" uses consistent hash only,
+# "random" uses weighted random distribution (no affinity)
 RANVIER_ROUTING_MODE=prefix
 
 # Prefix boundary detection (for multi-turn conversations)
@@ -250,19 +251,27 @@ routing:
 - `src/http_controller.cpp` - Routing decision and `X-Backend-ID` header
 - `src/config.hpp` - Configuration parsing
 
-### BPE Tokenization Boundary Alignment
+### System Message Boundary Detection
 
-BPE (Byte Pair Encoding) tokenizers produce different tokens depending on context. For example, "helpful" may tokenize differently than "helpful\n" due to subword boundaries.
-
-To ensure the system message tokens are an exact prefix of the full request tokens, Ranvier appends a trailing newline when tokenizing system messages:
+To determine the prefix boundary from system messages, Ranvier uses `extract_text_with_boundary_info()` which formats all messages into a combined text string (applying the configured chat template), then tracks the character offset where system messages end (`system_prefix_end`). This substring is then tokenized to determine the token-level boundary:
 
 ```cpp
-// Ensures BPE tokens match the prefix of full text tokenization
-auto system_text = extract_system_messages(body) + "\n";
-auto system_tokens = tokenizer.encode(system_text);
+// Extract text with boundary metadata (single JSON parse for all routing info)
+auto text_extraction = RequestRewriter::extract_text_with_boundary_info(body, ...);
+
+// Get system prefix as substring of the combined formatted text
+std::string system_prefix_text;
+if (text_extraction->has_system_prefix) {
+    system_prefix_text = text_extraction->text.substr(0, text_extraction->system_prefix_end);
+} else {
+    system_prefix_text = text_extraction->system_text;
+}
+
+// Tokenize the system prefix to get token-level boundary
+auto sys_tok_result = co_await tokenizer.encode_threaded_async(system_prefix_text);
 ```
 
-This aligns with how `extract_text()` formats messages internally (content separated by newlines).
+Because the system prefix is a substring of the same combined text that produces the full token sequence, the system tokens are guaranteed to be an exact prefix of the full tokenization — no trailing newline hack needed.
 
 ### Cluster-Wide Hash Consistency
 
@@ -350,13 +359,17 @@ Load-aware routing checks the preferred backend's in-flight request count before
 
 ### Algorithm
 
+Uses a **relative threshold** based on the median load across all backends. This auto-adapts to any workload, model size, or cluster size — no per-model tuning needed.
+
 ```
 1. Determine preferred backend (ART lookup or hash fallback)
-2. Check preferred backend's in-flight request count
-3. If count > `queue_depth_threshold`:
+2. If preferred load is 0, route to preferred (fast path)
+3. Compute median load across all live backends
+4. Compute threshold = median * load_imbalance_factor + load_imbalance_floor
+5. If preferred load > threshold:
    - Find least-loaded backend among candidates
-   - If load difference > `queue_diff_threshold`, route to least-loaded
-   - Otherwise, route to preferred (marginal difference not worth cache miss)
+   - Route to least-loaded (accepting cache miss)
+6. Otherwise, route to preferred
 ```
 
 ```
@@ -375,21 +388,29 @@ Load-aware routing checks the preferred backend's in-flight request count before
 │  │     Backend 1: 8 in-flight              │                    │
 │  └─────────────────────────────────────────┘                    │
 │         │                                                        │
-│    8 > threshold (4)?                                           │
-│    ├─ NO → Route to preferred (backend 1)                       │
+│    Preferred load == 0?                                          │
+│    └─ YES → Route to preferred (fast path)                      │
+│         │                                                        │
+│         ▼                                                        │
+│  ┌─────────────────────────────────────────┐                    │
+│  │  3. Compute median load                 │                    │
+│  │     All backends: [8, 3, 2, 1]          │                    │
+│  │     Median = 3                          │                    │
+│  └─────────────────────────────────────────┘                    │
+│         │                                                        │
+│    threshold = 3 * 2.0 + 2 = 8                                  │
+│    8 > threshold (8)?                                            │
+│    ├─ NO → Route to preferred (cache affinity)                  │
 │    │                                                             │
 │    └─ YES ──┐                                                   │
 │             ▼                                                    │
 │  ┌─────────────────────────────────────────┐                    │
-│  │  3. Find least-loaded backend           │                    │
-│  │     Backend 2: 1 in-flight              │                    │
+│  │  4. Find least-loaded backend           │                    │
+│  │     Backend 4: 1 in-flight              │                    │
 │  └─────────────────────────────────────────┘                    │
 │         │                                                        │
-│    Difference (8-1=7) > diff_threshold (2)?                     │
-│    ├─ NO → Route to preferred (cache affinity)                  │
-│    │                                                             │
-│    └─ YES → Route to least-loaded (backend 2)                   │
-│             Increment cache_miss_due_to_load counter            │
+│         └──→ Route to least-loaded (backend 4)                  │
+│              Increment load_aware_fallbacks counter              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -398,25 +419,27 @@ Load-aware routing checks the preferred backend's in-flight request count before
 | Option | Default | Environment Variable | Description |
 |--------|---------|---------------------|-------------|
 | `load_aware_routing` | `true` | `RANVIER_LOAD_AWARE_ROUTING` | Enable load-aware backend selection |
-| `queue_depth_threshold` | `4` | `RANVIER_QUEUE_DEPTH_THRESHOLD` | Max in-flight requests before considering alternatives |
-| `queue_diff_threshold` | `2` | `RANVIER_QUEUE_DIFF_THRESHOLD` | Min load difference to justify cache miss |
+| `load_imbalance_factor` | `2.0` | `RANVIER_LOAD_IMBALANCE_FACTOR` | Divert when preferred load > factor * median load |
+| `load_imbalance_floor` | `2` | `RANVIER_LOAD_IMBALANCE_FLOOR` | Additive floor to prevent flapping at low load |
+
+The threshold is computed as: `median_load * load_imbalance_factor + load_imbalance_floor`. This relative approach auto-adapts to any workload without per-model tuning.
 
 #### YAML Configuration
 
 ```yaml
 routing:
   load_aware_routing: true
-  queue_depth_threshold: 4
-  queue_diff_threshold: 2
+  load_imbalance_factor: 2.0
+  load_imbalance_floor: 2
 ```
 
 ### Load Tracking
 
-In-flight requests are tracked per-backend using atomic counters:
+In-flight requests are tracked per-backend using shard-local counters:
 
 - **BackendRequestGuard**: RAII guard that increments counter on construction and decrements on destruction
-- **Lock-free**: Uses `std::atomic` with relaxed memory ordering
-- **Shard-local**: Each Seastar shard maintains its own counters (no cross-shard synchronization)
+- **Lock-free**: Plain `uint64_t` in thread-local `ShardLocalState` — no atomics needed since each Seastar shard runs on a single reactor thread
+- **Shard-local**: Each Seastar shard maintains its own counters (no cross-shard synchronization needed for local tracking)
 
 ```cpp
 // Usage in request handling
@@ -431,9 +454,8 @@ co_return co_await do_with(std::move(guard), [...](auto& g) {
 
 | Metric | Description |
 |--------|-------------|
-| `router_load_aware_fallbacks` | Requests diverted due to backend overload |
-| `router_cache_miss_due_to_load` | Same as above (alternative name) |
-| `backend_active_requests{backend_id}` | Current in-flight requests per backend |
+| `router_load_aware_fallbacks_total` | Requests diverted due to backend overload |
+| `backend_active_requests` | Current in-flight requests per backend (gauge, labeled by backend) |
 
 ### Trade-offs
 
@@ -448,9 +470,10 @@ co_return co_await do_with(std::move(guard), [...](auto& g) {
 
 1. **Keep enabled by default**: The latency benefits outweigh the occasional cache miss
 2. **Tune thresholds based on backend capacity**:
-   - High-throughput backends: Increase `queue_depth_threshold` (e.g., 8-16)
-   - Low-latency requirements: Decrease thresholds for faster response
-3. **Monitor metrics**: Watch `cache_miss_due_to_load` to understand diversion frequency
+   - High-throughput backends: Increase `load_imbalance_factor` (e.g., 3.0-4.0) to tolerate more skew before diverting
+   - Low-latency requirements: Decrease `load_imbalance_factor` for faster diversion
+   - Increase `load_imbalance_floor` to prevent flapping when overall load is low
+3. **Monitor metrics**: Watch `router_load_aware_fallbacks_total` to understand diversion frequency
 4. **Combine with shard load balancing**: Load-aware routing handles backend imbalance; shard load balancing handles CPU core imbalance
 
 ### Benchmark Results
