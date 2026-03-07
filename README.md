@@ -79,8 +79,6 @@ Real-world results from 8x A100 GPUs (30-minute validated runs, February 2026):
 - Few-shot learning with shared examples
 - Any workload with 2K+ token shared prefixes
 
-> **Note:** Benefits scale with prefix size and model size. Use 8B+ parameter models for meaningful KV cache improvements. Small prefixes (<500 tokens) see minimal benefit.
-
 See [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for detailed methodology and results.
 
 ---
