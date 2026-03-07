@@ -1,6 +1,6 @@
 # Source Code Map
 
-This guide maps source files to logical modules, helping contributors navigate the ~20,500 LOC codebase.
+This guide maps source files to logical modules, helping contributors navigate the ~27,650 LOC codebase.
 
 ## Core Application
 
@@ -28,6 +28,9 @@ This guide maps source files to logical modules, helping contributors navigate t
 | `tokenizer_service.*` | HuggingFace tokenizer integration (GPT-2) |
 | `tokenizer_thread_pool.*` | Dedicated worker pool for blocking tokenizer FFI calls |
 | `request_rewriter.hpp` | Token injection for pre-tokenized forwarding |
+| `chat_template.hpp` | Pre-compiled chat templates (llama3, chatml, mistral) |
+| `boundary_detector.hpp` | Pure strategies for detecting message boundaries in token sequences |
+| `text_boundary_info.hpp` | Lightweight boundary metadata struct (separated from request_rewriter) |
 
 ## Networking Layer
 
