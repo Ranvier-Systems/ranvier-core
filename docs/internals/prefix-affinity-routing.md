@@ -121,24 +121,12 @@ Client-provided boundaries take precedence over automatic detection.
 
 **Important: Tokenization Format**
 
-When using client-provided `prompt_token_ids` with `prefix_token_count`, the tokenization format must match Ranvier's internal format. Ranvier tokenizes the raw message content with newline separators:
+When using client-provided `prompt_token_ids` with `prefix_token_count`, the tokenization must match Ranvier's internal format. The internal format depends on the configured chat template:
 
-```
-{system_content}\n{user_content}\n...
-```
+- **No chat template (default)**: Messages are concatenated with `\n` separators: `{system_content}\n{user_content}\n...`
+- **With chat template** (llama3, chatml, mistral): Messages are formatted using the template, matching vLLM's `apply_chat_template()` output
 
-**Do not** use chat template format (e.g., `<|system|>\n{content}`) when computing `prefix_token_count`. Use raw content concatenated with `\n` separators.
-
-Example (Python):
-```python
-# Correct: raw content with newlines
-system_text = system_content + "\n"
-tokens = tokenizer.encode(system_text)
-prefix_token_count = len(tokens)
-
-# Incorrect: chat template format
-# tokens = tokenizer.apply_chat_template(messages)  # Don't use this
-```
+Ensure your `prefix_token_count` is computed against the same format Ranvier uses. When in doubt, use the automatic system message detection (Option 1) instead of client-provided boundaries.
 
 ### Multi-Depth Route Storage (Option C)
 
@@ -253,61 +241,21 @@ routing:
 
 ### System Message Boundary Detection
 
-To determine the prefix boundary from system messages, Ranvier uses `extract_text_with_boundary_info()` which formats all messages into a combined text string (applying the configured chat template), then tracks the character offset where system messages end (`system_prefix_end`). This substring is then tokenized to determine the token-level boundary:
+Ranvier determines the prefix boundary through a single-pass JSON extraction (`extract_text_with_boundary_info()` in `request_rewriter.hpp`) that builds one combined text string from all messages while tracking the character offset where system messages end. This combined text is formatted using the configured chat template (llama3, chatml, mistral, or plain newline-joining), so tokenization aligns with vLLM's internal representation.
 
-```cpp
-// Extract text with boundary metadata (single JSON parse for all routing info)
-auto text_extraction = RequestRewriter::extract_text_with_boundary_info(body, ...);
+The system prefix substring is then tokenized to produce the token-level boundary. Because the prefix is a substring of the same combined text that produces the full token sequence, the system tokens are guaranteed to be an exact prefix of the full tokenization — no special delimiter or trailing newline needed.
 
-// Get system prefix as substring of the combined formatted text
-std::string system_prefix_text;
-if (text_extraction->has_system_prefix) {
-    system_prefix_text = text_extraction->text.substr(0, text_extraction->system_prefix_end);
-} else {
-    system_prefix_text = text_extraction->system_text;
-}
-
-// Tokenize the system prefix to get token-level boundary
-auto sys_tok_result = co_await tokenizer.encode_threaded_async(system_prefix_text);
-```
-
-Because the system prefix is a substring of the same combined text that produces the full token sequence, the system tokens are guaranteed to be an exact prefix of the full tokenization — no trailing newline hack needed.
+When system messages are interleaved with non-system messages (non-contiguous), Ranvier falls back to using the pre-extracted raw system text as an approximation.
 
 ### Cluster-Wide Hash Consistency
 
 In multi-node deployments, each Ranvier node learns routes independently. Before routes are learned, the hash fallback must be deterministic across all nodes.
 
-Ranvier uses `prefix_boundary` (not `prefix_token_length`) for hash computation when available:
-
-```cpp
-// Use prefix_boundary for hash to ensure cluster-wide consistency
-size_t hash_len = (prefix_boundary > 0) ? prefix_boundary : prefix_token_length;
-auto hash = hash_prefix(tokens.data(), hash_len, block_alignment);
-backend_id = hash % num_backends;
-```
-
-This ensures that requests with the same system message (but different user queries) hash to the same backend across all nodes, even before routes are learned.
+When a prefix boundary is available, Ranvier uses it (instead of `prefix_token_length`) as the hash input length. This ensures that requests sharing the same system message hash to the same backend across all nodes, even before routes are learned — regardless of differing user queries.
 
 ### Hash Function
 
-Uses FNV-1a hash with block alignment for vLLM compatibility:
-
-```cpp
-inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
-    // Align to block boundary
-    size_t aligned_len = (count / block_alignment) * block_alignment;
-    if (aligned_len == 0) aligned_len = count;
-
-    // FNV-1a hash
-    uint64_t hash = 14695981039346656037ULL;  // FNV offset basis
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
-    for (size_t i = 0; i < aligned_len * sizeof(int32_t); ++i) {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;  // FNV prime
-    }
-    return hash;
-}
-```
+The hash fallback uses FNV-1a over the raw token bytes, with the token count first rounded down to the nearest `block_alignment` boundary (defaulting to 16, matching vLLM's PagedAttention block size). This alignment ensures that two prefixes differing only in trailing partial-block tokens hash identically. See `hash_prefix()` in `router_service.cpp` for the implementation.
 
 ### X-Backend-ID Header
 
@@ -364,7 +312,7 @@ Uses a **relative threshold** based on the median load across all backends. This
 ```
 1. Determine preferred backend (ART lookup or hash fallback)
 2. If preferred load is 0, route to preferred (fast path)
-3. Compute median load across all live backends
+3. Compute median load across all live backends (via nth_element, O(n))
 4. Compute threshold = median * load_imbalance_factor + load_imbalance_floor
 5. If preferred load > threshold:
    - Find least-loaded backend among candidates
@@ -372,47 +320,7 @@ Uses a **relative threshold** based on the median load across all backends. This
 6. Otherwise, route to preferred
 ```
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Request arrives with prefix P1                                  │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  1. Determine preferred backend         │                    │
-│  │     (ART hit → backend 1)               │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  2. Check preferred load                │                    │
-│  │     Backend 1: 8 in-flight              │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│    Preferred load == 0?                                          │
-│    └─ YES → Route to preferred (fast path)                      │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  3. Compute median load                 │                    │
-│  │     All backends: [8, 3, 2, 1]          │                    │
-│  │     Median = 3                          │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│    threshold = 3 * 2.0 + 2 = 8                                  │
-│    8 > threshold (8)?                                            │
-│    ├─ NO → Route to preferred (cache affinity)                  │
-│    │                                                             │
-│    └─ YES ──┐                                                   │
-│             ▼                                                    │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  4. Find least-loaded backend           │                    │
-│  │     Backend 4: 1 in-flight              │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│         └──→ Route to least-loaded (backend 4)                  │
-│              Increment load_aware_fallbacks counter              │
-└─────────────────────────────────────────────────────────────────┘
-```
+See `apply_load_aware_selection()` in `router_service.cpp` for the implementation.
 
 ### Configuration
 
@@ -437,18 +345,9 @@ routing:
 
 In-flight requests are tracked per-backend using shard-local counters:
 
-- **BackendRequestGuard**: RAII guard that increments counter on construction and decrements on destruction
+- **BackendRequestGuard**: Move-only RAII guard (`router_service.hpp`) that increments the backend's `active_requests` on construction and decrements on destruction, ensuring correct counting on any exit path (including exceptions and early co_await returns)
 - **Lock-free**: Plain `uint64_t` in thread-local `ShardLocalState` — no atomics needed since each Seastar shard runs on a single reactor thread
-- **Shard-local**: Each Seastar shard maintains its own counters (no cross-shard synchronization needed for local tracking)
-
-```cpp
-// Usage in request handling
-auto guard = BackendRequestGuard(backend_id);
-co_return co_await do_with(std::move(guard), [...](auto& g) {
-    // Request processing
-    // Counter automatically decremented on any exit path
-});
-```
+- **Shard-local**: Each shard maintains its own counters; cross-shard load visibility requires the optional load sync feature (see `shard-load-balancing.md`)
 
 ### Metrics
 
@@ -463,7 +362,7 @@ co_return co_await do_with(std::move(guard), [...](auto& g) {
 |--------|-----|-----|
 | **Tail Latency** | Reduces P95/P99 TTFT by >35% under heavy load | — |
 | **Cache Efficiency** | — | May cause temporary cache misses when load spikes |
-| **Complexity** | — | Additional per-request overhead (atomic reads) |
+| **Complexity** | — | Additional per-request overhead (median computation over backends) |
 | **Observability** | Metrics show load distribution | Debugging routing decisions requires trace logs |
 
 ### Recommendations
