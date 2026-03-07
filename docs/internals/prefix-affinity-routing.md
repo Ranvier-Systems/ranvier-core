@@ -121,24 +121,12 @@ Client-provided boundaries take precedence over automatic detection.
 
 **Important: Tokenization Format**
 
-When using client-provided `prompt_token_ids` with `prefix_token_count`, the tokenization format must match Ranvier's internal format. Ranvier tokenizes the raw message content with newline separators:
+When using client-provided `prompt_token_ids` with `prefix_token_count`, the tokenization must match Ranvier's internal format. The internal format depends on the configured chat template:
 
-```
-{system_content}\n{user_content}\n...
-```
+- **No chat template (default)**: Messages are concatenated with `\n` separators: `{system_content}\n{user_content}\n...`
+- **With chat template** (llama3, chatml, mistral): Messages are formatted using the template, matching vLLM's `apply_chat_template()` output
 
-**Do not** use chat template format (e.g., `<|system|>\n{content}`) when computing `prefix_token_count`. Use raw content concatenated with `\n` separators.
-
-Example (Python):
-```python
-# Correct: raw content with newlines
-system_text = system_content + "\n"
-tokens = tokenizer.encode(system_text)
-prefix_token_count = len(tokens)
-
-# Incorrect: chat template format
-# tokens = tokenizer.apply_chat_template(messages)  # Don't use this
-```
+Ensure your `prefix_token_count` is computed against the same format Ranvier uses. When in doubt, use the automatic system message detection (Option 1) instead of client-provided boundaries.
 
 ### Multi-Depth Route Storage (Option C)
 
@@ -205,7 +193,8 @@ RANVIER_PREFIX_AFFINITY_ENABLED=true
 RANVIER_PREFIX_TOKEN_LENGTH=128
 
 # Alternative: set routing mode directly
-# "prefix" enables prefix-affinity, "round_robin" disables it
+# "prefix" enables prefix-affinity with ART, "hash" uses consistent hash only,
+# "random" uses weighted random distribution (no affinity)
 RANVIER_ROUTING_MODE=prefix
 
 # Prefix boundary detection (for multi-turn conversations)
@@ -250,55 +239,23 @@ routing:
 - `src/http_controller.cpp` - Routing decision and `X-Backend-ID` header
 - `src/config.hpp` - Configuration parsing
 
-### BPE Tokenization Boundary Alignment
+### System Message Boundary Detection
 
-BPE (Byte Pair Encoding) tokenizers produce different tokens depending on context. For example, "helpful" may tokenize differently than "helpful\n" due to subword boundaries.
+Ranvier determines the prefix boundary through a single-pass JSON extraction (`extract_text_with_boundary_info()` in `request_rewriter.hpp`) that builds one combined text string from all messages while tracking the character offset where system messages end. This combined text is formatted using the configured chat template (llama3, chatml, mistral, or plain newline-joining), so tokenization aligns with vLLM's internal representation.
 
-To ensure the system message tokens are an exact prefix of the full request tokens, Ranvier appends a trailing newline when tokenizing system messages:
+The system prefix substring is then tokenized to produce the token-level boundary. Because the prefix is a substring of the same combined text that produces the full token sequence, the system tokens are guaranteed to be an exact prefix of the full tokenization — no special delimiter or trailing newline needed.
 
-```cpp
-// Ensures BPE tokens match the prefix of full text tokenization
-auto system_text = extract_system_messages(body) + "\n";
-auto system_tokens = tokenizer.encode(system_text);
-```
-
-This aligns with how `extract_text()` formats messages internally (content separated by newlines).
+When system messages are interleaved with non-system messages (non-contiguous), Ranvier falls back to using the pre-extracted raw system text as an approximation.
 
 ### Cluster-Wide Hash Consistency
 
 In multi-node deployments, each Ranvier node learns routes independently. Before routes are learned, the hash fallback must be deterministic across all nodes.
 
-Ranvier uses `prefix_boundary` (not `prefix_token_length`) for hash computation when available:
-
-```cpp
-// Use prefix_boundary for hash to ensure cluster-wide consistency
-size_t hash_len = (prefix_boundary > 0) ? prefix_boundary : prefix_token_length;
-auto hash = hash_prefix(tokens.data(), hash_len, block_alignment);
-backend_id = hash % num_backends;
-```
-
-This ensures that requests with the same system message (but different user queries) hash to the same backend across all nodes, even before routes are learned.
+When a prefix boundary is available, Ranvier uses it (instead of `prefix_token_length`) as the hash input length. This ensures that requests sharing the same system message hash to the same backend across all nodes, even before routes are learned — regardless of differing user queries.
 
 ### Hash Function
 
-Uses FNV-1a hash with block alignment for vLLM compatibility:
-
-```cpp
-inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
-    // Align to block boundary
-    size_t aligned_len = (count / block_alignment) * block_alignment;
-    if (aligned_len == 0) aligned_len = count;
-
-    // FNV-1a hash
-    uint64_t hash = 14695981039346656037ULL;  // FNV offset basis
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
-    for (size_t i = 0; i < aligned_len * sizeof(int32_t); ++i) {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;  // FNV prime
-    }
-    return hash;
-}
-```
+The hash fallback uses FNV-1a over the raw token bytes, with the token count first rounded down to the nearest `block_alignment` boundary (defaulting to 16, matching vLLM's PagedAttention block size). This alignment ensures that two prefixes differing only in trailing partial-block tokens hash identically. See `hash_prefix()` in `router_service.cpp` for the implementation.
 
 ### X-Backend-ID Header
 
@@ -350,90 +307,54 @@ Load-aware routing checks the preferred backend's in-flight request count before
 
 ### Algorithm
 
-```
-1. Determine preferred backend (ART lookup or hash fallback)
-2. Check preferred backend's in-flight request count
-3. If count > `queue_depth_threshold`:
-   - Find least-loaded backend among candidates
-   - If load difference > `queue_diff_threshold`, route to least-loaded
-   - Otherwise, route to preferred (marginal difference not worth cache miss)
-```
+Uses a **relative threshold** based on the median load across all backends. This auto-adapts to any workload, model size, or cluster size — no per-model tuning needed.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Request arrives with prefix P1                                  │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  1. Determine preferred backend         │                    │
-│  │     (ART hit → backend 1)               │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  2. Check preferred load                │                    │
-│  │     Backend 1: 8 in-flight              │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│    8 > threshold (4)?                                           │
-│    ├─ NO → Route to preferred (backend 1)                       │
-│    │                                                             │
-│    └─ YES ──┐                                                   │
-│             ▼                                                    │
-│  ┌─────────────────────────────────────────┐                    │
-│  │  3. Find least-loaded backend           │                    │
-│  │     Backend 2: 1 in-flight              │                    │
-│  └─────────────────────────────────────────┘                    │
-│         │                                                        │
-│    Difference (8-1=7) > diff_threshold (2)?                     │
-│    ├─ NO → Route to preferred (cache affinity)                  │
-│    │                                                             │
-│    └─ YES → Route to least-loaded (backend 2)                   │
-│             Increment cache_miss_due_to_load counter            │
-└─────────────────────────────────────────────────────────────────┘
+1. Determine preferred backend (ART lookup or hash fallback)
+2. If preferred load is 0, route to preferred (fast path)
+3. Compute median load across all live backends (via nth_element, O(n))
+4. Compute threshold = median * load_imbalance_factor + load_imbalance_floor
+5. If preferred load > threshold:
+   - Find least-loaded backend among candidates
+   - Route to least-loaded (accepting cache miss)
+6. Otherwise, route to preferred
 ```
+
+See `apply_load_aware_selection()` in `router_service.cpp` for the implementation.
 
 ### Configuration
 
 | Option | Default | Environment Variable | Description |
 |--------|---------|---------------------|-------------|
 | `load_aware_routing` | `true` | `RANVIER_LOAD_AWARE_ROUTING` | Enable load-aware backend selection |
-| `queue_depth_threshold` | `4` | `RANVIER_QUEUE_DEPTH_THRESHOLD` | Max in-flight requests before considering alternatives |
-| `queue_diff_threshold` | `2` | `RANVIER_QUEUE_DIFF_THRESHOLD` | Min load difference to justify cache miss |
+| `load_imbalance_factor` | `2.0` | `RANVIER_LOAD_IMBALANCE_FACTOR` | Divert when preferred load > factor * median load |
+| `load_imbalance_floor` | `2` | `RANVIER_LOAD_IMBALANCE_FLOOR` | Additive floor to prevent flapping at low load |
+
+The threshold is computed as: `median_load * load_imbalance_factor + load_imbalance_floor`. This relative approach auto-adapts to any workload without per-model tuning.
 
 #### YAML Configuration
 
 ```yaml
 routing:
   load_aware_routing: true
-  queue_depth_threshold: 4
-  queue_diff_threshold: 2
+  load_imbalance_factor: 2.0
+  load_imbalance_floor: 2
 ```
 
 ### Load Tracking
 
-In-flight requests are tracked per-backend using atomic counters:
+In-flight requests are tracked per-backend using shard-local counters:
 
-- **BackendRequestGuard**: RAII guard that increments counter on construction and decrements on destruction
-- **Lock-free**: Uses `std::atomic` with relaxed memory ordering
-- **Shard-local**: Each Seastar shard maintains its own counters (no cross-shard synchronization)
-
-```cpp
-// Usage in request handling
-auto guard = BackendRequestGuard(backend_id);
-co_return co_await do_with(std::move(guard), [...](auto& g) {
-    // Request processing
-    // Counter automatically decremented on any exit path
-});
-```
+- **BackendRequestGuard**: Move-only RAII guard (`router_service.hpp`) that increments the backend's `active_requests` on construction and decrements on destruction, ensuring correct counting on any exit path (including exceptions and early co_await returns)
+- **Lock-free**: Plain `uint64_t` in thread-local `ShardLocalState` — no atomics needed since each Seastar shard runs on a single reactor thread
+- **Shard-local**: Each shard maintains its own counters; cross-shard load visibility requires the optional load sync feature (see `shard-load-balancing.md`)
 
 ### Metrics
 
 | Metric | Description |
 |--------|-------------|
-| `router_load_aware_fallbacks` | Requests diverted due to backend overload |
-| `router_cache_miss_due_to_load` | Same as above (alternative name) |
-| `backend_active_requests{backend_id}` | Current in-flight requests per backend |
+| `router_load_aware_fallbacks_total` | Requests diverted due to backend overload |
+| `backend_active_requests` | Current in-flight requests per backend (gauge, labeled by backend) |
 
 ### Trade-offs
 
@@ -441,16 +362,17 @@ co_return co_await do_with(std::move(guard), [...](auto& g) {
 |--------|-----|-----|
 | **Tail Latency** | Reduces P95/P99 TTFT by >35% under heavy load | — |
 | **Cache Efficiency** | — | May cause temporary cache misses when load spikes |
-| **Complexity** | — | Additional per-request overhead (atomic reads) |
+| **Complexity** | — | Additional per-request overhead (median computation over backends) |
 | **Observability** | Metrics show load distribution | Debugging routing decisions requires trace logs |
 
 ### Recommendations
 
 1. **Keep enabled by default**: The latency benefits outweigh the occasional cache miss
 2. **Tune thresholds based on backend capacity**:
-   - High-throughput backends: Increase `queue_depth_threshold` (e.g., 8-16)
-   - Low-latency requirements: Decrease thresholds for faster response
-3. **Monitor metrics**: Watch `cache_miss_due_to_load` to understand diversion frequency
+   - High-throughput backends: Increase `load_imbalance_factor` (e.g., 3.0-4.0) to tolerate more skew before diverting
+   - Low-latency requirements: Decrease `load_imbalance_factor` for faster diversion
+   - Increase `load_imbalance_floor` to prevent flapping when overall load is low
+3. **Monitor metrics**: Watch `router_load_aware_fallbacks_total` to understand diversion frequency
 4. **Combine with shard load balancing**: Load-aware routing handles backend imbalance; shard load balancing handles CPU core imbalance
 
 ### Benchmark Results
