@@ -480,6 +480,19 @@ public:
         return stats;
     }
 
+    // Estimate total memory used by the radix tree (nodes only, via slab stats).
+    // O(1) — reads slab allocator counters, no tree traversal.
+    // Used by ranvier_radix_tree_bytes gauge for capacity planning.
+    size_t estimate_memory_bytes() const {
+        NodeSlab* s = get_node_slab();
+        if (!s) return 0;
+        auto stats = s->get_stats();
+        return stats.allocated_nodes[0] * NODE4_SIZE
+             + stats.allocated_nodes[1] * NODE16_SIZE
+             + stats.allocated_nodes[2] * NODE48_SIZE
+             + stats.allocated_nodes[3] * NODE256_SIZE;
+    }
+
 private:
     NodePtr root_;
     uint32_t block_alignment_;
