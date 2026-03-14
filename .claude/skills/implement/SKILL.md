@@ -1,5 +1,11 @@
+---
+name: implement
+description: Start a structured implementation task with staged execution. Use when the user wants to implement a new feature, add functionality, or begin a coding task.
+argument-hint: [task-description]
+---
+
 I am STARTING AN IMPLEMENTATION TASK:
-<INSERT_TASK_FROM_TODO_LIST>
+$ARGUMENTS
 
 > Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 

@@ -1,20 +1,13 @@
+---
+name: perf
+description: Investigate performance bottlenecks with Seastar-aware analysis. Use when the user asks about performance, latency, throughput, optimization, or profiling.
+argument-hint: [component-or-feature]
+allowed-tools: Read, Grep, Glob
+---
+
 ## PERFORMANCE INVESTIGATION
 
-**Area:**
-<COMPONENT_OR_FEATURE>
-
-**Observation:**
-- Current performance: <METRIC> (e.g., "500 req/s", "p99 = 50ms")
-- Target performance: <METRIC>
-- Gap: <DIFFERENCE>
-
-**Suspected hot path:**
-- `<FILE:FUNCTION>`
-
-**Evidence:**
-- [ ] Profiler data available
-- [ ] Metrics showing bottleneck
-- [ ] Anecdotal observation
+**Area:** $ARGUMENTS
 
 > Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 

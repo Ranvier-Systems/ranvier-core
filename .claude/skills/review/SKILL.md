@@ -1,5 +1,11 @@
-I have written code for:
-<INSERT_TASK_NAME>
+---
+name: review
+description: Run Hard Rules compliance review on changed code. Use when code has been written and needs review before commit, or when the user asks for a code review or self-review.
+argument-hint: [task-name]
+allowed-tools: Read, Grep, Glob
+---
+
+I have written code for: $ARGUMENTS
 
 > Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
@@ -82,4 +88,4 @@ Rule #2 - src/services/router.cc:156
 - `[NO]` - Fixes required (list above)
 
 If violations found, fix and re-run this review. Only commit when all checks pass.
-Then run `claude-doc-prompt.md` for tests and documentation.
+Then run `/doc` for tests and documentation.

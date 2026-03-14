@@ -1,11 +1,12 @@
+---
+name: debug-build
+description: Triage build or runtime failures. Use when the user pastes a compile error, link error, runtime crash, test failure, or error log, or mentions a build failure.
+argument-hint: [error-type]
+---
+
 I have a BUILD/RUNTIME FAILURE.
 
-**Error type:** [compile / link / runtime / test failure]
-
-**Error log:**
-```
-<PASTE_ERROR_LOG>
-```
+**Error type:** $ARGUMENTS
 
 > Ref: `.dev-context/claude-context.md` for build constraints, architecture, coding conventions, and the Hard Rules.
 
