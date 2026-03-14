@@ -323,7 +323,7 @@ Metrics, tracing, and logging improvements for production monitoring and debuggi
   _Location:_ `src/http_controller.cpp`, `src/metrics_service.hpp`
   _Complexity:_ Low
 
-- [ ] **Add route table size and memory metrics**
+- [x] **Add route table size and memory metrics** ✓
   _Justification:_ No visibility into route table growth. Critical for capacity planning.
   _Metrics:_ `ranvier_routes_total`, `ranvier_radix_tree_bytes`
   _Location:_ `src/radix_tree.hpp`, `src/metrics_service.hpp`

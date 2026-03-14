@@ -1029,6 +1029,30 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("Total number of compaction cycles executed")),
 
         // ====================================================================
+        // Route Table Size & Memory Metrics (BACKLOG 3.1)
+        // ====================================================================
+
+        // Current number of active routes in the radix tree (shard-local)
+        seastar::metrics::make_gauge("routes_total",
+            seastar::metrics::description("Current number of active routes in the shard-local radix tree. Use for capacity planning."),
+            [] {
+                if (!g_shard_state) return static_cast<double>(0);
+                auto* tree = g_shard_state->tree.get();
+                if (!tree) return static_cast<double>(0);
+                return static_cast<double>(tree->route_count());
+            }),
+
+        // Estimated memory consumed by radix tree nodes (bytes, shard-local)
+        seastar::metrics::make_gauge("radix_tree_bytes",
+            seastar::metrics::description("Estimated memory in bytes consumed by allocated radix tree nodes. Use for capacity planning."),
+            [] {
+                if (!g_shard_state) return static_cast<double>(0);
+                auto* tree = g_shard_state->tree.get();
+                if (!tree) return static_cast<double>(0);
+                return static_cast<double>(tree->estimate_memory_bytes());
+            }),
+
+        // ====================================================================
         // Load-Aware Routing Metrics
         // ====================================================================
 
