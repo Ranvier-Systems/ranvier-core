@@ -71,7 +71,7 @@
         stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
 
   <!-- Lower Spine: N3 → N4 -->
-  <line x1="155" y1="300" x2="155" y2="420"
+  <line x1="155" y1="300" x2="155" y2="460"
         stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
 
   <!-- Bowl Upper Half: N1 → N2 (quarter-ellipse) -->
@@ -96,8 +96,8 @@
     <line x1="163" y1="104" x2="163" y2="256"/>
     <line x1="147" y1="104" x2="147" y2="256"/>
     <!-- Spine lower -->
-    <line x1="163" y1="304" x2="163" y2="416"/>
-    <line x1="147" y1="304" x2="147" y2="416"/>
+    <line x1="163" y1="304" x2="163" y2="456"/>
+    <line x1="147" y1="304" x2="147" y2="456"/>
     <!-- Bowl upper half -->
     <path d="M 176 82 Q 355 78 355 158" transform="translate(0,-6)"/>
     <path d="M 176 82 Q 355 78 355 158" transform="translate(0,6)"/>
@@ -115,8 +115,8 @@
     <circle cx="155" cy="148" r="2" fill="#a5f3fc"/>
     <circle cx="155" cy="210" r="1.5" fill="#a5f3fc"/>
     <!-- Spine lower -->
-    <circle cx="155" cy="345" r="2" fill="#a5f3fc"/>
-    <circle cx="155" cy="390" r="1.5" fill="#a5f3fc"/>
+    <circle cx="155" cy="360" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="420" r="1.5" fill="#a5f3fc"/>
     <!-- Bowl upper -->
     <circle cx="240" cy="78" r="1.5" fill="#a5f3fc"/>
     <circle cx="320" cy="88" r="2" fill="#a5f3fc"/>
@@ -157,10 +157,10 @@
   <circle cx="260" cy="280" r="4.5" fill="#ffffff"/>
 
   <!-- N4 — spine terminal -->
-  <circle cx="155" cy="440" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+  <circle cx="155" cy="480" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
           filter="url(#pulseGlow)"/>
-  <circle cx="155" cy="440" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
-  <circle cx="155" cy="440" r="4.5" fill="#ffffff"/>
+  <circle cx="155" cy="480" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="480" r="4.5" fill="#ffffff"/>
 
   <!-- N5 — leg terminal -->
   <circle cx="360" cy="440" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
