@@ -383,7 +383,7 @@ Compaction uses **post-order traversal** — children are processed before paren
 
 ```mermaid
 flowchart TB
-    START[compact_children(node)] --> RECURSE[Recurse into each child]
+    START["compact_children(node)"] --> RECURSE[Recurse into each child]
     RECURSE --> SHRINK{Child should shrink?}
     SHRINK -->|Yes| DO_SHRINK[shrink to smallest fitting type]
     SHRINK -->|No| EMPTY
