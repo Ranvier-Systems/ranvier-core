@@ -87,7 +87,7 @@ See [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for detailed me
 
 Ranvier is evolving from a prefix-aware router into a full **Intelligence Layer for AI Inference Infrastructure**.
 
-**Current Capabilities (v0.x):**
+**Current Capabilities (v1.0):**
 - Token prefix-based routing via Adaptive Radix Tree
 - Passive route learning (learns which prefixes → which backends)
 - Backend health checking with circuit breaker
@@ -257,6 +257,7 @@ See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed co
   - [Gossip Protocol](docs/internals/gossip-protocol.md)
   - [Radix Tree](docs/internals/radix-tree.md)
   - [Prefix Affinity Routing](docs/internals/prefix-affinity-routing.md)
+- [Changelog](CHANGELOG.md)
 
 ---
 
