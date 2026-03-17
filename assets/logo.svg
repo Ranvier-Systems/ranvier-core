@@ -1,0 +1,188 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background gradient -->
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+
+    <!-- Axon segment gradient -->
+    <linearGradient id="axon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+
+    <!-- Branch gradient (teal to blue) -->
+    <linearGradient id="branch" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+
+    <!-- Node gap glow -->
+    <filter id="nodeGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="6" result="blur1"/>
+      <feGaussianBlur stdDeviation="12" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Subtle outer glow for axon -->
+    <filter id="axonGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Ambient glow for branch tips -->
+    <filter id="tipGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Large ambient pulse at nodes -->
+    <filter id="pulseGlow" x="-200%" y="-200%" width="500%" height="500%">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Dark background -->
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!-- ============================================ -->
+  <!-- MAIN AXON PATH (diagonal, lower-left to upper-right area) -->
+  <!-- ============================================ -->
+
+  <!-- Axon segment 1: bottom-left entry -->
+  <path d="M 80 420 Q 110 390 140 355"
+        stroke="url(#axon)" stroke-width="14" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- NODE GAP 1 — pulse ring -->
+  <circle cx="152" cy="340" r="22" fill="none" stroke="#67e8f9" stroke-width="1" opacity="0.15"
+          filter="url(#pulseGlow)"/>
+  <circle cx="152" cy="340" r="22" fill="none" stroke="#a5f3fc" stroke-width="0.5" opacity="0.25"/>
+  <!-- Node gap 1 — bright core -->
+  <circle cx="152" cy="340" r="5" fill="#ecfeff" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="152" cy="340" r="2.5" fill="#ffffff"/>
+
+  <!-- Axon segment 2 -->
+  <path d="M 164 325 Q 195 285 225 250"
+        stroke="url(#axon)" stroke-width="13" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- NODE GAP 2 — pulse ring -->
+  <circle cx="238" cy="234" r="24" fill="none" stroke="#67e8f9" stroke-width="1" opacity="0.15"
+          filter="url(#pulseGlow)"/>
+  <circle cx="238" cy="234" r="24" fill="none" stroke="#a5f3fc" stroke-width="0.5" opacity="0.25"/>
+  <!-- Node gap 2 — bright core -->
+  <circle cx="238" cy="234" r="6" fill="#ecfeff" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="238" cy="234" r="3" fill="#ffffff"/>
+
+  <!-- Axon segment 3 -->
+  <path d="M 252 218 Q 275 190 300 165"
+        stroke="url(#axon)" stroke-width="12" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- NODE GAP 3 — pulse ring -->
+  <circle cx="312" cy="152" r="20" fill="none" stroke="#67e8f9" stroke-width="1" opacity="0.15"
+          filter="url(#pulseGlow)"/>
+  <circle cx="312" cy="152" r="20" fill="none" stroke="#a5f3fc" stroke-width="0.5" opacity="0.25"/>
+  <!-- Node gap 3 — bright core -->
+  <circle cx="312" cy="152" r="5.5" fill="#ecfeff" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="312" cy="152" r="2.5" fill="#ffffff"/>
+
+  <!-- ============================================ -->
+  <!-- BRANCHING TREE (Adaptive Radix Tree) -->
+  <!-- Axon fans out into progressively thinner branches -->
+  <!-- ============================================ -->
+
+  <!-- Main trunk continuing from node 3 -->
+  <path d="M 324 140 Q 340 125 355 112"
+        stroke="#0891b2" stroke-width="10" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.85"/>
+
+  <!-- Primary branch A (upper) -->
+  <path d="M 355 112 Q 375 95 400 82"
+        stroke="#0ea5e9" stroke-width="7" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.8"/>
+  <!-- Branch A sub-branches -->
+  <path d="M 400 82 Q 415 72 432 62"
+        stroke="#38bdf8" stroke-width="4" stroke-linecap="round" fill="none" opacity="0.75"/>
+  <path d="M 400 82 Q 420 85 440 90"
+        stroke="#38bdf8" stroke-width="3.5" stroke-linecap="round" fill="none" opacity="0.7"/>
+  <!-- Leaf tips A -->
+  <circle cx="432" cy="62" r="3" fill="#67e8f9" filter="url(#tipGlow)" opacity="0.8"/>
+  <circle cx="440" cy="90" r="2.5" fill="#67e8f9" filter="url(#tipGlow)" opacity="0.7"/>
+
+  <!-- Primary branch B (middle-upper) -->
+  <path d="M 355 112 Q 380 110 405 115"
+        stroke="#0ea5e9" stroke-width="6.5" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.8"/>
+  <!-- Branch B sub-branches -->
+  <path d="M 405 115 Q 425 108 445 105"
+        stroke="#38bdf8" stroke-width="3.5" stroke-linecap="round" fill="none" opacity="0.7"/>
+  <path d="M 405 115 Q 425 122 445 130"
+        stroke="#38bdf8" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.65"/>
+  <!-- Leaf tips B -->
+  <circle cx="445" cy="105" r="2.5" fill="#67e8f9" filter="url(#tipGlow)" opacity="0.75"/>
+  <circle cx="445" cy="130" r="2.5" fill="#67e8f9" filter="url(#tipGlow)" opacity="0.7"/>
+
+  <!-- Primary branch C (lower) -->
+  <path d="M 355 112 Q 372 128 390 145"
+        stroke="#0ea5e9" stroke-width="6" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.75"/>
+  <!-- Branch C sub-branches -->
+  <path d="M 390 145 Q 408 140 428 138"
+        stroke="#38bdf8" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.65"/>
+  <path d="M 390 145 Q 405 158 422 168"
+        stroke="#38bdf8" stroke-width="3" stroke-linecap="round" fill="none" opacity="0.6"/>
+  <path d="M 390 145 Q 398 162 408 180"
+        stroke="#2dd4bf" stroke-width="2.5" stroke-linecap="round" fill="none" opacity="0.55"/>
+  <!-- Leaf tips C -->
+  <circle cx="428" cy="138" r="2.5" fill="#67e8f9" filter="url(#tipGlow)" opacity="0.7"/>
+  <circle cx="422" cy="168" r="2.5" fill="#5eead4" filter="url(#tipGlow)" opacity="0.65"/>
+  <circle cx="408" cy="180" r="2" fill="#5eead4" filter="url(#tipGlow)" opacity="0.55"/>
+
+  <!-- ============================================ -->
+  <!-- MYELIN SHEATH texture lines (subtle) -->
+  <!-- Fine parallel strokes along axon segments -->
+  <!-- ============================================ -->
+  <g opacity="0.12" stroke="#67e8f9" stroke-width="0.8" fill="none">
+    <!-- Segment 1 sheath lines -->
+    <path d="M 88 412 Q 115 385 140 352" transform="translate(4,-6)"/>
+    <path d="M 88 412 Q 115 385 140 352" transform="translate(-4,6)"/>
+    <!-- Segment 2 sheath lines -->
+    <path d="M 168 320 Q 198 282 226 248" transform="translate(4,-5)"/>
+    <path d="M 168 320 Q 198 282 226 248" transform="translate(-4,5)"/>
+    <!-- Segment 3 sheath lines -->
+    <path d="M 255 215 Q 278 188 300 164" transform="translate(3,-4)"/>
+    <path d="M 255 215 Q 278 188 300 164" transform="translate(-3,4)"/>
+  </g>
+
+  <!-- ============================================ -->
+  <!-- SIGNAL PARTICLES along the axon path -->
+  <!-- Small dots suggesting data/signal flow -->
+  <!-- ============================================ -->
+  <g opacity="0.4">
+    <circle cx="95" cy="405" r="1.5" fill="#a5f3fc"/>
+    <circle cx="120" cy="375" r="1" fill="#a5f3fc"/>
+    <circle cx="180" cy="305" r="1.5" fill="#a5f3fc"/>
+    <circle cx="205" cy="270" r="1" fill="#a5f3fc"/>
+    <circle cx="270" cy="200" r="1.5" fill="#a5f3fc"/>
+    <circle cx="290" cy="178" r="1" fill="#a5f3fc"/>
+    <circle cx="340" cy="125" r="1.5" fill="#a5f3fc"/>
+    <circle cx="370" cy="108" r="1" fill="#a5f3fc"/>
+  </g>
+</svg>
