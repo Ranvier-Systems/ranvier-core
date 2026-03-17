@@ -4,12 +4,20 @@
       <stop offset="0%" stop-color="#0f2847"/>
       <stop offset="100%" stop-color="#091a30"/>
     </radialGradient>
-    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#22d3ee"/>
-      <stop offset="100%" stop-color="#06b6d4"/>
-    </linearGradient>
-    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="6" result="blur"/>
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="40%" stop-color="#cffafe"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="bigGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="18" result="blur"/>
       <feMerge>
         <feMergeNode in="blur"/>
         <feMergeNode in="SourceGraphic"/>
@@ -17,55 +25,40 @@
     </filter>
   </defs>
 
-  <!-- Background with visible border -->
+  <!-- Background -->
   <rect width="512" height="512" rx="80" fill="url(#bg)"/>
-  <rect width="512" height="512" rx="80" fill="none" stroke="#164e63" stroke-width="8"/>
+  <rect width="512" height="512" rx="80" fill="none" stroke="#164e63" stroke-width="6"/>
 
-  <!--
-    RV MONOGRAM — simplified & bold for favicon clarity
-    Thicker strokes (28px), fewer nodes, no tiny particles
-  -->
+  <!-- Option A: 6 even spokes, pointed tips, clean star feel -->
 
-  <!-- ═══ SEGMENTS ═══ -->
-  <g stroke="url(#stroke)" stroke-width="28" stroke-linecap="round" fill="none" filter="url(#glow)">
-    <!-- Upper Spine: N1 → N3 -->
-    <line x1="113" y1="102" x2="113" y2="258"/>
-    <!-- Lower Spine: N3 → N4 -->
-    <line x1="113" y1="302" x2="113" y2="458"/>
-    <!-- Bowl Upper Half: N1 → N2 -->
-    <path d="M 134 82 Q 273 78 308 158"/>
-    <!-- Bowl Lower Half: N2 → N3b -->
-    <path d="M 308 202 Q 293 260 242 276"/>
-    <!-- Horizontal Bar: N3 → N3b -->
-    <line x1="134" y1="280" x2="196" y2="280"/>
-    <!-- Leg / V-left: N3b → N5 -->
-    <line x1="228" y1="300" x2="308" y2="462"/>
-    <!-- V-right: N5 → N6 -->
-    <line x1="330" y1="462" x2="392" y2="198"/>
+  <!-- Spokes -->
+  <g stroke="#06b6d4" stroke-width="20" stroke-linecap="round" filter="url(#glow)">
+    <!-- Up -->
+    <line x1="256" y1="180" x2="256" y2="68"/>
+    <!-- Down -->
+    <line x1="256" y1="332" x2="256" y2="444"/>
+    <!-- Upper-right -->
+    <line x1="322" y1="218" x2="419" y2="162"/>
+    <!-- Lower-right -->
+    <line x1="322" y1="294" x2="419" y2="350"/>
+    <!-- Upper-left -->
+    <line x1="190" y1="218" x2="93" y2="162"/>
+    <!-- Lower-left -->
+    <line x1="190" y1="294" x2="93" y2="350"/>
   </g>
 
-  <!-- ═══ NODES — bright, bold dots ═══ -->
+  <!-- Spoke tip nodes -->
   <g>
-    <!-- N1 — top -->
-    <circle cx="113" cy="80" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="113" cy="80" r="6" fill="#ffffff"/>
-    <!-- N2 — bowl apex -->
-    <circle cx="313" cy="180" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="313" cy="180" r="6" fill="#ffffff"/>
-    <!-- N3 — junction -->
-    <circle cx="113" cy="280" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="113" cy="280" r="6" fill="#ffffff"/>
-    <!-- N3b — kick point -->
-    <circle cx="218" cy="280" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="218" cy="280" r="6" fill="#ffffff"/>
-    <!-- N4 — spine terminal -->
-    <circle cx="113" cy="480" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="113" cy="480" r="6" fill="#ffffff"/>
-    <!-- N5 — V bottom -->
-    <circle cx="318" cy="480" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="318" cy="480" r="6" fill="#ffffff"/>
-    <!-- N6 — V right top -->
-    <circle cx="398" cy="180" r="12" fill="#a5f3fc" filter="url(#glow)"/>
-    <circle cx="398" cy="180" r="6" fill="#ffffff"/>
+    <circle cx="256" cy="60" r="10" fill="#67e8f9" filter="url(#glow)"/>
+    <circle cx="256" cy="452" r="10" fill="#67e8f9" filter="url(#glow)"/>
+    <circle cx="425" cy="158" r="10" fill="#67e8f9" filter="url(#glow)"/>
+    <circle cx="425" cy="354" r="10" fill="#67e8f9" filter="url(#glow)"/>
+    <circle cx="87" cy="158" r="10" fill="#67e8f9" filter="url(#glow)"/>
+    <circle cx="87" cy="354" r="10" fill="#67e8f9" filter="url(#glow)"/>
   </g>
+
+  <!-- Center core -->
+  <circle cx="256" cy="256" r="55" fill="#22d3ee" opacity="0.15" filter="url(#bigGlow)"/>
+  <circle cx="256" cy="256" r="36" fill="#a5f3fc" filter="url(#glow)" opacity="0.9"/>
+  <circle cx="256" cy="256" r="20" fill="#ffffff"/>
 </svg>
