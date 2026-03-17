@@ -139,32 +139,32 @@
   <circle cx="155" cy="80" r="4.5" fill="#ffffff"/>
 
   <!-- N2 — bowl apex -->
-  <circle cx="355" cy="180" r="28" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+  <circle cx="355" cy="180" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
           filter="url(#pulseGlow)"/>
-  <circle cx="355" cy="180" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
-  <circle cx="355" cy="180" r="4" fill="#ffffff"/>
+  <circle cx="355" cy="180" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="355" cy="180" r="4.5" fill="#ffffff"/>
 
-  <!-- N3 — junction: spine + horizontal bar (largest) -->
-  <circle cx="155" cy="280" r="34" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.14"
+  <!-- N3 — junction: spine + horizontal bar -->
+  <circle cx="155" cy="280" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
           filter="url(#pulseGlow)"/>
-  <circle cx="155" cy="280" r="11" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
-  <circle cx="155" cy="280" r="5.5" fill="#ffffff"/>
+  <circle cx="155" cy="280" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="280" r="4.5" fill="#ffffff"/>
 
   <!-- N3b — kick point: horizontal bar + bowl return + leg -->
-  <circle cx="260" cy="280" r="28" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+  <circle cx="260" cy="280" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
           filter="url(#pulseGlow)"/>
-  <circle cx="260" cy="280" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
-  <circle cx="260" cy="280" r="4" fill="#ffffff"/>
+  <circle cx="260" cy="280" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="260" cy="280" r="4.5" fill="#ffffff"/>
 
   <!-- N4 — spine terminal -->
-  <circle cx="155" cy="440" r="28" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+  <circle cx="155" cy="440" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
           filter="url(#pulseGlow)"/>
-  <circle cx="155" cy="440" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
-  <circle cx="155" cy="440" r="4" fill="#ffffff"/>
+  <circle cx="155" cy="440" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="440" r="4.5" fill="#ffffff"/>
 
   <!-- N5 — leg terminal -->
-  <circle cx="360" cy="440" r="28" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+  <circle cx="360" cy="440" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
           filter="url(#pulseGlow)"/>
-  <circle cx="360" cy="440" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
-  <circle cx="360" cy="440" r="4" fill="#ffffff"/>
+  <circle cx="360" cy="440" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="360" cy="440" r="4.5" fill="#ffffff"/>
 </svg>
