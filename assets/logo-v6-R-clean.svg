@@ -105,8 +105,8 @@
     <path d="M 355 202 Q 355 280 242 280" transform="translate(0,-6)"/>
     <path d="M 355 202 Q 355 280 242 280" transform="translate(0,6)"/>
     <!-- Leg -->
-    <line x1="234" y1="296" x2="346" y2="424" transform="translate(-5,5)"/>
-    <line x1="234" y1="296" x2="346" y2="424" transform="translate(5,-5)"/>
+    <line x1="272" y1="294" x2="346" y2="424" transform="translate(-5,5)"/>
+    <line x1="272" y1="294" x2="346" y2="424" transform="translate(5,-5)"/>
   </g>
 
   <!-- ═══ Signal Particles ═══ -->
