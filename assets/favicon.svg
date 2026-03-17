@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0f2847"/>
+      <stop offset="100%" stop-color="#091a30"/>
+    </radialGradient>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background with visible border -->
+  <rect width="512" height="512" rx="80" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="80" fill="none" stroke="#164e63" stroke-width="8"/>
+
+  <!--
+    RV MONOGRAM — simplified & bold for favicon clarity
+    Thicker strokes (28px), fewer nodes, no tiny particles
+  -->
+
+  <!-- ═══ SEGMENTS ═══ -->
+  <g stroke="url(#stroke)" stroke-width="28" stroke-linecap="round" fill="none" filter="url(#glow)">
+    <!-- Upper Spine: N1 → N3 -->
+    <line x1="113" y1="102" x2="113" y2="258"/>
+    <!-- Lower Spine: N3 → N4 -->
+    <line x1="113" y1="302" x2="113" y2="458"/>
+    <!-- Bowl Upper Half: N1 → N2 -->
+    <path d="M 134 82 Q 273 78 308 158"/>
+    <!-- Bowl Lower Half: N2 → N3b -->
+    <path d="M 308 202 Q 293 260 242 276"/>
+    <!-- Horizontal Bar: N3 → N3b -->
+    <line x1="134" y1="280" x2="196" y2="280"/>
+    <!-- Leg / V-left: N3b → N5 -->
+    <line x1="228" y1="300" x2="308" y2="462"/>
+    <!-- V-right: N5 → N6 -->
+    <line x1="330" y1="462" x2="392" y2="198"/>
+  </g>
+
+  <!-- ═══ NODES — bright, bold dots ═══ -->
+  <g>
+    <!-- N1 — top -->
+    <circle cx="113" cy="80" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="113" cy="80" r="6" fill="#ffffff"/>
+    <!-- N2 — bowl apex -->
+    <circle cx="313" cy="180" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="313" cy="180" r="6" fill="#ffffff"/>
+    <!-- N3 — junction -->
+    <circle cx="113" cy="280" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="113" cy="280" r="6" fill="#ffffff"/>
+    <!-- N3b — kick point -->
+    <circle cx="218" cy="280" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="218" cy="280" r="6" fill="#ffffff"/>
+    <!-- N4 — spine terminal -->
+    <circle cx="113" cy="480" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="113" cy="480" r="6" fill="#ffffff"/>
+    <!-- N5 — V bottom -->
+    <circle cx="318" cy="480" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="318" cy="480" r="6" fill="#ffffff"/>
+    <!-- N6 — V right top -->
+    <circle cx="398" cy="180" r="12" fill="#a5f3fc" filter="url(#glow)"/>
+    <circle cx="398" cy="180" r="6" fill="#ffffff"/>
+  </g>
+</svg>
