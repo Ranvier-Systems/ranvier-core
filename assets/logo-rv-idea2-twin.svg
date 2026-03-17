@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+    <filter id="nodeGlow" x="-150%" y="-150%" width="400%" height="400%">
+      <feGaussianBlur stdDeviation="8" result="blur1"/>
+      <feGaussianBlur stdDeviation="16" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="pulseGlow" x="-250%" y="-250%" width="600%" height="600%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge><feMergeNode in="blur"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!--
+    IDEA 2 — "Twin Axons"
+    R and V side by side, separate letters, aligned baselines.
+    Clean corporate feel. Two independent neural structures.
+
+    R Nodes:
+      N1  (108, 72)   — R top
+      N2  (222, 148)  — R bowl apex
+      N3  (108, 228)  — R junction
+      N3b (178, 228)  — R kick
+      N4  (108, 448)  — R spine terminal
+      N5  (248, 448)  — R leg terminal
+    V Nodes:
+      N6  (302, 72)   — V left top
+      N7  (370, 448)  — V bottom
+      N8  (438, 72)   — V right top
+  -->
+
+  <!-- ═══ R SEGMENTS ═══ -->
+  <!-- Upper Spine: N1 → N3 -->
+  <line x1="108" y1="94" x2="108" y2="206"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- Lower Spine: N3 → N4 -->
+  <line x1="108" y1="250" x2="108" y2="426"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- Bowl Upper: N1 → N2 -->
+  <path d="M 128 74 Q 260 68 218 128"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <!-- Bowl Lower: N2 → N3b -->
+  <path d="M 218 168 Q 205 210 198 222"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <!-- Horizontal Bar: N3 → N3b -->
+  <line x1="128" y1="228" x2="158" y2="228"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- Leg: N3b → N5 -->
+  <line x1="190" y1="244" x2="238" y2="432"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+
+  <!-- ═══ V SEGMENTS ═══ -->
+  <!-- V Left Arm: N6 → N7 -->
+  <line x1="312" y1="92" x2="360" y2="428"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- V Right Arm: N7 → N8 -->
+  <line x1="380" y1="428" x2="428" y2="92"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+
+  <!-- ═══ Signal Particles ═══ -->
+  <g opacity="0.35">
+    <!-- R spine -->
+    <circle cx="108" cy="140" r="2" fill="#a5f3fc"/>
+    <circle cx="108" cy="330" r="2" fill="#a5f3fc"/>
+    <circle cx="108" cy="400" r="1.5" fill="#a5f3fc"/>
+    <!-- R bowl -->
+    <circle cx="185" cy="78" r="1.5" fill="#a5f3fc"/>
+    <circle cx="222" cy="96" r="2" fill="#a5f3fc"/>
+    <circle cx="212" cy="190" r="1.5" fill="#a5f3fc"/>
+    <!-- R leg -->
+    <circle cx="208" cy="320" r="2" fill="#a5f3fc"/>
+    <circle cx="225" cy="390" r="1.5" fill="#a5f3fc"/>
+    <!-- V left -->
+    <circle cx="328" cy="185" r="2" fill="#a5f3fc"/>
+    <circle cx="345" cy="320" r="1.5" fill="#a5f3fc"/>
+    <!-- V right -->
+    <circle cx="412" cy="185" r="2" fill="#a5f3fc"/>
+    <circle cx="398" cy="320" r="1.5" fill="#a5f3fc"/>
+  </g>
+
+  <!-- ═══ R NODES ═══ -->
+  <!-- N1 — R top -->
+  <circle cx="108" cy="72" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="108" cy="72" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="108" cy="72" r="4.5" fill="#ffffff"/>
+  <!-- N2 — bowl apex -->
+  <circle cx="222" cy="148" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="222" cy="148" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="222" cy="148" r="4.5" fill="#ffffff"/>
+  <!-- N3 — junction -->
+  <circle cx="108" cy="228" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="108" cy="228" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="108" cy="228" r="4.5" fill="#ffffff"/>
+  <!-- N3b — kick -->
+  <circle cx="178" cy="228" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="178" cy="228" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="178" cy="228" r="4.5" fill="#ffffff"/>
+  <!-- N4 — spine terminal -->
+  <circle cx="108" cy="448" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="108" cy="448" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="108" cy="448" r="4.5" fill="#ffffff"/>
+  <!-- N5 — R leg terminal -->
+  <circle cx="248" cy="448" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="248" cy="448" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="248" cy="448" r="4.5" fill="#ffffff"/>
+
+  <!-- ═══ V NODES ═══ -->
+  <!-- N6 — V left top -->
+  <circle cx="302" cy="72" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="302" cy="72" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="302" cy="72" r="4.5" fill="#ffffff"/>
+  <!-- N7 — V bottom -->
+  <circle cx="370" cy="448" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="370" cy="448" r="11" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="370" cy="448" r="5.5" fill="#ffffff"/>
+  <!-- N8 — V right top -->
+  <circle cx="438" cy="72" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="438" cy="72" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="438" cy="72" r="4.5" fill="#ffffff"/>
+</svg>
