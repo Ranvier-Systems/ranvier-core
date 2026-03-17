@@ -1,0 +1,195 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+
+    <!-- Axon gradients per segment direction -->
+    <linearGradient id="axonDown" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#0e7490"/>
+    </linearGradient>
+    <linearGradient id="axonRight" x1="0" y1="0.5" x2="1" y2="0.5">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="axonReturn" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="axonKick" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#0e7490"/>
+    </linearGradient>
+
+    <!-- Glow filters -->
+    <filter id="nodeGlow" x="-200%" y="-200%" width="500%" height="500%">
+      <feGaussianBlur stdDeviation="6" result="b1"/>
+      <feGaussianBlur stdDeviation="14" result="b2"/>
+      <feMerge>
+        <feMergeNode in="b2"/>
+        <feMergeNode in="b1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="axonGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="4.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="haloGlow" x="-300%" y="-300%" width="700%" height="700%">
+      <feGaussianBlur stdDeviation="20" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+    <filter id="termGlow" x="-200%" y="-200%" width="500%" height="500%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!--
+    LETTER R — 5 axon segments, 5 nodes (Nodes of Ranvier)
+
+    Node layout:
+      N1 (top-left)     — where spine starts & bowl departs
+      N2 (bowl apex)    — rightmost point of the bowl curve
+      N3 (junction)     — KEY NODE: bowl returns, spine continues, leg departs
+      N4 (spine end)    — bottom of the vertical stroke
+      N5 (leg end)      — tip of the diagonal kick
+
+    Segments:
+      S1: N1 → N3  upper spine (vertical)
+      S2: N3 → N4  lower spine (vertical)
+      S3: N1 → N2  bowl outward (curve right)
+      S4: N2 → N3  bowl return  (curve back left)
+      S5: N3 → N5  leg kick     (diagonal)
+
+    Node positions chosen for good R proportions in 512x512:
+      N1: (152, 72)
+      N2: (362, 148)
+      N3: (152, 280)
+      N4: (152, 442)
+      N5: (372, 442)
+  -->
+
+  <!-- ═══ SEGMENT S1: Upper Spine — N1 to N3 (vertical) ═══ -->
+  <line x1="152" y1="95" x2="152" y2="258"
+        stroke="url(#axonDown)" stroke-width="22" stroke-linecap="round"
+        filter="url(#axonGlow)" opacity="0.92"/>
+  <!-- Myelin sheath lines -->
+  <line x1="162" y1="100" x2="162" y2="253" stroke="#67e8f9" stroke-width="0.8" opacity="0.1"/>
+  <line x1="142" y1="100" x2="142" y2="253" stroke="#67e8f9" stroke-width="0.8" opacity="0.1"/>
+  <!-- Signal particles -->
+  <circle cx="152" cy="130" r="2" fill="#a5f3fc" opacity="0.4"/>
+  <circle cx="152" cy="175" r="1.5" fill="#a5f3fc" opacity="0.3"/>
+  <circle cx="152" cy="220" r="1.8" fill="#a5f3fc" opacity="0.35"/>
+
+  <!-- ═══ SEGMENT S2: Lower Spine — N3 to N4 (vertical) ═══ -->
+  <line x1="152" y1="302" x2="152" y2="420"
+        stroke="url(#axonDown)" stroke-width="22" stroke-linecap="round"
+        filter="url(#axonGlow)" opacity="0.92"/>
+  <!-- Myelin sheath lines -->
+  <line x1="162" y1="307" x2="162" y2="415" stroke="#67e8f9" stroke-width="0.8" opacity="0.1"/>
+  <line x1="142" y1="307" x2="142" y2="415" stroke="#67e8f9" stroke-width="0.8" opacity="0.1"/>
+  <!-- Signal particles -->
+  <circle cx="152" cy="340" r="1.5" fill="#a5f3fc" opacity="0.3"/>
+  <circle cx="152" cy="385" r="2" fill="#a5f3fc" opacity="0.35"/>
+
+  <!-- ═══ SEGMENT S3: Bowl Out — N1 to N2 (curve right) ═══ -->
+  <path d="M 172 78 Q 260 48 332 72 Q 380 92 385 136"
+        stroke="url(#axonRight)" stroke-width="20" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.88"/>
+  <!-- Myelin sheath -->
+  <path d="M 172 78 Q 260 48 332 72 Q 380 92 385 136"
+        stroke="#67e8f9" stroke-width="0.8" fill="none" opacity="0.09"
+        transform="translate(0,-7)"/>
+  <path d="M 172 78 Q 260 48 332 72 Q 380 92 385 136"
+        stroke="#67e8f9" stroke-width="0.8" fill="none" opacity="0.09"
+        transform="translate(0,7)"/>
+  <!-- Signal particles -->
+  <circle cx="230" cy="58" r="1.8" fill="#a5f3fc" opacity="0.35"/>
+  <circle cx="310" cy="68" r="1.5" fill="#a5f3fc" opacity="0.3"/>
+  <circle cx="365" cy="100" r="2" fill="#a5f3fc" opacity="0.4"/>
+
+  <!-- ═══ SEGMENT S4: Bowl Return — N2 to N3 (curve back left) ═══ -->
+  <path d="M 378 170 Q 370 225 320 258 Q 265 290 174 284"
+        stroke="url(#axonReturn)" stroke-width="20" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.88"/>
+  <!-- Myelin sheath -->
+  <path d="M 378 170 Q 370 225 320 258 Q 265 290 174 284"
+        stroke="#67e8f9" stroke-width="0.8" fill="none" opacity="0.09"
+        transform="translate(0,-7)"/>
+  <path d="M 378 170 Q 370 225 320 258 Q 265 290 174 284"
+        stroke="#67e8f9" stroke-width="0.8" fill="none" opacity="0.09"
+        transform="translate(0,7)"/>
+  <!-- Signal particles -->
+  <circle cx="365" cy="205" r="1.5" fill="#a5f3fc" opacity="0.3"/>
+  <circle cx="310" cy="255" r="2" fill="#a5f3fc" opacity="0.35"/>
+  <circle cx="235" cy="280" r="1.5" fill="#a5f3fc" opacity="0.3"/>
+
+  <!-- ═══ SEGMENT S5: Leg Kick — N3 to N5 (diagonal) ═══ -->
+  <path d="M 173 296 Q 240 350 300 395 Q 345 425 352 435"
+        stroke="url(#axonKick)" stroke-width="18" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.85"/>
+  <!-- Myelin sheath -->
+  <path d="M 173 296 Q 240 350 300 395 Q 345 425 352 435"
+        stroke="#67e8f9" stroke-width="0.8" fill="none" opacity="0.09"
+        transform="translate(-5,5)"/>
+  <path d="M 173 296 Q 240 350 300 395 Q 345 425 352 435"
+        stroke="#67e8f9" stroke-width="0.8" fill="none" opacity="0.09"
+        transform="translate(5,-5)"/>
+  <!-- Signal particles -->
+  <circle cx="220" cy="335" r="2" fill="#a5f3fc" opacity="0.35"/>
+  <circle cx="280" cy="380" r="1.5" fill="#a5f3fc" opacity="0.3"/>
+  <circle cx="330" cy="415" r="1.8" fill="#a5f3fc" opacity="0.35"/>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- NODES — Nodes of Ranvier at every segment junction -->
+  <!-- Each: outer halo → bright ring → core → white center -->
+  <!-- ═══════════════════════════════════════════════════ -->
+
+  <!-- NODE N1 — top-left: spine start + bowl departure -->
+  <circle cx="152" cy="78" r="28" fill="none" stroke="#67e8f9" stroke-width="1.2" opacity="0.12"
+          filter="url(#haloGlow)"/>
+  <circle cx="152" cy="78" r="13" fill="#b2f5ea" filter="url(#nodeGlow)" opacity="0.9"/>
+  <circle cx="152" cy="78" r="6" fill="#e0fcff"/>
+  <circle cx="152" cy="78" r="3" fill="#ffffff"/>
+
+  <!-- NODE N2 — bowl apex: rightmost point -->
+  <circle cx="382" cy="152" r="28" fill="none" stroke="#67e8f9" stroke-width="1.2" opacity="0.12"
+          filter="url(#haloGlow)"/>
+  <circle cx="382" cy="152" r="13" fill="#b2f5ea" filter="url(#nodeGlow)" opacity="0.9"/>
+  <circle cx="382" cy="152" r="6" fill="#e0fcff"/>
+  <circle cx="382" cy="152" r="3" fill="#ffffff"/>
+
+  <!-- NODE N3 — KEY JUNCTION: bowl return + spine + leg (biggest node) -->
+  <circle cx="152" cy="280" r="38" fill="none" stroke="#67e8f9" stroke-width="1.8" opacity="0.16"
+          filter="url(#haloGlow)"/>
+  <circle cx="152" cy="280" r="16" fill="#b2f5ea" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="152" cy="280" r="7.5" fill="#e0fcff"/>
+  <circle cx="152" cy="280" r="3.5" fill="#ffffff"/>
+
+  <!-- NODE N4 — spine terminal: bottom-left -->
+  <circle cx="152" cy="436" r="24" fill="none" stroke="#67e8f9" stroke-width="1" opacity="0.1"
+          filter="url(#haloGlow)"/>
+  <circle cx="152" cy="436" r="11" fill="#b2f5ea" filter="url(#nodeGlow)" opacity="0.85"/>
+  <circle cx="152" cy="436" r="5" fill="#e0fcff"/>
+  <circle cx="152" cy="436" r="2.5" fill="#ffffff"/>
+
+  <!-- NODE N5 — leg terminal: bottom-right -->
+  <circle cx="362" cy="442" r="24" fill="none" stroke="#67e8f9" stroke-width="1" opacity="0.1"
+          filter="url(#haloGlow)"/>
+  <circle cx="362" cy="442" r="11" fill="#b2f5ea" filter="url(#nodeGlow)" opacity="0.85"/>
+  <circle cx="362" cy="442" r="5" fill="#e0fcff"/>
+  <circle cx="362" cy="442" r="2.5" fill="#ffffff"/>
+</svg>
