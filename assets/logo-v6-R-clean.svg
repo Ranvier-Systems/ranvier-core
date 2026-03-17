@@ -68,33 +68,27 @@
 
   <!-- Upper Spine: N1 → N3 -->
   <line x1="155" y1="100" x2="155" y2="260"
-        stroke="url(#axonV)" stroke-width="18" stroke-linecap="round"
-        filter="url(#axonGlow)"/>
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
 
   <!-- Lower Spine: N3 → N4 -->
   <line x1="155" y1="300" x2="155" y2="420"
-        stroke="url(#axonV)" stroke-width="18" stroke-linecap="round"
-        filter="url(#axonGlow)"/>
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
 
   <!-- Bowl Upper Half: N1 → N2 (quarter-ellipse) -->
   <path d="M 176 82 Q 355 78 355 158"
-        stroke="url(#axon)" stroke-width="18" stroke-linecap="round" fill="none"
-        filter="url(#axonGlow)"/>
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round" fill="none"/>
 
   <!-- Bowl Lower Half: N2 → N3b (quarter-ellipse) -->
   <path d="M 355 202 Q 355 280 242 280"
-        stroke="url(#axon)" stroke-width="18" stroke-linecap="round" fill="none"
-        filter="url(#axonGlow)"/>
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round" fill="none"/>
 
   <!-- Horizontal Bar: N3 → N3b -->
   <line x1="176" y1="280" x2="198" y2="280"
-        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
-        filter="url(#axonGlow)"/>
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
 
   <!-- Leg: N3b → N5 -->
   <line x1="234" y1="296" x2="346" y2="424"
-        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
-        filter="url(#axonGlow)"/>
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
 
   <!-- ═══ Myelin Sheath — subtle parallel lines ═══ -->
   <g opacity="0.1" stroke="#67e8f9" stroke-width="1" fill="none">
