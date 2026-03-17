@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+    <linearGradient id="axonCW" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <filter id="nodeGlow" x="-150%" y="-150%" width="400%" height="400%">
+      <feGaussianBlur stdDeviation="8" result="blur1"/>
+      <feGaussianBlur stdDeviation="16" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="axonGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="pulseGlow" x="-250%" y="-250%" width="600%" height="600%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+    <filter id="tipGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!-- BRAIN SHAPE: rounded organic form made from axon segments -->
+  <!-- Two hemispheres suggested by curved axon paths with a central fissure -->
+  <!-- Node gaps at key junctions where signals route -->
+
+  <!-- === LEFT HEMISPHERE === -->
+
+  <!-- Left upper lobe -->
+  <path d="M 248 380 Q 130 360 95 270 Q 65 190 120 120 Q 175 60 248 75"
+        stroke="url(#axonCW)" stroke-width="18" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.85"/>
+
+  <!-- Myelin sheath left -->
+  <path d="M 248 380 Q 130 360 95 270 Q 65 190 120 120 Q 175 60 248 75"
+        stroke="#67e8f9" stroke-width="1" fill="none" opacity="0.08"
+        transform="translate(-6,0)"/>
+  <path d="M 248 380 Q 130 360 95 270 Q 65 190 120 120 Q 175 60 248 75"
+        stroke="#67e8f9" stroke-width="1" fill="none" opacity="0.08"
+        transform="translate(6,0)"/>
+
+  <!-- Node L1 — left side, mid-height -->
+  <circle cx="88" cy="230" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.14"
+          filter="url(#pulseGlow)"/>
+  <circle cx="88" cy="230" r="10" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="88" cy="230" r="5" fill="#ffffff"/>
+
+  <!-- Node L2 — upper left -->
+  <circle cx="140" cy="105" r="26" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="140" cy="105" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="140" cy="105" r="4" fill="#ffffff"/>
+
+  <!-- Left internal fold -->
+  <path d="M 150 330 Q 130 280 140 230 Q 150 180 180 140"
+        stroke="#0891b2" stroke-width="10" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.5"/>
+
+  <!-- === RIGHT HEMISPHERE === -->
+
+  <!-- Right upper lobe -->
+  <path d="M 264 75 Q 337 60 392 120 Q 447 190 417 270 Q 382 360 264 380"
+        stroke="url(#axonCW)" stroke-width="18" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.85"/>
+
+  <!-- Myelin sheath right -->
+  <path d="M 264 75 Q 337 60 392 120 Q 447 190 417 270 Q 382 360 264 380"
+        stroke="#67e8f9" stroke-width="1" fill="none" opacity="0.08"
+        transform="translate(6,0)"/>
+  <path d="M 264 75 Q 337 60 392 120 Q 447 190 417 270 Q 382 360 264 380"
+        stroke="#67e8f9" stroke-width="1" fill="none" opacity="0.08"
+        transform="translate(-6,0)"/>
+
+  <!-- Node R1 — right side, mid-height -->
+  <circle cx="424" cy="230" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.14"
+          filter="url(#pulseGlow)"/>
+  <circle cx="424" cy="230" r="10" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="424" cy="230" r="5" fill="#ffffff"/>
+
+  <!-- Node R2 — upper right -->
+  <circle cx="372" cy="105" r="26" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="372" cy="105" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="372" cy="105" r="4" fill="#ffffff"/>
+
+  <!-- Right internal fold -->
+  <path d="M 362 330 Q 382 280 372 230 Q 362 180 332 140"
+        stroke="#0891b2" stroke-width="10" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.5"/>
+
+  <!-- === CENTRAL FISSURE (dividing line / stem) === -->
+
+  <!-- Top bridge connecting hemispheres -->
+  <path d="M 248 75 L 264 75"
+        stroke="#06b6d4" stroke-width="16" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- Node top-center -->
+  <circle cx="256" cy="75" r="28" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.15"
+          filter="url(#pulseGlow)"/>
+  <circle cx="256" cy="75" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="256" cy="75" r="4.5" fill="#ffffff"/>
+
+  <!-- Central stem down -->
+  <path d="M 256 90 L 256 380"
+        stroke="#0891b2" stroke-width="6" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.35"/>
+
+  <!-- Brainstem / spinal exit -->
+  <path d="M 248 380 Q 252 405 256 430"
+        stroke="url(#axonCW)" stroke-width="14" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.7"/>
+  <path d="M 264 380 Q 260 405 256 430"
+        stroke="url(#axonCW)" stroke-width="14" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.7"/>
+
+  <!-- Node at brainstem -->
+  <circle cx="256" cy="380" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.14"
+          filter="url(#pulseGlow)"/>
+  <circle cx="256" cy="380" r="10" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="256" cy="380" r="5" fill="#ffffff"/>
+
+  <!-- Stem tip -->
+  <circle cx="256" cy="445" r="4" fill="#5eead4" filter="url(#tipGlow)" opacity="0.7"/>
+
+  <!-- Signal particles -->
+  <g opacity="0.35">
+    <circle cx="110" cy="160" r="2" fill="#a5f3fc"/>
+    <circle cx="85" cy="300" r="1.5" fill="#a5f3fc"/>
+    <circle cx="170" cy="365" r="2" fill="#a5f3fc"/>
+    <circle cx="200" cy="80" r="1.5" fill="#a5f3fc"/>
+    <circle cx="312" cy="80" r="1.5" fill="#a5f3fc"/>
+    <circle cx="402" cy="160" r="2" fill="#a5f3fc"/>
+    <circle cx="427" cy="300" r="1.5" fill="#a5f3fc"/>
+    <circle cx="342" cy="365" r="2" fill="#a5f3fc"/>
+    <circle cx="256" cy="200" r="1.5" fill="#a5f3fc"/>
+    <circle cx="256" cy="300" r="1.5" fill="#a5f3fc"/>
+  </g>
+</svg>

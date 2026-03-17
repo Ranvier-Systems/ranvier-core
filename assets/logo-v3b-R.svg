@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+    <linearGradient id="axonV" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#0e7490"/>
+    </linearGradient>
+    <linearGradient id="axonH" x1="0" y1="0.5" x2="1" y2="0.5">
+      <stop offset="0%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <filter id="nodeGlow" x="-150%" y="-150%" width="400%" height="400%">
+      <feGaussianBlur stdDeviation="8" result="blur1"/>
+      <feGaussianBlur stdDeviation="16" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="axonGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="pulseGlow" x="-250%" y="-250%" width="600%" height="600%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!-- LETTER R built from axon segments with node gaps -->
+  <!-- Vertical stroke = spine, curved bowl = top arc, leg = kick -->
+
+  <!-- === VERTICAL SPINE (left side of R) === -->
+
+  <!-- Spine segment 1: top -->
+  <path d="M 155 75 L 155 165"
+        stroke="url(#axonV)" stroke-width="20" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- Node A — top of spine -->
+  <circle cx="155" cy="165" r="28" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.13"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="165" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="165" r="4.5" fill="#ffffff"/>
+
+  <!-- Spine segment 2: middle -->
+  <path d="M 155 180 L 155 290"
+        stroke="url(#axonV)" stroke-width="20" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- Node B — junction where bowl meets spine and leg starts -->
+  <circle cx="155" cy="290" r="34" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.16"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="290" r="11" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="290" r="5.5" fill="#ffffff"/>
+
+  <!-- Spine segment 3: bottom -->
+  <path d="M 155 305 L 155 435"
+        stroke="url(#axonV)" stroke-width="20" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- === BOWL (curved top of R) === -->
+
+  <!-- Bowl segment: from top of spine, arcs right and curves back to junction -->
+  <path d="M 155 75 Q 165 70 210 68 Q 340 65 350 140 Q 358 210 270 260 Q 220 285 155 290"
+        stroke="#0ea5e9" stroke-width="18" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.82"/>
+
+  <!-- Myelin sheath on bowl -->
+  <path d="M 155 75 Q 165 70 210 68 Q 340 65 350 140 Q 358 210 270 260 Q 220 285 155 290"
+        stroke="#67e8f9" stroke-width="1" fill="none" opacity="0.08"
+        transform="translate(0,-7)"/>
+  <path d="M 155 75 Q 165 70 210 68 Q 340 65 350 140 Q 358 210 270 260 Q 220 285 155 290"
+        stroke="#67e8f9" stroke-width="1" fill="none" opacity="0.08"
+        transform="translate(0,7)"/>
+
+  <!-- Node on bowl apex -->
+  <circle cx="350" cy="140" r="26" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="350" cy="140" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="350" cy="140" r="4" fill="#ffffff"/>
+
+  <!-- === LEG (diagonal kick of R) === -->
+
+  <!-- Leg segment: from junction, kicks down-right -->
+  <path d="M 155 290 Q 220 330 290 385 Q 330 415 365 440"
+        stroke="#0ea5e9" stroke-width="16" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.78"/>
+
+  <!-- Node on leg -->
+  <circle cx="290" cy="385" r="26" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="290" cy="385" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="290" cy="385" r="4" fill="#ffffff"/>
+
+  <!-- Myelin sheath on spine -->
+  <g opacity="0.08" stroke="#67e8f9" stroke-width="1" fill="none">
+    <line x1="163" y1="78" x2="163" y2="160"/>
+    <line x1="147" y1="78" x2="147" y2="160"/>
+    <line x1="163" y1="185" x2="163" y2="285"/>
+    <line x1="147" y1="185" x2="147" y2="285"/>
+    <line x1="163" y1="310" x2="163" y2="430"/>
+    <line x1="147" y1="310" x2="147" y2="430"/>
+  </g>
+
+  <!-- Signal particles -->
+  <g opacity="0.35">
+    <circle cx="155" cy="105" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="140" r="1.5" fill="#a5f3fc"/>
+    <circle cx="155" cy="230" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="260" r="1.5" fill="#a5f3fc"/>
+    <circle cx="155" cy="350" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="400" r="1.5" fill="#a5f3fc"/>
+    <circle cx="250" cy="72" r="1.5" fill="#a5f3fc"/>
+    <circle cx="310" cy="85" r="2" fill="#a5f3fc"/>
+    <circle cx="310" cy="240" r="1.5" fill="#a5f3fc"/>
+    <circle cx="220" cy="340" r="2" fill="#a5f3fc"/>
+    <circle cx="340" cy="420" r="1.5" fill="#a5f3fc"/>
+  </g>
+</svg>
