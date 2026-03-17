@@ -30,9 +30,9 @@ The Helm chart deploys Ranvier as a **StatefulSet** with the following component
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Kubernetes Cluster                        │
+│                        Kubernetes Cluster                       │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
+│                                                                 │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │
 │  │  ranvier-0  │  │  ranvier-1  │  │  ranvier-2  │              │
 │  │             │  │             │  │             │              │
@@ -40,19 +40,19 @@ The Helm chart deploys Ranvier as a **StatefulSet** with the following component
 │  │  Port 9180  │  │  Port 9180  │  │  Port 9180  │  ◄── Metrics │
 │  │  Port 9190  │  │  Port 9190  │  │  Port 9190  │  ◄── Gossip  │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘              │
-│         │                │                │                      │
-│         └────────────────┼────────────────┘                      │
-│                          │                                       │
+│         │                │                │                     │
+│         └────────────────┼────────────────┘                     │
+│                          │                                      │
 │              ┌───────────▼───────────┐                          │
 │              │  ranvier-headless     │  (DNS-based discovery)   │
 │              │  ClusterIP: None      │                          │
 │              └───────────────────────┘                          │
-│                                                                   │
+│                                                                 │
 │              ┌───────────────────────┐                          │
 │              │  ranvier (Service)    │  (Load-balanced API)     │
 │              │  ClusterIP/LB         │                          │
 │              └───────────────────────┘                          │
-│                                                                   │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
