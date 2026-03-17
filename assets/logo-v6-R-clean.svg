@@ -6,8 +6,15 @@
       <stop offset="100%" stop-color="#060d1a"/>
     </radialGradient>
 
-    <!-- Axon segment gradient -->
+    <!-- Axon segment gradient (diagonal) -->
     <linearGradient id="axon" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+
+    <!-- Axon vertical gradient (for spine) -->
+    <linearGradient id="axonV" x1="0.5" y1="1" x2="0.5" y2="0">
       <stop offset="0%" stop-color="#0e7490"/>
       <stop offset="50%" stop-color="#0891b2"/>
       <stop offset="100%" stop-color="#06b6d4"/>
@@ -61,12 +68,12 @@
 
   <!-- Upper Spine: N1 → N3 -->
   <line x1="155" y1="100" x2="155" y2="260"
-        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
+        stroke="url(#axonV)" stroke-width="18" stroke-linecap="round"
         filter="url(#axonGlow)" opacity="0.9"/>
 
   <!-- Lower Spine: N3 → N4 -->
   <line x1="155" y1="300" x2="155" y2="420"
-        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
+        stroke="url(#axonV)" stroke-width="18" stroke-linecap="round"
         filter="url(#axonGlow)" opacity="0.9"/>
 
   <!-- Bowl Upper Half: N1 → N2 (quarter-ellipse) -->
