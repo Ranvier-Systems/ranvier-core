@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background gradient -->
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+    <!-- Axon segment gradient (diagonal) -->
+    <linearGradient id="axon" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <!-- Axon vertical gradient (for spine — userSpaceOnUse to avoid zero-width bbox) -->
+    <linearGradient id="axonV" x1="155" y1="440" x2="155" y2="80" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <!-- Node gap glow — tighter, brighter -->
+    <filter id="nodeGlow" x="-150%" y="-150%" width="400%" height="400%">
+      <feGaussianBlur stdDeviation="8" result="blur1"/>
+      <feGaussianBlur stdDeviation="16" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- Axon body glow -->
+    <filter id="axonGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- Large ambient pulse around nodes -->
+    <filter id="pulseGlow" x="-250%" y="-250%" width="600%" height="600%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <!-- Dark background -->
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+  <!--
+    LETTER R — axon construction with original styling
+    Nodes (~18px gap from segment ends):
+      N1  (155, 80)   — top: spine + bowl start
+      N2  (355, 180)  — bowl apex
+      N3  (155, 280)  — junction: spine + horizontal bar (largest)
+      N3b (260, 280)  — kick point: horizontal bar + bowl return + leg
+      N4  (155, 440)  — spine terminal
+      N5  (360, 440)  — leg terminal
+  -->
+  <!-- ═══ SEGMENTS ═══ -->
+  <!-- Upper Spine: N1 → N3 -->
+  <line x1="155" y1="102" x2="155" y2="258"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- Lower Spine: N3 → N4 -->
+  <line x1="155" y1="302" x2="155" y2="458"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- Bowl Upper Half: N1 → N2 (quarter-ellipse) -->
+  <path d="M 176 82 Q 315 78 350 158"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <!-- Bowl Lower Half: N2 → N3b (quarter-ellipse) -->
+  <path d="M 350 202 Q 335 260 284 276"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round" fill="none"/>
+  <!-- Horizontal Bar: N3 → N3b -->
+  <line x1="176" y1="280" x2="238" y2="280"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- Leg / V-left: N3b → N5 -->
+  <line x1="270" y1="300" x2="350" y2="462"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- V-right: N5 → N6 (up to y=80, same height as N1) -->
+  <line x1="372" y1="462" x2="447" y2="98"
+        stroke="#0891b2" stroke-width="18" stroke-linecap="round"/>
+  <!-- ═══ Signal Particles ═══ -->
+  <g opacity="0.35">
+    <!-- Spine upper -->
+    <circle cx="155" cy="148" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="210" r="1.5" fill="#a5f3fc"/>
+    <!-- Spine lower -->
+    <circle cx="155" cy="360" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="420" r="1.5" fill="#a5f3fc"/>
+    <!-- Bowl upper -->
+    <circle cx="240" cy="78" r="1.5" fill="#a5f3fc"/>
+    <circle cx="320" cy="88" r="2" fill="#a5f3fc"/>
+    <circle cx="352" cy="125" r="1.5" fill="#a5f3fc"/>
+    <!-- Bowl lower -->
+    <circle cx="352" cy="235" r="1.5" fill="#a5f3fc"/>
+    <circle cx="330" cy="265" r="2" fill="#a5f3fc"/>
+    <circle cx="285" cy="278" r="1.5" fill="#a5f3fc"/>
+    <!-- Leg / V-left -->
+    <circle cx="280" cy="355" r="2" fill="#a5f3fc"/>
+    <circle cx="320" cy="415" r="1.5" fill="#a5f3fc"/>
+    <!-- V-right -->
+    <circle cx="418" cy="210" r="2" fill="#a5f3fc"/>
+    <circle cx="398" cy="340" r="1.5" fill="#a5f3fc"/>
+  </g>
+  <!-- ═══ NODES — Nodes of Ranvier ═══ -->
+  <!-- N1 — top: spine start + bowl departure -->
+  <circle cx="155" cy="80" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="80" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="80" r="4.5" fill="#ffffff"/>
+  <!-- N2 — bowl apex -->
+  <circle cx="355" cy="180" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="355" cy="180" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="355" cy="180" r="4.5" fill="#ffffff"/>
+  <!-- N3 — junction: spine + horizontal bar -->
+  <circle cx="155" cy="280" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="280" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="280" r="4.5" fill="#ffffff"/>
+  <!-- N3b — kick point: horizontal bar + bowl return + leg -->
+  <circle cx="260" cy="280" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="260" cy="280" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="260" cy="280" r="4.5" fill="#ffffff"/>
+  <!-- N4 — spine terminal -->
+  <circle cx="155" cy="480" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="480" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="480" r="4.5" fill="#ffffff"/>
+  <!-- N5 — V bottom -->
+  <circle cx="360" cy="480" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="360" cy="480" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="360" cy="480" r="4.5" fill="#ffffff"/>
+  <!-- N6 — V right top (y=80) -->
+  <circle cx="455" cy="80" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="455" cy="80" r="9" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="455" cy="80" r="4.5" fill="#ffffff"/>
+</svg>
