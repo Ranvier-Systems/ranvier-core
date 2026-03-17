@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background gradient -->
+    <radialGradient id="bg" cx="50%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#0a1628"/>
+      <stop offset="100%" stop-color="#060d1a"/>
+    </radialGradient>
+
+    <!-- Single axon gradient -->
+    <linearGradient id="axon" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0e7490"/>
+      <stop offset="50%" stop-color="#0891b2"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+
+    <!-- Node gap glow -->
+    <filter id="nodeGlow" x="-150%" y="-150%" width="400%" height="400%">
+      <feGaussianBlur stdDeviation="8" result="blur1"/>
+      <feGaussianBlur stdDeviation="16" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Axon body glow -->
+    <filter id="axonGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Ambient pulse around nodes -->
+    <filter id="pulseGlow" x="-250%" y="-250%" width="600%" height="600%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Dark background -->
+  <rect width="512" height="512" rx="64" fill="url(#bg)"/>
+
+  <!--
+    LETTER R — clean, symmetric axon construction
+
+    Nodes:
+      N1 (155, 80)   — top: spine + bowl start
+      N2 (355, 180)  — bowl apex: splits curve into symmetric halves
+      N3 (155, 280)  — junction: bowl return + spine + leg
+      N4 (155, 440)  — spine terminal
+      N5 (360, 440)  — leg terminal
+
+    Bowl geometry: two symmetric quarter-ellipse arcs
+      Upper: (155,80) → (355,180)  control (355, 80)
+      Lower: (355,180) → (155,280) control (355, 280)
+      These mirror perfectly about y=180.
+  -->
+
+  <!-- ═══ Upper Spine: N1 → N3 ═══ -->
+  <line x1="155" y1="96" x2="155" y2="264"
+        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- ═══ Lower Spine: N3 → N4 ═══ -->
+  <line x1="155" y1="296" x2="155" y2="424"
+        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- ═══ Bowl Upper Half: N1 → N2 (quarter-ellipse) ═══ -->
+  <path d="M 172 84 Q 355 80 355 164"
+        stroke="url(#axon)" stroke-width="18" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- ═══ Bowl Lower Half: N2 → N3 (quarter-ellipse, symmetric mirror) ═══ -->
+  <path d="M 355 196 Q 355 280 172 276"
+        stroke="url(#axon)" stroke-width="18" stroke-linecap="round" fill="none"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- ═══ Leg: N3 → N5 ═══ -->
+  <line x1="172" y1="294" x2="344" y2="430"
+        stroke="url(#axon)" stroke-width="18" stroke-linecap="round"
+        filter="url(#axonGlow)" opacity="0.9"/>
+
+  <!-- ═══ Myelin Sheath — subtle parallel lines ═══ -->
+  <g opacity="0.1" stroke="#67e8f9" stroke-width="1" fill="none">
+    <!-- Spine upper -->
+    <line x1="163" y1="100" x2="163" y2="260"/>
+    <line x1="147" y1="100" x2="147" y2="260"/>
+    <!-- Spine lower -->
+    <line x1="163" y1="300" x2="163" y2="420"/>
+    <line x1="147" y1="300" x2="147" y2="420"/>
+    <!-- Bowl upper half -->
+    <path d="M 172 84 Q 355 80 355 164" transform="translate(0,-6)"/>
+    <path d="M 172 84 Q 355 80 355 164" transform="translate(0,6)"/>
+    <!-- Bowl lower half -->
+    <path d="M 355 196 Q 355 280 172 276" transform="translate(0,-6)"/>
+    <path d="M 355 196 Q 355 280 172 276" transform="translate(0,6)"/>
+    <!-- Leg -->
+    <line x1="172" y1="294" x2="344" y2="430" transform="translate(-5,5)"/>
+    <line x1="172" y1="294" x2="344" y2="430" transform="translate(5,-5)"/>
+  </g>
+
+  <!-- ═══ Signal Particles ═══ -->
+  <g opacity="0.35">
+    <!-- Spine -->
+    <circle cx="155" cy="140" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="200" r="1.5" fill="#a5f3fc"/>
+    <circle cx="155" cy="340" r="2" fill="#a5f3fc"/>
+    <circle cx="155" cy="395" r="1.5" fill="#a5f3fc"/>
+    <!-- Bowl upper -->
+    <circle cx="240" cy="78" r="1.5" fill="#a5f3fc"/>
+    <circle cx="320" cy="90" r="2" fill="#a5f3fc"/>
+    <circle cx="350" cy="130" r="1.5" fill="#a5f3fc"/>
+    <!-- Bowl lower -->
+    <circle cx="350" cy="230" r="1.5" fill="#a5f3fc"/>
+    <circle cx="320" cy="268" r="2" fill="#a5f3fc"/>
+    <circle cx="240" cy="280" r="1.5" fill="#a5f3fc"/>
+    <!-- Leg -->
+    <circle cx="220" cy="325" r="2" fill="#a5f3fc"/>
+    <circle cx="285" cy="375" r="1.5" fill="#a5f3fc"/>
+  </g>
+
+  <!-- ═══ NODES — Nodes of Ranvier ═══ -->
+
+  <!-- N1 — top: spine start + bowl departure -->
+  <circle cx="155" cy="80" r="26" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.12"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="80" r="8" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="80" r="4" fill="#ffffff"/>
+
+  <!-- N2 — bowl apex: smaller, splits curve -->
+  <circle cx="355" cy="180" r="22" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.11"
+          filter="url(#pulseGlow)"/>
+  <circle cx="355" cy="180" r="7" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="355" cy="180" r="3.5" fill="#ffffff"/>
+
+  <!-- N3 — junction: bowl return + spine + leg (largest) -->
+  <circle cx="155" cy="280" r="30" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.14"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="280" r="10" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="280" r="5" fill="#ffffff"/>
+
+  <!-- N4 — spine terminal -->
+  <circle cx="155" cy="440" r="24" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.11"
+          filter="url(#pulseGlow)"/>
+  <circle cx="155" cy="440" r="7" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="155" cy="440" r="3.5" fill="#ffffff"/>
+
+  <!-- N5 — leg terminal -->
+  <circle cx="360" cy="440" r="24" fill="none" stroke="#67e8f9" stroke-width="1.5" opacity="0.11"
+          filter="url(#pulseGlow)"/>
+  <circle cx="360" cy="440" r="7" fill="#cffafe" filter="url(#nodeGlow)" opacity="0.95"/>
+  <circle cx="360" cy="440" r="3.5" fill="#ffffff"/>
+</svg>
