@@ -944,27 +944,27 @@ std::optional<ProxyContext> RequestScheduler::dequeue() {
 ```
 Phase 1 (Foundation)
     ├── 1.1 Request Size Estimation ──────────────────┐
-    │           │                                      │
-    │           ▼                                      │
+    │           │                                     │
+    │           ▼                                     │
     ├── 1.4 Intent Classification ◄── 1.1 ────────────┼──┐
-    │                                                  │  │
+    │                                                 │  │
     ├── 1.2 Priority Infrastructure ──────────────────┼──┼──┐
-    │           │                                      │  │  │
-    │           │                                      │  │  │
+    │           │                                     │  │  │
+    │           │                                     │  │  │
     └── 1.3 Local Mode Config ────────────────────────┼──┼──┼──┐
-                │                                      │  │  │  │
-                ▼                                      │  │  │  │
-Phase 2 (Cloud)                                        │  │  │  │
-    ├── 2.1 vLLM Metrics ◄─────────────────────────────┘  │  │  │
-    │           │                                         │  │  │
-    │           ▼                                         │  │  │
-    ├── 2.2 Load-Aware Routing ◄──────────────────────────┘  │  │
-    │           │                                            │  │
-    │           ▼                                            │  │
-    └── 2.3 Cost-Based Routing ◄── 1.1, 1.4 ─────────────────┘  │
-                                                                │
-Phase 3 (Local)                                                 │
-    ├── 3.1 Local Discovery ◄───────────────────────────────────┘
+                │                                     │  │  │  │
+                ▼                                     │  │  │  │
+Phase 2 (Cloud)                                       │  │  │  │
+    ├── 2.1 vLLM Metrics ◄────────────────────────────┘  │  │  │
+    │           │                                        │  │  │
+    │           ▼                                        │  │  │
+    ├── 2.2 Load-Aware Routing ◄─────────────────────────┘  │  │
+    │           │                                           │  │
+    │           ▼                                           │  │
+    └── 2.3 Cost-Based Routing ◄── 1.1, 1.4 ────────────────┘  │
+                                                               │
+Phase 3 (Local)                                                │
+    ├── 3.1 Local Discovery ◄──────────────────────────────────┘
     │           │
     │           ▼
     ├── 3.2 Agent Awareness ◄── 1.2, 1.4
