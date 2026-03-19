@@ -2,6 +2,16 @@
 
 Prefix-affinity routing ensures that requests sharing the same token prefix are routed to the same backend, enabling vLLM's KV cache reuse across requests.
 
+## Prerequisites
+
+Prefix-affinity routing requires that backends have **prefix caching enabled**. Ranvier determines *which* backend should receive a request based on token prefix matching, but the backend itself must cache KV state for previously-seen prefixes. Without backend-side caching, routing to the "right" backend provides no benefit — there is no cached state to reuse.
+
+| Backend | How to Enable |
+|---------|---------------|
+| **vLLM** | `--enable-prefix-caching` (Automatic Prefix Caching / APC) |
+| **SGLang** | RadixAttention is enabled by default |
+| **TensorRT-LLM** | KV cache reuse is enabled by default |
+
 ## Overview
 
 When multiple requests share a common prefix (e.g., the same system prompt), routing them to the same backend allows that backend's KV cache to serve subsequent requests faster. Without prefix-affinity, requests are distributed randomly, resulting in ~50% cache hit rate with 2 backends.

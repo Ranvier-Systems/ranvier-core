@@ -103,6 +103,20 @@ The vision: A dropdown menu sets a global model preference. Ranvier will make **
 
 ---
 
+## ⚠️ Backend Requirement: Prefix Caching
+
+Ranvier routes requests to the backend that *should* have the relevant KV cache — but the backend must actually have prefix caching enabled for this to help. Without backend-side caching, Ranvier's routing decisions have no cache to hit.
+
+For **vLLM**, enable Automatic Prefix Caching (APC):
+```bash
+# vLLM ≥0.4.0
+python -m vllm.entrypoints.openai.api_server --enable-prefix-caching ...
+```
+
+Other backends with prefix/KV cache reuse (SGLang RadixAttention, TensorRT-LLM, etc.) also benefit. The key requirement is that the backend caches KV state for previously-seen token prefixes so that repeated prefixes skip the prefill phase.
+
+---
+
 ## 🛠️ Configuration
 Ranvier maps generic HTTP endpoints to specific Tokenizer/Model backends.
 
