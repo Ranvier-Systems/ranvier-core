@@ -245,6 +245,7 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
 }
 
 seastar::future<> Application::apply_vocab_size_config() {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     // Auto-configure max_token_id from tokenizer vocabulary size
     // This ensures client-provided tokens are validated against the actual tokenizer
     size_t vocab_size = _tokenizer.local().vocab_size();
@@ -253,7 +254,7 @@ seastar::future<> Application::apply_vocab_size_config() {
         // Tokenizer may not have loaded correctly, or vocab size unavailable
         log_main.warn("Tokenizer vocab_size returned 0 - using configured max_token_id: {}",
                       _config.routing.max_token_id);
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Bounds check: vocab_size must fit in int32_t (max ~2.1 billion)
@@ -272,7 +273,7 @@ seastar::future<> Application::apply_vocab_size_config() {
 
         // Update ShardedConfig so all shards have consistent config
         // This ensures Application::local_config() returns the correct value
-        return _sharded_config.invoke_on_all([max_id = _config.routing.max_token_id](ShardedConfig& cfg) {
+        co_await _sharded_config.invoke_on_all([max_id = _config.routing.max_token_id](ShardedConfig& cfg) {
             // Get a mutable copy, update max_token_id, and apply
             RanvierConfig updated = cfg.config();
             updated.routing.max_token_id = max_id;
@@ -282,8 +283,6 @@ seastar::future<> Application::apply_vocab_size_config() {
         log_main.debug("max_token_id ({}) already >= vocab_size ({}), no auto-config needed",
                        current_max, vocab_size);
     }
-
-    return seastar::make_ready_future<>();
 }
 
 // =============================================================================
@@ -291,6 +290,7 @@ seastar::future<> Application::apply_vocab_size_config() {
 // =============================================================================
 
 seastar::future<> Application::init_persistence() {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     // Create async persistence manager (which creates and owns the underlying SQLite store)
     _async_persistence = std::make_unique<AsyncPersistenceManager>(build_persistence_config());
 
@@ -298,7 +298,7 @@ seastar::future<> Application::init_persistence() {
     if (!_async_persistence->open(_config.database.path)) {
         log_main.warn("Failed to open persistence store - running without persistence");
         _async_persistence.reset();
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     log_main.info("Persistence initialized (SQLite: {})", _config.database.path);
@@ -311,18 +311,19 @@ seastar::future<> Application::init_persistence() {
     }
 
     // Start async persistence manager (arms flush timer)
-    return _async_persistence->start().then([this] {
-        // Distribute async persistence manager to all HttpController shards
-        return _controller.invoke_on_all([this](HttpController& c) {
-            c.set_persistence(_async_persistence.get());
-        });
+    co_await _async_persistence->start();
+
+    // Distribute async persistence manager to all HttpController shards
+    co_await _controller.invoke_on_all([this](HttpController& c) {
+        c.set_persistence(_async_persistence.get());
     });
 }
 
 seastar::future<> Application::load_persisted_state() {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_async_persistence || !_async_persistence->is_open()) {
         log_main.info("No persistence store - starting with empty state");
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Step 1: Verify database integrity
@@ -330,7 +331,7 @@ seastar::future<> Application::load_persisted_state() {
         log_main.error("Persistence integrity check failed - clearing corrupted state");
         _async_persistence->clear_all();
         log_main.info("Persistence store cleared - starting fresh");
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Step 2: Load backends and routes
@@ -353,7 +354,7 @@ seastar::future<> Application::load_persisted_state() {
 
     if (backends.empty() && routes.empty()) {
         log_main.info("Persistence store is empty - starting fresh");
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     log_main.info("Restoring state from persistence:");
@@ -367,52 +368,51 @@ seastar::future<> Application::load_persisted_state() {
     }
 
     // Step 3: Restore backends first, then routes
-    return seastar::do_with(std::move(backends), std::move(routes),
-                            size_t(0), size_t(0),
-        [this](auto& backends, auto& routes, size_t& failed_backends, size_t& failed_routes) {
-            return seastar::do_for_each(backends, [this, &failed_backends](const BackendRecord& rec) {
-                seastar::socket_address addr(seastar::ipv4_addr(rec.ip, rec.port));
-                return _router->register_backend_global(rec.id, addr, rec.weight, rec.priority)
-                    .handle_exception([&failed_backends, id = rec.id](auto ep) {
-                        failed_backends++;
-                        try {
-                            std::rethrow_exception(ep);
-                        } catch (const std::exception& e) {
-                            log_main.warn("Failed to restore backend {}: {}", id, e.what());
-                        }
-                        return seastar::make_ready_future<>();
-                    });
-            }).then([this, &routes, &failed_routes] {
-                return seastar::do_for_each(routes, [this, &failed_routes](const RouteRecord& rec) {
-                    auto tokens_copy = rec.tokens;
-                    return _router->learn_route_global(std::move(tokens_copy), rec.backend_id)
-                        .handle_exception([&failed_routes](auto ep) {
-                            failed_routes++;
-                            try {
-                                std::rethrow_exception(ep);
-                            } catch (const std::exception& e) {
-                                log_main.debug("Failed to restore route: {}", e.what());
-                            }
-                            return seastar::make_ready_future<>();
-                        });
-                });
-            }).then([&failed_backends, &failed_routes] {
-                if (failed_backends > 0 || failed_routes > 0) {
-                    log_main.warn("State restoration completed with errors: "
-                                  "{} backend failures, {} route failures",
-                                  failed_backends, failed_routes);
-                } else {
-                    log_main.info("State restoration complete");
-                }
-            });
-        }).handle_exception([](auto ep) {
+    try {
+        size_t failed_backends = 0;
+        for (const auto& rec : backends) {
             try {
-                std::rethrow_exception(ep);
-            } catch (const std::exception& e) {
-                log_main.error("State restoration failed: {} - starting with empty state", e.what());
+                seastar::socket_address addr(seastar::ipv4_addr(rec.ip, rec.port));
+                co_await _router->register_backend_global(rec.id, addr, rec.weight, rec.priority);
+            } catch (...) {
+                failed_backends++;
+                try {
+                    throw;
+                } catch (const std::exception& e) {
+                    log_main.warn("Failed to restore backend {}: {}", rec.id, e.what());
+                }
             }
-            return seastar::make_ready_future<>();
-        });
+        }
+
+        size_t failed_routes = 0;
+        for (const auto& rec : routes) {
+            try {
+                auto tokens_copy = rec.tokens;
+                co_await _router->learn_route_global(std::move(tokens_copy), rec.backend_id);
+            } catch (...) {
+                failed_routes++;
+                try {
+                    throw;
+                } catch (const std::exception& e) {
+                    log_main.debug("Failed to restore route: {}", e.what());
+                }
+            }
+        }
+
+        if (failed_backends > 0 || failed_routes > 0) {
+            log_main.warn("State restoration completed with errors: "
+                          "{} backend failures, {} route failures",
+                          failed_backends, failed_routes);
+        } else {
+            log_main.info("State restoration complete");
+        }
+    } catch (...) {
+        try {
+            throw;
+        } catch (const std::exception& e) {
+            log_main.error("State restoration failed: {} - starting with empty state", e.what());
+        }
+    }
 }
 
 void Application::init_health_checker() {
@@ -675,44 +675,47 @@ seastar::future<> Application::startup() {
 // =============================================================================
 
 seastar::future<> Application::start_servers() {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     _api_server = std::make_unique<seastar::httpd::http_server_control>();
     _metrics_server = std::make_unique<seastar::httpd::http_server_control>();
 
-    return setup_tls().then([this] {
-        // Start Prometheus metrics server
-        return _metrics_server->start();
-    }).then([this] {
-        seastar::prometheus::config pconf;
-        return seastar::prometheus::start(*_metrics_server, pconf);
-    }).then([this] {
-        auto addr = seastar::socket_address(
-            seastar::ipv4_addr(_config.server.bind_address, _config.server.metrics_port));
-        return _metrics_server->listen(addr);
-    }).then([this] {
-        log_main.info("Prometheus metrics listening on {}:{}",
-            _config.server.bind_address, _config.server.metrics_port);
+    co_await setup_tls();
 
-        // Start API server
-        return _api_server->start();
-    }).then([this] {
-        return _api_server->set_routes([this](seastar::httpd::routes& r) {
-            _controller.local().register_routes(r);
-        });
-    }).then([this] {
-        auto addr = seastar::socket_address(
-            seastar::ipv4_addr(_config.server.bind_address, _config.server.api_port));
-        if (_tls_creds) {
-            return _api_server->listen(addr, _tls_creds);
-        }
-        return _api_server->listen(addr);
-    }).then([this] {
-        auto protocol = _config.tls.enabled ? "https" : "http";
-        log_main.info("Ranvier listening on {}://{}:{}",
-            protocol, _config.server.bind_address, _config.server.api_port);
+    // Start Prometheus metrics server
+    co_await _metrics_server->start();
+
+    seastar::prometheus::config pconf;
+    co_await seastar::prometheus::start(*_metrics_server, pconf);
+
+    auto metrics_addr = seastar::socket_address(
+        seastar::ipv4_addr(_config.server.bind_address, _config.server.metrics_port));
+    co_await _metrics_server->listen(metrics_addr);
+
+    log_main.info("Prometheus metrics listening on {}:{}",
+        _config.server.bind_address, _config.server.metrics_port);
+
+    // Start API server
+    co_await _api_server->start();
+
+    co_await _api_server->set_routes([this](seastar::httpd::routes& r) {
+        _controller.local().register_routes(r);
     });
+
+    auto api_addr = seastar::socket_address(
+        seastar::ipv4_addr(_config.server.bind_address, _config.server.api_port));
+    if (_tls_creds) {
+        co_await _api_server->listen(api_addr, _tls_creds);
+    } else {
+        co_await _api_server->listen(api_addr);
+    }
+
+    auto protocol = _config.tls.enabled ? "https" : "http";
+    log_main.info("Ranvier listening on {}://{}:{}",
+        protocol, _config.server.bind_address, _config.server.api_port);
 }
 
 seastar::future<> Application::stop_servers() {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     seastar::future<> api_stop = seastar::make_ready_future<>();
     seastar::future<> metrics_stop = seastar::make_ready_future<>();
 
@@ -723,7 +726,7 @@ seastar::future<> Application::stop_servers() {
         metrics_stop = _metrics_server->stop();
     }
 
-    return seastar::when_all(std::move(api_stop), std::move(metrics_stop)).discard_result();
+    co_await seastar::when_all(std::move(api_stop), std::move(metrics_stop)).discard_result();
 }
 
 void Application::setup_signal_handlers() {

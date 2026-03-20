@@ -1548,12 +1548,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 // ---------------------------------------------------------
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_route(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     sstring id_str = req->get_query_param("backend_id");
     if (id_str.empty()) {
         log_control.warn("POST /admin/routes: missing backend_id parameter");
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Missing backend_id\"}");
-        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
 
     auto backend_id_opt = parse_backend_id(std::string_view(id_str));
@@ -1561,7 +1562,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
         log_control.warn("POST /admin/routes: invalid backend_id '{}'", id_str);
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Invalid backend_id: must be a valid integer\"}");
-        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
     int backend_id = *backend_id_opt;
 
@@ -1580,7 +1581,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
         metrics().record_tokenizer_validation_failure();
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Input validation failed: " + escape_json_string(validation.error) + "\"}");
-        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
 
     try {
@@ -1590,7 +1591,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
         metrics().record_tokenizer_error();
         rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", "{\"error\": \"Failed to tokenize request content\"}");
-        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
 
     // Check if route will actually be stored (must meet block_alignment minimum)
@@ -1608,7 +1609,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
             << ", \"warning\": \"Content too short (" << token_count << " tokens), need at least "
             << _config.block_alignment << " for block_alignment. Route not stored.\"}";
         rep->write_body("json", oss.str());
-        return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+        co_return std::move(rep);
     }
 
     // Queue route for async persistence (fire-and-forget, non-blocking)
@@ -1616,14 +1617,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
         _persistence->queue_save_route(tokens, backend_id);
     }
 
-    return _router.learn_route_global(tokens, backend_id).then([backend_id, token_count, aligned_len, rep = std::move(rep)]() mutable {
-         std::ostringstream oss;
-         oss << "{\"status\": \"ok\", \"backend_id\": " << backend_id
-             << ", \"tokens\": " << token_count
-             << ", \"stored_tokens\": " << aligned_len << "}";
-         rep->write_body("json", oss.str());
-         return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
-    });
+    co_await _router.learn_route_global(tokens, backend_id);
+
+    std::ostringstream oss;
+    oss << "{\"status\": \"ok\", \"backend_id\": " << backend_id
+        << ", \"tokens\": " << token_count
+        << ", \"stored_tokens\": " << aligned_len << "}";
+    rep->write_body("json", oss.str());
+    co_return std::move(rep);
 }
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {

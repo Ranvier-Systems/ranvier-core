@@ -150,55 +150,58 @@ void GossipTransport::initialize_crypto_offloader() {
 
 seastar::future<> GossipTransport::send(const seastar::socket_address& peer,
                                          const std::vector<uint8_t>& data) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_channel) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     if (!_dtls_context || !_dtls_context->is_enabled()) {
         // Plaintext mode
         seastar::temporary_buffer<char> buf(data.size());
         std::memcpy(buf.get_write(), data.data(), data.size());
-        return _channel->send(peer, std::span<seastar::temporary_buffer<char>>(&buf, 1));
+        co_await _channel->send(peer, std::span<seastar::temporary_buffer<char>>(&buf, 1));
+        co_return;
     }
 
     auto* session = _dtls_context->get_or_create_session(peer, false);
     if (!session) {
         log_gossip_transport().debug("Failed to get DTLS session for peer {}", peer);
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     if (!session->is_established()) {
         log_gossip_transport().trace("DTLS handshake not complete for peer {}, cannot send yet", peer);
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
-    auto peer_copy = peer;
-    return encrypt_with_offloading(session, data, peer).then([this, peer_copy](std::vector<uint8_t> encrypted) {
-        if (encrypted.empty() || !_channel) {
-            return seastar::make_ready_future<>();
-        }
+    auto encrypted = co_await encrypt_with_offloading(session, data, peer);
+    if (encrypted.empty() || !_channel) {
+        co_return;
+    }
 
-        seastar::temporary_buffer<char> buf(encrypted.size());
-        std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
-        return _channel->send(peer_copy, std::span<seastar::temporary_buffer<char>>(&buf, 1)).handle_exception([peer_copy](auto ep) {
-            log_gossip_transport().debug("Failed to send encrypted data to {}: {}", peer_copy, ep);
-        });
-    });
+    seastar::temporary_buffer<char> buf(encrypted.size());
+    std::memcpy(buf.get_write(), encrypted.data(), encrypted.size());
+    try {
+        co_await _channel->send(peer, std::span<seastar::temporary_buffer<char>>(&buf, 1));
+    } catch (...) {
+        log_gossip_transport().debug("Failed to send encrypted data to {}: {}", peer, std::current_exception());
+    }
 }
 
 seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_address>& peers,
                                               const std::vector<uint8_t>& data) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     if (peers.empty() || !_channel) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Plaintext mode - use parallel_for_each with send()
     if (!_dtls_context || !_dtls_context->is_enabled()) {
-        return seastar::do_with(std::vector<uint8_t>(data), [this, &peers](std::vector<uint8_t>& plaintext_ref) {
-            return seastar::parallel_for_each(peers, [this, &plaintext_ref](const seastar::socket_address& peer) {
-                return send(peer, plaintext_ref);
-            });
+        auto plaintext = std::vector<uint8_t>(data);
+        co_await seastar::parallel_for_each(peers, [this, &plaintext](const seastar::socket_address& peer) {
+            return send(peer, plaintext);
         });
+        co_return;
     }
 
     // For high fan-out broadcasts, use seastar::async to batch the crypto work
@@ -206,7 +209,7 @@ seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_a
         ++_crypto_batch_broadcasts;
         ++_crypto_ops_offloaded;
 
-        return seastar::async([this,
+        co_await seastar::async([this,
                                plaintext_copy = std::vector<uint8_t>(data),
                                peers_copy = std::vector<seastar::socket_address>(peers)]() {
             if (!_dtls_context || !_dtls_context->is_enabled()) {
@@ -254,13 +257,13 @@ seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_a
                 seastar::thread::yield();
             }
         });
+        co_return;
     }
 
     // For small peer counts, use parallel_for_each
-    return seastar::do_with(std::vector<uint8_t>(data), [this, &peers](std::vector<uint8_t>& plaintext_ref) {
-        return seastar::parallel_for_each(peers, [this, &plaintext_ref](const seastar::socket_address& peer) {
-            return send(peer, plaintext_ref);
-        });
+    auto plaintext = std::vector<uint8_t>(data);
+    co_await seastar::parallel_for_each(peers, [this, &plaintext](const seastar::socket_address& peer) {
+        return send(peer, plaintext);
     });
 }
 

@@ -1969,6 +1969,7 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
 // This reduces cross-core message traffic from O(routes × shards) to O(batches × shards).
 
 seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens, BackendId backend) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     // ========================================================================
     // Business-Layer Token Count Validation (Remote Routes)
     // ========================================================================
@@ -1979,7 +1980,7 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
     if (max_route_tokens > 0 && tokens.size() > max_route_tokens) {
         log_router.warn("Remote route rejected: {} tokens exceeds limit {} (backend={})",
                         tokens.size(), max_route_tokens, backend);
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     log_router.debug("Buffering remote route: {} tokens -> backend {}", tokens.size(), backend);
@@ -2015,10 +2016,8 @@ seastar::future<> RouterService::learn_route_remote(std::vector<int32_t> tokens,
     if (_pending_remote_routes.size() >= RouteBatchConfig::MAX_BATCH_SIZE) {
         log_router.debug("Batch buffer full ({} routes), triggering immediate flush",
                          _pending_remote_routes.size());
-        return flush_route_batch();
+        co_await flush_route_batch();
     }
-
-    return seastar::make_ready_future<>();
 }
 
 seastar::future<> RouterService::start_gossip() {
@@ -2296,16 +2295,15 @@ static bool push_local_route(ShardLocalState& state, std::vector<int32_t> tokens
 }
 
 seastar::future<> RouterService::buffer_local_route(std::vector<int32_t> tokens, BackendId backend) {
-    if (!g_shard_state) return seastar::make_ready_future<>();
+    // Rule 22: coroutine converts any pre-future throw into a failed future
+    if (!g_shard_state) co_return;
     auto& state = shard_state();
 
     if (push_local_route(state, std::move(tokens), backend)) {
         log_router.debug("Shard {}: Local batch buffer full ({} routes), triggering immediate flush",
                          seastar::this_shard_id(), state.pending_local_routes.size());
-        return flush_local_route_batch();
+        co_await flush_local_route_batch();
     }
-
-    return seastar::make_ready_future<>();
 }
 
 seastar::future<> RouterService::flush_local_route_batch() {
