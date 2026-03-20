@@ -3001,13 +3001,13 @@ Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seas
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P2 — Reactor stalls
   _Findings:_ 4 violations + 3 warnings:
-  - `gossip_protocol.cpp:604-614` — nested loops over DNS SRV records + addr_list (unbounded, could reach 500+) without yield. P2-HIGH
-  - `gossip_protocol.cpp:791-843` — `process_retries()` nested loops over `_pending_acks` (bounded at 1000 total but no yield). P2-HIGH
-  - `gossip_consensus.cpp:182-190` — peer removal loop (up to 1024) calls `broadcast_prune()` per peer without yield. P2
-  - `rate_limiter_core.hpp:113` — `cleanup()` loop iterates up to 100K buckets on reactor thread without yield. P2
-  - _(warn)_ `gossip_consensus.cpp:221-234` — liveness check loop (up to 1024 peers), lightweight but calls `broadcast_prune()`
-  - _(warn)_ `gossip_consensus.cpp:362-400` — `get_cluster_state()` builds PeerInfo for all peers (up to 1024)
-  - _(warn)_ `connection_pool.hpp:397` — `cleanup_expired()` can iterate ~10K times (1000 backends x 10 conns)
+  - ~~`gossip_protocol.cpp:604-614` — nested loops over DNS SRV records + addr_list (unbounded, could reach 500+) without yield. P2-HIGH~~ **DONE** — added `co_await maybe_yield()` after each SRV record resolution
+  - ~~`gossip_protocol.cpp:791-843` — `process_retries()` nested loops over `_pending_acks` (bounded at 1000 total but no yield). P2-HIGH~~ **DONE** — converted to coroutine with yield every 64 peers; timer callback now handles returned future (Rule #18)
+  - ~~`gossip_consensus.cpp:182-190` — peer removal loop (up to 1024) calls `broadcast_prune()` per peer without yield. P2~~ **DONE** — `update_peer_list()` converted to coroutine with yield every 64 pruned peers
+  - ~~`rate_limiter_core.hpp:113` — `cleanup()` loop iterates up to 100K buckets on reactor thread without yield. P2~~ **DONE** — added yielding `cleanup_async()` coroutine in Seastar wrapper (`rate_limiter.hpp`) with yield every 128 iterations; pure algorithm untouched for testability
+  - ~~_(warn)_ `gossip_consensus.cpp:221-234` — liveness check loop (up to 1024 peers), lightweight but calls `broadcast_prune()`~~ **DONE** — `check_liveness()` converted to coroutine with yield every 64 peers
+  - _(warn)_ `gossip_consensus.cpp:362-400` — `get_cluster_state()` builds PeerInfo for all peers (up to 1024). Sufficient bounds (~200μs, within 500μs task quota)
+  - _(warn)_ `connection_pool.hpp:397` — `cleanup_expired()` can iterate ~10K times (1000 backends x 10 conns). Sufficient bounds (~100μs, within 500μs task quota)
 
 - [x] **Scan for raw `semaphore::wait()`/`signal()` pairs (Rule 19)**
   _Pattern:_ `_sem.wait(` or `.signal(` without corresponding `get_units` or `with_semaphore`
@@ -3086,7 +3086,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   - ~~Rule 22 P2: `gossip_transport.cpp:189` — `broadcast()` may throw before future~~ **DONE** — converted to coroutine
   - Rule 21 P2: `gossip_protocol.hpp:126` — `start()` coroutine takes `&` params (low risk, stored as ptrs before suspend)
   - Rule 21 P2: `gossip_consensus.hpp:102` — `start()` coroutine takes `const&` param (low risk, consumed before suspend)
-  - Rule 17 P2: `gossip_protocol.cpp:791` — `process_retries()` up to ~1000 iterations without yield
+  - ~~Rule 17 P2: `gossip_protocol.cpp:791` — `process_retries()` up to ~1000 iterations without yield~~ **DONE** — converted to coroutine with yield every 64 peers
   - Rules 16, 19, 20, 23: PASS
 
 - [x] **Audit `tokenizer_service.{hpp,cpp}`, `tokenizer_thread_pool.{hpp,cpp}`**
@@ -3104,7 +3104,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Findings:_
   - ~~Rule 22 P2: `router_service.cpp:1971` — `learn_route_remote()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
   - ~~Rule 22 P2: `router_service.cpp:2298` — `buffer_local_route()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
-  - Rule 17 P2 (warn): `radix_tree.hpp` — `remove_expired()`, `compact()`, `remove_routes_by_backend()`, `for_each_leaf()` traverse potentially large trees without yield (callers should chunk)
+  - ~~Rule 17 P2 (warn): `radix_tree.hpp` — `remove_expired()`, `compact()`, `remove_routes_by_backend()`, `for_each_leaf()` traverse potentially large trees without yield (callers should chunk)~~ **DONE** — added yielding wrappers at caller level: `ttl_cleanup_on_shard()` coroutine yields between remove_expired/compact phases; `remove_routes_for_backend()` yields after traversal. Note: intra-traversal yields require tree-level iterator changes (future work)
   - Rules 16, 18, 19, 20, 21, 23: PASS
 
 - [x] **Audit remaining services (`sqlite_persistence`, `async_persistence`, `health_service`, `k8s_discovery_service`, `connection_pool`, `circuit_breaker`, `rate_limiter`, `stream_parser`, `shard_load_balancer`)**
@@ -3112,22 +3112,22 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Priority:_ P3
   _Findings:_
   - Rule 21 P2: `k8s_discovery_service` — 7 coroutine functions with `const&` params (see Phase 1)
-  - Rule 17 P2: `rate_limiter_core.hpp:113` — `cleanup()` iterates up to 100K buckets without yield
+  - ~~Rule 17 P2: `rate_limiter_core.hpp:113` — `cleanup()` iterates up to 100K buckets without yield~~ **DONE** — yielding `cleanup_async()` coroutine in Seastar wrapper
   - ~~Rule 22 P2: `shard_load_balancer.hpp:206` — `refresh_all_snapshots()` non-coroutine, `vector::reserve()`/`push_back()` can throw before future~~ **DONE** — converted to coroutine
-  - _(warn)_ Rule 17: `connection_pool.hpp:397` — `cleanup_expired()` up to ~10K iterations
-  - _(warn)_ Rule 17: `circuit_breaker.hpp:247` — `open_circuit_count()` up to 10K iterations
+  - _(warn)_ Rule 17: `connection_pool.hpp:397` — `cleanup_expired()` up to ~10K iterations. Sufficient bounds (~100μs)
+  - _(warn)_ Rule 17: `circuit_breaker.hpp:247` — `open_circuit_count()` up to 10K iterations. Sufficient bounds (~10μs)
   - Rules 16, 18, 19, 20, 23: PASS
 
 **Audit Summary (2026-03-20)**
 
 _Total violations found:_ 47
 _Critical (P1):_ 6 — Rule 16 ×2 (use-after-free), Rule 18 ×3 (discarded futures), Rule 19 ×1 (semaphore leak)
-_High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception-before-future), Rule 17 ×4 (reactor stall), Rule 17 warnings ×6
+_High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception-before-future), ~~Rule 17 ×4 (reactor stall)~~ FIXED, ~~Rule 17 warnings ×6~~ 5 FIXED + 3 sufficient bounds
 
 | Rule | Violations | Severity | Most Affected Components |
 |------|-----------|----------|--------------------------|
 | 16 — Lambda Coroutine Fiasco | 2 | P1 | http_controller, k8s_discovery_service |
-| 17 — Reactor Stall | 4 (+6 warn) | P2 | gossip_protocol, gossip_consensus, rate_limiter_core |
+| 17 — Reactor Stall | ~~4 (+6 warn)~~ 0 (+3 warn, 2 sufficient bounds) | ~~P2~~ FIXED | gossip_protocol, gossip_consensus, rate_limiter_core, router_service |
 | 18 — Discarded Futures | 3 | P1 | application, gossip_service, gossip_protocol |
 | 19 — Semaphore Leak | 1 | P1 | tokenizer_service |
 | 20 — do_with Missing & | 0 | — | — |

@@ -1239,6 +1239,42 @@ seastar::future<> RouterService::stop() {
     });
 }
 
+// Rule #17: Yielding TTL cleanup coroutine for radix_tree operations.
+// Named coroutine (not lambda) to avoid Rule #16 Lambda Coroutine Fiasco
+// when called from smp::submit_to. Yields between tree phases so each
+// phase's synchronous traversal runs in its own reactor timeslice.
+seastar::future<> RouterService::ttl_cleanup_on_shard(
+    std::chrono::steady_clock::time_point cutoff) {
+    if (!g_shard_state) co_return;
+    auto& state = shard_state();
+    RadixTree* tree = state.tree.get();
+    if (!tree) co_return;
+
+    // Phase 1: Expire old routes (marks leaves as empty)
+    size_t removed = tree->remove_expired(cutoff);
+    if (removed > 0) {
+        state.stats.routes_expired += removed;
+        log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
+    }
+
+    // Yield between phases to bound per-continuation CPU time
+    co_await seastar::coroutine::maybe_yield();
+
+    // Phase 2: Compact tree (reclaims empty nodes, shrinks oversized nodes)
+    auto compact_stats = tree->compact();
+    state.stats.compaction_runs++;
+    state.stats.compaction_nodes_removed += compact_stats.nodes_removed;
+    state.stats.compaction_nodes_shrunk += compact_stats.nodes_shrunk;
+    state.stats.compaction_bytes_reclaimed += compact_stats.bytes_reclaimed;
+    if (compact_stats.nodes_removed > 0 || compact_stats.nodes_shrunk > 0) {
+        log_main.debug("Shard {}: Compaction removed {} nodes, shrunk {} nodes, reclaimed {} bytes",
+                       seastar::this_shard_id(),
+                       compact_stats.nodes_removed,
+                       compact_stats.nodes_shrunk,
+                       compact_stats.bytes_reclaimed);
+    }
+}
+
 void RouterService::run_ttl_cleanup() {
     // Rule #5: Acquire gate holder to prevent use-after-free during shutdown.
     // If gate is closed (service stopping), skip cleanup gracefully.
@@ -1256,33 +1292,11 @@ void RouterService::run_ttl_cleanup() {
     // Keep gate holder alive for duration of async work via do_with
     (void)seastar::do_with(std::move(holder), [cutoff](seastar::gate::holder&) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
+            // Rule #17: ttl_cleanup_on_shard is a named coroutine that yields
+            // between tree phases to avoid reactor stalls on large trees.
+            // Using a named function (not a coroutine lambda) avoids Rule #16.
             return seastar::smp::submit_to(shard_id, [cutoff] {
-                if (!g_shard_state) return seastar::make_ready_future<>();
-                auto& state = shard_state();
-                RadixTree* tree = state.tree.get();
-                if (tree) {
-                    // Phase 1: Expire old routes (marks leaves as empty)
-                    size_t removed = tree->remove_expired(cutoff);
-                    if (removed > 0) {
-                        state.stats.routes_expired += removed;
-                        log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
-                    }
-
-                    // Phase 2: Compact tree (reclaims empty nodes, shrinks oversized nodes)
-                    auto compact_stats = tree->compact();
-                    state.stats.compaction_runs++;
-                    state.stats.compaction_nodes_removed += compact_stats.nodes_removed;
-                    state.stats.compaction_nodes_shrunk += compact_stats.nodes_shrunk;
-                    state.stats.compaction_bytes_reclaimed += compact_stats.bytes_reclaimed;
-                    if (compact_stats.nodes_removed > 0 || compact_stats.nodes_shrunk > 0) {
-                        log_main.debug("Shard {}: Compaction removed {} nodes, shrunk {} nodes, reclaimed {} bytes",
-                                       seastar::this_shard_id(),
-                                       compact_stats.nodes_removed,
-                                       compact_stats.nodes_shrunk,
-                                       compact_stats.bytes_reclaimed);
-                    }
-                }
-                return seastar::make_ready_future<>();
+                return RouterService::ttl_cleanup_on_shard(cutoff);
             });
         });
     }).handle_exception([](std::exception_ptr ep) {
@@ -2968,11 +2982,11 @@ void RouterService::run_draining_reaper() {
 seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
     // Remove all REMOTE routes pointing to this backend
     // This is called when a cluster peer fails and we need to prune orphaned routes
-    if (!g_shard_state) return seastar::make_ready_future<>();
+    if (!g_shard_state) co_return;
     auto& state = shard_state();
     RadixTree* tree = state.tree.get();
     if (!tree) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     size_t removed = tree->remove_routes_by_backend(b_id, RouteOrigin::REMOTE);
@@ -2982,7 +2996,9 @@ seastar::future<> RouterService::remove_routes_for_backend(BackendId b_id) {
                         seastar::this_shard_id(), removed, b_id);
     }
 
-    return seastar::make_ready_future<>();
+    // Rule #17: Yield after tree traversal to avoid reactor stall.
+    // remove_routes_by_backend traverses potentially large tree (up to max_routes).
+    co_await seastar::coroutine::maybe_yield();
 }
 
 seastar::future<> RouterService::handle_node_state_change(BackendId backend, NodeState node_state) {

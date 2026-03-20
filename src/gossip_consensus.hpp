@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
@@ -110,7 +111,8 @@ public:
 
     // Update peer table with new list (used by DNS discovery)
     // Returns list of newly added peers
-    std::vector<seastar::socket_address> update_peer_list(
+    // Coroutine: yields during peer removal to avoid reactor stall (Rule #17)
+    seastar::future<std::vector<seastar::socket_address>> update_peer_list(
         const std::vector<seastar::socket_address>& new_peers);
 
     // Quorum queries (lock-free, safe from any thread)
@@ -217,7 +219,7 @@ private:
     seastar::gate _timer_gate;
 
     // Internal methods
-    void check_liveness();
+    seastar::future<> check_liveness();  // Coroutine: yields during peer iteration (Rule #17)
     void check_quorum();
 
     // Broadcast route prune to all shards for a dead/removed peer's backend.

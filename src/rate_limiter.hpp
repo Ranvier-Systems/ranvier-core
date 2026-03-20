@@ -13,6 +13,7 @@
 
 #include "rate_limiter_core.hpp"
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics_registration.hh>
@@ -98,22 +99,49 @@ private:
             return;
         }
 
-        // Gate held - safe to access members
-        // Calculate max idle time as 2x the refill period
-        // A bucket is "stale" if no requests for 2x the time needed to fully refill
+        // Rule #18: cleanup_async() is a coroutine — handle returned future.
+        // Gate holder moved into coroutine chain for full async lifetime (Rule #5).
+        (void)cleanup_async().handle_exception([](auto ep) {
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) {
+                log_rate_limiter.warn("Rate limiter cleanup failed: {}", e.what());
+            }
+        }).finally([holder = std::move(holder)] {});
+    }
+
+    // Rule #17: Yielding cleanup for up to 100K buckets.
+    // Replaces synchronous cleanup() call with a coroutine that yields
+    // every 128 iterations to avoid reactor stalls.
+    seastar::future<> cleanup_async() {
+        auto now = std::chrono::steady_clock::now();
+
         auto refill_period = std::chrono::seconds(
             config().burst_size / std::max(config().requests_per_second, 1u));
         auto max_idle = std::max(refill_period * 2, std::chrono::seconds(60));
 
-        size_t cleaned = cleanup(max_idle);
-        if (cleaned > 0) {
-            add_buckets_cleaned(cleaned);
+        size_t removed = 0;
+        size_t iterations = 0;
+        for (auto it = buckets().begin(); it != buckets().end(); ) {
+            auto idle = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_refill);
+            if (idle > max_idle) {
+                it = buckets().erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+
+            if (++iterations % 128 == 0) {
+                co_await seastar::coroutine::maybe_yield();
+            }
+        }
+
+        if (removed > 0) {
+            add_buckets_cleaned(removed);
             log_rate_limiter.debug("Cleaned {} stale rate limit buckets ({} remaining)",
-                                   cleaned, bucket_count());
+                                   removed, bucket_count());
         }
 
         // Rearm timer for next cleanup cycle
-        // This happens while gate holder is still valid
         _cleanup_timer.arm(cleanup_interval());
     }
 

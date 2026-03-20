@@ -218,7 +218,16 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
                                    _config.gossip_ack_timeout.count(),
                                    _config.gossip_max_retries,
                                    _config.gossip_dedup_window);
-        _retry_timer.set_callback([this] { process_retries(); });
+        _retry_timer.set_callback([this] {
+            // Rule #18: Future must be handled. Gate holder inside process_retries()
+            // ensures stop() waits for completion.
+            (void)process_retries().handle_exception([](auto ep) {
+                try { std::rethrow_exception(ep); }
+                catch (const std::exception& e) {
+                    log_gossip_protocol().warn("process_retries failed: {}", e.what());
+                }
+            });
+        });
         auto retry_check_interval = std::max(
             std::chrono::milliseconds(10),
             _config.gossip_ack_timeout / 2);
@@ -613,6 +622,9 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 } catch (const std::exception& e) {
                     log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                 }
+                // Rule #17: Yield between DNS resolutions to avoid reactor stall
+                // when SRV record count is large (unbounded, could reach 500+)
+                co_await seastar::coroutine::maybe_yield();
             }
         } else if (_config.discovery_type == DiscoveryType::A) {
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
@@ -648,7 +660,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
         // Update consensus peer table and get newly added peers
         std::vector<seastar::socket_address> new_peers_for_handshake;
         if (_consensus) {
-            new_peers_for_handshake = _consensus->update_peer_list(new_peer_addresses);
+            new_peers_for_handshake = co_await _consensus->update_peer_list(new_peer_addresses);
         }
 
         // Clean up protocol state for removed peers
@@ -773,25 +785,29 @@ bool GossipProtocol::is_duplicate(const seastar::socket_address& peer, uint32_t 
     return false;
 }
 
-void GossipProtocol::process_retries() {
+seastar::future<> GossipProtocol::process_retries() {
     // RAII Timer Safety: Holder must outlive the work including async sends.
-    // Moved into .finally() so stop() waits for all in-flight retries (Rule #5).
+    // Lives on coroutine frame so stop() waits for completion (Rule #5).
     seastar::gate::holder timer_holder;
     try {
         if (_transport) {
             timer_holder = _transport->timer_gate().hold();
         }
     } catch (const seastar::gate_closed_exception&) {
-        return;
+        co_return;
     }
 
     if (!_transport || !_transport->is_ready() || !_running) {
-        return;
+        co_return;
     }
 
     auto now = seastar::lowres_clock::now();
     std::vector<seastar::future<>> send_futures;
 
+    // Rule #17: Yield every N peers to avoid reactor stall.
+    // _pending_acks is bounded at ~1000 entries total but the nested loops
+    // (classify + retry + remove per peer) accumulate CPU work.
+    size_t peers_processed = 0;
     for (auto& [peer, pending_map] : _pending_acks) {
         std::vector<uint32_t> to_retry;
         std::vector<uint32_t> to_remove;
@@ -835,6 +851,10 @@ void GossipProtocol::process_retries() {
             pending_map.erase(seq_num);
             --_stats_pending_acks_count;
         }
+
+        if (++peers_processed % 64 == 0) {
+            co_await seastar::coroutine::maybe_yield();
+        }
     }
 
     // Clean up empty peer entries
@@ -846,11 +866,11 @@ void GossipProtocol::process_retries() {
         }
     }
 
-    // Gate holder spans all async sends so stop() waits for completion
+    // Await all retry sends before returning (gate holder on coroutine frame
+    // keeps the gate open for the full duration)
     if (!send_futures.empty()) {
-        (void)seastar::when_all_succeed(send_futures.begin(), send_futures.end())
-            .discard_result()
-            .finally([holder = std::move(timer_holder)] {});
+        co_await seastar::when_all_succeed(send_futures.begin(), send_futures.end())
+            .discard_result();
     }
 }
 
