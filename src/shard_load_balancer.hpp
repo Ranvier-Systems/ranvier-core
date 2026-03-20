@@ -25,6 +25,7 @@
 #include <tuple>
 #include <vector>
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
