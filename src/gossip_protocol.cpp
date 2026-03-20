@@ -12,6 +12,7 @@
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
