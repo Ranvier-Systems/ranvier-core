@@ -442,6 +442,10 @@ private:
     // Perform TTL cleanup on all shards
     void run_ttl_cleanup();
 
+    // Rule #17: Yielding per-shard TTL cleanup coroutine.
+    // Named (not lambda) to avoid Rule #16 when called from smp::submit_to.
+    static seastar::future<> ttl_cleanup_on_shard(std::chrono::steady_clock::time_point cutoff);
+
     // Check for backends that have been draining long enough and fully remove them
     void run_draining_reaper();
 

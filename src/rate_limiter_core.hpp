@@ -149,6 +149,9 @@ protected:
     // Accessors for derived Seastar service class (rate_limiter.hpp)
     const RateLimiterConfig& config() const { return _config; }
     std::chrono::seconds cleanup_interval() const { return _cleanup_interval; }
+
+    // Expose buckets for yielding cleanup in Seastar wrapper (Rule #17)
+    auto& buckets() { return _buckets; }
     void add_buckets_cleaned(size_t n) {
         _buckets_cleaned_total.fetch_add(n, std::memory_order_relaxed);
     }
