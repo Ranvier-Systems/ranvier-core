@@ -12,6 +12,7 @@
 #pragma once
 
 #include "rate_limiter_core.hpp"
+#include "types.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -131,7 +132,7 @@ private:
                 ++it;
             }
 
-            if (++iterations % 128 == 0) {
+            if (++iterations % kYieldInterval == 0) {
                 co_await seastar::coroutine::maybe_yield();
             }
         }

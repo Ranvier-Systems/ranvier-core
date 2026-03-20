@@ -853,7 +853,7 @@ seastar::future<> GossipProtocol::process_retries() {
             --_stats_pending_acks_count;
         }
 
-        if (++peers_processed % 64 == 0) {
+        if (++peers_processed % kYieldInterval == 0) {
             co_await seastar::coroutine::maybe_yield();
         }
     }

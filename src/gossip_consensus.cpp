@@ -192,7 +192,7 @@ seastar::future<std::vector<seastar::socket_address>> GossipConsensus::update_pe
                 broadcast_prune(*state.associated_backend);
             }
 
-            if (++pruned % 64 == 0) {
+            if (++pruned % kYieldInterval == 0) {
                 co_await seastar::coroutine::maybe_yield();
             }
         }
