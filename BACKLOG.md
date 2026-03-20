@@ -2986,65 +2986,154 @@ Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seas
 
 **Approach:** Component-by-component, all rules per component. Each component is audited in a single session checking all 8 new rules, since rule violations interact within a component and fixes are more coherent with full component context.
 
-**Phase 1 — Mechanical grep pass (all components, fast)**
+**Phase 1 — Mechanical grep pass (all components, fast)** _(completed 2026-03-20)_
 
-- [ ] **Scan for lambda coroutines passed to `.then()` without `seastar::coroutine::lambda()` wrapper (Rule 16)**
+- [x] **Scan for lambda coroutines passed to `.then()` without `seastar::coroutine::lambda()` wrapper (Rule 16)**
   _Pattern:_ `.then([` near `co_await` inside the lambda body
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P1 — Use-after-free, ASAN may miss
+  _Findings:_ 2 violations found:
+  - `k8s_discovery_service.cpp:970` — coroutine lambda passed to `k8s_watch()` without wrapper; captures `this`, contains `co_await` at lines 991, 1022
+  - `http_controller.cpp:1319` — coroutine lambda passed to `write_body()` without wrapper; captures `this`, extensive `co_await` usage in streaming response handler
 
-- [ ] **Scan for loops without `maybe_yield()` preemption points (Rule 17)**
+- [x] **Scan for loops without `maybe_yield()` preemption points (Rule 17)**
   _Pattern:_ `for (` loops without `maybe_yield` in body, particularly over containers that could exceed ~100 iterations
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P2 — Reactor stalls
+  _Findings:_ 4 violations + 3 warnings:
+  - `gossip_protocol.cpp:604-614` — nested loops over DNS SRV records + addr_list (unbounded, could reach 500+) without yield. P2-HIGH
+  - `gossip_protocol.cpp:791-843` — `process_retries()` nested loops over `_pending_acks` (bounded at 1000 total but no yield). P2-HIGH
+  - `gossip_consensus.cpp:182-190` — peer removal loop (up to 1024) calls `broadcast_prune()` per peer without yield. P2
+  - `rate_limiter_core.hpp:113` — `cleanup()` loop iterates up to 100K buckets on reactor thread without yield. P2
+  - _(warn)_ `gossip_consensus.cpp:221-234` — liveness check loop (up to 1024 peers), lightweight but calls `broadcast_prune()`
+  - _(warn)_ `gossip_consensus.cpp:362-400` — `get_cluster_state()` builds PeerInfo for all peers (up to 1024)
+  - _(warn)_ `connection_pool.hpp:397` — `cleanup_expired()` can iterate ~10K times (1000 backends x 10 conns)
 
-- [ ] **Scan for raw `semaphore::wait()`/`signal()` pairs (Rule 19)**
+- [x] **Scan for raw `semaphore::wait()`/`signal()` pairs (Rule 19)**
   _Pattern:_ `_sem.wait(` or `.signal(` without corresponding `get_units` or `with_semaphore`
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P1 — Eventual deadlock
+  _Findings:_ 1 violation:
+  - `tokenizer_service.cpp:377-382` — raw `try_wait(1)` + `defer(signal(1))` instead of `try_get_units()`. The `defer` guard partially mitigates but is still the raw pattern.
 
-- [ ] **Scan for `do_with` lambdas missing `&` on parameters (Rule 20)**
+- [x] **Scan for `do_with` lambdas missing `&` on parameters (Rule 20)**
   _Pattern:_ `do_with(` ... `](auto ` without `&`
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P1 — Use-after-free
+  _Findings:_ 0 violations. All 11 `do_with` calls use correct `auto&` or explicit `Type&` parameters.
 
-- [ ] **Scan for coroutines taking reference parameters (Rule 21)**
+- [x] **Scan for coroutines taking reference parameters (Rule 21)**
   _Pattern:_ `future<>` functions with `const&` or `&` params
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P2 — Dangling reference on suspend
+  _Findings:_ 15 violations across 4 files:
+  - `http_controller.cpp:287` — `write_client_error(output_stream<char>&, std::string_view)`
+  - `http_controller.cpp:331` — `establish_backend_connection(ProxyContext&)`
+  - `http_controller.cpp:411` — `send_backend_request(ProxyContext&, ConnectionBundle&)`
+  - `http_controller.cpp:467` — `stream_backend_response(ProxyContext&, ConnectionBundle&, output_stream<char>&)`
+  - `http_controller.cpp:652` — `handle_proxy(..., std::string_view endpoint)`
+  - `dtls_context.cpp:543` — `read_file_contents(const std::string&)`
+  - `gossip_consensus.cpp:34` — `start(const std::vector<socket_address>&)`
+  - `gossip_protocol.cpp:188` — `start(GossipTransport&, GossipConsensus&, std::vector<socket_address>&)`
+  - `k8s_discovery_service.cpp:298` — `load_ca_cert(const std::string&)`
+  - `k8s_discovery_service.cpp:549` — `k8s_get(const std::string&)`
+  - `k8s_discovery_service.cpp:817` — `handle_endpoint_added(const K8sEndpoint&)`
+  - `k8s_discovery_service.cpp:864` — `handle_endpoint_removed(const std::string&)`
+  - `k8s_discovery_service.cpp:896` — `handle_endpoint_modified(const K8sEndpoint&)`
+  - `k8s_discovery_service.hpp:181-182` — `resolve_api_server(const std::string&, ...)`
+  - `k8s_discovery_service.hpp:216` — `k8s_watch(const std::string&, ...)`
 
-- [ ] **Scan for `temporary_buffer::share()` stored to member variables (Rule 23)**
+- [x] **Scan for `temporary_buffer::share()` stored to member variables (Rule 23)**
   _Pattern:_ `.share(` assigned to `_member` or stored in containers
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P2 — Silent memory bloat
+  _Findings:_ 0 violations. No `.share()` calls found in entire codebase. All `temporary_buffer` usage follows correct ownership patterns.
 
-**Phase 2 — Component deep audit (all new rules per component)**
+**Phase 2 — Component deep audit (all new rules per component)** _(completed 2026-03-20)_
 
 Rules 18 (discarded futures) and 22 (exception-before-future) require understanding async flow and cannot be reliably grepped. These are checked during the component audit along with a second pass on all other new rules.
 
-- [ ] **Audit `http_controller.{hpp,cpp}`**
+- [x] **Audit `http_controller.{hpp,cpp}`**
   _Justification:_ Highest traffic, most async complexity, most likely to have discarded futures and coroutine ref params
   _Priority:_ P1
+  _Findings:_
+  - Rule 16 P1: `http_controller.cpp:1319` — coroutine lambda in `write_body()` (see Phase 1)
+  - Rule 21 P2: 5 coroutine functions with reference params (see Phase 1)
+  - Rule 22 P2: `http_controller.cpp:1550` — `handle_broadcast_route()` non-coroutine with narrow throw window before `return .then()`
+  - Rules 17, 18, 19, 20, 23: PASS
 
-- [ ] **Audit `application.{hpp,cpp}`**
+- [x] **Audit `application.{hpp,cpp}`**
   _Justification:_ Lifecycle orchestration, shutdown ordering, gate/timer patterns
   _Priority:_ P1
+  _Findings:_
+  - Rule 18 P1: `application.cpp:757` — `(void)_controller.invoke_on_all(...)` without `.handle_exception()`
+  - Rule 18 P2: `application.cpp:872` — `(void)with_timeout(...)` only handles `timed_out_error`, other exceptions silently discarded
+  - Rule 22 P2: 5 non-coroutine functions with pre-future throw risk: `init_persistence()` (:293), `load_persisted_state()` (:322), `apply_vocab_size_config()` (:247), `start_servers()` (:677), `stop_servers()` (:715)
+  - Rules 16, 17, 19, 20, 21, 23: PASS
 
-- [ ] **Audit `gossip_service.{hpp,cpp}`, `gossip_protocol.{hpp,cpp}`, `gossip_transport.{hpp,cpp}`, `gossip_consensus.{hpp,cpp}`**
+- [x] **Audit `gossip_service.{hpp,cpp}`, `gossip_protocol.{hpp,cpp}`, `gossip_transport.{hpp,cpp}`, `gossip_consensus.{hpp,cpp}`**
   _Justification:_ Cross-shard communication, timers, background fibers
   _Priority:_ P1
+  _Findings:_
+  - Rule 18 P1: `gossip_service.cpp:212` — `(void)initiate_handshake(peer)` without error handling
+  - Rule 18 P1: `gossip_protocol.cpp:211` — `(void)broadcast_heartbeat()` without error handling
+  - Rule 18 P1: `gossip_protocol.cpp:674` — `(void)initiate_handshake(peer)` without error handling
+  - Rule 22 P2: `gossip_protocol.cpp:305` — `broadcast_route()` may throw before future
+  - Rule 22 P2: `gossip_protocol.cpp:390` — `broadcast_node_state()` may throw before future
+  - Rule 22 P2: `gossip_protocol.cpp:410` — `broadcast_heartbeat()` may throw before future (also: gate holder not chained into future)
+  - Rule 22 P2: `gossip_protocol.cpp:686` — `send_ack()` may throw before future
+  - Rule 22 P2: `gossip_transport.cpp:151` — `send()` may throw before future
+  - Rule 22 P2: `gossip_transport.cpp:189` — `broadcast()` may throw before future
+  - Rule 21 P2: `gossip_protocol.hpp:126` — `start()` coroutine takes `&` params (low risk, stored as ptrs before suspend)
+  - Rule 21 P2: `gossip_consensus.hpp:102` — `start()` coroutine takes `const&` param (low risk, consumed before suspend)
+  - Rule 17 P2: `gossip_protocol.cpp:791` — `process_retries()` up to ~1000 iterations without yield
+  - Rules 16, 19, 20, 23: PASS
 
-- [ ] **Audit `tokenizer_service.{hpp,cpp}`, `tokenizer_thread_pool.{hpp,cpp}`**
+- [x] **Audit `tokenizer_service.{hpp,cpp}`, `tokenizer_thread_pool.{hpp,cpp}`**
   _Justification:_ FFI boundary, prior allocator corruption issues
   _Priority:_ P2
+  _Findings:_
+  - Rule 19 P1: `tokenizer_service.cpp:377` — raw `try_wait`/`signal` (see Phase 1)
+  - Rule 22 P2: `tokenizer_service.cpp:211` — `encode_cached_async()` non-coroutine may throw before future
+  - Rule 22 P2: `tokenizer_service.cpp:315` — `encode_threaded_async()` non-coroutine may throw before future
+  - Rules 16, 17, 18, 20, 21, 23: PASS
 
-- [ ] **Audit `router_service.{hpp,cpp}`, `radix_tree.hpp`, `node_slab.{hpp,cpp}`**
+- [x] **Audit `router_service.{hpp,cpp}`, `radix_tree.hpp`, `node_slab.{hpp,cpp}`**
   _Justification:_ CPU-bound potential (ART traversal), preemption relevance
   _Priority:_ P2
+  _Findings:_
+  - Rule 22 P2: `router_service.cpp:1971` — `learn_route_remote()` non-coroutine may throw before future
+  - Rule 22 P2: `router_service.cpp:2298` — `buffer_local_route()` non-coroutine may throw before future
+  - Rule 17 P2 (warn): `radix_tree.hpp` — `remove_expired()`, `compact()`, `remove_routes_by_backend()`, `for_each_leaf()` traverse potentially large trees without yield (callers should chunk)
+  - Rules 16, 18, 19, 20, 21, 23: PASS
 
-- [ ] **Audit remaining services (`sqlite_persistence`, `async_persistence`, `health_service`, `k8s_discovery_service`, `connection_pool`, `circuit_breaker`, `rate_limiter`, `stream_parser`, `shard_load_balancer`)**
+- [x] **Audit remaining services (`sqlite_persistence`, `async_persistence`, `health_service`, `k8s_discovery_service`, `connection_pool`, `circuit_breaker`, `rate_limiter`, `stream_parser`, `shard_load_balancer`)**
   _Justification:_ Lower complexity but still need coverage
   _Priority:_ P3
+  _Findings:_
+  - Rule 21 P2: `k8s_discovery_service` — 7 coroutine functions with `const&` params (see Phase 1)
+  - Rule 17 P2: `rate_limiter_core.hpp:113` — `cleanup()` iterates up to 100K buckets without yield
+  - Rule 22 P2: `shard_load_balancer.hpp:206` — `refresh_all_snapshots()` non-coroutine, `vector::reserve()`/`push_back()` can throw before future
+  - _(warn)_ Rule 17: `connection_pool.hpp:397` — `cleanup_expired()` up to ~10K iterations
+  - _(warn)_ Rule 17: `circuit_breaker.hpp:247` — `open_circuit_count()` up to 10K iterations
+  - Rules 16, 18, 19, 20, 23: PASS
+
+**Audit Summary (2026-03-20)**
+
+_Total violations found:_ 47
+_Critical (P1):_ 6 — Rule 16 ×2 (use-after-free), Rule 18 ×3 (discarded futures), Rule 19 ×1 (semaphore leak)
+_High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception-before-future), Rule 17 ×4 (reactor stall), Rule 17 warnings ×6
+
+| Rule | Violations | Severity | Most Affected Components |
+|------|-----------|----------|--------------------------|
+| 16 — Lambda Coroutine Fiasco | 2 | P1 | http_controller, k8s_discovery_service |
+| 17 — Reactor Stall | 4 (+6 warn) | P2 | gossip_protocol, gossip_consensus, rate_limiter_core |
+| 18 — Discarded Futures | 3 | P1 | application, gossip_service, gossip_protocol |
+| 19 — Semaphore Leak | 1 | P1 | tokenizer_service |
+| 20 — do_with Missing & | 0 | — | — |
+| 21 — Coroutine Reference Params | 15 | P2 | k8s_discovery_service, http_controller, gossip_*, dtls_context |
+| 22 — Exception-Before-Future | 16 | P2 | application, gossip_protocol, gossip_transport, tokenizer_service, router_service |
+| 23 — Shared temporary_buffer Pin | 0 | — | — |
 
 ---
 
