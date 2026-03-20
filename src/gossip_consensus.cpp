@@ -32,7 +32,7 @@ GossipConsensus::GossipConsensus(const ClusterConfig& config)
     : _config(config) {
 }
 
-seastar::future<> GossipConsensus::start(const std::vector<seastar::socket_address>& initial_peers) {
+seastar::future<> GossipConsensus::start(std::vector<seastar::socket_address> initial_peers) {
     _running = true;
 
     // Only shard 0 manages the peer table

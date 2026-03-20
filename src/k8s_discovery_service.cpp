@@ -18,6 +18,7 @@
 #include <rapidjson/stringbuffer.h>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/lambda.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>
@@ -295,7 +296,7 @@ seastar::future<> K8sDiscoveryService::load_service_account_token() {
     }
 }
 
-seastar::future<std::string> K8sDiscoveryService::load_ca_cert(const std::string& path) {
+seastar::future<std::string> K8sDiscoveryService::load_ca_cert(std::string path) {
     // Check if file exists first (async)
     bool exists = co_await seastar::file_exists(path);
     if (!exists) {
@@ -423,7 +424,7 @@ std::pair<std::string, uint16_t> K8sDiscoveryService::parse_api_server() const {
 }
 
 seastar::future<seastar::socket_address> K8sDiscoveryService::resolve_api_server(
-    const std::string& host, uint16_t port) {
+    std::string host, uint16_t port) {
 
     // Fast path: Try parsing as direct IP address
     try {
@@ -546,7 +547,7 @@ std::string K8sDiscoveryService::build_url(const std::string& path) const {
     return _config.api_server + path;
 }
 
-seastar::future<std::string> K8sDiscoveryService::k8s_get(const std::string& path) {
+seastar::future<std::string> K8sDiscoveryService::k8s_get(std::string path) {
     auto gate_holder = _gate.hold();
 
     auto [host, port] = parse_api_server();
@@ -814,7 +815,7 @@ seastar::future<> K8sDiscoveryService::reconcile(std::vector<K8sEndpoint> discov
     co_return;
 }
 
-seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& endpoint) {
+seastar::future<> K8sDiscoveryService::handle_endpoint_added(K8sEndpoint endpoint) {
     // Rule #4: Bound endpoints map to prevent OOM from broad selector
     if (_endpoints.find(endpoint.uid) == _endpoints.end() &&
         _endpoints.size() >= K8S_MAX_ENDPOINTS) {
@@ -861,7 +862,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_added(const K8sEndpoint& 
     co_return;
 }
 
-seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string& uid) {
+seastar::future<> K8sDiscoveryService::handle_endpoint_removed(std::string uid) {
     auto it = _endpoints.find(uid);
     if (it == _endpoints.end()) {
         co_return;
@@ -893,7 +894,7 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_removed(const std::string
     co_return;
 }
 
-seastar::future<> K8sDiscoveryService::handle_endpoint_modified(const K8sEndpoint& endpoint) {
+seastar::future<> K8sDiscoveryService::handle_endpoint_modified(K8sEndpoint endpoint) {
     auto backend_id = endpoint.to_backend_id();
 
     log_k8s.info("K8s endpoint modified: {} (ready={}, weight={}, priority={}, backend_id={})",
@@ -967,7 +968,7 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
         }
 
         // --- THE CO_AWAIT MUST BE INSIDE THIS FUNCTION ---
-        co_await k8s_watch(path.str(), [this](const std::string& line) -> seastar::future<bool> {
+        co_await k8s_watch(path.str(), seastar::coroutine::lambda([this](const std::string& line) -> seastar::future<bool> {
             if (line.empty()) co_return true;
 
             rapidjson::Document event;
@@ -1071,7 +1072,7 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             }
 
             co_return true;
-        }); // End of lambda and k8s_watch call
+        })); // End of lambda and k8s_watch call
 
     } catch (const std::exception& e) {
         log_k8s.error("Watch connection failed: {}. Will retry in 5s...", e.what());
@@ -1204,7 +1205,7 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
 }
 
 seastar::future<> K8sDiscoveryService::k8s_watch(
-    const std::string& path,
+    std::string path,
     std::function<seastar::future<bool>(const std::string&)> on_event) {
 
     auto [host, port] = parse_api_server();

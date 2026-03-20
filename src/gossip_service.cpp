@@ -203,7 +203,7 @@ seastar::future<> GossipService::start() {
     co_await _consensus->start(_peer_addresses);
 
     // Start protocol layer (message handling, reliable delivery)
-    co_await _protocol->start(*_transport, *_consensus, _peer_addresses);
+    co_await _protocol->start(_transport.get(), _consensus.get(), &_peer_addresses);
 
     // Initiate DTLS handshakes with all configured peers
     if (_transport->is_dtls_enabled()) {

@@ -214,7 +214,7 @@ private:
     seastar::future<std::optional<std::string>> load_certificates();
 
     // Read file contents using Seastar async file I/O (Rule #12)
-    static seastar::future<std::string> read_file_contents(const std::string& path);
+    static seastar::future<std::string> read_file_contents(std::string path);
 
     // Get file modification time using Seastar async file I/O (Rule #12)
     static seastar::future<std::optional<std::chrono::system_clock::time_point>>

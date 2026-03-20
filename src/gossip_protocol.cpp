@@ -186,12 +186,12 @@ GossipProtocol::GossipProtocol(const ClusterConfig& config)
       _discovery_future(seastar::make_ready_future<>()) {
 }
 
-seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsensus& consensus,
-                                         std::vector<seastar::socket_address>& peer_addresses) {
-    _transport = &transport;
-    _consensus = &consensus;
-    _peer_addresses = &peer_addresses;
-    _peer_address_set.insert(peer_addresses.begin(), peer_addresses.end());
+seastar::future<> GossipProtocol::start(GossipTransport* transport, GossipConsensus* consensus,
+                                         std::vector<seastar::socket_address>* peer_addresses) {
+    _transport = transport;
+    _consensus = consensus;
+    _peer_addresses = peer_addresses;
+    _peer_address_set.insert(peer_addresses->begin(), peer_addresses->end());
     _running = true;
 
     // Only shard 0 manages protocol logic
