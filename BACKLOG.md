@@ -3059,7 +3059,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Findings:_
   - Rule 16 P1: `http_controller.cpp:1319` — coroutine lambda in `write_body()` (see Phase 1)
   - Rule 21 P2: 5 coroutine functions with reference params (see Phase 1)
-  - Rule 22 P2: `http_controller.cpp:1550` — `handle_broadcast_route()` non-coroutine with narrow throw window before `return .then()`
+  - ~~Rule 22 P2: `http_controller.cpp:1550` — `handle_broadcast_route()` non-coroutine with narrow throw window before `return .then()`~~ **DONE** — converted to coroutine
   - Rules 17, 18, 19, 20, 23: PASS
 
 - [x] **Audit `application.{hpp,cpp}`**
@@ -3068,7 +3068,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Findings:_
   - Rule 18 P1: `application.cpp:757` — `(void)_controller.invoke_on_all(...)` without `.handle_exception()`
   - Rule 18 P2: `application.cpp:872` — `(void)with_timeout(...)` only handles `timed_out_error`, other exceptions silently discarded
-  - Rule 22 P2: 5 non-coroutine functions with pre-future throw risk: `init_persistence()` (:293), `load_persisted_state()` (:322), `apply_vocab_size_config()` (:247), `start_servers()` (:677), `stop_servers()` (:715)
+  - ~~Rule 22 P2: 5 non-coroutine functions with pre-future throw risk: `init_persistence()` (:293), `load_persisted_state()` (:322), `apply_vocab_size_config()` (:247), `start_servers()` (:677), `stop_servers()` (:715)~~ **DONE** — all 5 converted to coroutines
   - Rules 16, 17, 19, 20, 21, 23: PASS
 
 - [x] **Audit `gossip_service.{hpp,cpp}`, `gossip_protocol.{hpp,cpp}`, `gossip_transport.{hpp,cpp}`, `gossip_consensus.{hpp,cpp}`**
@@ -3078,12 +3078,12 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   - Rule 18 P1: `gossip_service.cpp:212` — `(void)initiate_handshake(peer)` without error handling
   - Rule 18 P1: `gossip_protocol.cpp:211` — `(void)broadcast_heartbeat()` without error handling
   - Rule 18 P1: `gossip_protocol.cpp:674` — `(void)initiate_handshake(peer)` without error handling
-  - Rule 22 P2: `gossip_protocol.cpp:305` — `broadcast_route()` may throw before future
-  - Rule 22 P2: `gossip_protocol.cpp:390` — `broadcast_node_state()` may throw before future
-  - Rule 22 P2: `gossip_protocol.cpp:410` — `broadcast_heartbeat()` may throw before future (also: gate holder not chained into future)
-  - Rule 22 P2: `gossip_protocol.cpp:686` — `send_ack()` may throw before future
-  - Rule 22 P2: `gossip_transport.cpp:151` — `send()` may throw before future
-  - Rule 22 P2: `gossip_transport.cpp:189` — `broadcast()` may throw before future
+  - ~~Rule 22 P2: `gossip_protocol.cpp:305` — `broadcast_route()` may throw before future~~ **DONE** — converted to coroutine
+  - ~~Rule 22 P2: `gossip_protocol.cpp:390` — `broadcast_node_state()` may throw before future~~ **DONE** — converted to coroutine
+  - ~~Rule 22 P2: `gossip_protocol.cpp:410` — `broadcast_heartbeat()` may throw before future (also: gate holder not chained into future)~~ **DONE** — converted to coroutine (gate holder now lives on coroutine frame)
+  - ~~Rule 22 P2: `gossip_protocol.cpp:686` — `send_ack()` may throw before future~~ **DONE** — converted to coroutine
+  - ~~Rule 22 P2: `gossip_transport.cpp:151` — `send()` may throw before future~~ **DONE** — converted to coroutine
+  - ~~Rule 22 P2: `gossip_transport.cpp:189` — `broadcast()` may throw before future~~ **DONE** — converted to coroutine
   - Rule 21 P2: `gossip_protocol.hpp:126` — `start()` coroutine takes `&` params (low risk, stored as ptrs before suspend)
   - Rule 21 P2: `gossip_consensus.hpp:102` — `start()` coroutine takes `const&` param (low risk, consumed before suspend)
   - Rule 17 P2: `gossip_protocol.cpp:791` — `process_retries()` up to ~1000 iterations without yield
@@ -3094,16 +3094,16 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Priority:_ P2
   _Findings:_
   - Rule 19 P1: `tokenizer_service.cpp:377` — raw `try_wait`/`signal` (see Phase 1)
-  - Rule 22 P2: `tokenizer_service.cpp:211` — `encode_cached_async()` non-coroutine may throw before future
-  - Rule 22 P2: `tokenizer_service.cpp:315` — `encode_threaded_async()` non-coroutine may throw before future
+  - ~~Rule 22 P2: `tokenizer_service.cpp:211` — `encode_cached_async()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
+  - ~~Rule 22 P2: `tokenizer_service.cpp:315` — `encode_threaded_async()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
   - Rules 16, 17, 18, 20, 21, 23: PASS
 
 - [x] **Audit `router_service.{hpp,cpp}`, `radix_tree.hpp`, `node_slab.{hpp,cpp}`**
   _Justification:_ CPU-bound potential (ART traversal), preemption relevance
   _Priority:_ P2
   _Findings:_
-  - Rule 22 P2: `router_service.cpp:1971` — `learn_route_remote()` non-coroutine may throw before future
-  - Rule 22 P2: `router_service.cpp:2298` — `buffer_local_route()` non-coroutine may throw before future
+  - ~~Rule 22 P2: `router_service.cpp:1971` — `learn_route_remote()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
+  - ~~Rule 22 P2: `router_service.cpp:2298` — `buffer_local_route()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
   - Rule 17 P2 (warn): `radix_tree.hpp` — `remove_expired()`, `compact()`, `remove_routes_by_backend()`, `for_each_leaf()` traverse potentially large trees without yield (callers should chunk)
   - Rules 16, 18, 19, 20, 21, 23: PASS
 
@@ -3113,7 +3113,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Findings:_
   - Rule 21 P2: `k8s_discovery_service` — 7 coroutine functions with `const&` params (see Phase 1)
   - Rule 17 P2: `rate_limiter_core.hpp:113` — `cleanup()` iterates up to 100K buckets without yield
-  - Rule 22 P2: `shard_load_balancer.hpp:206` — `refresh_all_snapshots()` non-coroutine, `vector::reserve()`/`push_back()` can throw before future
+  - ~~Rule 22 P2: `shard_load_balancer.hpp:206` — `refresh_all_snapshots()` non-coroutine, `vector::reserve()`/`push_back()` can throw before future~~ **DONE** — converted to coroutine
   - _(warn)_ Rule 17: `connection_pool.hpp:397` — `cleanup_expired()` up to ~10K iterations
   - _(warn)_ Rule 17: `circuit_breaker.hpp:247` — `open_circuit_count()` up to 10K iterations
   - Rules 16, 18, 19, 20, 23: PASS
@@ -3132,7 +3132,7 @@ _High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception
 | 19 — Semaphore Leak | 1 | P1 | tokenizer_service |
 | 20 — do_with Missing & | 0 | — | — |
 | 21 — Coroutine Reference Params | 15 | P2 | k8s_discovery_service, http_controller, gossip_*, dtls_context |
-| 22 — Exception-Before-Future | 16 | P2 | application, gossip_protocol, gossip_transport, tokenizer_service, router_service |
+| 22 — Exception-Before-Future | ~~16~~ 0 (all DONE) | ~~P2~~ FIXED | application, gossip_protocol, gossip_transport, tokenizer_service, router_service, shard_load_balancer, http_controller |
 | 23 — Shared temporary_buffer Pin | 0 | — | — |
 
 ---

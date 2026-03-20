@@ -203,6 +203,7 @@ public:
 
     // Refresh snapshot cache for all shards
     // Call periodically from a background timer
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     seastar::future<> refresh_all_snapshots() {
         std::vector<seastar::future<ShardLoadSnapshot>> futures;
         futures.reserve(_shard_count);
@@ -211,12 +212,10 @@ public:
             futures.push_back(fetch_shard_snapshot(shard));
         }
 
-        return seastar::when_all_succeed(futures.begin(), futures.end())
-            .then([this](std::vector<ShardLoadSnapshot> snapshots) {
-                for (size_t i = 0; i < snapshots.size(); ++i) {
-                    _snapshot_cache[i] = snapshots[i];
-                }
-            });
+        auto snapshots = co_await seastar::when_all_succeed(futures.begin(), futures.end());
+        for (size_t i = 0; i < snapshots.size(); ++i) {
+            _snapshot_cache[i] = snapshots[i];
+        }
     }
 
     // Update local shard's snapshot in cache (called locally, no cross-shard)
