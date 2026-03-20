@@ -76,20 +76,14 @@ seastar::future<> GossipConsensus::start(const std::vector<seastar::socket_addre
     // Set up liveness check timer with RAII timer safety
     _liveness_timer.set_callback([this] {
         // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
+        // The holder must outlive the work, so declare outside try block.
         seastar::gate::holder timer_holder;
         try {
             timer_holder = _timer_gate.hold();
         } catch (const seastar::gate_closed_exception&) {
             return;
         }
-        // Rule #18: check_liveness() is now a coroutine — handle returned future.
-        // Gate holder moved into the coroutine chain to span the full async lifetime.
-        (void)check_liveness().handle_exception([](auto ep) {
-            try { std::rethrow_exception(ep); }
-            catch (const std::exception& e) {
-                log_gossip_consensus().warn("check_liveness failed: {}", e.what());
-            }
-        }).finally([holder = std::move(timer_holder)] {});
+        check_liveness();
     });
     _liveness_timer.arm_periodic(_config.gossip_heartbeat_interval);
 
@@ -157,7 +151,7 @@ void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
 }
 
 seastar::future<std::vector<seastar::socket_address>> GossipConsensus::update_peer_list(
-    const std::vector<seastar::socket_address>& new_peers) {
+    std::vector<seastar::socket_address> new_peers) {
 
     std::vector<seastar::socket_address> newly_added;
     auto now = seastar::lowres_clock::now();
@@ -228,13 +222,14 @@ size_t GossipConsensus::quorum_required() const {
     return std::min(required, total_nodes);
 }
 
-seastar::future<> GossipConsensus::check_liveness() {
+void GossipConsensus::check_liveness() {
     auto now = seastar::lowres_clock::now();
     uint64_t alive_count = 0;
 
-    // Rule #17: Yield periodically during peer iteration (up to 1024 peers).
-    // Each dead peer triggers broadcast_prune() which is non-trivial.
-    size_t iterations = 0;
+    // Bounded at MAX_PEERS (1024) with lightweight per-iteration work.
+    // broadcast_prune() is fire-and-forget (returns immediately).
+    // Must remain synchronous — yielding here could interleave with
+    // update_peer_list() which replaces _peer_table, invalidating iterators.
     for (auto& [addr, state] : _peer_table) {
         if (state.is_alive && (now - state.last_seen) > _config.gossip_peer_timeout) {
             state.is_alive = false;
@@ -247,10 +242,6 @@ seastar::future<> GossipConsensus::check_liveness() {
 
         if (state.is_alive) {
             ++alive_count;
-        }
-
-        if (++iterations % 64 == 0) {
-            co_await seastar::coroutine::maybe_yield();
         }
     }
 

@@ -3005,7 +3005,7 @@ Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seas
   - ~~`gossip_protocol.cpp:791-843` — `process_retries()` nested loops over `_pending_acks` (bounded at 1000 total but no yield). P2-HIGH~~ **DONE** — converted to coroutine with yield every 64 peers; timer callback now handles returned future (Rule #18)
   - ~~`gossip_consensus.cpp:182-190` — peer removal loop (up to 1024) calls `broadcast_prune()` per peer without yield. P2~~ **DONE** — `update_peer_list()` converted to coroutine with yield every 64 pruned peers
   - ~~`rate_limiter_core.hpp:113` — `cleanup()` loop iterates up to 100K buckets on reactor thread without yield. P2~~ **DONE** — added yielding `cleanup_async()` coroutine in Seastar wrapper (`rate_limiter.hpp`) with yield every 128 iterations; pure algorithm untouched for testability
-  - ~~_(warn)_ `gossip_consensus.cpp:221-234` — liveness check loop (up to 1024 peers), lightweight but calls `broadcast_prune()`~~ **DONE** — `check_liveness()` converted to coroutine with yield every 64 peers
+  - _(warn)_ `gossip_consensus.cpp:221-234` — liveness check loop (up to 1024 peers), lightweight but calls `broadcast_prune()`. Kept synchronous: bounded at MAX_PEERS (1024) with lightweight work (~50μs); yielding would risk iterator invalidation if interleaved with `update_peer_list()`
   - _(warn)_ `gossip_consensus.cpp:362-400` — `get_cluster_state()` builds PeerInfo for all peers (up to 1024). Sufficient bounds (~200μs, within 500μs task quota)
   - _(warn)_ `connection_pool.hpp:397` — `cleanup_expired()` can iterate ~10K times (1000 backends x 10 conns). Sufficient bounds (~100μs, within 500μs task quota)
 
@@ -3122,12 +3122,12 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
 
 _Total violations found:_ 47
 _Critical (P1):_ 6 — Rule 16 ×2 (use-after-free), Rule 18 ×3 (discarded futures), Rule 19 ×1 (semaphore leak)
-_High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception-before-future), ~~Rule 17 ×4 (reactor stall)~~ FIXED, ~~Rule 17 warnings ×6~~ 5 FIXED + 3 sufficient bounds
+_High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception-before-future), ~~Rule 17 ×4 (reactor stall)~~ FIXED, ~~Rule 17 warnings ×6~~ 4 FIXED + 3 within bounds
 
 | Rule | Violations | Severity | Most Affected Components |
 |------|-----------|----------|--------------------------|
 | 16 — Lambda Coroutine Fiasco | 2 | P1 | http_controller, k8s_discovery_service |
-| 17 — Reactor Stall | ~~4 (+6 warn)~~ 0 (+3 warn, 2 sufficient bounds) | ~~P2~~ FIXED | gossip_protocol, gossip_consensus, rate_limiter_core, router_service |
+| 17 — Reactor Stall | ~~4~~ 0 (+3 warn: 2 sufficient bounds, 1 kept sync for safety) | ~~P2~~ FIXED | gossip_protocol, gossip_consensus, rate_limiter_core, router_service |
 | 18 — Discarded Futures | 3 | P1 | application, gossip_service, gossip_protocol |
 | 19 — Semaphore Leak | 1 | P1 | tokenizer_service |
 | 20 — do_with Missing & | 0 | — | — |
