@@ -766,6 +766,8 @@ void Application::setup_signal_handlers() {
             log_main.error("Failed to send SIGHUP signal");
             return false;
         });
+    }).handle_exception([](auto ep) {
+        log_main.warn("Config reload callback broadcast failed: {}", ep);
     });
     log_main.info("Config reload callback registered for /admin/keys/reload endpoint");
 

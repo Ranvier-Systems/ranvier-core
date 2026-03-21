@@ -209,7 +209,9 @@ seastar::future<> GossipProtocol::start(GossipTransport* transport, GossipConsen
             return;
         }
 
-        (void)broadcast_heartbeat();
+        (void)broadcast_heartbeat().handle_exception([](auto ep) {
+            log_gossip_protocol().warn("Heartbeat broadcast failed: {}", ep);
+        });
     });
     _heartbeat_timer.arm_periodic(_config.gossip_heartbeat_interval);
 
@@ -686,7 +688,10 @@ seastar::future<> GossipProtocol::refresh_peers() {
             log_gossip_protocol().info("Initiating DTLS handshakes with {} newly discovered peers",
                                        new_peers_for_handshake.size());
             for (const auto& peer : new_peers_for_handshake) {
-                (void)_transport->initiate_handshake(peer);
+                (void)_transport->initiate_handshake(peer).handle_exception(
+                    [peer](auto ep) {
+                        log_gossip_protocol().warn("DTLS handshake failed for discovered peer {}: {}", peer, ep);
+                    });
             }
         }
 
