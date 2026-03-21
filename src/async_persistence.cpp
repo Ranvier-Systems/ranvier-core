@@ -192,10 +192,19 @@ void AsyncPersistenceManager::queue_remove_routes_for_backend(BackendId backend_
 void AsyncPersistenceManager::queue_clear_all() {
     if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
-    // Bump the generation counter. The consumer checks this before processing
-    // each batch and discards stale items. Then enqueue the ClearAllOp so the
-    // consumer will execute the actual store clear.
+    // Drain and discard all pending ops — they'll be cleared anyway.
+    // Safe because both producer and consumer (extract_batch/drain_queue)
+    // run on the reactor thread (cooperative, no concurrent access to ring).
+    std::vector<PersistenceOp> discarded;
+    size_t drained = _ring->drain_all(discarded);
+    if (drained > 0) {
+        _queue_size.fetch_sub(drained, std::memory_order_relaxed);
+    }
+
+    // Bump generation counter so any already-extracted batch (in-flight in
+    // seastar::async) will skip its stale ops when it reaches process_batch().
     _clear_generation.fetch_add(1, std::memory_order_release);
+
     try_enqueue(ClearAllOp{});
 }
 
@@ -204,6 +213,13 @@ void AsyncPersistenceManager::queue_clear_all() {
 // ============================================================================
 
 bool AsyncPersistenceManager::try_enqueue(PersistenceOp op) {
+    // Check configured backpressure limit before pushing. The ring buffer's
+    // internal capacity is rounded up to a power of two, so it may accept
+    // more items than max_queue_depth. Enforce the configured limit here.
+    if (_queue_size.load(std::memory_order_relaxed) >= _config.max_queue_depth) {
+        _ops_dropped++;
+        return false;
+    }
     if (!_ring->try_push(std::move(op))) {
         _ops_dropped++;
         return false;
