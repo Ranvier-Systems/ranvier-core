@@ -18,7 +18,6 @@
 #include <rapidjson/stringbuffer.h>
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/lambda.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/metrics.hh>

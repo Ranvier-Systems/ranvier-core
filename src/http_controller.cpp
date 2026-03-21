@@ -14,7 +14,6 @@
 #include <system_error>
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/lambda.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/timer.hh>

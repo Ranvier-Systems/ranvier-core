@@ -372,12 +372,12 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
     // limits concurrent local tokenizations per shard to prevent compounding
     // reactor stalls. If the semaphore is full, return empty result so the
     // caller falls back to hash/random routing.
-    auto units = _local_tokenize_sem.try_get_units(1);
-    if (!units) {
+    if (!_local_tokenize_sem.try_wait(1)) {
         ++_local_fallback_rejected;
         co_return TokenizationResult{};
     }
-    // RAII: units automatically returned when scope exits (exception-safe, Rule #19)
+    // RAII guard: signal semaphore when scope exits (exception-safe, Rule #19)
+    auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
     co_return tokenize_locally(text);
 }
 
