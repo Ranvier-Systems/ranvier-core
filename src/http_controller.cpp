@@ -747,6 +747,22 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Guard is released before entering the lambda, which takes over responsibility
     ActiveRequestGuard active_request_guard(metrics());
 
+    // Request body size limit check — before any body processing to prevent memory exhaustion (§4.4)
+    if (_config.max_request_body_bytes > 0) {
+        size_t body_size = get_request_body_size(*req);
+        if (body_size > _config.max_request_body_bytes) {
+            ++_requests_rejected_body_size;
+            metrics().record_body_size_rejection();
+            log_proxy.warn("[{}] Request rejected - body size {} exceeds limit {}",
+                           request_id, body_size, _config.max_request_body_bytes);
+            rep->set_status(static_cast<seastar::http::reply::status_type>(413));
+            rep->add_header("X-Request-ID", request_id);
+            rep->write_body("json", "{\"error\": \"Request body too large\", \"max_bytes\": " +
+                           std::to_string(_config.max_request_body_bytes) + "}");
+            co_return std::move(rep);
+        }
+    }
+
     // Zero-copy body access: use string_view for tokenization and parsing,
     // only create string copy when we need to forward/modify the body
 #pragma GCC diagnostic push
@@ -1709,7 +1725,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         log_control.debug("POST /admin/backends: '{}' is not a direct IP, attempting DNS resolution", ip_str);
 
         try {
-            auto hostent = co_await seastar::net::dns::get_host_by_name(std::string(ip_str));
+            auto deadline = seastar::lowres_clock::now()
+                + std::chrono::seconds(_config.dns_resolution_timeout_seconds);
+            auto hostent = co_await seastar::with_timeout(
+                deadline,
+                seastar::net::dns::get_host_by_name(std::string(ip_str))
+            );
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -1729,6 +1750,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
 
             log_control.info("POST /admin/backends: resolved hostname '{}' to IP '{}'", ip_str, resolved_ip);
 
+        } catch (const seastar::timed_out_error&) {
+            log_control.warn("POST /admin/backends: DNS resolution timed out for '{}' ({}s limit)",
+                            ip_str, _config.dns_resolution_timeout_seconds);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"DNS resolution timed out for hostname\"}");
+            co_return std::move(rep);
         } catch (const std::exception& e) {
             log_control.warn("POST /admin/backends: failed to resolve '{}': {}", ip_str, e.what());
             rep->set_status(seastar::http::reply::status_type::bad_request);
@@ -1968,6 +1995,24 @@ bool HttpController::is_persistence_backpressured() const {
     double fill_ratio = static_cast<double>(current_depth) / static_cast<double>(max_depth);
 
     return fill_ratio >= _config.backpressure.persistence_queue_threshold;
+}
+
+size_t HttpController::get_request_body_size(const seastar::http::request& req) {
+    auto content_length_it = req._headers.find("Content-Length");
+    if (content_length_it != req._headers.end()) {
+        // Content-Length header present — parse with from_chars (Rule #10)
+        const auto& cl_str = content_length_it->second;
+        uint64_t cl_value = 0;
+        auto [ptr, ec] = std::from_chars(cl_str.data(), cl_str.data() + cl_str.size(), cl_value);
+        if (ec == std::errc{} && ptr == cl_str.data() + cl_str.size()) {
+            return static_cast<size_t>(cl_value);
+        }
+    }
+    // Chunked/no Content-Length: use actual received content size
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    return req.content.size();
+#pragma GCC diagnostic pop
 }
 
 uint32_t HttpController::select_target_shard() {

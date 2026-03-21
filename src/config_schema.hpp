@@ -29,6 +29,8 @@ struct ServerConfig {
     std::string bind_address = "0.0.0.0";
     uint16_t api_port = 8080;
     uint16_t metrics_port = 9180;
+    size_t max_request_body_bytes = 10 * 1024 * 1024;  // Max request body size for proxy endpoints (default: 10MB, 0 = unlimited)
+    uint32_t dns_resolution_timeout_seconds = 5;        // Timeout for DNS resolution in backend registration (seconds)
 };
 
 // =============================================================================
