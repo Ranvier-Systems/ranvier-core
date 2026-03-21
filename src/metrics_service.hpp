@@ -185,6 +185,9 @@ public:
             seastar::metrics::make_counter("http_requests_backpressure_rejected", _requests_backpressure,
                 seastar::metrics::description("Total number of requests rejected due to backpressure (concurrency or persistence)")),
 
+            seastar::metrics::make_counter("requests_rejected_body_size_total", _requests_rejected_body_size,
+                seastar::metrics::description("Total number of requests rejected due to request body size exceeding limit (HTTP 413)")),
+
             seastar::metrics::make_counter("stream_parser_size_limit_rejections", _stream_parser_size_rejections,
                 seastar::metrics::description("Total number of connections rejected due to stream parser accumulator size limit (Slowloris defense)")),
 
@@ -346,6 +349,9 @@ public:
     // Record backpressure rejections (503 due to concurrency or persistence limits)
     void record_backpressure_rejection() { _requests_backpressure++; }
 
+    // Record request body size limit rejections (HTTP 413)
+    void record_body_size_rejection() { _requests_rejected_body_size++; }
+
     // Record stream parser size limit rejections (Slowloris defense)
     void record_stream_parser_size_rejection() { _stream_parser_size_rejections++; }
 
@@ -480,6 +486,7 @@ private:
     uint64_t _requests_connection_error = 0;
     uint64_t _stale_connection_retries = 0;
     uint64_t _requests_backpressure = 0;
+    uint64_t _requests_rejected_body_size = 0;
     uint64_t _circuit_opens = 0;
     uint64_t _circuits_removed = 0;
     uint64_t _fallback_attempts = 0;

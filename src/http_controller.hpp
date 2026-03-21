@@ -139,6 +139,8 @@ struct HttpControllerConfig {
     bool enable_multi_depth_routing = false;    // Enable multi-depth route storage (Option C)
     ChatTemplate chat_template;                 // Pre-compiled chat template for vLLM-aligned tokenization
     uint32_t max_stale_retries = 1;              // Max retries for empty backend responses on stale pooled connections (0 = disabled)
+    size_t max_request_body_bytes = 10 * 1024 * 1024;  // Max request body size for proxy endpoints (default: 10MB, 0 = unlimited)
+    uint32_t dns_resolution_timeout_seconds = 5;        // Timeout for DNS resolution in backend registration (seconds)
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
@@ -275,6 +277,7 @@ private:
     // Backpressure metrics (shard-local — no cross-shard access)
     uint64_t _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
     uint64_t _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
+    uint64_t _requests_rejected_body_size{0};     // Rejected due to request body size limit
 
     // Shard load balancing metrics (reserved for future cross-shard dispatch)
     uint64_t _requests_local_dispatch{0};         // Requests processed locally

@@ -457,11 +457,12 @@ Hardening for production deployment environments.
   _Location:_ `src/http_controller.hpp`, `src/http_controller.cpp`, `src/config.hpp`, `src/gossip_service.hpp`, `src/gossip_service.cpp`
   _Complexity:_ Medium
 
-- [ ] **Add request body size limits**
+- [x] **Add request body size limits** ✓
   _Justification:_ No maximum request size. Large payloads can exhaust memory.
   _Config:_ `max_request_body_bytes` (default: 10MB)
   _Location:_ `src/http_controller.cpp`, `src/config.hpp`
   _Complexity:_ Low
+  _Fixed:_ Content-Length checked before body processing; chunked requests checked by actual size; HTTP 413 with JSON error; `ranvier_requests_rejected_body_size_total` Prometheus counter; configurable via YAML and `RANVIER_MAX_REQUEST_BODY_BYTES` env var
 
 - [ ] **Implement per-API-key rate limiting**
   _Justification:_ Current rate limiting is per-IP only. Shared infrastructure (NAT) causes false positives.
@@ -1024,7 +1025,7 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
   _Severity:_ Medium
   _Fixed:_ PR #127 - std::call_once for init, std::atomic for enabled flag, shutdown guard
 
-- [ ] **Add DNS resolution timeout in backend registration**
+- [x] **Add DNS resolution timeout in backend registration** ✓
   _Issue:_ `src/http_controller.cpp:1469` calls `seastar::net::dns::get_host_by_name()` without timeout. If hostname doesn't resolve (especially `.local` mDNS domains), the request hangs indefinitely waiting for DNS response.
   _Fix:_ Wrap DNS call with `seastar::with_timeout()`:
   ```cpp
@@ -1035,6 +1036,7 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
   ```
   _Location:_ `src/http_controller.cpp:1469`
   _Severity:_ Medium
+  _Fixed:_ Wrapped with `seastar::with_timeout()` using `lowres_clock` deadline; catches `seastar::timed_out_error` separately with clear error message; configurable via `dns_resolution_timeout_seconds` (default: 5s) in YAML and `RANVIER_DNS_RESOLUTION_TIMEOUT_SECONDS` env var
 
 ### 7.3 Architecture Drift
 

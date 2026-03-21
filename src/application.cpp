@@ -153,6 +153,9 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.circuit_breaker.success_threshold = config.circuit_breaker.success_threshold;
     cfg.circuit_breaker.recovery_timeout = config.circuit_breaker.recovery_timeout;
     cfg.circuit_breaker.fallback_enabled = config.circuit_breaker.fallback_enabled;
+    // Request body size limit and DNS timeout
+    cfg.max_request_body_bytes = config.server.max_request_body_bytes;
+    cfg.dns_resolution_timeout_seconds = config.server.dns_resolution_timeout_seconds;
     // Backpressure settings
     cfg.backpressure.max_concurrent_requests = config.backpressure.max_concurrent_requests;
     cfg.backpressure.enable_persistence_backpressure = config.backpressure.enable_persistence_backpressure;

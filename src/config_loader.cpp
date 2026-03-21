@@ -51,6 +51,8 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_BIND_ADDRESS")) server.bind_address = *v;
     if (auto v = get_env_as<uint16_t>("RANVIER_API_PORT")) server.api_port = *v;
     if (auto v = get_env_as<uint16_t>("RANVIER_METRICS_PORT")) server.metrics_port = *v;
+    if (auto v = get_env_as<size_t>("RANVIER_MAX_REQUEST_BODY_BYTES")) server.max_request_body_bytes = *v;
+    if (auto v = get_env_as<uint32_t>("RANVIER_DNS_RESOLUTION_TIMEOUT_SECONDS")) server.dns_resolution_timeout_seconds = *v;
 
     // Database overrides
     if (auto v = get_env("RANVIER_DB_PATH")) database.path = *v;
@@ -539,6 +541,8 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (s["bind_address"]) config.server.bind_address = s["bind_address"].as<std::string>();
             if (s["api_port"]) config.server.api_port = s["api_port"].as<uint16_t>();
             if (s["metrics_port"]) config.server.metrics_port = s["metrics_port"].as<uint16_t>();
+            if (s["max_request_body_bytes"]) config.server.max_request_body_bytes = s["max_request_body_bytes"].as<size_t>();
+            if (s["dns_resolution_timeout_seconds"]) config.server.dns_resolution_timeout_seconds = s["dns_resolution_timeout_seconds"].as<uint32_t>();
         }
 
         // Database section
