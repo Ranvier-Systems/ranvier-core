@@ -123,8 +123,8 @@ public:
     GossipProtocol& operator=(const GossipProtocol&) = delete;
 
     // Lifecycle
-    seastar::future<> start(GossipTransport& transport, GossipConsensus& consensus,
-                            std::vector<seastar::socket_address>& peer_addresses);
+    seastar::future<> start(GossipTransport* transport, GossipConsensus* consensus,
+                            std::vector<seastar::socket_address>* peer_addresses);
     seastar::future<> stop();
 
     // Callbacks
@@ -233,7 +233,7 @@ private:
     seastar::future<> send_ack(const seastar::socket_address& peer, uint32_t seq_num);
     void handle_ack(const seastar::socket_address& peer, uint32_t seq_num);
     bool is_duplicate(const seastar::socket_address& peer, uint32_t seq_num);
-    void process_retries();
+    seastar::future<> process_retries();
     uint32_t next_seq_num(const seastar::socket_address& peer);
     std::chrono::milliseconds calculate_backoff(uint32_t retry_count) const;
 

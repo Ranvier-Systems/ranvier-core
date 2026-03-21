@@ -12,6 +12,7 @@
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
@@ -185,12 +186,12 @@ GossipProtocol::GossipProtocol(const ClusterConfig& config)
       _discovery_future(seastar::make_ready_future<>()) {
 }
 
-seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsensus& consensus,
-                                         std::vector<seastar::socket_address>& peer_addresses) {
-    _transport = &transport;
-    _consensus = &consensus;
-    _peer_addresses = &peer_addresses;
-    _peer_address_set.insert(peer_addresses.begin(), peer_addresses.end());
+seastar::future<> GossipProtocol::start(GossipTransport* transport, GossipConsensus* consensus,
+                                         std::vector<seastar::socket_address>* peer_addresses) {
+    _transport = transport;
+    _consensus = consensus;
+    _peer_addresses = peer_addresses;
+    _peer_address_set.insert(peer_addresses->begin(), peer_addresses->end());
     _running = true;
 
     // Only shard 0 manages protocol logic
@@ -218,7 +219,16 @@ seastar::future<> GossipProtocol::start(GossipTransport& transport, GossipConsen
                                    _config.gossip_ack_timeout.count(),
                                    _config.gossip_max_retries,
                                    _config.gossip_dedup_window);
-        _retry_timer.set_callback([this] { process_retries(); });
+        _retry_timer.set_callback([this] {
+            // Rule #18: Future must be handled. Gate holder inside process_retries()
+            // ensures stop() waits for completion.
+            (void)process_retries().handle_exception([](auto ep) {
+                try { std::rethrow_exception(ep); }
+                catch (const std::exception& e) {
+                    log_gossip_protocol().warn("process_retries failed: {}", e.what());
+                }
+            });
+        });
         auto retry_check_interval = std::max(
             std::chrono::milliseconds(10),
             _config.gossip_ack_timeout / 2);
@@ -303,15 +313,16 @@ seastar::future<> GossipProtocol::stop() {
 }
 
 seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Gossip protection: reject during shutdown or re-sync
     if (_consensus && !_consensus->is_accepting_tasks()) {
         log_gossip_protocol().debug("Route broadcast rejected: gossip service not accepting tasks. "
                                     "tokens={}, backend={}", tokens.size(), backend);
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     // Split-brain protection
@@ -325,7 +336,7 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
             _consensus->inc_routes_rejected_degraded();
             log_gossip_protocol().debug("Route broadcast rejected: cluster in DEGRADED mode (no quorum). "
                                         "tokens={}, backend={}", tokens.size(), backend);
-            return seastar::make_ready_future<>();
+            co_return;
         }
     }
 
@@ -343,7 +354,7 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
     auto base_serialized = pkt.serialize();
 
     // Send to each peer, stamping per-peer sequence numbers into the pre-serialized buffer
-    return seastar::parallel_for_each(*_peer_addresses,
+    co_await seastar::parallel_for_each(*_peer_addresses,
         [this, base_serialized = std::move(base_serialized)](const seastar::socket_address& peer) mutable {
 
         // Copy the pre-serialized buffer and stamp this peer's seq_num at bytes 2-5
@@ -388,8 +399,9 @@ seastar::future<> GossipProtocol::broadcast_route(const std::vector<TokenId>& to
 }
 
 seastar::future<> GossipProtocol::broadcast_node_state(NodeState state, BackendId local_backend_id) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     if (state == NodeState::DRAINING) {
@@ -402,24 +414,24 @@ seastar::future<> GossipProtocol::broadcast_node_state(NodeState state, BackendI
     pkt.backend_id = local_backend_id;
     auto serialized = pkt.serialize();
 
-    return _transport->broadcast(*_peer_addresses, serialized).then([this] {
-        ++_node_state_sent;
-    });
+    co_await _transport->broadcast(*_peer_addresses, serialized);
+    ++_node_state_sent;
 }
 
 seastar::future<> GossipProtocol::broadcast_heartbeat() {
-    // RAII Timer Safety: Holder must outlive the work
+    // Rule 22: coroutine converts any pre-future throw into a failed future
+    // RAII Timer Safety: Holder must outlive the work — coroutine frame keeps it alive
     seastar::gate::holder timer_holder;
     try {
         if (_transport) {
             timer_holder = _transport->timer_gate().hold();
         }
     } catch (const seastar::gate_closed_exception&) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     if (!_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     std::vector<uint8_t> heartbeat_data = {
@@ -427,7 +439,7 @@ seastar::future<> GossipProtocol::broadcast_heartbeat() {
         static_cast<uint8_t>(RouteAnnouncementPacket::PROTOCOL_VERSION)
     };
 
-    return _transport->broadcast(*_peer_addresses, heartbeat_data);
+    co_await _transport->broadcast(*_peer_addresses, heartbeat_data);
 }
 
 seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgram) {
@@ -611,6 +623,9 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 } catch (const std::exception& e) {
                     log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                 }
+                // Rule #17: Yield between DNS resolutions to avoid reactor stall
+                // when SRV record count is large (unbounded, could reach 500+)
+                co_await seastar::coroutine::maybe_yield();
             }
         } else if (_config.discovery_type == DiscoveryType::A) {
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
@@ -646,7 +661,7 @@ seastar::future<> GossipProtocol::refresh_peers() {
         // Update consensus peer table and get newly added peers
         std::vector<seastar::socket_address> new_peers_for_handshake;
         if (_consensus) {
-            new_peers_for_handshake = _consensus->update_peer_list(new_peer_addresses);
+            new_peers_for_handshake = co_await _consensus->update_peer_list(new_peer_addresses);
         }
 
         // Clean up protocol state for removed peers
@@ -684,8 +699,9 @@ seastar::future<> GossipProtocol::refresh_peers() {
 }
 
 seastar::future<> GossipProtocol::send_ack(const seastar::socket_address& peer, uint32_t seq_num) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     if (!_transport || !_transport->is_ready()) {
-        return seastar::make_ready_future<>();
+        co_return;
     }
 
     RouteAckPacket ack;
@@ -694,15 +710,16 @@ seastar::future<> GossipProtocol::send_ack(const seastar::socket_address& peer, 
 
     log_gossip_protocol().trace("Sending ACK: peer={}, seq_num={}", peer, seq_num);
 
-    return _transport->send(peer, serialized).then([this] {
+    try {
+        co_await _transport->send(peer, serialized);
         ++_acks_sent;
-    }).handle_exception([peer, seq_num](auto ep) {
+    } catch (...) {
         try {
-            std::rethrow_exception(ep);
+            throw;
         } catch (const std::exception& e) {
             log_gossip_protocol().debug("Failed to send ACK to peer {}: {}", peer, e.what());
         }
-    });
+    }
 }
 
 void GossipProtocol::handle_ack(const seastar::socket_address& peer, uint32_t seq_num) {
@@ -769,25 +786,29 @@ bool GossipProtocol::is_duplicate(const seastar::socket_address& peer, uint32_t 
     return false;
 }
 
-void GossipProtocol::process_retries() {
+seastar::future<> GossipProtocol::process_retries() {
     // RAII Timer Safety: Holder must outlive the work including async sends.
-    // Moved into .finally() so stop() waits for all in-flight retries (Rule #5).
+    // Lives on coroutine frame so stop() waits for completion (Rule #5).
     seastar::gate::holder timer_holder;
     try {
         if (_transport) {
             timer_holder = _transport->timer_gate().hold();
         }
     } catch (const seastar::gate_closed_exception&) {
-        return;
+        co_return;
     }
 
     if (!_transport || !_transport->is_ready() || !_running) {
-        return;
+        co_return;
     }
 
     auto now = seastar::lowres_clock::now();
     std::vector<seastar::future<>> send_futures;
 
+    // Rule #17: Yield every N peers to avoid reactor stall.
+    // _pending_acks is bounded at ~1000 entries total but the nested loops
+    // (classify + retry + remove per peer) accumulate CPU work.
+    size_t peers_processed = 0;
     for (auto& [peer, pending_map] : _pending_acks) {
         std::vector<uint32_t> to_retry;
         std::vector<uint32_t> to_remove;
@@ -831,6 +852,10 @@ void GossipProtocol::process_retries() {
             pending_map.erase(seq_num);
             --_stats_pending_acks_count;
         }
+
+        if (++peers_processed % kYieldInterval == 0) {
+            co_await seastar::coroutine::maybe_yield();
+        }
     }
 
     // Clean up empty peer entries
@@ -842,11 +867,11 @@ void GossipProtocol::process_retries() {
         }
     }
 
-    // Gate holder spans all async sends so stop() waits for completion
+    // Await all retry sends before returning (gate holder on coroutine frame
+    // keeps the gate open for the full duration)
     if (!send_futures.empty()) {
-        (void)seastar::when_all_succeed(send_futures.begin(), send_futures.end())
-            .discard_result()
-            .finally([holder = std::move(timer_holder)] {});
+        co_await seastar::when_all_succeed(send_futures.begin(), send_futures.end())
+            .discard_result();
     }
 }
 

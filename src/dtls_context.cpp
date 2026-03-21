@@ -540,7 +540,7 @@ std::optional<std::string> DtlsContext::load_certs_from_memory(
     return std::nullopt;
 }
 
-seastar::future<std::string> DtlsContext::read_file_contents(const std::string& path) {
+seastar::future<std::string> DtlsContext::read_file_contents(std::string path) {
     auto file = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
     auto size = co_await file.size();
 

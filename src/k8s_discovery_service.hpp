@@ -179,7 +179,7 @@ private:
     // Resolve API server hostname to socket address with retry and caching
     // Returns resolved address, or uses cached address on transient failures
     seastar::future<seastar::socket_address> resolve_api_server(
-        const std::string& host, uint16_t port);
+        std::string host, uint16_t port);
 
     // Load service account token from file
     seastar::future<> load_service_account_token();
@@ -189,7 +189,7 @@ private:
 
     // Load CA certificate from file asynchronously
     // Returns empty string if file doesn't exist or on read error (logs at warn level)
-    seastar::future<std::string> load_ca_cert(const std::string& path);
+    seastar::future<std::string> load_ca_cert(std::string path);
 
     // Perform full sync of endpoints
     seastar::future<> sync_endpoints();
@@ -204,16 +204,16 @@ private:
     std::vector<K8sEndpoint> parse_endpoint_slice(const rapidjson::Value& doc);
 
     // Handle endpoint changes
-    seastar::future<> handle_endpoint_added(const K8sEndpoint& endpoint);
-    seastar::future<> handle_endpoint_removed(const std::string& uid);
-    seastar::future<> handle_endpoint_modified(const K8sEndpoint& endpoint);
+    seastar::future<> handle_endpoint_added(K8sEndpoint endpoint);
+    seastar::future<> handle_endpoint_removed(std::string uid);
+    seastar::future<> handle_endpoint_modified(K8sEndpoint endpoint);
 
     // Reconcile current state with discovered endpoints
     seastar::future<> reconcile(std::vector<K8sEndpoint> discovered);
 
     // HTTP helpers for K8s API
-    seastar::future<std::string> k8s_get(const std::string& path);
-    seastar::future<> k8s_watch(const std::string& path,
+    seastar::future<std::string> k8s_get(std::string path);
+    seastar::future<> k8s_watch(std::string path,
                                 std::function<seastar::future<bool>(const std::string&)> on_event);
 
     // Build full URL for K8s API endpoint

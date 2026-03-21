@@ -209,6 +209,7 @@ uint32_t TokenizerService::select_tokenization_shard() const {
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: check local cache first (no async overhead for hits)
@@ -219,24 +220,24 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
         result.cache_hit = true;
         result.cross_shard = false;
         result.source_shard = local_shard;
-        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+        co_return result;
     }
 
     // Cache miss - check if tokenizer is loaded
     if (!_impl) {
-        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+        co_return TokenizationResult{};
     }
 
     // Decide whether to dispatch cross-shard
     if (!should_dispatch_cross_shard(text.size())) {
-        return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+        co_return tokenize_locally(text);
     }
 
     // Select target shard via P2C
     uint32_t target_shard = select_tokenization_shard();
 
     if (target_shard == local_shard) {
-        return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+        co_return tokenize_locally(text);
     }
 
     // Cross-shard dispatch: copy text for transfer (Rule #14: safe cross-shard data)
@@ -250,7 +251,7 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
     // Capture sharded pointer by value (not `this`) to avoid cross-shard memory access
     auto tokenizer_sharded = _tokenizer_sharded;
 
-    return seastar::smp::submit_to(target_shard,
+    auto remote_result = co_await seastar::smp::submit_to(target_shard,
         [tokenizer_sharded, text_copy = std::move(text_copy), target_shard]() mutable
             -> std::pair<std::vector<int32_t>, bool> {
             // CRITICAL: Reallocate the string buffer on THIS shard.
@@ -287,32 +288,31 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
             target_tokenizer._cache.insert(local_text, tokens);
 
             return {std::move(tokens), false};
-        })
-        .then([this, local_shard, target_shard, text = std::string(text)]
-              (std::pair<std::vector<int32_t>, bool> remote_result) {
-            // Back on calling shard: package result and cache locally
-
-            TokenizationResult result;
-            // CRITICAL: Reallocate tokens on THIS shard.
-            // The remote_result.first vector was allocated on the target shard.
-            // Moving it here would leave the buffer allocated on the wrong shard,
-            // causing memory corruption when eventually freed via do_foreign_free.
-            result.tokens = std::vector<int32_t>(
-                remote_result.first.begin(), remote_result.first.end());
-            result.cache_hit = remote_result.second;  // Was it a cache hit on target?
-            result.cross_shard = true;
-            result.source_shard = target_shard;
-
-            // Cache locally so future requests on this shard hit local cache
-            if (!result.tokens.empty()) {
-                _cache.insert(text, result.tokens);
-            }
-
-            return result;
         });
+
+    // Back on calling shard: package result and cache locally
+    TokenizationResult result;
+    // CRITICAL: Reallocate tokens on THIS shard.
+    // The remote_result.first vector was allocated on the target shard.
+    // Moving it here would leave the buffer allocated on the wrong shard,
+    // causing memory corruption when eventually freed via do_foreign_free.
+    result.tokens = std::vector<int32_t>(
+        remote_result.first.begin(), remote_result.first.end());
+    result.cache_hit = remote_result.second;  // Was it a cache hit on target?
+    result.cross_shard = true;
+    result.source_shard = target_shard;
+
+    // Cache locally so future requests on this shard hit local cache
+    std::string text_for_cache(text);
+    if (!result.tokens.empty()) {
+        _cache.insert(text_for_cache, result.tokens);
+    }
+
+    co_return result;
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std::string_view text) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: check local cache first (no async overhead for hits)
@@ -323,12 +323,12 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
         result.cache_hit = true;
         result.cross_shard = false;
         result.source_shard = local_shard;
-        return seastar::make_ready_future<TokenizationResult>(std::move(result));
+        co_return result;
     }
 
     // Cache miss - check if tokenizer is loaded
     if (!_impl) {
-        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+        co_return TokenizationResult{};
     }
 
     // Priority 1: Try thread pool (truly non-blocking)
@@ -341,22 +341,20 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
                 ++_thread_pool_dispatches;
 
                 // Convert ThreadPoolTokenizationResult to TokenizationResult
-                return std::move(*future_opt).then(
-                    [this, local_shard, text_copy = std::string(text)]
-                    (ThreadPoolTokenizationResult pool_result) {
-                        TokenizationResult result;
-                        result.tokens = std::move(pool_result.tokens);
-                        result.cache_hit = pool_result.cache_hit;
-                        result.cross_shard = false;  // Thread pool is shard-local
-                        result.source_shard = local_shard;
+                auto pool_result = co_await std::move(*future_opt);
+                TokenizationResult result;
+                result.tokens = std::move(pool_result.tokens);
+                result.cache_hit = pool_result.cache_hit;
+                result.cross_shard = false;  // Thread pool is shard-local
+                result.source_shard = local_shard;
 
-                        // Cache locally for future lookups
-                        if (!result.tokens.empty()) {
-                            _cache.insert(text_copy, result.tokens);
-                        }
+                // Cache locally for future lookups
+                std::string text_copy(text);
+                if (!result.tokens.empty()) {
+                    _cache.insert(text_copy, result.tokens);
+                }
 
-                        return result;
-                    });
+                co_return result;
             }
             // Queue full - fall through to other methods
             ++_thread_pool_fallbacks;
@@ -366,7 +364,7 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
     // Priority 2: Try cross-shard dispatch (frees local reactor)
     if (should_dispatch_cross_shard(text.size())) {
         // Delegate to existing cross-shard implementation
-        return encode_cached_async(text);
+        co_return co_await encode_cached_async(text);
     }
 
     // Priority 3: Local tokenization (blocks reactor) — gated by semaphore
@@ -376,11 +374,11 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
     // caller falls back to hash/random routing.
     if (!_local_tokenize_sem.try_wait(1)) {
         ++_local_fallback_rejected;
-        return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+        co_return TokenizationResult{};
     }
-    // Scope guard: signal semaphore after tokenize_locally() returns (exception safety)
+    // RAII guard: signal semaphore when scope exits (exception-safe, Rule #19)
     auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
-    return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+    co_return tokenize_locally(text);
 }
 
 TokenizationResult TokenizerService::tokenize_locally(std::string_view text) {

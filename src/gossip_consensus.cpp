@@ -11,6 +11,7 @@
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
 namespace ranvier {
 
@@ -31,7 +32,7 @@ GossipConsensus::GossipConsensus(const ClusterConfig& config)
     : _config(config) {
 }
 
-seastar::future<> GossipConsensus::start(const std::vector<seastar::socket_address>& initial_peers) {
+seastar::future<> GossipConsensus::start(std::vector<seastar::socket_address> initial_peers) {
     _running = true;
 
     // Only shard 0 manages the peer table
@@ -150,8 +151,8 @@ void GossipConsensus::remove_peer(const seastar::socket_address& peer) {
     }
 }
 
-std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
-    const std::vector<seastar::socket_address>& new_peers) {
+seastar::future<std::vector<seastar::socket_address>> GossipConsensus::update_peer_list(
+    std::vector<seastar::socket_address> new_peers) {
 
     std::vector<seastar::socket_address> newly_added;
     auto now = seastar::lowres_clock::now();
@@ -179,12 +180,20 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
     }
 
     // Log and prune removed peers
+    // Rule #17: Yield between prune broadcasts to avoid reactor stall.
+    // Peer table bounded at 1024 but each broadcast_prune() launches
+    // parallel_for_each across all shards — non-trivial work per iteration.
+    size_t pruned = 0;
     for (const auto& [peer, state] : _peer_table) {
         if (new_peer_table.find(peer) == new_peer_table.end()) {
             log_gossip_consensus().info("DNS discovery: peer removed: {}", peer);
 
             if (state.associated_backend && s_local_prune_callback) {
                 broadcast_prune(*state.associated_backend);
+            }
+
+            if (++pruned % kYieldInterval == 0) {
+                co_await seastar::coroutine::maybe_yield();
             }
         }
     }
@@ -201,7 +210,7 @@ std::vector<seastar::socket_address> GossipConsensus::update_peer_list(
     }
     _stats_cluster_peers_alive = alive_count;
 
-    return newly_added;
+    co_return newly_added;
 }
 
 size_t GossipConsensus::quorum_required() const {
@@ -218,6 +227,10 @@ void GossipConsensus::check_liveness() {
     auto now = seastar::lowres_clock::now();
     uint64_t alive_count = 0;
 
+    // Bounded at MAX_PEERS (1024) with lightweight per-iteration work.
+    // broadcast_prune() is fire-and-forget (returns immediately).
+    // Must remain synchronous — yielding here could interleave with
+    // update_peer_list() which replaces _peer_table, invalidating iterators.
     for (auto& [addr, state] : _peer_table) {
         if (state.is_alive && (now - state.last_seen) > _config.gossip_peer_timeout) {
             state.is_alive = false;

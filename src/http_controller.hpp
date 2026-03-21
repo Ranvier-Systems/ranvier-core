@@ -291,7 +291,7 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_proxy(
         std::unique_ptr<seastar::http::request> req,
         std::unique_ptr<seastar::http::reply> rep,
-        std::string_view endpoint = "/v1/chat/completions");
+        std::string endpoint = "/v1/chat/completions");
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_broadcast_route(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
@@ -326,24 +326,25 @@ private:
     // These are called from within the streaming lambda to handle different phases
 
     // Establish connection to backend with retry and fallback logic
-    // Returns connected bundle or sets ctx.connection_failed on failure
-    seastar::future<ConnectionBundle> establish_backend_connection(ProxyContext& ctx);
+    // Returns connected bundle or sets ctx->connection_failed on failure
+    // Rule #21: pointers are values — safe across coroutine suspend points
+    seastar::future<ConnectionBundle> establish_backend_connection(ProxyContext* ctx);
 
     // Send HTTP request to backend
     // Returns true on success, false on failure (sets appropriate ctx flags)
-    seastar::future<bool> send_backend_request(ProxyContext& ctx, ConnectionBundle& bundle);
+    seastar::future<bool> send_backend_request(ProxyContext* ctx, ConnectionBundle* bundle);
 
     // Stream response from backend to client
     // Handles the read loop, parsing, route learning, and client writes
     seastar::future<> stream_backend_response(
-        ProxyContext& ctx,
-        ConnectionBundle& bundle,
-        seastar::output_stream<char>& client_out);
+        ProxyContext* ctx,
+        ConnectionBundle* bundle,
+        seastar::output_stream<char>* client_out);
 
     // Write error message to client, handling disconnected clients gracefully
     seastar::future<> write_client_error(
-        seastar::output_stream<char>& client_out,
-        std::string_view error_msg);
+        seastar::output_stream<char>* client_out,
+        std::string error_msg);
 
     // Record final metrics and clean up after proxy request completes
     void record_proxy_completion_metrics(
