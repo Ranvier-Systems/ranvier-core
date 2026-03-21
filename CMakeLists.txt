@@ -425,6 +425,19 @@ target_link_libraries(node_slab_test
 )
 gtest_discover_tests(node_slab_test)
 
+# SpscRingBuffer Unit Tests (Pure C++, no Seastar dependency)
+# Tests lock-free SPSC ring buffer: push/pop, drain, wraparound, capacity
+# rounding, move-only types, variant types, and concurrent SPSC correctness.
+add_executable(spsc_ring_buffer_test
+  tests/unit/spsc_ring_buffer_test.cpp
+)
+target_include_directories(spsc_ring_buffer_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(spsc_ring_buffer_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(spsc_ring_buffer_test)
+
 # CrossShardRequest Unit Tests (Pure C++, uses stubs for Seastar)
 # Tests validation limits, force_local_allocation, and result factories.
 add_executable(cross_shard_request_test
