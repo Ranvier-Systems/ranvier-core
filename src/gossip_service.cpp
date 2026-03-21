@@ -209,7 +209,10 @@ seastar::future<> GossipService::start() {
     if (_transport->is_dtls_enabled()) {
         log_gossip.info("Initiating DTLS handshakes with {} peers", _peer_addresses.size());
         for (const auto& peer : _peer_addresses) {
-            (void)_transport->initiate_handshake(peer);
+            (void)_transport->initiate_handshake(peer).handle_exception(
+                [peer](auto ep) {
+                    log_gossip.warn("DTLS handshake failed for peer {}: {}", peer, ep);
+                });
         }
     }
 

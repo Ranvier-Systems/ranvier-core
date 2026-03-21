@@ -3072,7 +3072,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Justification:_ Lifecycle orchestration, shutdown ordering, gate/timer patterns
   _Priority:_ P1
   _Findings:_
-  - Rule 18 P1: `application.cpp:757` — `(void)_controller.invoke_on_all(...)` without `.handle_exception()`
+  - ~~Rule 18 P1: `application.cpp:757` — `(void)_controller.invoke_on_all(...)` without `.handle_exception()`~~ **DONE** — attached `.handle_exception()` with warn log
   - Rule 18 P2: `application.cpp:872` — `(void)with_timeout(...)` only handles `timed_out_error`, other exceptions silently discarded
   - ~~Rule 22 P2: 5 non-coroutine functions with pre-future throw risk: `init_persistence()` (:293), `load_persisted_state()` (:322), `apply_vocab_size_config()` (:247), `start_servers()` (:677), `stop_servers()` (:715)~~ **DONE** — all 5 converted to coroutines
   - Rules 16, 17, 19, 20, 21, 23: PASS
@@ -3081,9 +3081,9 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Justification:_ Cross-shard communication, timers, background fibers
   _Priority:_ P1
   _Findings:_
-  - Rule 18 P1: `gossip_service.cpp:212` — `(void)initiate_handshake(peer)` without error handling
-  - Rule 18 P1: `gossip_protocol.cpp:211` — `(void)broadcast_heartbeat()` without error handling
-  - Rule 18 P1: `gossip_protocol.cpp:674` — `(void)initiate_handshake(peer)` without error handling
+  - ~~Rule 18 P1: `gossip_service.cpp:212` — `(void)initiate_handshake(peer)` without error handling~~ **DONE** — attached `.handle_exception()` with warn log
+  - ~~Rule 18 P1: `gossip_protocol.cpp:211` — `(void)broadcast_heartbeat()` without error handling~~ **DONE** — attached `.handle_exception()` with warn log
+  - ~~Rule 18 P1: `gossip_protocol.cpp:674` — `(void)initiate_handshake(peer)` without error handling~~ **DONE** — attached `.handle_exception()` with warn log
   - ~~Rule 22 P2: `gossip_protocol.cpp:305` — `broadcast_route()` may throw before future~~ **DONE** — converted to coroutine
   - ~~Rule 22 P2: `gossip_protocol.cpp:390` — `broadcast_node_state()` may throw before future~~ **DONE** — converted to coroutine
   - ~~Rule 22 P2: `gossip_protocol.cpp:410` — `broadcast_heartbeat()` may throw before future (also: gate holder not chained into future)~~ **DONE** — converted to coroutine (gate holder now lives on coroutine frame)
@@ -3127,14 +3127,14 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
 **Audit Summary (2026-03-20)**
 
 _Total violations found:_ 47
-_Critical (P1):_ 6 — ~~Rule 16 ×2 (use-after-free)~~ FIXED, Rule 18 ×3 (discarded futures), ~~Rule 19 ×1 (semaphore leak)~~ FIXED
+_Critical (P1):_ 6 — ~~Rule 16 ×2 (use-after-free)~~ FIXED, ~~Rule 18 ×3 (discarded futures)~~ FIXED, ~~Rule 19 ×1 (semaphore leak)~~ FIXED
 _High (P2):_ 41 — ~~Rule 21 ×15 (coroutine ref params)~~ FIXED, Rule 22 ×16 (exception-before-future) FIXED, ~~Rule 17 ×4 (reactor stall)~~ FIXED, ~~Rule 17 warnings ×6~~ 4 FIXED + 3 within bounds
 
 | Rule | Violations | Severity | Most Affected Components |
 |------|-----------|----------|--------------------------|
 | 16 — Lambda Coroutine Fiasco | ~~2~~ 0 (all DONE) | ~~P1~~ FIXED | http_controller, k8s_discovery_service |
 | 17 — Reactor Stall | ~~4~~ 0 (+3 warn: 2 sufficient bounds, 1 kept sync for safety) | ~~P2~~ FIXED | gossip_protocol, gossip_consensus, rate_limiter_core, router_service |
-| 18 — Discarded Futures | 3 | P1 | application, gossip_service, gossip_protocol |
+| 18 — Discarded Futures | ~~3~~ 0 (all DONE) | ~~P1~~ FIXED | application, gossip_service, gossip_protocol |
 | 19 — Semaphore Leak | ~~1~~ 0 (all DONE) | ~~P1~~ FIXED | tokenizer_service |
 | 20 — do_with Missing & | 0 | — | — |
 | 21 — Coroutine Reference Params | ~~15~~ 0 (all DONE) | ~~P2~~ FIXED | k8s_discovery_service, http_controller, gossip_*, dtls_context |
