@@ -247,6 +247,12 @@ Hardening the gossip protocol and cluster coordination for production multi-node
   _Location:_ `src/gossip_service.cpp:649-713` (check_quorum), `src/gossip_service.cpp:1625-1695` (DTLS lockdown)
   _Complexity:_ Medium
 
+- [ ] **Push-based cache eviction notifications from GPU backends**
+  _Justification:_ Ranvier infers backend KV cache state from routing history, creating a staleness window of minutes-to-hours. With 1M-token contexts, backends evict more aggressively, causing misrouted requests and wasted prefill. Push notifications cut staleness to ~25ms.
+  _Design doc:_ [`docs/architecture/push-cache-eviction-notifications.md`](docs/architecture/push-cache-eviction-notifications.md)
+  _Approach:_ HTTP callback endpoint (`POST /v1/cache/events`) + `X-Ranvier-Prefix-Hash` header echoing. Optional sidecar for engines that can't implement directly. New gossip packet type for cluster propagation.
+  _Complexity:_ High (4 phases: MVP, cluster propagation, load events + sidecar, upstream engagement)
+
 - [ ] **Add partition healing with route reconciliation**
   _Justification:_ After partition heals, nodes have divergent route tables. Need incremental sync protocol to merge without full state transfer.
   _Location:_ `src/gossip_service.cpp`
@@ -1284,7 +1290,7 @@ Extend benchmarking to make it more realistic with production traces, cache pres
 
 - [ ] **Add metrics to detect cache evictions (if vLLM exposes this)**
   _Justification:_ Understanding cache eviction rate helps tune cache size and routing policy.
-  _Approach:_ Query vLLM `/metrics` for `vllm:cache_evictions_total` or similar, add to benchmark report
+  _Approach:_ Query vLLM `/metrics` for `vllm:cache_evictions_total` or similar, add to benchmark report. See also: [Push-based cache eviction notifications](docs/architecture/push-cache-eviction-notifications.md) for a design that goes beyond metrics to actively update Ranvier's routing state.
   _Location:_ `tests/integration/locustfile_real.py`
   _Complexity:_ Low
 
