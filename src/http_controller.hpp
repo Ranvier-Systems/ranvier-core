@@ -286,6 +286,10 @@ private:
     // Check if persistence queue is under backpressure
     bool is_persistence_backpressured() const;
 
+    // Extract request body size from Content-Length header or actual content.
+    // Returns 0 if Content-Length is missing/unparseable and content is empty.
+    static size_t get_request_body_size(const seastar::http::request& req);
+
     // Select target shard for request processing using P2C algorithm
     // Returns local shard if load balancing disabled or not beneficial
     uint32_t select_target_shard();
