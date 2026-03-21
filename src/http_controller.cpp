@@ -1316,7 +1316,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
     // is properly maintained until streaming completes.
     // BackendRequestGuard destructor will decrement active_requests when the lambda completes.
-    rep->write_body("text/event-stream", seastar::coroutine::lambda([this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units), backend_guard = std::move(backend_guard)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body("text/event-stream", seastar::coroutine::lambda([this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units), backend_guard = std::move(backend_guard)](output_stream<char>& client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
