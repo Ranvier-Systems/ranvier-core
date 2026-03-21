@@ -123,8 +123,8 @@ public:
     GossipProtocol& operator=(const GossipProtocol&) = delete;
 
     // Lifecycle
-    seastar::future<> start(GossipTransport& transport, GossipConsensus& consensus,
-                            std::vector<seastar::socket_address>& peer_addresses);
+    seastar::future<> start(GossipTransport* transport, GossipConsensus* consensus,
+                            std::vector<seastar::socket_address>* peer_addresses);
     seastar::future<> stop();
 
     // Callbacks

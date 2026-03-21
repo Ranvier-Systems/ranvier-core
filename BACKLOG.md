@@ -2993,8 +2993,8 @@ Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seas
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P1 — Use-after-free, ASAN may miss
   _Findings:_ 2 violations found:
-  - `k8s_discovery_service.cpp:970` — coroutine lambda passed to `k8s_watch()` without wrapper; captures `this`, contains `co_await` at lines 991, 1022
-  - `http_controller.cpp:1319` — coroutine lambda passed to `write_body()` without wrapper; captures `this`, extensive `co_await` usage in streaming response handler
+  - ~~`k8s_discovery_service.cpp:970` — coroutine lambda passed to `k8s_watch()` without wrapper; captures `this`, contains `co_await` at lines 991, 1022~~ **DONE** — wrapped with `seastar::coroutine::lambda()`
+  - ~~`http_controller.cpp:1319` — coroutine lambda passed to `write_body()` without wrapper; captures `this`, extensive `co_await` usage in streaming response handler~~ **DONE** — wrapped with `seastar::coroutine::lambda()`
 
 - [x] **Scan for loops without `maybe_yield()` preemption points (Rule 17)**
   _Pattern:_ `for (` loops without `maybe_yield` in body, particularly over containers that could exceed ~100 iterations
@@ -3014,7 +3014,7 @@ Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seas
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P1 — Eventual deadlock
   _Findings:_ 1 violation:
-  - `tokenizer_service.cpp:377-382` — raw `try_wait(1)` + `defer(signal(1))` instead of `try_get_units()`. The `defer` guard partially mitigates but is still the raw pattern.
+  - ~~`tokenizer_service.cpp:377-382` — raw `try_wait(1)` + `defer(signal(1))` instead of `try_get_units()`. The `defer` guard partially mitigates but is still the raw pattern.~~ **DONE** — replaced with `try_get_units(1)` for RAII semantics
 
 - [x] **Scan for `do_with` lambdas missing `&` on parameters (Rule 20)**
   _Pattern:_ `do_with(` ... `](auto ` without `&`
@@ -3027,21 +3027,21 @@ Audit the codebase against Hard Rules 16-23 (added 2026-02-28 from ScyllaDB/Seas
   _Scope:_ All `src/**/*.{hpp,cpp}`
   _Priority:_ P2 — Dangling reference on suspend
   _Findings:_ 15 violations across 4 files:
-  - `http_controller.cpp:287` — `write_client_error(output_stream<char>&, std::string_view)`
-  - `http_controller.cpp:331` — `establish_backend_connection(ProxyContext&)`
-  - `http_controller.cpp:411` — `send_backend_request(ProxyContext&, ConnectionBundle&)`
-  - `http_controller.cpp:467` — `stream_backend_response(ProxyContext&, ConnectionBundle&, output_stream<char>&)`
-  - `http_controller.cpp:652` — `handle_proxy(..., std::string_view endpoint)`
-  - `dtls_context.cpp:543` — `read_file_contents(const std::string&)`
-  - `gossip_consensus.cpp:34` — `start(const std::vector<socket_address>&)`
-  - `gossip_protocol.cpp:188` — `start(GossipTransport&, GossipConsensus&, std::vector<socket_address>&)`
-  - `k8s_discovery_service.cpp:298` — `load_ca_cert(const std::string&)`
-  - `k8s_discovery_service.cpp:549` — `k8s_get(const std::string&)`
-  - `k8s_discovery_service.cpp:817` — `handle_endpoint_added(const K8sEndpoint&)`
-  - `k8s_discovery_service.cpp:864` — `handle_endpoint_removed(const std::string&)`
-  - `k8s_discovery_service.cpp:896` — `handle_endpoint_modified(const K8sEndpoint&)`
-  - `k8s_discovery_service.hpp:181-182` — `resolve_api_server(const std::string&, ...)`
-  - `k8s_discovery_service.hpp:216` — `k8s_watch(const std::string&, ...)`
+  - ~~`http_controller.cpp:287` — `write_client_error(output_stream<char>&, std::string_view)`~~ **DONE** — changed to pointer + by-value string
+  - ~~`http_controller.cpp:331` — `establish_backend_connection(ProxyContext&)`~~ **DONE** — changed to pointer
+  - ~~`http_controller.cpp:411` — `send_backend_request(ProxyContext&, ConnectionBundle&)`~~ **DONE** — changed to pointers
+  - ~~`http_controller.cpp:467` — `stream_backend_response(ProxyContext&, ConnectionBundle&, output_stream<char>&)`~~ **DONE** — changed to pointers
+  - ~~`http_controller.cpp:652` — `handle_proxy(..., std::string_view endpoint)`~~ **DONE** — changed to `std::string` by value
+  - ~~`dtls_context.cpp:543` — `read_file_contents(const std::string&)`~~ **DONE** — changed to `std::string` by value
+  - ~~`gossip_consensus.cpp:34` — `start(const std::vector<socket_address>&)`~~ **DONE** — changed to `std::vector` by value
+  - ~~`gossip_protocol.cpp:188` — `start(GossipTransport&, GossipConsensus&, std::vector<socket_address>&)`~~ **DONE** — changed to pointers (services are non-copyable)
+  - ~~`k8s_discovery_service.cpp:298` — `load_ca_cert(const std::string&)`~~ **DONE** — changed to `std::string` by value
+  - ~~`k8s_discovery_service.cpp:549` — `k8s_get(const std::string&)`~~ **DONE** — changed to `std::string` by value
+  - ~~`k8s_discovery_service.cpp:817` — `handle_endpoint_added(const K8sEndpoint&)`~~ **DONE** — changed to `K8sEndpoint` by value
+  - ~~`k8s_discovery_service.cpp:864` — `handle_endpoint_removed(const std::string&)`~~ **DONE** — changed to `std::string` by value
+  - ~~`k8s_discovery_service.cpp:896` — `handle_endpoint_modified(const K8sEndpoint&)`~~ **DONE** — changed to `K8sEndpoint` by value
+  - ~~`k8s_discovery_service.hpp:181-182` — `resolve_api_server(const std::string&, ...)`~~ **DONE** — changed to `std::string` by value
+  - ~~`k8s_discovery_service.hpp:216` — `k8s_watch(const std::string&, ...)`~~ **DONE** — changed to `std::string` by value
 
 - [x] **Scan for `temporary_buffer::share()` stored to member variables (Rule 23)**
   _Pattern:_ `.share(` assigned to `_member` or stored in containers
@@ -3057,8 +3057,8 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Justification:_ Highest traffic, most async complexity, most likely to have discarded futures and coroutine ref params
   _Priority:_ P1
   _Findings:_
-  - Rule 16 P1: `http_controller.cpp:1319` — coroutine lambda in `write_body()` (see Phase 1)
-  - Rule 21 P2: 5 coroutine functions with reference params (see Phase 1)
+  - ~~Rule 16 P1: `http_controller.cpp:1319` — coroutine lambda in `write_body()` (see Phase 1)~~ **DONE** — wrapped with `seastar::coroutine::lambda()`
+  - ~~Rule 21 P2: 5 coroutine functions with reference params (see Phase 1)~~ **DONE** — changed to pointers/by-value
   - ~~Rule 22 P2: `http_controller.cpp:1550` — `handle_broadcast_route()` non-coroutine with narrow throw window before `return .then()`~~ **DONE** — converted to coroutine
   - Rules 17, 18, 19, 20, 23: PASS
 
@@ -3084,8 +3084,8 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   - ~~Rule 22 P2: `gossip_protocol.cpp:686` — `send_ack()` may throw before future~~ **DONE** — converted to coroutine
   - ~~Rule 22 P2: `gossip_transport.cpp:151` — `send()` may throw before future~~ **DONE** — converted to coroutine
   - ~~Rule 22 P2: `gossip_transport.cpp:189` — `broadcast()` may throw before future~~ **DONE** — converted to coroutine
-  - Rule 21 P2: `gossip_protocol.hpp:126` — `start()` coroutine takes `&` params (low risk, stored as ptrs before suspend)
-  - Rule 21 P2: `gossip_consensus.hpp:102` — `start()` coroutine takes `const&` param (low risk, consumed before suspend)
+  - ~~Rule 21 P2: `gossip_protocol.hpp:126` — `start()` coroutine takes `&` params (low risk, stored as ptrs before suspend)~~ **DONE** — changed to pointer params
+  - ~~Rule 21 P2: `gossip_consensus.hpp:102` — `start()` coroutine takes `const&` param (low risk, consumed before suspend)~~ **DONE** — changed to by-value
   - ~~Rule 17 P2: `gossip_protocol.cpp:791` — `process_retries()` up to ~1000 iterations without yield~~ **DONE** — converted to coroutine with yield every 64 peers
   - Rules 16, 19, 20, 23: PASS
 
@@ -3093,7 +3093,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Justification:_ FFI boundary, prior allocator corruption issues
   _Priority:_ P2
   _Findings:_
-  - Rule 19 P1: `tokenizer_service.cpp:377` — raw `try_wait`/`signal` (see Phase 1)
+  - ~~Rule 19 P1: `tokenizer_service.cpp:377` — raw `try_wait`/`signal` (see Phase 1)~~ **DONE** — replaced with `try_get_units()`
   - ~~Rule 22 P2: `tokenizer_service.cpp:211` — `encode_cached_async()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
   - ~~Rule 22 P2: `tokenizer_service.cpp:315` — `encode_threaded_async()` non-coroutine may throw before future~~ **DONE** — converted to coroutine
   - Rules 16, 17, 18, 20, 21, 23: PASS
@@ -3111,7 +3111,7 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
   _Justification:_ Lower complexity but still need coverage
   _Priority:_ P3
   _Findings:_
-  - Rule 21 P2: `k8s_discovery_service` — 7 coroutine functions with `const&` params (see Phase 1)
+  - ~~Rule 21 P2: `k8s_discovery_service` — 7 coroutine functions with `const&` params (see Phase 1)~~ **DONE** — all changed to by-value
   - ~~Rule 17 P2: `rate_limiter_core.hpp:113` — `cleanup()` iterates up to 100K buckets without yield~~ **DONE** — yielding `cleanup_async()` coroutine in Seastar wrapper
   - ~~Rule 22 P2: `shard_load_balancer.hpp:206` — `refresh_all_snapshots()` non-coroutine, `vector::reserve()`/`push_back()` can throw before future~~ **DONE** — converted to coroutine
   - _(warn)_ Rule 17: `connection_pool.hpp:397` — `cleanup_expired()` up to ~10K iterations. Sufficient bounds (~100μs)
@@ -3121,17 +3121,17 @@ Rules 18 (discarded futures) and 22 (exception-before-future) require understand
 **Audit Summary (2026-03-20)**
 
 _Total violations found:_ 47
-_Critical (P1):_ 6 — Rule 16 ×2 (use-after-free), Rule 18 ×3 (discarded futures), Rule 19 ×1 (semaphore leak)
-_High (P2):_ 41 — Rule 21 ×15 (coroutine ref params), Rule 22 ×16 (exception-before-future), ~~Rule 17 ×4 (reactor stall)~~ FIXED, ~~Rule 17 warnings ×6~~ 4 FIXED + 3 within bounds
+_Critical (P1):_ 6 — ~~Rule 16 ×2 (use-after-free)~~ FIXED, Rule 18 ×3 (discarded futures), ~~Rule 19 ×1 (semaphore leak)~~ FIXED
+_High (P2):_ 41 — ~~Rule 21 ×15 (coroutine ref params)~~ FIXED, Rule 22 ×16 (exception-before-future) FIXED, ~~Rule 17 ×4 (reactor stall)~~ FIXED, ~~Rule 17 warnings ×6~~ 4 FIXED + 3 within bounds
 
 | Rule | Violations | Severity | Most Affected Components |
 |------|-----------|----------|--------------------------|
-| 16 — Lambda Coroutine Fiasco | 2 | P1 | http_controller, k8s_discovery_service |
+| 16 — Lambda Coroutine Fiasco | ~~2~~ 0 (all DONE) | ~~P1~~ FIXED | http_controller, k8s_discovery_service |
 | 17 — Reactor Stall | ~~4~~ 0 (+3 warn: 2 sufficient bounds, 1 kept sync for safety) | ~~P2~~ FIXED | gossip_protocol, gossip_consensus, rate_limiter_core, router_service |
 | 18 — Discarded Futures | 3 | P1 | application, gossip_service, gossip_protocol |
-| 19 — Semaphore Leak | 1 | P1 | tokenizer_service |
+| 19 — Semaphore Leak | ~~1~~ 0 (all DONE) | ~~P1~~ FIXED | tokenizer_service |
 | 20 — do_with Missing & | 0 | — | — |
-| 21 — Coroutine Reference Params | 15 | P2 | k8s_discovery_service, http_controller, gossip_*, dtls_context |
+| 21 — Coroutine Reference Params | ~~15~~ 0 (all DONE) | ~~P2~~ FIXED | k8s_discovery_service, http_controller, gossip_*, dtls_context |
 | 22 — Exception-Before-Future | ~~16~~ 0 (all DONE) | ~~P2~~ FIXED | application, gossip_protocol, gossip_transport, tokenizer_service, router_service, shard_load_balancer, http_controller |
 | 23 — Shared temporary_buffer Pin | 0 | — | — |
 

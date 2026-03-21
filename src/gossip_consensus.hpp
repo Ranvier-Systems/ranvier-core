@@ -100,7 +100,7 @@ public:
     GossipConsensus& operator=(const GossipConsensus&) = delete;
 
     // Lifecycle
-    seastar::future<> start(const std::vector<seastar::socket_address>& initial_peers);
+    seastar::future<> start(std::vector<seastar::socket_address> initial_peers);
     seastar::future<> stop();
 
     // Peer management
