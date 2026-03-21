@@ -6,10 +6,10 @@
 #include <seastar/core/timer.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
-#include <deque>
+#include <atomic>
 #include <memory>
-#include <mutex>
 #include <variant>
+#include <vector>
 
 namespace ranvier {
 
@@ -28,14 +28,15 @@ namespace ranvier {
  *   2. Processes queued operations in batches via seastar::async()
  *   3. Runs SQLite operations on Seastar's thread pool (not the reactor)
  *
- * The std::mutex in the queue (_queue_mutex) is acceptable because:
- *   - Lock contention is minimal (queue operations are O(1))
- *   - The critical section is extremely short (push/pop from deque)
- *   - Cross-shard access requires some synchronization
+ * LOCK-FREE SPSC QUEUE:
+ * The operation queue uses a bounded single-producer single-consumer ring
+ * buffer with atomic head/tail indices. The reactor thread (sole producer)
+ * calls try_enqueue() without any mutex. The persistence worker thread
+ * (sole consumer) calls extract_batch()/drain_queue() lock-free.
  *
  * ARCHITECTURAL GUARANTEE:
  *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
- *                 ↑                                    ↓
+ *                 ↑ (lock-free enqueue)                ↓
  *           (reactor thread)                  (thread pool, mutex OK)
  *
  * @see SqlitePersistence for the underlying mutex-protected implementation.
@@ -79,6 +80,110 @@ using PersistenceOp = std::variant<
 >;
 
 // ============================================================================
+// SPSC Ring Buffer
+// ============================================================================
+// Lock-free bounded single-producer single-consumer ring buffer for move-only
+// types. Producer (reactor thread) writes at _tail; consumer (worker thread)
+// reads from _head. No mutex, no CAS — SPSC guarantees one writer per index.
+//
+// Memory ordering: acquire/release on head/tail provide the happens-before
+// relationship between producer writes and consumer reads. The producer
+// writes the slot, then release-stores _tail. The consumer acquire-loads
+// _tail to see the new slot data. Symmetric for the consumer side.
+
+template<typename T>
+class SpscRingBuffer {
+public:
+    explicit SpscRingBuffer(size_t capacity)
+        : _capacity(capacity)
+        , _mask(capacity - 1)
+        , _slots(std::make_unique<Slot[]>(capacity)) {
+        // Capacity must be a power of two for mask-based indexing.
+        // Round up if needed — caller provides desired capacity, we find
+        // the next power of two >= that value.
+        if (capacity == 0 || (capacity & (capacity - 1)) != 0) {
+            size_t p = 1;
+            while (p < capacity) p <<= 1;
+            _capacity = p;
+            _mask = p - 1;
+            _slots = std::make_unique<Slot[]>(p);
+        }
+    }
+
+    // Producer only (reactor thread). Returns false if buffer is full.
+    bool try_push(T&& item) {
+        const size_t tail = _tail.load(std::memory_order_relaxed);
+        const size_t next_tail = (tail + 1) & _mask;
+        if (next_tail == _head.load(std::memory_order_acquire)) {
+            return false;  // Full
+        }
+        _slots[tail].value = std::move(item);
+        _tail.store(next_tail, std::memory_order_release);
+        return true;
+    }
+
+    // Consumer only (worker thread). Returns false if buffer is empty.
+    bool try_pop(T& item) {
+        const size_t head = _head.load(std::memory_order_relaxed);
+        if (head == _tail.load(std::memory_order_acquire)) {
+            return false;  // Empty
+        }
+        item = std::move(_slots[head].value);
+        _head.store((head + 1) & _mask, std::memory_order_release);
+        return true;
+    }
+
+    // Consumer only. Drains up to max_count elements into output vector.
+    // Returns number of elements drained.
+    size_t drain(std::vector<T>& output, size_t max_count) {
+        const size_t head = _head.load(std::memory_order_relaxed);
+        const size_t tail = _tail.load(std::memory_order_acquire);
+        const size_t available = (tail - head) & _mask;
+        // When tail == head the ring is empty; available will be 0.
+        // Note: usable capacity is _capacity - 1 (one slot is sentinel).
+        const size_t count = std::min(available, max_count);
+        output.reserve(output.size() + count);
+        size_t h = head;
+        for (size_t i = 0; i < count; ++i) {
+            output.push_back(std::move(_slots[h].value));
+            h = (h + 1) & _mask;
+        }
+        _head.store(h, std::memory_order_release);
+        return count;
+    }
+
+    // Consumer only. Drains all elements.
+    size_t drain_all(std::vector<T>& output) {
+        return drain(output, _capacity);
+    }
+
+    // Lock-free size estimate. May be momentarily stale but safe to call
+    // from any thread. Used for metrics/backpressure checks.
+    size_t size_approx() const {
+        const size_t tail = _tail.load(std::memory_order_relaxed);
+        const size_t head = _head.load(std::memory_order_relaxed);
+        return (tail - head) & _mask;
+    }
+
+    // Usable capacity (one slot reserved as sentinel for full/empty distinction).
+    size_t capacity() const { return _capacity - 1; }
+
+private:
+    struct Slot {
+        T value{};
+    };
+
+    size_t _capacity;
+    size_t _mask;
+    std::unique_ptr<Slot[]> _slots;
+
+    // Placed on separate cache lines to avoid false sharing between
+    // producer (reactor) and consumer (worker) threads.
+    alignas(64) std::atomic<size_t> _head{0};
+    alignas(64) std::atomic<size_t> _tail{0};
+};
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -104,27 +209,21 @@ struct AsyncPersistenceConfig {
  * The "No Locks/Async Only" rule in Seastar means reactor threads must never
  * block. However, SQLite requires mutex protection because it's not thread-safe.
  * This class bridges the gap by:
- *   1. Accepting operations on the reactor thread (non-blocking queue)
+ *   1. Accepting operations on the reactor thread (lock-free enqueue)
  *   2. Processing them in seastar::async() on a separate thread pool
  *   3. Using mutex protection safely (thread pool threads can block)
  *
  * Architecture:
- *   - Fire-and-forget queue API for the hot request path
- *   - Background timer drains queue and writes to SQLite in batches
+ *   - Lock-free SPSC ring buffer between reactor (producer) and worker (consumer)
+ *   - Background timer drains ring buffer and writes to SQLite in batches
  *   - SQLite operations run in seastar::async (off the reactor thread)
  *   - Semaphore ensures batches are processed in order
  *
  * Thread Safety:
- *   - Queue protected by std::mutex (safe for cross-shard access)
+ *   - Queue is a lock-free SPSC ring buffer (no mutex on reactor thread)
  *   - SQLite operations serialized via semaphore
  *   - Shutdown flag is atomic for visibility across shards
- *
- * MUTEX JUSTIFICATION (per docs/claude-context.md):
- * The _queue_mutex is acceptable because:
- *   1. Critical sections are extremely short (deque push/pop)
- *   2. No blocking I/O occurs while holding the lock
- *   3. Cross-shard access to the shared queue requires synchronization
- *   4. The alternative (per-shard queues) would complicate shutdown ordering
+ *   - Clear-all uses an atomic generation counter checked by the consumer
  */
 
 class AsyncPersistenceManager {
@@ -175,8 +274,9 @@ public:
     // -------------------------------------------------------------------------
     // Write Operations (Fire-and-Forget Queue API)
     // -------------------------------------------------------------------------
-    // These methods queue operations and return immediately (non-blocking).
-    // Safe to call from any shard. Operations silently dropped if store not open.
+    // These methods queue operations and return immediately (lock-free).
+    // Must be called from the owning shard only (SPSC producer).
+    // Operations silently dropped if store not open.
 
     void queue_save_route(std::span<const TokenId> tokens, BackendId backend_id);
     void queue_save_backend(BackendId id, const std::string& ip, uint16_t port,
@@ -265,10 +365,15 @@ private:
     AsyncPersistenceConfig _config;
     std::unique_ptr<PersistenceStore> _store;  // Owned persistence engine
 
-    // Queue (protected by mutex for cross-shard access)
-    mutable std::mutex _queue_mutex;
-    std::deque<PersistenceOp> _queue;
-    std::atomic<size_t> _queue_size{0};  // Lock-free queue depth for metrics
+    // Lock-free SPSC ring buffer: reactor thread produces, worker thread consumes.
+    // Initialized in constructor; capacity is next power-of-two >= max_queue_depth.
+    std::unique_ptr<SpscRingBuffer<PersistenceOp>> _ring;
+    std::atomic<size_t> _queue_size{0};  // Maintained for metrics compatibility
+
+    // Generation counter for queue_clear_all(). Producer increments; consumer
+    // checks before processing each batch and discards if generation changed.
+    std::atomic<uint64_t> _clear_generation{0};
+    uint64_t _last_processed_generation{0};  // Consumer-only, no atomic needed
 
     // Timers
     seastar::timer<> _flush_timer;
