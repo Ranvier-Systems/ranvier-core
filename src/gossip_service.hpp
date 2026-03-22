@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "config.hpp"
+#include "chassis_config_schema.hpp"
 #include "gossip_consensus.hpp"
 #include "gossip_protocol.hpp"
 #include "gossip_transport.hpp"
