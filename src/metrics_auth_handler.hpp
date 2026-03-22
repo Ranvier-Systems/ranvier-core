@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 
+#include <fmt/format.h>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/handlers.hh>
 #include <seastar/http/reply.hh>
@@ -180,7 +181,7 @@ public:
         // Extract source IP (prefer X-Forwarded-For for reverse proxy setups)
         auto source_ip = req->get_header("X-Forwarded-For");
         if (source_ip.empty()) {
-            source_ip = req->get_client_address().addr();
+            source_ip = fmt::format("{}", req->get_client_address().addr());
         }
 
         // IP allowlist check (fast path — cheaper than token comparison)
