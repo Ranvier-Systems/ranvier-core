@@ -29,10 +29,11 @@ namespace ranvier {
  *   3. Runs SQLite operations on Seastar's thread pool (not the reactor)
  *
  * LOCK-FREE MPSC QUEUE:
- * The operation queue uses a bounded single-producer single-consumer ring
- * buffer with atomic head/tail indices. The reactor thread (sole producer)
- * calls try_enqueue() without any mutex. The persistence worker thread
- * (sole consumer) calls extract_batch()/drain_queue() lock-free.
+ * The operation queue uses a bounded multi-producer single-consumer ring
+ * buffer (Vyukov-style) with per-slot sequence numbers. Multiple reactor
+ * shards (producers) CAS-compete on the tail index to enqueue operations
+ * lock-free. The persistence worker (sole consumer) drains batches via
+ * extract_batch()/drain_queue().
  *
  * ARCHITECTURAL GUARANTEE:
  *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
