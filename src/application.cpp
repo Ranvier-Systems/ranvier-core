@@ -696,7 +696,9 @@ seastar::future<> Application::start_servers() {
     // we retrieve it via get_handler() and replace it with our wrapper
     // that checks Bearer token and IP allowlist before delegating.
     if (_config.metrics.auth_enabled() || _config.metrics.ip_filter_enabled()) {
-        auto auth_config = std::make_shared<MetricsAuthConfig>(_config.metrics);
+        // Copy by value into the lambda — MetricsAuthConfig is small and immutable
+        // after construction. Avoids std::shared_ptr (Rule #0).
+        MetricsAuthConfig auth_config(_config.metrics);
         co_await _metrics_server->set_routes([auth_config](seastar::httpd::routes& r) {
             seastar::httpd::parameters params;
             auto* prometheus_handler = r.get_handler(seastar::httpd::operation_type::GET,
@@ -705,11 +707,11 @@ seastar::future<> Application::start_servers() {
             // MetricsAuthHandler delegates to prometheus_handler after auth passes.
             // Seastar routes::put takes ownership of the new handler.
             r.put(seastar::httpd::operation_type::GET, "/metrics",
-                  new MetricsAuthHandler(*auth_config, prometheus_handler));
+                  new MetricsAuthHandler(auth_config, prometheus_handler));
         });
         log_main.info("Metrics endpoint auth enabled (token={}, ip_filter={})",
-            auth_config->auth_enabled() ? "yes" : "no",
-            auth_config->ip_filter_enabled() ? "yes" : "no");
+            auth_config.auth_enabled() ? "yes" : "no",
+            auth_config.ip_filter_enabled() ? "yes" : "no");
     }
 
     auto metrics_addr = seastar::socket_address(

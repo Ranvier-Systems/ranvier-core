@@ -24,7 +24,7 @@
 
 namespace ranvier {
 
-static seastar::logger log_metrics_auth("metrics_auth");
+inline seastar::logger log_metrics_auth("metrics_auth");
 
 // CIDR entry for IP allowlist matching
 struct CidrEntry {
