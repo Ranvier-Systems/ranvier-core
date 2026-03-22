@@ -212,18 +212,22 @@ void AsyncPersistenceManager::queue_clear_all() {
 // ============================================================================
 
 bool AsyncPersistenceManager::try_enqueue(PersistenceOp op) {
-    // Check configured backpressure limit before pushing. The ring buffer's
-    // internal capacity is rounded up to a power of two, so it may accept
-    // more items than max_queue_depth. Enforce the configured limit here.
-    if (_queue_size.load(std::memory_order_relaxed) >= _config.max_queue_depth) {
+    // Reserve a slot by incrementing _queue_size FIRST, then push. This avoids
+    // a TOCTOU race where multiple producers pass the backpressure check
+    // simultaneously and overshoot max_queue_depth.
+    const auto prev = _queue_size.fetch_add(1, std::memory_order_relaxed);
+    if (prev >= _config.max_queue_depth) {
+        // Over limit — undo the reservation.
+        _queue_size.fetch_sub(1, std::memory_order_relaxed);
         _ops_dropped++;
         return false;
     }
     if (!_ring->try_push(std::move(op))) {
+        // Ring buffer full (shouldn't happen if capacity >= max_queue_depth).
+        _queue_size.fetch_sub(1, std::memory_order_relaxed);
         _ops_dropped++;
         return false;
     }
-    _queue_size.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
