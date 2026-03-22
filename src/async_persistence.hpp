@@ -1,7 +1,7 @@
 #pragma once
 
 #include "persistence.hpp"
-#include "spsc_ring_buffer.hpp"
+#include "mpsc_ring_buffer.hpp"
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
@@ -28,7 +28,7 @@ namespace ranvier {
  *   2. Processes queued operations in batches via seastar::async()
  *   3. Runs SQLite operations on Seastar's thread pool (not the reactor)
  *
- * LOCK-FREE SPSC QUEUE:
+ * LOCK-FREE MPSC QUEUE:
  * The operation queue uses a bounded single-producer single-consumer ring
  * buffer with atomic head/tail indices. The reactor thread (sole producer)
  * calls try_enqueue() without any mutex. The persistence worker thread
@@ -110,13 +110,13 @@ struct AsyncPersistenceConfig {
  *   3. Using mutex protection safely (thread pool threads can block)
  *
  * Architecture:
- *   - Lock-free SPSC ring buffer between reactor (producer) and worker (consumer)
+ *   - Lock-free MPSC ring buffer between reactor (producer) and worker (consumer)
  *   - Background timer drains ring buffer and writes to SQLite in batches
  *   - SQLite operations run in seastar::async (off the reactor thread)
  *   - Semaphore ensures batches are processed in order
  *
  * Thread Safety:
- *   - Queue is a lock-free SPSC ring buffer (no mutex on reactor thread)
+ *   - Queue is a lock-free MPSC ring buffer (no mutex on reactor thread)
  *   - SQLite operations serialized via semaphore
  *   - Shutdown flag is atomic for visibility across shards
  *   - Clear-all uses an atomic generation counter checked by the consumer
@@ -171,7 +171,7 @@ public:
     // Write Operations (Fire-and-Forget Queue API)
     // -------------------------------------------------------------------------
     // These methods queue operations and return immediately (lock-free).
-    // Must be called from the owning shard only (SPSC producer).
+    // Safe to call from any shard (MPSC: multiple producers supported).
     // Operations silently dropped if store not open.
 
     void queue_save_route(std::span<const TokenId> tokens, BackendId backend_id);
@@ -261,9 +261,10 @@ private:
     AsyncPersistenceConfig _config;
     std::unique_ptr<PersistenceStore> _store;  // Owned persistence engine
 
-    // Lock-free SPSC ring buffer: reactor thread produces, worker thread consumes.
-    // Initialized in constructor; capacity is next power-of-two >= max_queue_depth.
-    std::unique_ptr<SpscRingBuffer<PersistenceOp>> _ring;
+    // Lock-free MPSC ring buffer: multiple reactor shards produce, single
+    // consumer (flush timer -> seastar::async worker) drains batches.
+    // Capacity is next power-of-two >= max_queue_depth.
+    std::unique_ptr<MpscRingBuffer<PersistenceOp>> _ring;
     std::atomic<size_t> _queue_size{0};  // Maintained for metrics compatibility
 
     // Generation counter for queue_clear_all(). Producer increments; consumer

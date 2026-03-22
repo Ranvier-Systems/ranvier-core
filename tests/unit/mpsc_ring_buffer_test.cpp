@@ -1,13 +1,14 @@
-// Ranvier Core - SPSC Ring Buffer Unit Tests
+// Ranvier Core - MPSC Ring Buffer Unit Tests
 //
-// Tests the lock-free single-producer single-consumer ring buffer used by
-// AsyncPersistenceManager to decouple the reactor thread (producer) from
-// the persistence worker thread (consumer) without any mutex.
+// Tests the lock-free multi-producer single-consumer ring buffer used by
+// AsyncPersistenceManager to decouple multiple reactor shards (producers)
+// from the persistence worker thread (consumer) without any mutex.
 //
 // Pure C++20 — no Seastar dependency.
 
-#include "spsc_ring_buffer.hpp"
+#include "mpsc_ring_buffer.hpp"
 #include <gtest/gtest.h>
+#include <latch>
 #include <memory>
 #include <string>
 #include <thread>
@@ -19,59 +20,57 @@ using namespace ranvier;
 // Test Fixture
 // =============================================================================
 
-class SpscRingBufferTest : public ::testing::Test {};
+class MpscRingBufferTest : public ::testing::Test {};
 
 // =============================================================================
 // Construction & Capacity
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, PowerOfTwoCapacityUnchanged) {
-    SpscRingBuffer<int> rb(16);
-    // Usable capacity is power_of_two - 1 (sentinel slot)
-    EXPECT_EQ(rb.capacity(), 15u);
+TEST_F(MpscRingBufferTest, PowerOfTwoCapacityUnchanged) {
+    MpscRingBuffer<int> rb(16);
+    EXPECT_EQ(rb.capacity(), 16u);
 }
 
-TEST_F(SpscRingBufferTest, NonPowerOfTwoRoundsUp) {
-    SpscRingBuffer<int> rb(10);
-    // 10 rounds up to 16, usable = 15
-    EXPECT_EQ(rb.capacity(), 15u);
+TEST_F(MpscRingBufferTest, NonPowerOfTwoRoundsUp) {
+    MpscRingBuffer<int> rb(10);
+    // 10 rounds up to 16
+    EXPECT_EQ(rb.capacity(), 16u);
 }
 
-TEST_F(SpscRingBufferTest, CapacityOfOne) {
-    SpscRingBuffer<int> rb(1);
-    // 1 is power of two, usable = 0 — degenerate but safe
-    EXPECT_EQ(rb.capacity(), 0u);
-}
-
-TEST_F(SpscRingBufferTest, CapacityOfTwo) {
-    SpscRingBuffer<int> rb(2);
+TEST_F(MpscRingBufferTest, CapacityOfOne) {
+    MpscRingBuffer<int> rb(1);
     EXPECT_EQ(rb.capacity(), 1u);
 }
 
-TEST_F(SpscRingBufferTest, LargeCapacity) {
-    SpscRingBuffer<int> rb(100000);
-    // 100000 rounds up to 131072, usable = 131071
-    EXPECT_EQ(rb.capacity(), 131071u);
+TEST_F(MpscRingBufferTest, CapacityOfTwo) {
+    MpscRingBuffer<int> rb(2);
+    EXPECT_EQ(rb.capacity(), 2u);
+}
+
+TEST_F(MpscRingBufferTest, LargeCapacity) {
+    MpscRingBuffer<int> rb(100000);
+    // 100000 rounds up to 131072
+    EXPECT_EQ(rb.capacity(), 131072u);
 }
 
 // =============================================================================
 // Empty Buffer
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, EmptyBufferSizeIsZero) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, EmptyBufferSizeIsZero) {
+    MpscRingBuffer<int> rb(16);
     EXPECT_EQ(rb.size_approx(), 0u);
 }
 
-TEST_F(SpscRingBufferTest, TryPopOnEmptyReturnsFalse) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, TryPopOnEmptyReturnsFalse) {
+    MpscRingBuffer<int> rb(16);
     int val = -1;
     EXPECT_FALSE(rb.try_pop(val));
     EXPECT_EQ(val, -1);  // Unchanged
 }
 
-TEST_F(SpscRingBufferTest, DrainOnEmptyReturnsZero) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, DrainOnEmptyReturnsZero) {
+    MpscRingBuffer<int> rb(16);
     std::vector<int> out;
     EXPECT_EQ(rb.drain(out, 100), 0u);
     EXPECT_TRUE(out.empty());
@@ -81,8 +80,8 @@ TEST_F(SpscRingBufferTest, DrainOnEmptyReturnsZero) {
 // Push / Pop Basics
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, PushPopSingleElement) {
-    SpscRingBuffer<int> rb(4);
+TEST_F(MpscRingBufferTest, PushPopSingleElement) {
+    MpscRingBuffer<int> rb(4);
     EXPECT_TRUE(rb.try_push(42));
     EXPECT_EQ(rb.size_approx(), 1u);
 
@@ -92,14 +91,14 @@ TEST_F(SpscRingBufferTest, PushPopSingleElement) {
     EXPECT_EQ(rb.size_approx(), 0u);
 }
 
-TEST_F(SpscRingBufferTest, PushPopMultipleElements) {
-    SpscRingBuffer<int> rb(8);
-    for (int i = 0; i < 7; ++i) {  // capacity = 7
+TEST_F(MpscRingBufferTest, PushPopMultipleElements) {
+    MpscRingBuffer<int> rb(8);
+    for (int i = 0; i < 8; ++i) {
         EXPECT_TRUE(rb.try_push(std::move(i)));
     }
-    EXPECT_EQ(rb.size_approx(), 7u);
+    EXPECT_EQ(rb.size_approx(), 8u);
 
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 8; ++i) {
         int val = -1;
         EXPECT_TRUE(rb.try_pop(val));
         EXPECT_EQ(val, i);
@@ -107,8 +106,8 @@ TEST_F(SpscRingBufferTest, PushPopMultipleElements) {
     EXPECT_EQ(rb.size_approx(), 0u);
 }
 
-TEST_F(SpscRingBufferTest, FIFOOrdering) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, FIFOOrdering) {
+    MpscRingBuffer<int> rb(16);
     for (int i = 0; i < 10; ++i) {
         EXPECT_TRUE(rb.try_push(std::move(i)));
     }
@@ -123,36 +122,38 @@ TEST_F(SpscRingBufferTest, FIFOOrdering) {
 // Full Buffer
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, PushToFullReturnsFalse) {
-    SpscRingBuffer<int> rb(4);  // usable capacity = 3
+TEST_F(MpscRingBufferTest, PushToFullReturnsFalse) {
+    MpscRingBuffer<int> rb(4);  // capacity = 4
     EXPECT_TRUE(rb.try_push(1));
     EXPECT_TRUE(rb.try_push(2));
     EXPECT_TRUE(rb.try_push(3));
-    EXPECT_FALSE(rb.try_push(4));  // Full
-    EXPECT_EQ(rb.size_approx(), 3u);
+    EXPECT_TRUE(rb.try_push(4));
+    EXPECT_FALSE(rb.try_push(5));  // Full
+    EXPECT_EQ(rb.size_approx(), 4u);
 }
 
-TEST_F(SpscRingBufferTest, PushAfterPopFromFull) {
-    SpscRingBuffer<int> rb(4);  // usable capacity = 3
+TEST_F(MpscRingBufferTest, PushAfterPopFromFull) {
+    MpscRingBuffer<int> rb(4);
     EXPECT_TRUE(rb.try_push(1));
     EXPECT_TRUE(rb.try_push(2));
     EXPECT_TRUE(rb.try_push(3));
-    EXPECT_FALSE(rb.try_push(4));  // Full
+    EXPECT_TRUE(rb.try_push(4));
+    EXPECT_FALSE(rb.try_push(5));  // Full
 
     int val = 0;
     EXPECT_TRUE(rb.try_pop(val));
     EXPECT_EQ(val, 1);
 
-    EXPECT_TRUE(rb.try_push(4));  // Now room for one
-    EXPECT_EQ(rb.size_approx(), 3u);
+    EXPECT_TRUE(rb.try_push(5));  // Now room for one
+    EXPECT_EQ(rb.size_approx(), 4u);
 }
 
 // =============================================================================
 // Wraparound
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, IndicesWrapAroundCorrectly) {
-    SpscRingBuffer<int> rb(4);  // usable capacity = 3
+TEST_F(MpscRingBufferTest, IndicesWrapAroundCorrectly) {
+    MpscRingBuffer<int> rb(4);
     // Push and pop repeatedly to force wraparound
     for (int round = 0; round < 20; ++round) {
         int v = round;
@@ -164,16 +165,16 @@ TEST_F(SpscRingBufferTest, IndicesWrapAroundCorrectly) {
     EXPECT_EQ(rb.size_approx(), 0u);
 }
 
-TEST_F(SpscRingBufferTest, FillDrainMultipleRounds) {
-    SpscRingBuffer<int> rb(8);  // usable capacity = 7
+TEST_F(MpscRingBufferTest, FillDrainMultipleRounds) {
+    MpscRingBuffer<int> rb(8);
     for (int round = 0; round < 5; ++round) {
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 8; ++i) {
             int v = round * 100 + i;
             EXPECT_TRUE(rb.try_push(std::move(v)));
         }
         EXPECT_FALSE(rb.try_push(999));  // Full
 
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 8; ++i) {
             int val = -1;
             EXPECT_TRUE(rb.try_pop(val));
             EXPECT_EQ(val, round * 100 + i);
@@ -186,8 +187,8 @@ TEST_F(SpscRingBufferTest, FillDrainMultipleRounds) {
 // Drain
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, DrainPartialBatch) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, DrainPartialBatch) {
+    MpscRingBuffer<int> rb(16);
     for (int i = 0; i < 10; ++i) {
         int v = i;
         EXPECT_TRUE(rb.try_push(std::move(v)));
@@ -202,8 +203,8 @@ TEST_F(SpscRingBufferTest, DrainPartialBatch) {
     EXPECT_EQ(rb.size_approx(), 5u);
 }
 
-TEST_F(SpscRingBufferTest, DrainMoreThanAvailable) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, DrainMoreThanAvailable) {
+    MpscRingBuffer<int> rb(16);
     for (int i = 0; i < 3; ++i) {
         int v = i;
         EXPECT_TRUE(rb.try_push(std::move(v)));
@@ -215,8 +216,8 @@ TEST_F(SpscRingBufferTest, DrainMoreThanAvailable) {
     EXPECT_EQ(rb.size_approx(), 0u);
 }
 
-TEST_F(SpscRingBufferTest, DrainAllElements) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, DrainAllElements) {
+    MpscRingBuffer<int> rb(16);
     for (int i = 0; i < 10; ++i) {
         int v = i;
         EXPECT_TRUE(rb.try_push(std::move(v)));
@@ -232,8 +233,8 @@ TEST_F(SpscRingBufferTest, DrainAllElements) {
     EXPECT_FALSE(rb.try_pop(val));
 }
 
-TEST_F(SpscRingBufferTest, DrainAppendsToExistingVector) {
-    SpscRingBuffer<int> rb(16);
+TEST_F(MpscRingBufferTest, DrainAppendsToExistingVector) {
+    MpscRingBuffer<int> rb(16);
     int v1 = 10, v2 = 20;
     EXPECT_TRUE(rb.try_push(std::move(v1)));
     EXPECT_TRUE(rb.try_push(std::move(v2)));
@@ -248,8 +249,8 @@ TEST_F(SpscRingBufferTest, DrainAppendsToExistingVector) {
     EXPECT_EQ(out[4], 20);
 }
 
-TEST_F(SpscRingBufferTest, DrainWithWraparound) {
-    SpscRingBuffer<int> rb(4);  // usable capacity = 3
+TEST_F(MpscRingBufferTest, DrainWithWraparound) {
+    MpscRingBuffer<int> rb(4);
     // Advance head past 0 to force wraparound during drain
     int v1 = 100, v2 = 200;
     EXPECT_TRUE(rb.try_push(std::move(v1)));
@@ -258,26 +259,28 @@ TEST_F(SpscRingBufferTest, DrainWithWraparound) {
     EXPECT_TRUE(rb.try_pop(discard));
     EXPECT_TRUE(rb.try_pop(discard));
 
-    // Now head=2, tail=2. Push 3 items to wrap tail around.
-    int v3 = 10, v4 = 20, v5 = 30;
+    // Now push items that will wrap around the buffer
+    int v3 = 10, v4 = 20, v5 = 30, v6 = 40;
     EXPECT_TRUE(rb.try_push(std::move(v3)));
     EXPECT_TRUE(rb.try_push(std::move(v4)));
     EXPECT_TRUE(rb.try_push(std::move(v5)));
+    EXPECT_TRUE(rb.try_push(std::move(v6)));
 
     std::vector<int> out;
-    EXPECT_EQ(rb.drain_all(out), 3u);
-    ASSERT_EQ(out.size(), 3u);
+    EXPECT_EQ(rb.drain_all(out), 4u);
+    ASSERT_EQ(out.size(), 4u);
     EXPECT_EQ(out[0], 10);
     EXPECT_EQ(out[1], 20);
     EXPECT_EQ(out[2], 30);
+    EXPECT_EQ(out[3], 40);
 }
 
 // =============================================================================
 // Move-Only Types
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, MoveOnlyType) {
-    SpscRingBuffer<std::unique_ptr<int>> rb(8);
+TEST_F(MpscRingBufferTest, MoveOnlyType) {
+    MpscRingBuffer<std::unique_ptr<int>> rb(8);
     EXPECT_TRUE(rb.try_push(std::make_unique<int>(42)));
     EXPECT_TRUE(rb.try_push(std::make_unique<int>(99)));
 
@@ -291,8 +294,8 @@ TEST_F(SpscRingBufferTest, MoveOnlyType) {
     EXPECT_EQ(*val, 99);
 }
 
-TEST_F(SpscRingBufferTest, DrainMoveOnlyType) {
-    SpscRingBuffer<std::unique_ptr<int>> rb(8);
+TEST_F(MpscRingBufferTest, DrainMoveOnlyType) {
+    MpscRingBuffer<std::unique_ptr<int>> rb(8);
     for (int i = 0; i < 5; ++i) {
         EXPECT_TRUE(rb.try_push(std::make_unique<int>(i * 10)));
     }
@@ -306,8 +309,8 @@ TEST_F(SpscRingBufferTest, DrainMoveOnlyType) {
     }
 }
 
-TEST_F(SpscRingBufferTest, StringMoveSemantics) {
-    SpscRingBuffer<std::string> rb(8);
+TEST_F(MpscRingBufferTest, StringMoveSemantics) {
+    MpscRingBuffer<std::string> rb(8);
     std::string s = "hello world this is a long string to avoid SSO";
     EXPECT_TRUE(rb.try_push(std::move(s)));
     EXPECT_TRUE(s.empty());  // Moved-from
@@ -321,9 +324,9 @@ TEST_F(SpscRingBufferTest, StringMoveSemantics) {
 // Variant Type (matches PersistenceOp usage)
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, VariantType) {
+TEST_F(MpscRingBufferTest, VariantType) {
     using Op = std::variant<int, std::string, std::vector<int>>;
-    SpscRingBuffer<Op> rb(8);
+    MpscRingBuffer<Op> rb(8);
 
     EXPECT_TRUE(rb.try_push(Op{42}));
     EXPECT_TRUE(rb.try_push(Op{std::string("test")}));
@@ -344,8 +347,8 @@ TEST_F(SpscRingBufferTest, VariantType) {
 // size_approx
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, SizeApproxTracksCorrectly) {
-    SpscRingBuffer<int> rb(8);
+TEST_F(MpscRingBufferTest, SizeApproxTracksCorrectly) {
+    MpscRingBuffer<int> rb(8);
     EXPECT_EQ(rb.size_approx(), 0u);
 
     int v1 = 1, v2 = 2, v3 = 3;
@@ -366,12 +369,12 @@ TEST_F(SpscRingBufferTest, SizeApproxTracksCorrectly) {
 }
 
 // =============================================================================
-// Concurrent SPSC (single producer thread, single consumer thread)
+// Concurrent: Single Producer, Single Consumer
 // =============================================================================
 
-TEST_F(SpscRingBufferTest, ConcurrentProducerConsumer) {
+TEST_F(MpscRingBufferTest, ConcurrentSingleProducerSingleConsumer) {
     constexpr size_t kItemCount = 100'000;
-    SpscRingBuffer<int> rb(1024);
+    MpscRingBuffer<int> rb(1024);
 
     std::vector<int> consumed;
     consumed.reserve(kItemCount);
@@ -405,17 +408,86 @@ TEST_F(SpscRingBufferTest, ConcurrentProducerConsumer) {
     }
 }
 
-TEST_F(SpscRingBufferTest, ConcurrentProducerConsumerWithDrain) {
-    constexpr size_t kItemCount = 50'000;
-    constexpr size_t kBatchSize = 100;
-    SpscRingBuffer<int> rb(1024);
+// =============================================================================
+// Concurrent: Multiple Producers, Single Consumer
+// =============================================================================
+
+TEST_F(MpscRingBufferTest, ConcurrentMultiProducerSingleConsumer) {
+    constexpr int kNumProducers = 8;
+    constexpr size_t kItemsPerProducer = 10'000;
+    constexpr size_t kTotalItems = kNumProducers * kItemsPerProducer;
+    MpscRingBuffer<int> rb(4096);
 
     std::vector<int> consumed;
-    consumed.reserve(kItemCount);
+    consumed.reserve(kTotalItems);
+
+    // Consumer thread
+    std::thread consumer([&rb, &consumed]() {
+        size_t count = 0;
+        while (count < kTotalItems) {
+            int val;
+            if (rb.try_pop(val)) {
+                consumed.push_back(val);
+                ++count;
+            }
+        }
+    });
+
+    // Multiple producer threads
+    std::latch start_latch(kNumProducers);
+    std::vector<std::thread> producers;
+    for (int t = 0; t < kNumProducers; ++t) {
+        producers.emplace_back([&rb, &start_latch, t]() {
+            start_latch.arrive_and_wait();
+            for (size_t i = 0; i < kItemsPerProducer; ++i) {
+                int v = t * 1000000 + static_cast<int>(i);
+                while (!rb.try_push(std::move(v))) {
+                    // Spin until space available
+                }
+            }
+        });
+    }
+
+    for (auto& p : producers) {
+        p.join();
+    }
+    consumer.join();
+
+    // Verify all items received (order may be interleaved across producers)
+    ASSERT_EQ(consumed.size(), kTotalItems);
+
+    // Verify each producer's items are in order relative to each other
+    std::vector<size_t> next_expected(kNumProducers, 0);
+    for (int val : consumed) {
+        int producer_id = val / 1000000;
+        size_t item_idx = val % 1000000;
+        ASSERT_GE(producer_id, 0);
+        ASSERT_LT(producer_id, kNumProducers);
+        EXPECT_EQ(item_idx, next_expected[producer_id])
+            << "Producer " << producer_id << " items out of order";
+        next_expected[producer_id]++;
+    }
+
+    // Verify all items from each producer were received
+    for (int t = 0; t < kNumProducers; ++t) {
+        EXPECT_EQ(next_expected[t], kItemsPerProducer)
+            << "Producer " << t << " missing items";
+    }
+}
+
+TEST_F(MpscRingBufferTest, ConcurrentMultiProducerWithDrain) {
+    constexpr int kNumProducers = 4;
+    constexpr size_t kItemsPerProducer = 10'000;
+    constexpr size_t kTotalItems = kNumProducers * kItemsPerProducer;
+    constexpr size_t kBatchSize = 100;
+    MpscRingBuffer<int> rb(2048);
+
+    std::vector<int> consumed;
+    consumed.reserve(kTotalItems);
 
     // Consumer thread using drain()
     std::thread consumer([&rb, &consumed]() {
-        while (consumed.size() < kItemCount) {
+        while (consumed.size() < kTotalItems) {
             std::vector<int> batch;
             rb.drain(batch, kBatchSize);
             for (auto& v : batch) {
@@ -424,18 +496,25 @@ TEST_F(SpscRingBufferTest, ConcurrentProducerConsumerWithDrain) {
         }
     });
 
-    // Producer (this thread)
-    for (size_t i = 0; i < kItemCount; ++i) {
-        int v = static_cast<int>(i);
-        while (!rb.try_push(std::move(v))) {
-            // Spin until space available
-        }
+    // Multiple producer threads
+    std::latch start_latch(kNumProducers);
+    std::vector<std::thread> producers;
+    for (int t = 0; t < kNumProducers; ++t) {
+        producers.emplace_back([&rb, &start_latch, t]() {
+            start_latch.arrive_and_wait();
+            for (size_t i = 0; i < kItemsPerProducer; ++i) {
+                int v = t * 1000000 + static_cast<int>(i);
+                while (!rb.try_push(std::move(v))) {
+                    // Spin until space available
+                }
+            }
+        });
     }
 
+    for (auto& p : producers) {
+        p.join();
+    }
     consumer.join();
 
-    ASSERT_EQ(consumed.size(), kItemCount);
-    for (size_t i = 0; i < kItemCount; ++i) {
-        EXPECT_EQ(consumed[i], static_cast<int>(i)) << "Mismatch at index " << i;
-    }
+    ASSERT_EQ(consumed.size(), kTotalItems);
 }

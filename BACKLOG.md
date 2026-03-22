@@ -2883,7 +2883,7 @@ End-to-end trace of an LLM inference request through all phases documented in `d
   _Complexity:_ Medium
   _Priority:_ P2 — Performance; reactor-thread mutex contention violates shared-nothing model
   _Completed:_ 2026-03-21
-  _Fixed:_ Implemented `SpscRingBuffer<T>` with cache-line-aligned atomic head/tail indices, power-of-two capacity, and move-only type support. Replaced `std::deque` + `std::mutex` with lock-free ring buffer. `queue_clear_all()` uses atomic generation counter instead of mutex-protected clear. All `std::lock_guard<std::mutex>` calls removed from reactor-thread code paths (`try_enqueue`, `queue_clear_all`). Consumer paths (`extract_batch`, `drain_queue`) are also lock-free.
+  _Fixed:_ Implemented `MpscRingBuffer<T>` (Vyukov-style bounded MPSC with per-slot sequence numbers) with cache-line-aligned atomic tail (CAS for multi-producer), power-of-two capacity, and move-only type support. Replaced `std::deque` + `std::mutex` with lock-free ring buffer. Multiple reactor shards can enqueue concurrently without locking. `queue_clear_all()` uses atomic generation counter — consumer skips stale ops. All `std::lock_guard<std::mutex>` calls removed. Consumer paths (`extract_batch`, `drain_queue`) are also lock-free.
 
 ### 21.4 Avoid Heap Copy of Text for Tokenizer Cache Insertion
 

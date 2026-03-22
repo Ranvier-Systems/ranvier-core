@@ -196,7 +196,10 @@ TEST_F(AsyncPersistenceQueueTest, BackpressureDropsOperations) {
     EXPECT_EQ(manager.operations_dropped(), 3);
 }
 
-TEST_F(AsyncPersistenceQueueTest, ClearAllClearsQueue) {
+TEST_F(AsyncPersistenceQueueTest, ClearAllEnqueuesClearOp) {
+    // queue_clear_all() bumps a generation counter and enqueues a ClearAllOp.
+    // The consumer (process_batch) will skip stale ops before the ClearAllOp.
+    // The queue_depth() includes both stale and new ops until consumed.
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;
     auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
@@ -211,20 +214,24 @@ TEST_F(AsyncPersistenceQueueTest, ClearAllClearsQueue) {
 
     EXPECT_EQ(manager.queue_depth(), 10);
 
-    // Clear all should clear the queue and add ClearAllOp
+    // Clear all enqueues ClearAllOp (stale ops remain until consumed)
     manager.queue_clear_all();
 
-    EXPECT_EQ(manager.queue_depth(), 1);  // Only ClearAllOp remains
+    EXPECT_EQ(manager.queue_depth(), 11);  // 10 stale + 1 ClearAllOp
 }
 
 TEST_F(AsyncPersistenceQueueTest, ClearAllBypassesBackpressure) {
+    // queue_clear_all() must succeed even when the queue is at the
+    // backpressure limit. It bypasses the max_queue_depth check and
+    // pushes directly to the ring buffer (which has extra capacity
+    // from power-of-two rounding).
     AsyncPersistenceConfig config;
     config.max_queue_depth = 5;
     auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
-    // Fill the queue
+    // Fill the queue to backpressure limit
     for (int i = 0; i < 5; ++i) {
         std::vector<TokenId> tokens = {static_cast<TokenId>(i)};
         manager.queue_save_route(tokens, i);
@@ -232,11 +239,10 @@ TEST_F(AsyncPersistenceQueueTest, ClearAllBypassesBackpressure) {
 
     EXPECT_TRUE(manager.is_backpressured());
 
-    // Clear all should still work
+    // Clear all should still enqueue the ClearAllOp
     manager.queue_clear_all();
 
-    EXPECT_EQ(manager.queue_depth(), 1);
-    EXPECT_FALSE(manager.is_backpressured());
+    EXPECT_EQ(manager.queue_depth(), 6);  // 5 stale + 1 ClearAllOp
 }
 
 TEST_F(AsyncPersistenceQueueTest, IsOpenReflectsStoreState) {
@@ -321,7 +327,7 @@ TEST_F(AsyncPersistenceQueueTest, SpanToVectorConversion) {
 // =============================================================================
 
 TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueOperations) {
-    // Single-producer enqueue (SPSC contract: only one thread may produce).
+    // Multiple producer threads enqueue concurrently (MPSC queue).
     // Validates that all ops are accepted when queue has sufficient capacity.
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100000;  // Large enough for test
@@ -329,21 +335,31 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueOperations) {
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
-    const int total_ops = 4000;
+    const int num_threads = 4;
+    const int ops_per_thread = 1000;
 
-    for (int i = 0; i < total_ops; ++i) {
-        std::vector<TokenId> tokens = {
-            static_cast<TokenId>(i)
-        };
-        manager.queue_save_route(tokens, i / 1000);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&manager, t, ops_per_thread]() {
+            for (int i = 0; i < ops_per_thread; ++i) {
+                std::vector<TokenId> tokens = {
+                    static_cast<TokenId>(t * 10000 + i)
+                };
+                manager.queue_save_route(tokens, t);
+            }
+        });
     }
 
-    EXPECT_EQ(manager.queue_depth(), total_ops);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(manager.queue_depth(), num_threads * ops_per_thread);
     EXPECT_EQ(manager.operations_dropped(), 0);
 }
 
 TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
-    // Single-producer enqueue exceeding max_queue_depth.
+    // Multiple producer threads exceed max_queue_depth.
     // Validates backpressure drops excess operations.
     AsyncPersistenceConfig config;
     config.max_queue_depth = 100;  // Small queue to trigger backpressure
@@ -351,20 +367,30 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
     store->open("/tmp/test");
     AsyncPersistenceManager manager(config, std::move(store));
 
-    const int total_ops = 400;
+    const int num_threads = 4;
+    const int ops_per_thread = 100;
 
-    for (int i = 0; i < total_ops; ++i) {
-        std::vector<TokenId> tokens = {
-            static_cast<TokenId>(i)
-        };
-        manager.queue_save_route(tokens, i / 100);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&manager, t, ops_per_thread]() {
+            for (int i = 0; i < ops_per_thread; ++i) {
+                std::vector<TokenId> tokens = {
+                    static_cast<TokenId>(t * 10000 + i)
+                };
+                manager.queue_save_route(tokens, t);
+            }
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
     }
 
     // Total attempted = 400, max queue = 100
-    // So 300 should be dropped
-    size_t total = manager.queue_depth() + manager.operations_dropped();
-    EXPECT_EQ(total, total_ops);
-    EXPECT_EQ(manager.operations_dropped(), 300);
+    // So at least 300 should be dropped
+    size_t total_ops = manager.queue_depth() + manager.operations_dropped();
+    EXPECT_EQ(total_ops, num_threads * ops_per_thread);
+    EXPECT_GE(manager.operations_dropped(), 300);
 }
 
 // =============================================================================
@@ -372,9 +398,6 @@ TEST_F(AsyncPersistenceQueueTest, ConcurrentQueueWithBackpressure) {
 // =============================================================================
 
 TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
-    // Single producer enqueues while a reader thread polls queue_depth().
-    // Validates that the atomic _queue_size counter is readable cross-thread
-    // without tearing or crashes (SPSC: only one producer thread).
     AsyncPersistenceConfig config;
     config.max_queue_depth = 10000;
     auto store = std::make_unique<NiceMock<MockPersistenceStore>>();
@@ -384,7 +407,7 @@ TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
     std::atomic<bool> running{true};
     std::atomic<size_t> max_depth{0};
 
-    // Reader thread: polls queue_depth() (atomic read, safe cross-thread)
+    // Thread that reads queue_depth
     std::thread reader([&]() {
         while (running) {
             size_t depth = manager.queue_depth();
@@ -395,15 +418,19 @@ TEST_F(AsyncPersistenceQueueTest, QueueDepthThreadSafe) {
         }
     });
 
-    // Single producer thread enqueues
-    for (int i = 0; i < 1000; ++i) {
-        std::vector<TokenId> tokens = {static_cast<TokenId>(i)};
-        manager.queue_save_route(tokens, 1);
-    }
+    // Thread that writes
+    std::thread writer([&]() {
+        for (int i = 0; i < 1000; ++i) {
+            std::vector<TokenId> tokens = {static_cast<TokenId>(i)};
+            manager.queue_save_route(tokens, 1);
+        }
+    });
 
+    writer.join();
     running = false;
     reader.join();
 
+    // If there were any race conditions, this would likely crash or give wrong results
     EXPECT_EQ(manager.queue_depth(), 1000);
 }
 

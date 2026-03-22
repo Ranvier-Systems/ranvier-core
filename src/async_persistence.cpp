@@ -68,13 +68,13 @@ private:
 AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config)
     : _config(std::move(config))
     , _store(create_persistence_store())
-    , _ring(std::make_unique<SpscRingBuffer<PersistenceOp>>(_config.max_queue_depth)) {}
+    , _ring(std::make_unique<MpscRingBuffer<PersistenceOp>>(_config.max_queue_depth)) {}
 
 AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config,
                                                    std::unique_ptr<PersistenceStore> store)
     : _config(std::move(config))
     , _store(std::move(store))
-    , _ring(std::make_unique<SpscRingBuffer<PersistenceOp>>(_config.max_queue_depth)) {}
+    , _ring(std::make_unique<MpscRingBuffer<PersistenceOp>>(_config.max_queue_depth)) {}
 
 bool AsyncPersistenceManager::open(const std::string& path) {
     if (!_store) {
@@ -192,20 +192,19 @@ void AsyncPersistenceManager::queue_remove_routes_for_backend(BackendId backend_
 void AsyncPersistenceManager::queue_clear_all() {
     if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
-    // Drain and discard all pending ops — they'll be cleared anyway.
-    // Safe because both producer and consumer (extract_batch/drain_queue)
-    // run on the reactor thread (cooperative, no concurrent access to ring).
-    std::vector<PersistenceOp> discarded;
-    size_t drained = _ring->drain_all(discarded);
-    if (drained > 0) {
-        _queue_size.fetch_sub(drained, std::memory_order_relaxed);
-    }
-
-    // Bump generation counter so any already-extracted batch (in-flight in
-    // seastar::async) will skip its stale ops when it reaches process_batch().
+    // Bump generation counter so the consumer (process_batch) will skip all
+    // ops enqueued before this point. Can't drain from producer side — only
+    // the consumer may read from the MPSC ring buffer.
     _clear_generation.fetch_add(1, std::memory_order_release);
 
-    try_enqueue(ClearAllOp{});
+    // Enqueue the ClearAllOp bypassing backpressure — the ring buffer has
+    // capacity beyond the configured max_queue_depth (rounded to power of two),
+    // so there is always room even when backpressured. Push directly to avoid
+    // the _queue_size >= max_queue_depth check in try_enqueue().
+    PersistenceOp op{ClearAllOp{}};
+    if (_ring->try_push(std::move(op))) {
+        _queue_size.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // ============================================================================
