@@ -378,6 +378,23 @@ struct AuthConfig {
 };
 
 // =============================================================================
+// Metrics Endpoint Security Configuration
+// =============================================================================
+
+// Security configuration for the Prometheus metrics endpoint (port 9180)
+// When auth_token and/or allowed_ips are set, requests must pass both checks (AND logic)
+struct MetricsConfig {
+    std::string auth_token;                    // Bearer token for /metrics auth (empty = no auth)
+    std::vector<std::string> allowed_ips;      // IP allowlist (empty = allow all, supports exact IPs and CIDR notation)
+
+    // Rule #4: Bounded container — reject configs with excessive IP entries
+    static constexpr size_t MAX_ALLOWED_IPS = 1000;
+
+    bool auth_enabled() const { return !auth_token.empty(); }
+    bool ip_filter_enabled() const { return !allowed_ips.empty(); }
+};
+
+// =============================================================================
 // Rate Limiting Configuration
 // =============================================================================
 
@@ -588,6 +605,7 @@ struct RanvierConfig {
     AssetsConfig assets;
     TlsConfig tls;
     AuthConfig auth;
+    MetricsConfig metrics;
     RateLimitConfig rate_limit;
     RetryConfig retry;
     CircuitBreakerConfig circuit_breaker;

@@ -393,17 +393,19 @@ Hardening for production deployment environments.
   _Complexity:_ Low
   _Priority:_ **Critical**
 
-- [ ] **Add read-only root filesystem**
+- [x] **Add read-only root filesystem** ✓
   _Justification:_ Reduces attack surface. Mutable data should be in explicit volume mounts.
   _Fix:_ Add `--read-only` flag compatibility, use `/tmp` for scratch.
   _Location:_ `Dockerfile.production`, `docker-compose.test.yml`
   _Complexity:_ Low
+  _Completed:_ 2026-03-22. Added `read_only: true` to all ranvier services in `docker-compose.test.yml` with `tmpfs: /tmp:size=64M` for SQLite WAL files and scratch space.
 
-- [ ] **Drop unnecessary Linux capabilities**
+- [x] **Drop unnecessary Linux capabilities** ✓
   _Justification:_ Container runs with full capability set. Drop all except `NET_BIND_SERVICE` (if using privileged ports).
   _Fix:_ Add `--cap-drop=ALL` to compose/runtime.
   _Location:_ `docker-compose.test.yml`
   _Complexity:_ Low
+  _Completed:_ 2026-03-22. Added `cap_drop: [ALL]` + `cap_add: [IPC_LOCK]` to all ranvier services. IPC_LOCK is required by Seastar for mlock/mlockall memory locking. NET_BIND_SERVICE not needed (ports 8080/9180 are >1024).
 
 - [ ] **Add seccomp profile**
   _Justification:_ Restrict syscalls to those required by Seastar. Blocks exploitation of kernel vulnerabilities.
@@ -474,11 +476,12 @@ Hardening for production deployment environments.
   _Location:_ `src/connection_pool.hpp`, `src/config.hpp`
   _Complexity:_ Low
 
-- [ ] **Protect metrics endpoint**
+- [x] **Protect metrics endpoint** ✓
   _Justification:_ Prometheus endpoint (port 9180) is unauthenticated. Exposes internal state.
   _Approach:_ Add optional bearer token or IP allowlist.
   _Location:_ `src/metrics_service.hpp`, `src/config.hpp`
   _Complexity:_ Low
+  _Completed:_ 2026-03-22. Added `MetricsConfig` struct with `auth_token` and `allowed_ips` fields. Bearer token auth (constant-time comparison) and IP allowlist (exact + CIDR notation) with AND logic when both set. Env vars: `RANVIER_METRICS_AUTH_TOKEN`, `RANVIER_METRICS_ALLOWED_IPS`. YAML: `metrics.auth_token`, `metrics.allowed_ips`. Rate-limited warn logs for rejected scrapes. Handler wraps Seastar prometheus handler at GET /metrics.
 
 ---
 
