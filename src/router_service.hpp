@@ -209,9 +209,9 @@ public:
     //                  full prefix_token_length. This enables prefix-aware routing for
     //                  multi-turn conversations where requests share a common system prompt.
     // Also broadcasts to cluster peers if gossip is enabled
-    seastar::future<> learn_route_global(std::vector<int32_t> tokens, BackendId backend,
-                                          const std::string& request_id = "",
-                                          size_t prefix_boundary = 0);
+    seastar::future<bool> learn_route_global(std::vector<int32_t> tokens, BackendId backend,
+                                              const std::string& request_id = "",
+                                              size_t prefix_boundary = 0);
 
     // Multi-depth route learning (Option C)
     // Stores routes at multiple prefix boundaries for optimal cache reuse in

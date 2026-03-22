@@ -176,6 +176,9 @@ public:
             seastar::metrics::make_counter("circuit_breaker_opens", _circuit_opens,
                 seastar::metrics::description("Total number of circuit breaker opens")),
 
+            seastar::metrics::make_counter("retries_skipped_circuit_open_total", _retries_skipped_circuit_open,
+                seastar::metrics::description("Connection retries skipped because circuit breaker was open")),
+
             seastar::metrics::make_counter("circuit_breaker_circuits_removed_total", _circuits_removed,
                 seastar::metrics::description("Total number of circuit breaker entries removed when backends were deregistered (Rule #4: bounded container cleanup)")),
 
@@ -343,6 +346,7 @@ public:
 
     // Record circuit breaker events
     void record_circuit_open() { _circuit_opens++; }
+    void record_retry_skipped_circuit_open() { _retries_skipped_circuit_open++; }
     void record_circuit_removed() { _circuits_removed++; }
     void record_fallback() { _fallback_attempts++; }
 
@@ -488,6 +492,7 @@ private:
     uint64_t _requests_backpressure = 0;
     uint64_t _requests_rejected_body_size = 0;
     uint64_t _circuit_opens = 0;
+    uint64_t _retries_skipped_circuit_open = 0;
     uint64_t _circuits_removed = 0;
     uint64_t _fallback_attempts = 0;
     uint64_t _stream_parser_size_rejections = 0;

@@ -366,6 +366,18 @@ future<ConnectionBundle> HttpController::establish_backend_connection(ProxyConte
         // Record failure for circuit breaker
         _circuit_breaker.record_failure(ctx->current_backend);
 
+        // Short-circuit retries if circuit breaker opened for this backend.
+        // Avoids holding the concurrency semaphore during backoff sleep
+        // against a confirmed-dead backend (§21.6).
+        if (_circuit_breaker.get_state(ctx->current_backend) == CircuitState::OPEN) {
+            log_proxy.info("[{}] Circuit breaker OPEN for backend {}, skipping remaining retries",
+                           ctx->request_id, ctx->current_backend);
+            ++_retries_skipped_circuit_open;
+            metrics().record_retry_skipped_circuit_open();
+            ctx->connection_failed = true;
+            break;
+        }
+
         // Try fallback to a different backend before retrying
         if (ctx->fallback_enabled && ctx->fallback_attempts < ProxyContext::MAX_FALLBACK_ATTEMPTS) {
             auto fallback = get_fallback_backend(ctx->current_backend);
@@ -588,17 +600,22 @@ future<> HttpController::stream_backend_response(
                         .handle_exception([request_id = ctx->request_id](auto) {
                             log_proxy.debug("[{}] Multi-depth route learning failed (non-fatal)", request_id);
                         });
+                    // Persistence for multi-depth (dedup handled internally per-boundary)
+                    if (_persistence) {
+                        _persistence->queue_save_route(ctx->tokens, ctx->current_backend);
+                    }
                 } else {
                     // Single-depth routing: use prefix_boundary or default
+                    // Skip persistence if route was deduplicated (§21.7)
                     (void)_router.learn_route_global(ctx->tokens, ctx->current_backend, ctx->request_id, ctx->prefix_boundary)
+                        .then([this, tokens = ctx->tokens, backend = ctx->current_backend](bool is_new_route) {
+                            if (is_new_route && _persistence) {
+                                _persistence->queue_save_route(tokens, backend);
+                            }
+                        })
                         .handle_exception([request_id = ctx->request_id](auto) {
                             log_proxy.debug("[{}] Route learning failed (non-fatal)", request_id);
                         });
-                }
-
-                // Queue route for async persistence (fire-and-forget, non-blocking)
-                if (_persistence) {
-                    _persistence->queue_save_route(ctx->tokens, ctx->current_backend);
                 }
             }
         }

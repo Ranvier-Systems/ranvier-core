@@ -131,6 +131,7 @@ struct ShardLocalState {
         uint64_t local_routes_batched = 0;        // Routes added to local buffer
         uint64_t local_batch_flushes = 0;          // Number of local flush operations
         uint64_t local_routes_deduplicated = 0;    // Routes skipped by dedup within batch
+        uint64_t routes_deduplicated_pre_buffer = 0; // Routes skipped by ART lookup before buffering
         uint64_t local_routes_dropped_overflow = 0; // Routes dropped due to buffer overflow
         // Cross-shard load sync stats
         uint64_t load_sync_broadcasts = 0;         // Number of load snapshot broadcasts sent
@@ -154,6 +155,7 @@ struct ShardLocalState {
             local_routes_batched = 0;
             local_batch_flushes = 0;
             local_routes_deduplicated = 0;
+            routes_deduplicated_pre_buffer = 0;
             local_routes_dropped_overflow = 0;
             load_sync_broadcasts = 0;
             load_sync_snapshots_received = 0;
@@ -1081,6 +1083,11 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] { return g_shard_state ? g_shard_state->stats.local_routes_deduplicated : 0UL; },
             seastar::metrics::description("Total number of duplicate routes eliminated within local batches")),
 
+        // Counter: routes skipped by ART lookup before buffering (§21.7)
+        seastar::metrics::make_counter("router_routes_deduplicated_total",
+            [] { return g_shard_state ? g_shard_state->stats.routes_deduplicated_pre_buffer : 0UL; },
+            seastar::metrics::description("Total routes skipped because ART already contained the same prefix-backend mapping")),
+
         // Counter: routes dropped due to local buffer overflow
         seastar::metrics::make_counter("router_local_routes_dropped_overflow_total",
             [] { return g_shard_state ? g_shard_state->stats.local_routes_dropped_overflow : 0UL; },
@@ -1845,9 +1852,9 @@ static bool push_local_route(ShardLocalState& state, std::vector<int32_t> tokens
 // inline before buffering. Gossip and cross-shard broadcast are deferred
 // to flush_local_route_batch().
 //
-seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
-                                                       const std::string& request_id,
-                                                       size_t prefix_boundary) {
+seastar::future<bool> RouterService::learn_route_global(std::vector<int32_t> tokens, BackendId backend,
+                                                          const std::string& request_id,
+                                                          size_t prefix_boundary) {
     // Determine effective prefix length for route storage:
     // 1. If prefix_boundary > 0 and valid, use it (truncate to shared prefix like system messages)
     // 2. Otherwise, fall back to config.prefix_token_length (default: 128)
@@ -1858,8 +1865,9 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     // user queries route to the same backend for KV-cache efficiency.
     // Use shard-local config for lock-free, hot-reloadable access.
     // _config is a member on shard 0 — reading it from shard N would be a cross-shard access.
-    if (!g_shard_state) return seastar::make_ready_future<>();
+    if (!g_shard_state) return seastar::make_ready_future<bool>(false);
     const auto& cfg = g_shard_state->config;
+    auto& state = shard_state();
 
     size_t effective_prefix_len;
     bool used_shared_prefix = false;
@@ -1884,7 +1892,25 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
         log_router.warn("Route rejected: {} tokens exceeds limit {} (backend={}, request={})",
                         tokens.size(), cfg.max_route_tokens, backend,
                         request_id.empty() ? "N/A" : request_id);
-        return seastar::make_ready_future<>();
+        return seastar::make_ready_future<bool>(false);
+    }
+
+    // ========================================================================
+    // Deduplication: skip if ART already maps this prefix to the same backend
+    // ========================================================================
+    // O(k) shard-local lookup — no SMP message, no future. Benign TOCTOU
+    // race: another shard could evict between check and insert, but redundant
+    // inserts are safe. The goal is eliminating the common case (§21.7).
+    RadixTree* tree = state.tree.get();
+    if (tree) {
+        std::span<const TokenId> token_span(tokens.data(), tokens.size());
+        auto existing = tree->lookup(token_span);
+        if (existing.has_value() && existing.value() == backend) {
+            state.stats.routes_deduplicated_pre_buffer++;
+            log_router.debug("[{}] Route dedup: prefix ({} tokens) -> backend {} already in ART, skipping",
+                             request_id.empty() ? "N/A" : request_id, tokens.size(), backend);
+            return seastar::make_ready_future<bool>(false);
+        }
     }
 
     // Log route learning with request_id before buffering
@@ -1899,7 +1925,7 @@ seastar::future<> RouterService::learn_route_global(std::vector<int32_t> tokens,
     }
 
     // Buffer the route for batched broadcast (no SMP messages on hot path)
-    return buffer_local_route(std::move(tokens), backend);
+    return buffer_local_route(std::move(tokens), backend).then([] { return true; });
 }
 
 seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> tokens, BackendId backend,
@@ -1919,7 +1945,7 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
 
     if (prefix_boundaries.empty()) {
         // No boundaries provided - fall back to single-depth learning
-        return learn_route_global(std::move(tokens), backend, request_id, 0);
+        return learn_route_global(std::move(tokens), backend, request_id, 0).discard_result();
     }
 
     // Filter boundaries: must be > 0 and <= tokens.size()
@@ -1933,7 +1959,7 @@ seastar::future<> RouterService::learn_route_global_multi(std::vector<int32_t> t
 
     if (valid_boundaries.empty()) {
         // No valid boundaries - fall back to default prefix length
-        return learn_route_global(std::move(tokens), backend, request_id, 0);
+        return learn_route_global(std::move(tokens), backend, request_id, 0).discard_result();
     }
 
     // Log multi-depth learning
