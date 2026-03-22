@@ -278,6 +278,7 @@ private:
     uint64_t _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
     uint64_t _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
     uint64_t _requests_rejected_body_size{0};     // Rejected due to request body size limit
+    uint64_t _retries_skipped_circuit_open{0};    // Retries skipped because circuit breaker opened
 
     // Shard load balancing metrics (reserved for future cross-shard dispatch)
     uint64_t _requests_local_dispatch{0};         // Requests processed locally
