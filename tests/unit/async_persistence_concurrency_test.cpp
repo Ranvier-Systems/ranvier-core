@@ -1,7 +1,7 @@
 // Ranvier Core - Async Persistence Concurrency Stress Tests
 //
 // Exercises concurrent enqueue operations on AsyncPersistenceManager's
-// mutex-protected queue from multiple threads using C++20 std::latch.
+// lock-free MPSC queue from multiple threads using C++20 std::latch.
 // Validates queue depth accounting, backpressure enforcement, and
 // mixed operation type handling under heavy contention.
 
@@ -247,8 +247,8 @@ TEST_F(AsyncPersistenceConcurrencyTest, ConcurrentQueueDepthReading) {
 
 TEST_F(AsyncPersistenceConcurrencyTest, ClearAllDuringConcurrentEnqueue) {
     // Writers enqueue while one thread calls queue_clear_all().
-    // After completion, queue should contain only ClearAllOp (depth=1)
-    // or whatever was enqueued after the clear.
+    // After completion, queue should contain at least the ClearAllOp
+    // plus whatever was enqueued after the clear.
     auto manager = create_manager(100000);
     std::latch start_latch(kNumThreads + 1);
     std::vector<std::thread> threads;
@@ -279,8 +279,8 @@ TEST_F(AsyncPersistenceConcurrencyTest, ClearAllDuringConcurrentEnqueue) {
     // After clear + remaining enqueues, the queue state is valid.
     // At least the ClearAllOp should be in the queue
     EXPECT_GE(manager->queue_depth(), 1u);
-    // Queue depth must not exceed configured limit
-    EXPECT_LE(manager->queue_depth(), manager->max_queue_depth());
+    // Queue depth must not exceed configured limit + ClearAllOp (bypasses backpressure)
+    EXPECT_LE(manager->queue_depth(), manager->max_queue_depth() + 1);
 }
 
 // =============================================================================
@@ -288,7 +288,7 @@ TEST_F(AsyncPersistenceConcurrencyTest, ClearAllDuringConcurrentEnqueue) {
 // =============================================================================
 
 TEST_F(AsyncPersistenceConcurrencyTest, HighContentionSmallQueue) {
-    // Many threads fight over a very small queue to maximize mutex contention.
+    // Many threads fight over a very small queue to maximize contention.
     constexpr size_t kTinyQueue = 10;
     constexpr int kHighOps = 10'000;
     auto manager = create_manager(kTinyQueue);

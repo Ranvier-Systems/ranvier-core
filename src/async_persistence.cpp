@@ -1,6 +1,7 @@
 #include "async_persistence.hpp"
 #include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
+#include <algorithm>
 
 namespace ranvier {
 
@@ -66,12 +67,14 @@ private:
 
 AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config)
     : _config(std::move(config))
-    , _store(create_persistence_store()) {}
+    , _store(create_persistence_store())
+    , _ring(std::make_unique<MpscRingBuffer<PersistenceOp>>(_config.max_queue_depth)) {}
 
 AsyncPersistenceManager::AsyncPersistenceManager(AsyncPersistenceConfig config,
                                                    std::unique_ptr<PersistenceStore> store)
     : _config(std::move(config))
-    , _store(std::move(store)) {}
+    , _store(std::move(store))
+    , _ring(std::make_unique<MpscRingBuffer<PersistenceOp>>(_config.max_queue_depth)) {}
 
 bool AsyncPersistenceManager::open(const std::string& path) {
     if (!_store) {
@@ -189,10 +192,19 @@ void AsyncPersistenceManager::queue_remove_routes_for_backend(BackendId backend_
 void AsyncPersistenceManager::queue_clear_all() {
     if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
-    std::lock_guard<std::mutex> lock(_queue_mutex);
-    _queue.clear();  // Discard pending ops - they'll be cleared anyway
-    _queue.push_back(ClearAllOp{});
-    _queue_size.store(1, std::memory_order_relaxed);  // Queue now contains only ClearAllOp
+    // Bump generation counter so the consumer (process_batch) will skip all
+    // ops enqueued before this point. Can't drain from producer side — only
+    // the consumer may read from the MPSC ring buffer.
+    _clear_generation.fetch_add(1, std::memory_order_release);
+
+    // Enqueue the ClearAllOp bypassing backpressure — the ring buffer has
+    // capacity beyond the configured max_queue_depth (rounded to power of two),
+    // so there is always room even when backpressured. Push directly to avoid
+    // the _queue_size >= max_queue_depth check in try_enqueue().
+    PersistenceOp op{ClearAllOp{}};
+    if (_ring->try_push(std::move(op))) {
+        _queue_size.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // ============================================================================
@@ -200,48 +212,40 @@ void AsyncPersistenceManager::queue_clear_all() {
 // ============================================================================
 
 bool AsyncPersistenceManager::try_enqueue(PersistenceOp op) {
-    std::lock_guard<std::mutex> lock(_queue_mutex);
-
-    if (_queue.size() >= _config.max_queue_depth) {
+    // Reserve a slot by incrementing _queue_size FIRST, then push. This avoids
+    // a TOCTOU race where multiple producers pass the backpressure check
+    // simultaneously and overshoot max_queue_depth.
+    const auto prev = _queue_size.fetch_add(1, std::memory_order_relaxed);
+    if (prev >= _config.max_queue_depth) {
+        // Over limit — undo the reservation.
+        _queue_size.fetch_sub(1, std::memory_order_relaxed);
         _ops_dropped++;
         return false;
     }
-
-    _queue.push_back(std::move(op));
-    _queue_size.fetch_add(1, std::memory_order_relaxed);
+    if (!_ring->try_push(std::move(op))) {
+        // Ring buffer full (shouldn't happen if capacity >= max_queue_depth).
+        _queue_size.fetch_sub(1, std::memory_order_relaxed);
+        _ops_dropped++;
+        return false;
+    }
     return true;
 }
 
 std::vector<PersistenceOp> AsyncPersistenceManager::extract_batch() {
-    std::lock_guard<std::mutex> lock(_queue_mutex);
-
-    size_t batch_size = std::min(_queue.size(), _config.max_batch_size);
-    if (batch_size == 0) return {};
-
     std::vector<PersistenceOp> batch;
-    batch.reserve(batch_size);
-
-    for (size_t i = 0; i < batch_size; ++i) {
-        batch.push_back(std::move(_queue.front()));
-        _queue.pop_front();
+    size_t drained = _ring->drain(batch, _config.max_batch_size);
+    if (drained > 0) {
+        _queue_size.fetch_sub(drained, std::memory_order_relaxed);
     }
-
-    _queue_size.fetch_sub(batch_size, std::memory_order_relaxed);
     return batch;
 }
 
 std::vector<PersistenceOp> AsyncPersistenceManager::drain_queue() {
-    std::lock_guard<std::mutex> lock(_queue_mutex);
-
     std::vector<PersistenceOp> all_ops;
-    all_ops.reserve(_queue.size());
-
-    while (!_queue.empty()) {
-        all_ops.push_back(std::move(_queue.front()));
-        _queue.pop_front();
+    size_t drained = _ring->drain_all(all_ops);
+    if (drained > 0) {
+        _queue_size.fetch_sub(drained, std::memory_order_relaxed);
     }
-
-    _queue_size.store(0, std::memory_order_relaxed);
     return all_ops;
 }
 
@@ -296,10 +300,29 @@ void AsyncPersistenceManager::on_flush_timer() {
 void AsyncPersistenceManager::process_batch(std::vector<PersistenceOp> batch) {
     if (!is_open() || batch.empty()) return;
 
+    // Snapshot the clear generation before processing. If a queue_clear_all()
+    // was called, all pre-existing ops in this batch are stale — skip them
+    // and only process ops from the current generation (the ClearAllOp itself
+    // and anything enqueued after it).
+    const auto gen_before = _clear_generation.load(std::memory_order_acquire);
+
     // Pre-allocate for common case where batch is mostly routes
     RouteAccumulator routes(*this, batch.size());
 
+    bool seen_clear = false;
     for (auto& op : batch) {
+        // If a clear was requested and we haven't seen the ClearAllOp yet,
+        // skip stale ops. Once we see ClearAllOp, process it and everything after.
+        if (gen_before != _last_processed_generation && !seen_clear) {
+            if (std::holds_alternative<ClearAllOp>(op)) {
+                seen_clear = true;
+                _last_processed_generation = gen_before;
+                // Fall through to execute the ClearAllOp
+            } else {
+                continue;  // Skip stale op
+            }
+        }
+
         try {
             std::visit([this, &routes](auto&& arg) {
                 execute(arg, routes);

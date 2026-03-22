@@ -889,11 +889,12 @@ All HIGH severity issues resolved. MEDIUM/LOW issues tracked below for future ha
   _Severity:_ Medium
   _Fixed:_ Added `remove_circuit(BackendId)` method to CircuitBreaker, shard-local callback in RouterService called from `unregister_backend_global()`, Prometheus metric `circuit_breaker_circuits_removed_total` (Rule #4)
 
-- [ ] **[MEDIUM] Consider lock-free queue for AsyncPersistenceManager**
+- [x] **[MEDIUM] Consider lock-free queue for AsyncPersistenceManager** ✓
   _Issue:_ `async_persistence.cpp:192,203,216,234` uses `std::lock_guard<std::mutex>` in `try_enqueue()` which briefly blocks reactor thread during write batching. Documented as acceptable tradeoff but still a theoretical stall point under high persistence load.
   _Fix:_ Consider lock-free SPSC queue or `seastar::submit_to` pattern for cross-shard enqueue. Current design is acceptable for typical workloads.
   _Location:_ `src/async_persistence.cpp`
   _Severity:_ Medium (acceptable tradeoff)
+  _Fixed:_ Replaced mutex-guarded deque with lock-free SPSC ring buffer. See §21.3.
 
 - [x] **[LOW] Audit _pending_acks cleanup in GossipService** (completed 2026-01-16)
   _Issue:_ `gossip_service.cpp` `_pending_acks` map tracks pending reliable delivery ACKs. Entries have retry limits, but if peers become permanently unresponsive, entries may accumulate until retry exhaustion. Need to verify cleanup occurs when peers are removed from cluster.
@@ -2875,12 +2876,14 @@ End-to-end trace of an LLM inference request through all phases documented in `d
 
 ### 21.3 Replace `std::mutex` in Async Persistence with Lock-Free Queue
 
-- [ ] **Replace mutex-guarded deque in `AsyncPersistenceManager` with a lock-free SPSC ring buffer**
+- [x] **Replace mutex-guarded deque in `AsyncPersistenceManager` with a lock-free SPSC ring buffer** ✓
   _Justification:_ `try_enqueue()` at line 202 acquires `std::lock_guard<std::mutex>` on the Seastar reactor thread. The same mutex is contended by `extract_batch()` (called from the persistence worker's `std::thread`), creating cross-thread contention on the reactor. Even a brief lock hold on the reactor violates Seastar's shared-nothing model (Hard Rule #1 — no locks on the reactor). Current queue operations under `_queue_mutex`: `try_enqueue()` (reactor thread, hot path), `extract_batch()` (worker thread, periodic), `drain_queue()` (worker thread, shutdown), `queue_clear_all()` (reactor thread, admin endpoint).
   _What to change:_ (a) Replace `std::deque<PersistenceOp> _queue` + `std::mutex _queue_mutex` with a bounded SPSC ring buffer. The reactor thread is the sole producer; the persistence worker is the sole consumer. Options: implement a simple `std::array`-based ring buffer with atomic head/tail indices, or use a well-tested lock-free queue. (b) `try_enqueue()` becomes a lock-free CAS on the tail index. Return false if full (existing drop behavior). (c) `extract_batch()` becomes a lock-free drain of up to `max_batch_size` elements from the head. (d) Handle `queue_clear_all()` carefully — set an atomic flag that the worker thread checks before processing. (e) Keep `_queue_size` atomic counter for metrics (already exists). (f) Remove `_queue_mutex` entirely. Note: `PersistenceOp` is a `std::variant` of several op types. The ring buffer must support move-only types. Pre-allocate to `max_queue_depth` (config, default 10,000).
   _Location:_ `src/async_persistence.cpp:202-246`, `src/async_persistence.hpp`
   _Complexity:_ Medium
   _Priority:_ P2 — Performance; reactor-thread mutex contention violates shared-nothing model
+  _Completed:_ 2026-03-21
+  _Fixed:_ Implemented `MpscRingBuffer<T>` (Vyukov-style bounded MPSC with per-slot sequence numbers) with cache-line-aligned atomic tail (CAS for multi-producer), power-of-two capacity, and move-only type support. Replaced `std::deque` + `std::mutex` with lock-free ring buffer. Multiple reactor shards can enqueue concurrently without locking. `queue_clear_all()` uses atomic generation counter — consumer skips stale ops. All `std::lock_guard<std::mutex>` calls removed. Consumer paths (`extract_batch`, `drain_queue`) are also lock-free.
 
 ### 21.4 Avoid Heap Copy of Text for Tokenizer Cache Insertion
 

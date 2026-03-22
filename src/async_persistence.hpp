@@ -1,15 +1,15 @@
 #pragma once
 
 #include "persistence.hpp"
+#include "mpsc_ring_buffer.hpp"
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <variant>
+#include <vector>
 
 namespace ranvier {
 
@@ -28,14 +28,16 @@ namespace ranvier {
  *   2. Processes queued operations in batches via seastar::async()
  *   3. Runs SQLite operations on Seastar's thread pool (not the reactor)
  *
- * The std::mutex in the queue (_queue_mutex) is acceptable because:
- *   - Lock contention is minimal (queue operations are O(1))
- *   - The critical section is extremely short (push/pop from deque)
- *   - Cross-shard access requires some synchronization
+ * LOCK-FREE MPSC QUEUE:
+ * The operation queue uses a bounded multi-producer single-consumer ring
+ * buffer (Vyukov-style) with per-slot sequence numbers. Multiple reactor
+ * shards (producers) CAS-compete on the tail index to enqueue operations
+ * lock-free. The persistence worker (sole consumer) drains batches via
+ * extract_batch()/drain_queue().
  *
  * ARCHITECTURAL GUARANTEE:
  *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
- *                 ↑                                    ↓
+ *                 ↑ (lock-free enqueue)                ↓
  *           (reactor thread)                  (thread pool, mutex OK)
  *
  * @see SqlitePersistence for the underlying mutex-protected implementation.
@@ -104,27 +106,21 @@ struct AsyncPersistenceConfig {
  * The "No Locks/Async Only" rule in Seastar means reactor threads must never
  * block. However, SQLite requires mutex protection because it's not thread-safe.
  * This class bridges the gap by:
- *   1. Accepting operations on the reactor thread (non-blocking queue)
+ *   1. Accepting operations on the reactor thread (lock-free enqueue)
  *   2. Processing them in seastar::async() on a separate thread pool
  *   3. Using mutex protection safely (thread pool threads can block)
  *
  * Architecture:
- *   - Fire-and-forget queue API for the hot request path
- *   - Background timer drains queue and writes to SQLite in batches
+ *   - Lock-free MPSC ring buffer between reactor (producer) and worker (consumer)
+ *   - Background timer drains ring buffer and writes to SQLite in batches
  *   - SQLite operations run in seastar::async (off the reactor thread)
  *   - Semaphore ensures batches are processed in order
  *
  * Thread Safety:
- *   - Queue protected by std::mutex (safe for cross-shard access)
+ *   - Queue is a lock-free MPSC ring buffer (no mutex on reactor thread)
  *   - SQLite operations serialized via semaphore
  *   - Shutdown flag is atomic for visibility across shards
- *
- * MUTEX JUSTIFICATION (per docs/claude-context.md):
- * The _queue_mutex is acceptable because:
- *   1. Critical sections are extremely short (deque push/pop)
- *   2. No blocking I/O occurs while holding the lock
- *   3. Cross-shard access to the shared queue requires synchronization
- *   4. The alternative (per-shard queues) would complicate shutdown ordering
+ *   - Clear-all uses an atomic generation counter checked by the consumer
  */
 
 class AsyncPersistenceManager {
@@ -175,8 +171,9 @@ public:
     // -------------------------------------------------------------------------
     // Write Operations (Fire-and-Forget Queue API)
     // -------------------------------------------------------------------------
-    // These methods queue operations and return immediately (non-blocking).
-    // Safe to call from any shard. Operations silently dropped if store not open.
+    // These methods queue operations and return immediately (lock-free).
+    // Safe to call from any shard (MPSC: multiple producers supported).
+    // Operations silently dropped if store not open.
 
     void queue_save_route(std::span<const TokenId> tokens, BackendId backend_id);
     void queue_save_backend(BackendId id, const std::string& ip, uint16_t port,
@@ -265,10 +262,16 @@ private:
     AsyncPersistenceConfig _config;
     std::unique_ptr<PersistenceStore> _store;  // Owned persistence engine
 
-    // Queue (protected by mutex for cross-shard access)
-    mutable std::mutex _queue_mutex;
-    std::deque<PersistenceOp> _queue;
-    std::atomic<size_t> _queue_size{0};  // Lock-free queue depth for metrics
+    // Lock-free MPSC ring buffer: multiple reactor shards produce, single
+    // consumer (flush timer -> seastar::async worker) drains batches.
+    // Capacity is next power-of-two >= max_queue_depth.
+    std::unique_ptr<MpscRingBuffer<PersistenceOp>> _ring;
+    std::atomic<size_t> _queue_size{0};  // Maintained for metrics compatibility
+
+    // Generation counter for queue_clear_all(). Producer increments; consumer
+    // checks before processing each batch and discards if generation changed.
+    std::atomic<uint64_t> _clear_generation{0};
+    uint64_t _last_processed_generation{0};  // Consumer-only, no atomic needed
 
     // Timers
     seastar::timer<> _flush_timer;
