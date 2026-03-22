@@ -51,14 +51,19 @@ services:
       context: .
       dockerfile: Dockerfile.production
     container_name: ranvier1
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M    # SQLite WAL files (RANVIER_DB_PATH=/tmp/ranvier.db) + scratch
+    cap_drop:
+      - ALL
+    cap_add:
+      - IPC_LOCK          # Required by Seastar for memory locking (mlock/mlockall)
     networks:
       ranvier-test:
         ipv4_address: 172.28.2.1
     ports:
       - "8081:8080"
       - "9181:9180"
-    cap_add:
-      - IPC_LOCK
     environment:
       # Cluster configuration via environment variables
       - RANVIER_CLUSTER_ENABLED=true
@@ -89,14 +94,19 @@ services:
       context: .
       dockerfile: Dockerfile.production
     container_name: ranvier2
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M    # SQLite WAL files + scratch
+    cap_drop:
+      - ALL
+    cap_add:
+      - IPC_LOCK          # Required by Seastar for memory locking (mlock/mlockall)
     networks:
       ranvier-test:
         ipv4_address: 172.28.2.2
     ports:
       - "8082:8080"
       - "9182:9180"
-    cap_add:
-      - IPC_LOCK
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190
@@ -125,14 +135,19 @@ services:
       context: .
       dockerfile: Dockerfile.production
     container_name: ranvier3
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M    # SQLite WAL files + scratch
+    cap_drop:
+      - ALL
+    cap_add:
+      - IPC_LOCK          # Required by Seastar for memory locking (mlock/mlockall)
     networks:
       ranvier-test:
         ipv4_address: 172.28.2.3
     ports:
       - "8083:8080"
       - "9183:9180"
-    cap_add:
-      - IPC_LOCK
     environment:
       - RANVIER_CLUSTER_ENABLED=true
       - RANVIER_CLUSTER_GOSSIP_PORT=9190

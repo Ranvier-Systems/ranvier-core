@@ -243,6 +243,27 @@ void RanvierConfig::apply_env_overrides() {
     // Auth overrides
     if (auto v = get_env("RANVIER_ADMIN_API_KEY")) auth.admin_api_key = *v;
 
+    // Metrics endpoint security overrides
+    if (auto v = get_env("RANVIER_METRICS_AUTH_TOKEN")) metrics.auth_token = *v;
+    if (auto v = get_env("RANVIER_METRICS_ALLOWED_IPS")) {
+        // Parse comma-separated IP list
+        metrics.allowed_ips.clear();
+        std::istringstream iss(*v);
+        std::string ip;
+        while (std::getline(iss, ip, ',')) {
+            size_t start = ip.find_first_not_of(" \t");
+            size_t end = ip.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                metrics.allowed_ips.push_back(ip.substr(start, end - start + 1));
+            }
+        }
+        if (metrics.allowed_ips.size() > MetricsConfig::MAX_ALLOWED_IPS) {
+            std::cerr << "[WARN] RANVIER_METRICS_ALLOWED_IPS has " << metrics.allowed_ips.size()
+                      << " entries, truncating to " << MetricsConfig::MAX_ALLOWED_IPS << "\n";
+            metrics.allowed_ips.resize(MetricsConfig::MAX_ALLOWED_IPS);
+        }
+    }
+
     // Rate limit overrides
     if (auto v = get_env("RANVIER_RATE_LIMIT_ENABLED")) {
         rate_limit.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -774,6 +795,23 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                     if (!api_key.key.empty()) {
                         config.auth.api_keys.push_back(std::move(api_key));
                     }
+                }
+            }
+        }
+
+        // Metrics endpoint security section
+        if (yaml["metrics"]) {
+            YAML::Node m = yaml["metrics"];
+            if (m["auth_token"]) config.metrics.auth_token = m["auth_token"].as<std::string>();
+            if (m["allowed_ips"]) {
+                config.metrics.allowed_ips.clear();
+                for (const auto& ip : m["allowed_ips"]) {
+                    config.metrics.allowed_ips.push_back(ip.as<std::string>());
+                }
+                if (config.metrics.allowed_ips.size() > MetricsConfig::MAX_ALLOWED_IPS) {
+                    std::cerr << "[WARN] metrics.allowed_ips has " << config.metrics.allowed_ips.size()
+                              << " entries, truncating to " << MetricsConfig::MAX_ALLOWED_IPS << "\n";
+                    config.metrics.allowed_ips.resize(MetricsConfig::MAX_ALLOWED_IPS);
                 }
             }
         }
