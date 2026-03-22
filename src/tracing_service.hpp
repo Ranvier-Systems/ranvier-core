@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "chassis_config_schema.hpp"
+#include "config.hpp"
 
 #include <memory>
 #include <optional>

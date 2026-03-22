@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "chassis_config_schema.hpp"
+#include "config.hpp"
 #include "gossip_consensus.hpp"
 #include "gossip_transport.hpp"
 #include "logging.hpp"

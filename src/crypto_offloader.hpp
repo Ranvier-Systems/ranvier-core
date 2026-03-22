@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "logging.hpp"
 
 #include <atomic>

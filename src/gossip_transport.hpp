@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "chassis_config_schema.hpp"
+#include "config.hpp"
 #include "crypto_offloader.hpp"
 #include "dtls_context.hpp"
 #include "logging.hpp"

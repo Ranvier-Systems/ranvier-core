@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "chassis_config_schema.hpp"
+#include "config.hpp"
 #include "logging.hpp"
 #include "types.hpp"
 
