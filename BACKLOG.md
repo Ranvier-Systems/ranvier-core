@@ -25,6 +25,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 12. [Request Lifecycle Performance Analysis (2026-02-20)](#12-request-lifecycle-performance-analysis-2026-02-20)
 13. [Code Modularity (Low Priority)](#13-code-modularity-low-priority)
 14. [Shard 0 Role Isolation Analysis (2026-03-06)](#14-shard-0-role-isolation-analysis-2026-03-06)
+15. [Intelligence Layer Roadmap (2026-03-25)](#15-intelligence-layer-roadmap-2026-03-25)
 
 ---
 
@@ -699,7 +700,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _What to change:_ Define a `BackendRegistry` abstract class with the three methods above. Have RouterService implement it. Change HealthService and K8sDiscoveryService constructors to accept `BackendRegistry&`.
   _Location:_ `src/health_service.hpp`, `src/k8s_discovery_service.hpp`, `src/router_service.hpp`
   _Complexity:_ Low
-  _Priority:_ P4 — Testability improvement
+  _Priority:_ **P2** — Promoted; prerequisite for §15 Tier 2 (vLLM metrics ingestion)
 
 ### 22.2 Split config_schema.hpp into Infrastructure and Product Configs
 
@@ -708,7 +709,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _What to change:_ Move infrastructure config structs to `config_infra.hpp`. Keep RoutingConfig and AssetsConfig in `config_schema.hpp`. RanvierConfig includes both headers.
   _Location:_ `src/config_schema.hpp`
   _Complexity:_ Low
-  _Priority:_ P4 — Code organization
+  _Priority:_ **P1** — Promoted; prerequisite for §15 Tier 1 (cost estimation + priority configs)
 
 ### 22.3 Split MetricsService into Helpers and Ranvier-Specific Counters
 
@@ -717,7 +718,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _What to change:_ Move MetricHistogram, bucket helpers, and the bounded per-backend metrics pattern to `metrics_helpers.hpp`. Keep Ranvier-specific counters in `metrics_service.hpp`.
   _Location:_ `src/metrics_service.hpp`
   _Complexity:_ Low
-  _Priority:_ P4 — Code organization
+  _Priority:_ **P1** — Promoted; prerequisite for §15 Tier 1 (per-priority metrics)
 
 ### 22.4 Template ShardedConfig on Config Type
 
@@ -753,6 +754,112 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Complexity:_ Medium
   _Priority:_ P3 — Only if evidence warrants; premature on clusters <8 nodes or <16 cores
   _Tradeoff:_ Permanently loses 1/N data plane capacity (25% on 4-core, 12% on 8-core, 6% on 16-core). Shard 0 would be mostly idle between control plane bursts — wasted core on small deployments.
+
+---
+
+## 15. Intelligence Layer Roadmap (2026-03-25)
+
+Prioritized implementation plan derived from [VISION.md](docs/architecture/VISION.md).
+Chassis refactors (§13) are interleaved where they prevent rework on shared files.
+
+### Tier 1: Foundation (do now)
+
+- [ ] **[P1] Split config_schema.hpp** (§13 item 22.2, promoted from P4)
+  _Why now:_ Tier 1 features add CostEstimationConfig + PriorityQueueConfig. Splitting infra vs product configs first avoids a second move.
+  _Location:_ `src/config_schema.hpp`
+  _Complexity:_ Low
+
+- [ ] **[P1] Split metrics_service.hpp** (§13 item 22.3, promoted from P4)
+  _Why now:_ Tier 1 features add per-priority metrics. Same logic.
+  _Location:_ `src/metrics_service.hpp`
+  _Complexity:_ Low
+
+- [ ] **[P1] Cost Estimation + Priority Tiers (VISION 1.1+1.2 merged)**
+  _Effort:_ ~2.5 weeks
+  _Scope:_ ProxyContext cost fields, input_tokens as initial cost proxy, PriorityLevel enum, PriorityQueue, X-Ranvier-Priority header, per-priority metrics. Heuristic decay deferred to v1.1.
+  _Files:_ `src/http_controller.{hpp,cpp}`, `src/config_schema.hpp`, `src/metrics_service.hpp`
+  _Dependencies:_ config + metrics splits above
+  _Complexity:_ High
+
+- [ ] **[P1] Intent Classification (VISION 1.4)**
+  _Effort:_ ~1 week
+  _Scope:_ RequestIntent enum (AUTOCOMPLETE/CHAT/EDIT), FIM detection, wire-format inspection, intent-based routing integration.
+  _Files:_ `src/http_controller.hpp`, `src/router_service.{hpp,cpp}`
+  _Dependencies:_ 1.1+1.2
+  _Complexity:_ Medium
+
+### Tier 2: Cloud Intelligence
+
+- [ ] **[P2] Extract BackendRegistry interface** (§13 item 22.1, promoted from P4)
+  _Why now:_ vLLM metrics ingestion wires into HealthService. Decoupling from RouterService first avoids deepening the coupling.
+  _Location:_ `src/health_service.hpp`, `src/k8s_discovery_service.hpp`, `src/router_service.hpp`
+  _Complexity:_ Low
+
+- [ ] **[P2] vLLM Metrics Ingestion (VISION 2.1)**
+  _Effort:_ ~2 weeks
+  _Scope:_ VLLMMetrics struct, /metrics scraping, Prometheus text parsing.
+  _Files:_ `src/health_service.{hpp,cpp}`, `src/metrics_service.hpp`
+  _Dependencies:_ BackendRegistry interface
+  _Complexity:_ High
+
+- [ ] **[P2] Load-Aware Backend Selection (VISION 2.2)**
+  _Effort:_ ~2 weeks (~30% infra exists from load-aware prefix routing)
+  _Scope:_ P2C alternative selection, routing decision logic, thundering herd prevention.
+  _Dependencies:_ 2.1
+  _Complexity:_ High
+
+- [ ] **[P2] Cost-Based Routing (VISION 2.3)**
+  _Effort:_ ~1.5 weeks
+  _Scope:_ Per-backend cost budget, small-request fast lane, budget reservation/release.
+  _Dependencies:_ 1.1+1.2, 2.2
+  _Complexity:_ Medium
+
+- [ ] **Re-benchmark: prefix + priority + load-aware vs baseline**
+
+### Tier 3: Local Product
+
+- [ ] **[P2] Local Mode Config (VISION 1.3)**
+  _Effort:_ ~1 week
+  _Scope:_ LocalModeConfig, RANVIER_LOCAL_MODE env, conditional startup.
+  _Files:_ `src/config_schema.hpp`, `src/application.cpp`
+  _Complexity:_ Low
+
+- [ ] **[P2] Local Backend Discovery (VISION 3.1)**
+  _Effort:_ ~1.5 weeks
+  _Scope:_ Port scanning, semantic liveness, server type detection.
+  _Dependencies:_ 1.3
+  _Complexity:_ Medium
+
+- [ ] **[P2] Agent-Aware Request Handling (VISION 3.2)**
+  _Effort:_ ~2 weeks
+  _Scope:_ AgentRegistry, agent identification, pause/resume API.
+  _Dependencies:_ 1.2, 1.4
+  _Complexity:_ High
+
+- [ ] **[P3] Request Queuing with Pause/Resume (VISION 3.3)**
+  _Effort:_ ~2 weeks | Risk: High
+  _Scope:_ RequestScheduler, per-agent queues, fair scheduling.
+  _Dependencies:_ 3.2
+  _Complexity:_ High
+
+### Tier 4: Polish (parallel, after Tier 3)
+
+- [ ] **[P3] Single-Binary Local Distribution (VISION 4.1)**
+  _Complexity:_ Medium
+
+- [ ] **[P3] Local Dashboard UI (VISION 4.2)**
+  _Complexity:_ High
+
+- [ ] **[P3] Documentation & Examples (VISION 4.3)**
+  _Complexity:_ Low
+
+### Chassis items deferred (no urgency)
+
+- [ ] **[P4] Template ShardedConfig** (§13 item 22.4) — trivial, do whenever
+- [ ] **[P4] Generalize gossip message types** — only when 2nd product committed
+
+---
+
 
 ---
 
