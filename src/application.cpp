@@ -167,6 +167,10 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.load_balancing.min_load_difference = config.load_balancing.min_load_difference;
     cfg.load_balancing.local_processing_threshold = config.load_balancing.local_processing_threshold;
     cfg.load_balancing.snapshot_refresh_interval_us = config.load_balancing.snapshot_refresh_interval_us;
+    // Cost estimation settings (VISION 1.1 §15)
+    cfg.cost_estimation_enabled = config.cost_estimation.enabled;
+    cfg.cost_estimation_output_multiplier = config.cost_estimation.default_output_multiplier;
+    cfg.cost_estimation_max_tokens = config.cost_estimation.max_estimated_tokens;
     return cfg;
 }
 

@@ -1321,6 +1321,70 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
+    // Cost estimation (VISION 1.1 §15): populate cost fields before context init.
+    // Uses text length from already-extracted content (no extra JSON parse) with a
+    // simple chars/4 heuristic for input tokens, and max_tokens from the request
+    // body for output tokens.
+    uint64_t estimated_input_tokens = 0;
+    uint64_t estimated_output_tokens = 0;
+    double estimated_cost_units = 0.0;
+
+    if (_config.cost_estimation_enabled) {
+        // Input token heuristic: content chars / 4 (rough chars-per-token approximation).
+        // Reuse text_extraction if available to avoid redundant parsing.
+        size_t content_chars = 0;
+        if (text_extraction.has_value()) {
+            content_chars = text_extraction->text.size();
+        } else {
+            // Fallback: use raw body length (overestimates but safe)
+            content_chars = body_view.size();
+        }
+        estimated_input_tokens = std::min(
+            static_cast<uint64_t>(content_chars / 4),
+            _config.cost_estimation_max_tokens);
+
+        // Output token estimate: extract max_tokens from request body.
+        // Lightweight scan — avoid full JSON re-parse by searching for the field
+        // in the already-parsed text_extraction context or falling back to a
+        // simple string search on body_view.
+        uint64_t max_tokens_from_request = 0;
+        {
+            // Quick parse: find "max_tokens" in body_view.
+            // RapidJSON already validated JSON structure above; this is a targeted extraction.
+            rapidjson::Document cost_doc;
+            cost_doc.Parse(body_view.data(), body_view.size());
+            if (!cost_doc.HasParseError() && cost_doc.IsObject()) {
+                // Check both "max_tokens" and "max_completion_tokens" (OpenAI API variants)
+                if (cost_doc.HasMember("max_tokens") && cost_doc["max_tokens"].IsUint64()) {
+                    max_tokens_from_request = cost_doc["max_tokens"].GetUint64();
+                } else if (cost_doc.HasMember("max_tokens") && cost_doc["max_tokens"].IsInt()) {
+                    auto val = cost_doc["max_tokens"].GetInt();
+                    if (val > 0) max_tokens_from_request = static_cast<uint64_t>(val);
+                } else if (cost_doc.HasMember("max_completion_tokens") && cost_doc["max_completion_tokens"].IsUint64()) {
+                    max_tokens_from_request = cost_doc["max_completion_tokens"].GetUint64();
+                } else if (cost_doc.HasMember("max_completion_tokens") && cost_doc["max_completion_tokens"].IsInt()) {
+                    auto val = cost_doc["max_completion_tokens"].GetInt();
+                    if (val > 0) max_tokens_from_request = static_cast<uint64_t>(val);
+                }
+            }
+        }
+
+        if (max_tokens_from_request > 0) {
+            estimated_output_tokens = std::min(max_tokens_from_request, _config.cost_estimation_max_tokens);
+        } else {
+            // No max_tokens specified: estimate as input * output_multiplier
+            estimated_output_tokens = std::min(
+                static_cast<uint64_t>(estimated_input_tokens * _config.cost_estimation_output_multiplier),
+                _config.cost_estimation_max_tokens);
+        }
+
+        estimated_cost_units = static_cast<double>(estimated_input_tokens)
+            + (static_cast<double>(estimated_output_tokens) * _config.cost_estimation_output_multiplier);
+
+        log_proxy.debug("[{}] Cost estimation: input={}, output={}, cost_units={:.1f}",
+                       request_id, estimated_input_tokens, estimated_output_tokens, estimated_cost_units);
+    }
+
     // Initialize ProxyContext with all state needed for streaming
     // This struct bundles request state to reduce lambda capture complexity
     // Using unique_ptr: ownership transfers from handle_proxy to the lambda (no sharing)
@@ -1344,6 +1408,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->fallback_enabled = fallback_enabled;
     ctx->shard_metrics_active = shard_metrics_active;
     ctx->request_deadline = lowres_clock::now() + request_timeout;
+    ctx->estimated_input_tokens = estimated_input_tokens;
+    ctx->estimated_output_tokens = estimated_output_tokens;
+    ctx->estimated_cost_units = estimated_cost_units;
 
     // Move gate_holder, semaphore_units, and backend_guard into the lambda to keep them alive during streaming.
     // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
