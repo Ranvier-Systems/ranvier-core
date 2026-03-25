@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "config_schema.hpp"
+#include "config_infra.hpp"
 
 #include <chrono>
 #include <cstdint>
