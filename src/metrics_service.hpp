@@ -3,16 +3,14 @@
 // Provides Prometheus metrics for monitoring Ranvier performance.
 // Includes histograms for latency tracking and counters for request stats.
 // Supports per-backend metrics for comparing GPU model performance.
+//
+// For reusable histogram/bucket infrastructure, see metrics_helpers.hpp.
 
 #pragma once
 
-#include "types.hpp"
+#include "metrics_helpers.hpp"
 
 #include <chrono>
-#include <functional>
-#include <unordered_map>
-#include <seastar/core/metrics.hh>
-#include <seastar/core/metrics_registration.hh>
 
 namespace ranvier {
 
@@ -20,133 +18,9 @@ namespace ranvier {
 // Defined in router_service.cpp - reads shard-local BackendInfo::active_requests
 uint64_t get_backend_load(BackendId id);
 
-// Histogram bucket boundaries for latency measurements (in seconds)
-// Covers range from 1ms to 5 minutes for LLM inference workloads
-inline std::vector<double> latency_buckets() {
-    return {
-        0.001,   // 1ms
-        0.005,   // 5ms
-        0.01,    // 10ms
-        0.025,   // 25ms
-        0.05,    // 50ms
-        0.1,     // 100ms
-        0.25,    // 250ms
-        0.5,     // 500ms
-        1.0,     // 1s
-        2.5,     // 2.5s
-        5.0,     // 5s
-        10.0,    // 10s
-        30.0,    // 30s
-        60.0,    // 1min
-        120.0,   // 2min
-        300.0    // 5min
-    };
-}
-
-// Optimized routing latency buckets: 100μs to 100ms
-// Note: Seastar's Prometheus exporter truncates very small values (< 0.0001)
-// to 0.000000, so we start at 100μs to ensure proper bucket boundaries.
-inline std::vector<double> routing_latency_buckets() {
-    return {
-        0.0001,   // 100μs
-        0.00025,  // 250μs
-        0.0005,   // 500μs
-        0.001,    // 1ms
-        0.0025,   // 2.5ms
-        0.005,    // 5ms
-        0.01,     // 10ms
-        0.025,    // 25ms
-        0.05,     // 50ms
-        0.1       // 100ms
-    };
-}
-
-// Backend latency buckets: 50ms to 10s
-// Optimized for LLM prefill/generation workloads (second-scale inference)
-inline std::vector<double> backend_latency_buckets() {
-    return {
-        0.05,    // 50ms
-        0.1,     // 100ms
-        0.25,    // 250ms
-        0.5,     // 500ms
-        0.75,    // 750ms
-        1.0,     // 1s
-        1.5,     // 1.5s
-        2.0,     // 2s
-        3.0,     // 3s
-        4.0,     // 4s
-        5.0,     // 5s
-        7.5,     // 7.5s
-        10.0     // 10s
-    };
-}
-
-// Total request latency buckets: full end-to-end time
-// Covers the complete request lifecycle from ingress to completion
-inline std::vector<double> total_request_latency_buckets() {
-    return {
-        0.01,    // 10ms
-        0.025,   // 25ms
-        0.05,    // 50ms
-        0.1,     // 100ms
-        0.25,    // 250ms
-        0.5,     // 500ms
-        1.0,     // 1s
-        2.5,     // 2.5s
-        5.0,     // 5s
-        10.0,    // 10s
-        30.0,    // 30s
-        60.0,    // 1min
-        120.0,   // 2min
-        300.0    // 5min
-    };
-}
-
 // Thread-local metrics for the HTTP controller
 // Each shard has its own counters/histograms (shared-nothing model)
 class MetricsService {
-    // Maximum number of unique backends to track metrics for (Rule #4: bounded containers)
-    // Prevents OOM from malicious/buggy backends flooding unique IDs
-    static constexpr size_t MAX_TRACKED_BACKENDS = 10000;
-    struct MetricHistogram {
-        seastar::metrics::histogram data;
-
-        // Initialize with boundaries
-        MetricHistogram(const std::vector<double>& boundaries) {
-            data.sample_count = 0;
-            data.sample_sum = 0;
-            for (double b : boundaries) {
-                data.buckets.push_back({0, b});
-            }
-        }
-
-        void record(double value) {
-            // 1. Update the global totals
-            data.sample_count++;
-            data.sample_sum += value;
-
-            // 2. Update the individual buckets
-            // In a cumulative histogram, a value of 0.05s belongs in
-            // the 0.05 bucket, the 0.1 bucket, the 0.5 bucket, etc.
-            for (auto& bucket : data.buckets) {
-                if (value <= bucket.upper_bound) {
-                    bucket.count++;
-                }
-            }
-        }
-    };
-
-    // Per-backend histogram storage for labeled metrics
-    struct BackendMetrics {
-        MetricHistogram latency;  // ranvier_backend_latency_seconds
-        MetricHistogram first_byte_latency;
-        bool registered = false;
-
-        BackendMetrics()
-            : latency(backend_latency_buckets())
-            , first_byte_latency(backend_latency_buckets()) {}
-    };
-
 public:
     MetricsService() {
         // Register metrics group with core metrics
@@ -455,9 +329,9 @@ public:
     // This populates ranvier_backend_latency_seconds{backend_id="X"}
     // Shard-local for lock-free hot path efficiency
     void record_backend_latency_by_id(BackendId backend_id, double seconds) {
-        auto* backend_metrics = get_or_create_backend_metrics(backend_id);
-        if (backend_metrics) {
-            backend_metrics->latency.record(seconds);
+        auto* bm = get_or_create_backend_metrics(backend_id);
+        if (bm) {
+            bm->latency.record(seconds);
         }
         // Always record in the aggregate histogram regardless of overflow
         _router_backend_latency.record(seconds);
@@ -465,9 +339,9 @@ public:
 
     // Record first-byte latency with backend_id label
     void record_first_byte_latency_by_id(BackendId backend_id, double seconds) {
-        auto* backend_metrics = get_or_create_backend_metrics(backend_id);
-        if (backend_metrics) {
-            backend_metrics->first_byte_latency.record(seconds);
+        auto* bm = get_or_create_backend_metrics(backend_id);
+        if (bm) {
+            bm->first_byte_latency.record(seconds);
         }
     }
 

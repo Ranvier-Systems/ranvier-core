@@ -93,7 +93,8 @@ src/
 
   # Configuration
   config.hpp                  # Facade header (includes schema + loader)
-  config_schema.hpp           # All config structs (RanvierConfig, RoutingConfig, etc.)
+  config_infra.hpp            # Infrastructure config structs (ServerConfig, PoolConfig, etc.)
+  config_schema.hpp           # Ranvier-specific configs (RoutingConfig, AssetsConfig, RanvierConfig)
   config_loader.{hpp,cpp}     # YAML parsing + env var overrides
   sharded_config.hpp          # Lock-free per-shard config distribution
 
@@ -105,7 +106,8 @@ src/
   # Infrastructure
   health_service.{hpp,cpp}    # Backend liveness monitoring
   k8s_discovery_service.{hpp,cpp} # Kubernetes EndpointSlice watching
-  metrics_service.hpp         # Prometheus metrics (:9180)
+  metrics_helpers.hpp         # Reusable histogram/bucket infrastructure (MetricHistogram, BackendMetrics)
+  metrics_service.hpp         # Ranvier-specific Prometheus metrics (:9180)
   tracing_service.{hpp,cpp}   # OpenTelemetry (optional, Zipkin exporter)
   shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch
   shard_load_metrics.hpp      # Per-shard load tracking

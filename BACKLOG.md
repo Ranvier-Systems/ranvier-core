@@ -704,7 +704,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 22.2 Split config_schema.hpp into Infrastructure and Product Configs
 
-- [ ] **Separate generic infrastructure configs from routing-specific configs**
+- [x] **Separate generic infrastructure configs from routing-specific configs**
   _Justification:_ `config_schema.hpp` is 618 lines mixing infrastructure configs (ServerConfig, PoolConfig, HealthConfig, TlsConfig, AuthConfig, etc.) with Ranvier-specific configs (RoutingConfig, AssetsConfig). Splitting reduces cognitive load and makes infrastructure configs independently reusable.
   _What to change:_ Move infrastructure config structs to `config_infra.hpp`. Keep RoutingConfig and AssetsConfig in `config_schema.hpp`. RanvierConfig includes both headers.
   _Location:_ `src/config_schema.hpp`
@@ -713,7 +713,7 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 22.3 Split MetricsService into Helpers and Ranvier-Specific Counters
 
-- [ ] **Extract generic histogram/counter patterns from Ranvier-specific metrics**
+- [x] **Extract generic histogram/counter patterns from Ranvier-specific metrics**
   _Justification:_ `metrics_service.hpp` is 620 lines mixing reusable patterns (MetricHistogram class, bucket definitions, per-backend metrics map) with Ranvier-specific counters (tokenization, ART, prefix boundary). Splitting makes the generic patterns reusable and reduces file size.
   _What to change:_ Move MetricHistogram, bucket helpers, and the bounded per-backend metrics pattern to `metrics_helpers.hpp`. Keep Ranvier-specific counters in `metrics_service.hpp`.
   _Location:_ `src/metrics_service.hpp`
@@ -764,12 +764,12 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
 
 ### Tier 1: Foundation (do now)
 
-- [ ] **[P1] Split config_schema.hpp** (§13 item 22.2, promoted from P4)
+- [x] **[P1] Split config_schema.hpp** (§13 item 22.2, promoted from P4)
   _Why now:_ Tier 1 features add CostEstimationConfig + PriorityQueueConfig. Splitting infra vs product configs first avoids a second move.
   _Location:_ `src/config_schema.hpp`
   _Complexity:_ Low
 
-- [ ] **[P1] Split metrics_service.hpp** (§13 item 22.3, promoted from P4)
+- [x] **[P1] Split metrics_service.hpp** (§13 item 22.3, promoted from P4)
   _Why now:_ Tier 1 features add per-priority metrics. Same logic.
   _Location:_ `src/metrics_service.hpp`
   _Complexity:_ Low
