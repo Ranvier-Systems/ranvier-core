@@ -188,7 +188,7 @@ struct AssetsConfig {
 };
 
 // =============================================================================
-// Cost Estimation Configuration (VISION 1.1 §15)
+// Cost Estimation Configuration
 // =============================================================================
 
 // Cost estimation for priority tier assignment.

@@ -114,7 +114,7 @@ struct ProxyContext {
     uint32_t chunks_received = 0;         // Chunks received from backend
     uint32_t stale_retry_attempt = 0;     // Number of stale connection retries attempted
 
-    // Cost estimation (VISION 1.1 §15 — populated before routing)
+    // Cost estimation (populated before routing)
     uint64_t estimated_input_tokens = 0;   // Heuristic: content chars / 4
     uint64_t estimated_output_tokens = 0;  // max_tokens from request, or input * output_multiplier
     double estimated_cost_units = 0.0;     // input + (output * output_multiplier)
@@ -147,7 +147,7 @@ struct HttpControllerConfig {
     size_t max_request_body_bytes = 10 * 1024 * 1024;  // Max request body size for proxy endpoints (default: 10MB, 0 = unlimited)
     uint32_t dns_resolution_timeout_seconds = 5;        // Timeout for DNS resolution in backend registration (seconds)
 
-    // Cost estimation settings (VISION 1.1 §15)
+    // Cost estimation settings
     bool cost_estimation_enabled = true;               // Enable cost estimation
     double cost_estimation_output_multiplier = 2.0;    // Default output token multiplier
     uint64_t cost_estimation_max_tokens = 1000000;     // Sanity cap on estimated tokens

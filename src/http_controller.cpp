@@ -1321,7 +1321,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
-    // Cost estimation (VISION 1.1 §15): populate cost fields before context init.
+    // Cost estimation: populate cost fields before context init.
     // Uses text length from already-extracted content (no extra JSON parse) with a
     // simple chars/4 heuristic for input tokens, and max_tokens from the request
     // body for output tokens.

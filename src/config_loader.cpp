@@ -528,7 +528,7 @@ void RanvierConfig::apply_env_overrides() {
         telemetry.max_export_batch_size = *v;
     }
 
-    // Cost estimation overrides (VISION 1.1 §15)
+    // Cost estimation overrides
     if (auto v = get_env("RANVIER_COST_ESTIMATION_ENABLED")) {
         cost_estimation.enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
@@ -1046,7 +1046,7 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.telemetry.max_export_batch_size = t["max_export_batch_size"].as<size_t>();
             }
         }
-        // Cost estimation section (VISION 1.1 §15)
+        // Cost estimation section
         if (yaml["cost_estimation"]) {
             YAML::Node ce = yaml["cost_estimation"];
             if (ce["enabled"]) config.cost_estimation.enabled = ce["enabled"].as<bool>();
@@ -1275,7 +1275,7 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         }
     }
 
-    // Validate cost estimation settings (VISION 1.1 §15)
+    // Validate cost estimation settings
     if (config.cost_estimation.default_output_multiplier < 0.0) {
         return "cost_estimation.default_output_multiplier must be non-negative";
     }
