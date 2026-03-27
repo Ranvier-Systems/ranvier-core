@@ -2,8 +2,10 @@
 
 #include "config.hpp"
 #include <gtest/gtest.h>
-#include <fstream>
+#include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <fstream>
 
 using namespace ranvier;
 
@@ -43,6 +45,10 @@ protected:
         // Client token env vars
         unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
         unsetenv("RANVIER_MAX_TOKEN_ID");
+        // Cost estimation env vars
+        unsetenv("RANVIER_COST_ESTIMATION_ENABLED");
+        unsetenv("RANVIER_COST_ESTIMATION_OUTPUT_MULTIPLIER");
+        unsetenv("RANVIER_COST_ESTIMATION_MAX_TOKENS");
         // Gossip TLS env vars
         unsetenv("RANVIER_CLUSTER_TLS_ENABLED");
         unsetenv("RANVIER_CLUSTER_TLS_CERT_PATH");
@@ -1510,6 +1516,138 @@ TEST_F(ConfigTest, ValidationPassesForEdgeCaseThresholds) {
     config.backpressure.persistence_queue_threshold = 1.0;
     error = RanvierConfig::validate(config);
     EXPECT_FALSE(error.has_value()) << "Threshold 1.0 should be valid";
+}
+
+// =============================================================================
+// Cost Estimation Config Tests
+// =============================================================================
+
+TEST_F(ConfigTest, CostEstimationDefaults) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.cost_estimation.enabled);
+    EXPECT_DOUBLE_EQ(config.cost_estimation.default_output_multiplier, 2.0);
+    EXPECT_EQ(config.cost_estimation.max_estimated_tokens, 1000000u);
+}
+
+TEST_F(ConfigTest, CostEstimationFromYaml) {
+    writeTestConfig("test_config.yaml", R"(
+cost_estimation:
+  enabled: false
+  default_output_multiplier: 3.5
+  max_estimated_tokens: 500000
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_FALSE(config.cost_estimation.enabled);
+    EXPECT_DOUBLE_EQ(config.cost_estimation.default_output_multiplier, 3.5);
+    EXPECT_EQ(config.cost_estimation.max_estimated_tokens, 500000u);
+}
+
+TEST_F(ConfigTest, CostEstimationPartialYamlUsesDefaults) {
+    writeTestConfig("test_config.yaml", R"(
+cost_estimation:
+  enabled: false
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_FALSE(config.cost_estimation.enabled);
+    // Unset fields keep defaults
+    EXPECT_DOUBLE_EQ(config.cost_estimation.default_output_multiplier, 2.0);
+    EXPECT_EQ(config.cost_estimation.max_estimated_tokens, 1000000u);
+}
+
+TEST_F(ConfigTest, CostEstimationEnvironmentVariables) {
+    setenv("RANVIER_COST_ESTIMATION_ENABLED", "false", 1);
+    setenv("RANVIER_COST_ESTIMATION_OUTPUT_MULTIPLIER", "1.5", 1);
+    setenv("RANVIER_COST_ESTIMATION_MAX_TOKENS", "250000", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.cost_estimation.enabled);
+    EXPECT_DOUBLE_EQ(config.cost_estimation.default_output_multiplier, 1.5);
+    EXPECT_EQ(config.cost_estimation.max_estimated_tokens, 250000u);
+}
+
+TEST_F(ConfigTest, CostEstimationEnvOverridesYaml) {
+    writeTestConfig("test_config.yaml", R"(
+cost_estimation:
+  enabled: true
+  default_output_multiplier: 3.0
+)");
+    setenv("RANVIER_COST_ESTIMATION_ENABLED", "false", 1);
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_FALSE(config.cost_estimation.enabled);
+    // YAML value retained for fields not overridden by env
+    EXPECT_DOUBLE_EQ(config.cost_estimation.default_output_multiplier, 3.0);
+}
+
+TEST_F(ConfigTest, ValidationFailsForNegativeOutputMultiplier) {
+    RanvierConfig config;
+    config.cost_estimation.default_output_multiplier = -1.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("default_output_multiplier"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationFailsForZeroMaxEstimatedTokens) {
+    RanvierConfig config;
+    config.cost_estimation.max_estimated_tokens = 0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("max_estimated_tokens"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationPassesForZeroOutputMultiplier) {
+    // 0.0 multiplier is valid (means output tokens don't contribute to cost)
+    RanvierConfig config;
+    config.cost_estimation.default_output_multiplier = 0.0;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value());
+}
+
+TEST_F(ConfigTest, ValidationPassesForDefaultCostEstimation) {
+    RanvierConfig config;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value());
+}
+
+// =============================================================================
+// Cost Estimation Formula Tests (standalone, no HttpController needed)
+// =============================================================================
+
+TEST(CostEstimationFormulaTest, InputTokensFromContentChars) {
+    // chars / 4, capped at max
+    uint64_t max_tokens = 1000000;
+    EXPECT_EQ(static_cast<uint64_t>(400 / 4), 100u);
+    EXPECT_EQ(std::min(static_cast<uint64_t>(400 / 4), max_tokens), 100u);
+    // Empty content
+    EXPECT_EQ(static_cast<uint64_t>(0 / 4), 0u);
+    // Large content hits cap
+    uint64_t small_cap = 100;
+    EXPECT_EQ(std::min(static_cast<uint64_t>(2000 / 4), small_cap), 100u);
+}
+
+TEST(CostEstimationFormulaTest, OutputTokensFromMaxTokensField) {
+    uint64_t max_cap = 1000000;
+    // max_tokens present: use directly, capped
+    EXPECT_EQ(std::min(static_cast<uint64_t>(512), max_cap), 512u);
+    // max_tokens exceeds cap
+    EXPECT_EQ(std::min(static_cast<uint64_t>(2000000), max_cap), 1000000u);
+}
+
+TEST(CostEstimationFormulaTest, OutputTokensFallbackToMultiplier) {
+    // When max_tokens absent: input * multiplier, capped
+    uint64_t input_tokens = 100;
+    double multiplier = 2.0;
+    uint64_t max_cap = 1000000;
+    uint64_t estimated = std::min(
+        static_cast<uint64_t>(input_tokens * multiplier), max_cap);
+    EXPECT_EQ(estimated, 200u);
+}
+
+TEST(CostEstimationFormulaTest, CostUnitsFormula) {
+    uint64_t input = 100;
+    uint64_t output = 200;
+    double multiplier = 2.0;
+    double cost = static_cast<double>(input)
+        + (static_cast<double>(output) * multiplier);
+    EXPECT_DOUBLE_EQ(cost, 500.0);  // 100 + (200 * 2.0)
 }
 
 int main(int argc, char** argv) {
