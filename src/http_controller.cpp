@@ -305,10 +305,10 @@ future<> HttpController::write_client_error(
     }
 }
 
-// Estimate request cost from content length and max_tokens fields.
-// Pure computation — no I/O, no futures, no retained references.
+// Estimate request cost from pre-extracted content length and max_tokens.
+// Pure computation — no I/O, no futures, no JSON parsing.
 HttpController::CostEstimate HttpController::estimate_request_cost(
-        std::string_view body_view, size_t content_chars) const {
+        size_t content_chars, uint64_t max_tokens_from_request) const {
     CostEstimate est;
 
     // Input: chars / 4 (rough chars-per-token approximation)
@@ -316,26 +316,7 @@ HttpController::CostEstimate HttpController::estimate_request_cost(
         static_cast<uint64_t>(content_chars / 4),
         _config.cost_estimation_max_tokens);
 
-    // Output: extract max_tokens / max_completion_tokens from request JSON
-    uint64_t max_tokens_from_request = 0;
-    {
-        rapidjson::Document doc;
-        doc.Parse(body_view.data(), body_view.size());
-        if (!doc.HasParseError() && doc.IsObject()) {
-            auto try_field = [&](const char* field) -> uint64_t {
-                if (!doc.HasMember(field)) return 0;
-                const auto& v = doc[field];
-                if (v.IsUint64()) return v.GetUint64();
-                if (v.IsInt() && v.GetInt() > 0) return static_cast<uint64_t>(v.GetInt());
-                return 0;
-            };
-            max_tokens_from_request = try_field("max_tokens");
-            if (max_tokens_from_request == 0) {
-                max_tokens_from_request = try_field("max_completion_tokens");
-            }
-        }
-    }
-
+    // Output: use request's max_tokens if present, otherwise input * multiplier
     if (max_tokens_from_request > 0) {
         est.output_tokens = std::min(max_tokens_from_request, _config.cost_estimation_max_tokens);
     } else {
@@ -1368,8 +1349,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
     // Cost estimation: derive cost signals before context init
     auto cost = _config.cost_estimation_enabled
-        ? estimate_request_cost(body_view,
-              text_extraction.has_value() ? text_extraction->text.size() : body_view.size())
+        ? estimate_request_cost(
+              text_extraction.has_value() ? text_extraction->text.size() : body_view.size(),
+              text_extraction.has_value() ? text_extraction->max_tokens : 0)
         : CostEstimate{};
 
     if (_config.cost_estimation_enabled) {

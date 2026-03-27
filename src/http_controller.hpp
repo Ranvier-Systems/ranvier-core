@@ -350,7 +350,7 @@ private:
         uint64_t output_tokens = 0;
         double cost_units = 0.0;
     };
-    CostEstimate estimate_request_cost(std::string_view body_view, size_t content_chars) const;
+    CostEstimate estimate_request_cost(size_t content_chars, uint64_t max_tokens_from_request) const;
 
     // Establish connection to backend with retry and fallback logic
     // Returns connected bundle or sets ctx->connection_failed on failure

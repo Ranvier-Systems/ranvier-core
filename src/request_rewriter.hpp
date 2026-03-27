@@ -345,11 +345,24 @@ RequestRewriter::extract_text_with_boundary_info(
         return std::nullopt;
     }
 
+    // Extract max_tokens / max_completion_tokens while the doc is in scope.
+    // Avoids a second JSON parse in cost estimation.
+    auto extract_max_tokens = [&doc]() -> uint64_t {
+        for (const char* field : {"max_tokens", "max_completion_tokens"}) {
+            if (!doc.HasMember(field)) continue;
+            const auto& v = doc[field];
+            if (v.IsUint64()) return v.GetUint64();
+            if (v.IsInt() && v.GetInt() > 0) return static_cast<uint64_t>(v.GetInt());
+        }
+        return 0;
+    };
+
     // Check for "prompt" field first (completion API style)
     if (doc.HasMember("prompt") && doc["prompt"].IsString()) {
         TextWithBoundaryInfo result;
         result.text = std::string(doc["prompt"].GetString(), doc["prompt"].GetStringLength());
         result.from_prompt = true;
+        result.max_tokens = extract_max_tokens();
         // No system message concept for prompt-style requests
         return result;
     }
@@ -476,6 +489,7 @@ RequestRewriter::extract_text_with_boundary_info(
         return std::nullopt;
     }
 
+    result.max_tokens = extract_max_tokens();
     return result;
 }
 
