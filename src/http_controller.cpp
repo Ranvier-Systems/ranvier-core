@@ -10,6 +10,7 @@
 #include "stream_parser.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <system_error>
 
@@ -329,6 +330,86 @@ HttpController::CostEstimate HttpController::estimate_request_cost(
         + (static_cast<double>(est.output_tokens) * _config.cost_estimation_output_multiplier);
 
     return est;
+}
+
+// Helper to parse a string to PriorityLevel (case-insensitive)
+static std::optional<PriorityLevel> parse_priority_string(std::string_view s) {
+    // Manual case-insensitive comparison for a small fixed set
+    if (s.size() < 3 || s.size() > 8) return std::nullopt;
+
+    // Convert to lowercase in a small stack buffer
+    char buf[9];
+    for (size_t i = 0; i < s.size(); ++i) {
+        buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+    }
+    std::string_view lower(buf, s.size());
+
+    if (lower == "critical") return PriorityLevel::CRITICAL;
+    if (lower == "high")     return PriorityLevel::HIGH;
+    if (lower == "normal")   return PriorityLevel::NORMAL;
+    if (lower == "low")      return PriorityLevel::LOW;
+    return std::nullopt;
+}
+
+// Helper to parse the default_priority config string to PriorityLevel
+static PriorityLevel default_priority_from_string(const std::string& s) {
+    auto p = parse_priority_string(s);
+    return p.value_or(PriorityLevel::NORMAL);
+}
+
+// Extract priority level from request using cascade:
+//   1. X-Ranvier-Priority header (if respect_header enabled)
+//   2. User-Agent match against known patterns
+//   3. Cost-based default from estimated_cost_units
+PriorityLevel HttpController::extract_priority(
+        const seastar::http::request& req,
+        double estimated_cost_units,
+        std::string_view body_view) const {
+
+    // Step 1: Explicit header
+    if (_config.priority_tier_respect_header) {
+        auto it = req._headers.find("X-Ranvier-Priority");
+        if (it != req._headers.end()) {
+            auto parsed = parse_priority_string(it->second);
+            if (parsed.has_value()) {
+                return *parsed;
+            }
+            // Rule #9: Log invalid header at warn level
+            log_proxy.warn("Invalid X-Ranvier-Priority header value '{}', falling through",
+                          it->second);
+        }
+    }
+
+    // Step 2: User-Agent match
+    auto ua_it = req._headers.find("User-Agent");
+    if (ua_it != req._headers.end()) {
+        const auto& ua = ua_it->second;
+        for (const auto& entry : _config.priority_tier_known_user_agents) {
+            if (ua.find(entry.pattern) != std::string::npos) {
+                auto matched_priority = static_cast<PriorityLevel>(entry.priority);
+                // Promote to CRITICAL if request has "stream": true
+                if (matched_priority != PriorityLevel::CRITICAL) {
+                    // Quick substring check for "stream":true in body
+                    // (avoids full JSON parse; sufficient for heuristic promotion)
+                    if (body_view.find("\"stream\":true") != std::string_view::npos ||
+                        body_view.find("\"stream\": true") != std::string_view::npos) {
+                        return PriorityLevel::CRITICAL;
+                    }
+                }
+                return matched_priority;
+            }
+        }
+    }
+
+    // Step 3: Cost-based default
+    if (estimated_cost_units > _config.priority_tier_cost_threshold_high) {
+        return PriorityLevel::HIGH;
+    }
+    if (estimated_cost_units < _config.priority_tier_cost_threshold_low) {
+        return PriorityLevel::LOW;
+    }
+
+    return default_priority_from_string(_config.priority_tier_default);
 }
 
 // Record final metrics and clean up after proxy request completes
@@ -1359,6 +1440,17 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                        request_id, cost.input_tokens, cost.output_tokens, cost.cost_units);
     }
 
+    // Priority tier extraction: classify request before routing
+    PriorityLevel priority = PriorityLevel::NORMAL;
+    if (_config.priority_tier_enabled) {
+        priority = extract_priority(*req, cost.cost_units, body_view);
+        log_proxy.debug("[{}] Priority tier: {}", request_id, priority_level_to_string(priority));
+        // Per-priority metrics: count and track active
+        auto tier = static_cast<uint8_t>(priority);
+        metrics().record_priority_request(tier);
+        metrics().increment_priority_active(tier);
+    }
+
     // Initialize ProxyContext with all state needed for streaming
     // This struct bundles request state to reduce lambda capture complexity
     // Using unique_ptr: ownership transfers from handle_proxy to the lambda (no sharing)
@@ -1385,6 +1477,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->estimated_input_tokens = cost.input_tokens;
     ctx->estimated_output_tokens = cost.output_tokens;
     ctx->estimated_cost_units = cost.cost_units;
+    ctx->priority = priority;
 
     // Move gate_holder, semaphore_units, and backend_guard into the lambda to keep them alive during streaming.
     // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
@@ -1399,6 +1492,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             log_proxy.error("[{}] Backend connection failed after retries", ctx->request_id);
             metrics().record_failure();
             metrics().decrement_active_requests();
+            metrics().decrement_priority_active(static_cast<uint8_t>(ctx->priority));
             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
@@ -1418,6 +1512,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 metrics().record_failure();
             }
             metrics().decrement_active_requests();
+            metrics().decrement_priority_active(static_cast<uint8_t>(ctx->priority));
             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
@@ -1443,6 +1538,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         if (streaming_exception) {
             metrics().record_failure();
             metrics().decrement_active_requests();
+            metrics().decrement_priority_active(static_cast<uint8_t>(ctx->priority));
             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
@@ -1537,6 +1633,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                         if (retry_exception) {
                             metrics().record_failure();
                             metrics().decrement_active_requests();
+                            metrics().decrement_priority_active(static_cast<uint8_t>(ctx->priority));
                             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                                 shard_load_metrics().decrement_active();
                             }
@@ -1608,6 +1705,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
         // Decrement active request counters
         metrics().decrement_active_requests();
+        metrics().decrement_priority_active(static_cast<uint8_t>(ctx->priority));
         if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
             shard_load_metrics().decrement_active();
             shard_load_metrics().record_request_completed();

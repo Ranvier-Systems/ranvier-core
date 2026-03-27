@@ -49,6 +49,12 @@ protected:
         unsetenv("RANVIER_COST_ESTIMATION_ENABLED");
         unsetenv("RANVIER_COST_ESTIMATION_OUTPUT_MULTIPLIER");
         unsetenv("RANVIER_COST_ESTIMATION_MAX_TOKENS");
+        // Priority tier env vars
+        unsetenv("RANVIER_PRIORITY_TIER_ENABLED");
+        unsetenv("RANVIER_PRIORITY_TIER_DEFAULT");
+        unsetenv("RANVIER_PRIORITY_TIER_COST_THRESHOLD_HIGH");
+        unsetenv("RANVIER_PRIORITY_TIER_COST_THRESHOLD_LOW");
+        unsetenv("RANVIER_PRIORITY_TIER_RESPECT_HEADER");
         // Gossip TLS env vars
         unsetenv("RANVIER_CLUSTER_TLS_ENABLED");
         unsetenv("RANVIER_CLUSTER_TLS_CERT_PATH");
@@ -1648,6 +1654,175 @@ TEST(CostEstimationFormulaTest, CostUnitsFormula) {
     double cost = static_cast<double>(input)
         + (static_cast<double>(output) * multiplier);
     EXPECT_DOUBLE_EQ(cost, 500.0);  // 100 + (200 * 2.0)
+}
+
+// =============================================================================
+// Priority Tier Config Tests
+// =============================================================================
+
+TEST_F(ConfigTest, PriorityTierDefaults) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.priority_tier.enabled);
+    EXPECT_EQ(config.priority_tier.default_priority, "normal");
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_high, 100.0);
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_low, 10.0);
+    EXPECT_TRUE(config.priority_tier.respect_header);
+    // Default known user agents
+    ASSERT_EQ(config.priority_tier.known_user_agents.size(), 4u);
+    EXPECT_EQ(config.priority_tier.known_user_agents[0].pattern, "Cursor");
+    EXPECT_EQ(config.priority_tier.known_user_agents[0].priority, 0u);  // CRITICAL
+    EXPECT_EQ(config.priority_tier.known_user_agents[1].pattern, "claude-code");
+    EXPECT_EQ(config.priority_tier.known_user_agents[1].priority, 0u);  // CRITICAL
+    EXPECT_EQ(config.priority_tier.known_user_agents[2].pattern, "cline");
+    EXPECT_EQ(config.priority_tier.known_user_agents[2].priority, 1u);  // HIGH
+    EXPECT_EQ(config.priority_tier.known_user_agents[3].pattern, "aider");
+    EXPECT_EQ(config.priority_tier.known_user_agents[3].priority, 1u);  // HIGH
+}
+
+TEST_F(ConfigTest, PriorityTierFromYaml) {
+    writeTestConfig("test_config.yaml", R"(
+priority_tier:
+  enabled: false
+  default_priority: "high"
+  cost_threshold_high: 200.0
+  cost_threshold_low: 5.0
+  respect_header: false
+  known_user_agents:
+    - pattern: "MyAgent"
+      priority: "critical"
+    - pattern: "BatchRunner"
+      priority: "low"
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_FALSE(config.priority_tier.enabled);
+    EXPECT_EQ(config.priority_tier.default_priority, "high");
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_high, 200.0);
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_low, 5.0);
+    EXPECT_FALSE(config.priority_tier.respect_header);
+    ASSERT_EQ(config.priority_tier.known_user_agents.size(), 2u);
+    EXPECT_EQ(config.priority_tier.known_user_agents[0].pattern, "MyAgent");
+    EXPECT_EQ(config.priority_tier.known_user_agents[0].priority, 0u);  // CRITICAL
+    EXPECT_EQ(config.priority_tier.known_user_agents[1].pattern, "BatchRunner");
+    EXPECT_EQ(config.priority_tier.known_user_agents[1].priority, 3u);  // LOW
+}
+
+TEST_F(ConfigTest, PriorityTierPartialYamlUsesDefaults) {
+    writeTestConfig("test_config.yaml", R"(
+priority_tier:
+  enabled: false
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_FALSE(config.priority_tier.enabled);
+    // Unset fields keep defaults
+    EXPECT_EQ(config.priority_tier.default_priority, "normal");
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_high, 100.0);
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_low, 10.0);
+    EXPECT_TRUE(config.priority_tier.respect_header);
+    // known_user_agents keeps defaults when not specified
+    EXPECT_EQ(config.priority_tier.known_user_agents.size(), 4u);
+}
+
+TEST_F(ConfigTest, PriorityTierEnvironmentVariables) {
+    setenv("RANVIER_PRIORITY_TIER_ENABLED", "false", 1);
+    setenv("RANVIER_PRIORITY_TIER_DEFAULT", "high", 1);
+    setenv("RANVIER_PRIORITY_TIER_COST_THRESHOLD_HIGH", "500.0", 1);
+    setenv("RANVIER_PRIORITY_TIER_COST_THRESHOLD_LOW", "2.5", 1);
+    setenv("RANVIER_PRIORITY_TIER_RESPECT_HEADER", "false", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.priority_tier.enabled);
+    EXPECT_EQ(config.priority_tier.default_priority, "high");
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_high, 500.0);
+    EXPECT_DOUBLE_EQ(config.priority_tier.cost_threshold_low, 2.5);
+    EXPECT_FALSE(config.priority_tier.respect_header);
+}
+
+TEST_F(ConfigTest, PriorityTierEnvOverridesYaml) {
+    writeTestConfig("test_config.yaml", R"(
+priority_tier:
+  enabled: true
+  default_priority: "low"
+)");
+    setenv("RANVIER_PRIORITY_TIER_ENABLED", "false", 1);
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_FALSE(config.priority_tier.enabled);
+    // YAML value retained for fields not overridden by env
+    EXPECT_EQ(config.priority_tier.default_priority, "low");
+}
+
+TEST_F(ConfigTest, PriorityTierValidationInvalidDefaultPriority) {
+    RanvierConfig config;
+    config.priority_tier.default_priority = "urgent";
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("default_priority"), std::string::npos);
+}
+
+TEST_F(ConfigTest, PriorityTierValidationNegativeThresholdHigh) {
+    RanvierConfig config;
+    config.priority_tier.cost_threshold_high = -1.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("cost_threshold_high"), std::string::npos);
+}
+
+TEST_F(ConfigTest, PriorityTierValidationNegativeThresholdLow) {
+    RanvierConfig config;
+    config.priority_tier.cost_threshold_low = -1.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("cost_threshold_low"), std::string::npos);
+}
+
+TEST_F(ConfigTest, PriorityTierValidationLowExceedsHigh) {
+    RanvierConfig config;
+    config.priority_tier.cost_threshold_low = 200.0;
+    config.priority_tier.cost_threshold_high = 100.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("cost_threshold_low"), std::string::npos);
+}
+
+TEST_F(ConfigTest, PriorityTierValidationPassesForDefaults) {
+    RanvierConfig config;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value());
+}
+
+TEST_F(ConfigTest, PriorityTierValidationSkippedWhenDisabled) {
+    RanvierConfig config;
+    config.priority_tier.enabled = false;
+    config.priority_tier.default_priority = "bogus";  // Would fail if validated
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value());
+}
+
+TEST_F(ConfigTest, PriorityTierMaxKnownUserAgents) {
+    EXPECT_EQ(PriorityTierConfig::MAX_KNOWN_USER_AGENTS, 64u);
+}
+
+TEST_F(ConfigTest, PriorityTierYamlUnknownPriorityDefaultsToNormal) {
+    writeTestConfig("test_config.yaml", R"(
+priority_tier:
+  known_user_agents:
+    - pattern: "TestAgent"
+      priority: "bogus_value"
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    ASSERT_EQ(config.priority_tier.known_user_agents.size(), 1u);
+    EXPECT_EQ(config.priority_tier.known_user_agents[0].priority, 2u);  // NORMAL
+}
+
+TEST_F(ConfigTest, PriorityTierYamlTruncatesOverMaxEntries) {
+    // Build YAML with 70 entries (exceeds MAX of 64)
+    std::string yaml = "priority_tier:\n  known_user_agents:\n";
+    for (int i = 0; i < 70; ++i) {
+        yaml += "    - pattern: \"Agent" + std::to_string(i) + "\"\n";
+        yaml += "      priority: \"normal\"\n";
+    }
+    writeTestConfig("test_config.yaml", yaml);
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_EQ(config.priority_tier.known_user_agents.size(),
+              PriorityTierConfig::MAX_KNOWN_USER_AGENTS);
 }
 
 int main(int argc, char** argv) {
