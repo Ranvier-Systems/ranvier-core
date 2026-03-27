@@ -201,6 +201,40 @@ struct CostEstimationConfig {
 };
 
 // =============================================================================
+// Priority Tier Configuration
+// =============================================================================
+
+// Forward declaration — PriorityLevel is defined in http_controller.hpp.
+// We use uint8_t here to avoid a circular include dependency; the config loader
+// maps string values ("critical"/"high"/"normal"/"low") to PriorityLevel.
+struct PriorityTierUserAgentEntry {
+    std::string pattern;            // Substring match against User-Agent header
+    uint8_t priority = 2;           // Maps to PriorityLevel (0=CRITICAL, 1=HIGH, 2=NORMAL, 3=LOW)
+};
+
+// Priority tier assignment configuration.
+// Assigns priority levels to incoming requests based on headers, user-agent,
+// and cost estimation. Used by Session C (Agent-Aware Scheduling) for
+// queue-jumping and fair scheduling.
+struct PriorityTierConfig {
+    bool enabled = true;                            // Enable priority tier assignment
+    std::string default_priority = "normal";        // Default priority ("critical"/"high"/"normal"/"low")
+    double cost_threshold_high = 100.0;             // estimated_cost_units above which → HIGH
+    double cost_threshold_low = 10.0;               // estimated_cost_units below which → LOW
+    bool respect_header = true;                     // Honor X-Ranvier-Priority header
+
+    // Known user-agent patterns with assigned priorities.
+    // First substring match wins. MAX 64 entries (Hard Rule #4).
+    static constexpr size_t MAX_KNOWN_USER_AGENTS = 64;
+    std::vector<PriorityTierUserAgentEntry> known_user_agents = {
+        {"Cursor",      0},   // CRITICAL
+        {"claude-code", 0},   // CRITICAL
+        {"cline",       1},   // HIGH
+        {"aider",       1},   // HIGH
+    };
+};
+
+// =============================================================================
 // Top-Level Configuration
 // =============================================================================
 
@@ -226,6 +260,7 @@ struct RanvierConfig {
     TelemetryConfig telemetry;
     LoadBalancingConfig load_balancing;
     CostEstimationConfig cost_estimation;
+    PriorityTierConfig priority_tier;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);

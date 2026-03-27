@@ -10,6 +10,7 @@
 
 #include "metrics_helpers.hpp"
 
+#include <array>
 #include <chrono>
 
 namespace ranvier {
@@ -165,6 +166,41 @@ public:
                     return static_cast<double>(_cache_hits) / static_cast<double>(total);
                 }),
 
+            // Per-priority request counters and active gauges
+            seastar::metrics::make_counter("proxy_requests_by_priority",
+                seastar::metrics::description("Total proxy requests by priority tier"),
+                {{"priority", "critical"}},
+                [this] { return _requests_by_priority[0]; }),
+            seastar::metrics::make_counter("proxy_requests_by_priority",
+                seastar::metrics::description("Total proxy requests by priority tier"),
+                {{"priority", "high"}},
+                [this] { return _requests_by_priority[1]; }),
+            seastar::metrics::make_counter("proxy_requests_by_priority",
+                seastar::metrics::description("Total proxy requests by priority tier"),
+                {{"priority", "normal"}},
+                [this] { return _requests_by_priority[2]; }),
+            seastar::metrics::make_counter("proxy_requests_by_priority",
+                seastar::metrics::description("Total proxy requests by priority tier"),
+                {{"priority", "low"}},
+                [this] { return _requests_by_priority[3]; }),
+
+            seastar::metrics::make_gauge("proxy_active_by_priority",
+                seastar::metrics::description("Active proxy requests by priority tier"),
+                {{"priority", "critical"}},
+                [this] { return _active_by_priority[0]; }),
+            seastar::metrics::make_gauge("proxy_active_by_priority",
+                seastar::metrics::description("Active proxy requests by priority tier"),
+                {{"priority", "high"}},
+                [this] { return _active_by_priority[1]; }),
+            seastar::metrics::make_gauge("proxy_active_by_priority",
+                seastar::metrics::description("Active proxy requests by priority tier"),
+                {{"priority", "normal"}},
+                [this] { return _active_by_priority[2]; }),
+            seastar::metrics::make_gauge("proxy_active_by_priority",
+                seastar::metrics::description("Active proxy requests by priority tier"),
+                {{"priority", "low"}},
+                [this] { return _active_by_priority[3]; }),
+
             // ================================================================
             // Radix Tree Path Compression Metric
             // Note: Lookup hit/miss counters, node counts, and slab utilization
@@ -262,6 +298,17 @@ public:
         _load_aware_fallbacks++;
     }
     uint64_t get_load_aware_fallbacks() const { return _load_aware_fallbacks; }
+
+    // Per-priority tier metrics (shard-local counters, no atomics)
+    void record_priority_request(uint8_t tier) {
+        if (tier < 4) _requests_by_priority[tier]++;
+    }
+    void increment_priority_active(uint8_t tier) {
+        if (tier < 4) _active_by_priority[tier]++;
+    }
+    void decrement_priority_active(uint8_t tier) {
+        if (tier < 4) _active_by_priority[tier]--;
+    }
 
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
@@ -383,6 +430,10 @@ private:
 
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
+
+    // Per-priority tier counters (shard-local, no atomics — Hard Rule #0/#1)
+    std::array<uint64_t, 4> _requests_by_priority = {0, 0, 0, 0};  // [CRITICAL, HIGH, NORMAL, LOW]
+    std::array<uint64_t, 4> _active_by_priority = {0, 0, 0, 0};    // Active gauge per tier
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance

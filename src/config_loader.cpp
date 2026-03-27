@@ -538,6 +538,23 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_COST_ESTIMATION_MAX_TOKENS")) {
         cost_estimation.max_estimated_tokens = *v;
     }
+
+    // Priority tier overrides
+    if (auto v = get_env("RANVIER_PRIORITY_TIER_ENABLED")) {
+        priority_tier.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_PRIORITY_TIER_DEFAULT")) {
+        priority_tier.default_priority = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_PRIORITY_TIER_COST_THRESHOLD_HIGH")) {
+        priority_tier.cost_threshold_high = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_PRIORITY_TIER_COST_THRESHOLD_LOW")) {
+        priority_tier.cost_threshold_low = *v;
+    }
+    if (auto v = get_env("RANVIER_PRIORITY_TIER_RESPECT_HEADER")) {
+        priority_tier.respect_header = (*v == "1" || *v == "true" || *v == "yes");
+    }
 }
 
 // =============================================================================
@@ -1057,6 +1074,47 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.cost_estimation.max_estimated_tokens = ce["max_estimated_tokens"].as<uint64_t>();
             }
         }
+
+        // Priority tier section
+        if (yaml["priority_tier"]) {
+            YAML::Node pt = yaml["priority_tier"];
+            if (pt["enabled"]) config.priority_tier.enabled = pt["enabled"].as<bool>();
+            if (pt["default_priority"]) config.priority_tier.default_priority = pt["default_priority"].as<std::string>();
+            if (pt["cost_threshold_high"]) config.priority_tier.cost_threshold_high = pt["cost_threshold_high"].as<double>();
+            if (pt["cost_threshold_low"]) config.priority_tier.cost_threshold_low = pt["cost_threshold_low"].as<double>();
+            if (pt["respect_header"]) config.priority_tier.respect_header = pt["respect_header"].as<bool>();
+            if (pt["known_user_agents"]) {
+                YAML::Node agents = pt["known_user_agents"];
+                if (agents.IsSequence()) {
+                    config.priority_tier.known_user_agents.clear();
+                    size_t count = 0;
+                    for (const auto& entry : agents) {
+                        if (count >= PriorityTierConfig::MAX_KNOWN_USER_AGENTS) {
+                            std::cerr << "[WARN] priority_tier.known_user_agents has more than "
+                                      << PriorityTierConfig::MAX_KNOWN_USER_AGENTS
+                                      << " entries, truncating (Rule #4)\n";
+                            break;
+                        }
+                        PriorityTierUserAgentEntry ua;
+                        if (entry["pattern"]) ua.pattern = entry["pattern"].as<std::string>();
+                        if (entry["priority"]) {
+                            std::string p = entry["priority"].as<std::string>();
+                            if (p == "critical")      ua.priority = 0;
+                            else if (p == "high")     ua.priority = 1;
+                            else if (p == "normal")   ua.priority = 2;
+                            else if (p == "low")      ua.priority = 3;
+                            else {
+                                std::cerr << "[WARN] Unknown priority '" << p
+                                          << "' in known_user_agents, defaulting to normal\n";
+                                ua.priority = 2;
+                            }
+                        }
+                        config.priority_tier.known_user_agents.push_back(std::move(ua));
+                        ++count;
+                    }
+                }
+            }
+        }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -1281,6 +1339,26 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.cost_estimation.max_estimated_tokens == 0) {
         return "cost_estimation.max_estimated_tokens must be positive";
+    }
+
+    // Validate priority tier settings
+    if (config.priority_tier.enabled) {
+        const auto& dp = config.priority_tier.default_priority;
+        if (dp != "critical" && dp != "high" && dp != "normal" && dp != "low") {
+            return "priority_tier.default_priority must be one of: critical, high, normal, low";
+        }
+        if (config.priority_tier.cost_threshold_high < 0.0) {
+            return "priority_tier.cost_threshold_high must be non-negative";
+        }
+        if (config.priority_tier.cost_threshold_low < 0.0) {
+            return "priority_tier.cost_threshold_low must be non-negative";
+        }
+        if (config.priority_tier.cost_threshold_low > config.priority_tier.cost_threshold_high) {
+            return "priority_tier.cost_threshold_low must not exceed cost_threshold_high";
+        }
+        if (config.priority_tier.known_user_agents.size() > PriorityTierConfig::MAX_KNOWN_USER_AGENTS) {
+            return "priority_tier.known_user_agents exceeds maximum of 64 entries (Rule #4)";
+        }
     }
 
     return std::nullopt;  // Valid

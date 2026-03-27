@@ -14,6 +14,7 @@
 #include "shard_load_metrics.hpp"
 #include "tokenizer_service.hpp"
 
+#include <array>
 #include <functional>
 #include <limits>
 
@@ -25,6 +26,26 @@
 #include <seastar/http/reply.hh>
 
 namespace ranvier {
+
+// Priority level for request classification (used by priority-aware scheduling)
+// Lower numeric value = higher priority
+enum class PriorityLevel : uint8_t {
+    CRITICAL = 0,   // Interactive typing, must not block
+    HIGH     = 1,   // Primary agent task
+    NORMAL   = 2,   // Background processing (default)
+    LOW      = 3,   // Batch jobs, can wait
+};
+
+// Convert PriorityLevel to string label for metrics and logging
+inline const char* priority_level_to_string(PriorityLevel level) {
+    switch (level) {
+        case PriorityLevel::CRITICAL: return "critical";
+        case PriorityLevel::HIGH:     return "high";
+        case PriorityLevel::NORMAL:   return "normal";
+        case PriorityLevel::LOW:      return "low";
+    }
+    return "normal";  // unreachable, but satisfies -Wreturn-type
+}
 
 // Retry configuration
 struct RetrySettings {
@@ -49,6 +70,10 @@ struct BackpressureSettings {
     bool enable_persistence_backpressure = true;      // Throttle writes when persistence queue is full
     double persistence_queue_threshold = 0.8;         // Start throttling at 80% of max_queue_depth
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
+
+    // Priority queue placeholders — reserved for Session C (Agent-Aware Scheduling)
+    bool enable_priority_queue = false;               // Reserved for Session C
+    std::array<uint32_t, 4> tier_capacity = {0, 0, 0, 0};  // 0 = unlimited, per Session C
 };
 
 // Shard load balancing settings
@@ -118,6 +143,9 @@ struct ProxyContext {
     uint64_t estimated_input_tokens = 0;   // Heuristic: content chars / 4
     uint64_t estimated_output_tokens = 0;  // max_tokens from request, or input * output_multiplier
     double estimated_cost_units = 0.0;     // input + (output * output_multiplier)
+
+    // Priority tier (populated by extract_priority before routing)
+    PriorityLevel priority = PriorityLevel::NORMAL;
 };
 
 // HTTP controller configuration
@@ -151,6 +179,19 @@ struct HttpControllerConfig {
     bool cost_estimation_enabled = true;               // Enable cost estimation
     double cost_estimation_output_multiplier = 2.0;    // Default output token multiplier
     uint64_t cost_estimation_max_tokens = 1000000;     // Sanity cap on estimated tokens
+
+    // Priority tier settings (copied from PriorityTierConfig at init)
+    bool priority_tier_enabled = true;
+    std::string priority_tier_default = "normal";
+    double priority_tier_cost_threshold_high = 100.0;
+    double priority_tier_cost_threshold_low = 10.0;
+    bool priority_tier_respect_header = true;
+    std::vector<PriorityTierUserAgentEntry> priority_tier_known_user_agents = {
+        {"Cursor",      0},   // CRITICAL
+        {"claude-code", 0},   // CRITICAL
+        {"cline",       1},   // HIGH
+        {"aider",       1},   // HIGH
+    };
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
@@ -342,6 +383,13 @@ private:
 
     // Proxy request helper methods - break down handle_proxy into manageable pieces
     // These are called from within the streaming lambda to handle different phases
+
+    // Extract priority level from request headers, user-agent, and cost estimation.
+    // Pure computation — no I/O, no futures.
+    // Cascade: X-Ranvier-Priority header → User-Agent match → cost-based default.
+    PriorityLevel extract_priority(const seastar::http::request& req,
+                                   double estimated_cost_units,
+                                   std::string_view body_view) const;
 
     // Estimate request cost from body content and max_tokens fields.
     // Pure computation — no I/O, no futures, no JSON ownership retained.
