@@ -527,6 +527,17 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_TELEMETRY_MAX_EXPORT_BATCH_SIZE")) {
         telemetry.max_export_batch_size = *v;
     }
+
+    // Cost estimation overrides
+    if (auto v = get_env("RANVIER_COST_ESTIMATION_ENABLED")) {
+        cost_estimation.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<double>("RANVIER_COST_ESTIMATION_OUTPUT_MULTIPLIER")) {
+        cost_estimation.default_output_multiplier = *v;
+    }
+    if (auto v = get_env_as<uint64_t>("RANVIER_COST_ESTIMATION_MAX_TOKENS")) {
+        cost_estimation.max_estimated_tokens = *v;
+    }
 }
 
 // =============================================================================
@@ -1035,6 +1046,17 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 config.telemetry.max_export_batch_size = t["max_export_batch_size"].as<size_t>();
             }
         }
+        // Cost estimation section
+        if (yaml["cost_estimation"]) {
+            YAML::Node ce = yaml["cost_estimation"];
+            if (ce["enabled"]) config.cost_estimation.enabled = ce["enabled"].as<bool>();
+            if (ce["default_output_multiplier"]) {
+                config.cost_estimation.default_output_multiplier = ce["default_output_multiplier"].as<double>();
+            }
+            if (ce["max_estimated_tokens"]) {
+                config.cost_estimation.max_estimated_tokens = ce["max_estimated_tokens"].as<uint64_t>();
+            }
+        }
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -1251,6 +1273,14 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         if (config.telemetry.max_export_batch_size == 0) {
             return "telemetry.max_export_batch_size must be positive";
         }
+    }
+
+    // Validate cost estimation settings
+    if (config.cost_estimation.default_output_multiplier < 0.0) {
+        return "cost_estimation.default_output_multiplier must be non-negative";
+    }
+    if (config.cost_estimation.max_estimated_tokens == 0) {
+        return "cost_estimation.max_estimated_tokens must be positive";
     }
 
     return std::nullopt;  // Valid

@@ -113,6 +113,11 @@ struct ProxyContext {
     size_t bytes_written_to_client = 0;   // Total bytes written to client output stream
     uint32_t chunks_received = 0;         // Chunks received from backend
     uint32_t stale_retry_attempt = 0;     // Number of stale connection retries attempted
+
+    // Cost estimation (populated before routing)
+    uint64_t estimated_input_tokens = 0;   // Heuristic: content chars / 4
+    uint64_t estimated_output_tokens = 0;  // max_tokens from request, or input * output_multiplier
+    double estimated_cost_units = 0.0;     // input + (output * output_multiplier)
 };
 
 // HTTP controller configuration
@@ -141,6 +146,11 @@ struct HttpControllerConfig {
     uint32_t max_stale_retries = 1;              // Max retries for empty backend responses on stale pooled connections (0 = disabled)
     size_t max_request_body_bytes = 10 * 1024 * 1024;  // Max request body size for proxy endpoints (default: 10MB, 0 = unlimited)
     uint32_t dns_resolution_timeout_seconds = 5;        // Timeout for DNS resolution in backend registration (seconds)
+
+    // Cost estimation settings
+    bool cost_estimation_enabled = true;               // Enable cost estimation
+    double cost_estimation_output_multiplier = 2.0;    // Default output token multiplier
+    uint64_t cost_estimation_max_tokens = 1000000;     // Sanity cap on estimated tokens
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
@@ -332,6 +342,15 @@ private:
 
     // Proxy request helper methods - break down handle_proxy into manageable pieces
     // These are called from within the streaming lambda to handle different phases
+
+    // Estimate request cost from body content and max_tokens fields.
+    // Pure computation — no I/O, no futures, no JSON ownership retained.
+    struct CostEstimate {
+        uint64_t input_tokens = 0;
+        uint64_t output_tokens = 0;
+        double cost_units = 0.0;
+    };
+    CostEstimate estimate_request_cost(size_t content_chars, uint64_t max_tokens_from_request) const;
 
     // Establish connection to backend with retry and fallback logic
     // Returns connected bundle or sets ctx->connection_failed on failure

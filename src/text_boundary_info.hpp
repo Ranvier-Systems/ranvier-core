@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,10 @@ struct TextWithBoundaryInfo {
         bool is_system;
     };
     std::vector<FormattedMessage> formatted_messages;
+
+    // max_tokens (or max_completion_tokens) extracted from the request body
+    // during the same JSON parse.  Zero if the field was absent or non-numeric.
+    uint64_t max_tokens = 0;
 };
 
 } // namespace ranvier

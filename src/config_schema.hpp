@@ -188,6 +188,19 @@ struct AssetsConfig {
 };
 
 // =============================================================================
+// Cost Estimation Configuration
+// =============================================================================
+
+// Cost estimation for priority tier assignment.
+// Provides cost signals from request metadata (token estimates) that
+// downstream priority tiers use for default priority assignment.
+struct CostEstimationConfig {
+    bool enabled = true;                        // Enable cost estimation on proxy requests
+    double default_output_multiplier = 2.0;     // Multiplier for estimated output tokens when max_tokens absent
+    uint64_t max_estimated_tokens = 1000000;    // Sanity cap on estimated tokens (Rule #4: bounded)
+};
+
+// =============================================================================
 // Top-Level Configuration
 // =============================================================================
 
@@ -212,6 +225,7 @@ struct RanvierConfig {
     K8sDiscoveryConfig k8s_discovery;
     TelemetryConfig telemetry;
     LoadBalancingConfig load_balancing;
+    CostEstimationConfig cost_estimation;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);

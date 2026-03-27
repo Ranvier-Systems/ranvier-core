@@ -1380,3 +1380,84 @@ TEST_F(RequestRewriterTest, BoundaryInfoUnicodeContent) {
     std::string prefix = result->text.substr(0, result->system_prefix_end);
     EXPECT_EQ(prefix, result->system_text);
 }
+
+// =============================================================================
+// max_tokens extraction via extract_text_with_boundary_info
+// =============================================================================
+
+TEST_F(RequestRewriterTest, BoundaryInfoExtractsMaxTokensFromPrompt) {
+    std::string body = R"({"prompt": "Hello", "max_tokens": 512})";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 512u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoExtractsMaxTokensFromMessages) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1024
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 1024u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoExtractsMaxCompletionTokens) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_completion_tokens": 2048
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 2048u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoPrefersMaxTokensOverMaxCompletionTokens) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 100,
+        "max_completion_tokens": 200
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 100u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoMaxTokensZeroWhenAbsent) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}]
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 0u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoMaxTokensIgnoresNegativeValues) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": -1
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 0u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoMaxTokensIgnoresStringValues) {
+    std::string body = R"({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": "not_a_number"
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 0u);
+}
+
+TEST_F(RequestRewriterTest, BoundaryInfoMaxTokensLargeValue) {
+    std::string body = R"({
+        "prompt": "Hello",
+        "max_tokens": 4294967296
+    })";
+    auto result = RequestRewriter::extract_text_with_boundary_info(body);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->max_tokens, 4294967296u);
+}

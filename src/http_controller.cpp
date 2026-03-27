@@ -305,6 +305,32 @@ future<> HttpController::write_client_error(
     }
 }
 
+// Estimate request cost from pre-extracted content length and max_tokens.
+// Pure computation — no I/O, no futures, no JSON parsing.
+HttpController::CostEstimate HttpController::estimate_request_cost(
+        size_t content_chars, uint64_t max_tokens_from_request) const {
+    CostEstimate est;
+
+    // Input: chars / 4 (rough chars-per-token approximation)
+    est.input_tokens = std::min(
+        static_cast<uint64_t>(content_chars / 4),
+        _config.cost_estimation_max_tokens);
+
+    // Output: use request's max_tokens if present, otherwise input * multiplier
+    if (max_tokens_from_request > 0) {
+        est.output_tokens = std::min(max_tokens_from_request, _config.cost_estimation_max_tokens);
+    } else {
+        est.output_tokens = std::min(
+            static_cast<uint64_t>(est.input_tokens * _config.cost_estimation_output_multiplier),
+            _config.cost_estimation_max_tokens);
+    }
+
+    est.cost_units = static_cast<double>(est.input_tokens)
+        + (static_cast<double>(est.output_tokens) * _config.cost_estimation_output_multiplier);
+
+    return est;
+}
+
 // Record final metrics and clean up after proxy request completes
 void HttpController::record_proxy_completion_metrics(
     const ProxyContext& ctx,
@@ -1321,6 +1347,18 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
+    // Cost estimation: derive cost signals before context init
+    auto cost = _config.cost_estimation_enabled
+        ? estimate_request_cost(
+              text_extraction.has_value() ? text_extraction->text.size() : body_view.size(),
+              text_extraction.has_value() ? text_extraction->max_tokens : 0)
+        : CostEstimate{};
+
+    if (_config.cost_estimation_enabled) {
+        log_proxy.debug("[{}] Cost estimation: input={}, output={}, cost_units={:.1f}",
+                       request_id, cost.input_tokens, cost.output_tokens, cost.cost_units);
+    }
+
     // Initialize ProxyContext with all state needed for streaming
     // This struct bundles request state to reduce lambda capture complexity
     // Using unique_ptr: ownership transfers from handle_proxy to the lambda (no sharing)
@@ -1344,6 +1382,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->fallback_enabled = fallback_enabled;
     ctx->shard_metrics_active = shard_metrics_active;
     ctx->request_deadline = lowres_clock::now() + request_timeout;
+    ctx->estimated_input_tokens = cost.input_tokens;
+    ctx->estimated_output_tokens = cost.output_tokens;
+    ctx->estimated_cost_units = cost.cost_units;
 
     // Move gate_holder, semaphore_units, and backend_guard into the lambda to keep them alive during streaming.
     // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
