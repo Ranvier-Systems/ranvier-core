@@ -15,9 +15,14 @@
 #include "tokenizer_service.hpp"
 
 #include <array>
+#include <chrono>
+#include <deque>
 #include <functional>
 #include <limits>
 
+#include <absl/container/flat_hash_map.h>
+
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
@@ -71,9 +76,9 @@ struct BackpressureSettings {
     double persistence_queue_threshold = 0.8;         // Start throttling at 80% of max_queue_depth
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
 
-    // Priority queue placeholders — reserved for Session C (Agent-Aware Scheduling)
-    bool enable_priority_queue = false;               // Reserved for Session C
-    std::array<uint32_t, 4> tier_capacity = {0, 0, 0, 0};  // 0 = unlimited, per Session C
+    // Priority queue scheduling (Session C: Agent-Aware Scheduling)
+    bool enable_priority_queue = false;               // Gate: use priority-aware scheduling
+    std::array<uint32_t, 4> tier_capacity = {64, 128, 256, 512};  // Per-tier capacity [CRITICAL, HIGH, NORMAL, LOW]
 };
 
 // Shard load balancing settings
@@ -146,6 +151,163 @@ struct ProxyContext {
 
     // Priority tier (populated by extract_priority before routing)
     PriorityLevel priority = PriorityLevel::NORMAL;
+
+    // Agent identification for fair scheduling (User-Agent header value)
+    std::string user_agent;
+
+    // Queue timing (set by RequestScheduler::enqueue)
+    std::chrono::steady_clock::time_point enqueue_time;
+
+    // Promise fulfilled by process_priority_queue() when this request is dequeued
+    // and a semaphore unit has been acquired. The handle_proxy coroutine awaits
+    // the corresponding future before proceeding with the streaming lambda.
+    seastar::promise<seastar::semaphore_units<>> dequeue_promise;
+};
+
+// =============================================================================
+// Request Scheduler — Priority-aware request queueing (Session C)
+// =============================================================================
+//
+// Shard-local class (one per core, no cross-shard state).
+// Enqueues ProxyContext by priority tier and dequeues with fair scheduling
+// across user-agents. CRITICAL tier always wins; within lower tiers, the
+// agent whose last_served timestamp is oldest gets served first.
+
+class RequestScheduler {
+public:
+    explicit RequestScheduler(const BackpressureSettings& settings) {
+        for (size_t i = 0; i < 4; ++i) {
+            _tier_capacity[i] = settings.tier_capacity[i] > 0
+                ? settings.tier_capacity[i] : DEFAULT_TIER_CAPACITY;
+        }
+    }
+
+    // Returns true if enqueued, false if queue full (caller returns 503).
+    // Caller must signal the condition variable after a successful enqueue.
+    bool enqueue(std::unique_ptr<ProxyContext> ctx) {
+        auto tier = static_cast<uint8_t>(ctx->priority);
+        if (tier >= 4) tier = 2;  // Fallback to NORMAL
+
+        if (_queues[tier].size() >= _tier_capacity[tier]) {
+            ++_overflow_drops[tier];
+            return false;
+        }
+        ctx->enqueue_time = std::chrono::steady_clock::now();
+        _queues[tier].push_back(std::move(ctx));
+        ++_total_enqueued;
+        return true;
+    }
+
+    // Dequeue highest-priority waiting request (fair within tier).
+    // CRITICAL always wins. Within each tier, picks the agent whose
+    // last_served timestamp is oldest (fair scheduling).
+    std::optional<std::unique_ptr<ProxyContext>> dequeue() {
+        // CRITICAL always wins — pop front immediately
+        if (!_queues[0].empty()) {
+            auto ctx = std::move(_queues[0].front());
+            _queues[0].pop_front();
+            update_agent_served(ctx.get());
+            ++_total_dequeued;
+            return ctx;
+        }
+
+        // Iterate HIGH → NORMAL → LOW
+        for (size_t tier = 1; tier < 4; ++tier) {
+            if (_queues[tier].empty()) continue;
+
+            // Find the request whose agent has the oldest last_served time
+            size_t best_idx = 0;
+            auto best_time = std::chrono::steady_clock::time_point::max();
+
+            for (size_t i = 0; i < _queues[tier].size(); ++i) {
+                auto agent = get_agent_key(_queues[tier][i].get());
+                auto it = _agent_last_served.find(agent);
+                auto served_time = (it != _agent_last_served.end())
+                    ? it->second : std::chrono::steady_clock::time_point::min();
+                if (served_time < best_time) {
+                    best_time = served_time;
+                    best_idx = i;
+                }
+            }
+
+            // Swap the winner to front and pop
+            if (best_idx != 0) {
+                std::swap(_queues[tier][0], _queues[tier][best_idx]);
+            }
+            auto ctx = std::move(_queues[tier].front());
+            _queues[tier].pop_front();
+            update_agent_served(ctx.get());
+            ++_total_dequeued;
+            return ctx;
+        }
+
+        return std::nullopt;
+    }
+
+    // Per-tier queue depth for metrics
+    std::array<size_t, 4> queue_depths() const {
+        return {_queues[0].size(), _queues[1].size(),
+                _queues[2].size(), _queues[3].size()};
+    }
+
+    // Total enqueued across all tiers
+    size_t total_queued() const {
+        return _queues[0].size() + _queues[1].size() +
+               _queues[2].size() + _queues[3].size();
+    }
+
+    // Lifetime counters
+    uint64_t total_enqueued_count() const { return _total_enqueued; }
+    uint64_t total_dequeued_count() const { return _total_dequeued; }
+    const std::array<uint64_t, 4>& overflow_drops() const { return _overflow_drops; }
+    size_t agents_tracked() const { return _agent_last_served.size(); }
+
+    seastar::future<> stop() { co_return; }
+
+private:
+    static constexpr uint32_t DEFAULT_TIER_CAPACITY = 512;
+    static constexpr size_t MAX_AGENT_TRACKING = 256;
+
+    // One bounded deque per priority tier (Rule #4: explicit MAX_SIZE + overflow counter)
+    std::array<std::deque<std::unique_ptr<ProxyContext>>, 4> _queues;
+    std::array<uint32_t, 4> _tier_capacity{};
+    std::array<uint64_t, 4> _overflow_drops{};
+
+    // Lifetime counters
+    uint64_t _total_enqueued{0};
+    uint64_t _total_dequeued{0};
+
+    // Fair scheduling: tracks last-served time per agent string
+    // MAX_SIZE = 256 entries, LRU eviction (Hard Rule #4)
+    absl::flat_hash_map<std::string, std::chrono::steady_clock::time_point> _agent_last_served;
+
+    // Extract agent key from context (User-Agent or request_id prefix as fallback)
+    static std::string get_agent_key(const ProxyContext* ctx) {
+        if (!ctx->user_agent.empty()) {
+            return ctx->user_agent;
+        }
+        return "unknown";
+    }
+
+    // Update last_served timestamp for the agent, with LRU eviction
+    void update_agent_served(const ProxyContext* ctx) {
+        auto key = get_agent_key(ctx);
+        auto now = std::chrono::steady_clock::now();
+        _agent_last_served[key] = now;
+
+        // LRU eviction: if over limit, remove the oldest entry
+        if (_agent_last_served.size() > MAX_AGENT_TRACKING) {
+            auto oldest_it = _agent_last_served.begin();
+            auto oldest_time = oldest_it->second;
+            for (auto it = _agent_last_served.begin(); it != _agent_last_served.end(); ++it) {
+                if (it->second < oldest_time) {
+                    oldest_time = it->second;
+                    oldest_it = it;
+                }
+            }
+            _agent_last_served.erase(oldest_it);
+        }
+    }
 };
 
 // HTTP controller configuration
@@ -216,7 +378,8 @@ public:
           _persistence(nullptr),
           _load_balancer(nullptr),
           // Backpressure: 0 means unlimited (use max size_t as semaphore limit)
-          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)) {
+          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)),
+          _scheduler(config.backpressure) {
         // Initialize load balancer configuration
         _lb_config.enabled = config.load_balancing.enabled;
         _lb_config.min_load_difference = config.load_balancing.min_load_difference;
@@ -325,6 +488,12 @@ private:
     // Uses try_get_units() for immediate rejection (no queueing)
     seastar::semaphore _request_semaphore;
 
+    // Priority-aware request scheduler (Session C)
+    RequestScheduler _scheduler;
+    seastar::condition_variable _queue_cv;  // Signaled by enqueue(), waited by process_priority_queue()
+    seastar::gate _queue_gate;              // Gate for background dequeue fiber (Rule #5)
+    seastar::metrics::metric_groups _scheduler_metrics;  // Deregistered in stop() (Rule #6)
+
     // Backpressure metrics (shard-local — no cross-shard access)
     uint64_t _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
     uint64_t _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
@@ -368,6 +537,16 @@ private:
 
     // Health check handler (public, no auth required)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_health(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Scheduler stats handler (admin, auth required)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_scheduler_stats(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Background dequeue loop for priority queue (gate-guarded, Rule #5)
+    seastar::future<> process_priority_queue();
+
+    // Dispatch a dequeued request through the normal proxy pipeline
+    // Fire-and-forget with gate guard (Rule #18: no discarded futures)
+    seastar::future<> dispatch_proxied_request(std::unique_ptr<ProxyContext> ctx, seastar::semaphore_units<> units);
 
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;

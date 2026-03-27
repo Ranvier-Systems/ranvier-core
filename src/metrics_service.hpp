@@ -208,6 +208,11 @@ public:
             // are accessible. This gauge aggregates path compression efficiency.
             // ================================================================
 
+            // Scheduler wait time: time requests spend queued in priority scheduler
+            seastar::metrics::make_histogram("scheduler_wait_seconds",
+                seastar::metrics::description("Time requests spend in priority queue before dequeue (seconds)"),
+                [this] { return _scheduler_wait_latency.data; }),
+
             // Average prefix skip length: measures path compression effectiveness
             // Higher values indicate more efficient tree structure (fewer nodes traversed per lookup)
             // This is the running average of tokens skipped via path compression during lookups
@@ -308,6 +313,11 @@ public:
     }
     void decrement_priority_active(uint8_t tier) {
         if (tier < 4) _active_by_priority[tier]--;
+    }
+
+    // Scheduler wait time histogram (time between enqueue and dequeue)
+    void record_scheduler_wait(double seconds) {
+        _scheduler_wait_latency.record(seconds);
     }
 
     // Get overflow count for backend metrics limit (for monitoring)
@@ -468,6 +478,9 @@ private:
     MetricHistogram _art_lookup_latency{routing_latency_buckets()};
     MetricHistogram _router_backend_latency{backend_latency_buckets()};
     MetricHistogram _router_total_latency{total_request_latency_buckets()};
+
+    // Scheduler wait time histogram (enqueue → dequeue latency)
+    MetricHistogram _scheduler_wait_latency{latency_buckets()};
 
     // Per-backend metrics for GPU model comparison
     std::unordered_map<BackendId, BackendMetrics> _per_backend_metrics;

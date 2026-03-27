@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -286,6 +287,10 @@ struct BackpressureConfig {
 
     // Response configuration
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
+
+    // Priority queue scheduling (Session C: Agent-Aware Scheduling)
+    bool enable_priority_queue = false;               // Gate: use priority-aware scheduling instead of direct semaphore
+    std::array<uint32_t, 4> tier_capacity = {64, 128, 256, 512};  // Per-tier queue capacity [CRITICAL, HIGH, NORMAL, LOW]
 };
 
 // =============================================================================
