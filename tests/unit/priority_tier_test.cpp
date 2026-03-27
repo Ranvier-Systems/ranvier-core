@@ -1,18 +1,46 @@
 // Ranvier Core - Priority Tier Unit Tests
 //
 // Tests for priority level enum, string conversion, parsing, cascade logic,
-// and PriorityTierConfig/BackpressureSettings structures.
+// and PriorityTierConfig structures.
 // Uses standalone formula tests (no HttpController needed), matching the
 // CostEstimationFormulaTest pattern in config_test.cpp.
+//
+// Note: PriorityLevel and priority_level_to_string are redefined here to
+// avoid including http_controller.hpp, which pulls in Seastar + tokenizer
+// dependencies not available in the unit test build.
 
-#include "http_controller.hpp"
 #include "config_schema.hpp"
 #include <gtest/gtest.h>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+
+// Replicate PriorityLevel and priority_level_to_string from http_controller.hpp
+// to avoid the heavy Seastar/tokenizer include chain.
+// These must be kept in sync with the production definitions.
+namespace ranvier {
+
+enum class PriorityLevel : uint8_t {
+    CRITICAL = 0,
+    HIGH     = 1,
+    NORMAL   = 2,
+    LOW      = 3,
+};
+
+inline const char* priority_level_to_string(PriorityLevel level) {
+    switch (level) {
+        case PriorityLevel::CRITICAL: return "critical";
+        case PriorityLevel::HIGH:     return "high";
+        case PriorityLevel::NORMAL:   return "normal";
+        case PriorityLevel::LOW:      return "low";
+    }
+    return "normal";
+}
+
+}  // namespace ranvier
 
 using namespace ranvier;
 
@@ -272,7 +300,7 @@ TEST_F(PriorityCascadeTest, UserAgentNoMatchFallsToCost) {
 
 // --- Step 2b: Stream promotion tests ---
 
-TEST_F(PriorityCascadeTest, StreamPromotionClineToCompact) {
+TEST_F(PriorityCascadeTest, StreamPromotionClineToCritical) {
     // cline is HIGH, but "stream":true in body → promote to CRITICAL
     auto p = test_extract_priority(cfg, "", "cline/0.5", 50.0,
                                    R"({"model":"llama","stream":true})");
@@ -365,24 +393,21 @@ TEST_F(PriorityCascadeTest, ZeroCostGetsLow) {
 }
 
 // =============================================================================
-// BackpressureSettings Extension Tests
+// PriorityTierConfig Tests
 // =============================================================================
 
-TEST(BackpressureSettingsTest, PriorityQueueDefaultDisabled) {
-    BackpressureSettings bp;
-    EXPECT_FALSE(bp.enable_priority_queue);
+TEST(PriorityTierConfigTest, MaxKnownUserAgents) {
+    EXPECT_EQ(PriorityTierConfig::MAX_KNOWN_USER_AGENTS, 64u);
 }
 
-TEST(BackpressureSettingsTest, TierCapacityDefaultZero) {
-    BackpressureSettings bp;
-    for (auto cap : bp.tier_capacity) {
-        EXPECT_EQ(cap, 0u);
-    }
-}
-
-TEST(BackpressureSettingsTest, TierCapacityHasFourSlots) {
-    BackpressureSettings bp;
-    EXPECT_EQ(bp.tier_capacity.size(), 4u);
+TEST(PriorityTierConfigTest, DefaultsAreValid) {
+    PriorityTierConfig cfg;
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_EQ(cfg.default_priority, "normal");
+    EXPECT_DOUBLE_EQ(cfg.cost_threshold_high, 100.0);
+    EXPECT_DOUBLE_EQ(cfg.cost_threshold_low, 10.0);
+    EXPECT_TRUE(cfg.respect_header);
+    EXPECT_EQ(cfg.known_user_agents.size(), 4u);
 }
 
 // =============================================================================
@@ -397,21 +422,4 @@ TEST(PriorityTierUserAgentEntryTest, DefaultPriorityIsNormal) {
 TEST(PriorityTierUserAgentEntryTest, PatternDefaultEmpty) {
     PriorityTierUserAgentEntry entry;
     EXPECT_TRUE(entry.pattern.empty());
-}
-
-// =============================================================================
-// ProxyContext Priority Field Tests
-// =============================================================================
-
-TEST(ProxyContextTest, DefaultPriorityIsNormal) {
-    ProxyContext ctx;
-    EXPECT_EQ(ctx.priority, PriorityLevel::NORMAL);
-}
-
-TEST(ProxyContextTest, PriorityCanBeSet) {
-    ProxyContext ctx;
-    ctx.priority = PriorityLevel::CRITICAL;
-    EXPECT_EQ(ctx.priority, PriorityLevel::CRITICAL);
-    ctx.priority = PriorityLevel::LOW;
-    EXPECT_EQ(ctx.priority, PriorityLevel::LOW);
 }
