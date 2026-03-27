@@ -343,6 +343,15 @@ private:
     // Proxy request helper methods - break down handle_proxy into manageable pieces
     // These are called from within the streaming lambda to handle different phases
 
+    // Estimate request cost from body content and max_tokens fields.
+    // Pure computation — no I/O, no futures, no JSON ownership retained.
+    struct CostEstimate {
+        uint64_t input_tokens = 0;
+        uint64_t output_tokens = 0;
+        double cost_units = 0.0;
+    };
+    CostEstimate estimate_request_cost(std::string_view body_view, size_t content_chars) const;
+
     // Establish connection to backend with retry and fallback logic
     // Returns connected bundle or sets ctx->connection_failed on failure
     // Rule #21: pointers are values — safe across coroutine suspend points
