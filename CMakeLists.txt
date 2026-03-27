@@ -492,6 +492,22 @@ target_link_libraries(config_test
 )
 gtest_discover_tests(config_test)
 
+# Priority Tier Unit Tests (Pure C++, uses stubs for Seastar)
+# Tests PriorityLevel enum, parsing, cascade logic, BackpressureSettings,
+# and ProxyContext priority field.
+add_executable(priority_tier_test
+  tests/unit/priority_tier_test.cpp
+)
+target_include_directories(priority_tier_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(priority_tier_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(priority_tier_test)
+
 # Gossip Protocol Unit Tests (Pure C++, no Seastar dependency)
 # Tests for gossip wire format, packet serialization/deserialization
 add_executable(gossip_protocol_test
