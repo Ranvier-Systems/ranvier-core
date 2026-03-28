@@ -575,7 +575,6 @@ void RanvierConfig::apply_env_overrides() {
         priority_tier.respect_header = (*v == "1" || *v == "true" || *v == "yes");
     }
 
-    // Intent classification overrides
     // Local mode overrides
     if (auto v = get_env("RANVIER_LOCAL_MODE")) {
         local_mode.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -619,6 +618,7 @@ void RanvierConfig::apply_env_overrides() {
         }
     }
 
+    // Intent classification overrides
     if (auto v = get_env("RANVIER_INTENT_CLASSIFICATION_ENABLED")) {
         intent_classification.enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
