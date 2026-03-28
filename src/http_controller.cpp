@@ -2649,7 +2649,7 @@ future<> HttpController::process_priority_queue() {
             ctx->dequeue_promise.set_exception(std::current_exception());
         }
 
-        if (++iterations % 64 == 0) {
+        if (++iterations % kYieldInterval == 0) {
             co_await seastar::coroutine::maybe_yield();
         }
     }
