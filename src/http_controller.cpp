@@ -292,12 +292,12 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
             sm::make_gauge("scheduler_queue_depth",
                 sm::description("Current queue depth per priority tier"),
                 {{"priority", priority_labels[i]}},
-                [this, i] { return static_cast<double>(_scheduler.queue_depths()[i]); }),
+                [this, i] { return static_cast<double>(_scheduler.queue_depth(i)); }),
 
             sm::make_gauge("scheduler_dropped_total",
                 sm::description("Requests dropped due to full priority queue"),
                 {{"priority", priority_labels[i]}},
-                [this, i] { return static_cast<double>(_scheduler.overflow_drops()[i]); }),
+                [this, i] { return static_cast<double>(_scheduler.overflow_drops()[i]); }),  // ref to array, no copy
         });
     }
     _scheduler_metrics.add_group("ranvier", {
@@ -2652,6 +2652,13 @@ future<> HttpController::process_priority_queue() {
             co_await seastar::coroutine::maybe_yield();
         }
     }
+
+    // Drain remaining queued contexts: destroy stubs so their promises break,
+    // which wakes any handle_proxy coroutine waiting in acquire_concurrency_slot.
+    while (auto leftover = _scheduler.dequeue()) {
+        // Stub is destroyed here → promise breaks → waiter gets broken_promise
+        (void)leftover;
+    }
 }
 
 // Dispatch is not used in the promise-based model (handle_proxy owns the
@@ -2697,8 +2704,15 @@ future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
     }
     _queue_cv.signal();
 
-    // Wait for process_priority_queue() to dequeue us and provide a semaphore unit
-    auto units = co_await std::move(dequeue_future);
+    // Wait for process_priority_queue() to dequeue us and provide a semaphore unit.
+    // If shutdown occurs while waiting, the promise is broken — treat as rejection.
+    seastar::semaphore_units<> units;
+    try {
+        units = co_await std::move(dequeue_future);
+    } catch (const seastar::broken_promise&) {
+        log_proxy.info("[{}] Request rejected - scheduler shutting down", request_id);
+        co_return AcquireResult{std::nullopt, true, "Server shutting down"};
+    }
 
     // Record scheduler wait time
     auto wait_duration = std::chrono::steady_clock::now() - request_start;

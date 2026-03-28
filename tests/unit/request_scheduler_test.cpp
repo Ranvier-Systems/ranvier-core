@@ -291,6 +291,49 @@ TEST(RequestSchedulerTest, InvalidPriorityFallsBackToNormal) {
     EXPECT_EQ(depths[2], 1u);
 }
 
+TEST(RequestSchedulerTest, AgentTrackingNeverExceedsLimit) {
+    // Use a small capacity scheduler to test LRU eviction
+    SchedulerSettings settings;
+    settings.tier_capacity = {512, 512, 512, 512};
+    TestScheduler sched(settings);
+
+    // Enqueue and dequeue 300 distinct agents (exceeds MAX_AGENT_TRACKING = 256)
+    for (int i = 0; i < 300; ++i) {
+        sched.enqueue(make_ctx(PriorityLevel::NORMAL, "agent-" + std::to_string(i)));
+    }
+    for (int i = 0; i < 300; ++i) {
+        sched.dequeue();
+    }
+
+    // Agent tracking should be capped at 256
+    EXPECT_LE(sched.agents_tracked(), 256u);
+}
+
+TEST(RequestSchedulerTest, ExistingAgentUpdatedInPlace) {
+    TestScheduler sched;
+    // Dequeue the same agent twice — should update, not add a second entry
+    sched.enqueue(make_ctx(PriorityLevel::NORMAL, "repeat"));
+    sched.dequeue();
+    EXPECT_EQ(sched.agents_tracked(), 1u);
+
+    sched.enqueue(make_ctx(PriorityLevel::NORMAL, "repeat"));
+    sched.dequeue();
+    EXPECT_EQ(sched.agents_tracked(), 1u);  // Still 1, not 2
+}
+
+TEST(RequestSchedulerTest, QueueDepthSingleTierAccessor) {
+    TestScheduler sched;
+    sched.enqueue(make_ctx(PriorityLevel::HIGH));
+    sched.enqueue(make_ctx(PriorityLevel::HIGH));
+    sched.enqueue(make_ctx(PriorityLevel::LOW));
+
+    EXPECT_EQ(sched.queue_depth(0), 0u);  // CRITICAL
+    EXPECT_EQ(sched.queue_depth(1), 2u);  // HIGH
+    EXPECT_EQ(sched.queue_depth(2), 0u);  // NORMAL
+    EXPECT_EQ(sched.queue_depth(3), 1u);  // LOW
+    EXPECT_EQ(sched.queue_depth(99), 0u); // Out of bounds
+}
+
 // =============================================================================
 // PriorityLevel utilities
 // =============================================================================

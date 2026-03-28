@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <absl/container/flat_hash_map.h>
 
@@ -107,8 +108,8 @@ public:
             auto best_time = std::chrono::steady_clock::time_point::max();
 
             for (size_t i = 0; i < _queues[tier].size(); ++i) {
-                auto agent = get_agent_key(_queues[tier][i].get());
-                auto it = _agent_last_served.find(agent);
+                auto agent_key = get_agent_key(_queues[tier][i].get());
+                auto it = _agent_last_served.find(agent_key);
                 auto served_time = (it != _agent_last_served.end())
                     ? it->second : std::chrono::steady_clock::time_point::min();
                 if (served_time < best_time) {
@@ -135,6 +136,11 @@ public:
     std::array<size_t, 4> queue_depths() const {
         return {_queues[0].size(), _queues[1].size(),
                 _queues[2].size(), _queues[3].size()};
+    }
+
+    // Single-tier depth (avoids temporary array in per-tier metric lambdas)
+    size_t queue_depth(size_t tier) const {
+        return tier < 4 ? _queues[tier].size() : 0;
     }
 
     // Total enqueued across all tiers
@@ -166,32 +172,42 @@ private:
     // MAX_SIZE = 256 entries, LRU eviction (Hard Rule #4)
     absl::flat_hash_map<std::string, std::chrono::steady_clock::time_point> _agent_last_served;
 
-    // Extract agent key from context (User-Agent or fallback)
-    static std::string get_agent_key(const Context* ctx) {
+    static constexpr std::string_view UNKNOWN_AGENT = "unknown";
+
+    // Extract agent key from context (User-Agent or fallback).
+    // Returns a view into ctx->user_agent — valid while the context is alive.
+    static std::string_view get_agent_key(const Context* ctx) {
         if (!ctx->user_agent.empty()) {
             return ctx->user_agent;
         }
-        return "unknown";
+        return UNKNOWN_AGENT;
     }
 
-    // Update last_served timestamp for the agent, with LRU eviction
+    // Update last_served timestamp for the agent, with LRU eviction.
+    // Evicts before insert to keep size strictly <= MAX_AGENT_TRACKING.
     void update_agent_served(const Context* ctx) {
         auto key = get_agent_key(ctx);
         auto now = std::chrono::steady_clock::now();
-        _agent_last_served[key] = now;
 
-        // LRU eviction: if over limit, remove the oldest entry
-        if (_agent_last_served.size() > MAX_AGENT_TRACKING) {
+        // Check if this agent is already tracked (update in place, no eviction needed)
+        auto existing = _agent_last_served.find(key);
+        if (existing != _agent_last_served.end()) {
+            existing->second = now;
+            return;
+        }
+
+        // New agent: evict oldest if at capacity
+        if (_agent_last_served.size() >= MAX_AGENT_TRACKING) {
             auto oldest_it = _agent_last_served.begin();
-            auto oldest_time = oldest_it->second;
             for (auto it = _agent_last_served.begin(); it != _agent_last_served.end(); ++it) {
-                if (it->second < oldest_time) {
-                    oldest_time = it->second;
+                if (it->second < oldest_it->second) {
                     oldest_it = it;
                 }
             }
             _agent_last_served.erase(oldest_it);
         }
+
+        _agent_last_served.emplace(std::string(key), now);
     }
 };
 
