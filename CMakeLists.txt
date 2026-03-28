@@ -506,6 +506,20 @@ target_link_libraries(priority_tier_test
 )
 gtest_discover_tests(priority_tier_test)
 
+# Request Scheduler Unit Tests (No Seastar dependency, uses absl::flat_hash_map)
+add_executable(request_scheduler_test
+  tests/unit/request_scheduler_test.cpp
+)
+target_include_directories(request_scheduler_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(request_scheduler_test
+  PRIVATE
+  absl::flat_hash_map
+  GTest::gtest_main
+)
+gtest_discover_tests(request_scheduler_test)
+
 # Gossip Protocol Unit Tests (Pure C++, no Seastar dependency)
 # Tests for gossip wire format, packet serialization/deserialization
 add_executable(gossip_protocol_test

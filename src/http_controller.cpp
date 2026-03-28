@@ -2179,7 +2179,6 @@ future<> HttpController::stop() {
     if (!_queue_gate.is_closed()) {
         co_await _queue_gate.close();
     }
-    co_await _scheduler.stop();
 
     // Deregister scheduler metrics before member destruction (Rule #6)
     _scheduler_metrics.clear();
