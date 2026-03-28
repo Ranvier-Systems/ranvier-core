@@ -343,6 +343,18 @@ target_link_libraries(boundary_detector_test
 )
 gtest_discover_tests(boundary_detector_test)
 
+# IntentClassifier Unit Tests (Pure C++, no Seastar)
+add_executable(intent_classifier_test
+  tests/unit/intent_classifier_test.cpp
+  src/intent_classifier.cpp
+)
+target_include_directories(intent_classifier_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(intent_classifier_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(intent_classifier_test)
+
 # TextValidator Unit Tests (Pure C++, header-only)
 add_executable(text_validator_test
   tests/unit/text_validator_test.cpp
