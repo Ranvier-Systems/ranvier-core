@@ -55,8 +55,19 @@ RequestIntent classify_intent(std::string_view endpoint,
         size_t max_scan = std::min(quote_start + 2048, body_view.size());
         size_t content_end = quote_start + 1;
         while (content_end < max_scan) {
-            if (body_view[content_end] == '"' && body_view[content_end - 1] != '\\') {
-                break;
+            if (body_view[content_end] == '"') {
+                // Count consecutive backslashes before this quote.
+                // Even count (including 0) → real closing quote.
+                // Odd count → escaped quote (\"), keep scanning.
+                size_t backslashes = 0;
+                size_t pos = content_end;
+                while (pos > quote_start + 1 && body_view[pos - 1] == '\\') {
+                    ++backslashes;
+                    --pos;
+                }
+                if (backslashes % 2 == 0) {
+                    break;
+                }
             }
             ++content_end;
         }

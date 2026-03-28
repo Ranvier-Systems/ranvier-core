@@ -442,6 +442,32 @@ TEST_F(StringBoundaryTest, EscapedQuotesNoKeyword) {
     EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
 }
 
+TEST_F(StringBoundaryTest, DoubleEscapedBackslashBeforeClosingQuote) {
+    // Content ends with a literal backslash: "path is C:\\"
+    // In JSON, \\\\ is two escaped backslashes → two real backslash bytes.
+    // The closing " after \\\\ is a real quote (even number of backslashes).
+    // The next message has "refactor" — it must NOT bleed into the scan.
+    //
+    // Raw JSON bytes in the content value: p,a,t,h, ,C,:,\,\,"
+    // The scanner must see the even backslash count and stop at the real quote.
+    std::string body =
+        R"({"messages": [{"role": "system", "content": "path is C:\\\\"},)"
+        R"({"role": "system", "content": "refactor everything"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
+}
+
+TEST_F(StringBoundaryTest, OddBackslashesBeforeQuoteIsEscaped) {
+    // Three backslashes then quote: \\\\\\\" in JSON → bytes \, \, \, "
+    // Odd count (3) → the quote is escaped, not a real closing quote.
+    // The real closing quote comes after "diff": ...\\\\\\\"diff\\"
+    // This verifies the scanner doesn't stop at the escaped quote.
+    std::string body =
+        R"({"messages": [{"role": "system", "content": "see \\\\\\\"diff\\\" here"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::EDIT);
+}
+
 // =============================================================================
 // Structured / Multi-Part Content
 // =============================================================================
