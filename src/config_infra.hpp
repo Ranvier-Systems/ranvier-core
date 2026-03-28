@@ -288,9 +288,22 @@ struct BackpressureConfig {
     // Response configuration
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
 
-    // Priority queue scheduling (Session C: Agent-Aware Scheduling)
+    // Priority queue scheduling
     bool enable_priority_queue = false;               // Gate: use priority-aware scheduling instead of direct semaphore
-    std::array<uint32_t, 4> tier_capacity = {64, 128, 256, 512};  // Per-tier queue capacity [CRITICAL, HIGH, NORMAL, LOW]
+
+    // Default per-tier queue capacities [CRITICAL, HIGH, NORMAL, LOW].
+    // Smaller tiers for higher priority keeps latency-sensitive requests from
+    // being buried behind a deep queue; larger tiers absorb burst traffic.
+    static constexpr uint32_t DEFAULT_TIER_CAPACITY_CRITICAL =  64;
+    static constexpr uint32_t DEFAULT_TIER_CAPACITY_HIGH     = 128;
+    static constexpr uint32_t DEFAULT_TIER_CAPACITY_NORMAL   = 256;
+    static constexpr uint32_t DEFAULT_TIER_CAPACITY_LOW      = 512;
+    std::array<uint32_t, 4> tier_capacity = {
+        DEFAULT_TIER_CAPACITY_CRITICAL,
+        DEFAULT_TIER_CAPACITY_HIGH,
+        DEFAULT_TIER_CAPACITY_NORMAL,
+        DEFAULT_TIER_CAPACITY_LOW,
+    };
 };
 
 // =============================================================================

@@ -76,9 +76,14 @@ struct BackpressureSettings {
     double persistence_queue_threshold = 0.8;         // Start throttling at 80% of max_queue_depth
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
 
-    // Priority queue scheduling (Session C: Agent-Aware Scheduling)
-    bool enable_priority_queue = false;               // Gate: use priority-aware scheduling
-    std::array<uint32_t, 4> tier_capacity = {64, 128, 256, 512};  // Per-tier capacity [CRITICAL, HIGH, NORMAL, LOW]
+    // Priority queue scheduling (defaults mirror BackpressureConfig)
+    bool enable_priority_queue = false;
+    std::array<uint32_t, 4> tier_capacity = {
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_CRITICAL,
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_HIGH,
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_NORMAL,
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW,
+    };
 };
 
 // Shard load balancing settings
@@ -165,7 +170,7 @@ struct ProxyContext {
 };
 
 // =============================================================================
-// Request Scheduler — Priority-aware request queueing (Session C)
+// Request Scheduler — Priority-aware request queueing
 // =============================================================================
 //
 // Shard-local class (one per core, no cross-shard state).
@@ -488,7 +493,7 @@ private:
     // Uses try_get_units() for immediate rejection (no queueing)
     seastar::semaphore _request_semaphore;
 
-    // Priority-aware request scheduler (Session C)
+    // Priority-aware request scheduler
     RequestScheduler _scheduler;
     seastar::condition_variable _queue_cv;  // Signaled by enqueue(), waited by process_priority_queue()
     seastar::gate _queue_gate;              // Gate for background dequeue fiber (Rule #5)
