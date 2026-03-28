@@ -521,13 +521,13 @@ protected:
     std::string_view endpoint = "/v1/chat/completions";
 };
 
-TEST_F(FimFieldScopeTest, NestedSuffixInContentValue) {
-    // "suffix" appears inside a content string value, not as a top-level key.
-    // The heuristic searches for the quoted key anywhere in the body, so this
-    // WILL match — documenting the known false-positive tradeoff.
+TEST_F(FimFieldScopeTest, EscapedQuotedSuffixInContentValue) {
+    // "suffix" appears inside a content string value with escaped quotes: \"suffix\"
+    // In the serialized JSON, the bytes are \, ", s, u, f, f, i, x, \, " — so the
+    // substring "suffix" (quote-suffix-quote) does NOT appear because a backslash
+    // sits between 'x' and the closing quote. No false positive.
     std::string body = R"({"messages": [{"role": "user", "content": "add a \"suffix\" to the name"}]})";
-    // The substring "suffix" is present as a quoted string, so FIM detection triggers
-    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::AUTOCOMPLETE);
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
 }
 
 TEST_F(FimFieldScopeTest, UnquotedSuffixDoesNotTrigger) {
