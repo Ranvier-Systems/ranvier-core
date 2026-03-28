@@ -548,6 +548,22 @@ private:
     // Fire-and-forget with gate guard (Rule #18: no discarded futures)
     seastar::future<> dispatch_proxied_request(std::unique_ptr<ProxyContext> ctx, seastar::semaphore_units<> units);
 
+    // Acquire a concurrency slot, either directly (try_get_units) or via the
+    // priority queue scheduler.  Returns nullopt when the request should be
+    // rejected with 503 (queue full / concurrency limit).
+    // Rule #22: all params by value.
+    struct AcquireResult {
+        std::optional<seastar::semaphore_units<>> units;
+        bool rejected = false;          // true → caller should 503
+        std::string rejection_reason;   // populated when rejected
+    };
+    seastar::future<AcquireResult> acquire_concurrency_slot(
+        PriorityLevel priority,
+        std::string request_id,
+        std::string user_agent,
+        std::chrono::steady_clock::time_point request_start,
+        std::optional<seastar::semaphore_units<>> early_units);
+
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;
 
