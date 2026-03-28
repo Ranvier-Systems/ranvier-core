@@ -43,7 +43,6 @@ namespace local_ports {
 // Represents a discovered local LLM backend
 struct DiscoveredBackend {
     BackendId id = 0;                                  // Assigned during registration
-    std::string address = "127.0.0.1";                 // Always localhost for local mode
     uint16_t port = 0;
     std::string server_type;                           // "ollama", "vllm", "lmstudio", "llamacpp", "localai", "textgenui", "unknown"
     std::vector<std::string> available_models;         // From /v1/models response
@@ -59,7 +58,7 @@ public:
         std::chrono::seconds scan_interval{10};        // How often to re-scan
         std::chrono::milliseconds probe_timeout{50};   // Semantic liveness timeout
         std::chrono::milliseconds connect_timeout{20}; // TCP connect timeout
-        size_t max_backends = 32;                      // Hard Rule #4
+        size_t max_backends = 32;                      // Configurable limit (Rule #4)
     };
 
     explicit LocalDiscoveryService(RouterService& router, Config config);
@@ -101,7 +100,7 @@ private:
 
     // Raw HTTP GET with timeout — lightweight, no connection pooling
     seastar::future<std::optional<seastar::sstring>> http_get_local(
-        uint16_t port, std::string_view path,
+        uint16_t port, seastar::sstring path,
         std::chrono::milliseconds timeout);
 
     // Parse /v1/models response to detect server type + model list
@@ -109,7 +108,8 @@ private:
         uint16_t port, const seastar::sstring& body);
 
     // Detect server type from response headers/body heuristics
-    std::string detect_server_type(uint16_t port, const seastar::sstring& body);
+    std::string detect_server_type(uint16_t port, const seastar::sstring& body,
+        const std::vector<std::string>& models);
 
     // Reconcile probe results with known state — add/remove from router
     seastar::future<> reconcile(

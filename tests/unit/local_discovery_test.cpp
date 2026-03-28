@@ -34,7 +34,6 @@ namespace local_ports {
 
 struct TestDiscoveredBackend {
     BackendId id = 0;
-    std::string address = "127.0.0.1";
     uint16_t port = 0;
     std::string server_type;
     std::vector<std::string> available_models;
@@ -43,22 +42,17 @@ struct TestDiscoveredBackend {
 };
 
 // Replicated from LocalDiscoveryService::detect_server_type
-std::string detect_server_type(uint16_t port, const std::string& body) {
+// Takes pre-parsed model list instead of re-parsing JSON
+std::string detect_server_type(uint16_t port, const std::string& body,
+        const std::vector<std::string>& models) {
     if (body.find("ollama") != std::string::npos) {
         return "ollama";
     }
 
-    rapidjson::Document doc;
-    doc.Parse(body.c_str(), body.size());
-    if (!doc.HasParseError() && doc.IsObject() && doc.HasMember("data") && doc["data"].IsArray()) {
-        const auto& data = doc["data"];
-        for (rapidjson::SizeType i = 0; i < data.Size(); ++i) {
-            if (data[i].IsObject() && data[i].HasMember("id") && data[i]["id"].IsString()) {
-                const char* id = data[i]["id"].GetString();
-                if (id && std::strchr(id, ':') != nullptr) {
-                    return "ollama";
-                }
-            }
+    // Check if any model ID contains ":" (like "llama3:8b") — likely Ollama
+    for (const auto& model : models) {
+        if (model.find(':') != std::string::npos) {
+            return "ollama";
         }
     }
 
@@ -99,7 +93,7 @@ TestDiscoveredBackend parse_models_response(uint16_t port, const std::string& bo
         }
     }
 
-    backend.server_type = detect_server_type(port, body);
+    backend.server_type = detect_server_type(port, body, backend.available_models);
     return backend;
 }
 
@@ -111,80 +105,80 @@ class DetectServerTypeTest : public ::testing::Test {};
 
 TEST_F(DetectServerTypeTest, OllamaByBodyMarker) {
     std::string body = R"({"data": [{"id": "llama3"}], "source": "ollama"})";
-    EXPECT_EQ(detect_server_type(9999, body), "ollama");
+    EXPECT_EQ(detect_server_type(9999, body, {"llama3"}), "ollama");
 }
 
 TEST_F(DetectServerTypeTest, OllamaByColonInModelId) {
     std::string body = R"({"data": [{"id": "llama3:8b"}]})";
-    EXPECT_EQ(detect_server_type(9999, body), "ollama");
+    EXPECT_EQ(detect_server_type(9999, body, {"llama3:8b"}), "ollama");
 }
 
 TEST_F(DetectServerTypeTest, OllamaByPort) {
     std::string body = R"({"data": [{"id": "some-model"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::OLLAMA, body), "ollama");
+    EXPECT_EQ(detect_server_type(local_ports::OLLAMA, body, {"some-model"}), "ollama");
 }
 
 TEST_F(DetectServerTypeTest, VllmByPortAndMarker) {
     std::string body = R"({"data": [{"id": "meta-llama/Llama-2-7b", "model_permission": []}]})";
-    EXPECT_EQ(detect_server_type(local_ports::VLLM, body), "vllm");
+    EXPECT_EQ(detect_server_type(local_ports::VLLM, body, {"meta-llama/Llama-2-7b"}), "vllm");
 }
 
 TEST_F(DetectServerTypeTest, VllmByPortAndVllmString) {
     std::string body = R"({"data": [{"id": "model"}], "engine": "vllm"})";
-    EXPECT_EQ(detect_server_type(local_ports::VLLM, body), "vllm");
+    EXPECT_EQ(detect_server_type(local_ports::VLLM, body, {"model"}), "vllm");
 }
 
 TEST_F(DetectServerTypeTest, LmStudioByPort) {
     std::string body = R"({"data": [{"id": "some-model"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::LMSTUDIO, body), "lmstudio");
+    EXPECT_EQ(detect_server_type(local_ports::LMSTUDIO, body, {"some-model"}), "lmstudio");
 }
 
 TEST_F(DetectServerTypeTest, LlamaCppByPort) {
     std::string body = R"({"data": [{"id": "some-model"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::LLAMACPP, body), "llamacpp");
+    EXPECT_EQ(detect_server_type(local_ports::LLAMACPP, body, {"some-model"}), "llamacpp");
 }
 
 TEST_F(DetectServerTypeTest, TextGenUIByPort) {
     std::string body = R"({"data": [{"id": "some-model"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::TEXTGENUI, body), "textgenui");
+    EXPECT_EQ(detect_server_type(local_ports::TEXTGENUI, body, {"some-model"}), "textgenui");
 }
 
 TEST_F(DetectServerTypeTest, LocalAIByPort) {
     std::string body = R"({"data": [{"id": "some-model"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::LOCALAI, body), "localai");
+    EXPECT_EQ(detect_server_type(local_ports::LOCALAI, body, {"some-model"}), "localai");
 }
 
 TEST_F(DetectServerTypeTest, UnknownPortReturnsUnknown) {
     std::string body = R"({"data": [{"id": "some-model"}]})";
-    EXPECT_EQ(detect_server_type(4444, body), "unknown");
+    EXPECT_EQ(detect_server_type(4444, body, {"some-model"}), "unknown");
 }
 
 TEST_F(DetectServerTypeTest, OllamaBodyMarkerTakesPrecedenceOverPort) {
     // Even on vLLM's port, "ollama" in body wins
     std::string body = R"({"data": [{"id": "model"}], "source": "ollama"})";
-    EXPECT_EQ(detect_server_type(local_ports::VLLM, body), "ollama");
+    EXPECT_EQ(detect_server_type(local_ports::VLLM, body, {"model"}), "ollama");
 }
 
 TEST_F(DetectServerTypeTest, ColonModelIdTakesPrecedenceOverPort) {
     // Colon in model ID → ollama, even on LM Studio's port
     std::string body = R"({"data": [{"id": "mistral:7b"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::LMSTUDIO, body), "ollama");
+    EXPECT_EQ(detect_server_type(local_ports::LMSTUDIO, body, {"mistral:7b"}), "ollama");
 }
 
 TEST_F(DetectServerTypeTest, InvalidJsonFallsBackToPort) {
     std::string body = "not json at all";
-    EXPECT_EQ(detect_server_type(local_ports::LLAMACPP, body), "llamacpp");
+    EXPECT_EQ(detect_server_type(local_ports::LLAMACPP, body, {}), "llamacpp");
 }
 
 TEST_F(DetectServerTypeTest, EmptyBodyFallsBackToPort) {
-    EXPECT_EQ(detect_server_type(local_ports::OLLAMA, ""), "ollama");
-    EXPECT_EQ(detect_server_type(9999, ""), "unknown");
+    EXPECT_EQ(detect_server_type(local_ports::OLLAMA, "", {}), "ollama");
+    EXPECT_EQ(detect_server_type(9999, "", {}), "unknown");
 }
 
 TEST_F(DetectServerTypeTest, VllmPortWithoutMarkersReturnsUnknown) {
     // Port 8080 without vllm markers falls through to default (8080 not in switch)
     std::string body = R"({"data": [{"id": "model"}]})";
-    EXPECT_EQ(detect_server_type(local_ports::VLLM, body), "unknown");
+    EXPECT_EQ(detect_server_type(local_ports::VLLM, body, {"model"}), "unknown");
 }
 
 // =============================================================================
@@ -328,7 +322,6 @@ class DiscoveredBackendTest : public ::testing::Test {};
 TEST_F(DiscoveredBackendTest, DefaultValues) {
     TestDiscoveredBackend b;
     EXPECT_EQ(b.id, 0);
-    EXPECT_EQ(b.address, "127.0.0.1");
     EXPECT_EQ(b.port, 0);
     EXPECT_TRUE(b.server_type.empty());
     EXPECT_TRUE(b.available_models.empty());

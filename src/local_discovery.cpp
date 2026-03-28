@@ -97,7 +97,7 @@ seastar::future<> LocalDiscoveryService::discovery_loop() {
 }
 
 seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get_local(
-        uint16_t port, std::string_view path,
+        uint16_t port, seastar::sstring path,
         std::chrono::milliseconds timeout) {
     auto deadline = seastar::lowres_clock::now() + timeout;
 
@@ -145,7 +145,8 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
 
         // 5. Parse HTTP status — look for "HTTP/1.1 200" or "HTTP/1.0 200"
         static constexpr size_t MIN_STATUS_LINE_LEN = 12;  // "HTTP/1.x 200"
-        static constexpr std::string_view HEADER_BODY_SEPARATOR = "\r\n\r\n";
+        static constexpr const char HEADER_BODY_SEPARATOR[] = "\r\n\r\n";
+        static constexpr size_t HEADER_BODY_SEPARATOR_LEN = 4;
 
         if (response_data.size() < MIN_STATUS_LINE_LEN) {
             co_return std::nullopt;
@@ -163,12 +164,12 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
         }
 
         // 6. Extract body (after \r\n\r\n)
-        auto body_start = response_data.find(HEADER_BODY_SEPARATOR.data());
+        auto body_start = response_data.find(HEADER_BODY_SEPARATOR);
         if (body_start == seastar::sstring::npos) {
             co_return std::nullopt;
         }
 
-        co_return response_data.substr(body_start + HEADER_BODY_SEPARATOR.size());
+        co_return response_data.substr(body_start + HEADER_BODY_SEPARATOR_LEN);
     } catch (const seastar::timed_out_error&) {
         log_discovery.debug("Port {} probe timed out", port);
         co_return std::nullopt;
@@ -218,30 +219,23 @@ DiscoveredBackend LocalDiscoveryService::parse_models_response(
         }
     }
 
-    // Detect server type
-    backend.server_type = detect_server_type(port, body);
+    // Detect server type using parsed models (avoids re-parsing JSON)
+    backend.server_type = detect_server_type(port, body, backend.available_models);
 
     return backend;
 }
 
-std::string LocalDiscoveryService::detect_server_type(uint16_t port, const seastar::sstring& body) {
+std::string LocalDiscoveryService::detect_server_type(uint16_t port, const seastar::sstring& body,
+        const std::vector<std::string>& models) {
     // Check response body for distinctive markers first
     if (body.find("ollama") != seastar::sstring::npos) {
         return "ollama";
     }
 
     // Check if any model ID contains ":" (like "llama3:8b") — likely Ollama
-    rapidjson::Document doc;
-    doc.Parse(body.c_str(), body.size());
-    if (!doc.HasParseError() && doc.IsObject() && doc.HasMember("data") && doc["data"].IsArray()) {
-        const auto& data = doc["data"];
-        for (rapidjson::SizeType i = 0; i < data.Size(); ++i) {
-            if (data[i].IsObject() && data[i].HasMember("id") && data[i]["id"].IsString()) {
-                const char* id = data[i]["id"].GetString();
-                if (id && std::strchr(id, ':') != nullptr) {
-                    return "ollama";
-                }
-            }
+    for (const auto& model : models) {
+        if (model.find(':') != std::string::npos) {
+            return "ollama";
         }
     }
 
@@ -312,11 +306,12 @@ seastar::future<> LocalDiscoveryService::reconcile(
             continue;  // Already tracked
         }
 
-        // Check capacity limit
-        if (_known_backends.size() >= MAX_KNOWN_BACKENDS) {
+        // Check capacity limit (configurable, hard-capped by MAX_KNOWN_BACKENDS)
+        auto effective_limit = std::min(_config.max_backends, MAX_KNOWN_BACKENDS);
+        if (_known_backends.size() >= effective_limit) {
             _overflow_drops++;
-            log_discovery.warn("MAX_KNOWN_BACKENDS ({}) reached, dropping backend on port {}",
-                MAX_KNOWN_BACKENDS, d.port);
+            log_discovery.warn("Backend limit ({}) reached, dropping backend on port {}",
+                effective_limit, d.port);
             continue;
         }
 
