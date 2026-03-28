@@ -52,11 +52,17 @@ RequestIntent classify_intent(std::string_view endpoint,
         auto quote_start = body_view.find('"', colon_pos + 1);
         if (quote_start == std::string_view::npos) break;
 
-        // Extract a reasonable window of the system content for scanning.
-        // We don't need to find the exact closing quote — scanning the first
-        // ~2KB of system content is sufficient for keyword detection.
-        size_t scan_end = std::min(quote_start + 2048, body_view.size());
-        std::string_view system_content = body_view.substr(quote_start, scan_end - quote_start);
+        // Find the closing quote of the content value (skip escaped quotes).
+        // Cap the scan at 2KB as a safety limit for very long system messages.
+        size_t max_scan = std::min(quote_start + 2048, body_view.size());
+        size_t content_end = quote_start + 1;
+        while (content_end < max_scan) {
+            if (body_view[content_end] == '"' && body_view[content_end - 1] != '\\') {
+                break;
+            }
+            ++content_end;
+        }
+        std::string_view system_content = body_view.substr(quote_start + 1, content_end - quote_start - 1);
 
         // Case-insensitive keyword matching against system content
         for (const auto& keyword : config.edit_system_keywords) {
