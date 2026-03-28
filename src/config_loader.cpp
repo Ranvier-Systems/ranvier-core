@@ -576,6 +576,49 @@ void RanvierConfig::apply_env_overrides() {
     }
 
     // Intent classification overrides
+    // Local mode overrides
+    if (auto v = get_env("RANVIER_LOCAL_MODE")) {
+        local_mode.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_LOCAL_DISABLE_CLUSTERING")) {
+        local_mode.disable_clustering = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_LOCAL_DISABLE_PERSISTENCE")) {
+        local_mode.disable_persistence = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_LOCAL_AUTO_DISCOVER")) {
+        local_mode.auto_discover_backends = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_LOCAL_DISCOVERY_PORTS")) {
+        // Parse comma-separated port list (same pattern as RANVIER_CLUSTER_PEERS)
+        local_mode.discovery_ports.clear();
+        std::istringstream iss(*v);
+        std::string token;
+        size_t count = 0;
+        while (std::getline(iss, token, ',')) {
+            if (count >= LocalModeConfig::MAX_DISCOVERY_PORTS) {
+                std::cerr << "[WARN] RANVIER_LOCAL_DISCOVERY_PORTS has more than "
+                          << LocalModeConfig::MAX_DISCOVERY_PORTS
+                          << " entries, truncating (Rule #4)\n";
+                break;
+            }
+            // Trim whitespace
+            size_t start = token.find_first_not_of(" \t");
+            size_t end = token.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                try {
+                    auto port = static_cast<uint16_t>(std::stoul(token.substr(start, end - start + 1)));
+                    local_mode.discovery_ports.push_back(port);
+                } catch (const std::exception& e) {
+                    // Rule #9: Log at warn level (pre-Seastar, use std::cerr)
+                    std::cerr << "[WARN] Invalid port in RANVIER_LOCAL_DISCOVERY_PORTS: '"
+                              << token << "': " << e.what() << " - skipping\n";
+                }
+            }
+            ++count;
+        }
+    }
+
     if (auto v = get_env("RANVIER_INTENT_CLASSIFICATION_ENABLED")) {
         intent_classification.enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
@@ -1247,6 +1290,32 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 }
             }
         }
+        // Local mode section
+        if (yaml["local_mode"]) {
+            YAML::Node lm = yaml["local_mode"];
+            if (lm["enabled"]) config.local_mode.enabled = lm["enabled"].as<bool>();
+            if (lm["disable_clustering"]) config.local_mode.disable_clustering = lm["disable_clustering"].as<bool>();
+            if (lm["disable_persistence"]) config.local_mode.disable_persistence = lm["disable_persistence"].as<bool>();
+            if (lm["auto_discover_backends"]) config.local_mode.auto_discover_backends = lm["auto_discover_backends"].as<bool>();
+            if (lm["discovery_ports"]) {
+                YAML::Node dp = lm["discovery_ports"];
+                if (dp.IsSequence()) {
+                    config.local_mode.discovery_ports.clear();
+                    size_t count = 0;
+                    for (const auto& entry : dp) {
+                        if (count >= LocalModeConfig::MAX_DISCOVERY_PORTS) {
+                            std::cerr << "[WARN] local_mode.discovery_ports has more than "
+                                      << LocalModeConfig::MAX_DISCOVERY_PORTS
+                                      << " entries, truncating (Rule #4)\n";
+                            break;
+                        }
+                        config.local_mode.discovery_ports.push_back(entry.as<uint16_t>());
+                        ++count;
+                    }
+                }
+            }
+        }
+
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -1491,6 +1560,28 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         if (config.priority_tier.known_user_agents.size() > PriorityTierConfig::MAX_KNOWN_USER_AGENTS) {
             return "priority_tier.known_user_agents exceeds maximum of 64 entries (Rule #4)";
         }
+    }
+
+    // Validate local mode settings
+    if (config.local_mode.enabled) {
+        if (config.cluster.enabled) {
+            // Warn but don't error — local_mode wins at startup via apply_local_mode_overrides()
+            std::cerr << "[WARN] local_mode.enabled overrides cluster.enabled — "
+                      << "clustering will be disabled\n";
+        }
+        if (config.local_mode.auto_discover_backends && config.local_mode.discovery_ports.empty()) {
+            std::cerr << "[WARN] No discovery ports configured, auto-discovery will find nothing\n";
+        }
+    }
+    // Validate discovery_ports regardless of enabled state (catch config errors early)
+    for (auto port : config.local_mode.discovery_ports) {
+        if (port == 0) {
+            return "local_mode.discovery_ports contains invalid port 0 (must be 1-65535)";
+        }
+        // uint16_t max is 65535, so no need to check > 65535
+    }
+    if (config.local_mode.discovery_ports.size() > LocalModeConfig::MAX_DISCOVERY_PORTS) {
+        return "local_mode.discovery_ports exceeds maximum of 64 entries (Rule #4)";
     }
 
     return std::nullopt;  // Valid

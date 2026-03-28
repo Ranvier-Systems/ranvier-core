@@ -264,6 +264,29 @@ struct IntentClassificationConfig {
 };
 
 // =============================================================================
+// Local Mode Configuration
+// =============================================================================
+
+// Local development mode — disables cloud features (clustering, persistence)
+// and prepares for local backend auto-discovery (VISION 3.1).
+// Feature-flag pattern: when disabled (default), the cloud path is unaffected.
+struct LocalModeConfig {
+    bool enabled = false;                          // Master switch
+    bool disable_clustering = true;                // Skip gossip when local (default: true)
+    bool disable_persistence = true;               // Skip SQLite when local (default: true)
+    bool auto_discover_backends = true;            // Enable port scanning (default: true)
+    std::vector<uint16_t> discovery_ports = {      // Ports to probe
+        11434,  // Ollama
+        8080,   // vLLM default
+        1234,   // LM Studio
+        8000,   // llama.cpp server
+        5000,   // Text Generation WebUI
+        3000,   // LocalAI
+    };
+    static constexpr size_t MAX_DISCOVERY_PORTS = 64;  // Hard Rule #4
+};
+
+// =============================================================================
 // Top-Level Configuration
 // =============================================================================
 
@@ -291,6 +314,7 @@ struct RanvierConfig {
     CostEstimationConfig cost_estimation;
     PriorityTierConfig priority_tier;
     IntentClassificationConfig intent_classification;
+    LocalModeConfig local_mode;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);

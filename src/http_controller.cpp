@@ -271,6 +271,10 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_dump_backends(std::move(req), std::move(rep));
     }));
 
+    r.add(operation_type::GET, url("/admin/config"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_dump_config(std::move(req), std::move(rep));
+    }));
+
     // 6. MANAGEMENT OPERATIONS
     r.add(operation_type::POST, url("/admin/drain"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_drain_backend(std::move(req), std::move(rep));
@@ -2525,6 +2529,32 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
     }
 
     oss << "  ]\n";
+    oss << "}";
+
+    rep->write_body("json", oss.str());
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_config(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    const auto& lm = _config.local_mode;
+
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"local_mode\": {\n";
+    oss << "    \"enabled\": " << (lm.enabled ? "true" : "false") << ",\n";
+    oss << "    \"clustering_disabled\": " << (lm.disable_clustering ? "true" : "false") << ",\n";
+    oss << "    \"persistence_disabled\": " << (lm.disable_persistence ? "true" : "false") << ",\n";
+    oss << "    \"auto_discover_backends\": " << (lm.auto_discover_backends ? "true" : "false") << ",\n";
+    oss << "    \"discovery_ports\": [";
+    for (size_t i = 0; i < lm.discovery_ports.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << lm.discovery_ports[i];
+    }
+    oss << "]\n";
+    oss << "  }\n";
     oss << "}";
 
     rep->write_body("json", oss.str());

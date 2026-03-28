@@ -1,0 +1,14 @@
+# Ranvier Local Mode — minimal config for local development
+# Start with: ranvier --config ranvier-local.yaml
+
+local_mode:
+  enabled: true
+  discovery_ports: [11434, 8080, 1234, 8000, 5000, 3000]
+
+routing:
+  mode: prefix
+
+# Clustering, gossip, and persistence are automatically disabled.
+# Override with:
+#   local_mode.disable_clustering: false
+#   local_mode.disable_persistence: false

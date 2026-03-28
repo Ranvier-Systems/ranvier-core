@@ -197,6 +197,13 @@ private:
     // TLS credentials (if TLS enabled)
     seastar::shared_ptr<seastar::tls::server_credentials> _tls_creds;
 
+    // --- Private Helpers: Local Mode ---
+
+    // Apply local mode overrides to config before services start.
+    // When local_mode.enabled, disables clustering and/or persistence
+    // based on local_mode sub-flags. Must be called before sharded_config.start().
+    void apply_local_mode_overrides();
+
     // --- Private Helpers: Initialization ---
 
     // Initialize tokenizer from JSON file (async, uses Seastar DMA file I/O)
