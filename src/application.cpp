@@ -182,9 +182,9 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.priority_tier_known_user_agents = config.priority_tier.known_user_agents;
     // Intent classification settings
     cfg.intent_classification_enabled = config.intent_classification.enabled;
-    cfg.intent_fim_fields = config.intent_classification.fim_fields;
-    cfg.intent_edit_system_keywords = config.intent_classification.edit_system_keywords;
-    cfg.intent_edit_tag_patterns = config.intent_classification.edit_tag_patterns;
+    cfg.intent_classifier.fim_fields = config.intent_classification.fim_fields;
+    cfg.intent_classifier.edit_system_keywords = config.intent_classification.edit_system_keywords;
+    cfg.intent_classifier.edit_tag_patterns = config.intent_classification.edit_tag_patterns;
     return cfg;
 }
 

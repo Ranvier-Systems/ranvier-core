@@ -6,6 +6,7 @@
 #include "config.hpp"
 #include "connection_pool.hpp"
 #include "cross_shard_request.hpp"
+#include "intent_classifier.hpp"
 #include "metrics_service.hpp"
 #include "proxy_retry_policy.hpp"
 #include "rate_limiter.hpp"
@@ -28,27 +29,6 @@
 #include <seastar/http/reply.hh>
 
 namespace ranvier {
-
-// Intent classification for request routing hints
-// Classifies requests by wire-format inspection to enable intent-aware routing.
-// AUTOCOMPLETE: FIM / inline completion — route to fastest backend
-// CHAT: Interactive conversation — prefix + cost-aware routing (default)
-// EDIT: Code rewrite / refactor — route to smartest backend
-enum class RequestIntent : uint8_t {
-    AUTOCOMPLETE = 0,
-    CHAT         = 1,
-    EDIT         = 2,
-};
-
-// Convert RequestIntent to string label for metrics and logging
-inline std::string_view intent_to_string(RequestIntent intent) {
-    switch (intent) {
-        case RequestIntent::AUTOCOMPLETE: return "autocomplete";
-        case RequestIntent::CHAT:         return "chat";
-        case RequestIntent::EDIT:         return "edit";
-    }
-    return "chat";  // unreachable, but satisfies -Wreturn-type
-}
 
 // Retry configuration
 struct RetrySettings {
@@ -225,9 +205,7 @@ struct HttpControllerConfig {
 
     // Intent classification settings (copied from IntentClassificationConfig at init)
     bool intent_classification_enabled = true;
-    std::vector<std::string> intent_fim_fields = {"suffix", "fim_prefix", "fim_middle", "fim_suffix"};
-    std::vector<std::string> intent_edit_system_keywords = {"diff", "rewrite", "refactor", "edit", "patch", "apply"};
-    std::vector<std::string> intent_edit_tag_patterns = {"<diff>", "<edit>", "<rewrite>", "<patch>"};
+    IntentClassifierConfig intent_classifier;
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
@@ -452,12 +430,6 @@ private:
 
     // Proxy request helper methods - break down handle_proxy into manageable pieces
     // These are called from within the streaming lambda to handle different phases
-
-    // Classify request intent from endpoint and body content.
-    // Pure computation — no I/O, no futures.
-    // Cascade: FIM field detection → endpoint check → edit keyword scan → CHAT fallback.
-    RequestIntent classify_intent(std::string_view endpoint,
-                                  std::string_view body_view) const;
 
     // Extract priority level from request headers, user-agent, and cost estimation.
     // Pure computation — no I/O, no futures.
