@@ -716,6 +716,24 @@ seastar::future<> Application::startup() {
             }
             return seastar::make_ready_future<>();
         }).then([this] {
+            // 16. Start local discovery if local mode enabled
+            if (_config.local_mode.enabled && _config.local_mode.auto_discover_backends) {
+                LocalDiscoveryService::Config disc_config;
+                disc_config.discovery_ports.assign(
+                    _config.local_mode.discovery_ports.begin(),
+                    _config.local_mode.discovery_ports.end());
+                disc_config.scan_interval = _config.local_mode.discovery_scan_interval;
+                disc_config.probe_timeout = _config.local_mode.discovery_probe_timeout;
+                disc_config.connect_timeout = _config.local_mode.discovery_connect_timeout;
+                _local_discovery = std::make_unique<LocalDiscoveryService>(
+                    *_router, std::move(disc_config));
+                return _local_discovery->start().then([this] {
+                    log_main.info("Local backend discovery started ({} ports)",
+                        _config.local_mode.discovery_ports.size());
+                });
+            }
+            return seastar::make_ready_future<>();
+        }).then([this] {
             _state = ApplicationState::RUNNING;
             log_main.info("Application startup complete");
         }).handle_exception([this](auto ep) {
@@ -1101,6 +1119,16 @@ seastar::future<> Application::stop_services() {
                 log_main.debug("  K8s discovery stopped");
             }).handle_exception([](auto ep) {
                 log_main.warn("  K8s discovery stop error (ignored)");
+            })
+        );
+    }
+
+    if (_local_discovery) {
+        parallel_stops.push_back(
+            _local_discovery->stop().then([] {
+                log_main.debug("  Local discovery stopped");
+            }).handle_exception([](auto ep) {
+                log_main.warn("  Local discovery stop error (ignored)");
             })
         );
     }

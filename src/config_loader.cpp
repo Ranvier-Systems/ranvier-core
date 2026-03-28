@@ -618,6 +618,32 @@ void RanvierConfig::apply_env_overrides() {
         }
     }
 
+    // Local discovery timing overrides
+    if (auto v = get_env("RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL")) {
+        try {
+            local_mode.discovery_scan_interval = std::chrono::seconds(std::stoul(*v));
+        } catch (const std::exception& e) {
+            std::cerr << "[WARN] Invalid RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL: '"
+                      << *v << "': " << e.what() << " - using default\n";
+        }
+    }
+    if (auto v = get_env("RANVIER_LOCAL_DISCOVERY_PROBE_TIMEOUT_MS")) {
+        try {
+            local_mode.discovery_probe_timeout = std::chrono::milliseconds(std::stoul(*v));
+        } catch (const std::exception& e) {
+            std::cerr << "[WARN] Invalid RANVIER_LOCAL_DISCOVERY_PROBE_TIMEOUT_MS: '"
+                      << *v << "': " << e.what() << " - using default\n";
+        }
+    }
+    if (auto v = get_env("RANVIER_LOCAL_DISCOVERY_CONNECT_TIMEOUT_MS")) {
+        try {
+            local_mode.discovery_connect_timeout = std::chrono::milliseconds(std::stoul(*v));
+        } catch (const std::exception& e) {
+            std::cerr << "[WARN] Invalid RANVIER_LOCAL_DISCOVERY_CONNECT_TIMEOUT_MS: '"
+                      << *v << "': " << e.what() << " - using default\n";
+        }
+    }
+
     // Intent classification overrides
     if (auto v = get_env("RANVIER_INTENT_CLASSIFICATION_ENABLED")) {
         intent_classification.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -1313,6 +1339,18 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                         ++count;
                     }
                 }
+            }
+            if (lm["discovery_scan_interval_seconds"]) {
+                config.local_mode.discovery_scan_interval =
+                    std::chrono::seconds(lm["discovery_scan_interval_seconds"].as<unsigned>());
+            }
+            if (lm["discovery_probe_timeout_ms"]) {
+                config.local_mode.discovery_probe_timeout =
+                    std::chrono::milliseconds(lm["discovery_probe_timeout_ms"].as<unsigned>());
+            }
+            if (lm["discovery_connect_timeout_ms"]) {
+                config.local_mode.discovery_connect_timeout =
+                    std::chrono::milliseconds(lm["discovery_connect_timeout_ms"].as<unsigned>());
             }
         }
 

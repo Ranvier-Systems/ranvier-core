@@ -1,0 +1,338 @@
+// Ranvier Core - Local Backend Discovery Implementation
+
+#include "local_discovery.hpp"
+
+#include <fmt/format.h>
+
+#include <rapidjson/document.h>
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/with_timeout.hh>
+#include <seastar/net/api.hh>
+#include <seastar/net/inet_address.hh>
+#include <seastar/net/socket_defs.hh>
+
+namespace ranvier {
+
+LocalDiscoveryService::LocalDiscoveryService(RouterService& router, Config config)
+    : _router(router),
+      _config(std::move(config)) {
+}
+
+seastar::future<> LocalDiscoveryService::start() {
+    // Register metrics (Rule #6: deregister in stop() before member destruction)
+    namespace sm = seastar::metrics;
+    _metrics.add_group("ranvier", {
+        sm::make_counter("discovery_probes_total", _probes_sent,
+            sm::description("Total number of local discovery probes sent")),
+        sm::make_counter("discovery_probes_success", _probes_succeeded,
+            sm::description("Total number of successful local discovery probes")),
+        sm::make_counter("discovery_probes_failed", _probes_failed,
+            sm::description("Total number of failed local discovery probes")),
+        sm::make_gauge("discovery_backends_active", [this] { return _known_backends.size(); },
+            sm::description("Current number of discovered local backends")),
+        sm::make_counter("discovery_backends_added_total", _backends_added,
+            sm::description("Total number of local backends added")),
+        sm::make_counter("discovery_backends_removed_total", _backends_removed,
+            sm::description("Total number of local backends removed")),
+        sm::make_counter("discovery_overflow_drops", _overflow_drops,
+            sm::description("Times backend discovery was skipped due to MAX_KNOWN_BACKENDS limit")),
+    });
+
+    _running = true;
+    // Store the loop future for clean shutdown tracking (Rule #5)
+    _loop_future = discovery_loop();
+    co_return;
+}
+
+seastar::future<> LocalDiscoveryService::stop() {
+    // Rule #6: Deregister metrics first before any member destruction
+    _metrics.clear();
+
+    _running = false;
+    // Close the gate (signals loop to exit and waits for in-flight probes)
+    co_await _gate.close();
+    // Await the loop future to ensure clean exit
+    co_await std::move(_loop_future);
+}
+
+seastar::future<> LocalDiscoveryService::discovery_loop() {
+    if (seastar::this_shard_id() != 0) co_return;  // Shard 0 only
+
+    auto holder = _gate.hold();
+
+    try {
+        while (_running) {
+            std::vector<DiscoveredBackend> results;
+
+            // Probe all configured ports in parallel (max 6 concurrent)
+            co_await seastar::max_concurrent_for_each(
+                _config.discovery_ports, 6,
+                [this, &results](uint16_t port) -> seastar::future<> {
+                    _probes_sent++;
+                    auto result = co_await probe_port(port);
+                    if (result) {
+                        _probes_succeeded++;
+                        results.push_back(std::move(*result));
+                    } else {
+                        _probes_failed++;
+                    }
+                });
+
+            // Reconcile with router
+            co_await reconcile(std::move(results));
+
+            co_await seastar::sleep(_config.scan_interval);
+        }
+    } catch (const seastar::gate_closed_exception&) {
+        log_discovery.debug("Discovery loop exiting: gate closed");
+    } catch (const std::exception& e) {
+        log_discovery.warn("Discovery loop exiting unexpectedly: {}", e.what());
+    } catch (...) {
+        log_discovery.warn("Discovery loop exiting: unknown exception");
+    }
+}
+
+seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get_local(
+        uint16_t port, std::string_view path,
+        std::chrono::milliseconds timeout) {
+    auto deadline = seastar::lowres_clock::now() + timeout;
+
+    try {
+        // 1. Connect with connect_timeout to 127.0.0.1:port
+        seastar::socket_address addr(seastar::net::inet_address("127.0.0.1"), port);
+        auto conn = co_await seastar::with_timeout(
+            seastar::lowres_clock::now() + _config.connect_timeout,
+            seastar::connect(addr));
+
+        auto out = conn.output();
+        auto in = conn.input();
+
+        try {
+            // 2. Write raw HTTP/1.1 GET request
+            auto request = fmt::format(
+                "GET {} HTTP/1.1\r\nHost: localhost:{}\r\nConnection: close\r\n\r\n",
+                path, port);
+            co_await out.write(request);
+            co_await out.flush();
+
+            // 3. Read response with probe_timeout deadline
+            seastar::sstring response_data;
+            static constexpr size_t MAX_RESPONSE_SIZE = 65536;  // 64KB limit (Rule #4)
+
+            while (response_data.size() < MAX_RESPONSE_SIZE) {
+                auto buf = co_await seastar::with_timeout(deadline, in.read());
+                if (buf.empty()) break;  // EOF
+                response_data.append(buf.get(), buf.size());
+            }
+
+            // 4. Close streams
+            co_await out.close();
+            co_await in.close();
+
+            // 5. Parse HTTP status — look for "HTTP/1.1 200" or "HTTP/1.0 200"
+            if (response_data.size() < 12) {
+                co_return std::nullopt;
+            }
+
+            auto status_end = response_data.find("\r\n");
+            if (status_end == seastar::sstring::npos) {
+                co_return std::nullopt;
+            }
+
+            auto status_line = response_data.substr(0, status_end);
+            if (status_line.find("200") == seastar::sstring::npos) {
+                log_discovery.debug("Port {} returned non-200: {}", port, status_line);
+                co_return std::nullopt;
+            }
+
+            // 6. Extract body (after \r\n\r\n)
+            auto body_start = response_data.find("\r\n\r\n");
+            if (body_start == seastar::sstring::npos) {
+                co_return std::nullopt;
+            }
+
+            co_return response_data.substr(body_start + 4);
+        } catch (...) {
+            // Ensure streams are closed in failure path
+            try { co_await out.close(); } catch (...) {}
+            try { co_await in.close(); } catch (...) {}
+            throw;
+        }
+    } catch (const seastar::timed_out_error&) {
+        log_discovery.debug("Port {} probe timed out", port);
+        co_return std::nullopt;
+    } catch (const std::system_error& e) {
+        log_discovery.debug("Port {} probe connection error: {}", port, e.what());
+        co_return std::nullopt;
+    } catch (const std::exception& e) {
+        log_discovery.debug("Port {} probe failed: {}", port, e.what());
+        co_return std::nullopt;
+    }
+}
+
+seastar::future<std::optional<DiscoveredBackend>> LocalDiscoveryService::probe_port(uint16_t port) {
+    // 1. Send GET /v1/models with probe_timeout
+    auto body = co_await http_get_local(port, "/v1/models", _config.probe_timeout);
+    if (!body) {
+        co_return std::nullopt;
+    }
+
+    // 2. Parse the response
+    auto backend = parse_models_response(port, *body);
+    co_return std::make_optional(std::move(backend));
+}
+
+DiscoveredBackend LocalDiscoveryService::parse_models_response(
+        uint16_t port, const seastar::sstring& body) {
+    DiscoveredBackend backend;
+    backend.port = port;
+    backend.last_seen = std::chrono::steady_clock::now();
+
+    // Parse JSON with RapidJSON
+    rapidjson::Document doc;
+    doc.Parse(body.c_str(), body.size());
+
+    if (!doc.HasParseError() && doc.IsObject() && doc.HasMember("data") && doc["data"].IsArray()) {
+        const auto& data = doc["data"];
+        size_t model_count = 0;
+        for (rapidjson::SizeType i = 0; i < data.Size() && model_count < DiscoveredBackend::MAX_MODELS; ++i) {
+            if (data[i].IsObject() && data[i].HasMember("id") && data[i]["id"].IsString()) {
+                // Rule #7 equivalent: null-guard C string from RapidJSON
+                const char* model_id = data[i]["id"].GetString();
+                if (model_id) {
+                    backend.available_models.emplace_back(model_id);
+                    ++model_count;
+                }
+            }
+        }
+    }
+
+    // Detect server type
+    backend.server_type = detect_server_type(port, body);
+
+    return backend;
+}
+
+std::string LocalDiscoveryService::detect_server_type(uint16_t port, const seastar::sstring& body) {
+    // Check response body for distinctive markers first
+    if (body.find("ollama") != seastar::sstring::npos) {
+        return "ollama";
+    }
+
+    // Check if any model ID contains ":" (like "llama3:8b") — likely Ollama
+    rapidjson::Document doc;
+    doc.Parse(body.c_str(), body.size());
+    if (!doc.HasParseError() && doc.IsObject() && doc.HasMember("data") && doc["data"].IsArray()) {
+        const auto& data = doc["data"];
+        for (rapidjson::SizeType i = 0; i < data.Size(); ++i) {
+            if (data[i].IsObject() && data[i].HasMember("id") && data[i]["id"].IsString()) {
+                const char* id = data[i]["id"].GetString();
+                if (id && std::strchr(id, ':') != nullptr) {
+                    return "ollama";
+                }
+            }
+        }
+    }
+
+    // Check for vLLM markers
+    if (port == 8080 && (body.find("vllm") != seastar::sstring::npos ||
+                          body.find("model_permission") != seastar::sstring::npos)) {
+        return "vllm";
+    }
+
+    // Port-based defaults
+    switch (port) {
+        case 11434: return "ollama";
+        case 1234:  return "lmstudio";
+        case 8000:  return "llamacpp";
+        case 5000:  return "textgenui";
+        case 3000:  return "localai";
+        default:    return "unknown";
+    }
+}
+
+seastar::future<> LocalDiscoveryService::reconcile(
+        std::vector<DiscoveredBackend> discovered) {
+    // Build set of ports that responded successfully
+    absl::flat_hash_map<uint16_t, DiscoveredBackend*> discovered_by_port;
+    for (auto& d : discovered) {
+        discovered_by_port[d.port] = &d;
+    }
+
+    // 1. Check for disappeared backends (in _known_backends but not in results)
+    std::vector<uint16_t> to_remove;
+    for (auto& [port, known] : _known_backends) {
+        auto it = discovered_by_port.find(port);
+        if (it == discovered_by_port.end()) {
+            // Backend missed this probe
+            known.consecutive_failures++;
+            if (known.consecutive_failures >= REMOVAL_THRESHOLD) {
+                to_remove.push_back(port);
+            }
+        } else {
+            // Backend still healthy — reset failure counter, update state
+            known.consecutive_failures = 0;
+            known.last_seen = it->second->last_seen;
+
+            // Check if models changed
+            if (known.available_models != it->second->available_models) {
+                log_discovery.info("Backend on port {} models changed: {} -> {}",
+                    port, known.available_models.size(), it->second->available_models.size());
+                known.available_models = std::move(it->second->available_models);
+            }
+        }
+    }
+
+    // Remove disappeared backends
+    for (auto port : to_remove) {
+        auto it = _known_backends.find(port);
+        if (it != _known_backends.end()) {
+            auto id = it->second.id;
+            co_await _router.unregister_backend_global(id);
+            log_discovery.info("Backend on port {} disappeared, unregistered (id={})", port, id);
+            _known_backends.erase(it);
+            _backends_removed++;
+        }
+    }
+
+    // 2. Check for new backends (in results but not in _known_backends)
+    for (auto& d : discovered) {
+        if (_known_backends.contains(d.port)) {
+            continue;  // Already tracked
+        }
+
+        // Check capacity limit
+        if (_known_backends.size() >= MAX_KNOWN_BACKENDS) {
+            _overflow_drops++;
+            log_discovery.warn("MAX_KNOWN_BACKENDS ({}) reached, dropping backend on port {}",
+                MAX_KNOWN_BACKENDS, d.port);
+            continue;
+        }
+
+        // Assign ID and register
+        d.id = _next_backend_id++;
+        seastar::socket_address addr(seastar::net::inet_address("127.0.0.1"), d.port);
+        co_await _router.register_backend_global(d.id, addr, 100, 0);
+
+        // Build models string for logging
+        std::string models_str;
+        for (size_t i = 0; i < d.available_models.size() && i < 5; ++i) {
+            if (i > 0) models_str += ", ";
+            models_str += d.available_models[i];
+        }
+        if (d.available_models.size() > 5) {
+            models_str += fmt::format(", ... (+{})", d.available_models.size() - 5);
+        }
+
+        log_discovery.info("Discovered {} on port {} (id={}, models: [{}])",
+            d.server_type, d.port, d.id, models_str);
+
+        _known_backends[d.port] = std::move(d);
+        _backends_added++;
+    }
+}
+
+}  // namespace ranvier
