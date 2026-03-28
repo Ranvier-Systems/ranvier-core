@@ -244,6 +244,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/gossip_transport.cpp
       src/health_service.cpp
       src/http_controller.cpp
+      src/intent_classifier.cpp
       src/k8s_discovery_service.cpp
       src/node_slab.cpp
       src/router_service.cpp
@@ -814,6 +815,7 @@ if(Seastar_FOUND)
       src/health_service.cpp
       src/k8s_discovery_service.cpp
       src/http_controller.cpp
+      src/intent_classifier.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
       src/stream_parser.cpp
