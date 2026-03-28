@@ -35,6 +35,30 @@ Application::Application(RanvierConfig config, std::string config_path)
 // Destructor defined here where GossipService is complete (via gossip_service.hpp)
 Application::~Application() = default;
 
+void Application::apply_local_mode_overrides() {
+    if (!_config.local_mode.enabled) return;
+
+    log_main.info("Local mode enabled — applying overrides");
+
+    if (_config.local_mode.disable_clustering) {
+        _config.cluster.enabled = false;
+        log_main.info("  Clustering disabled (local mode)");
+    }
+
+    if (_config.local_mode.disable_persistence) {
+        log_main.info("  Persistence disabled (local mode)");
+    }
+
+    if (_config.local_mode.auto_discover_backends) {
+        std::ostringstream ports_oss;
+        for (size_t i = 0; i < _config.local_mode.discovery_ports.size(); ++i) {
+            if (i > 0) ports_oss << ", ";
+            ports_oss << _config.local_mode.discovery_ports[i];
+        }
+        log_main.info("  Auto-discovery enabled on ports: {}", ports_oss.str());
+    }
+}
+
 seastar::future<> Application::init_tokenizer() {
     // Maximum tokenizer file size (100MB) - prevents OOM from misconfiguration
     static constexpr uint64_t MAX_TOKENIZER_SIZE = 100 * 1024 * 1024;
@@ -186,6 +210,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.intent_classifier.edit_system_keywords = config.intent_classification.edit_system_keywords;
     cfg.intent_classifier.edit_tag_patterns = config.intent_classification.edit_tag_patterns;
     cfg.intent_classifier.rebuild_quoted_fields();
+    // Local mode settings
+    cfg.local_mode = config.local_mode;
     return cfg;
 }
 
@@ -502,6 +528,10 @@ seastar::future<> Application::startup() {
 
     // Use the gate to track startup completion
     return seastar::try_with_gate(_lifecycle_gate, [this] {
+        // 0. Apply local mode overrides BEFORE distributing config to shards.
+        // This mutates _config so all shards receive the overridden values.
+        apply_local_mode_overrides();
+
         // 1. Initialize sharded config - distribute config to all CPU cores
         // This provides lock-free per-core access to configuration
         return _sharded_config.start(ShardedConfig(_config)).then([this] {
@@ -653,7 +683,11 @@ seastar::future<> Application::startup() {
                 _tokenizer_json.shrink_to_fit();
             });
         }).then([this] {
-            // 10. Initialize persistence
+            // 10. Initialize persistence (skip when local mode disables it)
+            if (_config.local_mode.enabled && _config.local_mode.disable_persistence) {
+                log_main.info("Persistence skipped (local mode)");
+                return seastar::make_ready_future<>();
+            }
             return init_persistence();
         }).then([this] {
             // 10. Initialize health checker
@@ -669,7 +703,11 @@ seastar::future<> Application::startup() {
             _router->start_draining_reaper();
             return seastar::make_ready_future<>();
         }).then([this] {
-            // 14. Load persisted state
+            // 14. Load persisted state (skip when local mode disables persistence)
+            if (_config.local_mode.enabled && _config.local_mode.disable_persistence) {
+                log_main.info("Persisted state load skipped (local mode)");
+                return seastar::make_ready_future<>();
+            }
             return load_persisted_state();
         }).then([this] {
             // 15. Start K8s discovery service if enabled
