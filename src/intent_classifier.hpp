@@ -55,11 +55,30 @@ struct IntentClassifierConfig {
     // FIM field names — if any appears as a top-level JSON key, → AUTOCOMPLETE
     std::vector<std::string> fim_fields = {"suffix", "fim_prefix", "fim_middle", "fim_suffix"};
 
+    // Pre-computed quoted FIM field names for hot-path substring search.
+    // Each entry is "\"field\"" — avoids heap allocation per request.
+    // Populated by rebuild_quoted_fields(), which must be called after
+    // modifying fim_fields.
+    std::vector<std::string> fim_fields_quoted;
+
     // Keywords matched case-insensitively in the first system message → EDIT
     std::vector<std::string> edit_system_keywords = {"diff", "rewrite", "refactor", "edit", "patch", "apply"};
 
     // Tag patterns matched literally in the first system message → EDIT
     std::vector<std::string> edit_tag_patterns = {"<diff>", "<edit>", "<rewrite>", "<patch>"};
+
+    // Rebuild fim_fields_quoted from fim_fields. Called automatically by the
+    // constructor; must also be called after modifying fim_fields at runtime
+    // (e.g., config reload, test setup).
+    void rebuild_quoted_fields() {
+        fim_fields_quoted.clear();
+        fim_fields_quoted.reserve(fim_fields.size());
+        for (const auto& f : fim_fields) {
+            fim_fields_quoted.push_back("\"" + f + "\"");
+        }
+    }
+
+    IntentClassifierConfig() { rebuild_quoted_fields(); }
 };
 
 // =============================================================================

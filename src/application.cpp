@@ -185,6 +185,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.intent_classifier.fim_fields = config.intent_classification.fim_fields;
     cfg.intent_classifier.edit_system_keywords = config.intent_classification.edit_system_keywords;
     cfg.intent_classifier.edit_tag_patterns = config.intent_classification.edit_tag_patterns;
+    cfg.intent_classifier.rebuild_quoted_fields();
     return cfg;
 }
 

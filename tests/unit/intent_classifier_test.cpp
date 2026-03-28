@@ -77,12 +77,14 @@ TEST_F(FimDetectionTest, FimFieldInValueNotKey) {
 
 TEST_F(FimDetectionTest, CustomFimFieldsRespected) {
     config.fim_fields = {"my_custom_fim"};
+    config.rebuild_quoted_fields();
     std::string body = R"({"my_custom_fim": "code here", "prompt": "test"})";
     EXPECT_EQ(classify_intent(chat_endpoint, body, config), RequestIntent::AUTOCOMPLETE);
 }
 
 TEST_F(FimDetectionTest, EmptyFimFieldsSkipsFimDetection) {
     config.fim_fields.clear();
+    config.rebuild_quoted_fields();
     std::string body = R"({"suffix": "code", "prompt": "test"})";
     // With empty fim_fields, suffix won't trigger FIM detection
     // But endpoint is chat, so it falls through to CHAT
@@ -101,6 +103,7 @@ protected:
 TEST(EndpointDetectionTest, CompletionsEndpointIsAutocomplete) {
     IntentClassifierConfig config;
     config.fim_fields.clear();  // Disable FIM field detection to isolate endpoint check
+    config.rebuild_quoted_fields();
     std::string body = R"({"prompt": "Hello world"})";
     EXPECT_EQ(classify_intent("/v1/completions", body, config), RequestIntent::AUTOCOMPLETE);
 }
@@ -108,6 +111,7 @@ TEST(EndpointDetectionTest, CompletionsEndpointIsAutocomplete) {
 TEST(EndpointDetectionTest, ChatCompletionsEndpointIsNotAutocomplete) {
     IntentClassifierConfig config;
     config.fim_fields.clear();
+    config.rebuild_quoted_fields();
     std::string body = R"({"messages": [{"role": "user", "content": "hello"}]})";
     EXPECT_EQ(classify_intent("/v1/chat/completions", body, config), RequestIntent::CHAT);
 }
@@ -300,6 +304,7 @@ TEST_F(CascadePriorityTest, EndpointBeatsEditKeyword) {
     std::string body = R"({"messages": [{"role": "system", "content": "Refactor this"}], "prompt": "code"})";
     // FIM fields empty for isolation
     config.fim_fields.clear();
+    config.rebuild_quoted_fields();
     EXPECT_EQ(classify_intent("/v1/completions", body, config), RequestIntent::AUTOCOMPLETE);
 }
 
@@ -320,6 +325,24 @@ TEST(IntentClassifierConfigTest, DefaultFimFields) {
     EXPECT_EQ(config.fim_fields[1], "fim_prefix");
     EXPECT_EQ(config.fim_fields[2], "fim_middle");
     EXPECT_EQ(config.fim_fields[3], "fim_suffix");
+}
+
+TEST(IntentClassifierConfigTest, DefaultQuotedFieldsPreComputed) {
+    IntentClassifierConfig config;
+    ASSERT_EQ(config.fim_fields_quoted.size(), 4u);
+    EXPECT_EQ(config.fim_fields_quoted[0], "\"suffix\"");
+    EXPECT_EQ(config.fim_fields_quoted[1], "\"fim_prefix\"");
+    EXPECT_EQ(config.fim_fields_quoted[2], "\"fim_middle\"");
+    EXPECT_EQ(config.fim_fields_quoted[3], "\"fim_suffix\"");
+}
+
+TEST(IntentClassifierConfigTest, RebuildQuotedFieldsAfterMutation) {
+    IntentClassifierConfig config;
+    config.fim_fields = {"custom_a", "custom_b"};
+    config.rebuild_quoted_fields();
+    ASSERT_EQ(config.fim_fields_quoted.size(), 2u);
+    EXPECT_EQ(config.fim_fields_quoted[0], "\"custom_a\"");
+    EXPECT_EQ(config.fim_fields_quoted[1], "\"custom_b\"");
 }
 
 TEST(IntentClassifierConfigTest, DefaultEditSystemKeywords) {
@@ -494,6 +517,7 @@ protected:
 TEST_F(EndpointVariationTest, TrailingSlashDoesNotMatch) {
     // Exact string match — /v1/completions/ should NOT trigger AUTOCOMPLETE
     config.fim_fields.clear();
+    config.rebuild_quoted_fields();
     std::string body = R"({"prompt": "hello"})";
     EXPECT_NE(classify_intent("/v1/completions/", body, config), RequestIntent::AUTOCOMPLETE);
 }
@@ -501,12 +525,14 @@ TEST_F(EndpointVariationTest, TrailingSlashDoesNotMatch) {
 TEST_F(EndpointVariationTest, QueryParamsDoNotMatch) {
     // /v1/completions?model=x is not an exact match
     config.fim_fields.clear();
+    config.rebuild_quoted_fields();
     std::string body = R"({"prompt": "hello"})";
     EXPECT_NE(classify_intent("/v1/completions?model=x", body, config), RequestIntent::AUTOCOMPLETE);
 }
 
 TEST_F(EndpointVariationTest, CaseSensitiveEndpoint) {
     config.fim_fields.clear();
+    config.rebuild_quoted_fields();
     std::string body = R"({"prompt": "hello"})";
     EXPECT_NE(classify_intent("/v1/Completions", body, config), RequestIntent::AUTOCOMPLETE);
 }

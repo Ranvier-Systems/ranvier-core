@@ -11,11 +11,9 @@ RequestIntent classify_intent(std::string_view endpoint,
                               const IntentClassifierConfig& config) {
 
     // Step 1: FIM detection — check for top-level FIM fields in body.
-    // Uses substring search on raw JSON to avoid re-parsing (the fields are
-    // distinctive enough that false positives are negligible for classification).
-    for (const auto& field : config.fim_fields) {
-        // Search for "field_name" pattern (quoted JSON key)
-        std::string quoted = "\"" + field + "\"";
+    // Uses pre-computed quoted field names ("\"suffix\"", etc.) to avoid
+    // heap allocation per request on the hot path.
+    for (const auto& quoted : config.fim_fields_quoted) {
         if (body_view.find(quoted) != std::string_view::npos) {
             return RequestIntent::AUTOCOMPLETE;
         }
