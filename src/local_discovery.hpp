@@ -21,6 +21,7 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics.hh>
@@ -71,6 +72,7 @@ private:
     RouterService& _router;
     Config _config;
     seastar::gate _gate;
+    seastar::abort_source _as;
     bool _running = false;
     seastar::future<> _loop_future = seastar::make_ready_future<>();
 

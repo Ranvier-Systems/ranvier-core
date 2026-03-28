@@ -10,6 +10,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
@@ -53,6 +54,8 @@ seastar::future<> LocalDiscoveryService::stop() {
     _metrics.clear();
 
     _running = false;
+    // Abort the sleep so the loop exits promptly instead of waiting up to scan_interval
+    _as.request_abort();
     // Close the gate (signals loop to exit and waits for in-flight probes)
     co_await _gate.close();
     // Await the loop future to ensure clean exit
@@ -85,8 +88,10 @@ seastar::future<> LocalDiscoveryService::discovery_loop() {
             // Reconcile with router
             co_await reconcile(std::move(results));
 
-            co_await seastar::sleep(_config.scan_interval);
+            co_await seastar::sleep_abortable(_config.scan_interval, _as);
         }
+    } catch (const seastar::sleep_aborted&) {
+        log_discovery.debug("Discovery loop exiting: sleep aborted");
     } catch (const seastar::gate_closed_exception&) {
         log_discovery.debug("Discovery loop exiting: gate closed");
     } catch (const std::exception& e) {
@@ -146,7 +151,7 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
         // 5. Parse HTTP status — look for "HTTP/1.1 200" or "HTTP/1.0 200"
         static constexpr size_t MIN_STATUS_LINE_LEN = 12;  // "HTTP/1.x 200"
         static constexpr const char HEADER_BODY_SEPARATOR[] = "\r\n\r\n";
-        static constexpr size_t HEADER_BODY_SEPARATOR_LEN = 4;
+        static constexpr size_t HEADER_BODY_SEPARATOR_LEN = sizeof(HEADER_BODY_SEPARATOR) - 1;
 
         if (response_data.size() < MIN_STATUS_LINE_LEN) {
             co_return std::nullopt;
@@ -301,13 +306,13 @@ seastar::future<> LocalDiscoveryService::reconcile(
     }
 
     // 2. Check for new backends (in results but not in _known_backends)
+    auto effective_limit = std::min(_config.max_backends, MAX_KNOWN_BACKENDS);
     for (auto& d : discovered) {
         if (_known_backends.contains(d.port)) {
             continue;  // Already tracked
         }
 
         // Check capacity limit (configurable, hard-capped by MAX_KNOWN_BACKENDS)
-        auto effective_limit = std::min(_config.max_backends, MAX_KNOWN_BACKENDS);
         if (_known_backends.size() >= effective_limit) {
             _overflow_drops++;
             log_discovery.warn("Backend limit ({}) reached, dropping backend on port {}",
