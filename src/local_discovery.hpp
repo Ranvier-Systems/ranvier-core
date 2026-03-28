@@ -30,6 +30,16 @@ namespace ranvier {
 // Logger for local discovery
 inline seastar::logger log_discovery("ranvier.discovery");
 
+// Well-known default ports for local LLM servers
+namespace local_ports {
+    constexpr uint16_t OLLAMA     = 11434;
+    constexpr uint16_t VLLM      = 8080;
+    constexpr uint16_t LMSTUDIO  = 1234;
+    constexpr uint16_t LLAMACPP  = 8000;
+    constexpr uint16_t TEXTGENUI = 5000;
+    constexpr uint16_t LOCALAI   = 3000;
+}  // namespace local_ports
+
 // Represents a discovered local LLM backend
 struct DiscoveredBackend {
     BackendId id = 0;                                  // Assigned during registration

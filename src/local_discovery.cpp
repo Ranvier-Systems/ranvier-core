@@ -133,7 +133,11 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
             co_await in.close();
 
             // 5. Parse HTTP status — look for "HTTP/1.1 200" or "HTTP/1.0 200"
-            if (response_data.size() < 12) {
+            // Minimum valid: "HTTP/1.x 200" = 12 chars
+            static constexpr size_t MIN_STATUS_LINE_LEN = 12;  // "HTTP/1.x 200"
+            static constexpr std::string_view HEADER_BODY_SEPARATOR = "\r\n\r\n";
+
+            if (response_data.size() < MIN_STATUS_LINE_LEN) {
                 co_return std::nullopt;
             }
 
@@ -149,12 +153,12 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
             }
 
             // 6. Extract body (after \r\n\r\n)
-            auto body_start = response_data.find("\r\n\r\n");
+            auto body_start = response_data.find(HEADER_BODY_SEPARATOR.data());
             if (body_start == seastar::sstring::npos) {
                 co_return std::nullopt;
             }
 
-            co_return response_data.substr(body_start + 4);
+            co_return response_data.substr(body_start + HEADER_BODY_SEPARATOR.size());
         } catch (...) {
             // Ensure streams are closed in failure path
             try { co_await out.close(); } catch (...) {}
@@ -238,19 +242,19 @@ std::string LocalDiscoveryService::detect_server_type(uint16_t port, const seast
     }
 
     // Check for vLLM markers
-    if (port == 8080 && (body.find("vllm") != seastar::sstring::npos ||
-                          body.find("model_permission") != seastar::sstring::npos)) {
+    if (port == local_ports::VLLM && (body.find("vllm") != seastar::sstring::npos ||
+                                       body.find("model_permission") != seastar::sstring::npos)) {
         return "vllm";
     }
 
     // Port-based defaults
     switch (port) {
-        case 11434: return "ollama";
-        case 1234:  return "lmstudio";
-        case 8000:  return "llamacpp";
-        case 5000:  return "textgenui";
-        case 3000:  return "localai";
-        default:    return "unknown";
+        case local_ports::OLLAMA:     return "ollama";
+        case local_ports::LMSTUDIO:   return "lmstudio";
+        case local_ports::LLAMACPP:   return "llamacpp";
+        case local_ports::TEXTGENUI:  return "textgenui";
+        case local_ports::LOCALAI:    return "localai";
+        default:                      return "unknown";
     }
 }
 
