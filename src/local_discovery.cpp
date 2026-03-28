@@ -111,6 +111,10 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
         auto out = conn.output();
         auto in = conn.input();
 
+        // Use exception_ptr to close streams outside catch (co_await not allowed in handlers)
+        std::exception_ptr ep;
+        seastar::sstring response_data;
+
         try {
             // 2. Write raw HTTP/1.1 GET request
             auto request = fmt::format(
@@ -120,7 +124,6 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
             co_await out.flush();
 
             // 3. Read response with probe_timeout deadline
-            seastar::sstring response_data;
             static constexpr size_t MAX_RESPONSE_SIZE = 65536;  // 64KB limit (Rule #4)
 
             while (response_data.size() < MAX_RESPONSE_SIZE) {
@@ -128,44 +131,44 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
                 if (buf.empty()) break;  // EOF
                 response_data.append(buf.get(), buf.size());
             }
-
-            // 4. Close streams
-            co_await out.close();
-            co_await in.close();
-
-            // 5. Parse HTTP status — look for "HTTP/1.1 200" or "HTTP/1.0 200"
-            // Minimum valid: "HTTP/1.x 200" = 12 chars
-            static constexpr size_t MIN_STATUS_LINE_LEN = 12;  // "HTTP/1.x 200"
-            static constexpr std::string_view HEADER_BODY_SEPARATOR = "\r\n\r\n";
-
-            if (response_data.size() < MIN_STATUS_LINE_LEN) {
-                co_return std::nullopt;
-            }
-
-            auto status_end = response_data.find("\r\n");
-            if (status_end == seastar::sstring::npos) {
-                co_return std::nullopt;
-            }
-
-            auto status_line = response_data.substr(0, status_end);
-            if (status_line.find("200") == seastar::sstring::npos) {
-                log_discovery.debug("Port {} returned non-200: {}", port, status_line);
-                co_return std::nullopt;
-            }
-
-            // 6. Extract body (after \r\n\r\n)
-            auto body_start = response_data.find(HEADER_BODY_SEPARATOR.data());
-            if (body_start == seastar::sstring::npos) {
-                co_return std::nullopt;
-            }
-
-            co_return response_data.substr(body_start + HEADER_BODY_SEPARATOR.size());
         } catch (...) {
-            // Ensure streams are closed in failure path
-            try { co_await out.close(); } catch (...) {}
-            try { co_await in.close(); } catch (...) {}
-            throw;
+            ep = std::current_exception();
         }
+
+        // 4. Close streams in all paths (success, failure, timeout)
+        try { co_await out.close(); } catch (...) {}
+        try { co_await in.close(); } catch (...) {}
+
+        if (ep) {
+            std::rethrow_exception(ep);
+        }
+
+        // 5. Parse HTTP status — look for "HTTP/1.1 200" or "HTTP/1.0 200"
+        static constexpr size_t MIN_STATUS_LINE_LEN = 12;  // "HTTP/1.x 200"
+        static constexpr std::string_view HEADER_BODY_SEPARATOR = "\r\n\r\n";
+
+        if (response_data.size() < MIN_STATUS_LINE_LEN) {
+            co_return std::nullopt;
+        }
+
+        auto status_end = response_data.find("\r\n");
+        if (status_end == seastar::sstring::npos) {
+            co_return std::nullopt;
+        }
+
+        auto status_line = response_data.substr(0, status_end);
+        if (status_line.find("200") == seastar::sstring::npos) {
+            log_discovery.debug("Port {} returned non-200: {}", port, status_line);
+            co_return std::nullopt;
+        }
+
+        // 6. Extract body (after \r\n\r\n)
+        auto body_start = response_data.find(HEADER_BODY_SEPARATOR.data());
+        if (body_start == seastar::sstring::npos) {
+            co_return std::nullopt;
+        }
+
+        co_return response_data.substr(body_start + HEADER_BODY_SEPARATOR.size());
     } catch (const seastar::timed_out_error&) {
         log_discovery.debug("Port {} probe timed out", port);
         co_return std::nullopt;
