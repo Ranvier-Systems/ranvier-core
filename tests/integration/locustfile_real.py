@@ -62,6 +62,17 @@ Environment Variables:
         - OpenAI:   {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
         - Simple:   {"prompt": "user prompt text here"}
 
+    Priority Queue / Agent Simulation:
+        SIMULATE_AGENTS           - Enable agent simulation (default: false)
+                                    When enabled, each Locust user randomly picks a User-Agent
+                                    from the known_user_agents pool to exercise fair scheduling.
+        AGENT_DISTRIBUTION        - Agent selection distribution (default: uniform)
+                                    "uniform": equal weight across all agents
+                                    "realistic": weighted distribution (40% Cursor, 25% claude-code,
+                                    15% cline, 10% aider, 10% batch-job)
+        INJECT_PRIORITY_HEADER    - Inject X-Ranvier-Priority header (default: false)
+                                    When enabled, batch-job agents send X-Ranvier-Priority: low
+
     Large Prefix Stress Testing:
         LARGE_PREFIX_MIN_TOKENS - Minimum prefix size (default: 2000)
         LARGE_PREFIX_MAX_TOKENS - Maximum prefix size (default: 8000)
@@ -612,6 +623,14 @@ READ_TIMEOUT_SECONDS = int(os.environ.get("READ_TIMEOUT_SECONDS", "120"))  # 2 m
 # Lower values reduce GPU contention and incomplete rates without affecting TTFT.
 # For TTFT-focused benchmarks with high user counts, use 20-50.
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "100"))
+
+# Priority queue / agent simulation configuration
+SIMULATE_AGENTS = os.environ.get("SIMULATE_AGENTS", "false").lower() in ("true", "1", "yes")
+AGENT_DISTRIBUTION = os.environ.get("AGENT_DISTRIBUTION", "uniform").lower()
+INJECT_PRIORITY_HEADER = os.environ.get("INJECT_PRIORITY_HEADER", "false").lower() in ("true", "1", "yes")
+
+AGENT_POOL = ["Cursor", "claude-code", "cline", "aider", "batch-job"]
+AGENT_WEIGHTS_REALISTIC = [0.40, 0.25, 0.15, 0.10, 0.10]
 
 # ============================================================================
 # Prompt Templates with Shared Prefixes
@@ -2778,6 +2797,89 @@ def get_histogram_percentile(metrics_url: str, metric_name: str, percentile: flo
         return None
 
 
+def get_labeled_metric_values(metrics_url: str, metric_name: str, label: str) -> dict:
+    """Extract labeled metric values from Prometheus endpoint.
+
+    Returns a dict mapping label values to float values.
+    Example: get_labeled_metric_values(url, "ranvier_scheduler_queue_depth", "priority")
+      -> {"interactive": 0.0, "normal": 0.0, "batch": 0.0, "bulk": 0.0}
+    """
+    result = {}
+    try:
+        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+        if resp.status_code != 200:
+            return result
+
+        pattern = re.compile(
+            rf'{metric_name}\{{{label}="([^"]+)"'
+            r'[^}]*\}\s+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$'
+        )
+
+        for line in resp.text.split("\n"):
+            if line.startswith("#"):
+                continue
+            match = pattern.search(line)
+            if match:
+                result[match.group(1)] = float(match.group(2))
+        return result
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch labeled metrics from {metrics_url}: {e}")
+        return result
+
+
+def get_scheduler_metrics() -> Optional[dict]:
+    """Scrape priority queue scheduler metrics from all Ranvier nodes.
+
+    Only scrapes if ranvier_scheduler_enabled gauge == 1 on at least one node.
+    Returns aggregated scheduler stats or None if scheduler is disabled.
+    """
+    # Check if scheduler is enabled on any node
+    enabled = False
+    for metrics_url in RANVIER_METRICS:
+        val = get_metric_value(metrics_url, "ranvier_scheduler_enabled")
+        if val is not None and val == 1.0:
+            enabled = True
+            break
+
+    if not enabled:
+        return None
+
+    stats: dict = {
+        "queue_depth": {},
+        "dropped_total": {},
+        "wait_seconds_p50": None,
+        "wait_seconds_p99": None,
+        "agents_tracked": 0,
+    }
+
+    # Aggregate across all nodes
+    for metrics_url in RANVIER_METRICS:
+        # Queue depth per priority tier (gauge — take max across nodes as worst case)
+        depths = get_labeled_metric_values(metrics_url, "ranvier_scheduler_queue_depth", "priority")
+        for tier, depth in depths.items():
+            stats["queue_depth"][tier] = max(stats["queue_depth"].get(tier, 0), depth)
+
+        # Dropped total per priority tier (counter — sum across nodes)
+        drops = get_labeled_metric_values(metrics_url, "ranvier_scheduler_dropped_total", "priority")
+        for tier, count in drops.items():
+            stats["dropped_total"][tier] = stats["dropped_total"].get(tier, 0) + count
+
+        # Wait seconds histogram — report worst-case P50/P99 across nodes
+        p50 = get_histogram_percentile(metrics_url, "ranvier_scheduler_wait_seconds", 0.50)
+        p99 = get_histogram_percentile(metrics_url, "ranvier_scheduler_wait_seconds", 0.99)
+        if p50 is not None:
+            stats["wait_seconds_p50"] = max(stats["wait_seconds_p50"] or 0, p50)
+        if p99 is not None:
+            stats["wait_seconds_p99"] = max(stats["wait_seconds_p99"] or 0, p99)
+
+        # Agents tracked (gauge — take max across nodes)
+        agents = get_metric_value(metrics_url, "ranvier_scheduler_agents_tracked")
+        if agents is not None:
+            stats["agents_tracked"] = max(stats["agents_tracked"], int(agents))
+
+    return stats
+
+
 def get_ranvier_latency_breakdown() -> dict:
     """Get Ranvier's internal latency breakdown from Prometheus metrics.
 
@@ -3582,6 +3684,35 @@ def on_test_stop(environment, **kwargs):
     summary.update(latency_breakdown)
     summary.update(prefix_stats)
 
+    # Scrape priority queue scheduler metrics (only when enabled)
+    scheduler_stats = get_scheduler_metrics()
+    if scheduler_stats:
+        logger.info(f"\nPriority Queue Scheduler:")
+        logger.info(f"  Agents Tracked: {scheduler_stats.get('agents_tracked', 'N/A')}")
+
+        queue_depths = scheduler_stats.get("queue_depth", {})
+        if queue_depths:
+            logger.info(f"  Queue Depth (end-of-test):")
+            for tier, depth in queue_depths.items():
+                status = " [WARN: non-zero]" if depth > 0 else ""
+                logger.info(f"    {tier}: {depth}{status}")
+
+        drops = scheduler_stats.get("dropped_total", {})
+        if drops:
+            logger.info(f"  Dropped Requests:")
+            for tier, count in drops.items():
+                status = " [WARN: drops occurred]" if count > 0 else ""
+                logger.info(f"    {tier}: {count}{status}")
+
+        wait_p50 = scheduler_stats.get("wait_seconds_p50")
+        wait_p99 = scheduler_stats.get("wait_seconds_p99")
+        if wait_p50 is not None or wait_p99 is not None:
+            p50_str = f"{wait_p50 * 1000:.2f}ms" if wait_p50 is not None else "N/A"
+            p99_str = f"{wait_p99 * 1000:.2f}ms" if wait_p99 is not None else "N/A"
+            logger.info(f"  Wait Time: P50={p50_str}, P99={p99_str}")
+
+        summary["scheduler"] = scheduler_stats
+
     # Check sync errors
     sync_passed, sync_msg = check_sync_errors()
     logger.info(f"\nCluster Health: {sync_msg}")
@@ -3630,6 +3761,12 @@ class RealBackendUser(HttpUser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._request_count = 0
+        self._user_agent = None
+        if SIMULATE_AGENTS:
+            if AGENT_DISTRIBUTION == "realistic":
+                self._user_agent = random.choices(AGENT_POOL, weights=AGENT_WEIGHTS_REALISTIC, k=1)[0]
+            else:
+                self._user_agent = random.choice(AGENT_POOL)
 
     @task
     def chat_completion(self):
@@ -3697,10 +3834,16 @@ class RealBackendUser(HttpUser):
             # Use tuple timeout: (connect_timeout, read_timeout)
             # read_timeout applies to each socket read, preventing indefinite blocking
             # on iter_lines() when vLLM is slow or unresponsive
+            headers = {"Content-Type": "application/json"}
+            if self._user_agent is not None:
+                headers["User-Agent"] = self._user_agent
+                if INJECT_PRIORITY_HEADER and self._user_agent == "batch-job":
+                    headers["X-Ranvier-Priority"] = "low"
+
             resp = requests.post(
                 f"{target_url}{endpoint}",
                 json=request_body,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 stream=True,
                 timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
             )

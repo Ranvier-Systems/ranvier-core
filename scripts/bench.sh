@@ -255,6 +255,10 @@ BENCHMARK OPTIONS:
     --multi-depth       Enable multi-depth route storage (Option C). Stores routes at
                         each message boundary, not just system message. Useful for
                         conversation continuations and branching scenarios.
+    --priority-queue    Enable priority queue scheduler and agent simulation.
+                        Sets RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=true and
+                        SIMULATE_AGENTS=true. Use for A/B testing with vs. without
+                        the priority queue.
     --no-load-aware     Disable load-aware backend selection. Routes always go to the
                         cached backend regardless of queue depth. Useful for A/B testing
                         cache hit rates vs load balancing trade-offs.
@@ -444,6 +448,7 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+PRIORITY_QUEUE=false
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
 MAX_TOKENS="$DEFAULT_MAX_TOKENS"
@@ -487,6 +492,7 @@ while [[ $# -gt 0 ]]; do
         --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
         --stop-timeout)   STOP_TIMEOUT="$2"; shift 2 ;;
         --cpuset)          CPUSET_OVERRIDE="$2"; shift 2 ;;
+        --priority-queue) PRIORITY_QUEUE=true; shift ;;
         --debug)          DEBUG_BUILD=true; shift ;;
         -h|--help)        print_help; exit 0 ;;
         *)                log_error "Unknown option: $1"; print_help; exit 1 ;;
@@ -1520,6 +1526,8 @@ run_benchmark() {
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
+        -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
+        -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
