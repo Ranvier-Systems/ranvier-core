@@ -1509,6 +1509,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         metrics().increment_priority_active(tier);
     }
 
+    // Intent classification: classify request before routing
+    RequestIntent intent = RequestIntent::CHAT;
+    if (_config.intent_classification_enabled) {
+        intent = classify_intent(endpoint, body_view, _config.intent_classifier);
+        log_proxy.debug("[{}] intent={} priority={} cost_units={:.1f}",
+                       request_id, intent_to_string(intent),
+                       priority_level_to_string(priority), cost.cost_units);
+        metrics().record_intent_request(static_cast<uint8_t>(intent));
+    }
+
     // Initialize ProxyContext with all state needed for streaming
     // This struct bundles request state to reduce lambda capture complexity
     // Using unique_ptr: ownership transfers from handle_proxy to the lambda (no sharing)
@@ -1536,6 +1546,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->estimated_output_tokens = cost.output_tokens;
     ctx->estimated_cost_units = cost.cost_units;
     ctx->priority = priority;
+    ctx->intent = intent;
 
     // Capture User-Agent for fair scheduling (used by RequestScheduler)
     {

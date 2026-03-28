@@ -244,6 +244,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/gossip_transport.cpp
       src/health_service.cpp
       src/http_controller.cpp
+      src/intent_classifier.cpp
       src/k8s_discovery_service.cpp
       src/node_slab.cpp
       src/router_service.cpp
@@ -341,6 +342,18 @@ target_link_libraries(boundary_detector_test
   GTest::gtest_main
 )
 gtest_discover_tests(boundary_detector_test)
+
+# IntentClassifier Unit Tests (Pure C++, no Seastar)
+add_executable(intent_classifier_test
+  tests/unit/intent_classifier_test.cpp
+  src/intent_classifier.cpp
+)
+target_include_directories(intent_classifier_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(intent_classifier_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(intent_classifier_test)
 
 # TextValidator Unit Tests (Pure C++, header-only)
 add_executable(text_validator_test
@@ -814,6 +827,7 @@ if(Seastar_FOUND)
       src/health_service.cpp
       src/k8s_discovery_service.cpp
       src/http_controller.cpp
+      src/intent_classifier.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
       src/stream_parser.cpp

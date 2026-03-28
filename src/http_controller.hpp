@@ -6,6 +6,7 @@
 #include "config.hpp"
 #include "connection_pool.hpp"
 #include "cross_shard_request.hpp"
+#include "intent_classifier.hpp"
 #include "metrics_service.hpp"
 #include "proxy_retry_policy.hpp"
 #include "rate_limiter.hpp"
@@ -134,6 +135,14 @@ struct ProxyContext {
     // Priority tier (populated by extract_priority before routing)
     PriorityLevel priority = PriorityLevel::NORMAL;
 
+    // Intent classification (populated by classify_intent before routing)
+    // Routing preference derived from intent — advisory, not enforced yet.
+    // AUTOCOMPLETE → prefer lowest-latency backend
+    // EDIT → prefer highest-capability backend
+    // CHAT → use normal prefix/cost routing
+    // Actual intent-based route selection is not yet implemented.
+    RequestIntent intent = RequestIntent::CHAT;
+
     // Agent identification for fair scheduling (User-Agent header value)
     std::string user_agent;
 
@@ -193,6 +202,10 @@ struct HttpControllerConfig {
         {"cline",       1},   // HIGH
         {"aider",       1},   // HIGH
     };
+
+    // Intent classification settings (copied from IntentClassificationConfig at init)
+    bool intent_classification_enabled = true;
+    IntentClassifierConfig intent_classifier;
 
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }

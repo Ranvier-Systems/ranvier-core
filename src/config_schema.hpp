@@ -235,6 +235,35 @@ struct PriorityTierConfig {
 };
 
 // =============================================================================
+// Intent Classification Configuration
+// =============================================================================
+
+// Intent classification for wire-format inspection of incoming requests.
+// Classifies requests as AUTOCOMPLETE (FIM), EDIT (code rewrite), or CHAT
+// (default) to provide routing hints for downstream cost-based and agent-aware
+// routing decisions.
+struct IntentClassificationConfig {
+    bool enabled = true;                        // Enable intent classification on proxy requests
+
+    // FIM field names to detect AUTOCOMPLETE intent (top-level JSON keys)
+    // Hard Rule #4: bounded container with overflow counter
+    static constexpr size_t MAX_FIM_FIELDS = 32;
+    std::vector<std::string> fim_fields = {"suffix", "fim_prefix", "fim_middle", "fim_suffix"};
+
+    // Keywords matched (case-insensitive substring) against the first system message
+    // to detect EDIT intent
+    // Hard Rule #4: bounded container with overflow counter
+    static constexpr size_t MAX_EDIT_SYSTEM_KEYWORDS = 64;
+    std::vector<std::string> edit_system_keywords = {"diff", "rewrite", "refactor", "edit", "patch", "apply"};
+
+    // Tag patterns matched (literal substring) against the first system message
+    // to detect EDIT intent
+    // Hard Rule #4: bounded container with overflow counter
+    static constexpr size_t MAX_EDIT_TAG_PATTERNS = 32;
+    std::vector<std::string> edit_tag_patterns = {"<diff>", "<edit>", "<rewrite>", "<patch>"};
+};
+
+// =============================================================================
 // Top-Level Configuration
 // =============================================================================
 
@@ -261,6 +290,7 @@ struct RanvierConfig {
     LoadBalancingConfig load_balancing;
     CostEstimationConfig cost_estimation;
     PriorityTierConfig priority_tier;
+    IntentClassificationConfig intent_classification;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);
