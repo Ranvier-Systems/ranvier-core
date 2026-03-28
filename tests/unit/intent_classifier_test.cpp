@@ -386,3 +386,188 @@ TEST_F(EdgeCaseTest, WhitespaceAroundRoleValue) {
         R"({"role": "user", "content": "go"}]})";
     EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::EDIT);
 }
+
+// =============================================================================
+// String Boundary Parsing
+// =============================================================================
+
+class StringBoundaryTest : public ::testing::Test {
+protected:
+    IntentClassifierConfig config;
+    std::string_view endpoint = "/v1/chat/completions";
+};
+
+TEST_F(StringBoundaryTest, EscapedQuotesInContent) {
+    // Content contains escaped quotes around an edit keyword — the closing-quote
+    // walker must skip \" and the keyword should still match inside the string.
+    std::string body = R"({"messages": [{"role": "system", "content": "output a \"diff\" here"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::EDIT);
+}
+
+TEST_F(StringBoundaryTest, EscapedQuoteDoesNotTerminateEarly) {
+    // Keyword is after an escaped quote — scanner must not stop at \"
+    std::string body = R"({"messages": [{"role": "system", "content": "say \"hello\" then refactor"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::EDIT);
+}
+
+TEST_F(StringBoundaryTest, EscapedQuotesNoKeyword) {
+    // Escaped quotes but no keyword — should be CHAT, not crash or false-positive
+    std::string body = R"({"messages": [{"role": "system", "content": "say \"hello\" nicely"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
+}
+
+// =============================================================================
+// Structured / Multi-Part Content
+// =============================================================================
+
+class StructuredContentTest : public ::testing::Test {
+protected:
+    IntentClassifierConfig config;
+    std::string_view endpoint = "/v1/chat/completions";
+};
+
+TEST_F(StructuredContentTest, ArrayContentNotScanned) {
+    // OpenAI multi-part content format: "content" is an array, not a string.
+    // The scanner looks for a '"' after the colon, which will find the '"type"'
+    // key — not actual content. The keyword in the text part should NOT reliably
+    // trigger. This documents that array content is not supported for edit detection.
+    std::string body = R"({"messages": [{"role": "system", "content": [{"type": "text", "text": "refactor this"}]},)"
+        R"({"role": "user", "content": "go"}]})";
+    auto intent = classify_intent(endpoint, body, config);
+    // Don't assert a specific value — just verify it doesn't crash.
+    // Array content is not a supported detection path.
+    EXPECT_TRUE(intent == RequestIntent::CHAT || intent == RequestIntent::EDIT);
+}
+
+TEST_F(StructuredContentTest, NullContentHandled) {
+    // "content": null — no opening quote found, scanner should bail gracefully
+    std::string body = R"({"messages": [{"role": "system", "content": null},)"
+        R"({"role": "user", "content": "hello"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
+}
+
+// =============================================================================
+// JSON Key Ordering
+// =============================================================================
+
+class KeyOrderingTest : public ::testing::Test {
+protected:
+    IntentClassifierConfig config;
+    std::string_view endpoint = "/v1/chat/completions";
+};
+
+TEST_F(KeyOrderingTest, ContentBeforeRole) {
+    // JSON keys in reverse order: "content" before "role"
+    // The scanner searches for "content" starting from role_value_start, so it
+    // will find a "content" key further in the body. With reversed key order,
+    // "content" appears BEFORE "role" in the same message object — the scanner
+    // starts searching from the "system" value position, so it may miss the
+    // content that appeared earlier.
+    std::string body = R"({"messages": [{"content": "refactor this code", "role": "system"},)"
+        R"({"role": "user", "content": "go"}]})";
+    auto intent = classify_intent(endpoint, body, config);
+    // Document current behavior: scanner searches forward from "system" and
+    // finds the user message's "content" instead. The keyword isn't there → CHAT.
+    // This is a known limitation (JSON key order dependent).
+    EXPECT_EQ(intent, RequestIntent::CHAT);
+}
+
+TEST_F(KeyOrderingTest, NormalKeyOrder) {
+    // Verify the standard order works as baseline for the above test
+    std::string body = R"({"messages": [{"role": "system", "content": "refactor this code"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::EDIT);
+}
+
+// =============================================================================
+// Endpoint Variations
+// =============================================================================
+
+class EndpointVariationTest : public ::testing::Test {
+protected:
+    IntentClassifierConfig config;
+};
+
+TEST_F(EndpointVariationTest, TrailingSlashDoesNotMatch) {
+    // Exact string match — /v1/completions/ should NOT trigger AUTOCOMPLETE
+    config.fim_fields.clear();
+    std::string body = R"({"prompt": "hello"})";
+    EXPECT_NE(classify_intent("/v1/completions/", body, config), RequestIntent::AUTOCOMPLETE);
+}
+
+TEST_F(EndpointVariationTest, QueryParamsDoNotMatch) {
+    // /v1/completions?model=x is not an exact match
+    config.fim_fields.clear();
+    std::string body = R"({"prompt": "hello"})";
+    EXPECT_NE(classify_intent("/v1/completions?model=x", body, config), RequestIntent::AUTOCOMPLETE);
+}
+
+TEST_F(EndpointVariationTest, CaseSensitiveEndpoint) {
+    config.fim_fields.clear();
+    std::string body = R"({"prompt": "hello"})";
+    EXPECT_NE(classify_intent("/v1/Completions", body, config), RequestIntent::AUTOCOMPLETE);
+}
+
+// =============================================================================
+// FIM Field Scope
+// =============================================================================
+
+class FimFieldScopeTest : public ::testing::Test {
+protected:
+    IntentClassifierConfig config;
+    std::string_view endpoint = "/v1/chat/completions";
+};
+
+TEST_F(FimFieldScopeTest, NestedSuffixInContentValue) {
+    // "suffix" appears inside a content string value, not as a top-level key.
+    // The heuristic searches for the quoted key anywhere in the body, so this
+    // WILL match — documenting the known false-positive tradeoff.
+    std::string body = R"({"messages": [{"role": "user", "content": "add a \"suffix\" to the name"}]})";
+    // The substring "suffix" is present as a quoted string, so FIM detection triggers
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::AUTOCOMPLETE);
+}
+
+TEST_F(FimFieldScopeTest, UnquotedSuffixDoesNotTrigger) {
+    // The word suffix without quotes should not trigger — we search for "suffix"
+    // (with quotes) to reduce false positives
+    std::string body = R"({"messages": [{"role": "user", "content": "add suffix to name"}]})";
+    // "suffix" without quotes won't match the quoted key search
+    EXPECT_NE(classify_intent(endpoint, body, config), RequestIntent::AUTOCOMPLETE);
+}
+
+// =============================================================================
+// Short / Minimal Content
+// =============================================================================
+
+class MinimalContentTest : public ::testing::Test {
+protected:
+    IntentClassifierConfig config;
+    std::string_view endpoint = "/v1/chat/completions";
+};
+
+TEST_F(MinimalContentTest, SingleCharacterContent) {
+    std::string body = R"({"messages": [{"role": "system", "content": "x"},)"
+        R"({"role": "user", "content": "hi"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
+}
+
+TEST_F(MinimalContentTest, KeywordIsEntireContent) {
+    std::string body = R"({"messages": [{"role": "system", "content": "diff"},)"
+        R"({"role": "user", "content": "go"}]})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::EDIT);
+}
+
+TEST_F(MinimalContentTest, NoMessagesArray) {
+    // Body has no "messages" key at all (e.g. raw prompt on chat endpoint)
+    std::string body = R"({"prompt": "hello world", "model": "gpt-4"})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::CHAT);
+}
+
+TEST_F(MinimalContentTest, NoMessagesButHasFimField) {
+    // No messages array, but has a FIM field — FIM detection still triggers
+    std::string body = R"({"prompt": "def foo", "suffix": "return 1"})";
+    EXPECT_EQ(classify_intent(endpoint, body, config), RequestIntent::AUTOCOMPLETE);
+}
