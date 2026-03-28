@@ -87,6 +87,12 @@ private:
     // Consecutive missed probes before removing a backend
     static constexpr uint32_t REMOVAL_THRESHOLD = 3;
 
+    // Max parallel probe coroutines per scan cycle
+    static constexpr size_t MAX_CONCURRENT_PROBES = 6;
+
+    // Max model names shown in discovery log messages
+    static constexpr size_t MAX_LOG_MODELS = 5;
+
     // Background loop
     seastar::future<> discovery_loop();
 

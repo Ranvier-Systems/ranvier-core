@@ -67,9 +67,9 @@ seastar::future<> LocalDiscoveryService::discovery_loop() {
         while (_running) {
             std::vector<DiscoveredBackend> results;
 
-            // Probe all configured ports in parallel (max 6 concurrent)
+            // Probe all configured ports in parallel
             co_await seastar::max_concurrent_for_each(
-                _config.discovery_ports, 6,
+                _config.discovery_ports, MAX_CONCURRENT_PROBES,
                 [this, &results](uint16_t port) -> seastar::future<> {
                     _probes_sent++;
                     auto result = co_await probe_port(port);
@@ -321,14 +321,14 @@ seastar::future<> LocalDiscoveryService::reconcile(
         seastar::socket_address addr(seastar::net::inet_address("127.0.0.1"), d.port);
         co_await _router.register_backend_global(d.id, addr, 100, 0);
 
-        // Build models string for logging
+        // Build models string for logging (truncate for readability)
         std::string models_str;
-        for (size_t i = 0; i < d.available_models.size() && i < 5; ++i) {
+        for (size_t i = 0; i < d.available_models.size() && i < MAX_LOG_MODELS; ++i) {
             if (i > 0) models_str += ", ";
             models_str += d.available_models[i];
         }
-        if (d.available_models.size() > 5) {
-            models_str += fmt::format(", ... (+{})", d.available_models.size() - 5);
+        if (d.available_models.size() > MAX_LOG_MODELS) {
+            models_str += fmt::format(", ... (+{})", d.available_models.size() - MAX_LOG_MODELS);
         }
 
         log_discovery.info("Discovered {} on port {} (id={}, models: [{}])",
