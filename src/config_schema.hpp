@@ -235,13 +235,13 @@ struct PriorityTierConfig {
 };
 
 // =============================================================================
-// Intent Classification Configuration (VISION 1.4)
+// Intent Classification Configuration
 // =============================================================================
 
 // Intent classification for wire-format inspection of incoming requests.
 // Classifies requests as AUTOCOMPLETE (FIM), EDIT (code rewrite), or CHAT
 // (default) to provide routing hints for downstream cost-based and agent-aware
-// routing (VISION 2.3 / 3.2).
+// routing decisions.
 struct IntentClassificationConfig {
     bool enabled = true;                        // Enable intent classification on proxy requests
 

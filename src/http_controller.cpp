@@ -1603,7 +1603,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         metrics().increment_priority_active(tier);
     }
 
-    // Intent classification: classify request before routing (VISION 1.4)
+    // Intent classification: classify request before routing
     RequestIntent intent = RequestIntent::CHAT;
     if (_config.intent_classification_enabled) {
         intent = classify_intent(endpoint, body_view);

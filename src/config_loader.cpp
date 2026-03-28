@@ -1191,7 +1191,7 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                 }
             }
         }
-        // Intent classification section (VISION 1.4)
+        // Intent classification section
         if (yaml["intent_classification"]) {
             YAML::Node ic = yaml["intent_classification"];
             if (ic["enabled"]) config.intent_classification.enabled = ic["enabled"].as<bool>();

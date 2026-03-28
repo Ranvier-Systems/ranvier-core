@@ -208,7 +208,7 @@ public:
             // are accessible. This gauge aggregates path compression efficiency.
             // ================================================================
 
-            // Per-intent request counters (VISION 1.4 intent classification)
+            // Per-intent request counters (intent classification)
             seastar::metrics::make_gauge("proxy_requests_by_intent",
                 seastar::metrics::description("Total proxy requests by classified intent"),
                 {{"intent", "autocomplete"}},
@@ -329,7 +329,7 @@ public:
         if (tier < 4) _active_by_priority[tier]--;
     }
 
-    // Per-intent metrics (shard-local counters, no atomics — VISION 1.4)
+    // Per-intent metrics (shard-local counters, no atomics)
     void record_intent_request(uint8_t intent) {
         if (intent < 3) _requests_by_intent[intent]++;
     }
@@ -464,7 +464,7 @@ private:
     std::array<uint64_t, 4> _requests_by_priority = {0, 0, 0, 0};  // [CRITICAL, HIGH, NORMAL, LOW]
     std::array<uint64_t, 4> _active_by_priority = {0, 0, 0, 0};    // Active gauge per tier
 
-    // Per-intent counters (shard-local, no atomics — VISION 1.4)
+    // Per-intent counters (shard-local, no atomics)
     std::array<uint64_t, 3> _requests_by_intent = {0, 0, 0};  // [AUTOCOMPLETE, CHAT, EDIT]
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge

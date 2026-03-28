@@ -29,7 +29,7 @@
 
 namespace ranvier {
 
-// Intent classification for request routing hints (VISION 1.4)
+// Intent classification for request routing hints
 // Classifies requests by wire-format inspection to enable intent-aware routing.
 // AUTOCOMPLETE: FIM / inline completion — route to fastest backend
 // CHAT: Interactive conversation — prefix + cost-aware routing (default)
@@ -160,7 +160,7 @@ struct ProxyContext {
     // AUTOCOMPLETE → prefer lowest-latency backend
     // EDIT → prefer highest-capability backend
     // CHAT → use normal prefix/cost routing
-    // Actual intent-based route selection is deferred to VISION 2.3 / 3.2.
+    // Actual intent-based route selection is not yet implemented.
     RequestIntent intent = RequestIntent::CHAT;
 
     // Agent identification for fair scheduling (User-Agent header value)
