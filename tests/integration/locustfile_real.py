@@ -3443,6 +3443,13 @@ def on_test_start(environment, **kwargs):
     logger.info(f"Max Output Tokens: {MAX_OUTPUT_TOKENS}")
     logger.info(f"Timeouts: connect={CONNECT_TIMEOUT_SECONDS}s, read={READ_TIMEOUT_SECONDS}s/chunk, stream={STREAMING_TIMEOUT_SECONDS}s total")
 
+    if SIMULATE_AGENTS:
+        logger.info(f"Agent Simulation: ENABLED (distribution={AGENT_DISTRIBUTION})")
+        logger.info(f"  Agent Pool: {AGENT_POOL}")
+        logger.info(f"  Priority Header Injection: {'ENABLED' if INJECT_PRIORITY_HEADER else 'disabled'}")
+    else:
+        logger.info(f"Agent Simulation: disabled (set SIMULATE_AGENTS=true to enable)")
+
     # Load prompts from file if PROMPT_FILE is set
     if PROMPT_FILE:
         logger.info(f"Loading prompts from file: {PROMPT_FILE}")

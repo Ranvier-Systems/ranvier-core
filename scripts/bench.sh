@@ -1630,6 +1630,8 @@ if [[ "$WARMUP" = true ]]; then
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
         -e MAX_OUTPUT_TOKENS="$MAX_TOKENS" \
         -e HF_TOKEN="${HF_TOKEN:-}" \
+        -e RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE="$PRIORITY_QUEUE" \
+        -e SIMULATE_AGENTS="$( [[ "$PRIORITY_QUEUE" = true ]] && echo true || echo false )" \
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
