@@ -36,12 +36,12 @@ protected:
 };
 
 TEST_F(FimDetectionTest, SuffixFieldDetected) {
-    std::string body = R"({"prompt": "def foo()", "suffix": "  return 42"})";
+    std::string body = R"json({"prompt": "def foo()", "suffix": "  return 42"})json";
     EXPECT_EQ(classify_intent(chat_endpoint, body, config), RequestIntent::AUTOCOMPLETE);
 }
 
 TEST_F(FimDetectionTest, FimPrefixFieldDetected) {
-    std::string body = R"({"fim_prefix": "def hello():\n", "fim_suffix": "\n  pass"})";
+    std::string body = R"json({"fim_prefix": "def hello():\n", "fim_suffix": "\n  pass"})json";
     EXPECT_EQ(classify_intent(chat_endpoint, body, config), RequestIntent::AUTOCOMPLETE);
 }
 
