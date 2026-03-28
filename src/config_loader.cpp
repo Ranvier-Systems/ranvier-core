@@ -332,6 +332,25 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint32_t>("RANVIER_BACKPRESSURE_RETRY_AFTER")) {
         backpressure.retry_after_seconds = *v;
     }
+    if (auto v = get_env("RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE")) {
+        backpressure.enable_priority_queue = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_BACKPRESSURE_TIER_CAPACITY")) {
+        // Parse comma-separated list: "64,128,256,512"
+        std::istringstream iss(*v);
+        std::string token;
+        size_t idx = 0;
+        while (std::getline(iss, token, ',') && idx < 4) {
+            try {
+                backpressure.tier_capacity[idx] = static_cast<uint32_t>(std::stoul(token));
+            } catch (const std::exception& e) {
+                // Rule #9: Log at warn level (pre-Seastar, use std::cerr)
+                std::cerr << "[WARN] Invalid RANVIER_BACKPRESSURE_TIER_CAPACITY element '"
+                          << token << "': " << e.what() << " - using default\n";
+            }
+            ++idx;
+        }
+    }
 
     // Cluster overrides
     if (auto v = get_env("RANVIER_CLUSTER_ENABLED")) {
@@ -901,6 +920,17 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (bp["retry_after_seconds"]) {
                 config.backpressure.retry_after_seconds = bp["retry_after_seconds"].as<uint32_t>();
+            }
+            if (bp["enable_priority_queue"]) {
+                config.backpressure.enable_priority_queue = bp["enable_priority_queue"].as<bool>();
+            }
+            if (bp["tier_capacity"]) {
+                auto tc = bp["tier_capacity"];
+                if (tc.IsSequence() && tc.size() == 4) {
+                    for (size_t i = 0; i < 4; ++i) {
+                        config.backpressure.tier_capacity[i] = tc[i].as<uint32_t>();
+                    }
+                }
             }
         }
 

@@ -162,6 +162,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.backpressure.enable_persistence_backpressure = config.backpressure.enable_persistence_backpressure;
     cfg.backpressure.persistence_queue_threshold = config.backpressure.persistence_queue_threshold;
     cfg.backpressure.retry_after_seconds = config.backpressure.retry_after_seconds;
+    cfg.backpressure.enable_priority_queue = config.backpressure.enable_priority_queue;
+    cfg.backpressure.tier_capacity = config.backpressure.tier_capacity;
     // Load balancing settings (P2C algorithm)
     cfg.load_balancing.enabled = config.load_balancing.enabled;
     cfg.load_balancing.min_load_difference = config.load_balancing.min_load_difference;

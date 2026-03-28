@@ -55,6 +55,9 @@ protected:
         unsetenv("RANVIER_PRIORITY_TIER_COST_THRESHOLD_HIGH");
         unsetenv("RANVIER_PRIORITY_TIER_COST_THRESHOLD_LOW");
         unsetenv("RANVIER_PRIORITY_TIER_RESPECT_HEADER");
+        // Priority queue env vars
+        unsetenv("RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE");
+        unsetenv("RANVIER_BACKPRESSURE_TIER_CAPACITY");
         // Gossip TLS env vars
         unsetenv("RANVIER_CLUSTER_TLS_ENABLED");
         unsetenv("RANVIER_CLUSTER_TLS_CERT_PATH");
@@ -1823,6 +1826,100 @@ TEST_F(ConfigTest, PriorityTierYamlTruncatesOverMaxEntries) {
     auto config = RanvierConfig::load("test_config.yaml");
     EXPECT_EQ(config.priority_tier.known_user_agents.size(),
               PriorityTierConfig::MAX_KNOWN_USER_AGENTS);
+}
+
+// =============================================================================
+// Priority Queue Config Tests
+// =============================================================================
+
+TEST_F(ConfigTest, PriorityQueueDefaults) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.backpressure.enable_priority_queue);
+    EXPECT_EQ(config.backpressure.tier_capacity[0], BackpressureConfig::DEFAULT_TIER_CAPACITY_CRITICAL);
+    EXPECT_EQ(config.backpressure.tier_capacity[1], BackpressureConfig::DEFAULT_TIER_CAPACITY_HIGH);
+    EXPECT_EQ(config.backpressure.tier_capacity[2], BackpressureConfig::DEFAULT_TIER_CAPACITY_NORMAL);
+    EXPECT_EQ(config.backpressure.tier_capacity[3], BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW);
+}
+
+TEST_F(ConfigTest, PriorityQueueFromYaml) {
+    writeTestConfig("test_config.yaml", R"(
+backpressure:
+  enable_priority_queue: true
+  tier_capacity: [32, 64, 128, 256]
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_TRUE(config.backpressure.enable_priority_queue);
+    EXPECT_EQ(config.backpressure.tier_capacity[0], 32u);
+    EXPECT_EQ(config.backpressure.tier_capacity[1], 64u);
+    EXPECT_EQ(config.backpressure.tier_capacity[2], 128u);
+    EXPECT_EQ(config.backpressure.tier_capacity[3], 256u);
+}
+
+TEST_F(ConfigTest, PriorityQueuePartialYamlKeepsDefaults) {
+    writeTestConfig("test_config.yaml", R"(
+backpressure:
+  enable_priority_queue: true
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_TRUE(config.backpressure.enable_priority_queue);
+    // tier_capacity not specified → defaults
+    EXPECT_EQ(config.backpressure.tier_capacity[0], BackpressureConfig::DEFAULT_TIER_CAPACITY_CRITICAL);
+    EXPECT_EQ(config.backpressure.tier_capacity[3], BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW);
+}
+
+TEST_F(ConfigTest, PriorityQueueYamlWrongSizeIgnored) {
+    writeTestConfig("test_config.yaml", R"(
+backpressure:
+  tier_capacity: [32, 64]
+)");
+    auto config = RanvierConfig::load("test_config.yaml");
+    // Wrong size (2 instead of 4) → defaults preserved
+    EXPECT_EQ(config.backpressure.tier_capacity[0], BackpressureConfig::DEFAULT_TIER_CAPACITY_CRITICAL);
+}
+
+TEST_F(ConfigTest, PriorityQueueEnvironmentVariables) {
+    setenv("RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE", "true", 1);
+    setenv("RANVIER_BACKPRESSURE_TIER_CAPACITY", "10,20,30,40", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.backpressure.enable_priority_queue);
+    EXPECT_EQ(config.backpressure.tier_capacity[0], 10u);
+    EXPECT_EQ(config.backpressure.tier_capacity[1], 20u);
+    EXPECT_EQ(config.backpressure.tier_capacity[2], 30u);
+    EXPECT_EQ(config.backpressure.tier_capacity[3], 40u);
+}
+
+TEST_F(ConfigTest, PriorityQueueEnvOverridesYaml) {
+    writeTestConfig("test_config.yaml", R"(
+backpressure:
+  enable_priority_queue: false
+  tier_capacity: [32, 64, 128, 256]
+)");
+    setenv("RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE", "true", 1);
+    auto config = RanvierConfig::load("test_config.yaml");
+    EXPECT_TRUE(config.backpressure.enable_priority_queue);
+    // tier_capacity from YAML (env override not set for it)
+    EXPECT_EQ(config.backpressure.tier_capacity[0], 32u);
+}
+
+TEST_F(ConfigTest, PriorityQueueEnvPartialCapacityParsed) {
+    // Fewer than 4 values → only those indices updated
+    setenv("RANVIER_BACKPRESSURE_TIER_CAPACITY", "10,20", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.backpressure.tier_capacity[0], 10u);
+    EXPECT_EQ(config.backpressure.tier_capacity[1], 20u);
+    // Indices 2 and 3 retain defaults
+    EXPECT_EQ(config.backpressure.tier_capacity[2], BackpressureConfig::DEFAULT_TIER_CAPACITY_NORMAL);
+    EXPECT_EQ(config.backpressure.tier_capacity[3], BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW);
+}
+
+TEST_F(ConfigTest, PriorityQueueEnvInvalidCapacityIgnored) {
+    setenv("RANVIER_BACKPRESSURE_TIER_CAPACITY", "10,abc,30,40", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.backpressure.tier_capacity[0], 10u);
+    // "abc" is invalid → default preserved for index 1
+    EXPECT_EQ(config.backpressure.tier_capacity[1], BackpressureConfig::DEFAULT_TIER_CAPACITY_HIGH);
+    EXPECT_EQ(config.backpressure.tier_capacity[2], 30u);
+    EXPECT_EQ(config.backpressure.tier_capacity[3], 40u);
 }
 
 int main(int argc, char** argv) {

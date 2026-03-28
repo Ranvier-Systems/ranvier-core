@@ -276,8 +276,60 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_drain_backend(std::move(req), std::move(rep));
     }));
 
+    // 7. SCHEDULER STATS (admin, auth required)
+    r.add(operation_type::GET, url("/admin/scheduler/stats"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_scheduler_stats(std::move(req), std::move(rep));
+    }));
+
     // Start rate limiter cleanup timer (Hard Rule #5: timer with gate guard)
     _rate_limiter.start();
+
+    // Register scheduler metrics (Rule #6: deregistered in stop() before member destruction)
+    namespace sm = seastar::metrics;
+    const char* priority_labels[] = {"critical", "high", "normal", "low"};
+    for (size_t i = 0; i < 4; ++i) {
+        _scheduler_metrics.add_group("ranvier", {
+            sm::make_gauge("scheduler_queue_depth",
+                sm::description("Current queue depth per priority tier"),
+                {{"priority", priority_labels[i]}},
+                [this, i] { return static_cast<double>(_scheduler.queue_depth(i)); }),
+
+            sm::make_gauge("scheduler_dropped_total",
+                sm::description("Requests dropped due to full priority queue"),
+                {{"priority", priority_labels[i]}},
+                [this, i] { return static_cast<double>(_scheduler.overflow_drops()[i]); }),  // ref to array, no copy
+        });
+    }
+    _scheduler_metrics.add_group("ranvier", {
+        sm::make_gauge("scheduler_enqueued_total",
+            sm::description("Total requests enqueued into priority scheduler"),
+            [this] { return static_cast<double>(_scheduler.total_enqueued_count()); }),
+
+        sm::make_gauge("scheduler_dequeued_total",
+            sm::description("Total requests dequeued from priority scheduler"),
+            [this] { return static_cast<double>(_scheduler.total_dequeued_count()); }),
+
+        sm::make_gauge("scheduler_enabled",
+            sm::description("Whether priority queue scheduling is enabled (0 or 1)"),
+            [this] { return _config.backpressure.enable_priority_queue ? 1.0 : 0.0; }),
+
+        sm::make_gauge("scheduler_agents_tracked",
+            sm::description("Number of unique agents tracked for fair scheduling"),
+            [this] { return static_cast<double>(_scheduler.agents_tracked()); }),
+    });
+
+    // Start priority queue background dequeue loop if enabled (Rule #5: gate-guarded)
+    if (_config.backpressure.enable_priority_queue) {
+        (void)process_priority_queue().handle_exception([](auto ep) {
+            // Rule #9: log at warn level
+            try { std::rethrow_exception(ep); }
+            catch (const std::exception& e) {
+                log_proxy.warn("Priority queue loop terminated with exception: {}", e.what());
+            } catch (...) {
+                log_proxy.warn("Priority queue loop terminated with unknown exception");
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------
@@ -824,19 +876,25 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         co_return std::move(rep);
     }
 
-    // Backpressure: try to acquire semaphore unit (non-blocking)
-    // If semaphore is exhausted, immediately return 503 instead of queueing
-    auto semaphore_units = seastar::try_get_units(_request_semaphore, 1);
-    if (!semaphore_units) {
-        ++_requests_rejected_concurrency;
-        log_proxy.warn("[{}] Request rejected - concurrency limit reached ({} concurrent)",
-                       request_id, _config.backpressure.max_concurrent_requests);
-        metrics().record_backpressure_rejection();
-        rep->set_status(seastar::http::reply::status_type::service_unavailable);
-        rep->add_header("X-Request-ID", request_id);
-        rep->add_header("Retry-After", std::to_string(_config.backpressure.retry_after_seconds));
-        rep->write_body("json", "{\"error\": \"Server overloaded - too many concurrent requests\"}");
-        co_return std::move(rep);
+    // Backpressure: early concurrency rejection (non-queue path only).
+    // When priority queue is disabled, try_get_units here avoids wasting CPU
+    // on tokenization/routing when the server is at capacity.
+    // When enabled, defer to acquire_concurrency_slot() after priority extraction.
+    std::optional<seastar::semaphore_units<>> early_units;
+    if (!_config.backpressure.enable_priority_queue) {
+        auto sem_check = seastar::try_get_units(_request_semaphore, 1);
+        if (!sem_check) {
+            ++_requests_rejected_concurrency;
+            log_proxy.warn("[{}] Request rejected - concurrency limit reached ({} concurrent)",
+                           request_id, _config.backpressure.max_concurrent_requests);
+            metrics().record_backpressure_rejection();
+            rep->set_status(seastar::http::reply::status_type::service_unavailable);
+            rep->add_header("X-Request-ID", request_id);
+            rep->add_header("Retry-After", std::to_string(_config.backpressure.retry_after_seconds));
+            rep->write_body("json", "{\"error\": \"Server overloaded - too many concurrent requests\"}");
+            co_return std::move(rep);
+        }
+        early_units = std::move(*sem_check);
     }
 
     // Backpressure: check persistence queue depth (skipped when persistence is not active)
@@ -1479,11 +1537,34 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->estimated_cost_units = cost.cost_units;
     ctx->priority = priority;
 
+    // Capture User-Agent for fair scheduling (used by RequestScheduler)
+    {
+        auto ua_it = req->_headers.find("User-Agent");
+        if (ua_it != req->_headers.end()) {
+            ctx->user_agent = ua_it->second;
+        }
+    }
+
+    // Acquire concurrency slot (direct semaphore or priority queue path)
+    auto slot = co_await acquire_concurrency_slot(
+        priority, request_id, ctx->user_agent, request_start,
+        std::move(early_units));
+    if (slot.rejected) {
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->add_header("X-Request-ID", request_id);
+        rep->add_header("Retry-After", std::to_string(_config.backpressure.retry_after_seconds));
+        rep->write_body("json", "{\"error\": \"" + slot.rejection_reason + "\"}");
+        if (_config.priority_tier_enabled) {
+            metrics().decrement_priority_active(static_cast<uint8_t>(priority));
+        }
+        co_return std::move(rep);
+    }
+
     // Move gate_holder, semaphore_units, and backend_guard into the lambda to keep them alive during streaming.
     // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
     // is properly maintained until streaming completes.
     // BackendRequestGuard destructor will decrement active_requests when the lambda completes.
-    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*semaphore_units), backend_guard = std::move(backend_guard)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
@@ -2093,6 +2174,15 @@ future<> HttpController::stop() {
     // the rate limiter's internal timer is cancelled.
     co_await _rate_limiter.stop();
 
+    // Stop priority queue background fiber (Rule #5: close gate, break CV)
+    _queue_cv.broken();
+    if (!_queue_gate.is_closed()) {
+        co_await _queue_gate.close();
+    }
+
+    // Deregister scheduler metrics before member destruction (Rule #6)
+    _scheduler_metrics.clear();
+
     // Close gate if not already closed by wait_for_drain()
     if (!_request_gate.is_closed()) {
         co_await _request_gate.close();
@@ -2513,6 +2603,157 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_health(
         : "{\"status\": \"healthy\", \"quorum\": false}";
 
     rep->write_body("json", response);
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+// ---------------------------------------------------------
+// PRIORITY QUEUE BACKGROUND DEQUEUE LOOP
+// ---------------------------------------------------------
+
+// Background fiber that dequeues requests by priority and acquires
+// semaphore units on their behalf. Gate-guarded for clean shutdown (Rule #5).
+// Inserts maybe_yield() every 64 iterations (Rule #17).
+future<> HttpController::process_priority_queue() {
+    seastar::gate::holder holder;
+    try {
+        holder = _queue_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        co_return;
+    }
+
+    uint64_t iterations = 0;
+    while (!_queue_gate.is_closed()) {
+        auto ctx_opt = _scheduler.dequeue();
+        if (!ctx_opt) {
+            try {
+                co_await _queue_cv.wait();
+            } catch (const seastar::broken_condition_variable&) {
+                // Shutdown signal — exit cleanly
+                break;
+            }
+            continue;
+        }
+
+        auto ctx = std::move(*ctx_opt);
+
+        // Acquire a semaphore unit for this request (may suspend)
+        try {
+            auto units = co_await seastar::get_units(_request_semaphore, 1);
+            // Fulfill the promise so handle_proxy can continue
+            ctx->dequeue_promise.set_value(std::move(units));
+        } catch (...) {
+            // Rule #9: log at warn level
+            log_proxy.warn("[{}] Failed to acquire semaphore for dequeued request",
+                           ctx->request_id);
+            ctx->dequeue_promise.set_exception(std::current_exception());
+        }
+
+        if (++iterations % kYieldInterval == 0) {
+            co_await seastar::coroutine::maybe_yield();
+        }
+    }
+
+    // Drain remaining queued contexts: destroy stubs so their promises break,
+    // which wakes any handle_proxy coroutine waiting in acquire_concurrency_slot.
+    while (auto leftover = _scheduler.dequeue()) {
+        // Stub is destroyed here → promise breaks → waiter gets broken_promise
+        (void)leftover;
+    }
+}
+
+// Dispatch is not used in the promise-based model (handle_proxy owns the
+// response lifecycle). Stub retained for interface completeness.
+future<> HttpController::dispatch_proxied_request(
+    std::unique_ptr<ProxyContext> /*ctx*/,
+    seastar::semaphore_units<> /*units*/) {
+    co_return;
+}
+
+// ---------------------------------------------------------
+// CONCURRENCY SLOT ACQUISITION
+// ---------------------------------------------------------
+
+// Unified helper: acquire a semaphore unit either directly or via the
+// priority queue scheduler. Keeps handle_proxy() focused on request logic.
+future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
+    PriorityLevel priority,
+    std::string request_id,
+    std::string user_agent,
+    std::chrono::steady_clock::time_point request_start,
+    std::optional<seastar::semaphore_units<>> early_units) {
+
+    // Direct path: units were already acquired early (before tokenization)
+    if (early_units) {
+        co_return AcquireResult{std::move(*early_units), false, {}};
+    }
+
+    // Priority queue path: enqueue a scheduling stub and wait for dequeue.
+    auto stub = std::make_unique<ProxyContext>();
+    stub->priority = priority;
+    stub->request_id = request_id;
+    stub->user_agent = user_agent;
+
+    auto dequeue_future = stub->dequeue_promise.get_future();
+
+    if (!_scheduler.enqueue(std::move(stub))) {
+        metrics().record_backpressure_rejection();
+        log_proxy.warn("[{}] Request rejected - priority queue full (tier={})",
+                       request_id, priority_level_to_string(priority));
+        co_return AcquireResult{std::nullopt, true,
+            "Server overloaded - priority queue full"};
+    }
+    _queue_cv.signal();
+
+    // Wait for process_priority_queue() to dequeue us and provide a semaphore unit.
+    // If shutdown occurs while waiting, the promise is broken — treat as rejection.
+    seastar::semaphore_units<> units;
+    try {
+        units = co_await std::move(dequeue_future);
+    } catch (const seastar::broken_promise&) {
+        log_proxy.info("[{}] Request rejected - scheduler shutting down", request_id);
+        co_return AcquireResult{std::nullopt, true, "Server shutting down"};
+    }
+
+    // Record scheduler wait time
+    auto wait_duration = std::chrono::steady_clock::now() - request_start;
+    metrics().record_scheduler_wait(
+        std::chrono::duration<double>(wait_duration).count());
+
+    co_return AcquireResult{std::move(units), false, {}};
+}
+
+// ---------------------------------------------------------
+// SCHEDULER STATS HANDLER (admin, auth required)
+// ---------------------------------------------------------
+
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_stats(
+    std::unique_ptr<seastar::http::request> /*req*/,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    auto depths = _scheduler.queue_depths();
+    auto drops = _scheduler.overflow_drops();
+
+    std::ostringstream oss;
+    oss << "{"
+        << "\"enabled\": " << (_config.backpressure.enable_priority_queue ? "true" : "false")
+        << ", \"queue_depths\": {"
+        << "\"critical\": " << depths[0]
+        << ", \"high\": " << depths[1]
+        << ", \"normal\": " << depths[2]
+        << ", \"low\": " << depths[3]
+        << "}"
+        << ", \"total_enqueued\": " << _scheduler.total_enqueued_count()
+        << ", \"total_dequeued\": " << _scheduler.total_dequeued_count()
+        << ", \"drops_by_priority\": {"
+        << "\"critical\": " << drops[0]
+        << ", \"high\": " << drops[1]
+        << ", \"normal\": " << drops[2]
+        << ", \"low\": " << drops[3]
+        << "}"
+        << ", \"agents_tracked\": " << _scheduler.agents_tracked()
+        << "}";
+
+    rep->write_body("json", oss.str());
     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
 }
 

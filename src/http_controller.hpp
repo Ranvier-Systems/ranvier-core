@@ -9,6 +9,7 @@
 #include "metrics_service.hpp"
 #include "proxy_retry_policy.hpp"
 #include "rate_limiter.hpp"
+#include "request_scheduler.hpp"
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
 #include "shard_load_metrics.hpp"
@@ -18,6 +19,7 @@
 #include <functional>
 #include <limits>
 
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
@@ -26,26 +28,6 @@
 #include <seastar/http/reply.hh>
 
 namespace ranvier {
-
-// Priority level for request classification (used by priority-aware scheduling)
-// Lower numeric value = higher priority
-enum class PriorityLevel : uint8_t {
-    CRITICAL = 0,   // Interactive typing, must not block
-    HIGH     = 1,   // Primary agent task
-    NORMAL   = 2,   // Background processing (default)
-    LOW      = 3,   // Batch jobs, can wait
-};
-
-// Convert PriorityLevel to string label for metrics and logging
-inline const char* priority_level_to_string(PriorityLevel level) {
-    switch (level) {
-        case PriorityLevel::CRITICAL: return "critical";
-        case PriorityLevel::HIGH:     return "high";
-        case PriorityLevel::NORMAL:   return "normal";
-        case PriorityLevel::LOW:      return "low";
-    }
-    return "normal";  // unreachable, but satisfies -Wreturn-type
-}
 
 // Retry configuration
 struct RetrySettings {
@@ -71,9 +53,14 @@ struct BackpressureSettings {
     double persistence_queue_threshold = 0.8;         // Start throttling at 80% of max_queue_depth
     uint32_t retry_after_seconds = 1;                 // Retry-After header value for 503 responses
 
-    // Priority queue placeholders — reserved for Session C (Agent-Aware Scheduling)
-    bool enable_priority_queue = false;               // Reserved for Session C
-    std::array<uint32_t, 4> tier_capacity = {0, 0, 0, 0};  // 0 = unlimited, per Session C
+    // Priority queue scheduling (defaults mirror BackpressureConfig)
+    bool enable_priority_queue = false;
+    std::array<uint32_t, 4> tier_capacity = {
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_CRITICAL,
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_HIGH,
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_NORMAL,
+        BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW,
+    };
 };
 
 // Shard load balancing settings
@@ -146,7 +133,21 @@ struct ProxyContext {
 
     // Priority tier (populated by extract_priority before routing)
     PriorityLevel priority = PriorityLevel::NORMAL;
+
+    // Agent identification for fair scheduling (User-Agent header value)
+    std::string user_agent;
+
+    // Queue timing (set by RequestScheduler::enqueue)
+    std::chrono::steady_clock::time_point enqueue_time;
+
+    // Promise fulfilled by process_priority_queue() when this request is dequeued
+    // and a semaphore unit has been acquired. The handle_proxy coroutine awaits
+    // the corresponding future before proceeding with the streaming lambda.
+    seastar::promise<seastar::semaphore_units<>> dequeue_promise;
 };
+
+// Type alias: production scheduler uses ProxyContext
+using RequestScheduler = BasicRequestScheduler<ProxyContext>;
 
 // HTTP controller configuration
 struct HttpControllerConfig {
@@ -216,7 +217,8 @@ public:
           _persistence(nullptr),
           _load_balancer(nullptr),
           // Backpressure: 0 means unlimited (use max size_t as semaphore limit)
-          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)) {
+          _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)),
+          _scheduler(SchedulerSettings{config.backpressure.tier_capacity}) {
         // Initialize load balancer configuration
         _lb_config.enabled = config.load_balancing.enabled;
         _lb_config.min_load_difference = config.load_balancing.min_load_difference;
@@ -325,6 +327,12 @@ private:
     // Uses try_get_units() for immediate rejection (no queueing)
     seastar::semaphore _request_semaphore;
 
+    // Priority-aware request scheduler
+    RequestScheduler _scheduler;
+    seastar::condition_variable _queue_cv;  // Signaled by enqueue(), waited by process_priority_queue()
+    seastar::gate _queue_gate;              // Gate for background dequeue fiber (Rule #5)
+    seastar::metrics::metric_groups _scheduler_metrics;  // Deregistered in stop() (Rule #6)
+
     // Backpressure metrics (shard-local — no cross-shard access)
     uint64_t _requests_rejected_concurrency{0};   // Rejected due to concurrency limit
     uint64_t _requests_rejected_persistence{0};   // Rejected due to persistence backpressure
@@ -368,6 +376,32 @@ private:
 
     // Health check handler (public, no auth required)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_health(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Scheduler stats handler (admin, auth required)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_scheduler_stats(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Background dequeue loop for priority queue (gate-guarded, Rule #5)
+    seastar::future<> process_priority_queue();
+
+    // Dispatch a dequeued request through the normal proxy pipeline
+    // Fire-and-forget with gate guard (Rule #18: no discarded futures)
+    seastar::future<> dispatch_proxied_request(std::unique_ptr<ProxyContext> ctx, seastar::semaphore_units<> units);
+
+    // Acquire a concurrency slot, either directly (try_get_units) or via the
+    // priority queue scheduler.  Returns nullopt when the request should be
+    // rejected with 503 (queue full / concurrency limit).
+    // Rule #22: all params by value.
+    struct AcquireResult {
+        std::optional<seastar::semaphore_units<>> units;
+        bool rejected = false;          // true → caller should 503
+        std::string rejection_reason;   // populated when rejected
+    };
+    seastar::future<AcquireResult> acquire_concurrency_slot(
+        PriorityLevel priority,
+        std::string request_id,
+        std::string user_agent,
+        std::chrono::steady_clock::time_point request_start,
+        std::optional<seastar::semaphore_units<>> early_units);
 
     // Auth helper - returns true if authorized, false otherwise
     bool check_admin_auth(const seastar::http::request& req) const;

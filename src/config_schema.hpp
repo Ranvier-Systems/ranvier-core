@@ -214,7 +214,7 @@ struct PriorityTierUserAgentEntry {
 
 // Priority tier assignment configuration.
 // Assigns priority levels to incoming requests based on headers, user-agent,
-// and cost estimation. Used by Session C (Agent-Aware Scheduling) for
+// and cost estimation. Used by the priority queue scheduler for
 // queue-jumping and fair scheduling.
 struct PriorityTierConfig {
     bool enabled = true;                            // Enable priority tier assignment
