@@ -62,6 +62,10 @@ BACKENDS = [
 # Configurable thresholds
 P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "100"))
 
+# Agent simulation (shared with locustfile_real.py)
+SIMULATE_AGENTS = os.environ.get("SIMULATE_AGENTS", "false").lower() in ("true", "1", "yes")
+AGENT_POOL = ["Cursor", "claude-code", "cline", "aider", "batch-job"]
+
 # Metrics collection for validation
 _initial_sync_errors: dict[str, float] = {}
 _backends_registered = False
@@ -484,6 +488,9 @@ class ChatCompletionUser(HttpUser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._request_count = 0
+        self._user_agent = None
+        if SIMULATE_AGENTS:
+            self._user_agent = random.choice(AGENT_POOL)
 
     @task
     def chat_completion(self):
@@ -510,10 +517,14 @@ class ChatCompletionUser(HttpUser):
         try:
             # Use requests library directly for proper SSE streaming support
             # Timeout: (connect, read) - shorter for mock backends in CI
+            headers = {"Content-Type": "application/json"}
+            if self._user_agent is not None:
+                headers["User-Agent"] = self._user_agent
+
             resp = requests.post(
                 f"{target_url}/v1/chat/completions",
                 json=request_body,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 stream=True,
                 timeout=(5, 10),
             )

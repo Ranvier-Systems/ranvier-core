@@ -175,6 +175,9 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Priority queue scheduler
+      - RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}
+      - RANVIER_BACKPRESSURE_TIER_CAPACITY=${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}
     # Pin Seastar reactors to the same cores as the Docker cpuset for deterministic scheduling.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -233,6 +236,9 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Priority queue scheduler
+      - RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}
+      - RANVIER_BACKPRESSURE_TIER_CAPACITY=${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}
     # Pin Seastar reactors to the same cores as the Docker cpuset for deterministic scheduling.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -291,6 +297,9 @@ services:
       - RANVIER_LOAD_AWARE_ROUTING=${RANVIER_LOAD_AWARE_ROUTING:-true}
       - RANVIER_LOAD_IMBALANCE_FACTOR=${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0}
       - RANVIER_LOAD_IMBALANCE_FLOOR=${RANVIER_LOAD_IMBALANCE_FLOOR:-2}
+      # Priority queue scheduler
+      - RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=${RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE:-false}
+      - RANVIER_BACKPRESSURE_TIER_CAPACITY=${RANVIER_BACKPRESSURE_TIER_CAPACITY:-64,128,256,512}
     # Pin Seastar reactors to the same cores as the Docker cpuset for deterministic scheduling.
     # Rust FFI (tokenizers) uses jemalloc as its global allocator (patched at build time),
     # so it bypasses Seastar's malloc entirely — no --std-alloc needed.
@@ -365,6 +374,10 @@ services:
       # Prompt configuration
       - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
       - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
+      # Priority queue agent simulation
+      - SIMULATE_AGENTS=${SIMULATE_AGENTS:-false}
+      - AGENT_DISTRIBUTION=${AGENT_DISTRIBUTION:-uniform}
+      - INJECT_PRIORITY_HEADER=${INJECT_PRIORITY_HEADER:-false}
     # Note: locustfiles are baked into the image (see Dockerfile.locust)
     # to support Docker-in-Docker environments
     depends_on:
@@ -420,6 +433,10 @@ services:
       - BENCHMARK_MODE=${BENCHMARK_MODE:-prefix}
       - PROMPT_DISTRIBUTION=${PROMPT_DISTRIBUTION:-mixed}
       - SHARED_PREFIX_RATIO=${SHARED_PREFIX_RATIO:-0.7}
+      # Priority queue agent simulation
+      - SIMULATE_AGENTS=${SIMULATE_AGENTS:-false}
+      - AGENT_DISTRIBUTION=${AGENT_DISTRIBUTION:-uniform}
+      - INJECT_PRIORITY_HEADER=${INJECT_PRIORITY_HEADER:-false}
     # Note: locustfiles are baked into the image (see Dockerfile.locust)
     # to support Docker-in-Docker environments
     depends_on:
