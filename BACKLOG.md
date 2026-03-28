@@ -774,19 +774,20 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
   _Location:_ `src/metrics_service.hpp`
   _Complexity:_ Low
 
-- [ ] **[P1] Cost Estimation + Priority Tiers (VISION 1.1+1.2 merged)**
+- [x] **[P1] Cost Estimation + Priority Tiers (VISION 1.1+1.2 merged)**
   _Effort:_ ~2.5 weeks
   _Scope:_ ProxyContext cost fields, input_tokens as initial cost proxy, PriorityLevel enum, PriorityQueue, X-Ranvier-Priority header, per-priority metrics. Heuristic decay deferred to v1.1.
   _Files:_ `src/http_controller.{hpp,cpp}`, `src/config_schema.hpp`, `src/metrics_service.hpp`
   _Dependencies:_ config + metrics splits above
   _Complexity:_ High
 
-- [ ] **[P1] Intent Classification (VISION 1.4)**
+- [x] **[P1] Intent Classification (VISION 1.4)**
   _Effort:_ ~1 week
-  _Scope:_ RequestIntent enum (AUTOCOMPLETE/CHAT/EDIT), FIM detection, wire-format inspection, intent-based routing integration.
-  _Files:_ `src/http_controller.hpp`, `src/router_service.{hpp,cpp}`
+  _Scope:_ RequestIntent enum (AUTOCOMPLETE/CHAT/EDIT), FIM detection, wire-format inspection, intent-based routing hints, per-intent metrics.
+  _Files:_ `src/http_controller.{hpp,cpp}`, `src/config_schema.hpp`, `src/config_loader.cpp`, `src/metrics_service.hpp`, `src/application.cpp`
   _Dependencies:_ 1.1+1.2
   _Complexity:_ Medium
+  _Completed:_ 2026-03-28 — §15 Tier 1 fully complete.
 
 ### Tier 2: Cloud Intelligence
 

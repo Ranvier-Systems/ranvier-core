@@ -208,6 +208,20 @@ public:
             // are accessible. This gauge aggregates path compression efficiency.
             // ================================================================
 
+            // Per-intent request counters (VISION 1.4 intent classification)
+            seastar::metrics::make_gauge("proxy_requests_by_intent",
+                seastar::metrics::description("Total proxy requests by classified intent"),
+                {{"intent", "autocomplete"}},
+                [this] { return static_cast<double>(_requests_by_intent[0]); }),
+            seastar::metrics::make_gauge("proxy_requests_by_intent",
+                seastar::metrics::description("Total proxy requests by classified intent"),
+                {{"intent", "chat"}},
+                [this] { return static_cast<double>(_requests_by_intent[1]); }),
+            seastar::metrics::make_gauge("proxy_requests_by_intent",
+                seastar::metrics::description("Total proxy requests by classified intent"),
+                {{"intent", "edit"}},
+                [this] { return static_cast<double>(_requests_by_intent[2]); }),
+
             // Scheduler wait time: time requests spend queued in priority scheduler
             seastar::metrics::make_histogram("scheduler_wait_seconds",
                 seastar::metrics::description("Time requests spend in priority queue before dequeue (seconds)"),
@@ -313,6 +327,11 @@ public:
     }
     void decrement_priority_active(uint8_t tier) {
         if (tier < 4) _active_by_priority[tier]--;
+    }
+
+    // Per-intent metrics (shard-local counters, no atomics — VISION 1.4)
+    void record_intent_request(uint8_t intent) {
+        if (intent < 3) _requests_by_intent[intent]++;
     }
 
     // Scheduler wait time histogram (time between enqueue and dequeue)
@@ -444,6 +463,9 @@ private:
     // Per-priority tier counters (shard-local, no atomics — Hard Rule #0/#1)
     std::array<uint64_t, 4> _requests_by_priority = {0, 0, 0, 0};  // [CRITICAL, HIGH, NORMAL, LOW]
     std::array<uint64_t, 4> _active_by_priority = {0, 0, 0, 0};    // Active gauge per tier
+
+    // Per-intent counters (shard-local, no atomics — VISION 1.4)
+    std::array<uint64_t, 3> _requests_by_intent = {0, 0, 0};  // [AUTOCOMPLETE, CHAT, EDIT]
 
     // Cache hit/miss counters for ranvier_cache_hit_ratio gauge
     // Shard-local for lock-free hot path performance

@@ -574,6 +574,52 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_PRIORITY_TIER_RESPECT_HEADER")) {
         priority_tier.respect_header = (*v == "1" || *v == "true" || *v == "yes");
     }
+
+    // Intent classification overrides
+    if (auto v = get_env("RANVIER_INTENT_CLASSIFICATION_ENABLED")) {
+        intent_classification.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_INTENT_FIM_FIELDS")) {
+        intent_classification.fim_fields.clear();
+        std::istringstream iss(*v);
+        std::string token;
+        size_t count = 0;
+        while (std::getline(iss, token, ',')) {
+            if (count >= IntentClassificationConfig::MAX_FIM_FIELDS) {
+                std::cerr << "[WARN] RANVIER_INTENT_FIM_FIELDS has more than "
+                          << IntentClassificationConfig::MAX_FIM_FIELDS
+                          << " entries, truncating (Rule #4)\n";
+                break;
+            }
+            // Trim whitespace
+            size_t start = token.find_first_not_of(" \t");
+            size_t end = token.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                intent_classification.fim_fields.push_back(token.substr(start, end - start + 1));
+            }
+            ++count;
+        }
+    }
+    if (auto v = get_env("RANVIER_INTENT_EDIT_KEYWORDS")) {
+        intent_classification.edit_system_keywords.clear();
+        std::istringstream iss(*v);
+        std::string token;
+        size_t count = 0;
+        while (std::getline(iss, token, ',')) {
+            if (count >= IntentClassificationConfig::MAX_EDIT_SYSTEM_KEYWORDS) {
+                std::cerr << "[WARN] RANVIER_INTENT_EDIT_KEYWORDS has more than "
+                          << IntentClassificationConfig::MAX_EDIT_SYSTEM_KEYWORDS
+                          << " entries, truncating (Rule #4)\n";
+                break;
+            }
+            size_t start = token.find_first_not_of(" \t");
+            size_t end = token.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos) {
+                intent_classification.edit_system_keywords.push_back(token.substr(start, end - start + 1));
+            }
+            ++count;
+        }
+    }
 }
 
 // =============================================================================
@@ -1140,6 +1186,62 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                             }
                         }
                         config.priority_tier.known_user_agents.push_back(std::move(ua));
+                        ++count;
+                    }
+                }
+            }
+        }
+        // Intent classification section (VISION 1.4)
+        if (yaml["intent_classification"]) {
+            YAML::Node ic = yaml["intent_classification"];
+            if (ic["enabled"]) config.intent_classification.enabled = ic["enabled"].as<bool>();
+            if (ic["fim_fields"]) {
+                YAML::Node ff = ic["fim_fields"];
+                if (ff.IsSequence()) {
+                    config.intent_classification.fim_fields.clear();
+                    size_t count = 0;
+                    for (const auto& entry : ff) {
+                        if (count >= IntentClassificationConfig::MAX_FIM_FIELDS) {
+                            std::cerr << "[WARN] intent_classification.fim_fields has more than "
+                                      << IntentClassificationConfig::MAX_FIM_FIELDS
+                                      << " entries, truncating (Rule #4)\n";
+                            break;
+                        }
+                        config.intent_classification.fim_fields.push_back(entry.as<std::string>());
+                        ++count;
+                    }
+                }
+            }
+            if (ic["edit_system_keywords"]) {
+                YAML::Node kw = ic["edit_system_keywords"];
+                if (kw.IsSequence()) {
+                    config.intent_classification.edit_system_keywords.clear();
+                    size_t count = 0;
+                    for (const auto& entry : kw) {
+                        if (count >= IntentClassificationConfig::MAX_EDIT_SYSTEM_KEYWORDS) {
+                            std::cerr << "[WARN] intent_classification.edit_system_keywords has more than "
+                                      << IntentClassificationConfig::MAX_EDIT_SYSTEM_KEYWORDS
+                                      << " entries, truncating (Rule #4)\n";
+                            break;
+                        }
+                        config.intent_classification.edit_system_keywords.push_back(entry.as<std::string>());
+                        ++count;
+                    }
+                }
+            }
+            if (ic["edit_tag_patterns"]) {
+                YAML::Node tp = ic["edit_tag_patterns"];
+                if (tp.IsSequence()) {
+                    config.intent_classification.edit_tag_patterns.clear();
+                    size_t count = 0;
+                    for (const auto& entry : tp) {
+                        if (count >= IntentClassificationConfig::MAX_EDIT_TAG_PATTERNS) {
+                            std::cerr << "[WARN] intent_classification.edit_tag_patterns has more than "
+                                      << IntentClassificationConfig::MAX_EDIT_TAG_PATTERNS
+                                      << " entries, truncating (Rule #4)\n";
+                            break;
+                        }
+                        config.intent_classification.edit_tag_patterns.push_back(entry.as<std::string>());
                         ++count;
                     }
                 }
