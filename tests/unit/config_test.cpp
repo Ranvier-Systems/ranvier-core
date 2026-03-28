@@ -66,6 +66,12 @@ protected:
         unsetenv("RANVIER_CLUSTER_TLS_VERIFY_PEER");
         unsetenv("RANVIER_CLUSTER_TLS_CERT_RELOAD_INTERVAL");
         unsetenv("RANVIER_CLUSTER_TLS_ALLOW_PLAINTEXT_FALLBACK");
+        // Local mode env vars
+        unsetenv("RANVIER_LOCAL_MODE");
+        unsetenv("RANVIER_LOCAL_DISABLE_CLUSTERING");
+        unsetenv("RANVIER_LOCAL_DISABLE_PERSISTENCE");
+        unsetenv("RANVIER_LOCAL_AUTO_DISCOVER");
+        unsetenv("RANVIER_LOCAL_DISCOVERY_PORTS");
     }
 
     void TearDown() override {
@@ -76,6 +82,7 @@ protected:
         std::remove("test_cluster.yaml");
         std::remove("test_dns_discovery.yaml");
         std::remove("test_gossip_tls.yaml");
+        std::remove("test_local_mode.yaml");
     }
 
     void writeTestConfig(const std::string& filename, const std::string& content) {
@@ -1920,6 +1927,143 @@ TEST_F(ConfigTest, PriorityQueueEnvInvalidCapacityIgnored) {
     EXPECT_EQ(config.backpressure.tier_capacity[1], BackpressureConfig::DEFAULT_TIER_CAPACITY_HIGH);
     EXPECT_EQ(config.backpressure.tier_capacity[2], 30u);
     EXPECT_EQ(config.backpressure.tier_capacity[3], 40u);
+}
+
+// =============================================================================
+// Local Mode Configuration Tests
+// =============================================================================
+
+TEST_F(ConfigTest, LocalModeDefaults) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.local_mode.enabled);
+    EXPECT_TRUE(config.local_mode.disable_clustering);
+    EXPECT_TRUE(config.local_mode.disable_persistence);
+    EXPECT_TRUE(config.local_mode.auto_discover_backends);
+    // Default discovery ports: Ollama, vLLM, LM Studio, llama.cpp, TG WebUI, LocalAI
+    EXPECT_EQ(config.local_mode.discovery_ports.size(), 6u);
+    EXPECT_EQ(config.local_mode.discovery_ports[0], 11434);
+    EXPECT_EQ(config.local_mode.discovery_ports[1], 8080);
+    EXPECT_EQ(config.local_mode.discovery_ports[2], 1234);
+    EXPECT_EQ(config.local_mode.discovery_ports[3], 8000);
+    EXPECT_EQ(config.local_mode.discovery_ports[4], 5000);
+    EXPECT_EQ(config.local_mode.discovery_ports[5], 3000);
+}
+
+TEST_F(ConfigTest, LocalModeFromYaml) {
+    writeTestConfig("test_local_mode.yaml", R"(
+local_mode:
+  enabled: true
+  disable_clustering: false
+  disable_persistence: false
+  auto_discover_backends: false
+  discovery_ports: [11434, 9090]
+)");
+    auto config = RanvierConfig::load("test_local_mode.yaml");
+    EXPECT_TRUE(config.local_mode.enabled);
+    EXPECT_FALSE(config.local_mode.disable_clustering);
+    EXPECT_FALSE(config.local_mode.disable_persistence);
+    EXPECT_FALSE(config.local_mode.auto_discover_backends);
+    EXPECT_EQ(config.local_mode.discovery_ports.size(), 2u);
+    EXPECT_EQ(config.local_mode.discovery_ports[0], 11434);
+    EXPECT_EQ(config.local_mode.discovery_ports[1], 9090);
+}
+
+TEST_F(ConfigTest, LocalModePartialYamlUsesDefaults) {
+    writeTestConfig("test_local_mode.yaml", R"(
+local_mode:
+  enabled: true
+)");
+    auto config = RanvierConfig::load("test_local_mode.yaml");
+    EXPECT_TRUE(config.local_mode.enabled);
+    // Unset fields keep defaults
+    EXPECT_TRUE(config.local_mode.disable_clustering);
+    EXPECT_TRUE(config.local_mode.disable_persistence);
+    EXPECT_TRUE(config.local_mode.auto_discover_backends);
+    EXPECT_EQ(config.local_mode.discovery_ports.size(), 6u);
+}
+
+TEST_F(ConfigTest, LocalModeEnvironmentVariables) {
+    setenv("RANVIER_LOCAL_MODE", "true", 1);
+    setenv("RANVIER_LOCAL_DISABLE_CLUSTERING", "false", 1);
+    setenv("RANVIER_LOCAL_DISABLE_PERSISTENCE", "false", 1);
+    setenv("RANVIER_LOCAL_AUTO_DISCOVER", "false", 1);
+    setenv("RANVIER_LOCAL_DISCOVERY_PORTS", "11434,9090,7070", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.local_mode.enabled);
+    EXPECT_FALSE(config.local_mode.disable_clustering);
+    EXPECT_FALSE(config.local_mode.disable_persistence);
+    EXPECT_FALSE(config.local_mode.auto_discover_backends);
+    EXPECT_EQ(config.local_mode.discovery_ports.size(), 3u);
+    EXPECT_EQ(config.local_mode.discovery_ports[0], 11434);
+    EXPECT_EQ(config.local_mode.discovery_ports[1], 9090);
+    EXPECT_EQ(config.local_mode.discovery_ports[2], 7070);
+}
+
+TEST_F(ConfigTest, LocalModeEnvOverridesYaml) {
+    writeTestConfig("test_local_mode.yaml", R"(
+local_mode:
+  enabled: false
+  disable_clustering: false
+)");
+    setenv("RANVIER_LOCAL_MODE", "true", 1);
+    auto config = RanvierConfig::load("test_local_mode.yaml");
+    EXPECT_TRUE(config.local_mode.enabled);
+    // YAML value retained for fields not overridden by env
+    EXPECT_FALSE(config.local_mode.disable_clustering);
+}
+
+TEST_F(ConfigTest, LocalModeValidationPassesForDefaults) {
+    RanvierConfig config;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value());
+}
+
+TEST_F(ConfigTest, LocalModeValidationFailsForZeroPort) {
+    RanvierConfig config;
+    config.local_mode.discovery_ports = {11434, 0, 8080};
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("invalid port 0"), std::string::npos);
+}
+
+TEST_F(ConfigTest, LocalModeValidationExceedsMaxDiscoveryPorts) {
+    RanvierConfig config;
+    config.local_mode.discovery_ports.resize(
+        LocalModeConfig::MAX_DISCOVERY_PORTS + 1, 8080);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("exceeds maximum"), std::string::npos);
+}
+
+TEST_F(ConfigTest, LocalModeYamlTruncatesOverMaxPorts) {
+    // Build a YAML with more than MAX_DISCOVERY_PORTS entries
+    std::ostringstream yaml;
+    yaml << "local_mode:\n  enabled: true\n  discovery_ports: [";
+    for (size_t i = 0; i < LocalModeConfig::MAX_DISCOVERY_PORTS + 5; ++i) {
+        if (i > 0) yaml << ", ";
+        yaml << (1000 + i);
+    }
+    yaml << "]\n";
+    writeTestConfig("test_local_mode.yaml", yaml.str());
+    auto config = RanvierConfig::load("test_local_mode.yaml");
+    // Should be truncated to MAX_DISCOVERY_PORTS
+    EXPECT_EQ(config.local_mode.discovery_ports.size(),
+              LocalModeConfig::MAX_DISCOVERY_PORTS);
+}
+
+TEST_F(ConfigTest, LocalModeDisabledDoesNotAffectCluster) {
+    // When local_mode is disabled (default), cluster.enabled is unaffected
+    RanvierConfig config;
+    config.cluster.enabled = true;
+    config.local_mode.enabled = false;
+    auto error = RanvierConfig::validate(config);
+    // Validation should pass (no conflict warning when local_mode disabled)
+    // Cluster validation requires gossip_port etc., so set them
+    config.cluster.gossip_port = 7946;
+    config.cluster.peers = {"10.0.0.1:7946"};
+    error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value());
+    EXPECT_TRUE(config.cluster.enabled);
 }
 
 int main(int argc, char** argv) {
