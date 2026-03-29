@@ -690,7 +690,7 @@ void RanvierConfig::apply_env_overrides() {
         }
     }
 
-    // Agent registry overrides (VISION 3.2)
+    // Agent registry overrides
     if (auto v = get_env("RANVIER_AGENT_REGISTRY_ENABLED")) {
         agent_registry.enabled = (*v == "1" || *v == "true" || *v == "yes");
     }
@@ -1361,7 +1361,7 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                     std::chrono::milliseconds(lm["discovery_connect_timeout_ms"].as<unsigned>());
             }
         }
-        // Agent registry section (VISION 3.2)
+        // Agent registry section
         if (yaml["agent_registry"]) {
             YAML::Node ar = yaml["agent_registry"];
             if (ar["enabled"]) config.agent_registry.enabled = ar["enabled"].as<bool>();

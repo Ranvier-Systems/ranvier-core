@@ -264,7 +264,7 @@ struct IntentClassificationConfig {
 };
 
 // =============================================================================
-// Agent Registry Configuration (VISION 3.2)
+// Agent Registry Configuration
 // =============================================================================
 
 // Per-agent identification and control configuration.

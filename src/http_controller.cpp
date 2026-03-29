@@ -286,7 +286,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_scheduler_stats(std::move(req), std::move(rep));
     }));
 
-    // 8. AGENT REGISTRY (VISION 3.2, admin, auth required)
+    // 8. AGENT REGISTRY (admin, auth required)
     // Note: these endpoints are shard-local. Each shard tracks its own agent
     // counters independently. Cross-shard aggregation is deferred to a future session.
     r.add(operation_type::GET, url("/admin/agents"), make_admin_handler(auth_check, [this](auto req, auto rep) {
@@ -339,7 +339,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
             [this] { return static_cast<double>(_scheduler.agents_tracked()); }),
     });
 
-    // Register agent registry metrics (VISION 3.2, Rule #6: deregistered in stop())
+    // Register agent registry metrics (Rule #6: deregistered in stop())
     if (_agent_registry) {
         _agent_metrics.add_group("ranvier", {
             sm::make_gauge("agents_tracked",
@@ -1590,7 +1590,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
-    // Agent identification (VISION 3.2)
+    // Agent identification
     // Runs after extract_priority() — additive identification, metrics, and pause/resume.
     // TODO: Agent config priority override is deferred; extract_priority() remains unchanged.
     if (_agent_registry) {
@@ -2827,7 +2827,7 @@ future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
 // ---------------------------------------------------------
 
 // =============================================================================
-// Agent Registry Admin Handlers (VISION 3.2)
+// Agent Registry Admin Handlers
 // =============================================================================
 // Note: these endpoints are shard-local. Each shard tracks its own agent
 // counters independently. Cross-shard aggregation is deferred to a future session.

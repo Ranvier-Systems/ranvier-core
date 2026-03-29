@@ -212,7 +212,7 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.intent_classifier.rebuild_quoted_fields();
     // Local mode settings
     cfg.local_mode = config.local_mode;
-    // Agent registry settings (VISION 3.2)
+    // Agent registry settings
     cfg.agent_registry = config.agent_registry;
     return cfg;
 }

@@ -1,4 +1,4 @@
-// Ranvier Core - Agent Registry Implementation (VISION 3.2)
+// Ranvier Core - Agent Registry Implementation
 //
 // Shard-local agent identification from User-Agent and custom headers.
 // See agent_registry.hpp for class documentation and Hard Rules compliance.

@@ -1,4 +1,4 @@
-// Ranvier Core - Agent Registry (VISION 3.2)
+// Ranvier Core - Agent Registry
 //
 // Shard-local agent identification, metrics, and pause/resume control.
 // One instance per HttpController (not sharded separately).
