@@ -63,6 +63,9 @@ struct BackpressureSettings {
         BackpressureConfig::DEFAULT_TIER_CAPACITY_NORMAL,
         BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW,
     };
+
+    // Per-agent queue depth limit (VISION 3.3)
+    uint32_t max_per_agent_queued = 128;
 };
 
 // Shard load balancing settings
@@ -244,10 +247,16 @@ public:
           _load_balancer(nullptr),
           // Backpressure: 0 means unlimited (use max size_t as semaphore limit)
           _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)),
-          _scheduler(SchedulerSettings{config.backpressure.tier_capacity}) {
+          _scheduler(SchedulerSettings{config.backpressure.tier_capacity,
+                                       config.backpressure.max_per_agent_queued}) {
         // Initialize agent registry
         if (config.agent_registry.enabled) {
             _agent_registry = std::make_unique<AgentRegistry>(config.agent_registry);
+            // VISION 3.3: Wire pause check into scheduler so paused agents are
+            // skipped during dequeue rather than rejected at the gate.
+            _scheduler.set_pause_check([this](std::string_view agent_id) {
+                return _agent_registry->is_paused(std::string(agent_id));
+            });
         }
         // Initialize load balancer configuration
         _lb_config.enabled = config.load_balancing.enabled;
@@ -444,6 +453,7 @@ private:
         PriorityLevel priority,
         std::string request_id,
         std::string user_agent,
+        std::string agent_id,                              // VISION 3.3
         std::chrono::steady_clock::time_point request_start,
         std::optional<seastar::semaphore_units<>> early_units);
 

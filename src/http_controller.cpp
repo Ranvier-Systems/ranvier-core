@@ -337,6 +337,15 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         sm::make_gauge("scheduler_agents_tracked",
             sm::description("Number of unique agents tracked for fair scheduling"),
             [this] { return static_cast<double>(_scheduler.agents_tracked()); }),
+
+        // VISION 3.3: Pause-aware scheduling metrics
+        sm::make_gauge("scheduler_paused_skips_total",
+            sm::description("Total times dequeue() skipped a paused agent's request"),
+            [this] { return static_cast<double>(_scheduler.paused_skips()); }),
+
+        sm::make_gauge("scheduler_per_agent_drops_total",
+            sm::description("Requests dropped due to per-agent queue depth limit"),
+            [this] { return static_cast<double>(_scheduler.per_agent_drops()); }),
     });
 
     // Register agent registry metrics (Rule #6: deregistered in stop())
@@ -1590,36 +1599,25 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
-    // Agent identification
-    // Runs after extract_priority() — additive identification, metrics, and pause/resume.
+    // Agent identification (VISION 3.3: paused agents enter the queue instead of being rejected)
+    // Runs after extract_priority() — additive identification and metrics.
     // TODO: Agent config priority override is deferred; extract_priority() remains unchanged.
     if (_agent_registry) {
         auto agent_id = _agent_registry->identify_agent(*req);
         if (agent_id) {
-            // Check if agent is paused → 503 with Retry-After
-            if (_agent_registry->is_paused(*agent_id)) {
-                _agent_registry->record_paused_rejection(*agent_id);
-                log_proxy.debug("[{}] Agent '{}' is paused, rejecting with 503", request_id, *agent_id);
-                rep->set_status(seastar::http::reply::status_type{503});
-                rep->add_header("X-Request-ID", request_id);
-                rep->_headers["Retry-After"] = std::to_string(_config.backpressure.retry_after_seconds);
-                rep->write_body("json", R"({"error":"agent_paused","message":"Agent is paused","retry_after":)" +
-                    std::to_string(_config.backpressure.retry_after_seconds) + "}");
-                if (_config.priority_tier_enabled) {
-                    metrics().decrement_priority_active(static_cast<uint8_t>(priority));
-                }
-                co_return std::move(rep);
-            }
             _agent_registry->record_request(*agent_id);
             ctx->agent_id = *agent_id;
+            // NOTE: paused agents are no longer rejected here (VISION 3.3).
+            // They enter the queue and are skipped during dequeue.
+            // When resumed, queued requests drain naturally.
             log_proxy.debug("[{}] Agent identified: {}", request_id, *agent_id);
         }
     }
 
     // Acquire concurrency slot (direct semaphore or priority queue path)
     auto slot = co_await acquire_concurrency_slot(
-        priority, request_id, ctx->user_agent, request_start,
-        std::move(early_units));
+        priority, request_id, ctx->user_agent, ctx->agent_id,
+        request_start, std::move(early_units));
     if (slot.rejected) {
         rep->set_status(seastar::http::reply::status_type::service_unavailable);
         rep->add_header("X-Request-ID", request_id);
@@ -2779,6 +2777,7 @@ future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
     PriorityLevel priority,
     std::string request_id,
     std::string user_agent,
+    std::string agent_id,
     std::chrono::steady_clock::time_point request_start,
     std::optional<seastar::semaphore_units<>> early_units) {
 
@@ -2792,6 +2791,7 @@ future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
     stub->priority = priority;
     stub->request_id = request_id;
     stub->user_agent = user_agent;
+    stub->agent_id = agent_id;  // VISION 3.3: agent_id for pause-aware dequeue
 
     auto dequeue_future = stub->dequeue_promise.get_future();
 
@@ -2911,11 +2911,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats
         co_return std::move(rep);
     }
 
+    // VISION 3.3: Include per-agent queue depth from the scheduler
+    auto agent_depths = _scheduler.queue_depths_by_agent();
+    size_t queued = 0;
+    auto depth_it = agent_depths.find(info->agent_id);
+    if (depth_it != agent_depths.end()) {
+        queued = depth_it->second;
+    }
+
     std::ostringstream oss;
     oss << "{"
         << R"("agent_id":")" << info->agent_id << "\""
         << R"(,"display_name":")" << info->display_name << "\""
         << R"(,"paused":)" << (info->paused ? "true" : "false")
+        << R"(,"queued_requests":)" << queued
         << R"(,"requests_total":)" << info->requests_total
         << R"(,"requests_paused_rejected":)" << info->requests_paused_rejected
         << R"(,"first_seen":")" << format_agent_time(info->first_seen) << "\""
@@ -2998,6 +3007,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
     }
 
     _agent_registry->resume_agent(agent_id_param);
+
+    // VISION 3.3: Wake the dequeue loop so previously skipped requests
+    // for this agent are processed promptly.
+    _queue_cv.signal();
+
     rep->write_body("json", R"({"status":"resumed"})");
     co_return std::move(rep);
 }
@@ -3008,6 +3022,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_s
 
     auto depths = _scheduler.queue_depths();
     auto drops = _scheduler.overflow_drops();
+    auto agent_depths = _scheduler.queue_depths_by_agent();
 
     std::ostringstream oss;
     oss << "{"
@@ -3018,6 +3033,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_s
         << ", \"normal\": " << depths[2]
         << ", \"low\": " << depths[3]
         << "}"
+        << ", \"queue_depths_by_agent\": {";
+    {
+        bool first = true;
+        for (const auto& [aid, count] : agent_depths) {
+            if (!first) oss << ", ";
+            oss << "\"" << aid << "\": " << count;
+            first = false;
+        }
+    }
+    oss << "}"
         << ", \"total_enqueued\": " << _scheduler.total_enqueued_count()
         << ", \"total_dequeued\": " << _scheduler.total_dequeued_count()
         << ", \"drops_by_priority\": {"
@@ -3026,6 +3051,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_s
         << ", \"normal\": " << drops[2]
         << ", \"low\": " << drops[3]
         << "}"
+        << ", \"per_agent_drops\": " << _scheduler.per_agent_drops()
         << ", \"agents_tracked\": " << _scheduler.agents_tracked()
         << "}";
 
