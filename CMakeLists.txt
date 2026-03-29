@@ -233,6 +233,7 @@ static GLOBAL: Jemalloc = Jemalloc;
     # Define the Main Server Executable
     add_executable(ranvier_server
       src/main.cpp
+      src/agent_registry.cpp
       src/application.cpp
       src/async_persistence.cpp
       src/config_loader.cpp

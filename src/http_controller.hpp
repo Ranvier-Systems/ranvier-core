@@ -1,5 +1,6 @@
 #pragma once
 
+#include "agent_registry.hpp"
 #include "async_persistence.hpp"
 #include "chat_template.hpp"
 #include "circuit_breaker.hpp"
@@ -146,6 +147,12 @@ struct ProxyContext {
     // Agent identification for fair scheduling (User-Agent header value)
     std::string user_agent;
 
+    // Normalized agent registry key (empty if unidentified).
+    // The raw user_agent stays for backward compatibility with RequestScheduler;
+    // agent_id is the normalized registry key used for agent-aware metrics and
+    // pause/resume control. Will feed into VISION 3.3 per-agent fair scheduling.
+    std::string agent_id;
+
     // Queue timing (set by RequestScheduler::enqueue)
     std::chrono::steady_clock::time_point enqueue_time;
 
@@ -210,6 +217,9 @@ struct HttpControllerConfig {
     // Local mode settings (copied from LocalModeConfig at init)
     LocalModeConfig local_mode;
 
+    // Agent registry settings (VISION 3.2)
+    AgentRegistryConfig agent_registry;
+
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }
@@ -235,6 +245,10 @@ public:
           // Backpressure: 0 means unlimited (use max size_t as semaphore limit)
           _request_semaphore(effective_semaphore_limit(config.backpressure.max_concurrent_requests)),
           _scheduler(SchedulerSettings{config.backpressure.tier_capacity}) {
+        // Initialize agent registry (VISION 3.2)
+        if (config.agent_registry.enabled) {
+            _agent_registry = std::make_unique<AgentRegistry>(config.agent_registry);
+        }
         // Initialize load balancer configuration
         _lb_config.enabled = config.load_balancing.enabled;
         _lb_config.min_load_difference = config.load_balancing.min_load_difference;
@@ -343,6 +357,11 @@ private:
     // Uses try_get_units() for immediate rejection (no queueing)
     seastar::semaphore _request_semaphore;
 
+    // Agent registry (VISION 3.2): shard-local agent identification & control.
+    // unique_ptr (Rule #0: no shared_ptr). Null when agent_registry.enabled is false.
+    std::unique_ptr<AgentRegistry> _agent_registry;
+    seastar::metrics::metric_groups _agent_metrics;  // Deregistered in stop() (Rule #6)
+
     // Priority-aware request scheduler
     RequestScheduler _scheduler;
     seastar::condition_variable _queue_cv;  // Signaled by enqueue(), waited by process_priority_queue()
@@ -396,6 +415,14 @@ private:
 
     // Scheduler stats handler (admin, auth required)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_scheduler_stats(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Agent registry admin handlers (VISION 3.2)
+    // Note: these are shard-local. Each shard tracks its own agent counters
+    // independently. Cross-shard aggregation is deferred to a future session.
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_list_agents(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_agent_stats(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_pause_agent(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_resume_agent(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
     // Background dequeue loop for priority queue (gate-guarded, Rule #5)
     seastar::future<> process_priority_queue();
