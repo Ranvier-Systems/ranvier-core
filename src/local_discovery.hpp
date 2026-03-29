@@ -11,7 +11,7 @@
 
 #include "config.hpp"
 #include "logging.hpp"
-#include "router_service.hpp"
+#include "backend_registry.hpp"
 #include "types.hpp"
 
 #include <chrono>
@@ -62,14 +62,14 @@ public:
         size_t max_backends = 32;                      // Configurable limit (Rule #4)
     };
 
-    explicit LocalDiscoveryService(RouterService& router, Config config);
+    explicit LocalDiscoveryService(BackendRegistry& registry, Config config);
 
     // Lifecycle — runs on shard 0 only
     seastar::future<> start();
     seastar::future<> stop();
 
 private:
-    RouterService& _router;
+    BackendRegistry& _registry;
     Config _config;
     seastar::gate _gate;
     seastar::abort_source _as;

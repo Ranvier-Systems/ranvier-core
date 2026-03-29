@@ -1,5 +1,6 @@
 #pragma once
 
+#include "backend_registry.hpp"
 #include "radix_tree.hpp"
 #include "config.hpp"
 #include "gossip_service.hpp"  // For NodeState
@@ -148,7 +149,7 @@ uint64_t get_backend_load(BackendId id);
 // O(n) scan where n is typically <10 backends
 std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates);
 
-class RouterService {
+class RouterService : public BackendRegistry {
 public:
     RouterService();
     explicit RouterService(const RoutingConfig& config);
@@ -199,7 +200,7 @@ public:
                                      const std::string& request_id = "");
 
     // Resolve ID -> IP:Port
-    std::optional<seastar::socket_address> get_backend_address(BackendId id);
+    std::optional<seastar::socket_address> get_backend_address(BackendId id) const override;
 
     // 2. CONTROL PLANE (Async Broadcasts)
     // Teach the tree a new prefix (Prefix -> ID) with LRU eviction
@@ -246,10 +247,10 @@ public:
     // Weight: relative load balancing weight (default 100, higher = more traffic)
     // Priority: priority group (default 0 = highest, lower priority backends used for fallback)
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr,
-                                               uint32_t weight = 100, uint32_t priority = 0);
+                                               uint32_t weight = 100, uint32_t priority = 0) override;
 
     // Remove a backend from all shards
-    seastar::future<> unregister_backend_global(BackendId id);
+    seastar::future<> unregister_backend_global(BackendId id) override;
 
     // Start draining a backend (stops new requests, allows existing cache hits)
     // After backend_drain_timeout, the backend will be fully removed
@@ -273,7 +274,7 @@ public:
                                                   const std::string& request_id = "");
 
     // Get list of all IDs (For the Health Checker to iterate)
-    std::vector<BackendId> get_all_backend_ids() const;
+    std::vector<BackendId> get_all_backend_ids() const override;
 
     // ==========================================================================
     // Admin API - State Inspection
@@ -301,7 +302,7 @@ public:
     std::optional<RadixTree::DumpNode> get_tree_dump_with_prefix(const std::vector<TokenId>& prefix) const;
 
     // Circuit Breaker API
-    seastar::future<> set_backend_status_global(BackendId id, bool is_alive);
+    seastar::future<> set_backend_status_global(BackendId id, bool is_alive) override;
 
     // Hot-reload: Update routing configuration on all shards
     seastar::future<> update_routing_config(const RoutingConfig& config);

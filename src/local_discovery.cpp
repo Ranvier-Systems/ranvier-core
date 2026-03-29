@@ -18,8 +18,8 @@
 
 namespace ranvier {
 
-LocalDiscoveryService::LocalDiscoveryService(RouterService& router, Config config)
-    : _router(router),
+LocalDiscoveryService::LocalDiscoveryService(BackendRegistry& registry, Config config)
+    : _registry(registry),
       _config(std::move(config)) {
 }
 
@@ -298,7 +298,7 @@ seastar::future<> LocalDiscoveryService::reconcile(
         auto it = _known_backends.find(port);
         if (it != _known_backends.end()) {
             auto id = it->second.id;
-            co_await _router.unregister_backend_global(id);
+            co_await _registry.unregister_backend_global(id);
             log_discovery.info("Backend on port {} disappeared, unregistered (id={})", port, id);
             _known_backends.erase(it);
             _backends_removed++;
@@ -323,7 +323,7 @@ seastar::future<> LocalDiscoveryService::reconcile(
         // Assign ID and register
         d.id = _next_backend_id++;
         seastar::socket_address addr(seastar::net::inet_address("127.0.0.1"), d.port);
-        co_await _router.register_backend_global(d.id, addr, 100, 0);
+        co_await _registry.register_backend_global(d.id, addr, 100, 0);
 
         // Build models string for logging (truncate for readability)
         std::string models_str;

@@ -1490,7 +1490,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     return result;
 }
 
-std::optional<seastar::socket_address> RouterService::get_backend_address(BackendId id) {
+std::optional<seastar::socket_address> RouterService::get_backend_address(BackendId id) const {
     if (!g_shard_state) return std::nullopt;
     auto& state = shard_state();
     auto it = state.backends.find(id);
