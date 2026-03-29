@@ -830,6 +830,7 @@ if(Seastar_FOUND)
     # Tests Application state machine, config builders, and accessors
     add_executable(application_test
       tests/unit/application_test.cpp
+      src/agent_registry.cpp
       src/application.cpp
       src/config_loader.cpp
       src/crypto_offloader.cpp
