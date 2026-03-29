@@ -101,8 +101,6 @@ private:
 
     // Auto-register a previously unseen agent (from User-Agent header).
     // Returns agent_id. Respects MAX_KNOWN_AGENTS bound.
-    // Note: mutable because it modifies _agents — called from identify_agent
-    // which is logically const for the caller but mutates internal tracking state.
     std::string auto_register(const std::string& user_agent);
 };
 
