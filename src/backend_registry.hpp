@@ -35,6 +35,14 @@ public:
 
     virtual seastar::future<>
         unregister_backend_global(BackendId id) = 0;
+
+    // --- Load query (used by routing layer) ---
+
+    // Get load score for a backend (0.0 = idle, 1.0 = saturated)
+    // Returns 0.0 by default (optimistic) if no load data available.
+    // Not pure-virtual — default implementation returns 0.0 so existing
+    // implementations don't break.
+    virtual double get_backend_load_score(BackendId /*id*/) const { return 0.0; }
 };
 
 }  // namespace ranvier

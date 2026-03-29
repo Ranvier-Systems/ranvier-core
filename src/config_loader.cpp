@@ -69,6 +69,12 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint32_t>("RANVIER_HEALTH_FAILURE_THRESHOLD")) {
         health.failure_threshold = *v;
     }
+    if (auto v = get_env("RANVIER_HEALTH_ENABLE_VLLM_METRICS")) {
+        health.enable_vllm_metrics = (*v == "true" || *v == "1");
+    }
+    if (auto v = get_env_as<int>("RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS")) {
+        health.vllm_metrics_timeout = std::chrono::milliseconds(*v);
+    }
 
     // Pool overrides
     if (auto v = get_env_as<size_t>("RANVIER_POOL_MAX_PER_HOST")) {
@@ -761,6 +767,13 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (h["recovery_threshold"]) {
                 config.health.recovery_threshold = h["recovery_threshold"].as<uint32_t>();
+            }
+            if (h["enable_vllm_metrics"]) {
+                config.health.enable_vllm_metrics = h["enable_vllm_metrics"].as<bool>();
+            }
+            if (h["vllm_metrics_timeout_ms"]) {
+                config.health.vllm_metrics_timeout = std::chrono::milliseconds(
+                    h["vllm_metrics_timeout_ms"].as<int>());
             }
         }
 

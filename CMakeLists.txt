@@ -379,6 +379,40 @@ target_link_libraries(parse_utils_test
 )
 gtest_discover_tests(parse_utils_test)
 
+# Prometheus Parser Unit Tests (Pure C++, header-only)
+add_executable(prometheus_parser_test
+  tests/unit/prometheus_parser_test.cpp
+)
+target_include_directories(prometheus_parser_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(prometheus_parser_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(prometheus_parser_test)
+
+# VLLMMetrics Unit Tests (Pure C++, header-only)
+add_executable(vllm_metrics_test
+  tests/unit/vllm_metrics_test.cpp
+)
+target_include_directories(vllm_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(vllm_metrics_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(vllm_metrics_test)
+
+# HealthService Storage Unit Tests (Pure C++, replicates store/get logic)
+add_executable(health_service_test
+  tests/unit/health_service_test.cpp
+)
+target_include_directories(health_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(health_service_test
+  PRIVATE
+  GTest::gtest_main
+  absl::flat_hash_map
+)
+gtest_discover_tests(health_service_test)
+
 # Logging Unit Tests (Pure C++, uses stubs for Seastar/fmt)
 # Tests generate_request_id format and header extraction helpers.
 add_executable(logging_test

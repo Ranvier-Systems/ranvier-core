@@ -247,6 +247,8 @@ HealthServiceConfig Application::build_health_config() const {
     cfg.check_timeout = _config.health.check_timeout;
     cfg.failure_threshold = _config.health.failure_threshold;
     cfg.recovery_threshold = _config.health.recovery_threshold;
+    cfg.enable_vllm_metrics = _config.health.enable_vllm_metrics;
+    cfg.vllm_metrics_timeout = _config.health.vllm_metrics_timeout;
     return cfg;
 }
 
@@ -470,6 +472,12 @@ seastar::future<> Application::load_persisted_state() {
 void Application::init_health_checker() {
     _health_checker = std::make_unique<HealthService>(*_router, build_health_config());
     _health_checker->start();
+    // Wire HealthService into RouterService for vLLM load score delegation
+    // Uses a callback to avoid linking HealthService into test binaries
+    auto* hs = _health_checker.get();
+    _router->set_load_score_callback([hs](BackendId id) {
+        return hs->get_backend_load(id);
+    });
 }
 
 void Application::init_k8s_discovery() {
@@ -696,6 +704,16 @@ seastar::future<> Application::startup() {
             // 10. Initialize health checker
             init_health_checker();
 
+            // Wire HealthService into HttpController for admin metrics endpoint
+            return _controller.invoke_on_all([this](HttpController& c) {
+                c.set_health_service(_health_checker.get());
+            });
+        }).then([this] {
+            // Wire HealthService into MetricsService for vLLM gauge lambdas
+            return seastar::smp::invoke_on_all([this] {
+                metrics().set_health_service(_health_checker.get());
+            });
+        }).then([this] {
             // 11. Initialize K8s discovery (if enabled)
             init_k8s_discovery();
 
