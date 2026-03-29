@@ -757,6 +757,21 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(crypto_offloader_test)
 
+    # AgentRegistry Unit Tests (Requires Seastar types for seastar::http::request)
+    # Tests agent identification, pause/resume, metrics, and MAX_KNOWN_AGENTS bound
+    add_executable(agent_registry_test
+      tests/unit/agent_registry_test.cpp
+      src/agent_registry.cpp
+    )
+    target_include_directories(agent_registry_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(agent_registry_test
+      PRIVATE
+      Seastar::seastar
+      absl::flat_hash_map
+      GTest::gtest_main
+    )
+    gtest_discover_tests(agent_registry_test)
+
     # DtlsContext Unit Tests (Requires Seastar types for header includes)
     # Tests memory-based certificate loading (load_certs_from_memory) without reactor
     add_executable(dtls_context_test
