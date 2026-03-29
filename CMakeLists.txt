@@ -246,6 +246,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/http_controller.cpp
       src/intent_classifier.cpp
       src/k8s_discovery_service.cpp
+      src/local_discovery.cpp
       src/node_slab.cpp
       src/router_service.cpp
       src/stream_parser.cpp
@@ -583,6 +584,19 @@ target_link_libraries(k8s_discovery_test
 )
 gtest_discover_tests(k8s_discovery_test)
 
+# Local Discovery Unit Tests (Pure C++, no Seastar dependency)
+# Tests for server type detection and model response parsing
+add_executable(local_discovery_test
+  tests/unit/local_discovery_test.cpp
+)
+target_include_directories(local_discovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(local_discovery_test
+  PRIVATE
+  GTest::gtest_main
+  rapidjson_interface
+)
+gtest_discover_tests(local_discovery_test)
+
 # Request Rewriter Unit Tests (Pure C++, no Seastar dependency)
 # Tests for JSON request parsing and token ID injection
 add_executable(request_rewriter_test
@@ -826,6 +840,7 @@ if(Seastar_FOUND)
       src/router_service.cpp
       src/health_service.cpp
       src/k8s_discovery_service.cpp
+      src/local_discovery.cpp
       src/http_controller.cpp
       src/intent_classifier.cpp
       src/async_persistence.cpp

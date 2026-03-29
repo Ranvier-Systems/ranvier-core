@@ -72,6 +72,9 @@ protected:
         unsetenv("RANVIER_LOCAL_DISABLE_PERSISTENCE");
         unsetenv("RANVIER_LOCAL_AUTO_DISCOVER");
         unsetenv("RANVIER_LOCAL_DISCOVERY_PORTS");
+        unsetenv("RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL");
+        unsetenv("RANVIER_LOCAL_DISCOVERY_PROBE_TIMEOUT_MS");
+        unsetenv("RANVIER_LOCAL_DISCOVERY_CONNECT_TIMEOUT_MS");
     }
 
     void TearDown() override {
@@ -2049,6 +2052,65 @@ TEST_F(ConfigTest, LocalModeYamlTruncatesOverMaxPorts) {
     // Should be truncated to MAX_DISCOVERY_PORTS
     EXPECT_EQ(config.local_mode.discovery_ports.size(),
               LocalModeConfig::MAX_DISCOVERY_PORTS);
+}
+
+TEST_F(ConfigTest, LocalModeDiscoveryTimingDefaults) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.local_mode.discovery_scan_interval, std::chrono::seconds(10));
+    EXPECT_EQ(config.local_mode.discovery_probe_timeout, std::chrono::milliseconds(50));
+    EXPECT_EQ(config.local_mode.discovery_connect_timeout, std::chrono::milliseconds(20));
+}
+
+TEST_F(ConfigTest, LocalModeDiscoveryTimingFromYaml) {
+    writeTestConfig("test_local_mode.yaml", R"(
+local_mode:
+  enabled: true
+  discovery_scan_interval_seconds: 30
+  discovery_probe_timeout_ms: 100
+  discovery_connect_timeout_ms: 40
+)");
+    auto config = RanvierConfig::load("test_local_mode.yaml");
+    EXPECT_EQ(config.local_mode.discovery_scan_interval, std::chrono::seconds(30));
+    EXPECT_EQ(config.local_mode.discovery_probe_timeout, std::chrono::milliseconds(100));
+    EXPECT_EQ(config.local_mode.discovery_connect_timeout, std::chrono::milliseconds(40));
+}
+
+TEST_F(ConfigTest, LocalModeDiscoveryTimingFromEnv) {
+    setenv("RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL", "60", 1);
+    setenv("RANVIER_LOCAL_DISCOVERY_PROBE_TIMEOUT_MS", "200", 1);
+    setenv("RANVIER_LOCAL_DISCOVERY_CONNECT_TIMEOUT_MS", "75", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_EQ(config.local_mode.discovery_scan_interval, std::chrono::seconds(60));
+    EXPECT_EQ(config.local_mode.discovery_probe_timeout, std::chrono::milliseconds(200));
+    EXPECT_EQ(config.local_mode.discovery_connect_timeout, std::chrono::milliseconds(75));
+}
+
+TEST_F(ConfigTest, LocalModeDiscoveryTimingEnvOverridesYaml) {
+    writeTestConfig("test_local_mode.yaml", R"(
+local_mode:
+  enabled: true
+  discovery_scan_interval_seconds: 30
+  discovery_probe_timeout_ms: 100
+  discovery_connect_timeout_ms: 40
+)");
+    setenv("RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL", "5", 1);
+    auto config = RanvierConfig::load("test_local_mode.yaml");
+    // Env should override YAML for scan_interval
+    EXPECT_EQ(config.local_mode.discovery_scan_interval, std::chrono::seconds(5));
+    // Others remain from YAML
+    EXPECT_EQ(config.local_mode.discovery_probe_timeout, std::chrono::milliseconds(100));
+    EXPECT_EQ(config.local_mode.discovery_connect_timeout, std::chrono::milliseconds(40));
+}
+
+TEST_F(ConfigTest, LocalModeDiscoveryTimingInvalidEnvKeepsDefault) {
+    setenv("RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL", "not_a_number", 1);
+    setenv("RANVIER_LOCAL_DISCOVERY_PROBE_TIMEOUT_MS", "abc", 1);
+    setenv("RANVIER_LOCAL_DISCOVERY_CONNECT_TIMEOUT_MS", "", 1);
+    auto config = RanvierConfig::defaults();
+    // Invalid values should leave defaults unchanged
+    EXPECT_EQ(config.local_mode.discovery_scan_interval, std::chrono::seconds(10));
+    EXPECT_EQ(config.local_mode.discovery_probe_timeout, std::chrono::milliseconds(50));
+    EXPECT_EQ(config.local_mode.discovery_connect_timeout, std::chrono::milliseconds(20));
 }
 
 TEST_F(ConfigTest, LocalModeDisabledDoesNotAffectCluster) {

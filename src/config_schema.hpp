@@ -284,6 +284,9 @@ struct LocalModeConfig {
         3000,   // LocalAI
     };
     static constexpr size_t MAX_DISCOVERY_PORTS = 64;  // Hard Rule #4
+    std::chrono::seconds discovery_scan_interval{10};           // How often to re-scan
+    std::chrono::milliseconds discovery_probe_timeout{50};      // Semantic liveness timeout
+    std::chrono::milliseconds discovery_connect_timeout{20};    // TCP connect timeout
 };
 
 // =============================================================================

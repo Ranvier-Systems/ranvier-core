@@ -4,6 +4,17 @@ All notable changes to Ranvier Core will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Local Backend Discovery (VISION 3.1)** — Auto-discovers local LLM servers (Ollama, vLLM,
+  LM Studio, llama.cpp, LocalAI, Text Generation WebUI) using semantic liveness checks.
+  Probes configured ports with real HTTP GET `/v1/models` requests to solve the zombie port
+  problem (TCP connect succeeds but server is unresponsive). Backends are hot-added/removed
+  from the router with 3-miss hysteresis. New config fields: `discovery_scan_interval_seconds`,
+  `discovery_probe_timeout_ms`, `discovery_connect_timeout_ms`.
+
 ## [1.0.0] - 2026-03-16
 
 Initial public release. Ranvier Core is a high-performance Layer 7+ LLM traffic controller

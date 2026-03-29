@@ -18,6 +18,7 @@
 #include "health_service.hpp"
 #include "http_controller.hpp"
 #include "k8s_discovery_service.hpp"
+#include "local_discovery.hpp"
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
 #include "sharded_config.hpp"
@@ -189,6 +190,9 @@ private:
 
     // Service discovery
     std::unique_ptr<K8sDiscoveryService> _k8s_discovery;
+
+    // Local backend discovery (local mode only)
+    std::unique_ptr<LocalDiscoveryService> _local_discovery;
 
     // HTTP servers (owned during run())
     std::unique_ptr<seastar::httpd::http_server_control> _api_server;
