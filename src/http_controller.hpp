@@ -2,6 +2,7 @@
 
 #include "agent_registry.hpp"
 #include "async_persistence.hpp"
+#include "health_service.hpp"
 #include "chat_template.hpp"
 #include "circuit_breaker.hpp"
 #include "config.hpp"
@@ -284,6 +285,9 @@ public:
     // Enables cross-shard request dispatch using Power of Two Choices algorithm
     void set_load_balancer(seastar::sharded<ShardLoadBalancer>* lb) { _load_balancer = lb; }
 
+    // Set optional HealthService pointer (for /admin/backends/metrics endpoint)
+    void set_health_service(HealthService* hs) { _health_service = hs; }
+
     // Set config reload callback (for /admin/keys/reload endpoint)
     // Callback returns true on success, false on failure
     // The callback is synchronous as it should just trigger the reload process
@@ -356,6 +360,9 @@ private:
     seastar::sharded<ShardLoadBalancer>* _load_balancer;  // Cross-shard load balancer
     ShardLoadBalancerConfig _lb_config;  // Local copy of load balancer config
 
+    // HealthService pointer for admin metrics endpoint (nullable, not owned)
+    HealthService* _health_service = nullptr;
+
     // Graceful shutdown state
     // Plain bool: set/read only from this shard's reactor via invoke_on_all/local handler
     bool _draining{false};
@@ -418,6 +425,9 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_backends(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_config(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_drain_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Backend vLLM metrics handler (admin, auth required)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_backend_metrics(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
     // Health check handler (public, no auth required)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_health(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);

@@ -65,8 +65,9 @@ struct RouteBatchConfig {
     static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{20};
 };
 
-// Forward declaration
+// Forward declarations
 class GossipService;
+class HealthService;
 
 // ============================================================================
 // Unified Route Result
@@ -313,6 +314,12 @@ public:
     // Set callback to be invoked when a backend is fully removed (for pool cleanup)
     void set_pool_cleanup_callback(PoolCleanupCallback callback);
 
+    // Set the HealthService pointer for vLLM load score delegation
+    void set_health_service(HealthService* hs) { _health_service = hs; }
+
+    // Override BackendRegistry::get_backend_load_score to delegate to HealthService
+    double get_backend_load_score(BackendId id) const override;
+
     // Callback type for circuit breaker cleanup when a backend is unregistered
     // Called on each shard during unregister_backend_global() to clean up circuit entries
     using CircuitCleanupCallback = std::function<void(BackendId)>;
@@ -439,6 +446,9 @@ private:
 
     // Callback for pool cleanup when a backend is fully removed
     PoolCleanupCallback _pool_cleanup_callback;
+
+    // HealthService pointer for vLLM load score delegation (nullable, not owned)
+    HealthService* _health_service = nullptr;
 
     // Perform TTL cleanup on all shards
     void run_ttl_cleanup();

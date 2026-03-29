@@ -1,5 +1,6 @@
 #include "router_service.hpp"
 #include "gossip_service.hpp"
+#include "health_service.hpp"
 #include "logging.hpp"
 #include "metrics_service.hpp"
 #include "node_slab.hpp"
@@ -2763,6 +2764,11 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
 std::vector<BackendId> RouterService::get_all_backend_ids() const {
     if (!g_shard_state) return {};
     return shard_state().backend_ids;
+}
+
+double RouterService::get_backend_load_score(BackendId id) const {
+    if (_health_service) return _health_service->get_backend_load(id);
+    return 0.0;
 }
 
 std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {

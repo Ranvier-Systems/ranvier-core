@@ -10,6 +10,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "vllm_metrics.hpp"
 
 #include <cstddef>
 #include <functional>
@@ -154,6 +155,9 @@ struct BackendMetrics {
     MetricHistogram latency;  // ranvier_backend_latency_seconds
     MetricHistogram first_byte_latency;
     bool registered = false;
+
+    // Latest vLLM metrics (updated by HealthService scrape)
+    VLLMMetrics latest_vllm;
 
     BackendMetrics()
         : latency(backend_latency_buckets())

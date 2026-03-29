@@ -58,6 +58,10 @@ struct HealthConfig {
     std::chrono::seconds check_timeout{3};
     uint32_t failure_threshold = 3;
     uint32_t recovery_threshold = 2;
+
+    // vLLM metrics scraping — scrape Prometheus /metrics from backends
+    bool enable_vllm_metrics = true;                         // Scrape /metrics if available
+    std::chrono::milliseconds vllm_metrics_timeout{200};     // Timeout for /metrics fetch
 };
 
 // =============================================================================

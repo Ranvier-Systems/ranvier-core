@@ -281,6 +281,11 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_drain_backend(std::move(req), std::move(rep));
     }));
 
+    // Backend vLLM metrics endpoint
+    r.add(operation_type::GET, url("/admin/backends/metrics"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_backend_metrics(std::move(req), std::move(rep));
+    }));
+
     // 7. SCHEDULER STATS (admin, auth required)
     r.add(operation_type::GET, url("/admin/scheduler/stats"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_scheduler_stats(std::move(req), std::move(rep));
@@ -2580,6 +2585,66 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
         } else {
             oss << "\n";
         }
+        oss << "    }";
+        if (i < backends.size() - 1) oss << ",";
+        oss << "\n";
+    }
+
+    oss << "  ]\n";
+    oss << "}";
+
+    rep->write_body("json", oss.str());
+    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_backend_metrics(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    auto backends = _router.get_all_backend_states();
+
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"backends\": [\n";
+
+    for (size_t i = 0; i < backends.size(); ++i) {
+        const auto& b = backends[i];
+
+        // Get vLLM metrics from HealthService (if available)
+        VLLMMetrics vllm;
+        double load_score = 0.0;
+        if (_health_service) {
+            vllm = _health_service->get_vllm_metrics(b.id);
+            load_score = _health_service->get_backend_load(b.id);
+        }
+
+        oss << "    {\n";
+        oss << "      \"id\": " << b.id << ",\n";
+        oss << "      \"address\": \"" << b.address << ":" << b.port << "\",\n";
+        oss << "      \"load_score\": " << load_score << ",\n";
+        oss << "      \"vllm_metrics\": {\n";
+        oss << "        \"valid\": " << (vllm.valid ? "true" : "false");
+
+        if (vllm.valid) {
+            auto now = std::chrono::steady_clock::now();
+            double scraped_ago = std::chrono::duration<double>(now - vllm.scraped_at).count();
+            double gpu_used_gb = vllm.gpu_memory_used_bytes / (1024.0 * 1024.0 * 1024.0);
+            double gpu_total_gb = vllm.gpu_memory_total_bytes / (1024.0 * 1024.0 * 1024.0);
+
+            oss << ",\n";
+            oss << "        \"num_requests_running\": " << vllm.num_requests_running << ",\n";
+            oss << "        \"num_requests_waiting\": " << vllm.num_requests_waiting << ",\n";
+            oss << "        \"gpu_cache_usage_percent\": " << vllm.gpu_cache_usage_percent << ",\n";
+            oss << "        \"gpu_memory_used_gb\": " << gpu_used_gb << ",\n";
+            oss << "        \"gpu_memory_total_gb\": " << gpu_total_gb << ",\n";
+            oss << "        \"avg_prompt_throughput\": " << vllm.avg_prompt_throughput << ",\n";
+            oss << "        \"avg_generation_throughput\": " << vllm.avg_generation_throughput << ",\n";
+            oss << "        \"scraped_seconds_ago\": " << scraped_ago << "\n";
+        } else {
+            oss << "\n";
+        }
+
+        oss << "      }\n";
         oss << "    }";
         if (i < backends.size() - 1) oss << ",";
         oss << "\n";
