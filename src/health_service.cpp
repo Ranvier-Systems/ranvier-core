@@ -116,31 +116,7 @@ future<> HealthService::run_loop() {
 
             // Scrape vLLM metrics (parallel, independent of health check result)
             if (_config.enable_vllm_metrics) {
-                co_await seastar::max_concurrent_for_each(
-                    backends_to_check, HEALTH_MAX_CONCURRENT_CHECKS,
-                    [this](const std::pair<BackendId, socket_address>& backend) -> future<> {
-                        auto [id, addr] = backend;
-                        ++_vllm_scrapes_total;
-                        auto scrape_start = std::chrono::steady_clock::now();
-                        try {
-                            auto metrics = co_await scrape_vllm_metrics(addr);
-                            if (metrics) {
-                                store_vllm_metrics(id, std::move(*metrics));
-                                ++_vllm_scrapes_success;
-                            } else {
-                                ++_vllm_scrapes_failed;
-                            }
-                        } catch (const std::exception& e) {
-                            // Not warn — expected for non-vLLM backends
-                            log_health.debug("vLLM metrics scrape failed for backend {}: {}",
-                                id, e.what());
-                            ++_vllm_scrapes_failed;
-                        }
-                        auto scrape_end = std::chrono::steady_clock::now();
-                        double duration = std::chrono::duration<double>(scrape_end - scrape_start).count();
-                        _vllm_scrape_duration_sum += duration;
-                        ++_vllm_scrape_duration_count;
-                    });
+                co_await scrape_all_vllm_metrics(backends_to_check);
             }
 
             // 5. Sleep for configured interval
@@ -156,6 +132,37 @@ future<> HealthService::run_loop() {
         // Rule #9: Log unknown exceptions at warn level
         log_health.warn("Health check loop exiting: unknown exception");
     }
+}
+
+future<> HealthService::scrape_all_vllm_metrics(
+        const std::vector<std::pair<BackendId, socket_address>>& backends) {
+    co_await seastar::max_concurrent_for_each(
+        backends, HEALTH_MAX_CONCURRENT_CHECKS,
+        [this](const std::pair<BackendId, socket_address>& backend) -> future<> {
+            co_await scrape_one_backend(backend.first, backend.second);
+        });
+}
+
+future<> HealthService::scrape_one_backend(BackendId id, socket_address addr) {
+    ++_vllm_scrapes_total;
+    auto scrape_start = std::chrono::steady_clock::now();
+    try {
+        auto metrics = co_await scrape_vllm_metrics(addr);
+        if (metrics) {
+            store_vllm_metrics(id, std::move(*metrics));
+            ++_vllm_scrapes_success;
+        } else {
+            ++_vllm_scrapes_failed;
+        }
+    } catch (const std::exception& e) {
+        // Not warn — expected for non-vLLM backends
+        log_health.debug("vLLM metrics scrape failed for backend {}: {}", id, e.what());
+        ++_vllm_scrapes_failed;
+    }
+    auto duration = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - scrape_start).count();
+    _vllm_scrape_duration_sum += duration;
+    ++_vllm_scrape_duration_count;
 }
 
 future<bool> HealthService::check_backend(socket_address addr) {

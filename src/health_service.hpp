@@ -64,6 +64,13 @@ private:
     static constexpr size_t MAX_TRACKED_BACKENDS = 256;
     uint64_t _metrics_overflow_drops = 0;
 
+    // Run one metrics scrape pass across all backends (called from run_loop)
+    seastar::future<> scrape_all_vllm_metrics(
+        const std::vector<std::pair<BackendId, seastar::socket_address>>& backends);
+
+    // Scrape and store metrics for a single backend (with timing + counters)
+    seastar::future<> scrape_one_backend(BackendId id, seastar::socket_address addr);
+
     // Scrape /metrics from a backend, parse vLLM Prometheus metrics
     seastar::future<std::optional<VLLMMetrics>>
         scrape_vllm_metrics(seastar::socket_address addr);
