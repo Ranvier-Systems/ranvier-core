@@ -379,6 +379,17 @@ target_link_libraries(parse_utils_test
 )
 gtest_discover_tests(parse_utils_test)
 
+# Prometheus Parser Unit Tests (Pure C++, header-only)
+add_executable(prometheus_parser_test
+  tests/unit/prometheus_parser_test.cpp
+)
+target_include_directories(prometheus_parser_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(prometheus_parser_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(prometheus_parser_test)
+
 # Logging Unit Tests (Pure C++, uses stubs for Seastar/fmt)
 # Tests generate_request_id format and header extraction helpers.
 add_executable(logging_test
