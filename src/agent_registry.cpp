@@ -35,7 +35,11 @@ void AgentRegistry::init_from_config() {
             std::min<uint8_t>(ac.default_priority, 3));
         info.allow_pause = ac.allow_pause;
         // first_seen / last_seen remain default-initialized (epoch) until first request
-        _agents.emplace(info.agent_id, std::move(info));
+        auto [it, inserted] = _agents.emplace(info.agent_id, std::move(info));
+        if (!inserted) {
+            log_control.warn("AgentRegistry: duplicate agent_id '{}' from config entry '{}', "
+                             "keeping first occurrence", it->first, ac.name);
+        }
     }
     log_control.info("AgentRegistry initialized with {} configured agents on shard {}",
                      _agents.size(), seastar::this_shard_id());
@@ -60,14 +64,15 @@ std::string AgentRegistry::normalize_agent_id(const std::string& name) {
 
 std::string AgentRegistry::auto_register(const std::string& user_agent) {
     // Extract first token before "/" as agent name
+    static constexpr size_t MAX_AUTO_DETECT_NAME_LENGTH = 32;
     std::string_view ua(user_agent);
     auto slash_pos = ua.find('/');
     std::string raw_name;
     if (slash_pos != std::string_view::npos && slash_pos > 0) {
         raw_name = std::string(ua.substr(0, slash_pos));
     } else {
-        // Use entire UA if no slash (truncate to something reasonable)
-        raw_name = std::string(ua.substr(0, std::min<size_t>(ua.size(), 32)));
+        // Use entire UA if no slash (truncate to prevent unbounded agent names)
+        raw_name = std::string(ua.substr(0, std::min<size_t>(ua.size(), MAX_AUTO_DETECT_NAME_LENGTH)));
     }
 
     std::string agent_id = normalize_agent_id(raw_name);
@@ -108,7 +113,7 @@ std::string AgentRegistry::auto_register(const std::string& user_agent) {
 // ---------------------------------------------------------------------------
 
 std::optional<std::string> AgentRegistry::identify_agent(
-        const seastar::http::request& req) const {
+        const seastar::http::request& req) {
 
     // 1. Custom header — X-Ranvier-Agent allows agents to self-identify
     auto custom_it = req._headers.find("X-Ranvier-Agent");
@@ -118,15 +123,14 @@ std::optional<std::string> AgentRegistry::identify_agent(
             return agent_id;
         }
         // If custom header value doesn't match a known agent and auto-detect is on,
-        // auto-register it. Need const_cast because auto_register mutates _agents
-        // for internal bookkeeping (logically const to the caller).
+        // auto-register it.
         if (_config.auto_detect_agents) {
-            auto& self = const_cast<AgentRegistry&>(*this);
-            auto id = self.auto_register(custom_it->second);
+            auto id = auto_register(custom_it->second);
             if (!id.empty()) return id;
         }
-        // Even if not registered, return the normalized ID so the caller can use it
-        return agent_id;
+        // Unknown agent with auto-detect off or overflow — return nullopt
+        // so the caller doesn't get a phantom ID with no backing AgentInfo.
+        return std::nullopt;
     }
 
     // 2. User-Agent substring match against configured patterns
@@ -144,8 +148,7 @@ std::optional<std::string> AgentRegistry::identify_agent(
 
     // 3. Auto-detect: extract agent name from User-Agent first token
     if (_config.auto_detect_agents) {
-        auto& self = const_cast<AgentRegistry&>(*this);
-        auto id = self.auto_register(user_agent);
+        auto id = auto_register(user_agent);
         if (!id.empty()) return id;
     }
 

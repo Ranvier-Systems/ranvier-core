@@ -249,9 +249,9 @@ TEST(AgentRegistryTest, CustomHeaderUnknownAgentAutoDetectOff) {
     AgentRegistry reg(no_auto_detect_config());
     auto req = make_request("", "MyCustomAgent");
     auto id = reg.identify_agent(req);
-    // Still returns the normalized ID even if not registered
-    ASSERT_TRUE(id.has_value());
-    EXPECT_EQ(*id, "mycustomagent");
+    // Returns nullopt — unknown agent with auto-detect off should not
+    // produce a phantom ID with no backing AgentInfo.
+    EXPECT_FALSE(id.has_value());
     // Not auto-registered
     EXPECT_EQ(reg.agent_count(), 4u);
 }

@@ -34,8 +34,8 @@ struct AgentInfo {
     std::string agent_id;                              // Normalized key (lowercase, spaces → dashes)
     std::string display_name;                          // Human-readable name
     std::string pattern;                               // Matched User-Agent substring
-    PriorityLevel default_priority;
-    bool allow_pause;
+    PriorityLevel default_priority = PriorityLevel::NORMAL;
+    bool allow_pause = true;
     bool paused = false;
 
     // Per-agent metrics (shard-local counters, no atomics — Rule #1)
@@ -54,9 +54,9 @@ public:
     // Identify agent from request headers.
     // Cascade: X-Ranvier-Agent header → User-Agent substring match → auto-detect.
     // Returns agent_id string if matched, nullopt if no match.
-    // Pure computation — no I/O.
+    // Not const: auto-detect path mutates _agents for internal bookkeeping.
     std::optional<std::string> identify_agent(
-        const seastar::http::request& req) const;
+        const seastar::http::request& req);
 
     // Get full agent info by ID (returns copy for safe iteration)
     std::optional<AgentInfo> get_agent(const std::string& agent_id) const;
