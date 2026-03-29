@@ -32,7 +32,7 @@ void AgentRegistry::init_from_config() {
         info.display_name = ac.name;
         info.pattern = ac.pattern;
         info.default_priority = static_cast<PriorityLevel>(
-            std::min<uint8_t>(ac.default_priority, 3));
+            std::min<uint8_t>(ac.default_priority, static_cast<uint8_t>(PriorityLevel::LOW)));
         info.allow_pause = ac.allow_pause;
         // first_seen / last_seen remain default-initialized (epoch) until first request
         auto [it, inserted] = _agents.emplace(info.agent_id, std::move(info));
