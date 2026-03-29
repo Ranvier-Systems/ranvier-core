@@ -473,7 +473,11 @@ void Application::init_health_checker() {
     _health_checker = std::make_unique<HealthService>(*_router, build_health_config());
     _health_checker->start();
     // Wire HealthService into RouterService for vLLM load score delegation
-    _router->set_health_service(_health_checker.get());
+    // Uses a callback to avoid linking HealthService into test binaries
+    auto* hs = _health_checker.get();
+    _router->set_load_score_callback([hs](BackendId id) {
+        return hs->get_backend_load(id);
+    });
 }
 
 void Application::init_k8s_discovery() {

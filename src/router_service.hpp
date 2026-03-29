@@ -65,9 +65,8 @@ struct RouteBatchConfig {
     static constexpr std::chrono::milliseconds DEFAULT_FLUSH_INTERVAL{20};
 };
 
-// Forward declarations
+// Forward declaration
 class GossipService;
-class HealthService;
 
 // ============================================================================
 // Unified Route Result
@@ -314,11 +313,16 @@ public:
     // Set callback to be invoked when a backend is fully removed (for pool cleanup)
     void set_pool_cleanup_callback(PoolCleanupCallback callback);
 
-    // Set the HealthService pointer for vLLM load score delegation
-    void set_health_service(HealthService* hs) { _health_service = hs; }
+    // Set vLLM load score callback (delegates to HealthService::get_backend_load)
+    // Uses std::function to avoid linking HealthService into test binaries.
+    using LoadScoreCallback = std::function<double(BackendId)>;
+    void set_load_score_callback(LoadScoreCallback cb) { _load_score_callback = std::move(cb); }
 
-    // Override BackendRegistry::get_backend_load_score to delegate to HealthService
-    double get_backend_load_score(BackendId id) const override;
+    // Override BackendRegistry::get_backend_load_score to invoke the callback
+    double get_backend_load_score(BackendId id) const override {
+        if (_load_score_callback) return _load_score_callback(id);
+        return 0.0;
+    }
 
     // Callback type for circuit breaker cleanup when a backend is unregistered
     // Called on each shard during unregister_backend_global() to clean up circuit entries
@@ -447,8 +451,8 @@ private:
     // Callback for pool cleanup when a backend is fully removed
     PoolCleanupCallback _pool_cleanup_callback;
 
-    // HealthService pointer for vLLM load score delegation (nullable, not owned)
-    HealthService* _health_service = nullptr;
+    // vLLM load score callback (set by Application after HealthService init)
+    LoadScoreCallback _load_score_callback;
 
     // Perform TTL cleanup on all shards
     void run_ttl_cleanup();

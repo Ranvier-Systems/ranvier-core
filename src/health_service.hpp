@@ -2,6 +2,7 @@
 #include <chrono>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/metrics.hh>
 #include <seastar/core/metrics_registration.hh>
 
 #include <absl/container/flat_hash_map.h>
