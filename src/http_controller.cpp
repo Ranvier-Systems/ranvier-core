@@ -1,4 +1,5 @@
 #include "http_controller.hpp"
+#include "agent_registry.hpp"
 #include "boundary_detector.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
@@ -285,6 +286,22 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         return this->handle_scheduler_stats(std::move(req), std::move(rep));
     }));
 
+    // 8. AGENT REGISTRY (admin, auth required)
+    // Note: these endpoints are shard-local. Each shard tracks its own agent
+    // counters independently. Cross-shard aggregation is deferred to a future session.
+    r.add(operation_type::GET, url("/admin/agents"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_list_agents(std::move(req), std::move(rep));
+    }));
+    r.add(operation_type::GET, url("/admin/agents/stats"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_agent_stats(std::move(req), std::move(rep));
+    }));
+    r.add(operation_type::POST, url("/admin/agents/pause"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_pause_agent(std::move(req), std::move(rep));
+    }));
+    r.add(operation_type::POST, url("/admin/agents/resume"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_resume_agent(std::move(req), std::move(rep));
+    }));
+
     // Start rate limiter cleanup timer (Hard Rule #5: timer with gate guard)
     _rate_limiter.start();
 
@@ -321,6 +338,19 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
             sm::description("Number of unique agents tracked for fair scheduling"),
             [this] { return static_cast<double>(_scheduler.agents_tracked()); }),
     });
+
+    // Register agent registry metrics (Rule #6: deregistered in stop())
+    if (_agent_registry) {
+        _agent_metrics.add_group("ranvier", {
+            sm::make_gauge("agents_tracked",
+                sm::description("Number of agents tracked by the agent registry"),
+                [this] { return static_cast<double>(_agent_registry->agent_count()); }),
+
+            sm::make_gauge("agents_overflow_drops",
+                sm::description("Agents dropped due to MAX_KNOWN_AGENTS bound"),
+                [this] { return static_cast<double>(_agent_registry->overflow_drops()); }),
+        });
+    }
 
     // Start priority queue background dequeue loop if enabled (Rule #5: gate-guarded)
     if (_config.backpressure.enable_priority_queue) {
@@ -1560,6 +1590,32 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
+    // Agent identification
+    // Runs after extract_priority() — additive identification, metrics, and pause/resume.
+    // TODO: Agent config priority override is deferred; extract_priority() remains unchanged.
+    if (_agent_registry) {
+        auto agent_id = _agent_registry->identify_agent(*req);
+        if (agent_id) {
+            // Check if agent is paused → 503 with Retry-After
+            if (_agent_registry->is_paused(*agent_id)) {
+                _agent_registry->record_paused_rejection(*agent_id);
+                log_proxy.debug("[{}] Agent '{}' is paused, rejecting with 503", request_id, *agent_id);
+                rep->set_status(seastar::http::reply::status_type{503});
+                rep->add_header("X-Request-ID", request_id);
+                rep->_headers["Retry-After"] = std::to_string(_config.backpressure.retry_after_seconds);
+                rep->write_body("json", R"({"error":"agent_paused","message":"Agent is paused","retry_after":)" +
+                    std::to_string(_config.backpressure.retry_after_seconds) + "}");
+                if (_config.priority_tier_enabled) {
+                    metrics().decrement_priority_active(static_cast<uint8_t>(priority));
+                }
+                co_return std::move(rep);
+            }
+            _agent_registry->record_request(*agent_id);
+            ctx->agent_id = *agent_id;
+            log_proxy.debug("[{}] Agent identified: {}", request_id, *agent_id);
+        }
+    }
+
     // Acquire concurrency slot (direct semaphore or priority queue path)
     auto slot = co_await acquire_concurrency_slot(
         priority, request_id, ctx->user_agent, request_start,
@@ -2198,6 +2254,9 @@ future<> HttpController::stop() {
     // Deregister scheduler metrics before member destruction (Rule #6)
     _scheduler_metrics.clear();
 
+    // Deregister agent registry metrics before member destruction (Rule #6)
+    _agent_metrics.clear();
+
     // Close gate if not already closed by wait_for_drain()
     if (!_request_gate.is_closed()) {
         co_await _request_gate.close();
@@ -2766,6 +2825,182 @@ future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
 // ---------------------------------------------------------
 // SCHEDULER STATS HANDLER (admin, auth required)
 // ---------------------------------------------------------
+
+// =============================================================================
+// Agent Registry Admin Handlers
+// =============================================================================
+// Note: these endpoints are shard-local. Each shard tracks its own agent
+// counters independently. Cross-shard aggregation is deferred to a future session.
+
+// Helper: format steady_clock time_point as ISO 8601 UTC string.
+// Returns "never" if the time_point is at epoch (agent never seen).
+static std::string format_agent_time(std::chrono::steady_clock::time_point tp) {
+    if (tp.time_since_epoch().count() == 0) {
+        return "never";
+    }
+    // Convert steady_clock to system_clock for wall-clock formatting
+    auto sys_now = std::chrono::system_clock::now();
+    auto steady_now = std::chrono::steady_clock::now();
+    auto sys_tp = sys_now + std::chrono::duration_cast<std::chrono::system_clock::duration>(tp - steady_now);
+    auto time_t_val = std::chrono::system_clock::to_time_t(sys_tp);
+    struct tm tm_buf;
+    gmtime_r(&time_t_val, &tm_buf);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
+    return std::string(buf);
+}
+
+// GET /admin/agents — list all known agents
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_list_agents(
+    std::unique_ptr<seastar::http::request> /*req*/,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    if (!_agent_registry) {
+        rep->write_body("json", R"({"error":"agent_registry_disabled"})");
+        co_return std::move(rep);
+    }
+
+    auto agents = _agent_registry->list_agents();
+    std::ostringstream oss;
+    oss << R"({"agents":[)";
+    for (size_t i = 0; i < agents.size(); ++i) {
+        const auto& a = agents[i];
+        if (i > 0) oss << ",";
+        oss << "{"
+            << R"("agent_id":")" << a.agent_id << "\""
+            << R"(,"display_name":")" << a.display_name << "\""
+            << R"(,"pattern":")" << a.pattern << "\""
+            << R"(,"default_priority":")" << priority_level_to_string(a.default_priority) << "\""
+            << R"(,"allow_pause":)" << (a.allow_pause ? "true" : "false")
+            << R"(,"paused":)" << (a.paused ? "true" : "false")
+            << R"(,"requests_total":)" << a.requests_total
+            << R"(,"requests_paused_rejected":)" << a.requests_paused_rejected
+            << R"(,"first_seen":")" << format_agent_time(a.first_seen) << "\""
+            << R"(,"last_seen":")" << format_agent_time(a.last_seen) << "\""
+            << "}";
+    }
+    oss << R"(],"total_agents":)" << _agent_registry->agent_count()
+        << R"(,"overflow_drops":)" << _agent_registry->overflow_drops()
+        << "}";
+
+    rep->write_body("json", oss.str());
+    co_return std::move(rep);
+}
+
+// GET /admin/agents/stats?agent_id=<id> — single agent detail
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    if (!_agent_registry) {
+        rep->write_body("json", R"({"error":"agent_registry_disabled"})");
+        co_return std::move(rep);
+    }
+
+    auto agent_id_param = req->get_query_param("agent_id");
+    if (agent_id_param.empty()) {
+        rep->set_status(seastar::http::reply::status_type{400});
+        rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
+        co_return std::move(rep);
+    }
+
+    auto info = _agent_registry->get_agent(agent_id_param);
+    if (!info) {
+        rep->set_status(seastar::http::reply::status_type{404});
+        rep->write_body("json", R"({"error":"agent_not_found"})");
+        co_return std::move(rep);
+    }
+
+    std::ostringstream oss;
+    oss << "{"
+        << R"("agent_id":")" << info->agent_id << "\""
+        << R"(,"display_name":")" << info->display_name << "\""
+        << R"(,"paused":)" << (info->paused ? "true" : "false")
+        << R"(,"requests_total":)" << info->requests_total
+        << R"(,"requests_paused_rejected":)" << info->requests_paused_rejected
+        << R"(,"first_seen":")" << format_agent_time(info->first_seen) << "\""
+        << R"(,"last_seen":")" << format_agent_time(info->last_seen) << "\""
+        << "}";
+
+    rep->write_body("json", oss.str());
+    co_return std::move(rep);
+}
+
+// POST /admin/agents/pause?agent_id=<id> — pause an agent
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_pause_agent(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    if (!_agent_registry) {
+        rep->write_body("json", R"({"error":"agent_registry_disabled"})");
+        co_return std::move(rep);
+    }
+
+    auto agent_id_param = req->get_query_param("agent_id");
+    if (agent_id_param.empty()) {
+        rep->set_status(seastar::http::reply::status_type{400});
+        rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
+        co_return std::move(rep);
+    }
+
+    auto info = _agent_registry->get_agent(agent_id_param);
+    if (!info) {
+        rep->set_status(seastar::http::reply::status_type{404});
+        rep->write_body("json", R"({"error":"agent_not_found"})");
+        co_return std::move(rep);
+    }
+
+    if (!info->allow_pause) {
+        rep->set_status(seastar::http::reply::status_type{409});
+        rep->write_body("json", R"({"error":"agent_pause_not_allowed"})");
+        co_return std::move(rep);
+    }
+
+    if (info->paused) {
+        rep->set_status(seastar::http::reply::status_type{409});
+        rep->write_body("json", R"({"error":"agent_already_paused"})");
+        co_return std::move(rep);
+    }
+
+    _agent_registry->pause_agent(agent_id_param);
+    rep->write_body("json", R"({"status":"paused"})");
+    co_return std::move(rep);
+}
+
+// POST /admin/agents/resume?agent_id=<id> — resume a paused agent
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agent(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    if (!_agent_registry) {
+        rep->write_body("json", R"({"error":"agent_registry_disabled"})");
+        co_return std::move(rep);
+    }
+
+    auto agent_id_param = req->get_query_param("agent_id");
+    if (agent_id_param.empty()) {
+        rep->set_status(seastar::http::reply::status_type{400});
+        rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
+        co_return std::move(rep);
+    }
+
+    auto info = _agent_registry->get_agent(agent_id_param);
+    if (!info) {
+        rep->set_status(seastar::http::reply::status_type{404});
+        rep->write_body("json", R"({"error":"agent_not_found"})");
+        co_return std::move(rep);
+    }
+
+    if (!info->paused) {
+        rep->set_status(seastar::http::reply::status_type{409});
+        rep->write_body("json", R"({"error":"agent_not_paused"})");
+        co_return std::move(rep);
+    }
+
+    _agent_registry->resume_agent(agent_id_param);
+    rep->write_body("json", R"({"status":"resumed"})");
+    co_return std::move(rep);
+}
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_stats(
     std::unique_ptr<seastar::http::request> /*req*/,

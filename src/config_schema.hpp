@@ -264,6 +264,35 @@ struct IntentClassificationConfig {
 };
 
 // =============================================================================
+// Agent Registry Configuration
+// =============================================================================
+
+// Per-agent identification and control configuration.
+// Maps User-Agent patterns to named agents with priority defaults and
+// pause/resume capability via the admin API.
+struct AgentConfig {
+    std::string pattern;                               // Substring match against User-Agent
+    std::string name;                                  // Display name (e.g. "Cursor IDE")
+    uint8_t default_priority = 2;                      // Maps to PriorityLevel (0=CRITICAL, 1=HIGH, 2=NORMAL, 3=LOW)
+    bool allow_pause = true;                           // Can this agent be paused via admin API?
+};
+
+// Agent registry master configuration.
+// Enables identification of requesting agents from HTTP headers, assigns
+// per-agent priorities, and exposes pause/resume control via admin API.
+struct AgentRegistryConfig {
+    bool enabled = true;                               // Master switch
+    bool auto_detect_agents = true;                    // Identify unknown agents from User-Agent header
+    static constexpr size_t MAX_KNOWN_AGENTS = 64;     // Hard Rule #4: bounded container
+    std::vector<AgentConfig> known_agents = {
+        {"Cursor",      "Cursor IDE",   0, true},      // CRITICAL
+        {"claude-code", "Claude Code",  0, true},      // CRITICAL
+        {"cline",       "Cline",        1, true},      // HIGH
+        {"aider",       "Aider",        1, true},      // HIGH
+    };
+};
+
+// =============================================================================
 // Local Mode Configuration
 // =============================================================================
 
@@ -318,6 +347,7 @@ struct RanvierConfig {
     PriorityTierConfig priority_tier;
     IntentClassificationConfig intent_classification;
     LocalModeConfig local_mode;
+    AgentRegistryConfig agent_registry;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);

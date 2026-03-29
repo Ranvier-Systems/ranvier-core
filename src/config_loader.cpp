@@ -689,6 +689,14 @@ void RanvierConfig::apply_env_overrides() {
             ++count;
         }
     }
+
+    // Agent registry overrides
+    if (auto v = get_env("RANVIER_AGENT_REGISTRY_ENABLED")) {
+        agent_registry.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_AGENT_AUTO_DETECT")) {
+        agent_registry.auto_detect_agents = (*v == "1" || *v == "true" || *v == "yes");
+    }
 }
 
 // =============================================================================
@@ -1351,6 +1359,45 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (lm["discovery_connect_timeout_ms"]) {
                 config.local_mode.discovery_connect_timeout =
                     std::chrono::milliseconds(lm["discovery_connect_timeout_ms"].as<unsigned>());
+            }
+        }
+        // Agent registry section
+        if (yaml["agent_registry"]) {
+            YAML::Node ar = yaml["agent_registry"];
+            if (ar["enabled"]) config.agent_registry.enabled = ar["enabled"].as<bool>();
+            if (ar["auto_detect_agents"]) config.agent_registry.auto_detect_agents = ar["auto_detect_agents"].as<bool>();
+            if (ar["known_agents"]) {
+                YAML::Node agents = ar["known_agents"];
+                if (agents.IsSequence()) {
+                    config.agent_registry.known_agents.clear();
+                    size_t count = 0;
+                    for (const auto& entry : agents) {
+                        if (count >= AgentRegistryConfig::MAX_KNOWN_AGENTS) {
+                            std::cerr << "[WARN] agent_registry.known_agents has more than "
+                                      << AgentRegistryConfig::MAX_KNOWN_AGENTS
+                                      << " entries, truncating (Rule #4)\n";
+                            break;
+                        }
+                        AgentConfig ac;
+                        if (entry["pattern"]) ac.pattern = entry["pattern"].as<std::string>();
+                        if (entry["name"]) ac.name = entry["name"].as<std::string>();
+                        if (entry["default_priority"]) {
+                            std::string p = entry["default_priority"].as<std::string>();
+                            if (p == "critical")      ac.default_priority = 0;
+                            else if (p == "high")     ac.default_priority = 1;
+                            else if (p == "normal")   ac.default_priority = 2;
+                            else if (p == "low")      ac.default_priority = 3;
+                            else {
+                                std::cerr << "[WARN] Unknown priority '" << p
+                                          << "' in agent_registry.known_agents, defaulting to normal\n";
+                                ac.default_priority = 2;
+                            }
+                        }
+                        if (entry["allow_pause"]) ac.allow_pause = entry["allow_pause"].as<bool>();
+                        config.agent_registry.known_agents.push_back(std::move(ac));
+                        ++count;
+                    }
+                }
             }
         }
 
