@@ -4,6 +4,9 @@
 local_mode:
   enabled: true
   discovery_ports: [11434, 8080, 1234, 8000, 5000, 3000]
+  # discovery_scan_interval_seconds: 10   # How often to re-scan ports
+  # discovery_probe_timeout_ms: 50        # HTTP GET /v1/models timeout
+  # discovery_connect_timeout_ms: 20      # TCP connect timeout
 
 routing:
   mode: prefix

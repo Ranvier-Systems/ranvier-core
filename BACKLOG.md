@@ -819,13 +819,13 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
 
 ### Tier 3: Local Product
 
-- [ ] **[P2] Local Mode Config (VISION 1.3)**
+- [x] **[P2] Local Mode Config (VISION 1.3)**
   _Effort:_ ~1 week
   _Scope:_ LocalModeConfig, RANVIER_LOCAL_MODE env, conditional startup.
   _Files:_ `src/config_schema.hpp`, `src/application.cpp`
   _Complexity:_ Low
 
-- [ ] **[P2] Local Backend Discovery (VISION 3.1)**
+- [x] **[P2] Local Backend Discovery (VISION 3.1)**
   _Effort:_ ~1.5 weeks
   _Scope:_ Port scanning, semantic liveness, server type detection.
   _Dependencies:_ 1.3
