@@ -64,7 +64,7 @@ struct BackpressureSettings {
         BackpressureConfig::DEFAULT_TIER_CAPACITY_LOW,
     };
 
-    // Per-agent queue depth limit (VISION 3.3)
+    // Per-agent queue depth limit
     uint32_t max_per_agent_queued = 128;
 };
 
@@ -153,7 +153,7 @@ struct ProxyContext {
     // Normalized agent registry key (empty if unidentified).
     // The raw user_agent stays for backward compatibility with RequestScheduler;
     // agent_id is the normalized registry key used for agent-aware metrics and
-    // pause/resume control. Will feed into VISION 3.3 per-agent fair scheduling.
+    // pause/resume control and per-agent fair scheduling.
     std::string agent_id;
 
     // Queue timing (set by RequestScheduler::enqueue)
@@ -252,7 +252,7 @@ public:
         // Initialize agent registry
         if (config.agent_registry.enabled) {
             _agent_registry = std::make_unique<AgentRegistry>(config.agent_registry);
-            // VISION 3.3: Wire pause check into scheduler so paused agents are
+            // Wire pause check into scheduler so paused agents are
             // skipped during dequeue rather than rejected at the gate.
             _scheduler.set_pause_check([this](std::string_view agent_id) {
                 return _agent_registry->is_paused(std::string(agent_id));
@@ -453,7 +453,7 @@ private:
         PriorityLevel priority,
         std::string request_id,
         std::string user_agent,
-        std::string agent_id,                              // VISION 3.3
+        std::string agent_id,                              // For pause-aware scheduling
         std::chrono::steady_clock::time_point request_start,
         std::optional<seastar::semaphore_units<>> early_units);
 

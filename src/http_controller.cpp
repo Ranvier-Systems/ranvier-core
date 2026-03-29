@@ -338,7 +338,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
             sm::description("Number of unique agents tracked for fair scheduling"),
             [this] { return static_cast<double>(_scheduler.agents_tracked()); }),
 
-        // VISION 3.3: Pause-aware scheduling metrics
+        // Pause-aware scheduling metrics
         sm::make_gauge("scheduler_paused_skips_total",
             sm::description("Total times dequeue() skipped a paused agent's request"),
             [this] { return static_cast<double>(_scheduler.paused_skips()); }),
@@ -1599,7 +1599,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
-    // Agent identification (VISION 3.3: paused agents enter the queue instead of being rejected)
+    // Agent identification (paused agents enter the queue instead of being rejected)
     // Runs after extract_priority() — additive identification and metrics.
     // TODO: Agent config priority override is deferred; extract_priority() remains unchanged.
     if (_agent_registry) {
@@ -1607,7 +1607,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         if (agent_id) {
             _agent_registry->record_request(*agent_id);
             ctx->agent_id = *agent_id;
-            // NOTE: paused agents are no longer rejected here (VISION 3.3).
+            // NOTE: paused agents are no longer rejected here.
             // They enter the queue and are skipped during dequeue.
             // When resumed, queued requests drain naturally.
             log_proxy.debug("[{}] Agent identified: {}", request_id, *agent_id);
@@ -2791,7 +2791,7 @@ future<HttpController::AcquireResult> HttpController::acquire_concurrency_slot(
     stub->priority = priority;
     stub->request_id = request_id;
     stub->user_agent = user_agent;
-    stub->agent_id = agent_id;  // VISION 3.3: agent_id for pause-aware dequeue
+    stub->agent_id = agent_id;
 
     auto dequeue_future = stub->dequeue_promise.get_future();
 
@@ -2911,7 +2911,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats
         co_return std::move(rep);
     }
 
-    // VISION 3.3: Include per-agent queue depth from the scheduler
+    // Include per-agent queue depth from the scheduler
     auto agent_depths = _scheduler.queue_depths_by_agent();
     size_t queued = 0;
     auto depth_it = agent_depths.find(info->agent_id);
@@ -3008,7 +3008,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
 
     _agent_registry->resume_agent(agent_id_param);
 
-    // VISION 3.3: Wake the dequeue loop so previously skipped requests
+    // Wake the dequeue loop so previously skipped requests
     // for this agent are processed promptly.
     _queue_cv.signal();
 

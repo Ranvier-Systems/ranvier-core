@@ -47,10 +47,10 @@ inline const char* priority_level_to_string(PriorityLevel level) {
 // header free of unrelated fields.
 struct SchedulerSettings {
     std::array<uint32_t, 4> tier_capacity = {64, 128, 256, 512};
-    uint32_t max_per_agent_queued = 128;  // Per-agent queue depth limit (VISION 3.3)
+    uint32_t max_per_agent_queued = 128;  // Per-agent queue depth limit
 };
 
-// Type alias for pause check callback (VISION 3.3).
+// Type alias for pause check callback.
 // Returns true if the given agent_id is currently paused.
 // The scheduler itself doesn't own the AgentRegistry — it receives this predicate.
 using PauseCheckFn = std::function<bool(std::string_view agent_id)>;
@@ -62,7 +62,7 @@ using PauseCheckFn = std::function<bool(std::string_view agent_id)>;
 // Context must expose:
 //   PriorityLevel                       priority;
 //   std::string                         user_agent;
-//   std::string                         agent_id;       (VISION 3.3)
+//   std::string                         agent_id;       (pause-aware scheduling)
 //   std::chrono::steady_clock::time_point enqueue_time;  (written by enqueue)
 
 template<typename Context>
@@ -81,7 +81,7 @@ public:
     BasicRequestScheduler() : BasicRequestScheduler(SchedulerSettings{}) {}
 
     // Set the pause check function (called during dequeue to skip paused agents).
-    // VISION 3.3: The scheduler doesn't own the AgentRegistry — it receives a predicate.
+    // The scheduler doesn't own the AgentRegistry — it receives a predicate.
     void set_pause_check(PauseCheckFn fn) { _pause_check = std::move(fn); }
 
     // Returns true if enqueued, false if queue full or per-agent limit reached (caller returns 503).
@@ -95,7 +95,7 @@ public:
             return false;
         }
 
-        // VISION 3.3: Per-agent queue depth limit.
+        // Per-agent queue depth limit.
         // Prevents a single paused agent from consuming an entire tier's capacity.
         if (!ctx->agent_id.empty()) {
             size_t agent_queued = count_agent_queued(ctx->agent_id);
@@ -114,7 +114,7 @@ public:
     // Dequeue highest-priority waiting request (fair within tier).
     // CRITICAL always wins (never subject to pause — interactive typing must not block).
     // Within each non-CRITICAL tier, picks the agent whose last_served timestamp
-    // is oldest, but SKIPS any request whose agent_id is paused (VISION 3.3).
+    // is oldest, but SKIPS any request whose agent_id is paused.
     std::optional<std::unique_ptr<Context>> dequeue() {
         // CRITICAL always wins — no pause check
         if (!_queues[0].empty()) {
@@ -134,7 +134,7 @@ public:
             auto best_time = std::chrono::steady_clock::time_point::max();
 
             for (size_t i = 0; i < _queues[tier].size(); ++i) {
-                // VISION 3.3: Skip paused agents
+                // Skip paused agents
                 if (_pause_check && !_queues[tier][i]->agent_id.empty()
                     && _pause_check(_queues[tier][i]->agent_id)) {
                     ++_paused_skips;
@@ -190,11 +190,11 @@ public:
     const std::array<uint64_t, 4>& overflow_drops() const { return _overflow_drops; }
     size_t agents_tracked() const { return _agent_last_served.size(); }
 
-    // VISION 3.3: Per-agent drop counter and paused-skip counter
+    // Per-agent drop counter and paused-skip counter
     uint64_t per_agent_drops() const { return _per_agent_drops; }
     uint64_t paused_skips() const { return _paused_skips; }
 
-    // VISION 3.3: Per-agent queue depth map (across all tiers).
+    // Per-agent queue depth map (across all tiers).
     // O(total_queued) — called infrequently (admin API only).
     absl::flat_hash_map<std::string, size_t> queue_depths_by_agent() const {
         absl::flat_hash_map<std::string, size_t> result;
@@ -218,7 +218,7 @@ private:
     std::array<uint32_t, 4> _tier_capacity{};
     std::array<uint64_t, 4> _overflow_drops{};
 
-    // VISION 3.3: Per-agent queue depth limit and pause check
+    // Per-agent queue depth limit and pause check
     uint32_t _max_per_agent_queued{DEFAULT_MAX_PER_AGENT_QUEUED};
     uint64_t _per_agent_drops{0};
     uint64_t _paused_skips{0};
@@ -270,7 +270,7 @@ private:
         _agent_last_served.emplace(std::string(key), now);
     }
 
-    // VISION 3.3: Count how many requests from a given agent_id are queued across all tiers.
+    // Count how many requests from a given agent_id are queued across all tiers.
     // O(total_queued) but called only on the enqueue path when agent_id is non-empty.
     size_t count_agent_queued(std::string_view aid) const {
         size_t count = 0;

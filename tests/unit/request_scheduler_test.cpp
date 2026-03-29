@@ -17,7 +17,7 @@ using namespace ranvier;
 struct TestContext {
     PriorityLevel priority = PriorityLevel::NORMAL;
     std::string user_agent;
-    std::string agent_id;  // VISION 3.3: required by scheduler for pause-aware dequeue
+    std::string agent_id;  // Required by scheduler for pause-aware dequeue
     std::chrono::steady_clock::time_point enqueue_time;
     std::string request_id;
 };
