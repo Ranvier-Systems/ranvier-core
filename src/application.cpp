@@ -248,7 +248,7 @@ HealthServiceConfig Application::build_health_config() const {
     cfg.failure_threshold = _config.health.failure_threshold;
     cfg.recovery_threshold = _config.health.recovery_threshold;
     cfg.enable_vllm_metrics = _config.health.enable_vllm_metrics;
-    cfg.metrics_timeout = _config.health.vllm_metrics_timeout;
+    cfg.vllm_metrics_timeout = _config.health.vllm_metrics_timeout;
     return cfg;
 }
 
@@ -707,6 +707,11 @@ seastar::future<> Application::startup() {
             // Wire HealthService into HttpController for admin metrics endpoint
             return _controller.invoke_on_all([this](HttpController& c) {
                 c.set_health_service(_health_checker.get());
+            });
+        }).then([this] {
+            // Wire HealthService into MetricsService for vLLM gauge lambdas
+            return seastar::smp::invoke_on_all([this] {
+                metrics().set_health_service(_health_checker.get());
             });
         }).then([this] {
             // 11. Initialize K8s discovery (if enabled)

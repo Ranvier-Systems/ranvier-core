@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "health_service.hpp"
 #include "metrics_helpers.hpp"
 
 #include <array>
@@ -421,13 +422,9 @@ public:
         }
     }
 
-    // Update vLLM metrics for a backend (called by HealthService after scrape)
-    void update_backend_vllm_metrics(BackendId backend_id, const VLLMMetrics& vllm) {
-        auto* bm = get_or_create_backend_metrics(backend_id);
-        if (bm) {
-            bm->latest_vllm = vllm;
-        }
-    }
+    // Set HealthService pointer for vLLM metrics gauge lambdas.
+    // Called during init; null-safe (gauges return 0 when unset).
+    void set_health_service(HealthService* hs) { _health_service = hs; }
 
     // Helper to convert chrono duration to seconds
     template<typename Duration>
@@ -438,6 +435,9 @@ public:
 private:
     seastar::metrics::metric_groups _metrics;
     seastar::metrics::metric_groups _backend_metrics;
+
+    // HealthService pointer for vLLM gauge lambdas (nullable, not owned)
+    HealthService* _health_service = nullptr;
 
     // Counters
     uint64_t _requests_total = 0;
@@ -559,36 +559,55 @@ private:
                 {{"backend_id", backend_id_str}},
                 [backend_id] { return static_cast<double>(get_backend_load(backend_id)); }),
 
-            // Per-backend vLLM metrics gauges (populated by HealthService scrapes)
+            // Per-backend vLLM metrics gauges (read from HealthService on shard 0)
+            // Returns 0/default when HealthService is not set or backend has no vLLM data
             seastar::metrics::make_gauge("backend_vllm_requests_running",
                 seastar::metrics::description("Active requests on GPU (from vLLM /metrics)"),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return static_cast<double>(metrics.latest_vllm.num_requests_running); }),
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return static_cast<double>(_health_service->get_vllm_metrics(backend_id).num_requests_running);
+                }),
 
             seastar::metrics::make_gauge("backend_vllm_requests_waiting",
                 seastar::metrics::description("Queued requests in vLLM scheduler (from /metrics)"),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return static_cast<double>(metrics.latest_vllm.num_requests_waiting); }),
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return static_cast<double>(_health_service->get_vllm_metrics(backend_id).num_requests_waiting);
+                }),
 
             seastar::metrics::make_gauge("backend_vllm_cache_usage",
                 seastar::metrics::description("GPU KV cache usage 0.0-1.0 (from vLLM /metrics)"),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return metrics.latest_vllm.gpu_cache_usage_percent; }),
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return _health_service->get_vllm_metrics(backend_id).gpu_cache_usage_percent;
+                }),
 
             seastar::metrics::make_gauge("backend_vllm_load_score",
                 seastar::metrics::description("Composite load score 0.0-1.0 (from vLLM /metrics)"),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return metrics.latest_vllm.load_score(); }),
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return _health_service->get_backend_load(backend_id);
+                }),
 
             seastar::metrics::make_gauge("backend_vllm_prompt_throughput",
                 seastar::metrics::description("Average prompt throughput tokens/sec (from vLLM /metrics)"),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return metrics.latest_vllm.avg_prompt_throughput; }),
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return _health_service->get_vllm_metrics(backend_id).avg_prompt_throughput;
+                }),
 
             seastar::metrics::make_gauge("backend_vllm_generation_throughput",
                 seastar::metrics::description("Average generation throughput tokens/sec (from vLLM /metrics)"),
                 {{"backend_id", backend_id_str}},
-                [&metrics] { return metrics.latest_vllm.avg_generation_throughput; })
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return _health_service->get_vllm_metrics(backend_id).avg_generation_throughput;
+                })
         });
 
         metrics.registered = true;

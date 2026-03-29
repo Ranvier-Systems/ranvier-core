@@ -2,6 +2,7 @@
 #include "logging.hpp"
 #include "prometheus_parser.hpp"
 
+#include <cmath>
 #include <fmt/format.h>
 
 #include <seastar/core/sleep.hh>
@@ -25,7 +26,9 @@ constexpr size_t HEALTH_MAX_CONCURRENT_CHECKS = 16;
 constexpr size_t METRICS_MAX_RESPONSE_SIZE = 128 * 1024;  // 128KB
 
 HealthService::HealthService(BackendRegistry& registry, HealthServiceConfig config)
-    : _registry(registry), _config(config) {}
+    : _registry(registry), _config(config) {
+    _backend_vllm_metrics.reserve(MAX_TRACKED_BACKENDS);
+}
 
 void HealthService::start() {
     // Register scraping observability metrics (Rule #6: deregistered in stop())
@@ -182,7 +185,7 @@ future<bool> HealthService::check_backend(socket_address addr) {
 
 future<std::optional<VLLMMetrics>>
 HealthService::scrape_vllm_metrics(socket_address addr) {
-    auto deadline = lowres_clock::now() + _config.metrics_timeout;
+    auto deadline = lowres_clock::now() + _config.vllm_metrics_timeout;
 
     try {
         // 1. Connect with metrics_timeout
@@ -250,12 +253,12 @@ HealthService::scrape_vllm_metrics(socket_address addr) {
         // 7. Parse target metrics using Prometheus text parser
         VLLMMetrics m;
 
-        // Request load
+        // Request load (guard against Inf/NaN — UB on integer cast)
         if (auto v = extract_prometheus_metric(body, "vllm:num_requests_running")) {
-            m.num_requests_running = static_cast<uint32_t>(*v);
+            if (std::isfinite(*v) && *v >= 0) m.num_requests_running = static_cast<uint32_t>(*v);
         }
         if (auto v = extract_prometheus_metric(body, "vllm:num_requests_waiting")) {
-            m.num_requests_waiting = static_cast<uint32_t>(*v);
+            if (std::isfinite(*v) && *v >= 0) m.num_requests_waiting = static_cast<uint32_t>(*v);
         }
 
         // KV cache usage
@@ -271,12 +274,12 @@ HealthService::scrape_vllm_metrics(socket_address addr) {
             m.avg_generation_throughput = *v;
         }
 
-        // Lifetime token counters
+        // Lifetime token counters (guard against Inf/NaN — UB on integer cast)
         if (auto v = extract_prometheus_metric(body, "vllm:prompt_tokens_total")) {
-            m.prompt_tokens_total = static_cast<uint64_t>(*v);
+            if (std::isfinite(*v) && *v >= 0) m.prompt_tokens_total = static_cast<uint64_t>(*v);
         }
         if (auto v = extract_prometheus_metric(body, "vllm:generation_tokens_total")) {
-            m.generation_tokens_total = static_cast<uint64_t>(*v);
+            if (std::isfinite(*v) && *v >= 0) m.generation_tokens_total = static_cast<uint64_t>(*v);
         }
 
         // GPU memory (may not be prefixed with vllm:)

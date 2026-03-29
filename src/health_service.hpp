@@ -20,8 +20,8 @@ struct HealthServiceConfig {
     uint32_t recovery_threshold = 2;
 
     // vLLM metrics scraping
-    bool enable_vllm_metrics = true;           // Scrape /metrics if available
-    std::chrono::milliseconds metrics_timeout{200};  // Timeout for /metrics fetch
+    bool enable_vllm_metrics = true;                    // Scrape /metrics if available
+    std::chrono::milliseconds vllm_metrics_timeout{200}; // Timeout for /metrics fetch
 };
 
 class HealthService {
