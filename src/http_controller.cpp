@@ -2897,14 +2897,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats
         co_return std::move(rep);
     }
 
-    auto id_it = req->query_parameters.find("agent_id");
-    if (id_it == req->query_parameters.end() || id_it->second.empty()) {
+    auto agent_id_param = req->get_query_param("agent_id");
+    if (agent_id_param.empty()) {
         rep->set_status(seastar::http::reply::status_type{400});
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
-    auto info = _agent_registry->get_agent(id_it->second);
+    auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
         rep->set_status(seastar::http::reply::status_type{404});
         rep->write_body("json", R"({"error":"agent_not_found"})");
@@ -2936,15 +2936,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_pause_agent
         co_return std::move(rep);
     }
 
-    auto id_it = req->query_parameters.find("agent_id");
-    if (id_it == req->query_parameters.end() || id_it->second.empty()) {
+    auto agent_id_param = req->get_query_param("agent_id");
+    if (agent_id_param.empty()) {
         rep->set_status(seastar::http::reply::status_type{400});
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
-    const std::string& agent_id = id_it->second;
 
-    auto info = _agent_registry->get_agent(agent_id);
+    auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
         rep->set_status(seastar::http::reply::status_type{404});
         rep->write_body("json", R"({"error":"agent_not_found"})");
@@ -2963,7 +2962,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_pause_agent
         co_return std::move(rep);
     }
 
-    _agent_registry->pause_agent(agent_id);
+    _agent_registry->pause_agent(agent_id_param);
     rep->write_body("json", R"({"status":"paused"})");
     co_return std::move(rep);
 }
@@ -2978,15 +2977,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
         co_return std::move(rep);
     }
 
-    auto id_it = req->query_parameters.find("agent_id");
-    if (id_it == req->query_parameters.end() || id_it->second.empty()) {
+    auto agent_id_param = req->get_query_param("agent_id");
+    if (agent_id_param.empty()) {
         rep->set_status(seastar::http::reply::status_type{400});
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
-    const std::string& agent_id = id_it->second;
 
-    auto info = _agent_registry->get_agent(agent_id);
+    auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
         rep->set_status(seastar::http::reply::status_type{404});
         rep->write_body("json", R"({"error":"agent_not_found"})");
@@ -2999,7 +2997,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
         co_return std::move(rep);
     }
 
-    _agent_registry->resume_agent(agent_id);
+    _agent_registry->resume_agent(agent_id_param);
     rep->write_body("json", R"({"status":"resumed"})");
     co_return std::move(rep);
 }
