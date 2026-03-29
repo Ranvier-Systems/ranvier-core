@@ -129,7 +129,10 @@ public:
         for (size_t tier = 1; tier < 4; ++tier) {
             if (_queues[tier].empty()) continue;
 
-            // Find the best non-paused candidate (oldest last_served)
+            // Find the best non-paused candidate (oldest last_served).
+            // Note: pause check uses agent_id (normalized registry key),
+            // while fair scheduling uses user_agent (raw header) via
+            // get_agent_key(). These are intentionally separate concerns.
             std::optional<size_t> best_idx;
             auto best_time = std::chrono::steady_clock::time_point::max();
 
