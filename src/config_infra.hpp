@@ -304,6 +304,12 @@ struct BackpressureConfig {
         DEFAULT_TIER_CAPACITY_NORMAL,
         DEFAULT_TIER_CAPACITY_LOW,
     };
+
+    // Per-agent queue depth limit.
+    // Prevents a single paused agent from consuming an entire tier's capacity.
+    // When an agent has >= max_per_agent_queued requests across all tiers,
+    // new requests for that agent are dropped (Hard Rule #4: bounded).
+    uint32_t max_per_agent_queued = 128;
 };
 
 // =============================================================================

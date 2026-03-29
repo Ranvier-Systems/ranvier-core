@@ -351,6 +351,9 @@ void RanvierConfig::apply_env_overrides() {
             ++idx;
         }
     }
+    if (auto v = get_env_as<uint32_t>("RANVIER_BACKPRESSURE_MAX_PER_AGENT_QUEUED")) {
+        backpressure.max_per_agent_queued = *v;
+    }
 
     // Cluster overrides
     if (auto v = get_env("RANVIER_CLUSTER_ENABLED")) {
@@ -1054,6 +1057,9 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
                         config.backpressure.tier_capacity[i] = tc[i].as<uint32_t>();
                     }
                 }
+            }
+            if (bp["max_per_agent_queued"]) {
+                config.backpressure.max_per_agent_queued = bp["max_per_agent_queued"].as<uint32_t>();
             }
         }
 

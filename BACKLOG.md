@@ -831,15 +831,15 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
   _Dependencies:_ 1.3
   _Complexity:_ Medium
 
-- [ ] **[P2] Agent-Aware Request Handling (VISION 3.2)**
+- [x] **[P2] Agent-Aware Request Handling (VISION 3.2)** ✓ Done (2026-03-29)
   _Effort:_ ~2 weeks
   _Scope:_ AgentRegistry, agent identification, pause/resume API.
   _Dependencies:_ 1.2, 1.4
   _Complexity:_ High
 
-- [ ] **[P3] Request Queuing with Pause/Resume (VISION 3.3)**
+- [x] **[P3] Request Queuing with Pause/Resume (VISION 3.3)** ✓ Done (2026-03-29)
   _Effort:_ ~2 weeks | Risk: High
-  _Scope:_ RequestScheduler, per-agent queues, fair scheduling.
+  _Scope:_ RequestScheduler pause-aware dequeue, per-agent queue depth limits, admin API stats.
   _Dependencies:_ 3.2
   _Complexity:_ High
 

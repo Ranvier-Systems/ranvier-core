@@ -17,6 +17,7 @@ using namespace ranvier;
 struct TestContext {
     PriorityLevel priority = PriorityLevel::NORMAL;
     std::string user_agent;
+    std::string agent_id;  // Required by scheduler for pause-aware dequeue
     std::chrono::steady_clock::time_point enqueue_time;
     std::string request_id;
 };
@@ -332,6 +333,231 @@ TEST(RequestSchedulerTest, QueueDepthSingleTierAccessor) {
     EXPECT_EQ(sched.queue_depth(2), 0u);  // NORMAL
     EXPECT_EQ(sched.queue_depth(3), 1u);  // LOW
     EXPECT_EQ(sched.queue_depth(99), 0u); // Out of bounds
+}
+
+// =============================================================================
+// Pause-aware dequeue
+// =============================================================================
+
+// Helper: create a context with both user_agent and agent_id set
+static std::unique_ptr<TestContext> make_agent_ctx(PriorityLevel p,
+                                                   std::string agent_id,
+                                                   std::string user_agent = "") {
+    auto ctx = std::make_unique<TestContext>();
+    ctx->priority = p;
+    ctx->agent_id = agent_id;
+    ctx->user_agent = user_agent.empty() ? agent_id : std::move(user_agent);
+    return ctx;
+}
+
+TEST(RequestSchedulerTest, PausedAgentSkippedDuringDequeue) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view aid) {
+        return aid == "paused-agent";
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "paused-agent"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "active-agent"));
+
+    auto r = sched.dequeue();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->agent_id, "active-agent");
+
+    // Paused agent's request is still in the queue
+    EXPECT_EQ(sched.total_queued(), 1u);
+}
+
+TEST(RequestSchedulerTest, CriticalTierIgnoresPauseCheck) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view) {
+        return true;  // Everything is "paused"
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::CRITICAL, "paused-agent"));
+
+    // CRITICAL always dequeues regardless of pause state
+    auto r = sched.dequeue();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->agent_id, "paused-agent");
+}
+
+TEST(RequestSchedulerTest, AllPausedTierSkippedToNextTier) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view aid) {
+        return aid == "paused-agent";
+    });
+
+    // HIGH tier: only paused agent
+    sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "paused-agent"));
+    // NORMAL tier: active agent
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "active-agent"));
+
+    // Should skip HIGH (all paused) and dequeue from NORMAL
+    auto r = sched.dequeue();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->priority, PriorityLevel::NORMAL);
+    EXPECT_EQ((*r)->agent_id, "active-agent");
+}
+
+TEST(RequestSchedulerTest, AllPausedReturnsNullopt) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view) {
+        return true;  // Everything paused
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "agent-a"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-b"));
+
+    // No CRITICAL, all others paused → nullopt
+    EXPECT_FALSE(sched.dequeue().has_value());
+    // Requests remain in queue
+    EXPECT_EQ(sched.total_queued(), 2u);
+}
+
+TEST(RequestSchedulerTest, ResumedAgentDrainsNaturally) {
+    bool paused = true;
+    TestScheduler sched;
+    sched.set_pause_check([&paused](std::string_view) {
+        return paused;
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a"));
+
+    // While paused: nothing dequeues
+    EXPECT_FALSE(sched.dequeue().has_value());
+
+    // Resume
+    paused = false;
+
+    // Now it dequeues
+    auto r = sched.dequeue();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->agent_id, "agent-a");
+}
+
+TEST(RequestSchedulerTest, PausedSkipsCounterIncrements) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view aid) {
+        return aid == "paused-agent";
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "paused-agent"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "active-agent"));
+
+    EXPECT_EQ(sched.paused_skips(), 0u);
+    sched.dequeue();
+    EXPECT_GT(sched.paused_skips(), 0u);
+}
+
+TEST(RequestSchedulerTest, NoPauseCheckSetBehavesAsBeforeChange) {
+    TestScheduler sched;
+    // No set_pause_check() call — should dequeue normally
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-b"));
+
+    auto r1 = sched.dequeue();
+    ASSERT_TRUE(r1.has_value());
+    auto r2 = sched.dequeue();
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(sched.total_queued(), 0u);
+    EXPECT_EQ(sched.paused_skips(), 0u);
+}
+
+TEST(RequestSchedulerTest, EmptyAgentIdNeverPauseChecked) {
+    TestScheduler sched;
+    bool pause_called = false;
+    sched.set_pause_check([&pause_called](std::string_view) {
+        pause_called = true;
+        return true;
+    });
+
+    // Context with empty agent_id (unidentified agent)
+    sched.enqueue(make_ctx(PriorityLevel::NORMAL, "some-user-agent"));
+
+    auto r = sched.dequeue();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE(pause_called);
+}
+
+// =============================================================================
+// Per-agent queue depth limit
+// =============================================================================
+
+TEST(RequestSchedulerTest, PerAgentQueueLimitEnforced) {
+    SchedulerSettings settings;
+    settings.max_per_agent_queued = 3;
+    TestScheduler sched(settings);
+
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+    // 4th should be rejected
+    EXPECT_FALSE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+    EXPECT_EQ(sched.per_agent_drops(), 1u);
+
+    // Different agent is unaffected
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-b")));
+    EXPECT_EQ(sched.per_agent_drops(), 1u);
+}
+
+TEST(RequestSchedulerTest, PerAgentLimitCountsAcrossTiers) {
+    SchedulerSettings settings;
+    settings.max_per_agent_queued = 2;
+    TestScheduler sched(settings);
+
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "agent-a")));
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::LOW, "agent-a")));
+    // 3rd in a different tier still exceeds the per-agent limit
+    EXPECT_FALSE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+    EXPECT_EQ(sched.per_agent_drops(), 1u);
+}
+
+TEST(RequestSchedulerTest, PerAgentLimitNotAppliedToEmptyAgentId) {
+    SchedulerSettings settings;
+    settings.max_per_agent_queued = 1;
+    TestScheduler sched(settings);
+
+    // Empty agent_id bypasses per-agent check
+    EXPECT_TRUE(sched.enqueue(make_ctx(PriorityLevel::NORMAL, "ua1")));
+    EXPECT_TRUE(sched.enqueue(make_ctx(PriorityLevel::NORMAL, "ua2")));
+    EXPECT_EQ(sched.per_agent_drops(), 0u);
+}
+
+TEST(RequestSchedulerTest, PerAgentLimitFreesAfterDequeue) {
+    SchedulerSettings settings;
+    settings.max_per_agent_queued = 1;
+    TestScheduler sched(settings);
+
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+    EXPECT_FALSE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+
+    // Dequeue frees the slot
+    sched.dequeue();
+    EXPECT_TRUE(sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-a")));
+}
+
+// =============================================================================
+// queue_depths_by_agent()
+// =============================================================================
+
+TEST(RequestSchedulerTest, QueueDepthsByAgentAccurate) {
+    TestScheduler sched;
+    sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "cursor-ide"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "cursor-ide"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "claude-code"));
+    sched.enqueue(make_ctx(PriorityLevel::LOW, "raw-ua"));  // empty agent_id
+
+    auto depths = sched.queue_depths_by_agent();
+    EXPECT_EQ(depths.size(), 2u);  // Only entries with non-empty agent_id
+    EXPECT_EQ(depths["cursor-ide"], 2u);
+    EXPECT_EQ(depths["claude-code"], 1u);
+}
+
+TEST(RequestSchedulerTest, QueueDepthsByAgentEmptyWhenQueueEmpty) {
+    TestScheduler sched;
+    auto depths = sched.queue_depths_by_agent();
+    EXPECT_TRUE(depths.empty());
 }
 
 // =============================================================================
