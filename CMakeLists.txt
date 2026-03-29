@@ -390,6 +390,17 @@ target_link_libraries(prometheus_parser_test
 )
 gtest_discover_tests(prometheus_parser_test)
 
+# VLLMMetrics Unit Tests (Pure C++, header-only)
+add_executable(vllm_metrics_test
+  tests/unit/vllm_metrics_test.cpp
+)
+target_include_directories(vllm_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(vllm_metrics_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(vllm_metrics_test)
+
 # Logging Unit Tests (Pure C++, uses stubs for Seastar/fmt)
 # Tests generate_request_id format and header extraction helpers.
 add_executable(logging_test
