@@ -401,6 +401,18 @@ target_link_libraries(vllm_metrics_test
 )
 gtest_discover_tests(vllm_metrics_test)
 
+# HealthService Storage Unit Tests (Pure C++, replicates store/get logic)
+add_executable(health_service_test
+  tests/unit/health_service_test.cpp
+)
+target_include_directories(health_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(health_service_test
+  PRIVATE
+  GTest::gtest_main
+  absl::flat_hash_map
+)
+gtest_discover_tests(health_service_test)
+
 # Logging Unit Tests (Pure C++, uses stubs for Seastar/fmt)
 # Tests generate_request_id format and header extraction helpers.
 add_executable(logging_test
