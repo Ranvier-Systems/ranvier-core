@@ -16,8 +16,8 @@ namespace ranvier {
 // Maximum concurrent health checks to prevent overwhelming backends/network
 constexpr size_t HEALTH_MAX_CONCURRENT_CHECKS = 16;
 
-HealthService::HealthService(RouterService& router, HealthServiceConfig config)
-    : _router(router), _config(config) {}
+HealthService::HealthService(BackendRegistry& registry, HealthServiceConfig config)
+    : _registry(registry), _config(config) {}
 
 void HealthService::start() {
     _running = true;
@@ -43,12 +43,12 @@ future<> HealthService::run_loop() {
     try {
         while (_running) {
             // 1. Get list of backends and resolve addresses
-            auto ids = _router.get_all_backend_ids();
+            auto ids = _registry.get_all_backend_ids();
 
             // Collect backends with valid addresses (Rule #2: no co_await in loops)
             std::vector<std::pair<BackendId, socket_address>> backends_to_check;
             for (auto id : ids) {
-                auto addr_opt = _router.get_backend_address(id);
+                auto addr_opt = _registry.get_backend_address(id);
                 if (addr_opt.has_value()) {
                     backends_to_check.emplace_back(id, addr_opt.value());
                 }
@@ -62,7 +62,7 @@ future<> HealthService::run_loop() {
                     try {
                         bool is_alive = co_await check_backend(addr);
                         // 4. Update State (Broadcasts to all cores)
-                        co_await _router.set_backend_status_global(id, is_alive);
+                        co_await _registry.set_backend_status_global(id, is_alive);
                     } catch (const std::exception& e) {
                         log_health.warn("Health check failed for backend {}: {}", id, e.what());
                     }

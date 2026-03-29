@@ -2,7 +2,7 @@
 #include <chrono>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include "router_service.hpp"
+#include "backend_registry.hpp"
 
 namespace ranvier {
 
@@ -16,7 +16,7 @@ struct HealthServiceConfig {
 
 class HealthService {
 public:
-    HealthService(RouterService& router, HealthServiceConfig config = {});
+    HealthService(BackendRegistry& registry, HealthServiceConfig config = {});
 
     // Start the background loop
     void start();
@@ -25,7 +25,7 @@ public:
     seastar::future<> stop();
 
 private:
-    RouterService& _router;
+    BackendRegistry& _registry;
     HealthServiceConfig _config;
     seastar::gate _gate; // Prevents shutdown while checking
     bool _running = false;
