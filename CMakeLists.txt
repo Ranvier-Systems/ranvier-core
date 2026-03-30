@@ -669,6 +669,18 @@ target_link_libraries(load_aware_routing_test
 )
 gtest_discover_tests(load_aware_routing_test)
 
+# GPU Load-Aware Routing Unit Tests (Pure C++, no Seastar dependency)
+# Tests for composite load calculation (local + GPU) and cache staleness
+add_executable(gpu_load_routing_test
+  tests/unit/gpu_load_routing_test.cpp
+)
+target_include_directories(gpu_load_routing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gpu_load_routing_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gpu_load_routing_test)
+
 # Quorum / Split-Brain Detection Unit Tests (Pure C++, no Seastar dependency)
 # Tests for quorum calculation, state transitions, and peer liveness with TestClock
 add_executable(quorum_test

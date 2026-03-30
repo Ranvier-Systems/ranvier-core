@@ -127,6 +127,7 @@ struct ShardLocalState {
         uint64_t compaction_runs = 0;
         // Load-aware routing stats
         uint64_t load_aware_fallbacks = 0;       // Times we chose non-preferred backend due to load
+        uint64_t gpu_load_redirects = 0;         // Times GPU-load-driven redirect occurred
         // Local route batching stats (per-shard)
         uint64_t local_routes_batched = 0;        // Routes added to local buffer
         uint64_t local_batch_flushes = 0;          // Number of local flush operations
@@ -152,6 +153,7 @@ struct ShardLocalState {
             compaction_bytes_reclaimed = 0;
             compaction_runs = 0;
             load_aware_fallbacks = 0;
+            gpu_load_redirects = 0;
             local_routes_batched = 0;
             local_batch_flushes = 0;
             local_routes_deduplicated = 0;
@@ -184,6 +186,9 @@ struct ShardLocalState {
         // Cross-shard load sync configuration
         bool cross_shard_load_sync = false;
         std::chrono::milliseconds cross_shard_load_sync_interval{100};
+        // GPU load integration (vLLM-aware routing)
+        double gpu_load_weight = 10.0;
+        std::chrono::seconds gpu_load_cache_ttl{30};
     } config;
 
     // ========================================================================
@@ -217,6 +222,19 @@ struct ShardLocalState {
 
     // Whether gossip is enabled (set on all shards during init for fast checks)
     bool gossip_enabled = false;
+
+    // ========================================================================
+    // GPU Load Cache (per-shard, broadcast from shard 0 by HealthService)
+    // ========================================================================
+    // Caches vLLM GPU load scores (0.0–1.0) from HealthService for use in
+    // routing decisions on all shards. HealthService runs on shard 0 only;
+    // broadcast_gpu_load() distributes scores to all shards after each scrape.
+    // Hot-path reads are shard-local only (Rule #1).
+    struct GpuLoadCache {
+        absl::flat_hash_map<BackendId, double> scores;  // BackendId → load_score (0.0–1.0)
+        std::chrono::steady_clock::time_point updated_at;
+        static constexpr size_t MAX_ENTRIES = 256;       // Hard Rule #4
+    } gpu_load_cache;
 
     // ========================================================================
     // Cross-Shard Load Synchronization
@@ -281,6 +299,9 @@ struct ShardLocalState {
         // Cross-shard load sync configuration
         config.cross_shard_load_sync = cfg.cross_shard_load_sync;
         config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
+        // GPU load integration
+        config.gpu_load_weight = cfg.gpu_load_weight;
+        config.gpu_load_cache_ttl = cfg.gpu_load_cache_ttl;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -316,6 +337,9 @@ struct ShardLocalState {
         // Cross-shard load sync configuration
         config.cross_shard_load_sync = cfg.cross_shard_load_sync;
         config.cross_shard_load_sync_interval = cfg.cross_shard_load_sync_interval;
+        // GPU load integration
+        config.gpu_load_weight = cfg.gpu_load_weight;
+        config.gpu_load_cache_ttl = cfg.gpu_load_cache_ttl;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -334,6 +358,9 @@ struct ShardLocalState {
         pending_local_routes.clear();
         gossip_ptr = nullptr;
         gossip_enabled = false;
+
+        // Clear GPU load cache
+        gpu_load_cache.scores.clear();
 
         // Clear cross-shard load sync state
         for (auto& snapshot : shard_load_snapshots) {
@@ -510,6 +537,57 @@ uint64_t get_backend_load(BackendId id) {
     return local_load;
 }
 
+// ============================================================================
+// GPU Load Cache Accessors (shard-local, lock-free)
+// ============================================================================
+
+// Get cached GPU load score for a backend from the per-shard GPU load cache.
+// Returns -1.0 if no valid cached score is available (no metrics, stale cache,
+// or backend not found). Staleness threshold is configurable via gpu_load_cache_ttl
+// (default 30s, should be ≥2x the health check scrape interval).
+//
+// Rule #1: Lock-free — shard-local read only, no cross-shard access.
+static double get_cached_gpu_load(BackendId id) {
+    if (!g_shard_state) return -1.0;
+    auto& cache = g_shard_state->gpu_load_cache;
+
+    // Stale check: if cache is older than configured TTL, ignore
+    auto age = std::chrono::steady_clock::now() - cache.updated_at;
+    if (age > g_shard_state->config.gpu_load_cache_ttl) return -1.0;
+
+    auto it = cache.scores.find(id);
+    if (it == cache.scores.end()) return -1.0;
+    return it->second;
+}
+
+// Compute composite load for a backend, blending shard-local active_requests
+// with GPU load score from vLLM metrics (when available).
+//
+// When vLLM metrics are available:
+//   composite = local_active_requests + (gpu_load_score * gpu_load_weight)
+// When vLLM metrics are unavailable:
+//   composite = local_active_requests (existing behavior, backward compatible)
+//
+// Returns uint64_t for backward compatibility with existing P2C/bounded-load
+// comparisons that use integer load values.
+//
+// Rule #1: Lock-free — all reads are shard-local plain integers + cache lookup.
+uint64_t get_composite_backend_load(BackendId id) {
+    uint64_t local_load = get_backend_load(id);
+
+    auto gpu_score = get_cached_gpu_load(id);
+    if (gpu_score < 0.0) {
+        return local_load;  // No GPU metrics available — fall back to existing behavior
+    }
+
+    // Scale GPU score to comparable range with active requests.
+    // gpu_load_weight controls the influence of GPU metrics on routing.
+    uint64_t gpu_contribution = static_cast<uint64_t>(
+        gpu_score * g_shard_state->config.gpu_load_weight);
+
+    return local_load + gpu_contribution;
+}
+
 std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates) {
     if (!g_shard_state || candidates.empty()) {
         return {0, UINT64_MAX};
@@ -532,9 +610,9 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
             continue;
         }
 
-        // Use get_backend_load() which includes cross-shard load hints
-        // when sync is enabled, giving a global view of backend utilization.
-        uint64_t load = get_backend_load(id);
+        // Use get_composite_backend_load() which includes cross-shard load hints
+        // and GPU load scores (when available) for a global view of utilization.
+        uint64_t load = get_composite_backend_load(id);
         if (load < best_load) {
             best_load = load;
             best_id = id;
@@ -588,8 +666,8 @@ static BackendId apply_load_aware_selection(
     const double factor = g_shard_state->config.load_imbalance_factor;
     const uint64_t floor = g_shard_state->config.load_imbalance_floor;
 
-    // Check preferred backend's load
-    uint64_t preferred_load = get_backend_load(preferred_id);
+    // Check preferred backend's composite load (local + GPU)
+    uint64_t preferred_load = get_composite_backend_load(preferred_id);
 
     // Fast path: zero load is never overloaded
     if (preferred_load == 0) {
@@ -602,7 +680,7 @@ static BackendId apply_load_aware_selection(
     std::vector<uint64_t> loads;
     loads.reserve(live_backends.size());
     for (BackendId id : live_backends) {
-        loads.push_back(get_backend_load(id));
+        loads.push_back(get_composite_backend_load(id));
     }
 
     // Compute median via nth_element (O(n), partial sort)
@@ -732,10 +810,10 @@ static BackendId bounded_load_select(
     if (n <= 0) return 0;
     if (n == 1) return live_backends[0];
 
-    // Compute total in-flight across all live backends for average
+    // Compute total composite load across all live backends for average
     uint64_t total_load = 0;
     for (BackendId id : live_backends) {
-        total_load += get_backend_load(id);
+        total_load += get_composite_backend_load(id);
     }
     double avg = static_cast<double>(total_load) / static_cast<double>(n);
     // Cap: at least 1 to avoid starving all backends when idle
@@ -746,7 +824,7 @@ static BackendId bounded_load_select(
     for (int32_t probe = 0; probe < n; ++probe) {
         int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
         BackendId candidate = live_backends[idx];
-        uint64_t load = get_backend_load(candidate);
+        uint64_t load = get_composite_backend_load(candidate);
         if (load < cap) {
             if (probe > 0) {
                 // Diverted from primary — record as load-aware fallback
@@ -756,7 +834,7 @@ static BackendId bounded_load_select(
                 }
                 log_router.debug("[{}] Bounded-load: primary over cap ({}>{}), "
                                  "probe {} -> backend {} (load={})",
-                                 request_id, get_backend_load(live_backends[jump_consistent_hash(prefix_hash, n)]),
+                                 request_id, get_composite_backend_load(live_backends[jump_consistent_hash(prefix_hash, n)]),
                                  cap, probe, candidate, load);
             }
             return candidate;
@@ -817,8 +895,8 @@ static BackendId p2c_select(
     BackendId primary = live_backends[primary_idx];
     BackendId secondary = live_backends[secondary_idx];
 
-    uint64_t p_load = get_backend_load(primary);
-    uint64_t s_load = get_backend_load(secondary);
+    uint64_t p_load = get_composite_backend_load(primary);
+    uint64_t s_load = get_composite_backend_load(secondary);
 
     // Prefer primary for cache affinity — only switch if secondary is
     // clearly less loaded (by at least load_bias)
@@ -1102,7 +1180,35 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // Counter: load snapshots received from other shards
         seastar::metrics::make_counter("router_load_sync_snapshots_received_total",
             [] { return g_shard_state ? g_shard_state->stats.load_sync_snapshots_received : 0UL; },
-            seastar::metrics::description("Total number of cross-shard load snapshots received from other shards"))
+            seastar::metrics::description("Total number of cross-shard load snapshots received from other shards")),
+
+        // ====================================================================
+        // GPU Load Integration Metrics (VISION 2.2)
+        // ====================================================================
+
+        // Counter: GPU-load-driven redirects (subset of load_aware_fallbacks)
+        seastar::metrics::make_counter("router_gpu_load_redirects_total",
+            [] { return g_shard_state ? g_shard_state->stats.gpu_load_redirects : 0UL; },
+            seastar::metrics::description("Total GPU-load-driven routing redirects (vLLM metrics influenced decision)")),
+
+        // Gauge: GPU load cache staleness in seconds
+        seastar::metrics::make_gauge("router_gpu_load_cache_age_seconds",
+            seastar::metrics::description("Age of GPU load cache in seconds (staleness indicator)"),
+            [] {
+                if (!g_shard_state) return 0.0;
+                auto& cache = g_shard_state->gpu_load_cache;
+                if (cache.scores.empty()) return 0.0;
+                auto age = std::chrono::steady_clock::now() - cache.updated_at;
+                return std::chrono::duration<double>(age).count();
+            }),
+
+        // Gauge: number of entries in GPU load cache
+        seastar::metrics::make_gauge("router_gpu_load_cache_size",
+            seastar::metrics::description("Number of entries in per-shard GPU load cache"),
+            [] {
+                if (!g_shard_state) return static_cast<double>(0);
+                return static_cast<double>(g_shard_state->gpu_load_cache.scores.size());
+            })
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -1459,6 +1565,8 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
         if (prefix_result.backend_id.has_value()) {
             result.backend_id = prefix_result.backend_id.value();
             result.cache_hit = prefix_result.art_hit;
+            result.was_load_redirect = prefix_result.was_load_redirect;
+            result.backend_load_at_decision = prefix_result.backend_load_at_decision;
         } else {
             result.error_message = "No backends registered";
         }
@@ -1707,12 +1815,12 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         if (art_hit) {
             uint64_t total_load = 0;
             for (BackendId id : live_backends) {
-                total_load += get_backend_load(id);
+                total_load += get_composite_backend_load(id);
             }
             double avg = static_cast<double>(total_load) / static_cast<double>(live_backends.size());
             uint64_t cap = std::max(static_cast<uint64_t>(1),
                                     static_cast<uint64_t>(std::ceil(avg * (1.0 + state.config.bounded_load_epsilon))));
-            uint64_t sel_load = get_backend_load(selected);
+            uint64_t sel_load = get_composite_backend_load(selected);
             if (sel_load >= cap) {
                 prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
                 final_backend = bounded_load_select(prefix_hash, live_backends,
@@ -1727,7 +1835,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         // vs a random alternative. Use same bias threshold.
         if (art_hit && live_backends.size() >= 2) {
             auto [least_id, least_load] = get_least_loaded_backend(live_backends);
-            uint64_t sel_load = get_backend_load(selected);
+            uint64_t sel_load = get_composite_backend_load(selected);
             if (least_id != 0 && least_load + state.config.p2c_load_bias < sel_load) {
                 final_backend = least_id;
                 g_shard_state->stats.load_aware_fallbacks++;
@@ -1749,6 +1857,26 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         break;
     }
 
+    // Track GPU-load-driven redirect for observability.
+    // Note: This is a heuristic — we check if GPU metrics existed for the original
+    // backend when a redirect happened, but the redirect may have been caused by
+    // local load alone. The metric is useful for "are GPU metrics influencing
+    // routing?" not precise per-redirect attribution.
+    bool was_load_redirect = false;
+    double load_at_decision = 0.0;
+    if (final_backend != selected) {
+        auto gpu_score = get_cached_gpu_load(selected);
+        if (gpu_score >= 0.0) {
+            // GPU metrics were present when this redirect occurred
+            was_load_redirect = true;
+            load_at_decision = gpu_score;
+            g_shard_state->stats.gpu_load_redirects++;
+            log_router.debug("[{}] GPU load redirect: backend {} overloaded (gpu_load={:.2f}), "
+                             "redirected to backend {}",
+                             request_id, selected, gpu_score, final_backend);
+        }
+    }
+
     if (!request_id.empty() && final_backend == selected) {
         if (art_hit) {
             log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
@@ -1759,7 +1887,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    return {final_backend, art_hit};
+    return {final_backend, art_hit, load_at_decision, was_load_redirect};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
@@ -2699,6 +2827,42 @@ seastar::future<> RouterService::stop_load_sync_timer() {
         log_router.info("Shard {}: Cross-shard load sync timer stopped", seastar::this_shard_id());
         return seastar::make_ready_future<>();
     });
+}
+
+// ============================================================================
+// GPU Load Broadcast (shard 0 → all shards)
+// ============================================================================
+//
+// Called from HealthService::run_loop() on shard 0 after scraping vLLM /metrics.
+// Distributes GPU load scores to all shards so routing decisions on every shard
+// can incorporate GPU-level signals without cross-shard calls on the hot path.
+//
+// Uses foreign_ptr to safely transfer the shared map across shards (Rule #0).
+// Takes scores by value (Rule #22: coroutine params by value).
+//
+seastar::future<> RouterService::broadcast_gpu_load(
+        absl::flat_hash_map<BackendId, double> scores) {
+    auto shared = seastar::make_foreign(
+        std::make_unique<absl::flat_hash_map<BackendId, double>>(std::move(scores)));
+
+    // Use do_with to anchor the foreign_ptr lifetime explicitly, matching
+    // the pattern in broadcast_load_snapshot(). While co_await keeps the
+    // coroutine frame alive, do_with makes the lifetime guarantee visible
+    // and resilient to future refactoring.
+    co_await seastar::do_with(std::move(shared),
+        [](auto& shared) {
+            return seastar::smp::invoke_on_all(
+                [&shared] {
+                    if (!g_shard_state) return;
+                    auto& cache = g_shard_state->gpu_load_cache;
+                    cache.scores.clear();
+                    for (const auto& [id, score] : *shared) {
+                        if (cache.scores.size() >= ShardLocalState::GpuLoadCache::MAX_ENTRIES) break;
+                        cache.scores[id] = score;
+                    }
+                    cache.updated_at = std::chrono::steady_clock::now();
+                });
+        });
 }
 
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,

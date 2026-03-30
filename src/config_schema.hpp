@@ -103,6 +103,23 @@ struct RoutingConfig {
     uint64_t load_imbalance_floor = 2;        // Additive floor to prevent flapping at low load
 
     // =========================================================================
+    // GPU Load Integration (vLLM-aware routing)
+    // =========================================================================
+    // When vLLM metrics are available via HealthService, the routing layer
+    // blends GPU load scores (0.0–1.0) with shard-local active_requests to
+    // form a composite load signal for P2C, bounded-load, and median-based
+    // routing decisions.
+    //
+    // gpu_load_weight: Scaling factor that converts the 0.0–1.0 GPU load score
+    //   into a value comparable to active_requests counts. Higher values give
+    //   GPU metrics more influence on routing decisions.
+    // gpu_load_cache_ttl: How long to trust cached GPU load scores before
+    //   treating them as stale. Should be ≥2x the health check interval to
+    //   tolerate one missed scrape cycle.
+    double gpu_load_weight = 10.0;              // Scaling factor for GPU load score in composite
+    std::chrono::seconds gpu_load_cache_ttl{30}; // Staleness threshold for GPU load cache (default: 2x typical scrape interval)
+
+    // =========================================================================
     // Cross-Shard Load Synchronization
     // =========================================================================
     // When enabled, each shard periodically broadcasts its active_requests

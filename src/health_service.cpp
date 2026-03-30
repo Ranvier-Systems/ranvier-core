@@ -1,6 +1,7 @@
 #include "health_service.hpp"
 #include "logging.hpp"
 #include "prometheus_parser.hpp"
+#include "router_service.hpp"
 
 #include <cmath>
 #include <fmt/format.h>
@@ -120,6 +121,25 @@ future<> HealthService::run_loop() {
             // Scrape vLLM metrics (parallel, independent of health check result)
             if (_config.enable_vllm_metrics) {
                 co_await scrape_all_vllm_metrics(backends_to_check);
+
+                // Broadcast GPU load scores to all shards for routing decisions.
+                // Only broadcast if we have valid metrics to distribute.
+                if (!_backend_vllm_metrics.empty()) {
+                    try {
+                        absl::flat_hash_map<BackendId, double> load_scores;
+                        for (const auto& [id, m] : _backend_vllm_metrics) {
+                            if (m.valid) {
+                                load_scores[id] = m.load_score();
+                            }
+                        }
+                        if (!load_scores.empty()) {
+                            co_await RouterService::broadcast_gpu_load(std::move(load_scores));
+                        }
+                    } catch (const std::exception& e) {
+                        // Rule #9: Log at warn level
+                        log_health.warn("GPU load broadcast failed: {}", e.what());
+                    }
+                }
             }
 
             // 5. Sleep for configured interval

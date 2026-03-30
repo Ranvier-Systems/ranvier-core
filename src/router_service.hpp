@@ -5,6 +5,7 @@
 #include "config.hpp"
 #include "gossip_service.hpp"  // For NodeState
 
+#include <absl/container/flat_hash_map.h>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -80,12 +81,20 @@ struct RouteResult {
     std::string routing_mode;             // "prefix", "hash", or "random"
     bool cache_hit = false;               // True if route was found via ART lookup (not hash fallback)
     std::string error_message;            // Non-empty if backend_id is nullopt
+
+    // GPU load observability (populated when vLLM metrics influence routing)
+    double backend_load_at_decision = 0.0;  // Composite load when route was chosen
+    bool was_load_redirect = false;          // True if load-aware override changed the backend
 };
 
 // Result from get_backend_for_prefix(), distinguishing ART hits from hash fallback.
 struct PrefixRouteResult {
     std::optional<BackendId> backend_id;  // Selected backend (nullopt if no backends)
     bool art_hit = false;                 // True only when ART lookup found a live backend
+
+    // GPU load observability (populated in Step 3 when load-aware override fires)
+    double backend_load_at_decision = 0.0;  // Composite load of originally-selected backend
+    bool was_load_redirect = false;          // True if load-aware override changed the backend
 };
 
 // ============================================================================
@@ -143,6 +152,11 @@ private:
 // Get current in-flight request count for a backend (shard-local read)
 // Returns 0 if backend not found in shard state
 uint64_t get_backend_load(BackendId id);
+
+// Get composite load for a backend, blending shard-local active_requests
+// with GPU load score from vLLM metrics (when available via broadcast cache).
+// Returns uint64_t for backward compatibility with P2C/bounded-load comparisons.
+uint64_t get_composite_backend_load(BackendId id);
 
 // Find the least loaded backend from a list of candidates
 // Returns pair of (backend_id, load). Returns (0, UINT64_MAX) if no candidates found.
@@ -357,6 +371,14 @@ public:
 
     // Stop per-shard load sync timers (call via smp::invoke_on_all during shutdown)
     static seastar::future<> stop_load_sync_timer();
+
+    // ---- GPU Load Broadcast (HealthService → all shards) ----
+
+    // Broadcast GPU load scores from shard 0 to all shards.
+    // Called by HealthService::run_loop() after scraping vLLM metrics.
+    // Takes scores by value (Rule #22: coroutine params by value).
+    static seastar::future<> broadcast_gpu_load(
+        absl::flat_hash_map<BackendId, double> scores);
 
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,
