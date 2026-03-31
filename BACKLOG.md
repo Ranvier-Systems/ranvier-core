@@ -791,29 +791,33 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
 
 ### Tier 2: Cloud Intelligence
 
-- [ ] **[P2] Extract BackendRegistry interface** (§13 item 22.1, promoted from P4)
+- [x] **[P2] Extract BackendRegistry interface** (§13 item 22.1, promoted from P4)
   _Why now:_ vLLM metrics ingestion wires into HealthService. Decoupling from RouterService first avoids deepening the coupling.
   _Location:_ `src/health_service.hpp`, `src/k8s_discovery_service.hpp`, `src/router_service.hpp`
   _Complexity:_ Low
+  _Completed:_ 2026-03-31
 
-- [ ] **[P2] vLLM Metrics Ingestion (VISION 2.1)**
+- [x] **[P2] vLLM Metrics Ingestion (VISION 2.1)**
   _Effort:_ ~2 weeks
   _Scope:_ VLLMMetrics struct, /metrics scraping, Prometheus text parsing.
   _Files:_ `src/health_service.{hpp,cpp}`, `src/metrics_service.hpp`
   _Dependencies:_ BackendRegistry interface
   _Complexity:_ High
+  _Completed:_ 2026-03-31
 
-- [ ] **[P2] Load-Aware Backend Selection (VISION 2.2)**
+- [x] **[P2] Load-Aware Backend Selection (VISION 2.2)**
   _Effort:_ ~2 weeks (~30% infra exists from load-aware prefix routing)
   _Scope:_ P2C alternative selection, routing decision logic, thundering herd prevention.
   _Dependencies:_ 2.1
   _Complexity:_ High
+  _Completed:_ 2026-03-31
 
-- [ ] **[P2] Cost-Based Routing (VISION 2.3)**
+- [x] **[P2] Cost-Based Routing (VISION 2.3)**
   _Effort:_ ~1.5 weeks
   _Scope:_ Per-backend cost budget, small-request fast lane, budget reservation/release.
   _Dependencies:_ 1.1+1.2, 2.2
   _Complexity:_ Medium
+  _Completed:_ 2026-03-31 — §15 Tier 2 fully complete.
 
 - [ ] **Re-benchmark: prefix + priority + load-aware vs baseline**
 

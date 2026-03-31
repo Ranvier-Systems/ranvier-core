@@ -85,6 +85,11 @@ struct RouteResult {
     // GPU load observability (populated when vLLM metrics influence routing)
     double backend_load_at_decision = 0.0;  // Composite load when route was chosen
     bool was_load_redirect = false;          // True if load-aware override changed the backend
+
+    // Cost-based routing observability (populated when cost routing is enabled)
+    bool was_cost_redirect = false;          // True if cost budget changed backend
+    bool was_fast_lane = false;              // True if small-request fast lane was used
+    double backend_cost_at_decision = 0.0;   // Cost budget when route was chosen
 };
 
 // Result from get_backend_for_prefix(), distinguishing ART hits from hash fallback.
@@ -95,6 +100,11 @@ struct PrefixRouteResult {
     // GPU load observability (populated in Step 3 when load-aware override fires)
     double backend_load_at_decision = 0.0;  // Composite load of originally-selected backend
     bool was_load_redirect = false;          // True if load-aware override changed the backend
+
+    // Cost-based routing observability (populated in Step 4 when cost override fires)
+    bool was_cost_redirect = false;          // True if cost budget changed backend
+    bool was_fast_lane = false;              // True if small-request fast lane was used
+    double backend_cost_at_decision = 0.0;   // Cost budget when route was chosen
 };
 
 // ============================================================================
@@ -146,12 +156,63 @@ private:
 };
 
 // ============================================================================
+// CostBudgetGuard: RAII guard for cost budget tracking per backend
+// ============================================================================
+//
+// Reserves cost budget on construction, releases on destruction.
+// Ensures symmetric reserve/release on ALL exit paths (success, error, exception).
+// Move-only, same pattern as BackendRequestGuard.
+//
+class CostBudgetGuard {
+public:
+    // Construct guard and reserve cost budget on the backend.
+    // If cost <= 0 or cost routing is disabled, guard is inactive (no-op).
+    CostBudgetGuard(BackendId id, double cost);
+
+    // Release cost budget if guard is active
+    ~CostBudgetGuard();
+
+    // Move constructor: transfer ownership
+    CostBudgetGuard(CostBudgetGuard&& other) noexcept;
+
+    // Move assignment: transfer ownership
+    CostBudgetGuard& operator=(CostBudgetGuard&& other) noexcept;
+
+    // Non-copyable
+    CostBudgetGuard(const CostBudgetGuard&) = delete;
+    CostBudgetGuard& operator=(const CostBudgetGuard&) = delete;
+
+    BackendId backend_id() const { return _backend_id; }
+    double cost() const { return _cost; }
+    bool is_active() const { return _active; }
+
+private:
+    BackendId _backend_id{0};
+    double _cost{0.0};
+    bool _active{false};
+};
+
+// ============================================================================
 // Load Tracking Helper Functions (shard-local, lock-free)
 // ============================================================================
 
 // Get current in-flight request count for a backend (shard-local read)
 // Returns 0 if backend not found in shard state
 uint64_t get_backend_load(BackendId id);
+
+// ============================================================================
+// Cost Budget Tracking Functions (shard-local, lock-free)
+// ============================================================================
+
+// Reserve cost budget when routing a request to a backend.
+// Returns false if budget would exceed max_cost_per_backend.
+bool reserve_cost_budget(BackendId id, double cost);
+
+// Release cost budget when a request completes or fails.
+void release_cost_budget(BackendId id, double cost);
+
+// Get current cost budget for a backend (for routing decisions).
+double get_backend_cost(BackendId id);
 
 // Get composite load for a backend, blending shard-local active_requests
 // with GPU load score from vLLM metrics (when available via broadcast cache).
@@ -206,7 +267,8 @@ public:
     //                  for requests sharing the same system prompt but different user queries.
     RouteResult route_request(const std::vector<int32_t>& tokens,
                               const std::string& request_id = "",
-                              size_t prefix_boundary = 0);
+                              size_t prefix_boundary = 0,
+                              double estimated_cost = 0.0);
 
     // Find which Backend ID owns this prefix (radix tree lookup)
     // request_id: Optional request ID for tracing (empty string if not tracing)
@@ -280,7 +342,8 @@ public:
     // Returns PrefixRouteResult with art_hit=true only on actual ART cache hit.
     PrefixRouteResult get_backend_for_prefix(const std::vector<int32_t>& tokens,
                                              const std::string& request_id = "",
-                                             size_t prefix_boundary = 0);
+                                             size_t prefix_boundary = 0,
+                                             double estimated_cost = 0.0);
 
     // Get a backend using consistent hash only (no ART, no learning)
     // Used to measure baseline hash performance vs ART

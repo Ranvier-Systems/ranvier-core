@@ -224,6 +224,13 @@ struct HttpControllerConfig {
     // Agent registry settings
     AgentRegistryConfig agent_registry;
 
+    // Cost-based routing settings (copied from CostBasedRoutingConfig at init)
+    bool cost_routing_enabled = false;
+    double cost_routing_max_cost = 10000.0;
+    double cost_routing_small_threshold = 500.0;
+    bool cost_routing_fast_lane = true;
+    double cost_routing_imbalance_factor = 2.0;
+
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }

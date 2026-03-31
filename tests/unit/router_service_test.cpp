@@ -1655,3 +1655,386 @@ TEST_F(CrossShardLoadSyncTest, LeastLoadedBackendWithSyncEnabled) {
     EXPECT_EQ(id, 2);
     EXPECT_EQ(load, 0u);
 }
+
+// =============================================================================
+// Cost-Based Routing Tests
+// =============================================================================
+//
+// Tests for per-backend cost budget tracking and cost-aware routing overlay.
+// Exercises reserve/release/get cost budget functions and the Step 4 routing
+// logic (small-request fast lane, large-request budget check).
+
+class CostBasedRoutingTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = false;  // Isolate cost routing from load routing
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;  // Deterministic
+
+        // Cost routing config is now embedded in RoutingConfig
+        cfg_.cost_routing.enabled = true;
+        cfg_.cost_routing.max_cost_per_backend = 10000.0;
+        cfg_.cost_routing.small_request_threshold = 500.0;
+        cfg_.cost_routing.enable_fast_lane = true;
+        cfg_.cost_routing.cost_imbalance_factor = 2.0;
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+
+    void register_backends(int count) {
+        for (int i = 1; i <= count; ++i) {
+            std::string ip = "10.0.0." + std::to_string(i);
+            RouterService::register_backend_for_testing(
+                i, make_addr(ip.c_str(), 8080));
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// reserve_cost_budget / release_cost_budget / get_backend_cost basics
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, ReserveCostBudgetIncrementsBackendCost) {
+    register_backends(1);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+
+    EXPECT_TRUE(reserve_cost_budget(1, 1000.0));
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 1000.0);
+
+    EXPECT_TRUE(reserve_cost_budget(1, 500.0));
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 1500.0);
+}
+
+TEST_F(CostBasedRoutingTest, ReleaseCostBudgetDecrementsBackendCost) {
+    register_backends(1);
+    reserve_cost_budget(1, 2000.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 2000.0);
+
+    release_cost_budget(1, 800.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 1200.0);
+
+    release_cost_budget(1, 1200.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, ReleaseClampsToZero) {
+    register_backends(1);
+    reserve_cost_budget(1, 100.0);
+    // Release more than reserved — should clamp to zero, not go negative
+    release_cost_budget(1, 200.0);
+    EXPECT_GE(get_backend_cost(1), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, ReserveReturnsFalseWhenOverBudget) {
+    register_backends(1);
+    // Fill up to just under max
+    reserve_cost_budget(1, 9500.0);
+    // This would push over 10000 max — returns false but still adds (symmetric with release)
+    EXPECT_FALSE(reserve_cost_budget(1, 600.0));
+    // Cost IS added (always-add policy ensures symmetric reserve/release)
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 10100.0);
+}
+
+TEST_F(CostBasedRoutingTest, ReserveExactlyAtMaxSucceeds) {
+    register_backends(1);
+    // Exactly at max should succeed (not >)
+    EXPECT_TRUE(reserve_cost_budget(1, 10000.0));
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 10000.0);
+}
+
+TEST_F(CostBasedRoutingTest, GetBackendCostReturnsZeroForUnknown) {
+    EXPECT_DOUBLE_EQ(get_backend_cost(999), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, ReserveForUnknownBackendReturnsFalse) {
+    EXPECT_FALSE(reserve_cost_budget(999, 100.0));
+}
+
+TEST_F(CostBasedRoutingTest, ReleaseForUnknownBackendIsNoOp) {
+    // Should not crash
+    release_cost_budget(999, 100.0);
+}
+
+TEST_F(CostBasedRoutingTest, ZeroCostReserveIsNoOp) {
+    register_backends(1);
+    EXPECT_TRUE(reserve_cost_budget(1, 0.0));
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, NegativeCostReserveIsNoOp) {
+    register_backends(1);
+    EXPECT_TRUE(reserve_cost_budget(1, -100.0));
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing: fast lane (small request -> least-cost backend)
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, FastLaneRedirectsSmallRequestToLeastCostBackend) {
+    register_backends(3);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Load up backend 1 and 2 with high cost, leave backend 3 empty
+    reserve_cost_budget(1, 8000.0);
+    reserve_cost_budget(2, 7000.0);
+    // Backend 3: cost = 0 (least cost)
+
+    // Insert ART route pointing to backend 1 (the expensive one)
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Route a small request (cost 100 < threshold 500)
+    auto result = router_->route_request(tokens, "test-fl", 0, 100.0);
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Backend 1 cost (8000) > backend 3 cost (0) * imbalance_factor (2.0)
+    // So fast lane should redirect to backend 3
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_TRUE(result.was_cost_redirect);
+    EXPECT_TRUE(result.was_fast_lane);
+}
+
+TEST_F(CostBasedRoutingTest, FastLaneNoRedirectWhenCostsBalanced) {
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Both backends have similar cost — no redirect needed
+    reserve_cost_budget(1, 100.0);
+    reserve_cost_budget(2, 80.0);
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->route_request(tokens, "test-bal", 0, 50.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Backend 1 cost (100) < backend 2 cost (80) * 2.0 = 160 → no redirect
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_FALSE(result.was_cost_redirect);
+    EXPECT_FALSE(result.was_fast_lane);
+}
+
+TEST_F(CostBasedRoutingTest, FastLaneDisabledWhenConfigOff) {
+    cfg_.cost_routing.enable_fast_lane = false;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+    reserve_cost_budget(1, 8000.0);  // Heavy load on backend 1
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->route_request(tokens, "test-nofl", 0, 100.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.was_fast_lane);
+}
+
+// ---------------------------------------------------------------------------
+// Cost-aware routing: large request budget check
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, LargeRequestRedirectsWhenBudgetExceeded) {
+    register_backends(3);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Backend 1 nearly full, backends 2 and 3 have room
+    reserve_cost_budget(1, 9000.0);
+    reserve_cost_budget(2, 1000.0);
+    reserve_cost_budget(3, 2000.0);
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Large request (cost 2000 >= threshold 500, and 9000 + 2000 > 10000 max)
+    auto result = router_->route_request(tokens, "test-lg", 0, 2000.0);
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Backend 1 would exceed budget, should redirect to 2 or 3
+    EXPECT_NE(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.was_cost_redirect);
+    EXPECT_FALSE(result.was_fast_lane);  // Not fast lane — this is budget check
+}
+
+TEST_F(CostBasedRoutingTest, LargeRequestStaysWhenBudgetAvailable) {
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Backend 1 has plenty of room
+    reserve_cost_budget(1, 2000.0);
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Large request that fits within budget (2000 + 3000 = 5000 < 10000)
+    auto result = router_->route_request(tokens, "test-lgok", 0, 3000.0);
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_FALSE(result.was_cost_redirect);
+}
+
+TEST_F(CostBasedRoutingTest, BestEffortWhenAllBudgetsExhausted) {
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Both backends nearly full
+    reserve_cost_budget(1, 9500.0);
+    reserve_cost_budget(2, 9500.0);
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Request that exceeds budget everywhere — should still route (best effort)
+    auto result = router_->route_request(tokens, "test-exh", 0, 1000.0);
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Route should succeed (advisory budget, never blocks)
+}
+
+// ---------------------------------------------------------------------------
+// Cost budget reservation via routing
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, CostBudgetGuardReservesOnConstruction) {
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    double cost = 750.0;
+    auto result = router_->route_request(tokens, "test-res", 0, cost);
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    BackendId routed_to = result.backend_id.value();
+
+    // CostBudgetGuard reserves cost on the routed backend (mirrors http_controller usage)
+    CostBudgetGuard guard(routed_to, cost);
+    EXPECT_TRUE(guard.is_active());
+    EXPECT_GE(get_backend_cost(routed_to), cost);
+}
+
+TEST_F(CostBasedRoutingTest, NoCostReservationWhenDisabled) {
+    cfg_.cost_routing.enabled = false;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    router_->route_request(tokens, "test-dis", 0, 500.0);
+
+    // No cost should be reserved when cost routing is disabled
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(2), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, NoCostReservationWhenZeroCost) {
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // estimated_cost = 0 should skip all cost routing logic
+    router_->route_request(tokens, "test-zero", 0, 0.0);
+
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(2), 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// RouteResult fields populated correctly
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, RouteResultCostFieldsDefaultWhenNoRedirect) {
+    register_backends(2);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Small cost that doesn't trigger any redirect
+    auto result = router_->route_request(tokens, "test-def", 0, 100.0);
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    // backend_cost_at_decision should reflect the selected backend's cost
+    // before this request was added (it was 0 since no prior requests)
+    EXPECT_GE(result.backend_cost_at_decision, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Multiple sequential requests accumulate cost
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, SequentialGuardsAccumulateCost) {
+    register_backends(2);
+
+    // Simulate multiple in-flight requests via guards (mirrors http_controller)
+    CostBudgetGuard g1(1, 1000.0);
+    CostBudgetGuard g2(1, 1000.0);
+    CostBudgetGuard g3(2, 1000.0);
+
+    // Cost accumulates on both backends
+    double total = get_backend_cost(1) + get_backend_cost(2);
+    EXPECT_GE(total, 3000.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 2000.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(2), 1000.0);
+}
+
+TEST_F(CostBasedRoutingTest, GuardReleasesOnDestruction) {
+    register_backends(1);
+
+    {
+        CostBudgetGuard guard(1, 500.0);
+        EXPECT_DOUBLE_EQ(get_backend_cost(1), 500.0);
+    }
+    // Guard destroyed — cost released
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, GuardMoveTransfersOwnership) {
+    register_backends(1);
+
+    CostBudgetGuard g1(1, 300.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 300.0);
+
+    CostBudgetGuard g2(std::move(g1));
+    EXPECT_FALSE(g1.is_active());
+    EXPECT_TRUE(g2.is_active());
+    // Cost still 300, not doubled
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 300.0);
+}
+
+TEST_F(CostBasedRoutingTest, GuardInactiveWhenCostRoutingDisabled) {
+    cfg_.cost_routing.enabled = false;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+    register_backends(1);
+
+    CostBudgetGuard guard(1, 500.0);
+    EXPECT_FALSE(guard.is_active());
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+}
+
+TEST_F(CostBasedRoutingTest, CostBudgetResetOnBackendUnregister) {
+    register_backends(1);
+    reserve_cost_budget(1, 5000.0);
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 5000.0);
+
+    RouterService::unregister_backend_for_testing(1);
+    // After unregister, backend is gone — cost should be 0 (unknown backend)
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
+}

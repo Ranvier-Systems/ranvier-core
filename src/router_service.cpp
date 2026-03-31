@@ -17,6 +17,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -71,6 +72,10 @@ struct BackendInfo {
     // Shard-local only — BackendInfo lives in thread_local ShardLocalState,
     // accessed exclusively from one reactor thread.  No atomic needed.
     uint64_t active_requests = 0;
+
+    // Cost tracking: sum of estimated_cost_units for in-flight requests.
+    // Shard-local, same as active_requests — no atomics needed.
+    double current_cost_budget = 0.0;
 
     BackendInfo() = default;
 
@@ -137,6 +142,12 @@ struct ShardLocalState {
         // Cross-shard load sync stats
         uint64_t load_sync_broadcasts = 0;         // Number of load snapshot broadcasts sent
         uint64_t load_sync_snapshots_received = 0; // Number of snapshots received from other shards
+        // Cost-based routing stats
+        uint64_t cost_redirects = 0;               // Times cost budget changed backend
+        uint64_t fast_lane_routes = 0;              // Small requests fast-laned
+        uint64_t budget_exhausted = 0;              // No budget available anywhere
+        uint64_t cost_reserved_total = 0;           // Total cost reservations made
+        uint64_t cost_released_total = 0;           // Total cost releases made
 
         void reset() {
             cache_hits = 0;
@@ -161,6 +172,11 @@ struct ShardLocalState {
             local_routes_dropped_overflow = 0;
             load_sync_broadcasts = 0;
             load_sync_snapshots_received = 0;
+            cost_redirects = 0;
+            fast_lane_routes = 0;
+            budget_exhausted = 0;
+            cost_reserved_total = 0;
+            cost_released_total = 0;
         }
     } stats;
 
@@ -189,6 +205,12 @@ struct ShardLocalState {
         // GPU load integration (vLLM-aware routing)
         double gpu_load_weight = 10.0;
         std::chrono::seconds gpu_load_cache_ttl{30};
+        // Cost-based routing configuration
+        bool cost_routing_enabled = false;
+        double cost_routing_max_cost = 10000.0;
+        double cost_routing_small_threshold = 500.0;
+        bool cost_routing_fast_lane = true;
+        double cost_routing_imbalance_factor = 2.0;
     } config;
 
     // ========================================================================
@@ -302,6 +324,12 @@ struct ShardLocalState {
         // GPU load integration
         config.gpu_load_weight = cfg.gpu_load_weight;
         config.gpu_load_cache_ttl = cfg.gpu_load_cache_ttl;
+        // Cost-based routing configuration
+        config.cost_routing_enabled = cfg.cost_routing.enabled;
+        config.cost_routing_max_cost = cfg.cost_routing.max_cost_per_backend;
+        config.cost_routing_small_threshold = cfg.cost_routing.small_request_threshold;
+        config.cost_routing_fast_lane = cfg.cost_routing.enable_fast_lane;
+        config.cost_routing_imbalance_factor = cfg.cost_routing.cost_imbalance_factor;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -340,6 +368,12 @@ struct ShardLocalState {
         // GPU load integration
         config.gpu_load_weight = cfg.gpu_load_weight;
         config.gpu_load_cache_ttl = cfg.gpu_load_cache_ttl;
+        // Cost-based routing configuration
+        config.cost_routing_enabled = cfg.cost_routing.enabled;
+        config.cost_routing_max_cost = cfg.cost_routing.max_cost_per_backend;
+        config.cost_routing_small_threshold = cfg.cost_routing.small_request_threshold;
+        config.cost_routing_fast_lane = cfg.cost_routing.enable_fast_lane;
+        config.cost_routing_imbalance_factor = cfg.cost_routing.cost_imbalance_factor;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -509,6 +543,62 @@ BackendRequestGuard& BackendRequestGuard::operator=(BackendRequestGuard&& other)
 }
 
 // ============================================================================
+// CostBudgetGuard Implementation
+// ============================================================================
+
+CostBudgetGuard::CostBudgetGuard(BackendId id, double cost)
+    : _backend_id(id), _cost(cost) {
+    if (cost > 0.0 && g_shard_state && g_shard_state->config.cost_routing_enabled) {
+        auto it = g_shard_state->backends.find(id);
+        if (it != g_shard_state->backends.end()) {
+            // Always reserve (symmetric with release). Budget is advisory.
+            it->second.current_cost_budget += cost;
+            g_shard_state->stats.cost_reserved_total++;
+            _active = true;
+        }
+    }
+}
+
+CostBudgetGuard::~CostBudgetGuard() {
+    if (_active && g_shard_state) {
+        auto it = g_shard_state->backends.find(_backend_id);
+        if (it != g_shard_state->backends.end()) {
+            it->second.current_cost_budget -= _cost;
+            if (it->second.current_cost_budget < 0.0) {
+                it->second.current_cost_budget = 0.0;
+            }
+            g_shard_state->stats.cost_released_total++;
+        }
+    }
+}
+
+CostBudgetGuard::CostBudgetGuard(CostBudgetGuard&& other) noexcept
+    : _backend_id(other._backend_id), _cost(other._cost), _active(other._active) {
+    other._active = false;
+}
+
+CostBudgetGuard& CostBudgetGuard::operator=(CostBudgetGuard&& other) noexcept {
+    if (this != &other) {
+        // Release current reservation if active
+        if (_active && g_shard_state) {
+            auto it = g_shard_state->backends.find(_backend_id);
+            if (it != g_shard_state->backends.end()) {
+                it->second.current_cost_budget -= _cost;
+                if (it->second.current_cost_budget < 0.0) {
+                    it->second.current_cost_budget = 0.0;
+                }
+                g_shard_state->stats.cost_released_total++;
+            }
+        }
+        _backend_id = other._backend_id;
+        _cost = other._cost;
+        _active = other._active;
+        other._active = false;
+    }
+    return *this;
+}
+
+// ============================================================================
 // Load Tracking Helper Functions
 // ============================================================================
 
@@ -620,6 +710,121 @@ std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<Backen
     }
 
     return {best_id, best_load};
+}
+
+// ============================================================================
+// Cost Budget Tracking (shard-local, lock-free)
+// ============================================================================
+//
+// Per-backend cost budget tracks the sum of estimated_cost_units for in-flight
+// requests. This prevents head-of-line blocking where a backend processing one
+// huge request appears equally loaded as one processing many tiny requests.
+//
+// All operations are shard-local (thread_local g_shard_state) — no locks needed.
+
+bool reserve_cost_budget(BackendId id, double cost) {
+    if (!g_shard_state || cost <= 0.0) return true;
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) return false;
+
+    double max_budget = g_shard_state->config.cost_routing_max_cost;
+    bool within_budget = (it->second.current_cost_budget + cost <= max_budget);
+    // Always add cost to ensure symmetric reserve/release. The budget is advisory —
+    // routing decisions check budget *before* reserving, and this function's return
+    // value is informational only. Asymmetric reserve/release causes budget drift.
+    it->second.current_cost_budget += cost;
+    g_shard_state->stats.cost_reserved_total++;
+    return within_budget;
+}
+
+void release_cost_budget(BackendId id, double cost) {
+    if (!g_shard_state || cost <= 0.0) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) return;
+
+    it->second.current_cost_budget -= cost;
+    // Clamp to zero to avoid negative drift from floating-point accumulation
+    if (it->second.current_cost_budget < 0.0) {
+        it->second.current_cost_budget = 0.0;
+    }
+    g_shard_state->stats.cost_released_total++;
+}
+
+double get_backend_cost(BackendId id) {
+    if (!g_shard_state) return 0.0;
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) return 0.0;
+    return it->second.current_cost_budget;
+}
+
+// Find backend with lowest cost budget among candidates.
+// O(n) scan, same pattern as get_least_loaded_backend.
+// Callers pass pre-filtered live_backends (dead/draining already excluded).
+static std::pair<BackendId, double> get_least_cost_backend(
+    const std::vector<BackendId>& candidates) {
+    if (!g_shard_state || candidates.empty()) {
+        return {0, std::numeric_limits<double>::max()};
+    }
+
+    BackendId best_id = 0;
+    double best_cost = std::numeric_limits<double>::max();
+
+    for (BackendId id : candidates) {
+        auto it = g_shard_state->backends.find(id);
+        if (it == g_shard_state->backends.end()) continue;
+
+        double cost = it->second.current_cost_budget;
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_id = id;
+        }
+    }
+    return {best_id, best_cost};
+}
+
+// Find a backend with available budget, excluding one backend.
+// Uses random-two-choices selection to avoid thundering herd.
+// Returns nullopt if no backend has sufficient budget headroom.
+// Stack-allocated: no heap allocation for up to 256 backends.
+static std::optional<BackendId> find_backend_with_budget(
+    const std::vector<BackendId>& candidates,
+    double request_cost,
+    double max_budget,
+    BackendId exclude_id) {
+    if (!g_shard_state || candidates.size() < 2) return std::nullopt;
+
+    // Build list of eligible candidates on the stack (no heap allocation).
+    // 256 is the hard limit on backends (ShardLocalState::GpuLoadCache::MAX_ENTRIES).
+    static constexpr size_t MAX_ELIGIBLE = 256;
+    std::array<BackendId, MAX_ELIGIBLE> eligible{};
+    size_t eligible_count = 0;
+
+    for (BackendId id : candidates) {
+        if (id == exclude_id) continue;
+        auto it = g_shard_state->backends.find(id);
+        if (it == g_shard_state->backends.end()) continue;
+        if (it->second.current_cost_budget + request_cost <= max_budget) {
+            if (eligible_count < MAX_ELIGIBLE) {
+                eligible[eligible_count++] = id;
+            }
+        }
+    }
+
+    if (eligible_count == 0) return std::nullopt;
+    if (eligible_count == 1) return eligible[0];
+
+    // Random-two-choices: pick 2 random candidates, return whichever has more headroom
+    auto& rng = g_shard_state->rng;
+    std::uniform_int_distribution<size_t> dist(0, eligible_count - 1);
+    size_t idx_a = dist(rng);
+    size_t idx_b = dist(rng);
+    if (idx_a == idx_b) {
+        idx_b = (idx_b + 1) % eligible_count;
+    }
+
+    double cost_a = get_backend_cost(eligible[idx_a]);
+    double cost_b = get_backend_cost(eligible[idx_b]);
+    return (cost_a <= cost_b) ? eligible[idx_a] : eligible[idx_b];
 }
 
 // Check if preferred backend is significantly more loaded than its peers and
@@ -1183,7 +1388,7 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             seastar::metrics::description("Total number of cross-shard load snapshots received from other shards")),
 
         // ====================================================================
-        // GPU Load Integration Metrics (VISION 2.2)
+        // GPU Load Integration Metrics
         // ====================================================================
 
         // Counter: GPU-load-driven redirects (subset of load_aware_fallbacks)
@@ -1208,7 +1413,36 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             [] {
                 if (!g_shard_state) return static_cast<double>(0);
                 return static_cast<double>(g_shard_state->gpu_load_cache.scores.size());
-            })
+            }),
+
+        // ====================================================================
+        // Cost-Based Routing Metrics
+        // ====================================================================
+
+        // Counter: cost-driven routing redirects (backend changed due to cost budget)
+        seastar::metrics::make_counter("router_cost_redirects_total",
+            [] { return g_shard_state ? g_shard_state->stats.cost_redirects : 0UL; },
+            seastar::metrics::description("Total cost-driven routing redirects")),
+
+        // Counter: small requests routed via fast lane
+        seastar::metrics::make_counter("router_fast_lane_total",
+            [] { return g_shard_state ? g_shard_state->stats.fast_lane_routes : 0UL; },
+            seastar::metrics::description("Total small requests routed via cost fast lane")),
+
+        // Counter: no budget available anywhere (best-effort fallthrough)
+        seastar::metrics::make_counter("router_budget_exhausted_total",
+            [] { return g_shard_state ? g_shard_state->stats.budget_exhausted : 0UL; },
+            seastar::metrics::description("Total times all backends exceeded cost budget")),
+
+        // Counter: total cost reserved across all backends
+        seastar::metrics::make_counter("router_cost_reserved_total",
+            [] { return g_shard_state ? g_shard_state->stats.cost_reserved_total : 0UL; },
+            seastar::metrics::description("Total cost budget reservations made")),
+
+        // Counter: total cost released across all backends
+        seastar::metrics::make_counter("router_cost_released_total",
+            [] { return g_shard_state ? g_shard_state->stats.cost_released_total : 0UL; },
+            seastar::metrics::description("Total cost budget releases made"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -1225,6 +1459,7 @@ seastar::future<> RouterService::initialize_shards() {
         [cfg, has_gossip](unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [cfg, has_gossip] {
                 // Initialize ShardLocalState with unified init() method
+                // (includes cost routing config via RoutingConfig::cost_routing)
                 g_shard_state = std::make_unique<ShardLocalState>();
                 g_shard_state->init(cfg);
                 // Set gossip_enabled flag on all shards (gossip_ptr only on shard 0)
@@ -1523,7 +1758,8 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
 //
 RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
                                          const std::string& request_id,
-                                         size_t prefix_boundary) {
+                                         size_t prefix_boundary,
+                                         double estimated_cost) {
     RouteResult result;
 
     // ==========================================================================
@@ -1560,13 +1796,16 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
-        auto prefix_result = get_backend_for_prefix(tokens, request_id, prefix_boundary);
+        auto prefix_result = get_backend_for_prefix(tokens, request_id, prefix_boundary, estimated_cost);
 
         if (prefix_result.backend_id.has_value()) {
             result.backend_id = prefix_result.backend_id.value();
             result.cache_hit = prefix_result.art_hit;
             result.was_load_redirect = prefix_result.was_load_redirect;
             result.backend_load_at_decision = prefix_result.backend_load_at_decision;
+            result.was_cost_redirect = prefix_result.was_cost_redirect;
+            result.was_fast_lane = prefix_result.was_fast_lane;
+            result.backend_cost_at_decision = prefix_result.backend_cost_at_decision;
         } else {
             result.error_message = "No backends registered";
         }
@@ -1678,7 +1917,8 @@ std::optional<BackendId> RouterService::get_random_backend() {
 //
 PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_t>& tokens,
                                                          const std::string& request_id,
-                                                         size_t prefix_boundary) {
+                                                         size_t prefix_boundary,
+                                                         double estimated_cost) {
     if (!g_shard_state) return {};
     auto& state = shard_state();
 
@@ -1877,7 +2117,70 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    if (!request_id.empty() && final_backend == selected) {
+    // ====================================================================
+    // Step 4: Cost-aware override
+    // ====================================================================
+    // Only runs when cost_routing.enabled is true and estimated_cost > 0.
+    // Overlays on top of Steps 1-3 — does NOT modify ART or hash strategies.
+    //
+    // 4a. Small request fast lane: route cheap requests to least-cost backend
+    // 4b. Large request budget check: avoid overloading already expensive backends
+    // Note: cost budget reservation is handled by CostBudgetGuard in http_controller
+    bool was_cost_redirect = false;
+    bool was_fast_lane = false;
+    double cost_at_decision = 0.0;
+
+    if (g_shard_state && state.config.cost_routing_enabled && estimated_cost > 0.0) {
+        double selected_cost = get_backend_cost(final_backend);
+        double max_budget = state.config.cost_routing_max_cost;
+        cost_at_decision = selected_cost;
+
+        // 4a. Small request fast lane
+        if (estimated_cost < state.config.cost_routing_small_threshold &&
+            state.config.cost_routing_fast_lane) {
+
+            auto [least_cost_id, least_cost] = get_least_cost_backend(live_backends);
+            if (least_cost_id != 0 && least_cost_id != final_backend &&
+                selected_cost > least_cost * state.config.cost_routing_imbalance_factor) {
+                BackendId prev = final_backend;
+                final_backend = least_cost_id;
+                was_cost_redirect = true;
+                was_fast_lane = true;
+                cost_at_decision = get_backend_cost(final_backend);
+                state.stats.cost_redirects++;
+                state.stats.fast_lane_routes++;
+                log_router.debug("[{}] Cost fast lane: backend {} cost={:.1f} > {:.1f}*{:.1f}, "
+                                 "redirected small request (cost={:.1f}) to backend {} (cost={:.1f})",
+                                 request_id, prev, selected_cost,
+                                 least_cost, state.config.cost_routing_imbalance_factor,
+                                 estimated_cost, least_cost_id, least_cost);
+            }
+        }
+        // 4b. Large request budget check
+        else if (selected_cost + estimated_cost > max_budget) {
+            auto alt = find_backend_with_budget(live_backends, estimated_cost,
+                                                max_budget, final_backend);
+            if (alt.has_value()) {
+                BackendId prev = final_backend;
+                final_backend = *alt;
+                was_cost_redirect = true;
+                cost_at_decision = get_backend_cost(final_backend);
+                state.stats.cost_redirects++;
+                log_router.debug("[{}] Cost budget redirect: backend {} budget={:.1f} + cost={:.1f} > max={:.1f}, "
+                                 "redirected to backend {} (budget={:.1f})",
+                                 request_id, prev, selected_cost, estimated_cost, max_budget,
+                                 *alt, get_backend_cost(*alt));
+            } else {
+                // No backend has budget — route anyway (best effort, advisory budget)
+                state.stats.budget_exhausted++;
+                log_router.debug("[{}] Cost budget exhausted: all backends over budget, "
+                                 "routing to backend {} anyway (best effort)",
+                                 request_id, final_backend);
+            }
+        }
+    }
+
+    if (!request_id.empty() && final_backend == selected && !was_cost_redirect) {
         if (art_hit) {
             log_router.debug("[{}] Prefix affinity (ART hit): {} tokens -> backend {}",
                              request_id, tokens.size(), selected);
@@ -1887,7 +2190,8 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    return {final_backend, art_hit, load_at_decision, was_load_redirect};
+    return {final_backend, art_hit, load_at_decision, was_load_redirect,
+            was_cost_redirect, was_fast_lane, cost_at_decision};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,
