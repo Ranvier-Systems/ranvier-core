@@ -1448,6 +1448,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
 
         target_id = route_result.backend_id.value();
+        if (route_result.was_load_redirect) {
+            log_proxy.debug("[{}] Load redirect: original backend overloaded (gpu_load={:.2f}), "
+                            "redirected to backend {}",
+                            request_id, route_result.backend_load_at_decision, target_id);
+        }
         log_proxy.debug("[{}] Route decision: {} mode, cache_hit={} -> backend {}",
                         request_id, route_result.routing_mode, route_result.cache_hit, target_id);
 
@@ -2618,10 +2623,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_backend_met
             load_score = _health_service->get_backend_load(b.id);
         }
 
+        // Compute composite load for this backend
+        uint64_t local_active = get_backend_load(b.id);
+        uint64_t composite_load = get_composite_backend_load(b.id);
+
         oss << "    {\n";
         oss << "      \"id\": " << b.id << ",\n";
         oss << "      \"address\": \"" << b.address << ":" << b.port << "\",\n";
         oss << "      \"load_score\": " << load_score << ",\n";
+        oss << "      \"composite_load\": " << composite_load << ",\n";
+        oss << "      \"local_active_requests\": " << local_active << ",\n";
         oss << "      \"vllm_metrics\": {\n";
         oss << "        \"valid\": " << (vllm.valid ? "true" : "false");
 

@@ -159,6 +159,13 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<uint64_t>("RANVIER_LOAD_IMBALANCE_FLOOR")) {
         routing.load_imbalance_floor = *v;
     }
+    // GPU load integration (vLLM-aware routing)
+    if (auto v = get_env_as<double>("RANVIER_ROUTING_GPU_LOAD_WEIGHT")) {
+        routing.gpu_load_weight = *v;
+    }
+    if (auto v = get_env_as<int>("RANVIER_ROUTING_GPU_LOAD_CACHE_TTL")) {
+        routing.gpu_load_cache_ttl = std::chrono::seconds(*v);
+    }
     // Cross-shard load synchronization
     if (auto v = get_env("RANVIER_CROSS_SHARD_LOAD_SYNC")) {
         routing.cross_shard_load_sync = (*v == "1" || *v == "true" || *v == "yes");
@@ -902,6 +909,14 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["p2c_load_bias"]) {
                 config.routing.p2c_load_bias = r["p2c_load_bias"].as<uint64_t>();
+            }
+            // GPU load integration (vLLM-aware routing)
+            if (r["gpu_load_weight"]) {
+                config.routing.gpu_load_weight = r["gpu_load_weight"].as<double>();
+            }
+            if (r["gpu_load_cache_ttl"]) {
+                config.routing.gpu_load_cache_ttl =
+                    std::chrono::seconds(r["gpu_load_cache_ttl"].as<int>());
             }
         }
 

@@ -10,4 +10,7 @@ public:
     future() = default;
 };
 
+template<typename T = void>
+future<T> make_ready_future() { return future<T>{}; }
+
 } // namespace seastar
