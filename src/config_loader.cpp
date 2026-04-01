@@ -713,6 +713,23 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_AGENT_AUTO_DETECT")) {
         agent_registry.auto_detect_agents = (*v == "1" || *v == "true" || *v == "yes");
     }
+
+    // Cost-based routing overrides
+    if (auto v = get_env("RANVIER_COST_ROUTING_ENABLED")) {
+        routing.cost_routing.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<double>("RANVIER_COST_ROUTING_MAX_COST")) {
+        routing.cost_routing.max_cost_per_backend = *v;
+    }
+    if (auto v = get_env_as<double>("RANVIER_COST_ROUTING_SMALL_THRESHOLD")) {
+        routing.cost_routing.small_request_threshold = *v;
+    }
+    if (auto v = get_env("RANVIER_COST_ROUTING_FAST_LANE")) {
+        routing.cost_routing.enable_fast_lane = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<double>("RANVIER_COST_ROUTING_IMBALANCE_FACTOR")) {
+        routing.cost_routing.cost_imbalance_factor = *v;
+    }
 }
 
 // =============================================================================
@@ -917,6 +934,23 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["gpu_load_cache_ttl"]) {
                 config.routing.gpu_load_cache_ttl =
                     std::chrono::seconds(r["gpu_load_cache_ttl"].as<int>());
+            }
+            // Cost-based routing sub-section (nested under routing)
+            if (r["cost_routing"]) {
+                YAML::Node cr = r["cost_routing"];
+                if (cr["enabled"]) config.routing.cost_routing.enabled = cr["enabled"].as<bool>();
+                if (cr["max_cost_per_backend"]) {
+                    config.routing.cost_routing.max_cost_per_backend = cr["max_cost_per_backend"].as<double>();
+                }
+                if (cr["small_request_threshold"]) {
+                    config.routing.cost_routing.small_request_threshold = cr["small_request_threshold"].as<double>();
+                }
+                if (cr["enable_fast_lane"]) {
+                    config.routing.cost_routing.enable_fast_lane = cr["enable_fast_lane"].as<bool>();
+                }
+                if (cr["cost_imbalance_factor"]) {
+                    config.routing.cost_routing.cost_imbalance_factor = cr["cost_imbalance_factor"].as<double>();
+                }
             }
         }
 
@@ -1435,6 +1469,8 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
         }
 
+
+
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -1701,6 +1737,17 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.local_mode.discovery_ports.size() > LocalModeConfig::MAX_DISCOVERY_PORTS) {
         return "local_mode.discovery_ports exceeds maximum of 64 entries (Rule #4)";
+    }
+
+    // Validate cost-based routing settings
+    if (config.routing.cost_routing.max_cost_per_backend <= 0.0) {
+        return "cost_routing.max_cost_per_backend must be positive";
+    }
+    if (config.routing.cost_routing.small_request_threshold < 0.0) {
+        return "cost_routing.small_request_threshold must be non-negative";
+    }
+    if (config.routing.cost_routing.cost_imbalance_factor <= 0.0) {
+        return "cost_routing.cost_imbalance_factor must be positive";
     }
 
     return std::nullopt;  // Valid

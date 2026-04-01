@@ -1421,6 +1421,19 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
     }
 
+    // Cost estimation: compute before routing so cost-based routing can use it.
+    // estimate_request_cost() only needs text length and max_tokens — both available now.
+    auto cost = _config.cost_estimation_enabled
+        ? estimate_request_cost(
+              text_extraction.has_value() ? text_extraction->text.size() : body_view.size(),
+              text_extraction.has_value() ? text_extraction->max_tokens : 0)
+        : CostEstimate{};
+
+    if (_config.cost_estimation_enabled && cost.cost_units > 0.0) {
+        log_proxy.debug("[{}] Cost estimation (pre-route): input={}, output={}, cost_units={:.1f}",
+                       request_id, cost.input_tokens, cost.output_tokens, cost.cost_units);
+    }
+
     BackendId target_id;
     std::string routing_mode_str;
 
@@ -1430,10 +1443,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
         // Unified routing decision - all mode logic is encapsulated in RouterService
         // Pass prefix_boundary for consistent hash fallback across cluster nodes
+        // Pass estimated_cost for cost-based routing
         // NOTE: art_lookup_start collapsed into post_tokenize (phase-snapshot
         // optimization — body prep between them is ~100ns, well within first
         // histogram bucket of 100μs).
-        auto route_result = _router.route_request(tokens, request_id, prefix_boundary);
+        auto route_result = _router.route_request(tokens, request_id, prefix_boundary,
+                                                     cost.cost_units);
         routing_mode_str = route_result.routing_mode;
         route_span.set_attribute("ranvier.routing_mode", route_result.routing_mode);
         route_span.set_attribute("ranvier.cache_hit", route_result.cache_hit);
@@ -1453,6 +1468,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                             "redirected to backend {}",
                             request_id, route_result.backend_load_at_decision, target_id);
         }
+        if (route_result.was_cost_redirect) {
+            log_proxy.debug("[{}] Cost redirect: backend cost_budget={:.1f}, fast_lane={} -> backend {}",
+                            request_id, route_result.backend_cost_at_decision,
+                            route_result.was_fast_lane, target_id);
+        }
         log_proxy.debug("[{}] Route decision: {} mode, cache_hit={} -> backend {}",
                         request_id, route_result.routing_mode, route_result.cache_hit, target_id);
 
@@ -1465,6 +1485,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // time all see load=0 and pile onto the same backend (transient hot-spot).
     // RAII ensures cleanup on any early-return error path below.
     BackendRequestGuard backend_guard(target_id);
+
+    // Cost budget guard: RAII ensures symmetric reserve/release on ALL exit paths.
+    // Created on the routed backend; destructor releases on any error/exception/success.
+    CostBudgetGuard cost_guard(target_id, cost.cost_units);
 
     // Phase snapshot: post-route (replaces separate art_lookup_end and routing_end)
     auto post_route = std::chrono::steady_clock::now();
@@ -1480,8 +1504,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         auto fallback = get_fallback_backend(target_id);
         if (fallback.has_value()) {
             target_id = fallback.value();
-            // Move-assign new guard: decrements old backend, increments new one
+            // Move-assign new guards: release old backend's counters, acquire new one's
             backend_guard = BackendRequestGuard(target_id);
+            cost_guard = CostBudgetGuard(target_id, cost.cost_units);
             metrics().record_fallback();
             log_proxy.info("[{}] Using fallback backend {}", request_id, target_id);
         } else {
@@ -1539,17 +1564,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Release the guard - lambda takes over responsibility for decrementing counter
     active_request_guard.release();
 
-    // Cost estimation: derive cost signals before context init
-    auto cost = _config.cost_estimation_enabled
-        ? estimate_request_cost(
-              text_extraction.has_value() ? text_extraction->text.size() : body_view.size(),
-              text_extraction.has_value() ? text_extraction->max_tokens : 0)
-        : CostEstimate{};
-
-    if (_config.cost_estimation_enabled) {
-        log_proxy.debug("[{}] Cost estimation: input={}, output={}, cost_units={:.1f}",
-                       request_id, cost.input_tokens, cost.output_tokens, cost.cost_units);
-    }
+    // Cost estimation already computed before routing (see cost variable above).
 
     // Priority tier extraction: classify request before routing
     PriorityLevel priority = PriorityLevel::NORMAL;
@@ -1639,11 +1654,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         co_return std::move(rep);
     }
 
-    // Move gate_holder, semaphore_units, and backend_guard into the lambda to keep them alive during streaming.
-    // This ensures the gate stays held, the semaphore slot is occupied, and the backend load tracking
-    // is properly maintained until streaming completes.
-    // BackendRequestGuard destructor will decrement active_requests when the lambda completes.
-    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard)](output_stream<char> client_out) mutable -> future<> {
+    // Move gate_holder, semaphore_units, backend_guard, and cost_guard into the lambda to keep them alive during streaming.
+    // This ensures the gate stays held, the semaphore slot is occupied, the backend load tracking
+    // is properly maintained, and cost budget is released when streaming completes (any exit path).
+    // BackendRequestGuard destructor decrements active_requests; CostBudgetGuard destructor releases cost budget.
+    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
@@ -1837,6 +1852,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // Phase 5: Record metrics and cleanup
         auto backend_end = std::chrono::steady_clock::now();
         record_proxy_completion_metrics(*ctx, backend_end);
+
+        // Cost budget release is handled by CostBudgetGuard destructor (RAII).
 
         // Return connection to pool or close it
         if (ctx->connection_failed || ctx->connection_error || ctx->timed_out || !bundle.is_valid) {
@@ -2633,6 +2650,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_backend_met
         oss << "      \"load_score\": " << load_score << ",\n";
         oss << "      \"composite_load\": " << composite_load << ",\n";
         oss << "      \"local_active_requests\": " << local_active << ",\n";
+        // Cost budget tracking
+        double cost_budget = get_backend_cost(b.id);
+        double cost_max = _config.cost_routing_max_cost;
+        double cost_headroom = cost_max > 0.0
+            ? ((cost_max - cost_budget) / cost_max) * 100.0
+            : 100.0;
+        oss << "      \"cost_budget\": " << cost_budget << ",\n";
+        oss << "      \"cost_budget_max\": " << cost_max << ",\n";
+        oss << "      \"cost_headroom_percent\": " << cost_headroom << ",\n";
+
         oss << "      \"vllm_metrics\": {\n";
         oss << "        \"valid\": " << (vllm.valid ? "true" : "false");
 

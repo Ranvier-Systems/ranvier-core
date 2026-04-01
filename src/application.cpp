@@ -215,6 +215,12 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.local_mode = config.local_mode;
     // Agent registry settings
     cfg.agent_registry = config.agent_registry;
+    // Cost-based routing settings
+    cfg.cost_routing_enabled = config.routing.cost_routing.enabled;
+    cfg.cost_routing_max_cost = config.routing.cost_routing.max_cost_per_backend;
+    cfg.cost_routing_small_threshold = config.routing.cost_routing.small_request_threshold;
+    cfg.cost_routing_fast_lane = config.routing.cost_routing.enable_fast_lane;
+    cfg.cost_routing_imbalance_factor = config.routing.cost_routing.cost_imbalance_factor;
     return cfg;
 }
 

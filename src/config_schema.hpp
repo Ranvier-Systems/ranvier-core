@@ -14,6 +14,26 @@
 namespace ranvier {
 
 // =============================================================================
+// Cost-Based Routing Configuration
+// =============================================================================
+
+// Cost-based routing overlays per-backend cost budget tracking on top of
+// load-aware routing. Prevents head-of-line blocking where a
+// backend processing one huge request (100K tokens) appears equally loaded
+// as one processing a tiny request (100 tokens). Also implements a
+// "small request fast lane" so cheap requests aren't queued behind expensive ones.
+//
+// Cost budgets are shard-local and advisory (not hard limits). When budget
+// is exhausted, requests are still routed (best effort).
+struct CostBasedRoutingConfig {
+    bool enabled = false;                      // Master switch (off by default, opt-in)
+    double max_cost_per_backend = 10000.0;     // Budget cap per backend
+    double small_request_threshold = 500.0;    // Requests below this cost -> fast lane eligible
+    bool enable_fast_lane = true;              // Route small requests to least-cost-loaded backend
+    double cost_imbalance_factor = 2.0;        // Divert when cost > factor * avg cost across backends
+};
+
+// =============================================================================
 // Routing Configuration
 // =============================================================================
 
@@ -158,6 +178,11 @@ struct RoutingConfig {
     // interval with P50 improvement, best throughput (+6% to +17%), and zero
     // transient hot-spotting failures (3/3 runs passed vs 1-2 failures at 10ms).
     std::chrono::milliseconds route_batch_flush_interval{20};              // Env: RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
+
+    // =========================================================================
+    // Cost-Based Routing (overlays on load-aware routing)
+    // =========================================================================
+    CostBasedRoutingConfig cost_routing;
 
     // Helper to check routing mode
     bool is_prefix_mode() const { return routing_mode == RoutingMode::PREFIX; }
