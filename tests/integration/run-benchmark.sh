@@ -334,6 +334,60 @@ EOF
     echo "  P50 latency delta: ${P50_DELTA}%"
     echo ""
 
+    # Intelligence Layer metrics (informational, not regression-gated)
+    # Parse from BENCHMARK_STATS_JSON if available in Locust log output
+    local LOCUST_LOG="$RESULTS_DIR/benchmark_log.txt"
+    if [[ -f "$LOCUST_LOG" ]] && command -v jq &> /dev/null; then
+        local INTEL_JSON
+        INTEL_JSON=$(grep -o 'BENCHMARK_STATS_JSON:{.*}' "$LOCUST_LOG" | sed 's/BENCHMARK_STATS_JSON://' | tail -1)
+        if [[ -n "$INTEL_JSON" ]]; then
+            local HAS_INTEL
+            HAS_INTEL=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer // empty' 2>/dev/null)
+            if [[ -n "$HAS_INTEL" ]]; then
+                echo "Intelligence Layer:"
+                local PRI_CRITICAL PRI_HIGH PRI_NORMAL PRI_LOW PRI_TOTAL
+                PRI_CRITICAL=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.priority_distribution.critical // 0')
+                PRI_HIGH=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.priority_distribution.high // 0')
+                PRI_NORMAL=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.priority_distribution.normal // 0')
+                PRI_LOW=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.priority_distribution.low // 0')
+                PRI_TOTAL=$((PRI_CRITICAL + PRI_HIGH + PRI_NORMAL + PRI_LOW))
+                if [[ "$PRI_TOTAL" -gt 0 ]]; then
+                    echo "  Priority distribution: critical=$((PRI_CRITICAL * 100 / PRI_TOTAL))% high=$((PRI_HIGH * 100 / PRI_TOTAL))% normal=$((PRI_NORMAL * 100 / PRI_TOTAL))% low=$((PRI_LOW * 100 / PRI_TOTAL))%"
+                else
+                    echo "  Priority distribution: no data"
+                fi
+
+                local INT_AUTO INT_CHAT INT_EDIT INT_TOTAL
+                INT_AUTO=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.intent_distribution.autocomplete // 0')
+                INT_CHAT=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.intent_distribution.chat // 0')
+                INT_EDIT=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.intent_distribution.edit // 0')
+                INT_TOTAL=$((INT_AUTO + INT_CHAT + INT_EDIT))
+                if [[ "$INT_TOTAL" -gt 0 ]]; then
+                    echo "  Intent distribution: autocomplete=$((INT_AUTO * 100 / INT_TOTAL))% chat=$((INT_CHAT * 100 / INT_TOTAL))% edit=$((INT_EDIT * 100 / INT_TOTAL))%"
+                else
+                    echo "  Intent distribution: no data"
+                fi
+
+                local COST_REDIR LOAD_REDIR AGENTS_DET AVG_SCHED
+                COST_REDIR=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.cost_redirects // 0')
+                LOAD_REDIR=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.load_redirects // 0')
+                AGENTS_DET=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.agents_detected // 0')
+                AVG_SCHED=$(echo "$INTEL_JSON" | jq -r '.intelligence_layer.avg_scheduler_wait_ms // 0')
+
+                if [[ "$REQUEST_COUNT" -gt 0 ]]; then
+                    echo "  Cost redirects: ${COST_REDIR} ($((COST_REDIR * 100 / REQUEST_COUNT))% of requests)"
+                    echo "  Load redirects: ${LOAD_REDIR} ($((LOAD_REDIR * 100 / REQUEST_COUNT))% of requests)"
+                else
+                    echo "  Cost redirects: ${COST_REDIR}"
+                    echo "  Load redirects: ${LOAD_REDIR}"
+                fi
+                echo "  Agents detected: ${AGENTS_DET}"
+                echo "  Avg scheduler wait: ${AVG_SCHED}ms"
+                echo ""
+            fi
+        fi
+    fi
+
     # Generate comparison.md for GitHub summary
     if [[ "$REGRESSION_DETECTED" -eq 1 ]]; then
         STATUS_ICON=":x:"
@@ -359,6 +413,16 @@ EOF
 - P99 latency regression: ≤${P99_THRESHOLD}%
 - Throughput regression: ≤${THROUGHPUT_THRESHOLD}%
 - Max failure rate: ≤${MAX_FAILURE_RATE}%
+
+#### Intelligence Layer (informational)
+| Metric | Value |
+|--------|-------|
+| Priority distribution | critical=${PRI_CRITICAL:-N/A} high=${PRI_HIGH:-N/A} normal=${PRI_NORMAL:-N/A} low=${PRI_LOW:-N/A} |
+| Intent distribution | autocomplete=${INT_AUTO:-N/A} chat=${INT_CHAT:-N/A} edit=${INT_EDIT:-N/A} |
+| Cost redirects | ${COST_REDIR:-N/A} |
+| Load redirects | ${LOAD_REDIR:-N/A} |
+| Agents detected | ${AGENTS_DET:-N/A} |
+| Avg scheduler wait | ${AVG_SCHED:-N/A}ms |
 EOF
 
     echo "Comparison report written to: $RESULTS_DIR/comparison.md"

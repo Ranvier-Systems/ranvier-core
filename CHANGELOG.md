@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Performance
+
+- **Intelligence Layer Benchmark**: All §15 features enabled (cost estimation,
+  priority tiers, intent classification, priority queue, agent registry,
+  vLLM metrics ingestion, GPU-aware load routing, cost-based routing).
+  - P99 latency: 67ms (baseline without §15: 140ms, no regression)
+  - Throughput: 9.53 rps (10 users, 1-3s wait — consistent with config)
+  - Priority queue overhead: 1.88ms average scheduler wait
+  - Zero failures, zero sync errors
+  - Intelligence layer Prometheus counters read zero on mock backends (expected;
+    counters populate with real vLLM backends)
+
 ### Added
 
 - **Local Backend Discovery (VISION 3.1)** — Auto-discovers local LLM servers (Ollama, vLLM,

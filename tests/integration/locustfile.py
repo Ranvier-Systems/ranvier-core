@@ -62,9 +62,39 @@ BACKENDS = [
 # Configurable thresholds
 P99_LATENCY_THRESHOLD_MS = float(os.environ.get("P99_LATENCY_THRESHOLD_MS", "100"))
 
-# Agent simulation (shared with locustfile_real.py)
-SIMULATE_AGENTS = os.environ.get("SIMULATE_AGENTS", "false").lower() in ("true", "1", "yes")
-AGENT_POOL = ["Cursor", "claude-code", "cline", "aider", "batch-job"]
+# Agent simulation — User-Agent strings that exercise agent registry and priority extraction
+USER_AGENTS = [
+    "Cursor/1.0",          # → CRITICAL priority
+    "claude-code/1.0",     # → CRITICAL priority
+    "cline/1.0",           # → HIGH priority
+    "aider/1.0",           # → HIGH priority
+    "python-requests/2.0", # → NORMAL (auto-detect fallback)
+]
+
+# Request size classes for cost estimation exercising
+REQUEST_SIZES = [
+    ("small", 100),     # ~25 tokens, LOW cost
+    ("medium", 2000),   # ~500 tokens, NORMAL cost
+    ("large", 16000),   # ~4000 tokens, HIGH cost
+]
+
+# Intent body templates — weighted 60% chat, 25% FIM, 15% edit
+INTENT_WEIGHTS = [
+    ("chat", 0.60),
+    ("fim", 0.25),
+    ("edit", 0.15),
+]
+
+# §15 Intelligence Layer Prometheus metrics to scrape after benchmark
+INTELLIGENCE_LAYER_METRICS = [
+    "ranvier_proxy_requests_by_priority",     # Per-tier counts
+    "ranvier_proxy_requests_by_intent",       # Per-intent counts
+    "ranvier_scheduler_queue_depth",          # Queue utilization
+    "ranvier_scheduler_wait_seconds",         # Queue wait time
+    "ranvier_agents_tracked",                 # Agent registry size
+    "ranvier_routing_cost_redirects_total",   # Cost-based redirects
+    "ranvier_routing_load_redirects_total",   # Load-based redirects
+]
 
 # Metrics collection for validation
 _initial_sync_errors: dict[str, float] = {}
@@ -254,6 +284,124 @@ def get_ranvier_latency_breakdown() -> dict:
     return breakdown
 
 
+def _generate_content(size: int) -> str:
+    """Generate a content string of approximately the given character length."""
+    base = "The quick brown fox jumps over the lazy dog. "
+    repeats = max(1, size // len(base))
+    return (base * repeats)[:size]
+
+
+def _build_request_body() -> dict:
+    """Build a varied request body exercising cost estimation and intent classification."""
+    # Pick intent based on weighted distribution
+    roll = random.random()
+    cumulative = 0.0
+    intent = "chat"
+    for intent_name, weight in INTENT_WEIGHTS:
+        cumulative += weight
+        if roll < cumulative:
+            intent = intent_name
+            break
+
+    # Pick request size
+    size_label, size_chars = random.choice(REQUEST_SIZES)
+    content = _generate_content(size_chars)
+
+    if intent == "fim":
+        return {
+            "model": "test-model",
+            "prompt": f"def hello():\n    {content[:size_chars // 2]}",
+            "suffix": "\n    pass",
+            "stream": True,
+        }
+    elif intent == "edit":
+        return {
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a code editor. Apply the diff."},
+                {"role": "user", "content": f"Refactor this function: {content}"},
+            ],
+            "stream": True,
+        }
+    else:  # chat
+        return {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": content}],
+            "stream": True,
+        }
+
+
+def scrape_intelligence_layer_metrics() -> dict:
+    """Scrape §15 intelligence layer metrics from all Ranvier nodes.
+
+    Returns a dict with aggregated metric values across nodes.
+    """
+    results = {}
+    for metrics_url in RANVIER_METRICS:
+        try:
+            resp = requests.get(f"{metrics_url}/metrics", timeout=5)
+            if resp.status_code != 200:
+                continue
+            for line in resp.text.split("\n"):
+                if line.startswith("#"):
+                    continue
+                for metric_name in INTELLIGENCE_LAYER_METRICS:
+                    if metric_name in line:
+                        # Parse label and value, e.g.:
+                        # ranvier_proxy_requests_by_priority{priority="critical"} 42
+                        match = re.match(
+                            rf'({metric_name}(?:\{{[^}}]*\}})?)[\s]+(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)',
+                            line,
+                        )
+                        if match:
+                            key = match.group(1)
+                            val = float(match.group(2))
+                            results[key] = results.get(key, 0.0) + val
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to scrape intelligence metrics from {metrics_url}: {e}")
+    return results
+
+
+def _summarize_intelligence_metrics(raw_metrics: dict) -> dict:
+    """Summarize scraped intelligence layer metrics into structured report."""
+    summary = {
+        "priority_distribution": {"critical": 0, "high": 0, "normal": 0, "low": 0},
+        "intent_distribution": {"autocomplete": 0, "chat": 0, "edit": 0},
+        "cost_redirects": 0,
+        "load_redirects": 0,
+        "agents_detected": 0,
+        "avg_scheduler_wait_ms": 0.0,
+    }
+
+    for key, val in raw_metrics.items():
+        # Priority distribution
+        for tier in ("critical", "high", "normal", "low"):
+            if "requests_by_priority" in key and f'priority="{tier}"' in key:
+                summary["priority_distribution"][tier] += int(val)
+        # Intent distribution
+        for intent in ("autocomplete", "chat", "edit"):
+            if "requests_by_intent" in key and f'intent="{intent}"' in key:
+                summary["intent_distribution"][intent] += int(val)
+        # Scalar metrics
+        if "cost_redirects_total" in key:
+            summary["cost_redirects"] += int(val)
+        if "load_redirects_total" in key:
+            summary["load_redirects"] += int(val)
+        if "agents_tracked" in key and "{" not in key:
+            summary["agents_detected"] = max(summary["agents_detected"], int(val))
+
+    # Scheduler wait — use histogram avg across nodes
+    wait_values = []
+    for metrics_url in RANVIER_METRICS:
+        avg = get_histogram_avg(metrics_url, "ranvier_scheduler_wait_seconds")
+        if avg is not None:
+            wait_values.append(avg * 1000)  # Convert to ms
+    if wait_values:
+        summary["avg_scheduler_wait_ms"] = sum(wait_values) / len(wait_values)
+
+    return summary
+
+
 def register_backends_on_all_nodes():
     """Register backends on all Ranvier nodes."""
     global _backends_registered
@@ -436,6 +584,34 @@ def on_test_stop(environment, **kwargs):
         p99_str = f"{p99:.3f}" if p99 is not None else "N/A"
         logger.info(f"  {label:<40} {p50_str:>10} {p99_str:>10}")
 
+    # Scrape §15 intelligence layer metrics
+    raw_intel_metrics = scrape_intelligence_layer_metrics()
+    intel_summary = _summarize_intelligence_metrics(raw_intel_metrics)
+
+    # Log intelligence layer metrics summary
+    logger.info("Intelligence Layer Metrics:")
+    pri = intel_summary["priority_distribution"]
+    pri_total = sum(pri.values()) or 1
+    logger.info(
+        f"  Priority distribution: "
+        f"critical={pri['critical']} ({pri['critical']*100/pri_total:.1f}%) "
+        f"high={pri['high']} ({pri['high']*100/pri_total:.1f}%) "
+        f"normal={pri['normal']} ({pri['normal']*100/pri_total:.1f}%) "
+        f"low={pri['low']} ({pri['low']*100/pri_total:.1f}%)"
+    )
+    intent = intel_summary["intent_distribution"]
+    intent_total = sum(intent.values()) or 1
+    logger.info(
+        f"  Intent distribution: "
+        f"autocomplete={intent['autocomplete']} ({intent['autocomplete']*100/intent_total:.1f}%) "
+        f"chat={intent['chat']} ({intent['chat']*100/intent_total:.1f}%) "
+        f"edit={intent['edit']} ({intent['edit']*100/intent_total:.1f}%)"
+    )
+    logger.info(f"  Cost redirects: {intel_summary['cost_redirects']}")
+    logger.info(f"  Load redirects: {intel_summary['load_redirects']}")
+    logger.info(f"  Agents detected: {intel_summary['agents_detected']}")
+    logger.info(f"  Avg scheduler wait: {intel_summary['avg_scheduler_wait_ms']:.2f}ms")
+
     # Build summary and emit BENCHMARK_STATS_JSON for results_parser.py
     summary = {
         "total_requests": stats.total.num_requests if hasattr(stats, 'total') else 0,
@@ -443,6 +619,7 @@ def on_test_stop(environment, **kwargs):
         "validation_passed": validation_passed,
     }
     summary.update(latency_breakdown)
+    summary["intelligence_layer"] = intel_summary
     logger.info("BENCHMARK_STATS_JSON:" + json.dumps(summary))
 
     # Log summary
@@ -471,26 +648,9 @@ class ChatCompletionUser(HttpUser):
         float(os.environ.get('LOCUST_WAIT_MAX', '3'))
     )
 
-    # Sample prompts for variety
-    PROMPTS = [
-        "Hello, how are you today?",
-        "What is the capital of France?",
-        "Explain quantum computing in simple terms.",
-        "Write a haiku about programming.",
-        "What's the weather like?",
-        "Tell me a joke.",
-        "How do I make pasta?",
-        "What is machine learning?",
-        "Describe the ocean.",
-        "Why is the sky blue?",
-    ]
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._request_count = 0
-        self._user_agent = None
-        if SIMULATE_AGENTS:
-            self._user_agent = random.choice(AGENT_POOL)
 
     @task
     def chat_completion(self):
@@ -499,13 +659,8 @@ class ChatCompletionUser(HttpUser):
         node_index = self._request_count % len(RANVIER_NODES)
         self._request_count += 1
 
-        prompt = random.choice(self.PROMPTS)
-
-        request_body = {
-            "model": "test-model",
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-        }
+        # Build varied request body for cost/intent classification
+        request_body = _build_request_body()
 
         # Get the target node URL
         target_url = RANVIER_NODES[node_index]
@@ -518,8 +673,15 @@ class ChatCompletionUser(HttpUser):
             # Use requests library directly for proper SSE streaming support
             # Timeout: (connect, read) - shorter for mock backends in CI
             headers = {"Content-Type": "application/json"}
-            if self._user_agent is not None:
-                headers["User-Agent"] = self._user_agent
+
+            # Rotate User-Agent per request to exercise agent registry
+            headers["User-Agent"] = random.choice(USER_AGENTS)
+
+            # 10% of requests send explicit priority header
+            if random.random() < 0.1:
+                headers["X-Ranvier-Priority"] = random.choice(
+                    ["critical", "high", "normal", "low"]
+                )
 
             resp = requests.post(
                 f"{target_url}/v1/chat/completions",
