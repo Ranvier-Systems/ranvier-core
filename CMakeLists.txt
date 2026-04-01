@@ -300,6 +300,15 @@ static GLOBAL: Jemalloc = Jemalloc;
 
     # Copy the assets folder to the build directory automatically
     file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
+
+    # Install targets for `make install` / packaging
+    install(TARGETS ranvier_server DESTINATION bin)
+    install(FILES assets/gpt2.json
+            DESTINATION share/ranvier
+            OPTIONAL)
+    install(FILES ranvier-local.yaml.example
+            DESTINATION share/ranvier/examples
+            OPTIONAL)
 else()
     message(STATUS "Seastar not found - building unit tests only")
 endif()

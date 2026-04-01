@@ -12,6 +12,8 @@
 #include "application.hpp"
 #include "config.hpp"
 
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <streambuf>
@@ -28,6 +30,83 @@ using namespace seastar;
 // UTF-8 status symbols for console output
 constexpr const char* kCheckMark = "\xE2\x9C\x93";  // ✓ (U+2713)
 constexpr const char* kCrossMark = "\xE2\x9C\x97";  // ✗ (U+2717)
+
+// Resolve tokenizer path for local mode.
+// Search order: relative to binary, ~/.ranvier/, /usr/local/share/ranvier/
+static std::string resolve_local_tokenizer_path(const std::string& binary_path) {
+    namespace fs = std::filesystem;
+
+    // 1. Relative to binary: <binary_dir>/assets/gpt2.json
+    auto bin_dir = fs::path(binary_path).parent_path();
+    auto candidate = bin_dir / "assets" / "gpt2.json";
+    if (fs::exists(candidate)) {
+        return candidate.string();
+    }
+
+    // 2. ~/.ranvier/gpt2.json
+    const char* home = std::getenv("HOME");
+    if (home) {
+        candidate = fs::path(home) / ".ranvier" / "gpt2.json";
+        if (fs::exists(candidate)) {
+            return candidate.string();
+        }
+    }
+
+    // 3. /usr/local/share/ranvier/gpt2.json
+    candidate = fs::path("/usr/local/share/ranvier/gpt2.json");
+    if (fs::exists(candidate)) {
+        return candidate.string();
+    }
+
+    // Not found — return empty; caller will print a helpful message
+    return {};
+}
+
+// Apply local-mode configuration defaults
+static void apply_local_mode_defaults(ranvier::RanvierConfig& config) {
+    // Core local mode flags
+    config.local_mode.enabled = true;
+    config.local_mode.auto_discover_backends = true;
+    config.local_mode.disable_clustering = true;
+    config.local_mode.disable_persistence = true;
+
+    // Disable cloud features
+    config.cluster.enabled = false;
+
+    // Routing: prefix mode with load-aware routing
+    config.routing.routing_mode = ranvier::RoutingConfig::RoutingMode::PREFIX;
+    config.routing.load_aware_routing = true;
+
+    // Agent-aware scheduling
+    config.agent_registry.enabled = true;
+    config.agent_registry.auto_detect_agents = true;
+
+    // Priority queue enabled by default in local mode
+    config.backpressure.enable_priority_queue = true;
+
+    // Cost estimation and intent classification
+    config.cost_estimation.enabled = true;
+    config.priority_tier.enabled = true;
+    config.intent_classification.enabled = true;
+}
+
+// Print the local-mode startup banner
+static void print_local_mode_banner() {
+    std::cout << R"(
+╔═══════════════════════════════════════════════╗
+║           Ranvier Local Mode                  ║
+║                                               ║
+║  API:     http://localhost:8080               ║
+║  Metrics: http://localhost:9180/metrics       ║
+║                                               ║
+║  Discovering backends on ports:               ║
+║    11434 (Ollama), 8080 (vLLM), 1234 (LM      ║
+║    Studio), 8000 (llama.cpp), 5000, 3000      ║
+║                                               ║
+║  Press Ctrl+C to stop                         ║
+╚═══════════════════════════════════════════════╝
+)" << std::flush;
+}
 
 // Dry-run validation - checks configuration, tokenizer, database, and TLS without starting services
 // Returns 0 if all checks pass, 1 if any fail
@@ -274,6 +353,9 @@ OPTIONS:
     -h, --help              Print this help message and exit
     --help-seastar          Show Seastar framework options
     --help-loggers          Print available logger names
+    --local                 Start in local mode with sensible defaults (no
+                            config file needed). Auto-discovers Ollama, vLLM,
+                            LM Studio, and other local LLM servers.
     --config <PATH>         Path to configuration file (default: ranvier.yaml,
                             falls back to built-in defaults if not found)
     --dry-run               Validate configuration and exit (no server start)
@@ -288,6 +370,9 @@ SIGNALS:
     SIGINT, SIGTERM         Graceful shutdown with connection draining
 
 EXAMPLES:
+    ranvier_server --local
+        Start in local mode — auto-discovers local LLM backends
+
     ranvier_server
         Start with ranvier.yaml if present, otherwise use built-in defaults
 
@@ -296,6 +381,9 @@ EXAMPLES:
 
     ranvier_server --dry-run
         Validate configuration without starting the server
+
+    ranvier_server --dry-run --local
+        Validate local-mode configuration without starting the server
 
     ranvier_server --smp 4 --memory 8G
         Start with 4 CPU cores and 8GB memory
@@ -318,37 +406,89 @@ int main(int argc, char** argv) {
     std::string config_path = "ranvier.yaml";
     bool dry_run = false;
     bool use_std_alloc = false;
+    bool local_mode = false;
+    bool explicit_config = false;
+    bool explicit_smp = false;
+    bool explicit_memory = false;
 
-    // Check for --config, --dry-run, and --std-alloc arguments
+    // Check for --config, --dry-run, --std-alloc, and --local arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
             config_path = argv[i + 1];
+            explicit_config = true;
         } else if (arg.rfind("--config=", 0) == 0) {
             config_path = arg.substr(9);
+            explicit_config = true;
         } else if (arg == "--dry-run") {
             dry_run = true;
         } else if (arg == "--std-alloc") {
             use_std_alloc = true;
+        } else if (arg == "--local") {
+            local_mode = true;
+        } else if (arg == "--smp" || arg.rfind("--smp=", 0) == 0) {
+            explicit_smp = true;
+        } else if (arg == "--memory" || arg.rfind("--memory=", 0) == 0 ||
+                   arg == "-m") {
+            explicit_memory = true;
         }
     }
 
     ranvier::RanvierConfig config;
     try {
-        config = ranvier::RanvierConfig::load(config_path);
+        if (local_mode && !explicit_config) {
+            // Local mode without explicit config: start from defaults
+            config = ranvier::RanvierConfig::defaults();
+        } else {
+            config = ranvier::RanvierConfig::load(config_path);
+        }
+
+        // Apply local-mode overrides on top of whatever config was loaded
+        if (local_mode) {
+            apply_local_mode_defaults(config);
+
+            // Auto-detect tokenizer path
+            auto tokenizer_path = resolve_local_tokenizer_path(argv[0]);
+            if (!tokenizer_path.empty()) {
+                config.assets.tokenizer_path = tokenizer_path;
+            } else {
+                std::cerr << "Warning: Tokenizer not found. Download with:\n"
+                          << "  curl -L -o ~/.ranvier/gpt2.json \\\n"
+                          << "    https://huggingface.co/gpt2/resolve/main/tokenizer.json\n\n";
+            }
+        }
 
         // Run dry-run validation if requested
         if (dry_run) {
             return run_dry_run_validation(config_path, config);
         }
 
-        // Print config summary
-        print_config_summary(config_path, config);
+        // Print appropriate banner/summary
+        if (local_mode) {
+            print_local_mode_banner();
+        } else {
+            print_config_summary(config_path, config);
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "Failed to load config: " << e.what() << "\n";
         return 1;
     }
+
+    // In local mode, inject --smp 1 and --memory 256M if not explicitly provided
+    // We build a modified argv to pass to Seastar
+    std::vector<char*> effective_argv(argv, argv + argc);
+    std::string smp_arg_val = "1";
+    std::string memory_arg_val = "256M";
+    if (local_mode && !explicit_smp) {
+        effective_argv.push_back(const_cast<char*>("--smp"));
+        effective_argv.push_back(smp_arg_val.data());
+    }
+    if (local_mode && !explicit_memory) {
+        effective_argv.push_back(const_cast<char*>("--memory"));
+        effective_argv.push_back(memory_arg_val.data());
+    }
+    int effective_argc = static_cast<int>(effective_argv.size());
 
     // Create Seastar app template with proper options
     app_template::seastar_options opts;
@@ -369,10 +509,11 @@ int main(int argc, char** argv) {
         ("config", boost::program_options::value<std::string>()->default_value("ranvier.yaml"),
          "Path to configuration file")
         ("dry-run", "Validate configuration and exit (no server start)")
+        ("local", "Start in local mode with sensible defaults (no config file needed)")
         ("std-alloc", "Use standard libc allocator instead of Seastar's per-shard allocator");
 
-    // Run the application
-    return app.run(argc, argv, [config = std::move(config), config_path]() mutable {
+    // Run the application (use effective_argc/argv which may include injected --smp/--memory)
+    return app.run(effective_argc, effective_argv.data(), [config = std::move(config), config_path]() mutable {
         // Create the Application instance
         auto app_ptr = std::make_unique<ranvier::Application>(std::move(config), config_path);
 
