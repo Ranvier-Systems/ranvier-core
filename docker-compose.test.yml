@@ -76,6 +76,15 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
+      # §15 Intelligence Layer — all enabled for benchmark
+      - RANVIER_COST_ESTIMATION_ENABLED=true
+      - RANVIER_PRIORITY_TIER_ENABLED=true
+      - RANVIER_INTENT_CLASSIFICATION_ENABLED=true
+      - RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=true
+      - RANVIER_AGENT_REGISTRY_ENABLED=true
+      - RANVIER_AGENT_AUTO_DETECT=true
+      - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
+      - RANVIER_COST_ROUTING_ENABLED=true
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
     depends_on:
       - backend1
@@ -117,6 +126,15 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
+      # §15 Intelligence Layer — all enabled for benchmark
+      - RANVIER_COST_ESTIMATION_ENABLED=true
+      - RANVIER_PRIORITY_TIER_ENABLED=true
+      - RANVIER_INTENT_CLASSIFICATION_ENABLED=true
+      - RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=true
+      - RANVIER_AGENT_REGISTRY_ENABLED=true
+      - RANVIER_AGENT_AUTO_DETECT=true
+      - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
+      - RANVIER_COST_ROUTING_ENABLED=true
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
     depends_on:
       - backend1
@@ -158,6 +176,15 @@ services:
       - RANVIER_MIN_TOKEN_LENGTH=2
       - RANVIER_DB_PATH=/tmp/ranvier.db
       - RANVIER_ENABLE_TOKEN_FORWARDING=${RANVIER_ENABLE_TOKEN_FORWARDING:-0}
+      # §15 Intelligence Layer — all enabled for benchmark
+      - RANVIER_COST_ESTIMATION_ENABLED=true
+      - RANVIER_PRIORITY_TIER_ENABLED=true
+      - RANVIER_INTENT_CLASSIFICATION_ENABLED=true
+      - RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=true
+      - RANVIER_AGENT_REGISTRY_ENABLED=true
+      - RANVIER_AGENT_AUTO_DETECT=true
+      - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
+      - RANVIER_COST_ROUTING_ENABLED=true
     command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
     depends_on:
       - backend1

@@ -456,6 +456,7 @@ target_include_directories(metrics_service_test PRIVATE
 target_link_libraries(metrics_service_test
   PRIVATE
   GTest::gtest_main
+  absl::flat_hash_map
 )
 gtest_discover_tests(metrics_service_test)
 
@@ -862,6 +863,7 @@ if(Seastar_FOUND)
       PRIVATE
       Seastar::seastar
       GTest::gtest_main
+      absl::flat_hash_map
     )
     gtest_discover_tests(stream_parser_test)
 
