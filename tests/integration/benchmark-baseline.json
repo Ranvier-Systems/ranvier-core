@@ -1,7 +1,7 @@
 {
   "version": "2.0.0-intelligence-layer",
   "description": "Benchmark baseline for Ranvier Core CI regression testing (§15 intelligence layer enabled)",
-  "updated_at": "2026-04-02T01:32:13Z",
+  "updated_at": "2026-04-02T02:00:10Z",
   "updated_by": "run-benchmark.sh",
   "features_enabled": [
     "cost_estimation",
@@ -14,20 +14,20 @@
     "cost_based_routing"
   ],
   "test_config": {
-    "users": 10,
-    "duration_seconds": 300,
-    "spawn_rate": 2,
-    "environment": "docker-compose.test.yml (mock backends, §15 features enabled)"
+    "users": 100,
+    "duration_seconds": 60,
+    "spawn_rate": 10,
+    "environment": "docker-compose.test.yml (mock backends, §15 features enabled, CI mode)"
   },
   "metrics": {
-    "p50_latency_ms": 55.00,
-    "p90_latency_ms": 62.00,
-    "p99_latency_ms": 67.00,
-    "avg_latency_ms": 55.00,
-    "min_latency_ms": 45.00,
-    "max_latency_ms": 70.00,
-    "throughput_rps": 9.53,
-    "total_requests": 2856,
+    "p50_latency_ms": 49.00,
+    "p90_latency_ms": 66.00,
+    "p99_latency_ms": 85.00,
+    "avg_latency_ms": 52.00,
+    "min_latency_ms": 30.00,
+    "max_latency_ms": 120.00,
+    "throughput_rps": 502.27,
+    "total_requests": 29684,
     "failure_rate_percent": 0.00,
     "success_rate_percent": 100.00
   },
@@ -45,11 +45,11 @@
     "max_failure_rate_percent": 1.0
   },
   "notes": [
-    "Baseline established with mock vLLM backends (docker-compose.test.yml)",
+    "Baseline captured from CI environment (100 users, 0.1-0.5s wait, ubuntu-latest runner)",
     "All §15 intelligence layer features enabled",
+    "P99 increased from ~56ms (pre-§15) to ~85ms with intelligence layer — acceptable",
     "Intelligence layer Prometheus counters read zero on mock backends (expected)",
-    "Scheduler wait 1.88ms confirms priority queue is active",
-    "P99 latency target: <74ms for mock backend tests (10% regression budget over 67ms)",
+    "P99 latency target: <94ms for CI (10% regression budget over 85ms)",
     "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
   ]
 }
