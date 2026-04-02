@@ -336,8 +336,14 @@ EOF
 
     # Intelligence Layer metrics (informational, not regression-gated)
     # Parse from BENCHMARK_STATS_JSON if available in Locust log output
-    local LOCUST_LOG="$RESULTS_DIR/benchmark_log.txt"
-    if [[ -f "$LOCUST_LOG" ]] && command -v jq &> /dev/null; then
+    local LOCUST_LOG=""
+    for candidate in "$RESULTS_DIR/benchmark_log.txt" "$RESULTS_DIR/benchmark.log"; do
+        if [[ -f "$candidate" ]] && grep -q 'BENCHMARK_STATS_JSON:' "$candidate" 2>/dev/null; then
+            LOCUST_LOG="$candidate"
+            break
+        fi
+    done
+    if [[ -n "$LOCUST_LOG" ]] && command -v jq &> /dev/null; then
         local INTEL_JSON
         INTEL_JSON=$(grep -o 'BENCHMARK_STATS_JSON:{.*}' "$LOCUST_LOG" | sed 's/BENCHMARK_STATS_JSON://' | tail -1)
         if [[ -n "$INTEL_JSON" ]]; then
