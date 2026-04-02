@@ -86,14 +86,16 @@ INTENT_WEIGHTS = [
 ]
 
 # §15 Intelligence Layer Prometheus metrics to scrape after benchmark
+# Seastar registers metrics in add_group("ranvier", ...) which produces
+# the "seastar_ranvier_" prefix on the /metrics endpoint.
 INTELLIGENCE_LAYER_METRICS = [
-    "ranvier_proxy_requests_by_priority",     # Per-tier counts
-    "ranvier_proxy_requests_by_intent",       # Per-intent counts
-    "ranvier_scheduler_queue_depth",          # Queue utilization
-    "ranvier_scheduler_wait_seconds",         # Queue wait time
-    "ranvier_agents_tracked",                 # Agent registry size
-    "ranvier_routing_cost_redirects_total",   # Cost-based redirects
-    "ranvier_routing_load_redirects_total",   # Load-based redirects
+    "seastar_ranvier_proxy_requests_by_priority",     # Per-tier counts
+    "seastar_ranvier_proxy_requests_by_intent",       # Per-intent counts
+    "seastar_ranvier_scheduler_queue_depth",           # Queue utilization
+    "seastar_ranvier_scheduler_wait_seconds",          # Queue wait time
+    "seastar_ranvier_agents_tracked",                  # Agent registry size
+    "seastar_ranvier_router_cost_redirects_total",     # Cost-based redirects
+    "seastar_ranvier_router_gpu_load_redirects_total", # GPU-load-based redirects
 ]
 
 # Metrics collection for validation
@@ -393,7 +395,7 @@ def _summarize_intelligence_metrics(raw_metrics: dict) -> dict:
     # Scheduler wait — use histogram avg across nodes
     wait_values = []
     for metrics_url in RANVIER_METRICS:
-        avg = get_histogram_avg(metrics_url, "ranvier_scheduler_wait_seconds")
+        avg = get_histogram_avg(metrics_url, "seastar_ranvier_scheduler_wait_seconds")
         if avg is not None:
             wait_values.append(avg * 1000)  # Convert to ms
     if wait_values:
