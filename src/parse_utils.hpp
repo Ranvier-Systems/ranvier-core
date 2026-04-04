@@ -171,4 +171,33 @@ inline std::optional<int32_t> parse_backend_id(std::string_view input) {
     return parse_int32(input);
 }
 
+/**
+ * Parse a string as a boolean value.
+ * Accepts: "true", "1", "yes" (-> true), "false", "0", "no" (-> false).
+ * Case-insensitive comparison to avoid silent misinterpretation of "True", "FALSE", etc.
+ *
+ * @param input String to parse
+ * @return Parsed boolean, or std::nullopt if unrecognized
+ */
+inline std::optional<bool> parse_bool(std::string_view input) {
+    if (input.empty()) {
+        return std::nullopt;
+    }
+
+    // Case-insensitive comparison via lowercasing (ASCII-safe for these keywords)
+    std::string lower;
+    lower.reserve(input.size());
+    for (char c : input) {
+        lower += static_cast<char>(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    }
+
+    if (lower == "true" || lower == "1" || lower == "yes") {
+        return true;
+    }
+    if (lower == "false" || lower == "0" || lower == "no") {
+        return false;
+    }
+    return std::nullopt;
+}
+
 } // namespace ranvier

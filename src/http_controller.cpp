@@ -601,6 +601,15 @@ future<ConnectionBundle> HttpController::establish_backend_connection(ProxyConte
                 if (fallback_addr.has_value()) {
                     log_proxy.info("[{}] Falling back from backend {} to {}",
                                   ctx->request_id, ctx->current_backend, fallback.value());
+                    // Strip prompt_token_ids if the fallback backend doesn't support them.
+                    // The body may contain tokens injected for the original vLLM target;
+                    // sending them to a non-vLLM fallback (e.g., Ollama) would cause 400s.
+                    if (ctx->endpoint == "/v1/completions" &&
+                        !_router.backend_supports_token_ids(fallback.value())) {
+                        ctx->forwarded_body = RequestRewriter::strip_prompt_token_ids(ctx->forwarded_body);
+                        log_proxy.debug("[{}] Stripped prompt_token_ids for fallback backend {} (supports_token_ids=false)",
+                                       ctx->request_id, fallback.value());
+                    }
                     ctx->current_backend = fallback.value();
                     ctx->current_addr = fallback_addr.value();
                     ctx->fallback_attempts++;
@@ -1550,6 +1559,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     socket_address target_addr = target_addr_opt.value();
     log_proxy.info("[{}] Routing to backend {} at {}", request_id, target_id, target_addr);
 
+    // Strip prompt_token_ids if the target backend doesn't support them.
+    // Token injection (above) runs before routing since tokens are needed for prefix lookup.
+    // Now that we know the target backend, strip tokens for non-vLLM backends to avoid
+    // 400 rejections from backends that don't recognize prompt_token_ids (e.g., Ollama).
+    if (is_completions_endpoint && !_router.backend_supports_token_ids(target_id)) {
+        forwarded_body = RequestRewriter::strip_prompt_token_ids(forwarded_body);
+        log_proxy.debug("[{}] Stripped prompt_token_ids for backend {} (supports_token_ids=false)",
+                       request_id, target_id);
+    }
+
     // 2. Setup Streaming with Timeout, Retry, and Circuit Breaker
     // Capture config for the lambda
     auto connect_timeout = _config.connect_timeout;
@@ -2010,13 +2029,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
 }
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0
+    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true
     // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
     sstring port_str = req->get_query_param("port");
     sstring weight_str = req->get_query_param("weight");
     sstring priority_str = req->get_query_param("priority");
+    sstring supports_token_ids_str = req->get_query_param("supports_token_ids");
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
@@ -2065,6 +2085,21 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
             co_return std::move(rep);
         }
         priority = *priority_opt;
+    }
+
+    // supports_token_ids: whether this backend supports vLLM's prompt_token_ids field.
+    // Default true for backward compatibility. Set to false for non-vLLM backends
+    // (e.g., Ollama) to prevent injecting unrecognized fields.
+    bool supports_token_ids = true;
+    if (!supports_token_ids_str.empty()) {
+        auto supports_opt = parse_bool(std::string_view(supports_token_ids_str));
+        if (!supports_opt) {
+            log_control.warn("POST /admin/backends: invalid supports_token_ids '{}'", supports_token_ids_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid supports_token_ids: must be true/false, 1/0, or yes/no\"}");
+            co_return std::move(rep);
+        }
+        supports_token_ids = *supports_opt;
     }
 
     // Resolve address: supports both direct IP addresses and hostnames
@@ -2136,12 +2171,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         _persistence->queue_save_backend(id, resolved_ip, port, weight, priority);
     }
 
-    co_await _router.register_backend_global(id, addr, weight, priority);
+    co_await _router.register_backend_global(id, addr, weight, priority, supports_token_ids);
 
-    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={})",
-        id, ip_str, port, weight, priority);
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={})",
+        id, ip_str, port, weight, priority, supports_token_ids);
     rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
-        ", \"priority\": " + std::to_string(priority) + "}");
+        ", \"priority\": " + std::to_string(priority) +
+        ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") + "}");
     co_return std::move(rep);
 }
 
@@ -2645,7 +2681,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
         oss << "      \"weight\": " << b.weight << ",\n";
         oss << "      \"priority\": " << b.priority << ",\n";
         oss << "      \"is_draining\": " << (b.is_draining ? "true" : "false") << ",\n";
-        oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false");
+        oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false") << ",\n";
+        oss << "      \"supports_token_ids\": " << (b.supports_token_ids ? "true" : "false");
         if (b.drain_start_ms > 0) {
             oss << ",\n      \"drain_start_ms\": " << b.drain_start_ms << "\n";
         } else {

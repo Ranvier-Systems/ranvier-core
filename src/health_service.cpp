@@ -179,7 +179,7 @@ future<> HealthService::scrape_all_vllm_metrics(
         for (auto it = _backend_scrape_failures.begin();
              it != _backend_scrape_failures.end(); ) {
             if (!active_ids.contains(it->first)) {
-                it = _backend_scrape_failures.erase(it);
+                _backend_scrape_failures.erase(it++);
             } else {
                 ++it;
             }

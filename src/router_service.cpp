@@ -68,6 +68,12 @@ struct BackendInfo {
     bool is_draining = false;
     std::chrono::steady_clock::time_point drain_start_time;
 
+    // Whether this backend supports vLLM's prompt_token_ids field.
+    // When false, token IDs are stripped from forwarded requests to avoid
+    // 400 rejections from backends that don't recognize the field (e.g., Ollama).
+    // Default true for backward compatibility with existing vLLM deployments.
+    bool supports_token_ids = true;
+
     // Load tracking: in-flight requests to this backend.
     // Shard-local only — BackendInfo lives in thread_local ShardLocalState,
     // accessed exclusively from one reactor thread.  No atomic needed.
@@ -79,10 +85,12 @@ struct BackendInfo {
 
     BackendInfo() = default;
 
-    BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_)
+    BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
+                bool supports_token_ids_ = true)
         : addr(std::move(addr_))
         , weight(weight_)
-        , priority(priority_) {}
+        , priority(priority_)
+        , supports_token_ids(supports_token_ids_) {}
 };
 
 // ============================================================================
@@ -1847,6 +1855,17 @@ std::optional<seastar::socket_address> RouterService::get_backend_address(Backen
     return std::nullopt;
 }
 
+bool RouterService::backend_supports_token_ids(BackendId id) const {
+    if (!g_shard_state) return false;
+    auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it != state.backends.end()) {
+        return it->second.supports_token_ids;
+    }
+    // Backend not found — safe default: don't inject unknown fields
+    return false;
+}
+
 std::optional<BackendId> RouterService::get_random_backend() {
     if (!g_shard_state) return std::nullopt;
     auto& state = shard_state();
@@ -3170,18 +3189,20 @@ seastar::future<> RouterService::broadcast_gpu_load(
 }
 
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
-                                                          uint32_t weight, uint32_t priority) {
-    return seastar::do_with(addr, weight, priority, [id](seastar::socket_address& shared_addr,
-                                                          uint32_t& shared_weight,
-                                                          uint32_t& shared_priority) {
+                                                          uint32_t weight, uint32_t priority,
+                                                          bool supports_token_ids) {
+    return seastar::do_with(addr, weight, priority, supports_token_ids,
+        [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
+             uint32_t& shared_priority, bool& shared_supports_token_ids) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-            [id, &shared_addr, &shared_weight, &shared_priority] (unsigned shard_id) {
+            [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
                                                        weight = shared_weight,
-                                                       priority = shared_priority] {
+                                                       priority = shared_priority,
+                                                       supports_token_ids = shared_supports_token_ids] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
-                state.backends[id] = BackendInfo{addr, weight, priority};
+                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids};
 
                 // Update vector (check for duplicates)
                 bool exists = false;
@@ -3268,6 +3289,7 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         bs.priority = info.priority;
         bs.is_draining = info.is_draining;
         bs.is_dead = shard.dead_backends.contains(id);
+        bs.supports_token_ids = info.supports_token_ids;
 
         if (info.is_draining) {
             // Convert steady_clock to wall-clock time:
@@ -3561,10 +3583,11 @@ void RouterService::set_circuit_cleanup_callback(CircuitCleanupCallback callback
 }
 
 void RouterService::register_backend_for_testing(BackendId id, seastar::socket_address addr,
-                                                   uint32_t weight, uint32_t priority) {
+                                                   uint32_t weight, uint32_t priority,
+                                                   bool supports_token_ids) {
     if (!g_shard_state) return;
     auto& state = *g_shard_state;
-    state.backends[id] = BackendInfo{addr, weight, priority};
+    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids};
 
     bool exists = false;
     for (auto existing : state.backend_ids) {

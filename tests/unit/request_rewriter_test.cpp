@@ -1461,3 +1461,55 @@ TEST_F(RequestRewriterTest, BoundaryInfoMaxTokensLargeValue) {
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->max_tokens, 4294967296u);
 }
+
+// =============================================================================
+// Token injection + strip round-trip tests
+// =============================================================================
+// These tests verify the strip_prompt_token_ids path used when forwarding to
+// backends that don't support vLLM's prompt_token_ids field (e.g., Ollama).
+
+TEST_F(RequestRewriterTest, StripAfterRewriteRemovesInjectedTokens) {
+    // Simulate the flow: server tokenizes, injects tokens, then strips for non-vLLM backend
+    std::string body = R"({"prompt": "Hello, world!", "max_tokens": 100})";
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    auto rewrite_result = RequestRewriter::rewrite(body, tokens);
+    ASSERT_TRUE(rewrite_result.success);
+    EXPECT_TRUE(has_prompt_token_ids(rewrite_result.body));
+
+    // Strip for non-vLLM backend
+    auto stripped = RequestRewriter::strip_prompt_token_ids(rewrite_result.body);
+    EXPECT_FALSE(has_prompt_token_ids(stripped));
+
+    // Verify the original fields are preserved
+    rapidjson::Document doc;
+    doc.Parse(stripped.c_str());
+    ASSERT_FALSE(doc.HasParseError());
+    EXPECT_TRUE(doc.HasMember("prompt"));
+    EXPECT_STREQ(doc["prompt"].GetString(), "Hello, world!");
+    EXPECT_TRUE(doc.HasMember("max_tokens"));
+    EXPECT_EQ(doc["max_tokens"].GetInt(), 100);
+}
+
+TEST_F(RequestRewriterTest, StripClientProvidedTokensForNonVllmBackend) {
+    // Client sends pre-tokenized request; backend doesn't support prompt_token_ids
+    std::string body = R"({"prompt": "Hello", "prompt_token_ids": [10, 20, 30], "max_tokens": 50})";
+
+    auto stripped = RequestRewriter::strip_prompt_token_ids(body);
+    EXPECT_FALSE(has_prompt_token_ids(stripped));
+
+    rapidjson::Document doc;
+    doc.Parse(stripped.c_str());
+    ASSERT_FALSE(doc.HasParseError());
+    EXPECT_TRUE(doc.HasMember("prompt"));
+    EXPECT_TRUE(doc.HasMember("max_tokens"));
+}
+
+TEST_F(RequestRewriterTest, StripNoOpWhenNoTokenIds) {
+    // Body without prompt_token_ids — strip should be a no-op
+    std::string body = R"({"prompt": "Hello", "max_tokens": 50})";
+
+    auto stripped = RequestRewriter::strip_prompt_token_ids(body);
+    // Should return the body unchanged (fast path: no parse needed)
+    EXPECT_EQ(stripped, body);
+}

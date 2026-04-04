@@ -94,7 +94,7 @@ struct TestMetricsStore {
         absl::flat_hash_set<BackendId> active_set(active_ids.begin(), active_ids.end());
         for (auto it = scrape_failures.begin(); it != scrape_failures.end(); ) {
             if (!active_set.contains(it->first)) {
-                it = scrape_failures.erase(it);
+                scrape_failures.erase(it++);
             } else {
                 ++it;
             }
