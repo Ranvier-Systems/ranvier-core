@@ -855,8 +855,19 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
 - [ ] **[P3] Local Dashboard UI (VISION 4.2)**
   _Complexity:_ High
 
-- [ ] **[P3] Documentation & Examples (VISION 4.3)**
+- [x] **[P3] Documentation & Examples (VISION 4.3)** ✓ Done (2026-04-04)
   _Complexity:_ Low
+  _Delivered:_ Getting Started (Local), Cloud Deployment Guide, IDE Integration Guide, Benchmark Reproduction Guide. README updated with Quick Start and Documentation sections.
+
+### §15 Completion Note (2026-04-04)
+
+**The Intelligence Layer Roadmap is complete.** All four tiers delivered:
+- **Tier 1 (Foundation):** Cost estimation, priority tiers, intent classification — 2026-03-28
+- **Tier 2 (Cloud Intelligence):** vLLM metrics, load-aware routing, cost-based routing — 2026-03-31
+- **Tier 3 (Local Product):** Local mode, backend discovery, agent-aware handling, pause/resume — 2026-03-29
+- **Tier 4 (Polish):** Documentation & integration examples — 2026-04-04
+
+Remaining Tier 4 items (4.1 single-binary distribution, 4.2 local dashboard UI) are deferred — not blocking the v1.0 release.
 
 ### Chassis items deferred (no urgency)
 
