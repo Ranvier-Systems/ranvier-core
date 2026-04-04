@@ -31,9 +31,16 @@ using namespace ranvier;
 // Mirrors HealthService storage with same bounds
 static constexpr size_t MAX_TRACKED_BACKENDS = 256;
 
+// Mirrors HealthService adaptive suppression threshold
+static constexpr uint32_t SCRAPE_FAILURE_SUPPRESSION_THRESHOLD = 3;
+
 struct TestMetricsStore {
     absl::flat_hash_map<BackendId, VLLMMetrics> backend_vllm_metrics;
     uint64_t overflow_drops = 0;
+
+    // Adaptive scrape suppression state (mirrors HealthService)
+    absl::flat_hash_map<BackendId, uint32_t> scrape_failures;
+    uint64_t scrapes_suppressed = 0;
 
     void store(BackendId id, VLLMMetrics metrics) {
         if (backend_vllm_metrics.size() >= MAX_TRACKED_BACKENDS
@@ -58,6 +65,26 @@ struct TestMetricsStore {
             return it->second.load_score();
         }
         return 0.0;
+    }
+
+    // --- Adaptive suppression (mirrors HealthService logic) ---
+
+    bool is_scrape_suppressed(BackendId id) const {
+        auto it = scrape_failures.find(id);
+        return it != scrape_failures.end()
+            && it->second >= SCRAPE_FAILURE_SUPPRESSION_THRESHOLD;
+    }
+
+    uint32_t record_scrape_failure(BackendId id) {
+        if (scrape_failures.size() >= MAX_TRACKED_BACKENDS
+            && !scrape_failures.contains(id)) {
+            return 0;
+        }
+        return ++scrape_failures[id];
+    }
+
+    void record_scrape_success(BackendId id) {
+        scrape_failures.erase(id);
     }
 };
 
@@ -215,4 +242,91 @@ TEST_F(HealthServiceStoreTest, OverflowDoesNotCorruptExistingData) {
         EXPECT_TRUE(m.valid);
         EXPECT_EQ(m.num_requests_running, static_cast<uint32_t>(i));
     }
+}
+
+// =============================================================================
+// Adaptive Scrape Suppression
+// =============================================================================
+
+TEST_F(HealthServiceStoreTest, NewBackendIsNotSuppressed) {
+    EXPECT_FALSE(store.is_scrape_suppressed(42));
+}
+
+TEST_F(HealthServiceStoreTest, BelowThresholdNotSuppressed) {
+    for (uint32_t i = 0; i < SCRAPE_FAILURE_SUPPRESSION_THRESHOLD - 1; ++i) {
+        store.record_scrape_failure(1);
+    }
+    EXPECT_FALSE(store.is_scrape_suppressed(1));
+}
+
+TEST_F(HealthServiceStoreTest, AtThresholdIsSuppressed) {
+    for (uint32_t i = 0; i < SCRAPE_FAILURE_SUPPRESSION_THRESHOLD; ++i) {
+        store.record_scrape_failure(1);
+    }
+    EXPECT_TRUE(store.is_scrape_suppressed(1));
+}
+
+TEST_F(HealthServiceStoreTest, AboveThresholdStaysSuppressed) {
+    for (uint32_t i = 0; i < SCRAPE_FAILURE_SUPPRESSION_THRESHOLD + 5; ++i) {
+        store.record_scrape_failure(1);
+    }
+    EXPECT_TRUE(store.is_scrape_suppressed(1));
+}
+
+TEST_F(HealthServiceStoreTest, SuccessResetsSuppressionCounter) {
+    // Reach suppression threshold
+    for (uint32_t i = 0; i < SCRAPE_FAILURE_SUPPRESSION_THRESHOLD; ++i) {
+        store.record_scrape_failure(1);
+    }
+    EXPECT_TRUE(store.is_scrape_suppressed(1));
+
+    // A single success resets (backend upgraded to vLLM)
+    store.record_scrape_success(1);
+    EXPECT_FALSE(store.is_scrape_suppressed(1));
+}
+
+TEST_F(HealthServiceStoreTest, SuccessOnNeverFailedBackendIsNoOp) {
+    store.record_scrape_success(42);
+    EXPECT_FALSE(store.is_scrape_suppressed(42));
+    EXPECT_TRUE(store.scrape_failures.empty());
+}
+
+TEST_F(HealthServiceStoreTest, SuppressionIsPerBackend) {
+    // Suppress backend 1
+    for (uint32_t i = 0; i < SCRAPE_FAILURE_SUPPRESSION_THRESHOLD; ++i) {
+        store.record_scrape_failure(1);
+    }
+    // Backend 2 has one failure
+    store.record_scrape_failure(2);
+
+    EXPECT_TRUE(store.is_scrape_suppressed(1));
+    EXPECT_FALSE(store.is_scrape_suppressed(2));
+}
+
+TEST_F(HealthServiceStoreTest, FailureCounterReturnValue) {
+    EXPECT_EQ(store.record_scrape_failure(1), 1u);
+    EXPECT_EQ(store.record_scrape_failure(1), 2u);
+    EXPECT_EQ(store.record_scrape_failure(1), 3u);
+    EXPECT_EQ(store.record_scrape_failure(1), 4u);
+}
+
+TEST_F(HealthServiceStoreTest, SuccessAfterPartialFailureResetsCount) {
+    store.record_scrape_failure(1);
+    store.record_scrape_failure(1);
+    store.record_scrape_success(1);
+
+    // Counter should restart from 1
+    EXPECT_EQ(store.record_scrape_failure(1), 1u);
+    EXPECT_FALSE(store.is_scrape_suppressed(1));
+}
+
+TEST_F(HealthServiceStoreTest, ScrapeFailuresBoundedByMaxTrackedBackends) {
+    // Fill failure tracking to capacity
+    for (size_t i = 0; i < MAX_TRACKED_BACKENDS; ++i) {
+        store.record_scrape_failure(static_cast<BackendId>(i));
+    }
+
+    // New backend beyond capacity returns 0 (not tracked)
+    EXPECT_EQ(store.record_scrape_failure(static_cast<BackendId>(MAX_TRACKED_BACKENDS)), 0u);
+    EXPECT_EQ(store.scrape_failures.size(), MAX_TRACKED_BACKENDS);
 }

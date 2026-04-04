@@ -29,6 +29,7 @@ constexpr size_t METRICS_MAX_RESPONSE_SIZE = 128 * 1024;  // 128KB
 HealthService::HealthService(BackendRegistry& registry, HealthServiceConfig config)
     : _registry(registry), _config(config) {
     _backend_vllm_metrics.reserve(MAX_TRACKED_BACKENDS);
+    _backend_scrape_failures.reserve(MAX_TRACKED_BACKENDS);
 }
 
 void HealthService::start() {
@@ -41,6 +42,8 @@ void HealthService::start() {
             sm::description("Successful vLLM metrics scrapes")),
         sm::make_counter("health_vllm_scrapes_failed", _vllm_scrapes_failed,
             sm::description("Failed vLLM metrics scrapes (includes non-vLLM backends)")),
+        sm::make_counter("health_vllm_scrapes_suppressed", _vllm_scrapes_suppressed,
+            sm::description("vLLM scrapes skipped due to adaptive suppression (non-vLLM backends)")),
         sm::make_counter("health_vllm_overflow_drops", _metrics_overflow_drops,
             sm::description("vLLM metrics dropped due to MAX_TRACKED_BACKENDS limit")),
         sm::make_gauge("health_vllm_scrape_duration_avg_seconds",
@@ -167,20 +170,46 @@ future<> HealthService::scrape_all_vllm_metrics(
 }
 
 future<> HealthService::scrape_one_backend(BackendId id, socket_address addr) {
+    // Adaptive suppression: skip backends that consistently fail (non-vLLM)
+    if (is_scrape_suppressed(id)) {
+        ++_vllm_scrapes_suppressed;
+        co_return;
+    }
+
     ++_vllm_scrapes_total;
     auto scrape_start = std::chrono::steady_clock::now();
     try {
         auto metrics = co_await scrape_vllm_metrics(addr);
         if (metrics) {
             store_vllm_metrics(id, std::move(*metrics));
+            record_scrape_success(id);
             ++_vllm_scrapes_success;
         } else {
+            auto count = record_scrape_failure(id);
             ++_vllm_scrapes_failed;
+            // Log at info on first failure, debug thereafter (reduce noise)
+            if (count == 1) {
+                log_health.info("vLLM metrics scrape returned no data for backend {} "
+                    "(will suppress after {} consecutive failures)", id,
+                    SCRAPE_FAILURE_SUPPRESSION_THRESHOLD);
+            } else if (count == SCRAPE_FAILURE_SUPPRESSION_THRESHOLD) {
+                log_health.info("Suppressing vLLM metrics scraping for backend {} "
+                    "after {} consecutive failures (not a vLLM backend?)", id, count);
+            }
         }
     } catch (const std::exception& e) {
-        // Not warn — expected for non-vLLM backends
-        log_health.debug("vLLM metrics scrape failed for backend {}: {}", id, e.what());
+        auto count = record_scrape_failure(id);
         ++_vllm_scrapes_failed;
+        if (count == 1) {
+            log_health.info("vLLM metrics scrape failed for backend {}: {} "
+                "(will suppress after {} consecutive failures)", id, e.what(),
+                SCRAPE_FAILURE_SUPPRESSION_THRESHOLD);
+        } else if (count == SCRAPE_FAILURE_SUPPRESSION_THRESHOLD) {
+            log_health.info("Suppressing vLLM metrics scraping for backend {} "
+                "after {} consecutive failures (not a vLLM backend?)", id, count);
+        } else {
+            log_health.debug("vLLM metrics scrape failed for backend {}: {}", id, e.what());
+        }
     }
     auto duration = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - scrape_start).count();
@@ -325,6 +354,25 @@ HealthService::scrape_vllm_metrics(socket_address addr) {
         log_health.debug("vLLM metrics scrape exception: {}", e.what());
         co_return std::nullopt;
     }
+}
+
+bool HealthService::is_scrape_suppressed(BackendId id) const {
+    auto it = _backend_scrape_failures.find(id);
+    return it != _backend_scrape_failures.end()
+        && it->second >= SCRAPE_FAILURE_SUPPRESSION_THRESHOLD;
+}
+
+uint32_t HealthService::record_scrape_failure(BackendId id) {
+    // Bounded by MAX_TRACKED_BACKENDS — same pool as _backend_vllm_metrics
+    if (_backend_scrape_failures.size() >= MAX_TRACKED_BACKENDS
+        && !_backend_scrape_failures.contains(id)) {
+        return 0;
+    }
+    return ++_backend_scrape_failures[id];
+}
+
+void HealthService::record_scrape_success(BackendId id) {
+    _backend_scrape_failures.erase(id);
 }
 
 void HealthService::store_vllm_metrics(BackendId id, VLLMMetrics metrics) {
