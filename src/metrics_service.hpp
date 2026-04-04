@@ -348,6 +348,10 @@ public:
     void decrement_active_requests() { _active_requests--; }
     uint64_t get_active_requests() const { return _active_requests; }
 
+    // Counter accessors (for dashboard stats aggregation)
+    uint64_t get_requests_total() const { return _requests_total; }
+    uint64_t get_requests_failed() const { return _requests_failed; }
+
     // Record latencies (in seconds) - legacy methods for backwards compatibility
     void record_request_latency(double seconds) {
         _request_latency.record(seconds);

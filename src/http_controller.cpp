@@ -167,12 +167,21 @@ std::optional<BackendId> HttpController::get_fallback_backend(BackendId failed_i
     return std::nullopt;
 }
 
-// Helper to create an auth-protected admin handler with detailed error messages
+// Add CORS headers to a reply (for dashboard cross-port access)
+inline void add_cors_headers(seastar::http::reply& rep) {
+    rep.add_header("Access-Control-Allow-Origin", "*");
+    rep.add_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    rep.add_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+}
+
+// Helper to create an auth-protected admin handler with detailed error messages.
+// When enable_cors is true, adds CORS headers to every response (for dashboard on :9180).
 template <typename AuthCheckWithInfo, typename Func>
-auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler) {
+auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler, bool enable_cors = false) {
     return new async_handler([
         auth_check_with_info = std::forward<AuthCheckWithInfo>(auth_check_with_info),
-        handler = std::forward<Func>(handler)
+        handler = std::forward<Func>(handler),
+        enable_cors
     ](auto req, auto rep) mutable -> future<std::unique_ptr<seastar::http::reply>> {
 
         // Execute the captured private check with detailed info
@@ -180,12 +189,17 @@ auto make_admin_handler(AuthCheckWithInfo&& auth_check_with_info, Func&& handler
         if (!authorized) {
             rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->add_header("WWW-Authenticate", "Bearer");
+            if (enable_cors) add_cors_headers(*rep);
             // Provide specific error message (escape to prevent malformed JSON)
             std::string error_msg = "{\"error\": \"Unauthorized - " + escape_json_string(info) + "\"}";
             rep->write_body("json", error_msg);
             return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
         }
-        return handler(std::move(req), std::move(rep));
+        return handler(std::move(req), std::move(rep)).then(
+            [enable_cors](std::unique_ptr<seastar::http::reply> rep) {
+                if (enable_cors) add_cors_headers(*rep);
+                return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+            });
     });
 }
 
@@ -211,6 +225,9 @@ auto make_rate_limited_handler(RateLimitCheck&& rate_limit_check, Func&& handler
 void HttpController::register_routes(seastar::httpd::routes& r) {
     using namespace seastar::httpd;
 
+    // CORS flag — gated behind dashboard config (enabled in local mode, disabled in cloud)
+    const bool cors = _config.dashboard.enable_cors;
+
     // 0. HEALTH CHECK (public, no auth required - for load balancer probes)
     r.add(operation_type::GET, url("/health"), new async_handler<std::function<future<std::unique_ptr<seastar::http::reply>>(std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
         [this](auto req, auto rep) {
@@ -232,80 +249,103 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     // Use check_admin_auth_with_info for detailed error messages
     auto auth_check = [this](const auto& req) { return this->check_admin_auth_with_info(req); };
 
+    // CORS preflight handlers for admin endpoints used by the dashboard on :9180.
+    // Only registered when CORS is enabled (local mode). The dashboard calls
+    // GET /admin/dump/backends, GET /admin/scheduler/stats, GET /admin/agents,
+    // and POST /admin/agents/{pause,resume}. Browsers send OPTIONS preflight
+    // for cross-origin POST requests.
+    if (cors) {
+        auto make_preflight = []() {
+            return new async_handler<std::function<future<std::unique_ptr<seastar::http::reply>>(
+                std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
+                [](auto /*req*/, auto rep) {
+                    add_cors_headers(*rep);
+                    rep->set_status(seastar::http::reply::status_type{204});
+                    rep->done();
+                    return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+                });
+        };
+        r.add(operation_type::OPTIONS, url("/admin/dump/backends"), make_preflight());
+        r.add(operation_type::OPTIONS, url("/admin/scheduler/stats"), make_preflight());
+        r.add(operation_type::OPTIONS, url("/admin/agents"), make_preflight());
+        r.add(operation_type::OPTIONS, url("/admin/agents/pause"), make_preflight());
+        r.add(operation_type::OPTIONS, url("/admin/agents/resume"), make_preflight());
+    }
+
     // 2. CONTROL PLANE - Create/Update (auth protected)
     r.add(operation_type::POST, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_broadcast_route(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     r.add(operation_type::POST, url("/admin/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_broadcast_backend(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // 3. CONTROL PLANE - Delete (auth protected)
     r.add(operation_type::DELETE, url("/admin/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_delete_backend(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     r.add(operation_type::DELETE, url("/admin/routes"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_delete_routes(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     r.add(operation_type::POST, url("/admin/clear"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_clear_all(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // 4. API KEY MANAGEMENT
     r.add(operation_type::POST, url("/admin/keys/reload"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_keys_reload(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // 5. STATE INSPECTION (for rvctl CLI)
     r.add(operation_type::GET, url("/admin/dump/tree"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_dump_tree(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     r.add(operation_type::GET, url("/admin/dump/cluster"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_dump_cluster(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     r.add(operation_type::GET, url("/admin/dump/backends"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_dump_backends(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     r.add(operation_type::GET, url("/admin/config"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_dump_config(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // 6. MANAGEMENT OPERATIONS
     r.add(operation_type::POST, url("/admin/drain"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_drain_backend(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // Backend vLLM metrics endpoint
     r.add(operation_type::GET, url("/admin/backends/metrics"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_backend_metrics(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // 7. SCHEDULER STATS (admin, auth required)
     r.add(operation_type::GET, url("/admin/scheduler/stats"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_scheduler_stats(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // 8. AGENT REGISTRY (admin, auth required)
     // Note: these endpoints are shard-local. Each shard tracks its own agent
     // counters independently. Cross-shard aggregation is deferred to a future session.
     r.add(operation_type::GET, url("/admin/agents"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_list_agents(std::move(req), std::move(rep));
-    }));
+    }, cors));
     r.add(operation_type::GET, url("/admin/agents/stats"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_agent_stats(std::move(req), std::move(rep));
-    }));
+    }, cors));
     r.add(operation_type::POST, url("/admin/agents/pause"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_pause_agent(std::move(req), std::move(rep));
-    }));
+    }, cors));
     r.add(operation_type::POST, url("/admin/agents/resume"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_resume_agent(std::move(req), std::move(rep));
-    }));
+    }, cors));
 
     // Start rate limiter cleanup timer (Hard Rule #5: timer with gate guard)
     _rate_limiter.start();

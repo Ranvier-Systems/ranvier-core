@@ -1,6 +1,7 @@
 // Ranvier Core - Application Bootstrap and Lifecycle Implementation
 
 #include "application.hpp"
+#include "dashboard_resource.hpp"
 #include "gossip_service.hpp"
 #include "logging.hpp"
 #include "metrics_auth_handler.hpp"
@@ -8,6 +9,7 @@
 #include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
 
+#include <cstdio>
 #include <csignal>
 #include <cstdlib>
 #include <fstream>
@@ -21,6 +23,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
+#include <seastar/http/function_handlers.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
@@ -57,6 +60,12 @@ void Application::apply_local_mode_overrides() {
         }
         log_main.info("  Auto-discovery enabled on ports: {}", ports_oss.str());
     }
+
+    // Auto-enable dashboard and CORS in local mode
+    _config.dashboard.enabled = true;
+    _config.dashboard.enable_cors = true;
+    log_main.info("  Dashboard enabled at http://localhost:{}/dashboard",
+        _config.server.metrics_port);
 }
 
 seastar::future<> Application::init_tokenizer() {
@@ -213,6 +222,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.intent_classifier.rebuild_quoted_fields();
     // Local mode settings
     cfg.local_mode = config.local_mode;
+    // Dashboard settings (CORS gating)
+    cfg.dashboard = config.dashboard;
     // Agent registry settings
     cfg.agent_registry = config.agent_registry;
     // Cost-based routing settings
@@ -762,6 +773,7 @@ seastar::future<> Application::startup() {
             return seastar::make_ready_future<>();
         }).then([this] {
             _state = ApplicationState::RUNNING;
+            _startup_time = std::chrono::steady_clock::now();
             log_main.info("Application startup complete");
         }).handle_exception([this](auto ep) {
             // Startup failed - log and re-throw
@@ -814,6 +826,63 @@ seastar::future<> Application::start_servers() {
         log_main.info("Metrics endpoint auth enabled (token={}, ip_filter={})",
             auth_config.auth_enabled() ? "yes" : "no",
             auth_config.ip_filter_enabled() ? "yes" : "no");
+    }
+
+    // Register dashboard routes on metrics server (if enabled)
+    if (_config.dashboard.enabled) {
+        // Capture a pointer to Application for the stats handler.
+        // Safe: Application outlives the metrics server (stop_servers() runs before ~Application).
+        auto* app = this;
+        co_await _metrics_server->set_routes([app](seastar::httpd::routes& r) {
+            // GET / — redirect to /dashboard
+            r.add(seastar::httpd::operation_type::GET,
+                  seastar::httpd::url("/"),
+                  new seastar::httpd::function_handler(
+                      [](seastar::httpd::const_req /*req*/) -> seastar::sstring {
+                          return seastar::sstring(
+                              "<html><head>"
+                              "<meta http-equiv=\"refresh\" content=\"0;url=/dashboard\">"
+                              "</head></html>");
+                      }, "html"));
+
+            // GET /dashboard — serve embedded HTML
+            r.add(seastar::httpd::operation_type::GET,
+                  seastar::httpd::url("/dashboard"),
+                  new seastar::httpd::function_handler(
+                      [](seastar::httpd::const_req /*req*/) {
+                          return std::string(kDashboardHtml);
+                      }, "html"));
+
+            // GET /dashboard/stats — pre-computed JSON stats for dashboard footer.
+            // Runs on shard 0 only (metrics server is single-shard). Returns
+            // shard-0 counters which are representative for --smp 1 (local mode default).
+            r.add(seastar::httpd::operation_type::GET,
+                  seastar::httpd::url("/dashboard/stats"),
+                  new seastar::httpd::function_handler(
+                      [app](seastar::httpd::const_req /*req*/) {
+                          auto& m = metrics();
+                          auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::steady_clock::now() - app->_startup_time).count();
+                          auto total = m.get_requests_total();
+                          double rps = (uptime > 0) ? static_cast<double>(total) / static_cast<double>(uptime) : 0.0;
+
+                          // Manual JSON — avoids pulling in a JSON library for 6 fields
+                          char buf[256];
+                          std::snprintf(buf, sizeof(buf),
+                              "{\"uptime_seconds\":%ld,"
+                              "\"requests_total\":%lu,"
+                              "\"requests_per_second\":%.1f,"
+                              "\"errors_total\":%lu,"
+                              "\"active_requests\":%lu}",
+                              static_cast<long>(uptime),
+                              static_cast<unsigned long>(total),
+                              rps,
+                              static_cast<unsigned long>(m.get_requests_failed()),
+                              static_cast<unsigned long>(m.get_active_requests()));
+                          return std::string(buf);
+                      }, "json"));
+        });
+        log_main.info("Dashboard enabled at /dashboard on metrics port");
     }
 
     auto metrics_addr = seastar::socket_address(

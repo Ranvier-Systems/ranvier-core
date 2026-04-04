@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ranvier Local Dashboard</title>
+<style>
+:root {
+  --bg-primary: #1a1b26;
+  --bg-secondary: #24283b;
+  --bg-tertiary: #2f3349;
+  --text-primary: #c0caf5;
+  --text-secondary: #a9b1d6;
+  --text-muted: #565f89;
+  --accent: #7aa2f7;
+  --green: #9ece6a;
+  --red: #f7768e;
+  --yellow: #e0af68;
+  --orange: #ff9e64;
+  --border: #3b4261;
+  --bar-bg: #1f2335;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  min-width: 800px;
+}
+.mono { font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace; }
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+header h1 { font-size: 18px; font-weight: 600; }
+header h1 span { color: var(--accent); }
+.header-controls { display: flex; align-items: center; gap: 12px; font-size: 13px; }
+.header-controls select {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.refresh-indicator {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  display: inline-block;
+}
+.refresh-indicator.error { background: var(--red); }
+#error-banner {
+  display: none;
+  background: var(--red);
+  color: #1a1b26;
+  text-align: center;
+  padding: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  padding: 16px 24px;
+}
+.panel {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+.panel h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 12px;
+}
+.full-width { grid-column: 1 / -1; }
+/* Backends */
+.backend-list { display: flex; flex-direction: column; gap: 8px; }
+.backend-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+}
+.status-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.status-dot.healthy { background: var(--green); }
+.status-dot.dead { background: var(--red); }
+.status-dot.draining { background: var(--yellow); }
+.backend-info { flex: 1; }
+.backend-addr { font-size: 14px; }
+.backend-meta { font-size: 12px; color: var(--text-muted); }
+/* Queue bars */
+.queue-list { display: flex; flex-direction: column; gap: 8px; }
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.queue-label {
+  width: 70px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+.queue-bar-bg {
+  flex: 1;
+  height: 22px;
+  background: var(--bar-bg);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.queue-bar {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+  min-width: 2px;
+}
+.queue-bar.critical { background: var(--red); }
+.queue-bar.high { background: var(--orange); }
+.queue-bar.normal { background: var(--accent); }
+.queue-bar.low { background: var(--text-muted); }
+.queue-count {
+  width: 50px;
+  font-size: 13px;
+  text-align: right;
+}
+.queue-stats {
+  display: flex;
+  gap: 16px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+/* Agents table */
+.agents-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.agents-table th {
+  text-align: left;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+}
+.agents-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.agents-table tr:last-child td { border-bottom: none; }
+.agent-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.action-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.15s;
+}
+.action-btn:hover { background: var(--bg-primary); }
+.action-btn.pause { border-color: var(--yellow); color: var(--yellow); }
+.action-btn.resume { border-color: var(--green); color: var(--green); }
+/* Footer */
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 32px;
+  padding: 12px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-secondary);
+  font-size: 14px;
+}
+footer .stat-label { color: var(--text-muted); font-size: 12px; }
+footer .stat-value { font-weight: 600; }
+.empty-state {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 12px;
+  text-align: center;
+}
+/* Toast notifications */
+#toast-container {
+  position: fixed;
+  bottom: 60px;
+  right: 24px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  opacity: 0;
+  transform: translateX(20px);
+  animation: toast-in 0.2s ease forwards;
+}
+.toast.success { border-color: var(--green); }
+.toast.error { border-color: var(--red); }
+@keyframes toast-in {
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes toast-out {
+  to { opacity: 0; transform: translateX(20px); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1><span>Ranvier</span> Local Dashboard</h1>
+  <div class="header-controls">
+    <span class="refresh-indicator" id="refresh-dot"></span>
+    <label>Refresh:
+      <select id="refresh-select" onchange="updateInterval()">
+        <option value="2">2s</option>
+        <option value="5" selected>5s</option>
+        <option value="10">10s</option>
+        <option value="30">30s</option>
+      </select>
+    </label>
+  </div>
+</header>
+<div id="error-banner">Connection lost &mdash; retrying...</div>
+<div class="grid">
+  <div class="panel" id="backends-panel">
+    <h2>Backends</h2>
+    <div id="backends-content" class="backend-list">
+      <div class="empty-state">Loading...</div>
+    </div>
+  </div>
+  <div class="panel" id="queue-panel">
+    <h2>Request Queue</h2>
+    <div id="queue-content">
+      <div class="empty-state">Loading...</div>
+    </div>
+  </div>
+  <div class="panel full-width" id="agents-panel">
+    <h2>Agents</h2>
+    <div id="agents-content">
+      <div class="empty-state">Loading...</div>
+    </div>
+  </div>
+</div>
+<footer>
+  <div><span class="stat-label">Throughput</span><br>
+    <span class="stat-value mono" id="stat-rps">--</span> <span class="stat-label">req/s</span></div>
+  <div><span class="stat-label">Total Requests</span><br>
+    <span class="stat-value mono" id="stat-total">--</span></div>
+  <div><span class="stat-label">Errors</span><br>
+    <span class="stat-value mono" id="stat-errors">--</span></div>
+  <div><span class="stat-label">Uptime</span><br>
+    <span class="stat-value mono" id="stat-uptime">--</span></div>
+</footer>
+
+<div id="toast-container"></div>
+<script>
+(function() {
+  // API base URL: configurable via ?api=http://host:port, defaults to same host on :8080
+  const params = new URLSearchParams(window.location.search);
+  const apiBase = params.get('api') || ('http://' + window.location.hostname + ':8080');
+  // Stats endpoint is on the same metrics server as the dashboard
+  const metricsBase = window.location.protocol + '//' + window.location.host;
+
+  let refreshMs = 5000;
+  let timerId = null;
+  let errorCount = 0;
+
+  function fmt(n) {
+    if (n == null) return '--';
+    return Number(n).toLocaleString();
+  }
+
+  function fmtUptime(seconds) {
+    if (seconds == null) return '--';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'm ' + s + 's';
+    return s + 's';
+  }
+
+  async function fetchJSON(url) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    return resp.json();
+  }
+
+  // -- Backends Panel --
+  async function refreshBackends() {
+    try {
+      const data = await fetchJSON(apiBase + '/admin/dump/backends');
+      const el = document.getElementById('backends-content');
+      const backends = data.backends || [];
+      if (backends.length === 0) {
+        el.innerHTML = '<div class="empty-state">No backends discovered</div>';
+        return;
+      }
+      el.innerHTML = backends.map(function(b) {
+        const status = b.is_dead ? 'dead' : (b.is_draining ? 'draining' : 'healthy');
+        const label = b.is_dead ? 'Dead' : (b.is_draining ? 'Draining' : 'Healthy');
+        const addr = b.address + ':' + b.port;
+        const meta = ['W:' + b.weight, 'P:' + b.priority];
+        if (b.server_type) meta.push(b.server_type);
+        return '<div class="backend-item">' +
+          '<div class="status-dot ' + status + '" title="' + label + '"></div>' +
+          '<div class="backend-info">' +
+            '<div class="backend-addr mono">' + escHtml(addr) + '</div>' +
+            '<div class="backend-meta">' + escHtml(meta.join(' | ')) + '</div>' +
+          '</div></div>';
+      }).join('');
+    } catch (e) { throw e; }
+  }
+
+  // -- Queue Panel --
+  async function refreshQueue() {
+    try {
+      const data = await fetchJSON(apiBase + '/admin/scheduler/stats');
+      const el = document.getElementById('queue-content');
+      const depths = data.queue_depths || {};
+      const tiers = ['critical', 'high', 'normal', 'low'];
+      const maxDepth = Math.max(1, ...tiers.map(function(t) { return depths[t] || 0; }));
+      let html = '<div class="queue-list">';
+      tiers.forEach(function(tier) {
+        const count = depths[tier] || 0;
+        const pct = Math.round((count / maxDepth) * 100);
+        html += '<div class="queue-row">' +
+          '<span class="queue-label">' + tier.charAt(0).toUpperCase() + tier.slice(1) + '</span>' +
+          '<div class="queue-bar-bg"><div class="queue-bar ' + tier + '" style="width:' + pct + '%"></div></div>' +
+          '<span class="queue-count mono">' + fmt(count) + '</span></div>';
+      });
+      html += '</div>';
+      const drops = data.drops_by_priority || {};
+      const totalDrops = Object.values(drops).reduce(function(a, b) { return a + b; }, 0);
+      html += '<div class="queue-stats">' +
+        '<span>Enqueued: <span class="mono">' + fmt(data.total_enqueued) + '</span></span>' +
+        '<span>Dequeued: <span class="mono">' + fmt(data.total_dequeued) + '</span></span>' +
+        '<span>Drops: <span class="mono">' + fmt(totalDrops) + '</span></span>' +
+        '<span>Agents tracked: <span class="mono">' + fmt(data.agents_tracked) + '</span></span>' +
+        '</div>';
+      el.innerHTML = html;
+    } catch (e) { throw e; }
+  }
+
+  // -- Agents Panel --
+  async function refreshAgents() {
+    try {
+      const data = await fetchJSON(apiBase + '/admin/agents');
+      const el = document.getElementById('agents-content');
+      const agents = data.agents || [];
+      if (agents.length === 0) {
+        el.innerHTML = '<div class="empty-state">No agents detected yet</div>';
+        return;
+      }
+      let html = '<table class="agents-table"><thead><tr>' +
+        '<th>Agent</th><th>Requests</th><th>Rejected</th><th>Status</th><th>Last Seen</th><th>Action</th>' +
+        '</tr></thead><tbody>';
+      agents.forEach(function(a) {
+        const paused = a.paused;
+        const statusClass = paused ? 'draining' : 'healthy';
+        const statusLabel = paused ? 'Paused' : 'Active';
+        const btnClass = paused ? 'resume' : 'pause';
+        const btnLabel = paused ? 'Resume' : 'Pause';
+        const agentName = a.display_name || a.agent_id;
+        html += '<tr>' +
+          '<td>' + escHtml(agentName) + '</td>' +
+          '<td class="mono">' + fmt(a.requests_total) + '</td>' +
+          '<td class="mono">' + fmt(a.requests_paused_rejected) + '</td>' +
+          '<td><div class="agent-status"><div class="status-dot ' + statusClass + '"></div>' + statusLabel + '</div></td>' +
+          '<td class="mono" style="font-size:12px;color:var(--text-muted)">' + escHtml(a.last_seen || '--') + '</td>' +
+          '<td><button class="action-btn ' + btnClass + '" onclick="toggleAgent(\'' +
+            escAttr(a.agent_id) + '\',' + (paused ? 'false' : 'true') + ')">' + btnLabel + '</button></td>' +
+          '</tr>';
+      });
+      html += '</tbody></table>';
+      el.innerHTML = html;
+    } catch (e) { throw e; }
+  }
+
+  // -- Footer Stats --
+  async function refreshStats() {
+    try {
+      const data = await fetchJSON(metricsBase + '/dashboard/stats');
+      document.getElementById('stat-rps').textContent =
+        data.requests_per_second != null ? data.requests_per_second.toFixed(1) : '--';
+      document.getElementById('stat-total').textContent = fmt(data.requests_total);
+      document.getElementById('stat-errors').textContent = fmt(data.errors_total);
+      document.getElementById('stat-uptime').textContent = fmtUptime(data.uptime_seconds);
+    } catch (e) { throw e; }
+  }
+
+  // -- Toast Notifications --
+  function showToast(message, type) {
+    var container = document.getElementById('toast-container');
+    var toast = document.createElement('div');
+    toast.className = 'toast ' + (type || '');
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(function() {
+      toast.style.animation = 'toast-out 0.2s ease forwards';
+      setTimeout(function() { toast.remove(); }, 200);
+    }, 2500);
+  }
+
+  // -- Agent Pause/Resume --
+  window.toggleAgent = async function(agentId, pause) {
+    const action = pause ? 'pause' : 'resume';
+    const label = pause ? 'Paused' : 'Resumed';
+    try {
+      const resp = await fetch(apiBase + '/admin/agents/' + action + '?agent_id=' + encodeURIComponent(agentId), {
+        method: 'POST'
+      });
+      if (resp.ok) {
+        showToast(label + ' ' + agentId, 'success');
+      } else {
+        showToast('Failed to ' + action + ' ' + agentId, 'error');
+      }
+      await refreshAgents();
+    } catch (e) {
+      showToast('Failed to ' + action + ' ' + agentId, 'error');
+    }
+  };
+
+  // -- Refresh All --
+  async function refreshAll() {
+    const results = await Promise.allSettled([
+      refreshBackends(),
+      refreshQueue(),
+      refreshAgents(),
+      refreshStats()
+    ]);
+    const failed = results.filter(function(r) { return r.status === 'rejected'; });
+    const banner = document.getElementById('error-banner');
+    const dot = document.getElementById('refresh-dot');
+    if (failed.length > 0) {
+      errorCount++;
+      if (errorCount >= 2) {
+        banner.style.display = 'block';
+        dot.classList.add('error');
+      }
+    } else {
+      errorCount = 0;
+      banner.style.display = 'none';
+      dot.classList.remove('error');
+    }
+  }
+
+  function updateInterval() {
+    const val = parseInt(document.getElementById('refresh-select').value, 10);
+    refreshMs = val * 1000;
+    if (timerId) clearInterval(timerId);
+    timerId = setInterval(refreshAll, refreshMs);
+  }
+  window.updateInterval = updateInterval;
+
+  function escHtml(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function escAttr(s) {
+    return escHtml(s).replace(/'/g, '&#39;');
+  }
+
+  // Initial load + start timer
+  refreshAll();
+  timerId = setInterval(refreshAll, refreshMs);
+})();
+</script>
+</body>
+</html>

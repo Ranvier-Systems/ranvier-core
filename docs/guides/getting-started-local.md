@@ -45,8 +45,9 @@ Expected output:
 ╔═══════════════════════════════════════════════╗
 ║           Ranvier Local Mode                  ║
 ║                                               ║
-║  API:     http://localhost:8080               ║
-║  Metrics: http://localhost:9180/metrics       ║
+║  API:       http://localhost:8080             ║
+║  Dashboard: http://localhost:9180/dashboard   ║
+║  Metrics:   http://localhost:9180/metrics     ║
 ║                                               ║
 ║  Discovering backends on ports:               ║
 ║    11434 (Ollama), 8080 (vLLM), 1234 (LM      ║
@@ -85,29 +86,46 @@ That's it. Ranvier proxies `/v1/chat/completions` (and other OpenAI-compatible e
 
 ## Verify It Works
 
-Send a test request:
+**Quick check** — confirm the dashboard and API are responding:
+
+```bash
+# Dashboard stats (should return JSON with uptime, request counts)
+curl -s http://localhost:9180/dashboard/stats
+
+# Discovered backends (should list any detected local LLM servers)
+curl -s http://localhost:8080/admin/dump/backends
+```
+
+Or open [http://localhost:9180/dashboard](http://localhost:9180/dashboard) in your browser for a live view of backends, agents, queue depths, and request rates.
+
+**Send a test request** (adjust the model name to one you have pulled in Ollama):
 
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "User-Agent: Cursor/1.0" \
   -d '{
-    "model": "llama3",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 32
+    "model": "llama3.2:1b",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}]
   }'
 ```
 
-Check that Ranvier is routing and collecting metrics:
+After this request, the dashboard should show:
+- A backend entry with a green status dot
+- "Cursor IDE" in the agents table with a request count of 1
+- Footer stats with an incrementing request total
+
+**Check agent tracking and metrics:**
 
 ```bash
-# Prometheus metrics
-curl -s http://localhost:9180/metrics | grep seastar_ranvier_http_requests
-
-# Registered backends
-curl -s http://localhost:8080/admin/dump/backends
-
-# Detected agents
+# Detected agents (should show "Cursor IDE" after the request above)
 curl -s http://localhost:8080/admin/agents
+
+# Scheduler queue stats
+curl -s http://localhost:8080/admin/scheduler/stats
+
+# Prometheus metrics
+curl -s http://localhost:9180/metrics | grep ranvier_http_requests
 ```
 
 ### Troubleshooting: No Backends Discovered
@@ -144,5 +162,6 @@ For the full architecture, see [VISION.md](../architecture/VISION.md).
 
 - **Custom config**: Copy [`ranvier-local.yaml.example`](../../ranvier-local.yaml.example) and adjust discovery ports or routing mode.
 - **Add cloud backends**: Mix local and remote backends in a single config. See the [Cloud Deployment Guide](cloud-deployment.md).
+- **Dashboard**: Open [http://localhost:9180](http://localhost:9180) for a live view of backends, agents, queue depths, and throughput. Pause/resume agents directly from the UI.
 - **Monitor**: Scrape `:9180/metrics` with Prometheus for cache hit rates, P99 latency, and per-agent traffic.
-- **Pause an agent**: `curl -X POST http://localhost:8080/admin/agents/aider/pause` to temporarily stop routing to a noisy agent.
+- **Pause an agent**: `curl -X POST "http://localhost:8080/admin/agents/pause?agent_id=aider"` to temporarily hold an agent's requests, or use the dashboard's Pause button. Pausing doesn't reject requests — they queue in the scheduler until the agent is resumed or the request times out. The agent's request counter still increments (requests are identified on arrival), but `requests_paused_rejected` tracks how many were dropped while paused.

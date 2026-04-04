@@ -730,6 +730,14 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<double>("RANVIER_COST_ROUTING_IMBALANCE_FACTOR")) {
         routing.cost_routing.cost_imbalance_factor = *v;
     }
+
+    // Dashboard overrides
+    if (auto v = get_env("RANVIER_DASHBOARD_ENABLED")) {
+        dashboard.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_DASHBOARD_CORS")) {
+        dashboard.enable_cors = (*v == "1" || *v == "true" || *v == "yes");
+    }
 }
 
 // =============================================================================
@@ -1469,7 +1477,12 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
         }
 
-
+        // Dashboard section
+        if (yaml["dashboard"]) {
+            YAML::Node db = yaml["dashboard"];
+            if (db["enabled"]) config.dashboard.enabled = db["enabled"].as<bool>();
+            if (db["enable_cors"]) config.dashboard.enable_cors = db["enable_cors"].as<bool>();
+        }
 
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
