@@ -3,6 +3,8 @@
 #include "prometheus_parser.hpp"
 #include "router_service.hpp"
 
+#include <absl/container/flat_hash_set.h>
+
 #include <cmath>
 #include <fmt/format.h>
 
@@ -162,6 +164,28 @@ future<> HealthService::run_loop() {
 
 future<> HealthService::scrape_all_vllm_metrics(
         const std::vector<std::pair<BackendId, socket_address>>& backends) {
+    // Prune stale failure entries for backends that were unregistered.
+    // Prevents permanent suppression if a backend ID is reused with a
+    // different engine (e.g., Ollama removed, vLLM registered as same ID).
+    // O(n) where n <= MAX_TRACKED_BACKENDS, runs once per health check cycle.
+    if (!_backend_scrape_failures.empty()) {
+        // Build a set of currently-active backend IDs for fast lookup
+        absl::flat_hash_set<BackendId> active_ids;
+        active_ids.reserve(backends.size());
+        for (const auto& [id, addr] : backends) {
+            active_ids.insert(id);
+        }
+        // Erase failure entries for backends no longer in the active set
+        for (auto it = _backend_scrape_failures.begin();
+             it != _backend_scrape_failures.end(); ) {
+            if (!active_ids.contains(it->first)) {
+                it = _backend_scrape_failures.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     co_await seastar::max_concurrent_for_each(
         backends, HEALTH_MAX_CONCURRENT_CHECKS,
         [this](const std::pair<BackendId, socket_address>& backend) -> future<> {

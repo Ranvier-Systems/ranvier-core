@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 using namespace ranvier;
 
@@ -85,6 +86,19 @@ struct TestMetricsStore {
 
     void record_scrape_success(BackendId id) {
         scrape_failures.erase(id);
+    }
+
+    // Prune stale failure entries for backends no longer active
+    // (mirrors scrape_all_vllm_metrics pruning logic)
+    void prune_stale_failures(const std::vector<BackendId>& active_ids) {
+        absl::flat_hash_set<BackendId> active_set(active_ids.begin(), active_ids.end());
+        for (auto it = scrape_failures.begin(); it != scrape_failures.end(); ) {
+            if (!active_set.contains(it->first)) {
+                it = scrape_failures.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 };
 
@@ -329,4 +343,50 @@ TEST_F(HealthServiceStoreTest, ScrapeFailuresBoundedByMaxTrackedBackends) {
     // New backend beyond capacity returns 0 (not tracked)
     EXPECT_EQ(store.record_scrape_failure(static_cast<BackendId>(MAX_TRACKED_BACKENDS)), 0u);
     EXPECT_EQ(store.scrape_failures.size(), MAX_TRACKED_BACKENDS);
+}
+
+// =============================================================================
+// Stale Failure Pruning (prevents permanent suppression on ID reuse)
+// =============================================================================
+
+TEST_F(HealthServiceStoreTest, PruneRemovesUnregisteredBackendFailures) {
+    // Suppress backend 1 (Ollama)
+    for (uint32_t i = 0; i < SCRAPE_FAILURE_SUPPRESSION_THRESHOLD; ++i) {
+        store.record_scrape_failure(1);
+    }
+    EXPECT_TRUE(store.is_scrape_suppressed(1));
+
+    // Backend 1 is unregistered — prune with only backend 2 active
+    store.prune_stale_failures({2});
+
+    // Suppression cleared — backend 1 re-registered as vLLM would be scraped
+    EXPECT_FALSE(store.is_scrape_suppressed(1));
+    EXPECT_TRUE(store.scrape_failures.empty());
+}
+
+TEST_F(HealthServiceStoreTest, PrunePreservesActiveBackendFailures) {
+    store.record_scrape_failure(1);
+    store.record_scrape_failure(2);
+
+    // Prune with backend 1 still active, backend 2 removed
+    store.prune_stale_failures({1});
+
+    EXPECT_EQ(store.scrape_failures.size(), 1u);
+    EXPECT_EQ(store.scrape_failures.count(1), 1u);
+    EXPECT_EQ(store.scrape_failures.count(2), 0u);
+}
+
+TEST_F(HealthServiceStoreTest, PruneWithEmptyActiveListClearsAll) {
+    store.record_scrape_failure(1);
+    store.record_scrape_failure(2);
+    store.record_scrape_failure(3);
+
+    store.prune_stale_failures({});
+
+    EXPECT_TRUE(store.scrape_failures.empty());
+}
+
+TEST_F(HealthServiceStoreTest, PruneWithEmptyFailuresIsNoOp) {
+    store.prune_stale_failures({1, 2, 3});
+    EXPECT_TRUE(store.scrape_failures.empty());
 }
