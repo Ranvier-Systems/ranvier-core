@@ -788,6 +788,16 @@ future<> HttpController::stream_backend_response(
             break;
         }
 
+        // If backend signaled Connection: close (or HTTP/1.0 without keep-alive),
+        // mark bundle invalid so it is NOT returned to the connection pool.
+        // Without this, the pooled connection is dead and the next request gets an
+        // immediate EOF, triggering the stale-connection retry path and doubling latency.
+        if (res.connection_close) {
+            log_proxy.debug("[{}] Backend sent Connection: close, will not repool",
+                            ctx->request_id);
+            bundle->is_valid = false;
+        }
+
         // Snooping Logic - record success and learn route
         if (res.header_snoop_success) {
             // Backend responded successfully - record for circuit breaker

@@ -437,6 +437,134 @@ TEST_F(StreamParserTest, IsStreamingReturnsFalseForIncrementalContentLength) {
 }
 
 // =============================================================================
+// Connection: close Detection Tests
+// =============================================================================
+
+TEST_F(StreamParserTest, DetectsConnectionCloseHeader) {
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: close\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_TRUE(result.connection_close);
+    EXPECT_EQ(result.data, body);
+    EXPECT_TRUE(result.done);
+}
+
+TEST_F(StreamParserTest, DetectsConnectionCloseLowercase) {
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "connection: close\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.connection_close);
+}
+
+TEST_F(StreamParserTest, Http10WithoutKeepAliveImpliesClose) {
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.connection_close);
+    EXPECT_TRUE(result.done);
+}
+
+TEST_F(StreamParserTest, Http11WithoutConnectionHeaderDefaultsKeepAlive) {
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_FALSE(result.connection_close);
+}
+
+TEST_F(StreamParserTest, Http11WithConnectionKeepAliveIsNotClose) {
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_FALSE(result.connection_close);
+}
+
+TEST_F(StreamParserTest, Http10WithExplicitKeepAliveIsNotClose) {
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_FALSE(result.connection_close);
+}
+
+TEST_F(StreamParserTest, ConnectionCloseWithChunkedEncoding) {
+    // Ollama may also send Connection: close with chunked streaming
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "5\r\n"
+        "hello\r\n"
+        "0\r\n"
+        "\r\n";
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_TRUE(result.connection_close);
+    EXPECT_EQ(result.data, "hello");
+    EXPECT_TRUE(result.done);
+}
+
+TEST_F(StreamParserTest, ConnectionCloseDetectedWithIncrementalHeaders) {
+    // Headers arrive in two TCP segments — Connection: close is in the second
+    auto result1 = parser.push(make_buffer(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 11\r\n"));
+    EXPECT_FALSE(result1.connection_close);  // Headers incomplete, default false
+    EXPECT_FALSE(result1.done);
+
+    auto result2 = parser.push(make_buffer(
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"ok\":true}"));
+    EXPECT_TRUE(result2.connection_close);
+    EXPECT_TRUE(result2.header_snoop_success);
+    EXPECT_EQ(result2.data, "{\"ok\":true}");
+    EXPECT_TRUE(result2.done);
+}
+
+TEST_F(StreamParserTest, ConnectionCloseDefaultFalse) {
+    // Default Result should have connection_close = false
+    StreamParser::Result res;
+    EXPECT_FALSE(res.connection_close);
+}
+
+// =============================================================================
 // Config Tests
 // =============================================================================
 
