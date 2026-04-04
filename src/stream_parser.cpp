@@ -73,6 +73,9 @@ StreamParser::Result StreamParser::push(seastar::temporary_buffer<char> chunk) {
             case State::ChunkData:
                 consumed = parse_chunk_data(res);
                 break;
+            case State::ContentBody:
+                consumed = parse_content_body(res);
+                break;
             case State::Error:
                 // Already handled above
                 break;
@@ -109,6 +112,7 @@ void StreamParser::reset() noexcept {
     _accum = seastar::sstring();  // sstring doesn't have clear()
     _read_pos = 0;
     _chunk_bytes_needed = 0;
+    _content_length = 0;
 }
 
 void StreamParser::compact_if_needed() {
@@ -152,8 +156,79 @@ ssize_t StreamParser::parse_headers(Result& res) {
     // We look for " 200 " which handles various HTTP versions
     res.header_snoop_success = (headers.find(" 200 ") != std::string_view::npos);
 
-    // Advance past headers + CRLF CRLF
-    _state = State::ChunkSize;
+    // Determine transfer encoding: chunked vs Content-Length.
+    // Ollama (and some other backends) send non-chunked responses with Content-Length.
+    // We must detect this to avoid misinterpreting the body as chunked encoding.
+    //
+    // Per RFC 7230 §3.2, HTTP header field names are case-insensitive.
+    // We use a case-insensitive prefix match to handle any server casing.
+    bool is_chunked = false;
+    _content_length = 0;
+
+    // Case-insensitive prefix match (needle must be all lowercase)
+    auto icase_starts_with = [](std::string_view haystack, std::string_view needle) -> bool {
+        if (haystack.size() < needle.size()) return false;
+        for (size_t i = 0; i < needle.size(); ++i) {
+            if (static_cast<char>(std::tolower(static_cast<unsigned char>(haystack[i]))) != needle[i])
+                return false;
+        }
+        return true;
+    };
+
+    // Case-insensitive substring search (needle must be all lowercase)
+    auto icase_contains = [](std::string_view haystack, std::string_view needle) -> bool {
+        if (haystack.size() < needle.size()) return false;
+        for (size_t i = 0; i <= haystack.size() - needle.size(); ++i) {
+            bool match = true;
+            for (size_t j = 0; j < needle.size() && match; ++j) {
+                match = (static_cast<char>(std::tolower(static_cast<unsigned char>(haystack[i + j]))) == needle[j]);
+            }
+            if (match) return true;
+        }
+        return false;
+    };
+
+    // Scan each header line for Transfer-Encoding and Content-Length
+    size_t line_start = 0;
+    while (line_start < headers.size()) {
+        auto line_end = headers.find("\r\n", line_start);
+        if (line_end == std::string_view::npos) line_end = headers.size();
+        auto line = headers.substr(line_start, line_end - line_start);
+
+        if (icase_starts_with(line, "transfer-encoding:")) {
+            if (icase_contains(line.substr(18), "chunked")) {
+                is_chunked = true;
+            }
+        } else if (icase_starts_with(line, "content-length:")) {
+            auto val_str = line.substr(15);
+            while (!val_str.empty() && (val_str.front() == ' ' || val_str.front() == '\t')) {
+                val_str.remove_prefix(1);
+            }
+            // Trim trailing whitespace (OWS per RFC 7230 §3.2.6)
+            while (!val_str.empty() && (val_str.back() == ' ' || val_str.back() == '\t')) {
+                val_str.remove_suffix(1);
+            }
+            auto [ptr, ec] = std::from_chars(val_str.data(), val_str.data() + val_str.size(),
+                                              _content_length);
+            if (ec != std::errc{} || ptr != val_str.data() + val_str.size()) {
+                res.error_message = "Invalid Content-Length header";
+                return -1;
+            }
+        }
+
+        line_start = (line_end < headers.size()) ? line_end + 2 : headers.size();
+    }
+
+    if (is_chunked) {
+        _state = State::ChunkSize;
+    } else {
+        if (_content_length > StreamParserConfig::max_accumulator_size) {
+            res.error_message = "Content-Length exceeds maximum";
+            return -1;
+        }
+        _state = State::ContentBody;
+    }
+
     return static_cast<ssize_t>(header_end + 4);
 }
 
@@ -244,6 +319,30 @@ ssize_t StreamParser::parse_chunk_data(Result& res) {
     _chunk_bytes_needed = 0;
     _state = State::ChunkSize;
     return static_cast<ssize_t>(needed);
+}
+
+ssize_t StreamParser::parse_content_body(Result& res) {
+    auto view = unread_view();
+
+    if (_content_length > 0) {
+        // Known Content-Length: wait for all bytes
+        if (view.size() < _content_length) {
+            return 0;  // Need more data
+        }
+        res.data.append(view.data(), _content_length);
+        res.done = true;
+        return static_cast<ssize_t>(_content_length);
+    }
+
+    // No Content-Length and not chunked: accumulate until EOF.
+    // EOF is signaled by an empty chunk from the network layer, which sets res.done
+    // in the caller. Here we just pass through whatever data is available.
+    if (!view.empty()) {
+        res.data.append(view.data(), view.size());
+        return static_cast<ssize_t>(view.size());
+    }
+
+    return 0;
 }
 
 } // namespace ranvier
