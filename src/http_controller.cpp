@@ -2302,23 +2302,34 @@ future<> HttpController::wait_for_drain() {
     // Mark as stopped so HttpController::stop() is a no-op after drain
     _stopped = true;
 
-    // Stop rate limiter cleanup timer first (Hard Rule #5: close gate before destruction)
+    // Stop priority queue background fiber first (Rule #5: close gate before destruction).
+    // Must happen before _request_gate.close() because the dequeue loop acquires
+    // semaphore units which would keep _request_gate holders alive.
+    _queue_cv.broken();
+    if (!_queue_gate.is_closed()) {
+        co_await _queue_gate.close();
+    }
+
+    // Deregister scheduler/agent metrics before member destruction (Rule #6)
+    _scheduler_metrics.clear();
+    _agent_metrics.clear();
+
+    // Stop rate limiter cleanup timer (Hard Rule #5: close gate before destruction)
     // This ensures no timer callbacks are in-flight when we proceed with shutdown
-    return _rate_limiter.stop().then([this, drain_timeout] {
-        // Close the gate and wait for all holders to be released
-        auto gate_close_future = _request_gate.close();
+    co_await _rate_limiter.stop();
 
-        // Race between gate closing and timeout
-        auto deadline = lowres_clock::now() + drain_timeout;
+    // Close the gate and wait for all holders to be released
+    auto gate_close_future = _request_gate.close();
 
-        return with_timeout(deadline, std::move(gate_close_future))
-            .then([] {
-                log_proxy.info("All in-flight requests completed");
-            })
-            .handle_exception_type([](const seastar::timed_out_error&) {
-                log_proxy.warn("Drain timeout reached - some requests may be interrupted");
-            });
-    });
+    // Race between gate closing and timeout
+    auto deadline = lowres_clock::now() + drain_timeout;
+
+    try {
+        co_await with_timeout(deadline, std::move(gate_close_future));
+        log_proxy.info("All in-flight requests completed");
+    } catch (const seastar::timed_out_error&) {
+        log_proxy.warn("Drain timeout reached - some requests may be interrupted");
+    }
 }
 
 bool HttpController::is_draining() const {

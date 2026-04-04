@@ -1,0 +1,16 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  # TODO: Build static binaries for linux-amd64, linux-arm64,
+  # darwin-arm64, darwin-x86_64 using the base Docker image
+  # Upload to GitHub Releases
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: placeholder
+        run: echo "Release workflow - TODO"
