@@ -540,6 +540,24 @@ TEST_F(StreamParserTest, ConnectionCloseWithChunkedEncoding) {
     EXPECT_TRUE(result.done);
 }
 
+TEST_F(StreamParserTest, ConnectionCloseDetectedWithIncrementalHeaders) {
+    // Headers arrive in two TCP segments — Connection: close is in the second
+    auto result1 = parser.push(make_buffer(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 11\r\n"));
+    EXPECT_FALSE(result1.connection_close);  // Headers incomplete, default false
+    EXPECT_FALSE(result1.done);
+
+    auto result2 = parser.push(make_buffer(
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"ok\":true}"));
+    EXPECT_TRUE(result2.connection_close);
+    EXPECT_TRUE(result2.header_snoop_success);
+    EXPECT_EQ(result2.data, "{\"ok\":true}");
+    EXPECT_TRUE(result2.done);
+}
+
 TEST_F(StreamParserTest, ConnectionCloseDefaultFalse) {
     // Default Result should have connection_close = false
     StreamParser::Result res;

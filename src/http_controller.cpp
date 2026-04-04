@@ -793,6 +793,8 @@ future<> HttpController::stream_backend_response(
         // Without this, the pooled connection is dead and the next request gets an
         // immediate EOF, triggering the stale-connection retry path and doubling latency.
         if (res.connection_close) {
+            log_proxy.debug("[{}] Backend sent Connection: close, will not repool",
+                            ctx->request_id);
             bundle->is_valid = false;
         }
 
