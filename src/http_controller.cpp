@@ -384,12 +384,20 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
 // PROXY HELPER METHODS
 // ---------------------------------------------------------
 
-// Write error message to client, handling disconnected clients gracefully
+// Write error message to client, handling disconnected clients gracefully.
+// Streaming (SSE/chunked) responses use SSE format: data: {"error": "..."}\n\n
+// Non-streaming (Content-Length) responses use plain JSON: {"error": "..."}
 future<> HttpController::write_client_error(
     output_stream<char>* client_out,
-    std::string error_msg) {
+    std::string error_msg,
+    bool is_streaming) {
     try {
-        sstring msg = sstring("data: {\"error\": \"") + sstring(error_msg) + "\"}\n\n";
+        sstring msg;
+        if (is_streaming) {
+            msg = sstring("data: {\"error\": \"") + sstring(error_msg) + "\"}\n\n";
+        } else {
+            msg = sstring("{\"error\": \"") + sstring(error_msg) + "\"}";
+        }
         co_await client_out->write(msg);
         co_await client_out->flush();
     } catch (...) {
@@ -775,7 +783,8 @@ future<> HttpController::stream_backend_response(
             bundle->is_valid = false;
             metrics().record_failure();
             co_await write_client_error(client_out,
-                sstring("Backend response parsing error: ") + sstring(res.error_message));
+                sstring("Backend response parsing error: ") + sstring(res.error_message),
+                ctx->client_expects_streaming);
             break;
         }
 
@@ -1616,6 +1625,17 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->priority = priority;
     ctx->intent = intent;
 
+    // Detect whether client expects streaming (SSE) or non-streaming (JSON) response.
+    // OpenAI-compatible APIs use "stream":true/false in the request body.
+    // If "stream":false is explicitly present, the client expects a JSON response.
+    // Otherwise default to streaming (SSE) for backwards compatibility.
+    {
+        bool has_stream_false =
+            body_view.find("\"stream\":false") != std::string_view::npos ||
+            body_view.find("\"stream\": false") != std::string_view::npos;
+        ctx->client_expects_streaming = !has_stream_false;
+    }
+
     // Capture User-Agent for fair scheduling (used by RequestScheduler)
     {
         auto ua_it = req->_headers.find("User-Agent");
@@ -1658,7 +1678,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // This ensures the gate stays held, the semaphore slot is occupied, the backend load tracking
     // is properly maintained, and cost budget is released when streaming completes (any exit path).
     // BackendRequestGuard destructor decrements active_requests; CostBudgetGuard destructor releases cost budget.
-    rep->write_body("text/event-stream", [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
+    // Use SSE content type for streaming requests, JSON for non-streaming (e.g. Ollama non-stream)
+    auto response_content_type = ctx->client_expects_streaming ? "text/event-stream" : "json";
+    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
@@ -1671,7 +1693,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                 shard_load_metrics().decrement_active();
             }
-            co_await write_client_error(&client_out, "Backend connection failed after retries");
+            co_await write_client_error(&client_out, "Backend connection failed after retries", ctx->client_expects_streaming);
             co_await client_out.close();
             co_return;
         }
@@ -1693,7 +1715,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             }
             co_await bundle.close();
             co_await write_client_error(&client_out,
-                ctx->timed_out ? "Request timed out" : "Backend connection lost during request");
+                ctx->timed_out ? "Request timed out" : "Backend connection lost during request",
+                ctx->client_expects_streaming);
             co_await client_out.close();
             co_return;
         }
@@ -1835,15 +1858,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             log_proxy.warn("[{}] Request timed out", ctx->request_id);
             _circuit_breaker.record_failure(ctx->current_backend);
             metrics().record_timeout();
-            co_await write_client_error(&client_out, "Request timed out");
+            co_await write_client_error(&client_out, "Request timed out", ctx->client_expects_streaming);
         } else if (ctx->connection_error) {
             log_proxy.warn("[{}] Backend connection error occurred", ctx->request_id);
             metrics().record_connection_error();
-            co_await write_client_error(&client_out, "Backend connection lost");
+            co_await write_client_error(&client_out, "Backend connection lost", ctx->client_expects_streaming);
         } else if (ctx->connection_failed) {
             log_proxy.warn("[{}] Backend connection failed during stale retry", ctx->request_id);
             metrics().record_failure();
-            co_await write_client_error(&client_out, "Backend connection failed");
+            co_await write_client_error(&client_out, "Backend connection failed", ctx->client_expects_streaming);
         } else {
             log_proxy.info("[{}] Request completed successfully", ctx->request_id);
             metrics().record_success();

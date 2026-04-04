@@ -368,6 +368,75 @@ TEST_F(StreamParserTest, LowercaseTransferEncodingHeader) {
 }
 
 // =============================================================================
+// is_streaming() Accessor Tests
+// =============================================================================
+
+TEST_F(StreamParserTest, IsStreamingReturnsTrueForChunkedResponse) {
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n";
+
+    parser.push(make_buffer(response));
+
+    EXPECT_TRUE(parser.is_streaming());
+    EXPECT_EQ(parser.state(), StreamParser::State::ChunkSize);
+}
+
+TEST_F(StreamParserTest, IsStreamingReturnsFalseForContentLengthResponse) {
+    std::string body = R"({"id":"1","choices":[{"message":{"content":"Hi"}}]})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    parser.push(make_buffer(response));
+
+    EXPECT_FALSE(parser.is_streaming());
+}
+
+TEST_F(StreamParserTest, IsStreamingReturnsFalseBeforeHeadersParsed) {
+    // Before any data is pushed, state is Headers — not streaming
+    EXPECT_FALSE(parser.is_streaming());
+}
+
+TEST_F(StreamParserTest, IsStreamingReturnsFalseForPartialHeaders) {
+    // Push incomplete headers — state remains Headers
+    parser.push(make_buffer("HTTP/1.1 200 OK\r\n"));
+    EXPECT_FALSE(parser.is_streaming());
+}
+
+TEST_F(StreamParserTest, IsStreamingReturnsTrueAfterChunkDataParsed) {
+    // After parsing a chunk, state is ChunkData or ChunkSize — still streaming
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\n"
+        "hello\r\n";
+
+    parser.push(make_buffer(response));
+
+    // After parsing the chunk data, state returns to ChunkSize
+    EXPECT_TRUE(parser.is_streaming());
+    EXPECT_EQ(parser.state(), StreamParser::State::ChunkSize);
+}
+
+TEST_F(StreamParserTest, IsStreamingReturnsFalseForIncrementalContentLength) {
+    // Headers parsed but body incomplete — state is ContentBody, not streaming
+    std::string body = R"({"id":"1","choices":[{"message":{"content":"Hello!"}}]})";
+    std::string headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n";
+
+    parser.push(make_buffer(headers + body.substr(0, 5)));
+
+    EXPECT_FALSE(parser.is_streaming());
+    EXPECT_EQ(parser.state(), StreamParser::State::ContentBody);
+}
+
+// =============================================================================
 // Config Tests
 // =============================================================================
 
