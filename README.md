@@ -19,6 +19,20 @@ docker run -p 8080:8080 ghcr.io/ranvier-systems/ranvier:latest
 
 ---
 
+## Quick Start (Local Mode)
+
+```bash
+ranvier --local
+```
+
+Auto-discovers Ollama, vLLM, LM Studio, and other local LLM servers.
+Routes requests by intent, priority, and cost — no configuration needed.
+Point your IDE to `http://localhost:8080` and start coding.
+
+See [Getting Started with Ranvier Local](docs/guides/getting-started-local.md) for details.
+
+---
+
 ## ⚡ The Problem: "Blind" Routing
 Standard load balancers (Nginx, HAProxy) route LLM requests based on *server availability* (Least Connections or Round Robin). They treat LLM requests as generic HTTP packets.
 
@@ -262,9 +276,18 @@ See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed co
 
 ## 📖 Documentation
 
+### Guides
+- [Getting Started with Ranvier Local](docs/guides/getting-started-local.md)
+- [Cloud Deployment Guide](docs/guides/cloud-deployment.md)
+- [IDE Integration (Cursor, Claude Code, Cline, Aider)](docs/guides/ide-integration.md)
+- [Benchmark Reproduction](docs/guides/benchmark-reproduction.md)
+
+### Reference
+- [Architecture & Vision](docs/architecture/VISION.md)
 - [Architecture Overview](docs/architecture/system-design.md)
 - [API Reference](docs/api/reference.md)
 - [Request Flow](docs/request-flow.md)
+- [Benchmark Results (8x A100)](docs/benchmarks/benchmark-guide-8xA100.md)
 - [Kubernetes Deployment](docs/deployment/kubernetes.md)
 - [Performance Tuning](docs/deployment/performance.md)
 - **Internals:**
