@@ -49,10 +49,11 @@ struct StreamParserConfig {
 class StreamParser {
 public:
     enum class State {
-        Headers,    // Parsing HTTP response headers
-        ChunkSize,  // Parsing chunked encoding size line
-        ChunkData,  // Reading chunk data bytes
-        Error       // Parser encountered unrecoverable error
+        Headers,      // Parsing HTTP response headers
+        ChunkSize,    // Parsing chunked encoding size line
+        ChunkData,    // Reading chunk data bytes
+        ContentBody,  // Reading non-chunked body (Content-Length)
+        Error         // Parser encountered unrecoverable error
     };
 
     struct Result {
@@ -84,6 +85,7 @@ private:
     seastar::sstring _accum;
     size_t _read_pos = 0;           // Read offset into _accum (avoids substr copies)
     size_t _chunk_bytes_needed = 0;
+    size_t _content_length = 0;     // For non-chunked (Content-Length) responses
 
     // Helper to get unread portion of accumulator as string_view (zero-copy)
     std::string_view unread_view() const noexcept {
@@ -99,6 +101,7 @@ private:
     ssize_t parse_headers(Result& res);
     ssize_t parse_chunk_size(Result& res);
     ssize_t parse_chunk_data(Result& res);
+    ssize_t parse_content_body(Result& res);
 };
 
 } // namespace ranvier

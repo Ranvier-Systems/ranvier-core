@@ -60,6 +60,7 @@ TEST_F(StreamParserTest, ParsesSimpleChunkedResponse) {
 TEST_F(StreamParserTest, DetectsNon200Status) {
     std::string response =
         "HTTP/1.1 500 Internal Server Error\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "0\r\n"
         "\r\n";
@@ -73,6 +74,7 @@ TEST_F(StreamParserTest, DetectsNon200Status) {
 TEST_F(StreamParserTest, HandlesMultipleChunks) {
     std::string response =
         "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "6\r\n"
         "chunk1\r\n"
@@ -90,7 +92,10 @@ TEST_F(StreamParserTest, HandlesMultipleChunks) {
 
 TEST_F(StreamParserTest, HandlesIncrementalParsing) {
     // Send headers first
-    auto result1 = parser.push(make_buffer("HTTP/1.1 200 OK\r\n\r\n"));
+    auto result1 = parser.push(make_buffer(
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"));
     EXPECT_TRUE(result1.header_snoop_success);
     EXPECT_FALSE(result1.done);
     EXPECT_TRUE(result1.data.empty());
@@ -116,6 +121,7 @@ TEST_F(StreamParserTest, HandlesIncrementalParsing) {
 TEST_F(StreamParserTest, HandlesEmptyChunkSize) {
     std::string response =
         "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "\r\n"  // Empty chunk size line (treat as 0)
         "\r\n";
@@ -129,6 +135,7 @@ TEST_F(StreamParserTest, HandlesChunkExtensions) {
     // RFC 7230: chunk-ext = *( ";" chunk-ext-name [ "=" chunk-ext-val ] )
     std::string response =
         "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "5;ext=value\r\n"  // Chunk size with extension
         "hello\r\n"
@@ -156,6 +163,7 @@ TEST_F(StreamParserTest, RejectsOversizedHeaders) {
 TEST_F(StreamParserTest, RejectsOversizedChunk) {
     std::string response =
         "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "FFFFFFFF\r\n";  // ~4GB chunk size
 
@@ -168,6 +176,7 @@ TEST_F(StreamParserTest, RejectsOversizedChunk) {
 TEST_F(StreamParserTest, RejectsInvalidChunkSizeHex) {
     std::string response =
         "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "ZZZ\r\n";  // Invalid hex
 
@@ -195,6 +204,7 @@ TEST_F(StreamParserTest, HandlesSSEFormat) {
     std::string response =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "17\r\n"
         "data: {\"text\": \"Hi!\"}\n\n\r\n"
@@ -225,6 +235,7 @@ TEST_F(StreamParserTest, BufferSizeAfterTerminalChunk) {
     // After parsing "0\r\n", the trailing "\r\n" remains in buffer
     std::string response =
         "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "0\r\n"
         "\r\n";
@@ -234,6 +245,126 @@ TEST_F(StreamParserTest, BufferSizeAfterTerminalChunk) {
     // Trailing CRLF after terminal chunk remains (2 bytes)
     // This is correct per HTTP spec - it's part of message framing
     EXPECT_EQ(parser.buffer_size(), 2u);
+}
+
+// =============================================================================
+// Content-Length (Non-Chunked) Response Tests
+// =============================================================================
+
+TEST_F(StreamParserTest, ParsesContentLengthResponse) {
+    // Ollama-style response: Content-Length instead of chunked encoding
+    std::string body = R"({"id":"chatcmpl-1","choices":[{"message":{"content":"Hello!"}}]})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_EQ(result.data, body);
+    EXPECT_TRUE(result.done);
+    EXPECT_FALSE(result.has_error);
+}
+
+TEST_F(StreamParserTest, ParsesContentLengthIncrementally) {
+    // Body arrives in two TCP segments
+    std::string body = R"({"id":"chatcmpl-1","choices":[{"message":{"content":"Hi"}}]})";
+    std::string headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n";
+
+    auto result1 = parser.push(make_buffer(headers + body.substr(0, 10)));
+    EXPECT_TRUE(result1.header_snoop_success);
+    EXPECT_FALSE(result1.done);  // Not enough body data yet
+
+    auto result2 = parser.push(make_buffer(body.substr(10)));
+    EXPECT_EQ(result2.data, body);
+    EXPECT_TRUE(result2.done);
+}
+
+TEST_F(StreamParserTest, DetectsNon200ContentLengthResponse) {
+    std::string body = R"({"error":"model not found"})";
+    std::string response =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_FALSE(result.header_snoop_success);
+    EXPECT_EQ(result.data, body);
+    EXPECT_TRUE(result.done);
+}
+
+TEST_F(StreamParserTest, ContentLengthLargeJsonBody) {
+    // Simulate a larger Ollama response that would have triggered
+    // "Chunk size line too long" before the fix
+    std::string body(500, 'x');  // 500-byte body
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_EQ(result.data, body);
+    EXPECT_TRUE(result.done);
+    EXPECT_FALSE(result.has_error);
+}
+
+TEST_F(StreamParserTest, LowercaseContentLengthHeader) {
+    // Some servers send lowercase header names
+    std::string body = R"({"ok":true})";
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "content-length: " + std::to_string(body.size()) + "\r\n"
+        "\r\n" + body;
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_EQ(result.data, body);
+    EXPECT_TRUE(result.done);
+}
+
+TEST_F(StreamParserTest, MixedCaseTransferEncodingHeader) {
+    // RFC 7230: header names are case-insensitive
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-encoding: Chunked\r\n"
+        "\r\n"
+        "5\r\n"
+        "hello\r\n"
+        "0\r\n"
+        "\r\n";
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_EQ(result.data, "hello");
+    EXPECT_TRUE(result.done);
+}
+
+TEST_F(StreamParserTest, LowercaseTransferEncodingHeader) {
+    // Some servers send lowercase header names
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "transfer-encoding: chunked\r\n"
+        "\r\n"
+        "5\r\n"
+        "hello\r\n"
+        "0\r\n"
+        "\r\n";
+
+    auto result = parser.push(make_buffer(response));
+
+    EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_EQ(result.data, "hello");
+    EXPECT_TRUE(result.done);
 }
 
 // =============================================================================
