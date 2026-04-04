@@ -528,7 +528,7 @@ private:
     seastar::future<> write_client_error(
         seastar::output_stream<char>* client_out,
         std::string error_msg,
-        bool is_streaming = true);
+        bool is_streaming);
 
     // Record final metrics and clean up after proxy request completes
     void record_proxy_completion_metrics(
