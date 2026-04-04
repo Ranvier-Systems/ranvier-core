@@ -77,6 +77,13 @@ public:
     // Get current parser state (for debugging/metrics)
     State state() const noexcept { return _state; }
 
+    // True if the backend response uses chunked transfer encoding (SSE streaming).
+    // False if the response uses Content-Length (non-streaming, e.g. Ollama).
+    // Only valid after parse_headers() has completed (state != Headers).
+    bool is_streaming() const noexcept {
+        return _state == State::ChunkSize || _state == State::ChunkData;
+    }
+
     // Get accumulated buffer size (for backpressure monitoring)
     size_t buffer_size() const noexcept { return _accum.size() - _read_pos; }
 

@@ -120,6 +120,7 @@ struct ProxyContext {
     bool client_disconnected = false;
     bool stream_closed = false;
     bool response_latency_recorded = false;
+    bool client_expects_streaming = true;  // True if client request had "stream":true (SSE); false for JSON
 
     // Retry tracking
     uint32_t retry_attempt = 0;
@@ -521,10 +522,13 @@ private:
         ConnectionBundle* bundle,
         seastar::output_stream<char>* client_out);
 
-    // Write error message to client, handling disconnected clients gracefully
+    // Write error message to client, handling disconnected clients gracefully.
+    // When is_streaming is true (chunked/SSE), writes SSE-formatted error: data: {"error": "..."}\n\n
+    // When is_streaming is false (Content-Length), writes plain JSON: {"error": "..."}
     seastar::future<> write_client_error(
         seastar::output_stream<char>* client_out,
-        std::string error_msg);
+        std::string error_msg,
+        bool is_streaming);
 
     // Record final metrics and clean up after proxy request completes
     void record_proxy_completion_metrics(
