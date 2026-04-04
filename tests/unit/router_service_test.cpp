@@ -308,6 +308,75 @@ TEST_F(RouterServiceTest, DuplicateRegisterDoesNotDuplicate) {
     EXPECT_EQ(ids.size(), 1u);
 }
 
+// =============================================================================
+// supports_token_ids tests
+// =============================================================================
+
+TEST_F(RouterServiceTest, BackendSupportsTokenIdsDefaultTrue) {
+    // Default registration should support token IDs (backward compatibility)
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    EXPECT_TRUE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, BackendSupportsTokenIdsExplicitFalse) {
+    // Register a non-vLLM backend (e.g., Ollama) that doesn't support prompt_token_ids
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, false);
+    EXPECT_FALSE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, BackendSupportsTokenIdsExplicitTrue) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true);
+    EXPECT_TRUE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, BackendSupportsTokenIdsNonexistentReturnsFalse) {
+    // Non-existent backend should return false (safe default: don't inject)
+    EXPECT_FALSE(router_->backend_supports_token_ids(999));
+}
+
+TEST_F(RouterServiceTest, BackendSupportsTokenIdsUpdatedOnReregister) {
+    // Register with token support, then re-register without
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true);
+    EXPECT_TRUE(router_->backend_supports_token_ids(1));
+
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, false);
+    EXPECT_FALSE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, BackendSupportsTokenIdsMixedFleet) {
+    // Mixed fleet: vLLM backend with token support, Ollama without
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true);   // vLLM
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 11434),
+                                                 100, 0, false);  // Ollama
+
+    EXPECT_TRUE(router_->backend_supports_token_ids(1));
+    EXPECT_FALSE(router_->backend_supports_token_ids(2));
+}
+
+TEST_F(RouterServiceTest, BackendStatesIncludeSupportsTokenIds) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 11434),
+                                                 100, 0, false);
+
+    auto states = router_->get_all_backend_states();
+    ASSERT_EQ(states.size(), 2u);
+
+    // Find each backend in the states
+    for (const auto& s : states) {
+        if (s.id == 1) {
+            EXPECT_TRUE(s.supports_token_ids);
+        } else if (s.id == 2) {
+            EXPECT_FALSE(s.supports_token_ids);
+        }
+    }
+}
+
 TEST_F(RouterServiceTest, UnregisterClearsDeadStatus) {
     RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
     RouterService::mark_backend_dead_for_testing(1);

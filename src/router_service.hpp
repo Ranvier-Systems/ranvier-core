@@ -323,7 +323,8 @@ public:
     // Weight: relative load balancing weight (default 100, higher = more traffic)
     // Priority: priority group (default 0 = highest, lower priority backends used for fallback)
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr,
-                                               uint32_t weight = 100, uint32_t priority = 0) override;
+                                               uint32_t weight = 100, uint32_t priority = 0,
+                                               bool supports_token_ids = true) override;
 
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id) override;
@@ -366,11 +367,16 @@ public:
         uint32_t priority;
         bool is_draining;
         bool is_dead;
+        bool supports_token_ids;  // Whether backend supports vLLM prompt_token_ids
         int64_t drain_start_ms;  // 0 if not draining
     };
 
     // Get all backend states for admin inspection
     std::vector<BackendState> get_all_backend_states() const;
+
+    // Check if a backend supports vLLM's prompt_token_ids field.
+    // Returns false if backend not found (safe default: don't inject unknown fields).
+    bool backend_supports_token_ids(BackendId id) const;
 
     // Get tree dump for admin inspection (local shard only)
     RadixTree::DumpNode get_tree_dump() const;
@@ -478,7 +484,8 @@ public:
     // Register a backend in shard-local state (bypasses async cross-shard broadcast).
     // Allows unit tests to set up backend state without a running Seastar reactor.
     static void register_backend_for_testing(BackendId id, seastar::socket_address addr,
-                                              uint32_t weight = 100, uint32_t priority = 0);
+                                              uint32_t weight = 100, uint32_t priority = 0,
+                                              bool supports_token_ids = true);
 
     // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
     static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);
