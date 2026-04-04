@@ -64,6 +64,26 @@ private:
     static constexpr size_t MAX_TRACKED_BACKENDS = 256;
     uint64_t _metrics_overflow_drops = 0;
 
+    // --- Adaptive scrape suppression ---
+    // After SCRAPE_FAILURE_SUPPRESSION_THRESHOLD consecutive failures for a
+    // backend, stop scraping it (avoids log noise and wasted TCP connections
+    // for non-vLLM backends like Ollama). A single successful scrape resets
+    // the counter, so backends upgraded to vLLM recover automatically.
+    static constexpr uint32_t SCRAPE_FAILURE_SUPPRESSION_THRESHOLD = 3;
+
+    // Per-backend consecutive failure count.
+    // Hard Rule #4: bounded by MAX_TRACKED_BACKENDS (same pool of backends).
+    absl::flat_hash_map<BackendId, uint32_t> _backend_scrape_failures;
+
+    // Returns true if scraping should be skipped for this backend
+    bool is_scrape_suppressed(BackendId id) const;
+
+    // Record a scrape failure; returns the new consecutive failure count
+    uint32_t record_scrape_failure(BackendId id);
+
+    // Record a scrape success (resets failure counter)
+    void record_scrape_success(BackendId id);
+
     // Run one metrics scrape pass across all backends (called from run_loop)
     seastar::future<> scrape_all_vllm_metrics(
         const std::vector<std::pair<BackendId, seastar::socket_address>>& backends);
@@ -83,6 +103,7 @@ private:
     uint64_t _vllm_scrapes_total = 0;
     uint64_t _vllm_scrapes_success = 0;
     uint64_t _vllm_scrapes_failed = 0;
+    uint64_t _vllm_scrapes_suppressed = 0;
 
     // Scrape duration histogram (using simple sum/count for now)
     double _vllm_scrape_duration_sum = 0.0;
