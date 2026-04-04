@@ -61,6 +61,7 @@ public:
         bool header_snoop_success = false;  // Did we see HTTP 200 OK?
         bool done = false;                  // Is the stream finished (0-length chunk)?
         bool has_error = false;             // Did parsing encounter an error?
+        bool connection_close = false;      // Backend signaled Connection: close (or HTTP/1.0 without keep-alive)
         std::string error_message;          // Error description if has_error is true
     };
 

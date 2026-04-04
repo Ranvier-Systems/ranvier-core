@@ -163,6 +163,8 @@ ssize_t StreamParser::parse_headers(Result& res) {
     // Per RFC 7230 §3.2, HTTP header field names are case-insensitive.
     // We use a case-insensitive prefix match to handle any server casing.
     bool is_chunked = false;
+    bool saw_connection_close = false;
+    bool saw_connection_keepalive = false;
     _content_length = 0;
 
     // Case-insensitive prefix match (needle must be all lowercase)
@@ -199,6 +201,14 @@ ssize_t StreamParser::parse_headers(Result& res) {
             if (icase_contains(line.substr(18), "chunked")) {
                 is_chunked = true;
             }
+        } else if (icase_starts_with(line, "connection:")) {
+            auto val = line.substr(11);
+            if (icase_contains(val, "close")) {
+                saw_connection_close = true;
+            }
+            if (icase_contains(val, "keep-alive")) {
+                saw_connection_keepalive = true;
+            }
         } else if (icase_starts_with(line, "content-length:")) {
             auto val_str = line.substr(15);
             while (!val_str.empty() && (val_str.front() == ' ' || val_str.front() == '\t')) {
@@ -217,6 +227,16 @@ ssize_t StreamParser::parse_headers(Result& res) {
         }
 
         line_start = (line_end < headers.size()) ? line_end + 2 : headers.size();
+    }
+
+    // Determine connection persistence.
+    // HTTP/1.0 defaults to close unless explicit "Connection: keep-alive".
+    // HTTP/1.1 defaults to keep-alive unless explicit "Connection: close".
+    bool is_http_10 = icase_starts_with(headers, "http/1.0");
+    if (saw_connection_close) {
+        res.connection_close = true;
+    } else if (is_http_10 && !saw_connection_keepalive) {
+        res.connection_close = true;
     }
 
     if (is_chunked) {
