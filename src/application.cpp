@@ -1416,37 +1416,38 @@ seastar::future<> Application::reload_config() {
         // Log warnings for settings that cannot be hot-reloaded
         log_non_reloadable_changes(new_config);
 
-        // Use shared_ptr to avoid copying config N times for N shards
-        auto config_ptr = std::make_shared<RanvierConfig>(std::move(new_config));
+        // Pin config on shard 0 with do_with; avoids std::shared_ptr (Rule #0).
+        // invoke_on_all lambdas capture by value so each shard owns its copy.
+        return seastar::do_with(std::move(new_config), [this, now](RanvierConfig& cfg_ref) {
+            // Step 1: Update the sharded config across all cores using invoke_on_all
+            // Each shard receives its own copy — no cross-shard atomic refcounting
+            return _sharded_config.invoke_on_all([cfg_ref](ShardedConfig& cfg) {
+                cfg.update(cfg_ref);
+            }).then([this, &cfg_ref] {
+                log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
 
-        // Step 1: Update the sharded config across all cores using invoke_on_all
-        // This ensures each shard has the updated configuration for lock-free access
-        return _sharded_config.invoke_on_all([config_ptr](ShardedConfig& cfg) {
-            cfg.update(*config_ptr);
-        }).then([this, config_ptr] {
-            log_main.debug("Sharded config updated on all {} cores", seastar::smp::count);
+                // Step 2: Build updated controller config from the new config
+                auto ctrl_config = build_controller_config_from(cfg_ref);
 
-            // Step 2: Build updated controller config from the new config
-            auto ctrl_config = build_controller_config_from(*config_ptr);
+                // Step 3: Update HttpController config on all shards
+                return _controller.invoke_on_all([ctrl_config](HttpController& c) {
+                    c.update_config(ctrl_config);
+                });
+            }).then([this, &cfg_ref] {
+                // Step 4: Update routing config on all shards via RouterService
+                return _router->update_routing_config(cfg_ref.routing);
+            }).then([this, &cfg_ref, now] {
+                // Step 5: Only update master config after all shards succeeded
+                // This ensures consistency - if any step fails, master config is unchanged
+                _config = cfg_ref;
+                _last_reload_time = now;
 
-            // Step 3: Update HttpController config on all shards
-            return _controller.invoke_on_all([ctrl_config](HttpController& c) {
-                c.update_config(ctrl_config);
+                // Step 6: Re-apply auto-configure for max_token_id from tokenizer vocab size
+                // This ensures the tokenizer-derived value is preserved across reloads
+                return apply_vocab_size_config();
+            }).then([] {
+                log_main.info("Configuration reloaded successfully on all cores");
             });
-        }).then([this, config_ptr] {
-            // Step 4: Update routing config on all shards via RouterService
-            return _router->update_routing_config(config_ptr->routing);
-        }).then([this, config_ptr, now] {
-            // Step 5: Only update master config after all shards succeeded
-            // This ensures consistency - if any step fails, master config is unchanged
-            _config = *config_ptr;
-            _last_reload_time = now;
-
-            // Step 6: Re-apply auto-configure for max_token_id from tokenizer vocab size
-            // This ensures the tokenizer-derived value is preserved across reloads
-            return apply_vocab_size_config();
-        }).then([] {
-            log_main.info("Configuration reloaded successfully on all cores");
         });
     }).handle_exception([](auto ep) {
         try {
