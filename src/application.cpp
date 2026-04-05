@@ -232,6 +232,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.cost_routing_small_threshold = config.routing.cost_routing.small_request_threshold;
     cfg.cost_routing_fast_lane = config.routing.cost_routing.enable_fast_lane;
     cfg.cost_routing_imbalance_factor = config.routing.cost_routing.cost_imbalance_factor;
+    // Compression-aware load scoring
+    cfg.default_compression_ratio = config.routing.default_compression_ratio;
     return cfg;
 }
 

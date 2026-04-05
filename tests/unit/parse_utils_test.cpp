@@ -178,3 +178,43 @@ TEST_F(ParseAliasTest, BackendIdParsesLikeInt32) {
     EXPECT_EQ(parse_backend_id("abc"), std::nullopt);
     EXPECT_EQ(parse_backend_id(""), std::nullopt);
 }
+
+// =============================================================================
+// parse_double Tests
+// =============================================================================
+
+class ParseDoubleTest : public ::testing::Test {};
+
+TEST_F(ParseDoubleTest, ValidValues) {
+    EXPECT_DOUBLE_EQ(parse_double("1.0").value(), 1.0);
+    EXPECT_DOUBLE_EQ(parse_double("6.0").value(), 6.0);
+    EXPECT_DOUBLE_EQ(parse_double("0.5").value(), 0.5);
+    EXPECT_DOUBLE_EQ(parse_double("100").value(), 100.0);
+    EXPECT_DOUBLE_EQ(parse_double("-3.14").value(), -3.14);
+    EXPECT_DOUBLE_EQ(parse_double("0").value(), 0.0);
+}
+
+TEST_F(ParseDoubleTest, ScientificNotation) {
+    EXPECT_DOUBLE_EQ(parse_double("1e3").value(), 1000.0);
+    EXPECT_DOUBLE_EQ(parse_double("2.5e-1").value(), 0.25);
+}
+
+TEST_F(ParseDoubleTest, TrailingGarbageRejected) {
+    EXPECT_EQ(parse_double("1.0abc"), std::nullopt);
+    EXPECT_EQ(parse_double("3.14 "), std::nullopt);
+    EXPECT_EQ(parse_double("1.0 2.0"), std::nullopt);
+}
+
+TEST_F(ParseDoubleTest, NonNumericRejected) {
+    EXPECT_EQ(parse_double("abc"), std::nullopt);
+    EXPECT_EQ(parse_double(""), std::nullopt);
+    EXPECT_EQ(parse_double(" "), std::nullopt);
+}
+
+TEST_F(ParseDoubleTest, InfAndNanRejected) {
+    EXPECT_EQ(parse_double("inf"), std::nullopt);
+    EXPECT_EQ(parse_double("-inf"), std::nullopt);
+    EXPECT_EQ(parse_double("nan"), std::nullopt);
+    EXPECT_EQ(parse_double("NaN"), std::nullopt);
+    EXPECT_EQ(parse_double("infinity"), std::nullopt);
+}

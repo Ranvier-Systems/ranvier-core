@@ -41,6 +41,10 @@ public:
     // Returns 0.0 if no vLLM metrics available (optimistic default)
     double get_backend_load(BackendId id) const;
 
+    // Set compression ratio for a backend (called at registration time).
+    // Used during load broadcast to compute compression-aware load scores.
+    void set_backend_compression_ratio(BackendId id, double compression_ratio);
+
 private:
     BackendRegistry& _registry;
     HealthServiceConfig _config;
@@ -63,6 +67,11 @@ private:
     absl::flat_hash_map<BackendId, VLLMMetrics> _backend_vllm_metrics;
     static constexpr size_t MAX_TRACKED_BACKENDS = 256;
     uint64_t _metrics_overflow_drops = 0;
+
+    // Per-backend compression ratio for compression-aware load scoring.
+    // Sourced from BackendInfo at registration time; read during load broadcast.
+    // Hard Rule #4: bounded by MAX_TRACKED_BACKENDS (same backend pool).
+    absl::flat_hash_map<BackendId, double> _backend_compression_ratios;
 
     // --- Adaptive scrape suppression ---
     // After SCRAPE_FAILURE_SUPPRESSION_THRESHOLD consecutive failures for a

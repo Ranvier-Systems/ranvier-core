@@ -166,6 +166,10 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<int>("RANVIER_ROUTING_GPU_LOAD_CACHE_TTL")) {
         routing.gpu_load_cache_ttl = std::chrono::seconds(*v);
     }
+    // Compression-aware load scoring
+    if (auto v = get_env_as<double>("RANVIER_DEFAULT_COMPRESSION_RATIO")) {
+        routing.default_compression_ratio = *v;
+    }
     // Cross-shard load synchronization
     if (auto v = get_env("RANVIER_CROSS_SHARD_LOAD_SYNC")) {
         routing.cross_shard_load_sync = (*v == "1" || *v == "true" || *v == "yes");
@@ -942,6 +946,10 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["gpu_load_cache_ttl"]) {
                 config.routing.gpu_load_cache_ttl =
                     std::chrono::seconds(r["gpu_load_cache_ttl"].as<int>());
+            }
+            // Compression-aware load scoring
+            if (r["default_compression_ratio"]) {
+                config.routing.default_compression_ratio = r["default_compression_ratio"].as<double>();
             }
             // Cost-based routing sub-section (nested under routing)
             if (r["cost_routing"]) {
@@ -1750,6 +1758,11 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.local_mode.discovery_ports.size() > LocalModeConfig::MAX_DISCOVERY_PORTS) {
         return "local_mode.discovery_ports exceeds maximum of 64 entries (Rule #4)";
+    }
+
+    // Validate compression-aware load scoring
+    if (config.routing.default_compression_ratio < 1.0) {
+        return "default_compression_ratio must be >= 1.0 (1.0 = no compression)";
     }
 
     // Validate cost-based routing settings

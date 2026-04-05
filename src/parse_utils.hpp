@@ -1,8 +1,10 @@
 #pragma once
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -198,6 +200,37 @@ inline std::optional<bool> parse_bool(std::string_view input) {
         return false;
     }
     return std::nullopt;
+}
+
+/**
+ * Parse a string as double.
+ * Uses std::strtod with strict validation (Rule #10: no unchecked conversions).
+ * Rejects empty input, trailing characters, Inf, and NaN.
+ *
+ * @param input String to parse
+ * @return Parsed value, or std::nullopt if invalid
+ */
+inline std::optional<double> parse_double(std::string_view input) {
+    if (input.empty()) {
+        return std::nullopt;
+    }
+
+    // std::strtod requires null-terminated string
+    std::string str(input);
+    char* end = nullptr;
+    double value = std::strtod(str.c_str(), &end);
+
+    // Require exact match - no trailing characters allowed
+    if (end != str.c_str() + str.size()) {
+        return std::nullopt;
+    }
+
+    // Reject Inf/NaN
+    if (!std::isfinite(value)) {
+        return std::nullopt;
+    }
+
+    return value;
 }
 
 } // namespace ranvier

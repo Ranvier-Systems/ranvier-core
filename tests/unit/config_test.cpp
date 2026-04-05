@@ -2194,6 +2194,46 @@ TEST_F(ConfigTest, DashboardEnvFalseValues) {
     EXPECT_FALSE(config.dashboard.enable_cors);
 }
 
+// =============================================================================
+// Compression Ratio Validation Tests
+// =============================================================================
+
+TEST_F(ConfigTest, ValidationPassesForDefaultCompressionRatio) {
+    RanvierConfig config;
+    // Default is 1.0
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidationPassesForHighCompressionRatio) {
+    RanvierConfig config;
+    config.routing.default_compression_ratio = 6.0;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, ValidationFailsForCompressionRatioBelowOne) {
+    RanvierConfig config;
+    config.routing.default_compression_ratio = 0.5;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("compression_ratio"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidationFailsForZeroCompressionRatio) {
+    RanvierConfig config;
+    config.routing.default_compression_ratio = 0.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+}
+
+TEST_F(ConfigTest, ValidationFailsForNegativeCompressionRatio) {
+    RanvierConfig config;
+    config.routing.default_compression_ratio = -1.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

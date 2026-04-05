@@ -235,6 +235,9 @@ struct HttpControllerConfig {
     bool cost_routing_fast_lane = true;
     double cost_routing_imbalance_factor = 2.0;
 
+    // Compression-aware load scoring: fleet-wide default when not specified per-backend
+    double default_compression_ratio = 1.0;
+
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }

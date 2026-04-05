@@ -83,14 +83,20 @@ struct BackendInfo {
     // Shard-local, same as active_requests — no atomics needed.
     double current_cost_budget = 0.0;
 
+    // KV-cache compression ratio (>= 1.0). A backend with 6x compression
+    // has 6x effective cache capacity. Default 1.0 (no compression).
+    // Set via per-backend config or admin API. Technology-agnostic.
+    double compression_ratio = 1.0;
+
     BackendInfo() = default;
 
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
-                bool supports_token_ids_ = true)
+                bool supports_token_ids_ = true, double compression_ratio_ = 1.0)
         : addr(std::move(addr_))
         , weight(weight_)
         , priority(priority_)
-        , supports_token_ids(supports_token_ids_) {}
+        , supports_token_ids(supports_token_ids_)
+        , compression_ratio(compression_ratio_) {}
 };
 
 // ============================================================================
@@ -3190,19 +3196,23 @@ seastar::future<> RouterService::broadcast_gpu_load(
 
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
                                                           uint32_t weight, uint32_t priority,
-                                                          bool supports_token_ids) {
-    return seastar::do_with(addr, weight, priority, supports_token_ids,
+                                                          bool supports_token_ids,
+                                                          double compression_ratio) {
+    return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio,
         [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
-             uint32_t& shared_priority, bool& shared_supports_token_ids) {
+             uint32_t& shared_priority, bool& shared_supports_token_ids,
+             double& shared_compression_ratio) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-            [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids] (unsigned shard_id) {
+            [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
+             &shared_compression_ratio] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
                                                        weight = shared_weight,
                                                        priority = shared_priority,
-                                                       supports_token_ids = shared_supports_token_ids] {
+                                                       supports_token_ids = shared_supports_token_ids,
+                                                       compression_ratio = shared_compression_ratio] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
-                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids};
+                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids, compression_ratio};
 
                 // Update vector (check for duplicates)
                 bool exists = false;
@@ -3290,6 +3300,7 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         bs.is_draining = info.is_draining;
         bs.is_dead = shard.dead_backends.contains(id);
         bs.supports_token_ids = info.supports_token_ids;
+        bs.compression_ratio = info.compression_ratio;
 
         if (info.is_draining) {
             // Convert steady_clock to wall-clock time:
@@ -3584,10 +3595,11 @@ void RouterService::set_circuit_cleanup_callback(CircuitCleanupCallback callback
 
 void RouterService::register_backend_for_testing(BackendId id, seastar::socket_address addr,
                                                    uint32_t weight, uint32_t priority,
-                                                   bool supports_token_ids) {
+                                                   bool supports_token_ids,
+                                                   double compression_ratio) {
     if (!g_shard_state) return;
     auto& state = *g_shard_state;
-    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids};
+    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids, compression_ratio};
 
     bool exists = false;
     for (auto existing : state.backend_ids) {
