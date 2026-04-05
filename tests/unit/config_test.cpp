@@ -75,6 +75,9 @@ protected:
         unsetenv("RANVIER_LOCAL_DISCOVERY_SCAN_INTERVAL");
         unsetenv("RANVIER_LOCAL_DISCOVERY_PROBE_TIMEOUT_MS");
         unsetenv("RANVIER_LOCAL_DISCOVERY_CONNECT_TIMEOUT_MS");
+        // Dashboard env vars
+        unsetenv("RANVIER_DASHBOARD_ENABLED");
+        unsetenv("RANVIER_DASHBOARD_CORS");
     }
 
     void TearDown() override {
@@ -86,6 +89,7 @@ protected:
         std::remove("test_dns_discovery.yaml");
         std::remove("test_gossip_tls.yaml");
         std::remove("test_local_mode.yaml");
+        std::remove("test_dashboard.yaml");
     }
 
     void writeTestConfig(const std::string& filename, const std::string& content) {
@@ -2126,6 +2130,68 @@ TEST_F(ConfigTest, LocalModeDisabledDoesNotAffectCluster) {
     error = RanvierConfig::validate(config);
     EXPECT_FALSE(error.has_value());
     EXPECT_TRUE(config.cluster.enabled);
+}
+
+// =============================================================================
+// Dashboard Configuration Tests
+// =============================================================================
+
+TEST_F(ConfigTest, DashboardDefaults) {
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.dashboard.enabled);
+    EXPECT_FALSE(config.dashboard.enable_cors);
+}
+
+TEST_F(ConfigTest, DashboardFromYaml) {
+    writeTestConfig("test_dashboard.yaml", R"(
+dashboard:
+  enabled: true
+  enable_cors: true
+)");
+    auto config = RanvierConfig::load("test_dashboard.yaml");
+    EXPECT_TRUE(config.dashboard.enabled);
+    EXPECT_TRUE(config.dashboard.enable_cors);
+}
+
+TEST_F(ConfigTest, DashboardPartialYamlUsesDefaults) {
+    writeTestConfig("test_dashboard.yaml", R"(
+dashboard:
+  enabled: true
+)");
+    auto config = RanvierConfig::load("test_dashboard.yaml");
+    EXPECT_TRUE(config.dashboard.enabled);
+    // enable_cors not set in YAML, should remain false
+    EXPECT_FALSE(config.dashboard.enable_cors);
+}
+
+TEST_F(ConfigTest, DashboardEnvironmentVariables) {
+    setenv("RANVIER_DASHBOARD_ENABLED", "true", 1);
+    setenv("RANVIER_DASHBOARD_CORS", "true", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.dashboard.enabled);
+    EXPECT_TRUE(config.dashboard.enable_cors);
+}
+
+TEST_F(ConfigTest, DashboardEnvOverridesYaml) {
+    writeTestConfig("test_dashboard.yaml", R"(
+dashboard:
+  enabled: false
+  enable_cors: false
+)");
+    setenv("RANVIER_DASHBOARD_ENABLED", "true", 1);
+    auto config = RanvierConfig::load("test_dashboard.yaml");
+    // Env overrides YAML for enabled
+    EXPECT_TRUE(config.dashboard.enabled);
+    // YAML value retained for enable_cors (not overridden by env)
+    EXPECT_FALSE(config.dashboard.enable_cors);
+}
+
+TEST_F(ConfigTest, DashboardEnvFalseValues) {
+    setenv("RANVIER_DASHBOARD_ENABLED", "false", 1);
+    setenv("RANVIER_DASHBOARD_CORS", "0", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_FALSE(config.dashboard.enabled);
+    EXPECT_FALSE(config.dashboard.enable_cors);
 }
 
 int main(int argc, char** argv) {

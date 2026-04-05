@@ -222,6 +222,9 @@ struct HttpControllerConfig {
     // Local mode settings (copied from LocalModeConfig at init)
     LocalModeConfig local_mode;
 
+    // Dashboard settings (CORS gating)
+    DashboardConfig dashboard;
+
     // Agent registry settings
     AgentRegistryConfig agent_registry;
 

@@ -96,8 +96,9 @@ static void print_local_mode_banner() {
 ╔═══════════════════════════════════════════════╗
 ║           Ranvier Local Mode                  ║
 ║                                               ║
-║  API:     http://localhost:8080               ║
-║  Metrics: http://localhost:9180/metrics       ║
+║  API:       http://localhost:8080             ║
+║  Dashboard: http://localhost:9180/dashboard   ║
+║  Metrics:   http://localhost:9180/metrics     ║
 ║                                               ║
 ║  Discovering backends on ports:               ║
 ║    11434 (Ollama), 8080 (vLLM), 1234 (LM      ║

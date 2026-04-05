@@ -335,6 +335,18 @@ struct AgentRegistryConfig {
 };
 
 // =============================================================================
+// Dashboard Configuration
+// =============================================================================
+
+// Local dashboard served on the metrics port (:9180/dashboard).
+// Shows discovered backends, agent status, queue depths, and request rates.
+// Auto-enabled in local mode; disabled by default in cloud mode.
+struct DashboardConfig {
+    bool enabled = false;                              // Serve dashboard on metrics port
+    bool enable_cors = false;                          // CORS for cross-port dashboard->API access
+};
+
+// =============================================================================
 // Local Mode Configuration
 // =============================================================================
 
@@ -390,6 +402,7 @@ struct RanvierConfig {
     IntentClassificationConfig intent_classification;
     LocalModeConfig local_mode;
     AgentRegistryConfig agent_registry;
+    DashboardConfig dashboard;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);

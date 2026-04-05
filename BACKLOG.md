@@ -852,8 +852,9 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
 - [ ] **[P3] Single-Binary Local Distribution (VISION 4.1)**
   _Complexity:_ Medium
 
-- [ ] **[P3] Local Dashboard UI (VISION 4.2)**
+- [x] **[P3] Local Dashboard UI (VISION 4.2)** ✓ Done (2026-04-04)
   _Complexity:_ High
+  _Delivered:_ Single-page dashboard at localhost:9180/dashboard with backend status, queue depths, agent table with pause/resume, and throughput stats. HTML embedded in binary via CMake. CORS gated behind DashboardConfig (auto-enabled in local mode).
 
 - [x] **[P3] Documentation & Examples (VISION 4.3)** ✓ Done (2026-04-04)
   _Complexity:_ Low
@@ -865,9 +866,29 @@ Chassis refactors (§13) are interleaved where they prevent rework on shared fil
 - **Tier 1 (Foundation):** Cost estimation, priority tiers, intent classification — 2026-03-28
 - **Tier 2 (Cloud Intelligence):** vLLM metrics, load-aware routing, cost-based routing — 2026-03-31
 - **Tier 3 (Local Product):** Local mode, backend discovery, agent-aware handling, pause/resume — 2026-03-29
-- **Tier 4 (Polish):** Documentation & integration examples — 2026-04-04
+- **Tier 4 (Polish):** Documentation & examples, local dashboard UI — 2026-04-04
 
-Remaining Tier 4 items (4.1 single-binary distribution, 4.2 local dashboard UI) are deferred — not blocking the v1.0 release.
+Remaining Tier 4 item (4.1 single-binary distribution) is deferred — not blocking the v1.0 release.
+
+### Dashboard v2 (future improvements)
+
+**Next iteration:**
+- [ ] **[P2] Rolling request rate** — replace average-over-uptime req/s with a sliding window (60s ring buffer in `/dashboard/stats`). Current metric flatlines quickly and doesn't reflect real-time throughput.
+  _Complexity:_ Low (add ring buffer to stats handler, ~50 lines)
+- [ ] **[P2] Error breakdown** — split "Errors: N" into timeouts, connection errors, circuit breaker rejections. MetricsService already tracks these separately (`_requests_timeout`, `_requests_connection_error`, `_circuit_opens`); just expose via `/dashboard/stats`.
+  _Complexity:_ Low (add fields to stats JSON, update dashboard JS)
+- [ ] **[P3] Backend detail** — show circuit breaker state (closed/open/half-open) and active connections per backend. HealthService already tracks vLLM GPU metrics that could surface here too.
+  _Complexity:_ Medium (need to expose circuit breaker state via admin API or new endpoint)
+
+**Later:**
+- [ ] **[P3] Cross-shard stats aggregation** — `/dashboard/stats` currently returns shard-0 counters only (correct for `--smp 1`). Multi-core needs `smp::invoke_on_all` to sum across shards, requiring an async handler instead of the sync `function_handler`.
+  _Complexity:_ Medium (async handler pattern change + cross-shard summation)
+- [ ] **[P4] WebSocket push** — replace 5s polling with push to eliminate the blind spot for transient queue depth spikes. Seastar has WebSocket support.
+  _Complexity:_ High (new protocol, connection lifecycle management)
+- [ ] **[P3] Request log tail** — last N requests with latency, status, backend, agent. Needs a bounded ring buffer per shard.
+  _Complexity:_ Medium (bounded ring buffer + new endpoint + dashboard panel)
+- [ ] **[P4] Model inventory per backend** — local discovery detects server type; could fetch `/api/tags` from Ollama to show available models on each backend.
+  _Complexity:_ Medium (discovery service changes + dashboard UI)
 
 ### Chassis items deferred (no urgency)
 

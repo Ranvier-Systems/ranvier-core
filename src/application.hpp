@@ -152,6 +152,9 @@ private:
     // Prevents concurrent execution from multiple signal handlers.
     std::atomic<bool> _shutdown_initiated{false};
 
+    // Startup timing for dashboard uptime calculation
+    std::chrono::steady_clock::time_point _startup_time;
+
     // Shutdown timing for metrics/debugging
     std::chrono::steady_clock::time_point _shutdown_start_time;
 

@@ -230,6 +230,32 @@ static GLOBAL: Jemalloc = Jemalloc;
     # Limit the Noise
     add_compile_options(-fmax-errors=3)
 
+    # =========================================================================
+    # Embed dashboard HTML as a compile-time C++ string
+    # =========================================================================
+    # Uses a custom target to run a CMake script at build time, so edits to
+    # index.html are picked up by `make` without re-running `cmake`.
+    # The script reads the HTML, injects it into the .hpp.in template via
+    # configure_file, and writes dashboard_resource.hpp to the build tree.
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/generated/dashboard_resource.hpp
+        COMMAND ${CMAKE_COMMAND}
+            -DDASHBOARD_IN=${CMAKE_SOURCE_DIR}/src/dashboard/dashboard_resource.hpp.in
+            -DDASHBOARD_HTML=${CMAKE_SOURCE_DIR}/src/dashboard/index.html
+            -DDASHBOARD_OUT=${CMAKE_BINARY_DIR}/generated/dashboard_resource.hpp
+            -P ${CMAKE_SOURCE_DIR}/cmake/embed_dashboard.cmake
+        DEPENDS
+            ${CMAKE_SOURCE_DIR}/src/dashboard/index.html
+            ${CMAKE_SOURCE_DIR}/src/dashboard/dashboard_resource.hpp.in
+            ${CMAKE_SOURCE_DIR}/cmake/embed_dashboard.cmake
+        COMMENT "Embedding dashboard HTML into dashboard_resource.hpp"
+    )
+    # Custom target so the header is generated before compilation
+    add_custom_target(dashboard_resource
+        DEPENDS ${CMAKE_BINARY_DIR}/generated/dashboard_resource.hpp
+    )
+
     # Define the Main Server Executable
     add_executable(ranvier_server
       src/main.cpp
@@ -256,8 +282,12 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/sqlite_persistence.cpp
       src/tracing_service.cpp
     )
+    add_dependencies(ranvier_server dashboard_resource)
 
-    target_include_directories(ranvier_server PRIVATE ${SQLITE3_INCLUDE_DIRS})
+    target_include_directories(ranvier_server PRIVATE
+        ${SQLITE3_INCLUDE_DIRS}
+        ${CMAKE_BINARY_DIR}/generated
+    )
 
     # Debug metrics configuration (optional)
     # Enables 8 additional gossip metrics for crypto offload debugging
@@ -925,7 +955,12 @@ if(Seastar_FOUND)
       src/tokenizer_thread_pool.cpp
       src/tracing_service.cpp
     )
-    target_include_directories(application_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+    target_include_directories(application_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${SQLITE3_INCLUDE_DIRS}
+        ${CMAKE_BINARY_DIR}/generated
+    )
+    add_dependencies(application_test dashboard_resource)
     if(NOT WITH_TELEMETRY)
         target_compile_definitions(application_test PRIVATE RANVIER_NO_TELEMETRY)
     endif()
