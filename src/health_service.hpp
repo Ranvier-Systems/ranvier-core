@@ -45,6 +45,16 @@ public:
     // Used during load broadcast to compute compression-aware load scores.
     void set_backend_compression_ratio(BackendId id, double compression_ratio);
 
+    // --- Fleet-Wide Cache Efficiency Accessors ---
+    // Synchronous, lock-free reads from in-memory maps (Rule #1).
+    // Called by MetricsService gauge lambdas during Prometheus scrape.
+
+    // Per-backend effective capacity: raw capacity * compression_ratio.
+    double get_backend_effective_cache_capacity(BackendId id) const;
+
+    // Per-backend effective usage: raw_usage / compression_ratio.
+    double get_backend_effective_cache_usage(BackendId id) const;
+
 private:
     BackendRegistry& _registry;
     HealthServiceConfig _config;
@@ -106,6 +116,14 @@ private:
 
     // Store scraped metrics with bounds checking
     void store_vllm_metrics(BackendId id, VLLMMetrics metrics);
+
+    // --- Fleet-Wide Cache Efficiency (private computation helpers) ---
+
+    // Sum of (raw_capacity_estimate * compression_ratio) across all backends.
+    double compute_fleet_effective_cache_capacity() const;
+
+    // Sum of (raw_usage / compression_ratio) across all backends.
+    double compute_fleet_effective_cache_usage() const;
 
     // --- Scraping Observability Metrics (Rule #6: deregistered in stop()) ---
     seastar::metrics::metric_groups _metrics;

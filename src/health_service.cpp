@@ -54,6 +54,15 @@ void HealthService::start() {
                 if (_vllm_scrape_duration_count == 0) return 0.0;
                 return _vllm_scrape_duration_sum / static_cast<double>(_vllm_scrape_duration_count);
             }),
+
+        // Fleet-wide cache efficiency gauges
+        sm::make_gauge("fleet_effective_cache_capacity_total",
+            sm::description("Sum of (raw GPU memory * compression_ratio) across all backends with valid metrics (bytes)"),
+            [this] { return compute_fleet_effective_cache_capacity(); }),
+
+        sm::make_gauge("fleet_effective_cache_usage_total",
+            sm::description("Sum of (raw cache usage / compression_ratio) across all backends with valid metrics (bytes)"),
+            [this] { return compute_fleet_effective_cache_usage(); }),
     });
 
     _running = true;
@@ -428,6 +437,72 @@ void HealthService::store_vllm_metrics(BackendId id, VLLMMetrics metrics) {
         return;
     }
     _backend_vllm_metrics[id] = std::move(metrics);
+}
+
+// =============================================================================
+// Fleet-Wide Cache Efficiency Metrics
+// =============================================================================
+// All methods are synchronous, reading from in-memory maps.
+// Called by Prometheus gauge lambdas — lock-free (Rule #1).
+
+double HealthService::compute_fleet_effective_cache_capacity() const {
+    double total = 0.0;
+    for (const auto& [id, m] : _backend_vllm_metrics) {
+        if (!m.valid || m.gpu_memory_total_bytes <= 0.0) continue;
+        double cr = 1.0;
+        auto cr_it = _backend_compression_ratios.find(id);
+        if (cr_it != _backend_compression_ratios.end()) {
+            cr = cr_it->second;
+        }
+        total += m.gpu_memory_total_bytes * cr;
+    }
+    return total;
+}
+
+double HealthService::compute_fleet_effective_cache_usage() const {
+    double total = 0.0;
+    for (const auto& [id, m] : _backend_vllm_metrics) {
+        if (!m.valid || m.gpu_memory_total_bytes <= 0.0) continue;
+        double cr = 1.0;
+        auto cr_it = _backend_compression_ratios.find(id);
+        if (cr_it != _backend_compression_ratios.end()) {
+            cr = cr_it->second;
+        }
+        // Effective usage = raw_usage / compression_ratio
+        // Raw usage = gpu_cache_usage_percent * gpu_memory_total_bytes
+        double raw_usage = m.gpu_cache_usage_percent * m.gpu_memory_total_bytes;
+        total += raw_usage / cr;
+    }
+    return total;
+}
+
+double HealthService::get_backend_effective_cache_capacity(BackendId id) const {
+    auto it = _backend_vllm_metrics.find(id);
+    if (it == _backend_vllm_metrics.end() || !it->second.valid
+        || it->second.gpu_memory_total_bytes <= 0.0) {
+        return 0.0;
+    }
+    double cr = 1.0;
+    auto cr_it = _backend_compression_ratios.find(id);
+    if (cr_it != _backend_compression_ratios.end()) {
+        cr = cr_it->second;
+    }
+    return it->second.gpu_memory_total_bytes * cr;
+}
+
+double HealthService::get_backend_effective_cache_usage(BackendId id) const {
+    auto it = _backend_vllm_metrics.find(id);
+    if (it == _backend_vllm_metrics.end() || !it->second.valid
+        || it->second.gpu_memory_total_bytes <= 0.0) {
+        return 0.0;
+    }
+    double cr = 1.0;
+    auto cr_it = _backend_compression_ratios.find(id);
+    if (cr_it != _backend_compression_ratios.end()) {
+        cr = cr_it->second;
+    }
+    double raw_usage = it->second.gpu_cache_usage_percent * it->second.gpu_memory_total_bytes;
+    return raw_usage / cr;
 }
 
 } // namespace ranvier

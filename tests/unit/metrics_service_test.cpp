@@ -533,3 +533,76 @@ TEST_F(PriorityMetricsTest, HighVolumeDoesNotCrash) {
         svc.decrement_priority_active(tier);
     }
 }
+
+// =============================================================================
+// P1: Prefix Hits by Compression Tier Tests
+// =============================================================================
+
+class PrefixHitsByCompressionTierTest : public ::testing::Test {
+protected:
+    MetricsService svc;
+};
+
+TEST_F(PrefixHitsByCompressionTierTest, AllCountersStartAtZero) {
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 0u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_moderate(), 0u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_high(), 0u);
+}
+
+TEST_F(PrefixHitsByCompressionTierTest, UncompressedBackendGoesToNoneTier) {
+    svc.record_prefix_hit_by_compression_tier(1.0);
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 1u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_moderate(), 0u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_high(), 0u);
+}
+
+TEST_F(PrefixHitsByCompressionTierTest, ModerateCompressionGoesToModerateTier) {
+    svc.record_prefix_hit_by_compression_tier(2.0);
+    svc.record_prefix_hit_by_compression_tier(3.5);
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 0u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_moderate(), 2u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_high(), 0u);
+}
+
+TEST_F(PrefixHitsByCompressionTierTest, HighCompressionGoesToHighTier) {
+    svc.record_prefix_hit_by_compression_tier(4.0);
+    svc.record_prefix_hit_by_compression_tier(6.0);
+    svc.record_prefix_hit_by_compression_tier(10.0);
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 0u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_moderate(), 0u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_high(), 3u);
+}
+
+TEST_F(PrefixHitsByCompressionTierTest, BoundaryValues) {
+    // Exactly 1.0 -> none
+    svc.record_prefix_hit_by_compression_tier(1.0);
+    // Just above 1.0 -> moderate
+    svc.record_prefix_hit_by_compression_tier(1.001);
+    // Just below 4.0 -> moderate
+    svc.record_prefix_hit_by_compression_tier(3.999);
+    // Exactly 4.0 -> high
+    svc.record_prefix_hit_by_compression_tier(4.0);
+
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 1u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_moderate(), 2u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_high(), 1u);
+}
+
+TEST_F(PrefixHitsByCompressionTierTest, SubOneRatioTreatedAsNone) {
+    // compression_ratio < 1.0 shouldn't happen (clamped at config layer),
+    // but if it does, bucket as "none" (defensive)
+    svc.record_prefix_hit_by_compression_tier(0.5);
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 1u);
+}
+
+TEST_F(PrefixHitsByCompressionTierTest, MixedTrafficAcrossAllTiers) {
+    // Simulate fleet with 3 backend types
+    for (int i = 0; i < 100; ++i) {
+        svc.record_prefix_hit_by_compression_tier(1.0);   // uncompressed
+        svc.record_prefix_hit_by_compression_tier(2.5);   // moderate
+        svc.record_prefix_hit_by_compression_tier(6.0);   // high (TurboQuant)
+    }
+    EXPECT_EQ(svc.get_prefix_hits_tier_none(), 100u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_moderate(), 100u);
+    EXPECT_EQ(svc.get_prefix_hits_tier_high(), 100u);
+}

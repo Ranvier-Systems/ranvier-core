@@ -233,7 +233,24 @@ public:
             // This is the running average of tokens skipped via path compression during lookups
             seastar::metrics::make_gauge("radix_tree_average_prefix_skip_length",
                 seastar::metrics::description("Average tokens skipped per lookup via path compression. Higher = better tree structure."),
-                [this] { return get_average_prefix_skip_length(); })
+                [this] { return get_average_prefix_skip_length(); }),
+
+            // Prefix cache hits bucketed by backend compression tier.
+            // Tiers: "none" (ratio == 1.0), "moderate" (1.0 < ratio < 4.0), "high" (ratio >= 4.0).
+            // Uses make_gauge with lambdas (same pattern as proxy_requests_by_priority)
+            // because Seastar's make_counter with labels requires a lambda, not a variable reference.
+            seastar::metrics::make_gauge("prefix_hits_by_compression_tier",
+                seastar::metrics::description("Cache hits on backends with no KV-cache compression (ratio == 1.0)"),
+                {{"compression_tier", "none"}},
+                [this] { return static_cast<double>(_prefix_hits_tier_none); }),
+            seastar::metrics::make_gauge("prefix_hits_by_compression_tier",
+                seastar::metrics::description("Cache hits on backends with moderate KV-cache compression (1.0 < ratio < 4.0)"),
+                {{"compression_tier", "moderate"}},
+                [this] { return static_cast<double>(_prefix_hits_tier_moderate); }),
+            seastar::metrics::make_gauge("prefix_hits_by_compression_tier",
+                seastar::metrics::description("Cache hits on backends with high KV-cache compression (ratio >= 4.0)"),
+                {{"compression_tier", "high"}},
+                [this] { return static_cast<double>(_prefix_hits_tier_high); })
         });
     }
 
@@ -318,6 +335,22 @@ public:
         _load_aware_fallbacks++;
     }
     uint64_t get_load_aware_fallbacks() const { return _load_aware_fallbacks; }
+
+    // Record a prefix cache hit bucketed by backend compression tier.
+    // compression_ratio: the selected backend's KV-cache compression ratio (>= 1.0).
+    // Tiers: "none" (== 1.0), "moderate" (1.0 < ratio < 4.0), "high" (>= 4.0).
+    void record_prefix_hit_by_compression_tier(double compression_ratio) {
+        if (compression_ratio >= 4.0) {
+            _prefix_hits_tier_high++;
+        } else if (compression_ratio > 1.0) {
+            _prefix_hits_tier_moderate++;
+        } else {
+            _prefix_hits_tier_none++;
+        }
+    }
+    uint64_t get_prefix_hits_tier_none() const { return _prefix_hits_tier_none; }
+    uint64_t get_prefix_hits_tier_moderate() const { return _prefix_hits_tier_moderate; }
+    uint64_t get_prefix_hits_tier_high() const { return _prefix_hits_tier_high; }
 
     // Per-priority tier metrics (shard-local counters, no atomics)
     void record_priority_request(uint8_t tier) {
@@ -472,6 +505,11 @@ private:
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
 
+    // Prefix hit counters by compression tier (shard-local, no atomics — Rule #1)
+    uint64_t _prefix_hits_tier_none = 0;      // compression_ratio == 1.0
+    uint64_t _prefix_hits_tier_moderate = 0;  // 1.0 < compression_ratio < 4.0
+    uint64_t _prefix_hits_tier_high = 0;      // compression_ratio >= 4.0
+
     // Per-priority tier counters (shard-local, no atomics — Hard Rule #0/#1)
     std::array<uint64_t, 4> _requests_by_priority = {0, 0, 0, 0};  // [CRITICAL, HIGH, NORMAL, LOW]
     std::array<uint64_t, 4> _active_by_priority = {0, 0, 0, 0};    // Active gauge per tier
@@ -611,6 +649,23 @@ private:
                 [this, backend_id] {
                     if (!_health_service) return 0.0;
                     return _health_service->get_vllm_metrics(backend_id).avg_generation_throughput;
+                }),
+
+            // Per-backend effective cache capacity/usage (compression-aware)
+            seastar::metrics::make_gauge("backend_effective_cache_capacity",
+                seastar::metrics::description("Raw GPU memory * compression_ratio (bytes). Higher = more effective KV-cache room."),
+                {{"backend_id", backend_id_str}},
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return _health_service->get_backend_effective_cache_capacity(backend_id);
+                }),
+
+            seastar::metrics::make_gauge("backend_effective_cache_usage",
+                seastar::metrics::description("Raw cache usage / compression_ratio (bytes). Lower = more effective headroom."),
+                {{"backend_id", backend_id_str}},
+                [this, backend_id] {
+                    if (!_health_service) return 0.0;
+                    return _health_service->get_backend_effective_cache_usage(backend_id);
                 })
         });
 

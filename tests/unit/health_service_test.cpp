@@ -88,6 +88,69 @@ struct TestMetricsStore {
         scrape_failures.erase(id);
     }
 
+    // Per-backend compression ratios (mirrors HealthService)
+    absl::flat_hash_map<BackendId, double> compression_ratios;
+
+    void set_compression_ratio(BackendId id, double cr) {
+        if (compression_ratios.size() >= MAX_TRACKED_BACKENDS
+            && !compression_ratios.contains(id)) {
+            return;
+        }
+        compression_ratios[id] = std::max(cr, 1.0);
+    }
+
+    // --- P1: Fleet-wide cache efficiency (mirrors HealthService) ---
+
+    double compute_fleet_effective_cache_capacity() const {
+        double total = 0.0;
+        for (const auto& [id, m] : backend_vllm_metrics) {
+            if (!m.valid || m.gpu_memory_total_bytes <= 0.0) continue;
+            double cr = 1.0;
+            auto cr_it = compression_ratios.find(id);
+            if (cr_it != compression_ratios.end()) cr = cr_it->second;
+            total += m.gpu_memory_total_bytes * cr;
+        }
+        return total;
+    }
+
+    double compute_fleet_effective_cache_usage() const {
+        double total = 0.0;
+        for (const auto& [id, m] : backend_vllm_metrics) {
+            if (!m.valid || m.gpu_memory_total_bytes <= 0.0) continue;
+            double cr = 1.0;
+            auto cr_it = compression_ratios.find(id);
+            if (cr_it != compression_ratios.end()) cr = cr_it->second;
+            double raw_usage = m.gpu_cache_usage_percent * m.gpu_memory_total_bytes;
+            total += raw_usage / cr;
+        }
+        return total;
+    }
+
+    double get_backend_effective_cache_capacity(BackendId id) const {
+        auto it = backend_vllm_metrics.find(id);
+        if (it == backend_vllm_metrics.end() || !it->second.valid
+            || it->second.gpu_memory_total_bytes <= 0.0) {
+            return 0.0;
+        }
+        double cr = 1.0;
+        auto cr_it = compression_ratios.find(id);
+        if (cr_it != compression_ratios.end()) cr = cr_it->second;
+        return it->second.gpu_memory_total_bytes * cr;
+    }
+
+    double get_backend_effective_cache_usage(BackendId id) const {
+        auto it = backend_vllm_metrics.find(id);
+        if (it == backend_vllm_metrics.end() || !it->second.valid
+            || it->second.gpu_memory_total_bytes <= 0.0) {
+            return 0.0;
+        }
+        double cr = 1.0;
+        auto cr_it = compression_ratios.find(id);
+        if (cr_it != compression_ratios.end()) cr = cr_it->second;
+        double raw_usage = it->second.gpu_cache_usage_percent * it->second.gpu_memory_total_bytes;
+        return raw_usage / cr;
+    }
+
     // Prune stale failure entries for backends no longer active
     // (mirrors scrape_all_vllm_metrics pruning logic)
     void prune_stale_failures(const std::vector<BackendId>& active_ids) {
@@ -109,6 +172,17 @@ static VLLMMetrics make_metrics(uint32_t running, uint32_t waiting, double cache
     m.num_requests_running = running;
     m.num_requests_waiting = waiting;
     m.gpu_cache_usage_percent = cache;
+    m.scraped_at = std::chrono::steady_clock::now();
+    return m;
+}
+
+// Helper: create a valid VLLMMetrics with GPU memory fields for fleet efficiency tests
+static VLLMMetrics make_metrics_with_memory(double cache_percent, double mem_used, double mem_total) {
+    VLLMMetrics m;
+    m.valid = true;
+    m.gpu_cache_usage_percent = cache_percent;
+    m.gpu_memory_used_bytes = mem_used;
+    m.gpu_memory_total_bytes = mem_total;
     m.scraped_at = std::chrono::steady_clock::now();
     return m;
 }
@@ -389,4 +463,133 @@ TEST_F(HealthServiceStoreTest, PruneWithEmptyActiveListClearsAll) {
 TEST_F(HealthServiceStoreTest, PruneWithEmptyFailuresIsNoOp) {
     store.prune_stale_failures({1, 2, 3});
     EXPECT_TRUE(store.scrape_failures.empty());
+}
+
+// =============================================================================
+// P1: Fleet-Wide Cache Efficiency Metrics
+// =============================================================================
+
+class FleetCacheEfficiencyTest : public ::testing::Test {
+protected:
+    TestMetricsStore store;
+};
+
+// --- Per-backend effective capacity ---
+
+TEST_F(FleetCacheEfficiencyTest, MissingBackendReturnsZeroCapacity) {
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_capacity(42), 0.0);
+}
+
+TEST_F(FleetCacheEfficiencyTest, InvalidMetricsReturnsZeroCapacity) {
+    VLLMMetrics m;
+    m.valid = false;
+    m.gpu_memory_total_bytes = 24e9;
+    store.store(1, m);
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_capacity(1), 0.0);
+}
+
+TEST_F(FleetCacheEfficiencyTest, ZeroMemoryReturnsZeroCapacity) {
+    store.store(1, make_metrics_with_memory(0.5, 0.0, 0.0));
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_capacity(1), 0.0);
+}
+
+TEST_F(FleetCacheEfficiencyTest, UncompressedBackendCapacity) {
+    // No compression ratio set -> default 1.0
+    store.store(1, make_metrics_with_memory(0.5, 12e9, 24e9));
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_capacity(1), 24e9);
+}
+
+TEST_F(FleetCacheEfficiencyTest, CompressedBackendCapacity) {
+    store.store(1, make_metrics_with_memory(0.5, 12e9, 24e9));
+    store.set_compression_ratio(1, 6.0);
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_capacity(1), 24e9 * 6.0);
+}
+
+// --- Per-backend effective usage ---
+
+TEST_F(FleetCacheEfficiencyTest, MissingBackendReturnsZeroUsage) {
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_usage(42), 0.0);
+}
+
+TEST_F(FleetCacheEfficiencyTest, UncompressedBackendUsage) {
+    store.store(1, make_metrics_with_memory(0.5, 12e9, 24e9));
+    // effective_usage = (0.5 * 24e9) / 1.0 = 12e9
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_usage(1), 12e9);
+}
+
+TEST_F(FleetCacheEfficiencyTest, CompressedBackendUsage) {
+    store.store(1, make_metrics_with_memory(0.5, 12e9, 24e9));
+    store.set_compression_ratio(1, 6.0);
+    // effective_usage = (0.5 * 24e9) / 6.0 = 2e9
+    EXPECT_DOUBLE_EQ(store.get_backend_effective_cache_usage(1), 2e9);
+}
+
+// --- Fleet aggregate capacity ---
+
+TEST_F(FleetCacheEfficiencyTest, EmptyFleetCapacityIsZero) {
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_capacity(), 0.0);
+}
+
+TEST_F(FleetCacheEfficiencyTest, FleetCapacitySumsAcrossBackends) {
+    // Backend 1: 24GB uncompressed
+    store.store(1, make_metrics_with_memory(0.3, 7.2e9, 24e9));
+    // Backend 2: 80GB with 6x compression
+    store.store(2, make_metrics_with_memory(0.5, 40e9, 80e9));
+    store.set_compression_ratio(2, 6.0);
+
+    // Expected: 24e9 * 1.0 + 80e9 * 6.0 = 24e9 + 480e9 = 504e9
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_capacity(), 504e9);
+}
+
+TEST_F(FleetCacheEfficiencyTest, FleetCapacitySkipsInvalidBackends) {
+    store.store(1, make_metrics_with_memory(0.5, 12e9, 24e9));
+
+    VLLMMetrics invalid;
+    invalid.valid = false;
+    invalid.gpu_memory_total_bytes = 80e9;
+    store.store(2, invalid);
+
+    // Only backend 1 counts
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_capacity(), 24e9);
+}
+
+// --- Fleet aggregate usage ---
+
+TEST_F(FleetCacheEfficiencyTest, EmptyFleetUsageIsZero) {
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_usage(), 0.0);
+}
+
+TEST_F(FleetCacheEfficiencyTest, FleetUsageSumsAcrossBackends) {
+    // Backend 1: 24GB, 50% used, no compression -> 12e9
+    store.store(1, make_metrics_with_memory(0.5, 12e9, 24e9));
+    // Backend 2: 80GB, 50% used, 4x compression -> (0.5*80e9)/4 = 10e9
+    store.store(2, make_metrics_with_memory(0.5, 40e9, 80e9));
+    store.set_compression_ratio(2, 4.0);
+
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_usage(), 12e9 + 10e9);
+}
+
+TEST_F(FleetCacheEfficiencyTest, FullyLoadedFleetUsage) {
+    store.store(1, make_metrics_with_memory(1.0, 24e9, 24e9));
+    store.set_compression_ratio(1, 6.0);
+    // effective_usage = (1.0 * 24e9) / 6.0 = 4e9
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_usage(), 4e9);
+}
+
+// --- Heterogeneous fleet scenario ---
+
+TEST_F(FleetCacheEfficiencyTest, HeterogeneousFleetMixedCompression) {
+    // 3-backend fleet: 2 uncompressed A100-40GB, 1 compressed H100-80GB
+    store.store(1, make_metrics_with_memory(0.8, 32e9, 40e9));
+    store.store(2, make_metrics_with_memory(0.6, 24e9, 40e9));
+    store.store(3, make_metrics_with_memory(0.5, 40e9, 80e9));
+    store.set_compression_ratio(3, 6.0);
+
+    // Capacity: 40e9 + 40e9 + 80e9*6 = 560e9
+    EXPECT_DOUBLE_EQ(store.compute_fleet_effective_cache_capacity(), 560e9);
+
+    // Usage: (0.8*40e9)/1.0 + (0.6*40e9)/1.0 + (0.5*80e9)/6.0
+    //      = 32e9 + 24e9 + 6.666...e9
+    double expected_usage = 32e9 + 24e9 + (0.5 * 80e9 / 6.0);
+    EXPECT_NEAR(store.compute_fleet_effective_cache_usage(), expected_usage, 1.0);
 }
