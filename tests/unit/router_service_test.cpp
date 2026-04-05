@@ -2157,3 +2157,105 @@ TEST_F(CostBasedRoutingTest, CostBudgetResetOnBackendUnregister) {
     // After unregister, backend is gone — cost should be 0 (unknown backend)
     EXPECT_DOUBLE_EQ(get_backend_cost(1), 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// Effective Capacity: compression_ratio scales cost budget ceiling
+// ---------------------------------------------------------------------------
+
+TEST_F(CostBasedRoutingTest, ReserveBudgetScaledByCompressionRatio) {
+    // Backend with 6x compression: effective max = 10000 * 6 = 60000
+    RouterService::register_backend_for_testing(
+        1, make_addr("10.0.0.1", 8080), 100, 0, true, 6.0);
+
+    // 55000 is over flat 10000 but under effective 60000
+    EXPECT_TRUE(reserve_cost_budget(1, 55000.0));
+    EXPECT_DOUBLE_EQ(get_backend_cost(1), 55000.0);
+
+    // 6000 more would push to 61000 > 60000 effective max
+    EXPECT_FALSE(reserve_cost_budget(1, 6000.0));
+}
+
+TEST_F(CostBasedRoutingTest, ReserveBudgetDefaultCompressionIsFlat) {
+    // Backend with default compression 1.0: effective max = 10000
+    register_backends(1);
+
+    reserve_cost_budget(1, 9500.0);
+    // 600 more would push to 10100 > 10000
+    EXPECT_FALSE(reserve_cost_budget(1, 600.0));
+}
+
+TEST_F(CostBasedRoutingTest, CostRedirectRespectsEffectiveCapacity) {
+    // Backend 1: 6x compression (effective max = 60000)
+    // Backend 2: no compression (effective max = 10000)
+    RouterService::register_backend_for_testing(
+        1, make_addr("10.0.0.1", 8080), 100, 0, true, 6.0);
+    RouterService::register_backend_for_testing(
+        2, make_addr("10.0.0.2", 8080), 100, 0, true, 1.0);
+
+    // Load backend 1 to 50000 — over flat 10000 but well under effective 60000
+    reserve_cost_budget(1, 50000.0);
+    // Backend 2 is empty
+    reserve_cost_budget(2, 0.0);
+
+    // Route a request with estimated_cost=5000. Tokens hash to backend 1.
+    // With effective capacity, backend 1 still has room (50000+5000 < 60000).
+    // The route should NOT redirect away from backend 1.
+    std::vector<int32_t> tokens(128, 42);
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->get_backend_for_prefix(tokens, "test", 0, 5000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Backend 1 should keep the request (within effective budget)
+    EXPECT_EQ(*result.backend_id, 1);
+    EXPECT_FALSE(result.was_cost_redirect);
+}
+
+TEST_F(CostBasedRoutingTest, CostRedirectWhenOverEffectiveCapacity) {
+    // Backend 1: 2x compression (effective max = 20000)
+    // Backend 2: no compression (effective max = 10000)
+    RouterService::register_backend_for_testing(
+        1, make_addr("10.0.0.1", 8080), 100, 0, true, 2.0);
+    RouterService::register_backend_for_testing(
+        2, make_addr("10.0.0.2", 8080), 100, 0, true, 1.0);
+
+    // Load backend 1 to 18000 — under effective 20000 but over flat 10000
+    reserve_cost_budget(1, 18000.0);
+
+    // Route with estimated_cost=3000 to backend 1: 18000+3000=21000 > 20000 effective max
+    std::vector<int32_t> tokens(128, 42);
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->get_backend_for_prefix(tokens, "test", 0, 3000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Should redirect to backend 2 (has budget room)
+    EXPECT_EQ(*result.backend_id, 2);
+    EXPECT_TRUE(result.was_cost_redirect);
+}
+
+TEST_F(CostBasedRoutingTest, FindBackendWithBudgetPrefersCompressedBackend) {
+    // Backend 1: no compression (effective max = 10000), already at 9000
+    // Backend 2: 4x compression (effective max = 40000), already at 9000
+    // Backend 3: no compression (effective max = 10000), already at 9000
+    RouterService::register_backend_for_testing(
+        1, make_addr("10.0.0.1", 8080), 100, 0, true, 1.0);
+    RouterService::register_backend_for_testing(
+        2, make_addr("10.0.0.2", 8080), 100, 0, true, 4.0);
+    RouterService::register_backend_for_testing(
+        3, make_addr("10.0.0.3", 8080), 100, 0, true, 1.0);
+
+    reserve_cost_budget(1, 9000.0);
+    reserve_cost_budget(2, 9000.0);
+    reserve_cost_budget(3, 9000.0);
+
+    // Route with cost=2000 to backend 1. 9000+2000=11000 > 10000 flat max.
+    // Should redirect. Backend 2 has room (9000+2000=11000 < 40000).
+    // Backends 1 and 3 do NOT have room (11000 > 10000).
+    std::vector<int32_t> tokens(128, 42);
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->get_backend_for_prefix(tokens, "test", 0, 2000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Only backend 2 has effective budget room
+    EXPECT_EQ(*result.backend_id, 2);
+    EXPECT_TRUE(result.was_cost_redirect);
+}
