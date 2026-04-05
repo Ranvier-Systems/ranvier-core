@@ -347,45 +347,6 @@ TEST(RateLimiterTypeTraitsTest, RateLimiterNotCopyable) {
     EXPECT_FALSE(std::is_copy_constructible_v<RateLimiter>);
     EXPECT_FALSE(std::is_copy_assignable_v<RateLimiter>);
 }
-
-// =============================================================================
-// Stress Test for MAX_BUCKETS (Optional - marked for integration tests)
-// =============================================================================
-
-// This test is expensive (creates 100k+ entries) - run selectively
-TEST(RateLimiterStressTest, DISABLED_FailOpenAtMaxBuckets) {
-    RateLimiterConfig config;
-    config.enabled = true;
-    config.requests_per_second = 100;
-    config.burst_size = 10;
-
-    RateLimiter limiter(config);
-
-    // Fill to capacity
-    for (size_t i = 0; i < RateLimiter::MAX_BUCKETS; ++i) {
-        EXPECT_TRUE(limiter.allow("ip_" + std::to_string(i)));
-    }
-    EXPECT_EQ(limiter.bucket_count(), RateLimiter::MAX_BUCKETS);
-    EXPECT_EQ(limiter.overflow_count(), 0u);
-
-    // Next new IP should fail-open (allowed, but no bucket created)
-    EXPECT_TRUE(limiter.allow("overflow_ip_1"));
-    EXPECT_EQ(limiter.bucket_count(), RateLimiter::MAX_BUCKETS);  // No new bucket
-    EXPECT_EQ(limiter.overflow_count(), 1u);
-
-    // More overflow requests
-    EXPECT_TRUE(limiter.allow("overflow_ip_2"));
-    EXPECT_TRUE(limiter.allow("overflow_ip_3"));
-    EXPECT_EQ(limiter.overflow_count(), 3u);
-
-    // Existing clients still work normally
-    for (size_t i = 0; i < 5; ++i) {
-        limiter.allow("ip_0");  // Existing bucket
-    }
-    // Should be rate limited after burst
-    EXPECT_FALSE(limiter.allow("ip_0"));
-}
-
 // =============================================================================
 // Deterministic Timing Tests (TestClock - no sleeps, instant execution)
 // =============================================================================
