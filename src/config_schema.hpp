@@ -206,6 +206,19 @@ struct RoutingConfig {
     double capacity_headroom_weight = 5.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
 
     // =========================================================================
+    // Compression-Aware Route TTL
+    // =========================================================================
+    // Routes to compressed backends survive longer in the ART because their
+    // underlying KV-cache entries face less eviction pressure (more fits in
+    // GPU memory). Scale route TTL by the backend's compression ratio:
+    //   effective_ttl = base_ttl * min(compression_ratio, max_ttl_multiplier)
+    //
+    // max_ttl_multiplier caps the scaling to prevent excessively stale routes.
+    // Set to 1.0 to disable compression-aware TTL (all routes use base_ttl).
+    // Valid range: 1.0–10.0. Default 4.0 (a 6x-compressed backend gets 4x TTL).
+    double max_ttl_multiplier = 4.0;  // Env: RANVIER_MAX_TTL_MULTIPLIER
+
+    // =========================================================================
     // Cost-Based Routing (overlays on load-aware routing)
     // =========================================================================
     CostBasedRoutingConfig cost_routing;

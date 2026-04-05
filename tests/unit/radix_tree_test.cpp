@@ -936,6 +936,101 @@ TEST_F(RadixTreeLRUTest, RemoveExpiredUpdatesRouteCount) {
 }
 
 // -----------------------------------------------------------------------------
+// remove_expired(CutoffFn) Tests — Per-Backend Compression-Aware TTL
+// -----------------------------------------------------------------------------
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredPerBackendSelectiveExpiry) {
+    // Backend 1 routes get short TTL (expire), backend 2 routes get long TTL (survive)
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    auto now = std::chrono::steady_clock::now();
+    // Backend 1: cutoff in the future (expires everything)
+    // Backend 2: cutoff in the past (expires nothing)
+    auto expire_cutoff = now + std::chrono::hours(1);
+    auto keep_cutoff = now - std::chrono::hours(1);
+
+    size_t removed = tree.remove_expired([&](BackendId id) {
+        return (id == 1) ? expire_cutoff : keep_cutoff;
+    });
+
+    EXPECT_EQ(removed, 1u);
+    EXPECT_EQ(tree.route_count(), 1u);
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredPerBackendAllExpired) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    auto future = std::chrono::steady_clock::now() + std::chrono::hours(1);
+
+    size_t removed = tree.remove_expired([&](BackendId) {
+        return future;  // All backends get aggressive cutoff
+    });
+
+    EXPECT_EQ(removed, 2u);
+    EXPECT_EQ(tree.route_count(), 0u);
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredPerBackendNoneExpired) {
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+
+    auto past = std::chrono::steady_clock::now() - std::chrono::hours(1);
+
+    size_t removed = tree.remove_expired([&](BackendId) {
+        return past;  // All backends get lenient cutoff
+    });
+
+    EXPECT_EQ(removed, 0u);
+    EXPECT_EQ(tree.route_count(), 2u);
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredPerBackendMultipleBackends) {
+    // 3 backends: expire backends 1 and 3, keep backend 2
+    tree.insert(tokens({1, 2, 3}), 1);
+    tree.insert(tokens({4, 5, 6}), 2);
+    tree.insert(tokens({7, 8, 9}), 3);
+
+    auto now = std::chrono::steady_clock::now();
+    auto expire = now + std::chrono::hours(1);
+    auto keep = now - std::chrono::hours(1);
+
+    size_t removed = tree.remove_expired([&](BackendId id) {
+        return (id == 2) ? keep : expire;
+    });
+
+    EXPECT_EQ(removed, 2u);
+    EXPECT_EQ(tree.route_count(), 1u);
+    EXPECT_FALSE(tree.lookup(tokens({1, 2, 3})).has_value());
+    EXPECT_TRUE(tree.lookup(tokens({4, 5, 6})).has_value());
+    EXPECT_FALSE(tree.lookup(tokens({7, 8, 9})).has_value());
+}
+
+TEST_F(RadixTreeLRUTest, RemoveExpiredPerBackendUpdatesRouteCount) {
+    for (int i = 0; i < 10; i++) {
+        // Even backends get id 0, odd backends get id 1
+        tree.insert(tokens({static_cast<TokenId>(i), 1, 2}),
+                    static_cast<BackendId>(i % 2));
+    }
+    EXPECT_EQ(tree.route_count(), 10u);
+
+    auto now = std::chrono::steady_clock::now();
+    auto expire = now + std::chrono::hours(1);
+    auto keep = now - std::chrono::hours(1);
+
+    // Expire only backend 0 (even indices)
+    size_t removed = tree.remove_expired([&](BackendId id) {
+        return (id == 0) ? expire : keep;
+    });
+
+    EXPECT_EQ(removed, 5u);
+    EXPECT_EQ(tree.route_count(), 5u);
+}
+
+// -----------------------------------------------------------------------------
 // evict_oldest() Tests
 // -----------------------------------------------------------------------------
 

@@ -402,6 +402,17 @@ public:
         return removed;
     }
 
+    // Compression-aware TTL: each backend may have a different cutoff time.
+    // cutoff_fn(BackendId) returns the expiry cutoff for that backend.
+    // Routes whose last_accessed < cutoff_fn(backend) are removed.
+    template<typename CutoffFn>
+    size_t remove_expired(CutoffFn&& cutoff_fn) {
+        size_t removed = 0;
+        remove_expired_per_backend_recursive(root_.get(), cutoff_fn, removed);
+        route_count_ = (route_count_ > removed) ? route_count_ - removed : 0;
+        return removed;
+    }
+
     // =========================================================================
     // evict_oldest() / evict_oldest_remote() - LRU Eviction Policy
     // =========================================================================
@@ -1579,6 +1590,25 @@ private:
 
         visit_children(node, [&](TokenId, Node* child) {
             remove_expired_recursive(child, cutoff, removed);
+        });
+    }
+
+    // Per-backend cutoff variant: each route's expiry depends on its backend.
+    template<typename CutoffFn>
+    void remove_expired_per_backend_recursive(Node* node, CutoffFn& cutoff_fn, size_t& removed) {
+        if (!node) return;
+
+        if (node->leaf_value.has_value()) {
+            auto cutoff = cutoff_fn(node->leaf_value.value());
+            if (node->last_accessed < cutoff) {
+                lru_remove(node);
+                node->leaf_value = std::nullopt;
+                removed++;
+            }
+        }
+
+        visit_children(node, [&](TokenId, Node* child) {
+            remove_expired_per_backend_recursive(child, cutoff_fn, removed);
         });
     }
 

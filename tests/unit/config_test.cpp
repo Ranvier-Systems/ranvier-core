@@ -2234,6 +2234,48 @@ TEST_F(ConfigTest, ValidationFailsForNegativeCompressionRatio) {
     ASSERT_TRUE(error.has_value());
 }
 
+// =============================================================================
+// Compression-Aware Route TTL: max_ttl_multiplier Validation
+// =============================================================================
+
+TEST_F(ConfigTest, MaxTtlMultiplierDefaultIsValid) {
+    RanvierConfig config;
+    // Default is 4.0
+    EXPECT_DOUBLE_EQ(config.routing.max_ttl_multiplier, 4.0);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, MaxTtlMultiplierAtMinBoundary) {
+    RanvierConfig config;
+    config.routing.max_ttl_multiplier = 1.0;  // Effectively disables scaling
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, MaxTtlMultiplierAtMaxBoundary) {
+    RanvierConfig config;
+    config.routing.max_ttl_multiplier = 10.0;
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
+}
+
+TEST_F(ConfigTest, MaxTtlMultiplierBelowMinFails) {
+    RanvierConfig config;
+    config.routing.max_ttl_multiplier = 0.5;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("max_ttl_multiplier"), std::string::npos);
+}
+
+TEST_F(ConfigTest, MaxTtlMultiplierAboveMaxFails) {
+    RanvierConfig config;
+    config.routing.max_ttl_multiplier = 15.0;
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("max_ttl_multiplier"), std::string::npos);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -230,6 +230,8 @@ struct ShardLocalState {
         double cost_routing_imbalance_factor = 2.0;
         // Capacity-aware hash fallback
         double capacity_headroom_weight = 5.0;
+        // Compression-aware route TTL
+        double max_ttl_multiplier = 4.0;
     } config;
 
     // ========================================================================
@@ -364,6 +366,8 @@ struct ShardLocalState {
         config.cost_routing_imbalance_factor = cfg.cost_routing.cost_imbalance_factor;
         // Capacity-aware hash fallback
         config.capacity_headroom_weight = cfg.capacity_headroom_weight;
+        // Compression-aware route TTL
+        config.max_ttl_multiplier = cfg.max_ttl_multiplier;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -410,6 +414,8 @@ struct ShardLocalState {
         config.cost_routing_imbalance_factor = cfg.cost_routing.cost_imbalance_factor;
         // Capacity-aware hash fallback
         config.capacity_headroom_weight = cfg.capacity_headroom_weight;
+        // Compression-aware route TTL
+        config.max_ttl_multiplier = cfg.max_ttl_multiplier;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -1700,14 +1706,25 @@ seastar::future<> RouterService::stop() {
 // when called from smp::submit_to. Yields between tree phases so each
 // phase's synchronous traversal runs in its own reactor timeslice.
 seastar::future<> RouterService::ttl_cleanup_on_shard(
-    std::chrono::steady_clock::time_point cutoff) {
+    std::chrono::steady_clock::time_point default_cutoff,
+    absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> backend_cutoffs) {
     if (!g_shard_state) co_return;
     auto& state = shard_state();
     RadixTree* tree = state.tree.get();
     if (!tree) co_return;
 
     // Phase 1: Expire old routes (marks leaves as empty)
-    size_t removed = tree->remove_expired(cutoff);
+    // Compression-aware: routes to compressed backends get longer TTLs
+    size_t removed = 0;
+    if (backend_cutoffs.empty()) {
+        // Fast path: no per-backend overrides, use uniform cutoff
+        removed = tree->remove_expired(default_cutoff);
+    } else {
+        removed = tree->remove_expired([&](BackendId id) {
+            auto it = backend_cutoffs.find(id);
+            return (it != backend_cutoffs.end()) ? it->second : default_cutoff;
+        });
+    }
     if (removed > 0) {
         state.stats.routes_expired += removed;
         log_main.debug("Shard {}: Expired {} routes", seastar::this_shard_id(), removed);
@@ -1743,16 +1760,37 @@ void RouterService::run_ttl_cleanup() {
         return;
     }
 
-    auto cutoff = std::chrono::steady_clock::now() - shard_state().config.ttl_seconds;
+    auto now = std::chrono::steady_clock::now();
+    auto& config = shard_state().config;
+    auto default_cutoff = now - config.ttl_seconds;
+
+    // Build per-backend cutoff map for compression-aware TTL.
+    // Backends with compression_ratio > 1.0 get proportionally longer TTLs,
+    // capped by max_ttl_multiplier. Only populated when overrides exist.
+    absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> backend_cutoffs;
+    if (config.max_ttl_multiplier > 1.0) {
+        for (const auto& [id, info] : shard_state().backends) {
+            if (info.compression_ratio > 1.0) {
+                double multiplier = std::min(info.compression_ratio, config.max_ttl_multiplier);
+                auto effective_ttl_secs = static_cast<int64_t>(
+                    config.ttl_seconds.count() * multiplier);
+                backend_cutoffs[id] = now - std::chrono::seconds(effective_ttl_secs);
+            }
+        }
+    }
 
     // Keep gate holder alive for duration of async work via do_with
-    (void)seastar::do_with(std::move(holder), [cutoff](seastar::gate::holder&) {
-        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count), [cutoff](unsigned shard_id) {
+    (void)seastar::do_with(std::move(holder), std::move(backend_cutoffs),
+        [default_cutoff](auto& /*holder*/, auto& cutoffs) {
+        return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+            [default_cutoff, &cutoffs](unsigned shard_id) {
             // Rule #17: ttl_cleanup_on_shard is a named coroutine that yields
             // between tree phases to avoid reactor stalls on large trees.
             // Using a named function (not a coroutine lambda) avoids Rule #16.
-            return seastar::smp::submit_to(shard_id, [cutoff] {
-                return RouterService::ttl_cleanup_on_shard(cutoff);
+            // Copy cutoffs per shard (typically <20 entries, once per 60s cycle).
+            auto shard_cutoffs = cutoffs;
+            return seastar::smp::submit_to(shard_id, [default_cutoff, shard_cutoffs = std::move(shard_cutoffs)] {
+                return RouterService::ttl_cleanup_on_shard(default_cutoff, shard_cutoffs);
             });
         });
     }).handle_exception([](std::exception_ptr ep) {

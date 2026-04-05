@@ -174,6 +174,10 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<double>("RANVIER_CAPACITY_HEADROOM_WEIGHT")) {
         routing.capacity_headroom_weight = *v;
     }
+    // Compression-aware route TTL
+    if (auto v = get_env_as<double>("RANVIER_MAX_TTL_MULTIPLIER")) {
+        routing.max_ttl_multiplier = *v;
+    }
     // Cross-shard load synchronization
     if (auto v = get_env("RANVIER_CROSS_SHARD_LOAD_SYNC")) {
         routing.cross_shard_load_sync = (*v == "1" || *v == "true" || *v == "yes");
@@ -959,6 +963,10 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["capacity_headroom_weight"]) {
                 config.routing.capacity_headroom_weight = r["capacity_headroom_weight"].as<double>();
             }
+            // Compression-aware route TTL
+            if (r["max_ttl_multiplier"]) {
+                config.routing.max_ttl_multiplier = r["max_ttl_multiplier"].as<double>();
+            }
             // Cost-based routing sub-section (nested under routing)
             if (r["cost_routing"]) {
                 YAML::Node cr = r["cost_routing"];
@@ -1561,6 +1569,9 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.routing.capacity_headroom_weight < 0.0 || config.routing.capacity_headroom_weight > 100.0) {
         return "routing.capacity_headroom_weight must be between 0.0 and 100.0";
+    }
+    if (config.routing.max_ttl_multiplier < 1.0 || config.routing.max_ttl_multiplier > 10.0) {
+        return "routing.max_ttl_multiplier must be between 1.0 and 10.0";
     }
 
     // Validate timeout settings
