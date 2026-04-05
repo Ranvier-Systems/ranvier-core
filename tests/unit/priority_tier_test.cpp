@@ -423,3 +423,73 @@ TEST(PriorityTierUserAgentEntryTest, PatternDefaultEmpty) {
     PriorityTierUserAgentEntry entry;
     EXPECT_TRUE(entry.pattern.empty());
 }
+
+// =============================================================================
+// sstring::npos regression test
+// =============================================================================
+// Seastar's basic_sstring uses uint32_t as size_type, so its npos is
+// 0xFFFFFFFF.  On 64-bit platforms, std::string::npos is 0xFFFFFFFFFFFFFFFF.
+// Comparing sstring::find() result against std::string::npos causes every
+// find-miss to look like a hit (the 32-bit npos gets zero-extended to 64-bit).
+// This test verifies the correct comparison pattern.
+
+namespace {
+
+// Minimal sstring stand-in with 32-bit size_type (mirrors seastar::basic_sstring)
+struct short_string {
+    using size_type = uint32_t;
+    static constexpr size_type npos = static_cast<size_type>(-1);
+
+    std::string data;
+    short_string(const char* s) : data(s) {}
+
+    size_type find(const std::string& pattern) const {
+        auto pos = data.find(pattern);
+        if (pos == std::string::npos) return npos;
+        return static_cast<size_type>(pos);
+    }
+};
+
+}  // anonymous namespace
+
+TEST(SstringNposRegressionTest, NposMismatchDetected) {
+    short_string ua("aider/0.50");
+
+    // This is the BUGGY pattern — 32-bit npos != 64-bit npos
+    auto pos = ua.find("Cursor");
+    EXPECT_EQ(pos, short_string::npos);         // find correctly returns its own npos
+    EXPECT_NE(pos, std::string::npos);           // but it != std::string::npos (the bug)
+
+    // The CORRECT comparison — use the type's own npos
+    EXPECT_TRUE(ua.find("Cursor") == short_string::npos);   // no match
+    EXPECT_TRUE(ua.find("aider") != short_string::npos);    // match at pos 0
+    EXPECT_EQ(ua.find("aider"), 0u);
+}
+
+TEST(SstringNposRegressionTest, FirstPatternMatchWins) {
+    // Simulates extract_priority step 2: iterate known_user_agents,
+    // first match wins.  With the npos bug, the first entry always
+    // "matched", so every request got that entry's priority.
+    struct PatternEntry {
+        std::string pattern;
+        uint8_t priority;
+    };
+    std::vector<PatternEntry> known_agents = {
+        {"Cursor",      0},   // CRITICAL
+        {"claude-code", 0},   // CRITICAL
+        {"cline",       1},   // HIGH
+        {"aider",       1},   // HIGH
+    };
+
+    short_string ua("aider/0.50");
+    uint8_t matched_priority = 255;  // sentinel
+
+    for (const auto& entry : known_agents) {
+        if (ua.find(entry.pattern) != short_string::npos) {  // correct comparison
+            matched_priority = entry.priority;
+            break;
+        }
+    }
+
+    EXPECT_EQ(matched_priority, 1u);  // HIGH, not CRITICAL
+}

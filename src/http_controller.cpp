@@ -529,11 +529,16 @@ PriorityLevel HttpController::extract_priority(
     }
 
     // Step 2: User-Agent match
+    // NOTE: ua is seastar::sstring whose size_type is uint32_t.  Its find()
+    // returns a 32-bit npos (0xFFFFFFFF) which != std::string::npos on 64-bit
+    // platforms (0xFFFFFFFFFFFFFFFF), causing every find-miss to look like a
+    // match.  Use the sstring's own npos via decltype.
     auto ua_it = req._headers.find("User-Agent");
     if (ua_it != req._headers.end()) {
         const auto& ua = ua_it->second;
+        using ua_type = std::decay_t<decltype(ua)>;
         for (const auto& entry : _config.priority_tier_known_user_agents) {
-            if (ua.find(entry.pattern) != std::string::npos) {
+            if (ua.find(entry.pattern) != ua_type::npos) {
                 auto matched_priority = static_cast<PriorityLevel>(entry.priority);
                 // Promote to CRITICAL if request has "stream": true
                 if (matched_priority != PriorityLevel::CRITICAL) {
@@ -2975,9 +2980,11 @@ future<> HttpController::process_priority_queue() {
         }
     }
 
-    // Drain remaining queued contexts: destroy stubs so their promises break,
-    // which wakes any handle_proxy coroutine waiting in acquire_concurrency_slot.
-    while (auto leftover = _scheduler.dequeue()) {
+    // Drain remaining queued contexts (including paused agents): destroy stubs
+    // so their promises break, waking any handle_proxy coroutine waiting in
+    // acquire_concurrency_slot.  Uses drain_one() instead of dequeue() because
+    // dequeue() skips paused agents, which would leak stubs on shutdown.
+    while (auto leftover = _scheduler.drain_one()) {
         // Stub is destroyed here → promise breaks → waiter gets broken_promise
         (void)leftover;
     }

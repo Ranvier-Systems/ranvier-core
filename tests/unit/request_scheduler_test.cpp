@@ -367,7 +367,7 @@ TEST(RequestSchedulerTest, PausedAgentSkippedDuringDequeue) {
     EXPECT_EQ(sched.total_queued(), 1u);
 }
 
-TEST(RequestSchedulerTest, CriticalTierIgnoresPauseCheck) {
+TEST(RequestSchedulerTest, CriticalTierRespectsPauseCheck) {
     TestScheduler sched;
     sched.set_pause_check([](std::string_view) {
         return true;  // Everything is "paused"
@@ -375,10 +375,28 @@ TEST(RequestSchedulerTest, CriticalTierIgnoresPauseCheck) {
 
     sched.enqueue(make_agent_ctx(PriorityLevel::CRITICAL, "paused-agent"));
 
-    // CRITICAL always dequeues regardless of pause state
+    // Admin pause is authoritative — even CRITICAL tier respects it
+    auto r = sched.dequeue();
+    EXPECT_FALSE(r.has_value());
+    EXPECT_EQ(sched.total_queued(), 1u);
+    EXPECT_GT(sched.paused_skips(), 0u);
+}
+
+TEST(RequestSchedulerTest, CriticalTierDequeuesNonPausedAgent) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view aid) {
+        return aid == "paused-agent";
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::CRITICAL, "paused-agent"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::CRITICAL, "active-agent"));
+
+    // Non-paused CRITICAL request still dequeues immediately
     auto r = sched.dequeue();
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ((*r)->agent_id, "paused-agent");
+    EXPECT_EQ((*r)->agent_id, "active-agent");
+    // Paused request remains in queue
+    EXPECT_EQ(sched.total_queued(), 1u);
 }
 
 TEST(RequestSchedulerTest, AllPausedTierSkippedToNextTier) {
@@ -399,6 +417,26 @@ TEST(RequestSchedulerTest, AllPausedTierSkippedToNextTier) {
     EXPECT_EQ((*r)->agent_id, "active-agent");
 }
 
+TEST(RequestSchedulerTest, PausedCriticalFallsThroughToLowerTier) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view aid) {
+        return aid == "paused-agent";
+    });
+
+    // CRITICAL tier: only paused agent
+    sched.enqueue(make_agent_ctx(PriorityLevel::CRITICAL, "paused-agent"));
+    // HIGH tier: active agent
+    sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "active-agent"));
+
+    // Should skip CRITICAL (all paused) and dequeue from HIGH
+    auto r = sched.dequeue();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->priority, PriorityLevel::HIGH);
+    EXPECT_EQ((*r)->agent_id, "active-agent");
+    // Paused CRITICAL request stays queued
+    EXPECT_EQ(sched.total_queued(), 1u);
+}
+
 TEST(RequestSchedulerTest, AllPausedReturnsNullopt) {
     TestScheduler sched;
     sched.set_pause_check([](std::string_view) {
@@ -408,7 +446,7 @@ TEST(RequestSchedulerTest, AllPausedReturnsNullopt) {
     sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "agent-a"));
     sched.enqueue(make_agent_ctx(PriorityLevel::NORMAL, "agent-b"));
 
-    // No CRITICAL, all others paused → nullopt
+    // All paused → nullopt (pause applies to all tiers including CRITICAL)
     EXPECT_FALSE(sched.dequeue().has_value());
     // Requests remain in queue
     EXPECT_EQ(sched.total_queued(), 2u);
@@ -478,6 +516,26 @@ TEST(RequestSchedulerTest, EmptyAgentIdNeverPauseChecked) {
     auto r = sched.dequeue();
     ASSERT_TRUE(r.has_value());
     EXPECT_FALSE(pause_called);
+}
+
+TEST(RequestSchedulerTest, DrainOneIgnoresPauseCheck) {
+    TestScheduler sched;
+    sched.set_pause_check([](std::string_view) {
+        return true;  // Everything paused
+    });
+
+    sched.enqueue(make_agent_ctx(PriorityLevel::CRITICAL, "agent-a"));
+    sched.enqueue(make_agent_ctx(PriorityLevel::HIGH, "agent-b"));
+
+    // dequeue() returns nullopt (all paused)
+    EXPECT_FALSE(sched.dequeue().has_value());
+
+    // drain_one() ignores pause — used for shutdown cleanup
+    auto r1 = sched.drain_one();
+    ASSERT_TRUE(r1.has_value());
+    auto r2 = sched.drain_one();
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_FALSE(sched.drain_one().has_value());  // Empty
 }
 
 // =============================================================================

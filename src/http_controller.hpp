@@ -58,7 +58,7 @@ struct BackpressureSettings {
 
     // Priority queue scheduling (defaults mirror BackpressureConfig)
     bool enable_priority_queue = false;
-    std::array<uint32_t, 4> tier_capacity = {
+    std::array<uint32_t, NUM_PRIORITY_TIERS> tier_capacity = {
         BackpressureConfig::DEFAULT_TIER_CAPACITY_CRITICAL,
         BackpressureConfig::DEFAULT_TIER_CAPACITY_HIGH,
         BackpressureConfig::DEFAULT_TIER_CAPACITY_NORMAL,
