@@ -167,6 +167,24 @@ future<> HealthService::run_loop() {
                         if (!load_scores.empty()) {
                             co_await RouterService::broadcast_gpu_load(std::move(load_scores));
                         }
+
+                        // Broadcast effective cache pressure for capacity-aware
+                        // hash fallback. Computed from gpu_cache_usage_percent
+                        // adjusted by compression ratio — same data, different view.
+                        absl::flat_hash_map<BackendId, double> pressure_map;
+                        for (const auto& [id, m] : _backend_vllm_metrics) {
+                            if (m.valid) {
+                                double cr = 1.0;
+                                auto cr_it = _backend_compression_ratios.find(id);
+                                if (cr_it != _backend_compression_ratios.end()) {
+                                    cr = cr_it->second;
+                                }
+                                pressure_map[id] = m.effective_cache_pressure(cr);
+                            }
+                        }
+                        if (!pressure_map.empty()) {
+                            co_await RouterService::broadcast_cache_headroom(std::move(pressure_map));
+                        }
                     } catch (const std::exception& e) {
                         // Rule #9: Log at warn level
                         log_health.warn("GPU load broadcast failed: {}", e.what());

@@ -119,22 +119,34 @@ TurboQuant backends accept proportionally more concurrent cost budget. This natu
 
 **Complexity:** Low. Derived metrics from existing data + `compression_ratio` field. Zero new async boundaries. All gauge lambdas are lock-free (Rule #1).
 
-### P2: Capacity-Aware Hash Fallback Selection
+### P2: Capacity-Aware Hash Fallback Selection ✅
+
+**Status:** Implemented
 
 **Problem:** When ART lookup misses (Step 1 in `get_backend_for_prefix()`), hash fallback (Step 2) selects backends based on hash consistency and load. It doesn't consider how much room a backend has for new KV-cache entries.
 
-**Proposal:** For hash fallback, factor in effective remaining capacity — especially for large-context requests. A backend with 80% prefix match but exhausted cache is worse than 70% match with headroom. The `estimated_cost` field (already computed) provides request size; combine with effective remaining capacity:
+**Solution:** Effective cache pressure (0.0–1.0, compression-adjusted) is broadcast from HealthService to all shards via `broadcast_cache_headroom()`. During hash fallback, `get_capacity_adjusted_load()` blends composite load with a cache fullness penalty:
 
 ```
-effective_headroom = (1.0 - effective_cache_usage) * effective_capacity
-candidate_score = f(hash_affinity, load, effective_headroom, estimated_cost)
+penalty = capacity_headroom_weight * effective_cache_pressure * (1.0 + cost_scale)
+adjusted_load = composite_load + penalty
 ```
 
-**Where:**
-- `src/router_service.cpp` — `bounded_load_selection()`, `p2c_selection()`
-- Uses existing `gpu_cache_usage_perc` from `VLLMMetrics` + new `compression_ratio`
+where `cost_scale = min(estimated_cost / max_cost_per_backend, 1.0)`. Larger requests penalize cache-full backends more aggressively.
 
-**Complexity:** Medium. Requires tuning the multi-signal scoring function.
+**Changed files:**
+- `src/router_service.cpp` — `CacheHeadroomCache` struct, `get_cached_cache_pressure()`, `get_capacity_adjusted_load()`, `broadcast_cache_headroom()`, `set_cache_headroom_for_testing()`; `bounded_load_select()` and `p2c_select()` now accept `estimated_cost` and use capacity-adjusted load
+- `src/router_service.hpp` — `broadcast_cache_headroom()` declaration, `set_cache_headroom_for_testing()` test helper
+- `src/health_service.cpp` — Broadcasts effective cache pressure alongside GPU load scores
+- `src/config_schema.hpp` — `RoutingConfig::capacity_headroom_weight` (env: `RANVIER_CAPACITY_HEADROOM_WEIGHT`, default 5.0)
+- `src/config_loader.cpp` — YAML + env var parsing, validation (0.0–100.0)
+- `src/metrics_service.hpp` — `routing_headroom_redirects_total` counter, `record_headroom_redirect()` method
+
+**Tests:** 8 new tests in `tests/unit/router_service_test.cpp` covering headroom penalty, weight=0 bypass, no-data fallback, cost amplification, compressed backends, P2C strategy, and zero-cost baseline.
+
+**Configuration:** `routing.capacity_headroom_weight` (default 5.0). Set to 0.0 to disable. Higher values give cache fullness more influence on routing.
+
+**Complexity:** Medium. New cache + broadcast (mirrors existing GPU load pattern). Zero new async boundaries on hot path — all reads are shard-local.
 
 **Independence from TurboQuant:** Yes. Useful any time backends have different remaining capacity.
 

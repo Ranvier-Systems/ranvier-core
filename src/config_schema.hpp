@@ -193,6 +193,19 @@ struct RoutingConfig {
     double default_compression_ratio = 1.0;  // Fleet-wide default (env: RANVIER_DEFAULT_COMPRESSION_RATIO)
 
     // =========================================================================
+    // Capacity-Aware Hash Fallback
+    // =========================================================================
+    // When hash fallback selects a backend (cache miss), factor in effective
+    // remaining KV-cache capacity. Backends with exhausted cache are penalized
+    // in the load comparison, especially for large-context requests.
+    //
+    // capacity_headroom_weight: Scaling factor that converts effective cache
+    //   pressure (0.0–1.0) into a load penalty comparable to active_requests.
+    //   Higher values make cache fullness a stronger routing signal.
+    //   Set to 0.0 to disable capacity-aware hash fallback (default behavior).
+    double capacity_headroom_weight = 5.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
+
+    // =========================================================================
     // Cost-Based Routing (overlays on load-aware routing)
     // =========================================================================
     CostBasedRoutingConfig cost_routing;

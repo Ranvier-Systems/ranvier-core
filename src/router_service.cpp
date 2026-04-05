@@ -162,6 +162,8 @@ struct ShardLocalState {
         uint64_t budget_exhausted = 0;              // No budget available anywhere
         uint64_t cost_reserved_total = 0;           // Total cost reservations made
         uint64_t cost_released_total = 0;           // Total cost releases made
+        // Capacity-aware hash fallback stats
+        uint64_t headroom_redirects = 0;            // Times cache headroom changed backend selection
 
         void reset() {
             cache_hits = 0;
@@ -191,6 +193,7 @@ struct ShardLocalState {
             budget_exhausted = 0;
             cost_reserved_total = 0;
             cost_released_total = 0;
+            headroom_redirects = 0;
         }
     } stats;
 
@@ -225,6 +228,8 @@ struct ShardLocalState {
         double cost_routing_small_threshold = 500.0;
         bool cost_routing_fast_lane = true;
         double cost_routing_imbalance_factor = 2.0;
+        // Capacity-aware hash fallback
+        double capacity_headroom_weight = 5.0;
     } config;
 
     // ========================================================================
@@ -271,6 +276,19 @@ struct ShardLocalState {
         std::chrono::steady_clock::time_point updated_at;
         static constexpr size_t MAX_ENTRIES = 256;       // Hard Rule #4
     } gpu_load_cache;
+
+    // ========================================================================
+    // Cache Headroom Cache (per-shard, broadcast from shard 0 by HealthService)
+    // ========================================================================
+    // Caches per-backend effective cache pressure (0.0–1.0) for capacity-aware
+    // hash fallback. Higher values mean more cache fullness (less headroom).
+    // broadcast_cache_headroom() distributes values to all shards after scrape.
+    // Hot-path reads are shard-local only (Rule #1).
+    struct CacheHeadroomCache {
+        absl::flat_hash_map<BackendId, double> pressure;  // BackendId → effective_cache_pressure (0.0–1.0)
+        std::chrono::steady_clock::time_point updated_at;
+        static constexpr size_t MAX_ENTRIES = 256;         // Hard Rule #4
+    } cache_headroom_cache;
 
     // ========================================================================
     // Cross-Shard Load Synchronization
@@ -344,6 +362,8 @@ struct ShardLocalState {
         config.cost_routing_small_threshold = cfg.cost_routing.small_request_threshold;
         config.cost_routing_fast_lane = cfg.cost_routing.enable_fast_lane;
         config.cost_routing_imbalance_factor = cfg.cost_routing.cost_imbalance_factor;
+        // Capacity-aware hash fallback
+        config.capacity_headroom_weight = cfg.capacity_headroom_weight;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -388,6 +408,8 @@ struct ShardLocalState {
         config.cost_routing_small_threshold = cfg.cost_routing.small_request_threshold;
         config.cost_routing_fast_lane = cfg.cost_routing.enable_fast_lane;
         config.cost_routing_imbalance_factor = cfg.cost_routing.cost_imbalance_factor;
+        // Capacity-aware hash fallback
+        config.capacity_headroom_weight = cfg.capacity_headroom_weight;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -409,6 +431,9 @@ struct ShardLocalState {
 
         // Clear GPU load cache
         gpu_load_cache.scores.clear();
+
+        // Clear cache headroom cache
+        cache_headroom_cache.pressure.clear();
 
         // Clear cross-shard load sync state
         for (auto& snapshot : shard_load_snapshots) {
@@ -690,6 +715,62 @@ uint64_t get_composite_backend_load(BackendId id) {
         gpu_score * g_shard_state->config.gpu_load_weight);
 
     return local_load + gpu_contribution;
+}
+
+// ============================================================================
+// Cache Headroom Accessors (shard-local, lock-free)
+// ============================================================================
+
+// Get cached effective cache pressure for a backend from the per-shard cache.
+// Returns -1.0 if no valid cached value is available (no metrics, stale cache,
+// or backend not found). Uses same staleness threshold as GPU load cache.
+//
+// Rule #1: Lock-free — shard-local read only, no cross-shard access.
+static double get_cached_cache_pressure(BackendId id) {
+    if (!g_shard_state) return -1.0;
+    auto& cache = g_shard_state->cache_headroom_cache;
+
+    // Stale check: reuse GPU load cache TTL (both are refreshed from same scrape cycle)
+    auto age = std::chrono::steady_clock::now() - cache.updated_at;
+    if (age > g_shard_state->config.gpu_load_cache_ttl) return -1.0;
+
+    auto it = cache.pressure.find(id);
+    if (it == cache.pressure.end()) return -1.0;
+    return it->second;
+}
+
+// Compute capacity-adjusted load for a backend, blending composite load with
+// a penalty for cache fullness. The penalty scales with estimated request cost:
+// large-context requests care more about available cache headroom.
+//
+//   adjusted = composite_load + capacity_headroom_weight * cache_pressure * (1.0 + cost_scale)
+//
+// where cost_scale = min(estimated_cost / cost_routing_max_cost, 1.0)
+//
+// When cache headroom data is unavailable, falls back to composite load.
+// When capacity_headroom_weight is 0.0, this equals get_composite_backend_load().
+//
+// Rule #1: Lock-free — all reads are shard-local.
+static uint64_t get_capacity_adjusted_load(BackendId id, double estimated_cost) {
+    uint64_t base = get_composite_backend_load(id);
+
+    if (!g_shard_state || g_shard_state->config.capacity_headroom_weight <= 0.0) {
+        return base;
+    }
+
+    double cache_pressure = get_cached_cache_pressure(id);
+    if (cache_pressure < 0.0) return base;  // No headroom data available
+
+    // Scale penalty by request size: larger requests should penalize cache-full
+    // backends more aggressively, since they'll generate more KV-cache entries.
+    double cost_scale = 0.0;
+    if (estimated_cost > 0.0 && g_shard_state->config.cost_routing_max_cost > 0.0) {
+        cost_scale = std::min(estimated_cost / g_shard_state->config.cost_routing_max_cost, 1.0);
+    }
+
+    double penalty = g_shard_state->config.capacity_headroom_weight
+                   * cache_pressure * (1.0 + cost_scale);
+    return base + static_cast<uint64_t>(penalty);
 }
 
 std::pair<BackendId, uint64_t> get_least_loaded_backend(const std::vector<BackendId>& candidates) {
@@ -1028,16 +1109,19 @@ static BackendId bounded_load_select(
     uint64_t prefix_hash,
     const std::vector<BackendId>& live_backends,
     double epsilon,
-    const std::string& request_id)
+    const std::string& request_id,
+    double estimated_cost = 0.0)
 {
     const auto n = static_cast<int32_t>(live_backends.size());
     if (n <= 0) return 0;
     if (n == 1) return live_backends[0];
 
-    // Compute total composite load across all live backends for average
+    // Compute total capacity-adjusted load across all live backends for average.
+    // When cache headroom data is available and capacity_headroom_weight > 0,
+    // backends with fuller caches appear more loaded — especially for large requests.
     uint64_t total_load = 0;
     for (BackendId id : live_backends) {
-        total_load += get_composite_backend_load(id);
+        total_load += get_capacity_adjusted_load(id, estimated_cost);
     }
     double avg = static_cast<double>(total_load) / static_cast<double>(n);
     // Cap: at least 1 to avoid starving all backends when idle
@@ -1048,7 +1132,7 @@ static BackendId bounded_load_select(
     for (int32_t probe = 0; probe < n; ++probe) {
         int32_t idx = jump_consistent_hash(prefix_hash + static_cast<uint64_t>(probe), n);
         BackendId candidate = live_backends[idx];
-        uint64_t load = get_composite_backend_load(candidate);
+        uint64_t load = get_capacity_adjusted_load(candidate, estimated_cost);
         if (load < cap) {
             if (probe > 0) {
                 // Diverted from primary — record as load-aware fallback
@@ -1058,7 +1142,7 @@ static BackendId bounded_load_select(
                 }
                 log_router.debug("[{}] Bounded-load: primary over cap ({}>{}), "
                                  "probe {} -> backend {} (load={})",
-                                 request_id, get_composite_backend_load(live_backends[jump_consistent_hash(prefix_hash, n)]),
+                                 request_id, get_capacity_adjusted_load(live_backends[jump_consistent_hash(prefix_hash, n)], estimated_cost),
                                  cap, probe, candidate, load);
             }
             return candidate;
@@ -1101,7 +1185,8 @@ static BackendId p2c_select(
     uint64_t request_salt,
     const std::vector<BackendId>& live_backends,
     uint64_t load_bias,
-    const std::string& request_id)
+    const std::string& request_id,
+    double estimated_cost = 0.0)
 {
     const auto n = static_cast<int32_t>(live_backends.size());
     if (n <= 0) return 0;
@@ -1119,8 +1204,11 @@ static BackendId p2c_select(
     BackendId primary = live_backends[primary_idx];
     BackendId secondary = live_backends[secondary_idx];
 
-    uint64_t p_load = get_composite_backend_load(primary);
-    uint64_t s_load = get_composite_backend_load(secondary);
+    // Use capacity-adjusted load: backends with fuller caches appear more
+    // loaded, especially for large requests. Falls back to composite load
+    // when headroom data is unavailable or weight is 0.
+    uint64_t p_load = get_capacity_adjusted_load(primary, estimated_cost);
+    uint64_t s_load = get_capacity_adjusted_load(secondary, estimated_cost);
 
     // Prefer primary for cache affinity — only switch if secondary is
     // clearly less loaded (by at least load_bias)
@@ -2040,9 +2128,11 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
 
         switch (state.config.hash_strategy) {
         case RoutingConfig::HashStrategy::BOUNDED_LOAD:
-            // Bounded-load has built-in load awareness — no separate step 3 needed
+            // Bounded-load has built-in load awareness — no separate step 3 needed.
+            // estimated_cost enables capacity-aware fallback when headroom data is available.
             selected = bounded_load_select(prefix_hash, live_backends,
-                                           state.config.bounded_load_epsilon, request_id);
+                                           state.config.bounded_load_epsilon, request_id,
+                                           estimated_cost);
             break;
 
         case RoutingConfig::HashStrategy::P2C: {
@@ -2056,7 +2146,8 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 }
             }
             selected = p2c_select(prefix_hash, salt, live_backends,
-                                  state.config.p2c_load_bias, request_id);
+                                  state.config.p2c_load_bias, request_id,
+                                  estimated_cost);
             break;
         }
 
@@ -2072,6 +2163,20 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
             hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
             selected = live_backends[hash_index];
             break;
+        }
+
+        // Track whether cache headroom influenced the selection.
+        // Compare capacity-adjusted load with base composite load for selected backend:
+        // if they differ, headroom data contributed to the decision.
+        if (estimated_cost > 0.0 && state.config.capacity_headroom_weight > 0.0) {
+            uint64_t base_load = get_composite_backend_load(selected);
+            uint64_t adj_load = get_capacity_adjusted_load(selected, estimated_cost);
+            if (adj_load != base_load) {
+                state.stats.headroom_redirects++;
+                if (g_metrics) {
+                    metrics().record_headroom_redirect();
+                }
+            }
         }
 
         // This is a cache miss — the route will be learned after successful response
@@ -2093,16 +2198,17 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         if (art_hit) {
             uint64_t total_load = 0;
             for (BackendId id : live_backends) {
-                total_load += get_composite_backend_load(id);
+                total_load += get_capacity_adjusted_load(id, estimated_cost);
             }
             double avg = static_cast<double>(total_load) / static_cast<double>(live_backends.size());
             uint64_t cap = std::max(static_cast<uint64_t>(1),
                                     static_cast<uint64_t>(std::ceil(avg * (1.0 + state.config.bounded_load_epsilon))));
-            uint64_t sel_load = get_composite_backend_load(selected);
+            uint64_t sel_load = get_capacity_adjusted_load(selected, estimated_cost);
             if (sel_load >= cap) {
                 prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
                 final_backend = bounded_load_select(prefix_hash, live_backends,
-                                                    state.config.bounded_load_epsilon, request_id);
+                                                    state.config.bounded_load_epsilon, request_id,
+                                                    estimated_cost);
             }
         }
         // Hash path: already handled in step 2
@@ -3218,6 +3324,29 @@ seastar::future<> RouterService::broadcast_gpu_load(
         });
 }
 
+seastar::future<> RouterService::broadcast_cache_headroom(
+        absl::flat_hash_map<BackendId, double> pressure_map) {
+    auto shared = seastar::make_foreign(
+        std::make_unique<absl::flat_hash_map<BackendId, double>>(std::move(pressure_map)));
+
+    // Same pattern as broadcast_gpu_load(): foreign_ptr anchored via do_with,
+    // then invoke_on_all distributes to every shard's local cache.
+    co_await seastar::do_with(std::move(shared),
+        [](auto& shared) {
+            return seastar::smp::invoke_on_all(
+                [&shared] {
+                    if (!g_shard_state) return;
+                    auto& cache = g_shard_state->cache_headroom_cache;
+                    cache.pressure.clear();
+                    for (const auto& [id, p] : *shared) {
+                        if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) break;
+                        cache.pressure[id] = p;
+                    }
+                    cache.updated_at = std::chrono::steady_clock::now();
+                });
+        });
+}
+
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
                                                           uint32_t weight, uint32_t priority,
                                                           bool supports_token_ids,
@@ -3679,6 +3808,14 @@ size_t RouterService::get_route_count_for_testing() {
     RadixTree* tree = g_shard_state->tree.get();
     if (!tree) return 0;
     return tree->route_count();
+}
+
+void RouterService::set_cache_headroom_for_testing(BackendId id, double pressure) {
+    if (!g_shard_state) return;
+    auto& cache = g_shard_state->cache_headroom_cache;
+    if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) return;
+    cache.pressure[id] = pressure;
+    cache.updated_at = std::chrono::steady_clock::now();
 }
 
 } // namespace ranvier
