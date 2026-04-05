@@ -170,6 +170,10 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<double>("RANVIER_DEFAULT_COMPRESSION_RATIO")) {
         routing.default_compression_ratio = *v;
     }
+    // Capacity-aware hash fallback
+    if (auto v = get_env_as<double>("RANVIER_CAPACITY_HEADROOM_WEIGHT")) {
+        routing.capacity_headroom_weight = *v;
+    }
     // Cross-shard load synchronization
     if (auto v = get_env("RANVIER_CROSS_SHARD_LOAD_SYNC")) {
         routing.cross_shard_load_sync = (*v == "1" || *v == "true" || *v == "yes");
@@ -951,6 +955,10 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (r["default_compression_ratio"]) {
                 config.routing.default_compression_ratio = r["default_compression_ratio"].as<double>();
             }
+            // Capacity-aware hash fallback
+            if (r["capacity_headroom_weight"]) {
+                config.routing.capacity_headroom_weight = r["capacity_headroom_weight"].as<double>();
+            }
             // Cost-based routing sub-section (nested under routing)
             if (r["cost_routing"]) {
                 YAML::Node cr = r["cost_routing"];
@@ -1550,6 +1558,9 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     // Validate hash strategy settings
     if (config.routing.bounded_load_epsilon < 0.0 || config.routing.bounded_load_epsilon > 10.0) {
         return "routing.bounded_load_epsilon must be between 0.0 and 10.0";
+    }
+    if (config.routing.capacity_headroom_weight < 0.0 || config.routing.capacity_headroom_weight > 100.0) {
+        return "routing.capacity_headroom_weight must be between 0.0 and 100.0";
     }
 
     // Validate timeout settings

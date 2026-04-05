@@ -104,6 +104,9 @@ public:
             seastar::metrics::make_counter("routing_load_aware_fallbacks_total", _load_aware_fallbacks,
                 seastar::metrics::description("Total number of requests diverted to less-loaded backends due to queue depth exceeding threshold")),
 
+            seastar::metrics::make_counter("routing_headroom_redirects_total", _headroom_redirects,
+                seastar::metrics::description("Total number of requests where cache headroom influenced hash fallback backend selection")),
+
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -336,6 +339,13 @@ public:
     }
     uint64_t get_load_aware_fallbacks() const { return _load_aware_fallbacks; }
 
+    // Capacity-aware hash fallback: records when cache headroom data influenced
+    // the backend selected during hash fallback (cache miss path).
+    void record_headroom_redirect() {
+        _headroom_redirects++;
+    }
+    uint64_t get_headroom_redirects() const { return _headroom_redirects; }
+
     // Record a prefix cache hit bucketed by backend compression tier.
     // compression_ratio: the selected backend's KV-cache compression ratio (>= 1.0).
     // Tiers: "none" (== 1.0), "moderate" (1.0 < ratio < 4.0), "high" (>= 4.0).
@@ -504,6 +514,7 @@ private:
 
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
+    uint64_t _headroom_redirects = 0;    // Requests where cache headroom influenced selection
 
     // Prefix hit counters by compression tier (shard-local, no atomics — Rule #1)
     uint64_t _prefix_hits_tier_none = 0;      // compression_ratio == 1.0

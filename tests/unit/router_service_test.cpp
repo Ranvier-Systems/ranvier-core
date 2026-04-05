@@ -2259,3 +2259,230 @@ TEST_F(CostBasedRoutingTest, FindBackendWithBudgetPrefersCompressedBackend) {
     EXPECT_EQ(*result.backend_id, 2);
     EXPECT_TRUE(result.was_cost_redirect);
 }
+
+// =============================================================================
+// 10. Capacity-Aware Hash Fallback
+// =============================================================================
+//
+// Tests that hash fallback selection factors in effective cache headroom
+// when capacity_headroom_weight > 0 and headroom data is available.
+
+class CapacityAwareHashTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = false;  // Isolate capacity-aware from median-based
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+        cfg_.bounded_load_epsilon = 0.25;
+        cfg_.capacity_headroom_weight = 10.0;  // Strong signal for test visibility
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+
+    void register_backends(int count, double compression_ratio = 1.0) {
+        for (int i = 1; i <= count; ++i) {
+            std::string ip = "10.0.0." + std::to_string(i);
+            RouterService::register_backend_for_testing(
+                i, make_addr(ip.c_str(), 8080), 100, 0, true, compression_ratio);
+        }
+    }
+};
+
+TEST_F(CapacityAwareHashTest, HeadroomPenalizesFullCacheBackend) {
+    // Backend 1: cache nearly full (pressure=0.9)
+    // Backend 2: cache nearly empty (pressure=0.1)
+    // Both have zero in-flight requests. Without headroom, bounded-load picks
+    // whichever the hash lands on. With headroom, backend 2 should be preferred
+    // because backend 1 gets a load penalty from cache pressure.
+    register_backends(2);
+    RouterService::set_cache_headroom_for_testing(1, 0.9);  // 90% full
+    RouterService::set_cache_headroom_for_testing(2, 0.1);  // 10% full
+
+    // Route many requests — with bounded-load and headroom, backend 2 should
+    // receive a disproportionate share because backend 1 appears "loaded" due
+    // to cache pressure penalty.
+    int backend1_count = 0, backend2_count = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);  // Different prefix each time
+        auto result = router_->get_backend_for_prefix(tokens, "test-" + std::to_string(i), 0, 5000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_count++;
+        if (*result.backend_id == 2) backend2_count++;
+    }
+
+    // Backend 2 (low pressure) should handle more requests than backend 1 (high pressure)
+    EXPECT_GT(backend2_count, backend1_count);
+}
+
+TEST_F(CapacityAwareHashTest, NoEffectWhenWeightIsZero) {
+    // Set weight to 0 — headroom should not influence routing
+    cfg_.capacity_headroom_weight = 0.0;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_backends(2);
+    RouterService::set_cache_headroom_for_testing(1, 0.95);  // Nearly full
+    RouterService::set_cache_headroom_for_testing(2, 0.05);  // Nearly empty
+
+    // With weight=0, both backends should get roughly equal share
+    int backend1_count = 0, backend2_count = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        auto result = router_->get_backend_for_prefix(tokens, "test-" + std::to_string(i), 0, 5000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_count++;
+        if (*result.backend_id == 2) backend2_count++;
+    }
+
+    // Both should be roughly balanced (within 30/70 range at minimum)
+    EXPECT_GT(backend1_count, 20);
+    EXPECT_GT(backend2_count, 20);
+}
+
+TEST_F(CapacityAwareHashTest, NoEffectWithoutHeadroomData) {
+    // Don't set any headroom data — should fall back to pure load-based routing
+    register_backends(2);
+
+    // Both backends have no headroom data, should get roughly equal share
+    int backend1_count = 0, backend2_count = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        auto result = router_->get_backend_for_prefix(tokens, "test-" + std::to_string(i), 0, 5000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_count++;
+        if (*result.backend_id == 2) backend2_count++;
+    }
+
+    EXPECT_GT(backend1_count, 20);
+    EXPECT_GT(backend2_count, 20);
+}
+
+TEST_F(CapacityAwareHashTest, LargerCostAmplifiesHeadroomPenalty) {
+    // With 3 backends, one nearly full:
+    // Backend 1: pressure=0.8 (80% full)
+    // Backend 2: pressure=0.2 (20% full)
+    // Backend 3: pressure=0.2 (20% full)
+    register_backends(3);
+    RouterService::set_cache_headroom_for_testing(1, 0.8);
+    RouterService::set_cache_headroom_for_testing(2, 0.2);
+    RouterService::set_cache_headroom_for_testing(3, 0.2);
+
+    // Large cost request: backend 1 should be avoided more strongly
+    int backend1_large = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        auto result = router_->get_backend_for_prefix(tokens, "large-" + std::to_string(i), 0, 9000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_large++;
+    }
+
+    // Small cost request: backend 1 penalty is smaller
+    int backend1_small = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        auto result = router_->get_backend_for_prefix(tokens, "small-" + std::to_string(i), 0, 100.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_small++;
+    }
+
+    // Large requests should route to backend 1 less often than small requests
+    EXPECT_LE(backend1_large, backend1_small);
+}
+
+TEST_F(CapacityAwareHashTest, CompressedBackendHasLowerEffectivePressure) {
+    // Backend 1: no compression, 50% raw cache usage -> pressure = 0.5
+    // Backend 2: 6x compression, 50% raw cache usage -> effective_pressure = 0.5/6 ≈ 0.083
+    // The HealthService computes this, but here we set it directly.
+    register_backends(2);
+    RouterService::register_backend_for_testing(
+        2, make_addr("10.0.0.2", 8080), 100, 0, true, 6.0);
+
+    RouterService::set_cache_headroom_for_testing(1, 0.5);   // No compression, high pressure
+    RouterService::set_cache_headroom_for_testing(2, 0.083);  // 6x compressed, low effective pressure
+
+    int backend1_count = 0, backend2_count = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        auto result = router_->get_backend_for_prefix(tokens, "test-" + std::to_string(i), 0, 5000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_count++;
+        if (*result.backend_id == 2) backend2_count++;
+    }
+
+    // Backend 2 (compressed, low effective pressure) should handle more
+    EXPECT_GT(backend2_count, backend1_count);
+}
+
+TEST_F(CapacityAwareHashTest, P2CStrategyRespectsHeadroom) {
+    // Switch to P2C strategy and verify headroom influences selection
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+    cfg_.p2c_load_bias = 0;  // No bias — pure load comparison
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_backends(2);
+    RouterService::set_cache_headroom_for_testing(1, 0.9);  // Nearly full
+    RouterService::set_cache_headroom_for_testing(2, 0.1);  // Nearly empty
+
+    int backend1_count = 0, backend2_count = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        auto result = router_->get_backend_for_prefix(tokens, "p2c-" + std::to_string(i), 0, 5000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_count++;
+        if (*result.backend_id == 2) backend2_count++;
+    }
+
+    // Backend 2 (low pressure) should handle more requests
+    EXPECT_GT(backend2_count, backend1_count);
+}
+
+TEST_F(CapacityAwareHashTest, ZeroEstimatedCostUsesBaselineHeadroom) {
+    // With estimated_cost=0, the cost_scale factor is 0, but the base
+    // headroom penalty still applies (weight * pressure * 1.0).
+    register_backends(2);
+    RouterService::set_cache_headroom_for_testing(1, 0.9);
+    RouterService::set_cache_headroom_for_testing(2, 0.1);
+
+    int backend1_count = 0, backend2_count = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, i);
+        // estimated_cost=0.0 (default)
+        auto result = router_->get_backend_for_prefix(tokens, "zero-" + std::to_string(i));
+        ASSERT_TRUE(result.backend_id.has_value());
+        if (*result.backend_id == 1) backend1_count++;
+        if (*result.backend_id == 2) backend2_count++;
+    }
+
+    // Even with zero cost, base headroom penalty should steer traffic
+    EXPECT_GT(backend2_count, backend1_count);
+}
+
+TEST_F(CapacityAwareHashTest, SetCacheHeadroomForTestingStoresData) {
+    register_backends(1);
+    // Initially no headroom data
+    // After setting, the test helper should have stored it
+    RouterService::set_cache_headroom_for_testing(1, 0.75);
+
+    // Route a request to verify it doesn't crash and data is accessible
+    std::vector<int32_t> tokens(128, 42);
+    auto result = router_->get_backend_for_prefix(tokens, "test", 0, 1000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(*result.backend_id, 1);
+}

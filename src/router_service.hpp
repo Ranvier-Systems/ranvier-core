@@ -451,6 +451,13 @@ public:
     static seastar::future<> broadcast_gpu_load(
         absl::flat_hash_map<BackendId, double> scores);
 
+    // Broadcast effective cache pressure from shard 0 to all shards.
+    // Called by HealthService::run_loop() alongside GPU load broadcast.
+    // pressure_map: BackendId → effective_cache_pressure (0.0–1.0).
+    // Takes map by value (Rule #22: coroutine params by value).
+    static seastar::future<> broadcast_cache_headroom(
+        absl::flat_hash_map<BackendId, double> pressure_map);
+
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,
     // and submits gossip batch to shard 0
@@ -501,6 +508,10 @@ public:
 
     // Mark a backend as dead (circuit-breaker quarantine) in shard-local state.
     static void mark_backend_dead_for_testing(BackendId id);
+
+    // Set cache headroom (effective cache pressure) for a backend in shard-local state.
+    // pressure: 0.0 (empty cache, full headroom) to 1.0 (full cache, no headroom).
+    static void set_cache_headroom_for_testing(BackendId id, double pressure);
 
     // Remove a backend from shard-local state (bypasses async cross-shard broadcast).
     static void unregister_backend_for_testing(BackendId id);
