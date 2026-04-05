@@ -231,8 +231,9 @@ seastar::future<> GossipProtocol::start(GossipTransport* transport, GossipConsen
                 }
             });
         });
+        static constexpr auto kMinRetryCheckInterval = std::chrono::milliseconds(10);
         auto retry_check_interval = std::max(
-            std::chrono::milliseconds(10),
+            kMinRetryCheckInterval,
             _config.gossip_ack_timeout / 2);
         _retry_timer.arm_periodic(retry_check_interval);
     }

@@ -122,8 +122,9 @@ seastar::future<> GossipTransport::initialize_dtls() {
     }
 
     // Set up DTLS session cleanup timer
+    static constexpr auto kDtlsCleanupInterval = std::chrono::seconds(60);
     _dtls_session_cleanup_timer.set_callback([this] { cleanup_dtls_sessions(); });
-    _dtls_session_cleanup_timer.arm_periodic(std::chrono::seconds(60));
+    _dtls_session_cleanup_timer.arm_periodic(kDtlsCleanupInterval);
 
     co_return;
 }
@@ -513,7 +514,8 @@ void GossipTransport::cleanup_dtls_sessions() {
         return;
     }
 
-    _dtls_context->cleanup_idle_sessions(std::chrono::seconds(300));
+    static constexpr auto kDtlsIdleTimeout = std::chrono::seconds(300);
+    _dtls_context->cleanup_idle_sessions(kDtlsIdleTimeout);
 }
 
 seastar::future<> GossipTransport::check_cert_reload() {

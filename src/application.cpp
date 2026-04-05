@@ -269,13 +269,18 @@ HealthServiceConfig Application::build_health_config() const {
     return cfg;
 }
 
+static constexpr auto kPersistenceFlushInterval = std::chrono::milliseconds(100);
+static constexpr size_t kPersistenceMaxBatchSize = 1000;
+static constexpr size_t kPersistenceMaxQueueDepth = 100000;
+static constexpr auto kPersistenceStatsInterval = std::chrono::seconds(60);
+
 AsyncPersistenceConfig Application::build_persistence_config() const {
     AsyncPersistenceConfig cfg;
-    cfg.flush_interval = std::chrono::milliseconds(100);
-    cfg.max_batch_size = 1000;
-    cfg.max_queue_depth = 100000;
+    cfg.flush_interval = kPersistenceFlushInterval;
+    cfg.max_batch_size = kPersistenceMaxBatchSize;
+    cfg.max_queue_depth = kPersistenceMaxQueueDepth;
     cfg.enable_stats_logging = true;
-    cfg.stats_interval = std::chrono::seconds(60);
+    cfg.stats_interval = kPersistenceStatsInterval;
     return cfg;
 }
 
