@@ -37,27 +37,36 @@ Several opportunities below are useful **independent of TurboQuant** — they ap
 
 ## Opportunities
 
-### P0: Compression-Aware Load Scoring
+### P0: Compression-Aware Load Scoring ✅
+
+**Status:** Implemented ([`538b795`](https://github.com/Ranvier-Systems/ranvier-core/commit/538b795), [`0ea30c7`](https://github.com/Ranvier-Systems/ranvier-core/commit/0ea30c7))
 
 **Problem:** The current `VLLMMetrics::load_score()` formula (`0.7 * request_pressure + 0.3 * cache_pressure`) treats all backends identically. A `gpu_cache_usage_perc` of 0.5 means "half full" regardless of whether the backend has 24GB or 144GB of effective cache capacity (after compression).
 
-**Proposal:** Track a per-backend `compression_ratio` (default 1.0). Compute effective cache pressure:
+**Solution:** Per-backend `compression_ratio` (default 1.0) adjusts cache pressure in the load score formula:
 
 ```
 effective_cache_pressure = raw_cache_usage / compression_ratio
 ```
 
-A TurboQuant backend at 50% raw usage with 6x compression has `effective_cache_pressure = 0.083` — it has enormous headroom. A non-TurboQuant backend at 50% has `effective_cache_pressure = 0.5`. This distinction should influence routing.
+A TurboQuant backend at 50% raw usage with 6x compression has `effective_cache_pressure = 0.083` — it has enormous headroom. A non-TurboQuant backend at 50% has `effective_cache_pressure = 0.5`. This distinction now influences routing.
 
-**Where:**
-- `src/vllm_metrics.hpp` — `load_score()` formula
-- `src/router_service.cpp` — `BackendInfo` struct (add `compression_ratio` field)
-- `src/health_service.cpp` — scrape or configure compression ratio
-- `src/config_schema.hpp` — per-backend config or auto-detection
+**Changed files:**
+- `src/vllm_metrics.hpp` — `load_score(compression_ratio)` + `effective_cache_pressure()` method
+- `src/router_service.cpp` — `BackendInfo::compression_ratio` field, plumbed through registration
+- `src/router_service.hpp` — `BackendState::compression_ratio`, updated `register_backend_global` signature
+- `src/backend_registry.hpp` — Updated virtual interface
+- `src/health_service.hpp/cpp` — Per-backend compression ratio storage, passed to `load_score()` during broadcast
+- `src/config_schema.hpp` — `RoutingConfig::default_compression_ratio` (env: `RANVIER_DEFAULT_COMPRESSION_RATIO`)
+- `src/config_loader.cpp` — YAML + env var parsing, validation (>= 1.0)
+- `src/http_controller.cpp` — Admin API `compression_ratio` parameter on `POST /admin/backends`
+- `src/parse_utils.hpp` — `parse_double()` utility
 
-**Complexity:** Low. Config + formula change using existing data flow.
+**Tests:** 10 new tests in `tests/unit/vllm_metrics_test.cpp`, 5 new tests in `tests/unit/parse_utils_test.cpp`.
 
-**Independence from TurboQuant:** Yes. Useful for any heterogeneous GPU fleet (e.g., A100-40GB vs A100-80GB backends already have different effective capacities).
+**Configuration:** Static config via admin API or YAML (`routing.default_compression_ratio`). Auto-detection from vLLM metrics deferred to when inference engines expose compression ratio natively.
+
+**Complexity:** Low. Config + formula change using existing data flow. Zero new async boundaries on the hot path.
 
 ### P1: Effective Capacity in Cost-Based Routing
 
@@ -176,14 +185,18 @@ The core enabler is a `compression_ratio` field per backend. Three sourcing opti
 
 **Recommendation:** Start with static config (Option 1). Add scrape-based detection (Option 2) when/if inference engines expose the metric. This mirrors how `supports_token_ids` is currently handled in `BackendInfo`.
 
+**Current status:** Static config implemented (P0). Admin API and YAML both supported.
+
 ### Existing Structs That Change
 
-| Struct | File | Change |
-|--------|------|--------|
-| `BackendInfo` | `src/router_service.cpp` | Add `double compression_ratio = 1.0` |
-| `VLLMMetrics` | `src/vllm_metrics.hpp` | Add `effective_cache_pressure()` method |
-| `RoutingConfig` | `src/config_schema.hpp` | Add per-backend compression config |
-| `RouteResult` | `src/router_service.hpp` | Add `double effective_cache_headroom` (observability) |
+| Struct | File | Change | Status |
+|--------|------|--------|--------|
+| `BackendInfo` | `src/router_service.cpp` | Add `double compression_ratio = 1.0` | ✅ P0 |
+| `VLLMMetrics` | `src/vllm_metrics.hpp` | Add `effective_cache_pressure()` method, `load_score(compression_ratio)` | ✅ P0 |
+| `RoutingConfig` | `src/config_schema.hpp` | Add `default_compression_ratio` | ✅ P0 |
+| `BackendState` | `src/router_service.hpp` | Add `double compression_ratio` (admin API visibility) | ✅ P0 |
+| `HealthService` | `src/health_service.hpp` | Add `_backend_compression_ratios` map + setter | ✅ P0 |
+| `RouteResult` | `src/router_service.hpp` | Add `double effective_cache_headroom` (observability) | Deferred to P1 |
 
 ### Relationship to Other Proposals
 

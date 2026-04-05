@@ -208,3 +208,117 @@ TEST_F(VLLMMetricsTest, WaitingOnlyNoRunning) {
     // score = 0.7 * min(10.0/3.0, 1.0) = 0.7 * 1.0 = 0.7
     EXPECT_NEAR(m.load_score(), 0.7, 0.01);
 }
+
+// =============================================================================
+// Effective Cache Pressure (compression-aware)
+// =============================================================================
+
+TEST_F(VLLMMetricsTest, EffectiveCachePressureNoCompression) {
+    VLLMMetrics m;
+    m.gpu_cache_usage_percent = 0.5;
+    // ratio 1.0 = no compression: effective == raw
+    EXPECT_DOUBLE_EQ(m.effective_cache_pressure(1.0), 0.5);
+}
+
+TEST_F(VLLMMetricsTest, EffectiveCachePressureWith6xCompression) {
+    VLLMMetrics m;
+    m.gpu_cache_usage_percent = 0.5;
+    // 6x compression: 0.5 / 6.0 = ~0.083
+    EXPECT_NEAR(m.effective_cache_pressure(6.0), 0.5 / 6.0, 0.001);
+}
+
+TEST_F(VLLMMetricsTest, EffectiveCachePressureClampsRatioBelow1) {
+    VLLMMetrics m;
+    m.gpu_cache_usage_percent = 0.8;
+    // Invalid ratio < 1.0 should be clamped to 1.0
+    EXPECT_DOUBLE_EQ(m.effective_cache_pressure(0.5), 0.8);
+    EXPECT_DOUBLE_EQ(m.effective_cache_pressure(0.0), 0.8);
+    EXPECT_DOUBLE_EQ(m.effective_cache_pressure(-1.0), 0.8);
+}
+
+// =============================================================================
+// Compression-Aware Load Score
+// =============================================================================
+
+TEST_F(VLLMMetricsTest, LoadScoreDefaultCompressionBackwardCompatible) {
+    // load_score() with no args should behave identically to the original formula
+    VLLMMetrics m;
+    m.valid = true;
+    m.num_requests_running = 8;
+    m.num_requests_waiting = 3;
+    m.gpu_cache_usage_percent = 0.65;
+    EXPECT_DOUBLE_EQ(m.load_score(), m.load_score(1.0));
+}
+
+TEST_F(VLLMMetricsTest, CompressionReducesCachePressureInScore) {
+    VLLMMetrics m;
+    m.valid = true;
+    m.num_requests_running = 5;
+    m.gpu_cache_usage_percent = 0.9;  // High cache pressure
+
+    double score_no_compression = m.load_score(1.0);
+    double score_6x_compression = m.load_score(6.0);
+
+    // 6x compression should produce a lower score (more headroom)
+    EXPECT_LT(score_6x_compression, score_no_compression);
+}
+
+TEST_F(VLLMMetricsTest, CompressionOnlyAffectsCacheComponent) {
+    // With zero cache usage, compression ratio shouldn't matter
+    VLLMMetrics m;
+    m.valid = true;
+    m.num_requests_running = 10;
+    m.num_requests_waiting = 5;
+    m.gpu_cache_usage_percent = 0.0;
+
+    EXPECT_DOUBLE_EQ(m.load_score(1.0), m.load_score(6.0));
+}
+
+TEST_F(VLLMMetricsTest, HighCompressionDramaticallyReducesCachePressure) {
+    VLLMMetrics m;
+    m.valid = true;
+    m.gpu_cache_usage_percent = 0.5;
+
+    // No compression: score = 0.7 * 0 + 0.3 * 0.5 = 0.15
+    EXPECT_NEAR(m.load_score(1.0), 0.15, 0.001);
+
+    // 6x compression: score = 0.7 * 0 + 0.3 * (0.5/6.0) = 0.3 * 0.083 = ~0.025
+    EXPECT_NEAR(m.load_score(6.0), 0.3 * (0.5 / 6.0), 0.001);
+}
+
+TEST_F(VLLMMetricsTest, SaturatedBackendWithCompression) {
+    VLLMMetrics m;
+    m.valid = true;
+    m.num_requests_running = 10;
+    m.num_requests_waiting = 100;
+    m.gpu_cache_usage_percent = 1.0;
+    // request saturated: 0.7 * 1.0 = 0.7
+    // cache with 6x: 0.3 * (1.0/6.0) = 0.05
+    // total = 0.75
+    EXPECT_NEAR(m.load_score(6.0), 0.75, 0.01);
+    // Without compression: 0.7 + 0.3 = 1.0
+    EXPECT_DOUBLE_EQ(m.load_score(1.0), 1.0);
+}
+
+TEST_F(VLLMMetricsTest, InvalidMetricsIgnoreCompression) {
+    VLLMMetrics m;
+    m.num_requests_running = 100;
+    m.gpu_cache_usage_percent = 1.0;
+    // Invalid → 0.0 regardless of compression ratio
+    EXPECT_DOUBLE_EQ(m.load_score(6.0), 0.0);
+}
+
+TEST_F(VLLMMetricsTest, ScoreDecreasesMonotonicallyWithCompressionRatio) {
+    VLLMMetrics m;
+    m.valid = true;
+    m.num_requests_running = 5;
+    m.num_requests_waiting = 2;
+    m.gpu_cache_usage_percent = 0.7;
+
+    double prev = m.load_score(1.0);
+    for (double ratio = 2.0; ratio <= 10.0; ratio += 1.0) {
+        double score = m.load_score(ratio);
+        EXPECT_LE(score, prev) << "Score increased at compression_ratio=" << ratio;
+        prev = score;
+    }
+}

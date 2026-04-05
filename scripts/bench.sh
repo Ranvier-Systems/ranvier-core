@@ -259,6 +259,10 @@ BENCHMARK OPTIONS:
                         Sets RANVIER_BACKPRESSURE_ENABLE_PRIORITY_QUEUE=true and
                         SIMULATE_AGENTS=true. Use for A/B testing with vs. without
                         the priority queue.
+    --compression-ratio R
+                        Set default KV-cache compression ratio for all backends (default: 1.0).
+                        Use with TurboQuant-enabled vLLM backends (e.g., --compression-ratio 6.0).
+                        Sets RANVIER_DEFAULT_COMPRESSION_RATIO for the cluster.
     --no-load-aware     Disable load-aware backend selection. Routes always go to the
                         cached backend regardless of queue depth. Useful for A/B testing
                         cache hit rates vs load balancing trade-offs.
@@ -448,6 +452,7 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+COMPRESSION_RATIO=""
 PRIORITY_QUEUE=false
 PROMPT_FILE=""
 STOP_TIMEOUT="$DEFAULT_STOP_TIMEOUT"
@@ -483,6 +488,7 @@ while [[ $# -gt 0 ]]; do
         --client-tokenize) CLIENT_TOKENIZE=true; shift ;;
         --multi-depth)    MULTI_DEPTH=true; shift ;;
         --no-load-aware)  LOAD_AWARE=false; shift ;;
+        --compression-ratio) COMPRESSION_RATIO="$2"; shift 2 ;;
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
@@ -1279,6 +1285,12 @@ fi
 if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
+fi
+
+# Export compression ratio for docker-compose
+if [[ -n "$COMPRESSION_RATIO" ]]; then
+    export RANVIER_DEFAULT_COMPRESSION_RATIO="$COMPRESSION_RATIO"
+    log_info "KV-cache compression ratio: $COMPRESSION_RATIO"
 fi
 
 # -------------------------------------------------------------------------

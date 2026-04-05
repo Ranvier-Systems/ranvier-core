@@ -83,9 +83,22 @@ VLLMMetrics HealthService::get_vllm_metrics(BackendId id) const {
 double HealthService::get_backend_load(BackendId id) const {
     auto it = _backend_vllm_metrics.find(id);
     if (it != _backend_vllm_metrics.end()) {
-        return it->second.load_score();
+        double cr = 1.0;
+        auto cr_it = _backend_compression_ratios.find(id);
+        if (cr_it != _backend_compression_ratios.end()) {
+            cr = cr_it->second;
+        }
+        return it->second.load_score(cr);
     }
     return 0.0;  // Optimistic default
+}
+
+void HealthService::set_backend_compression_ratio(BackendId id, double compression_ratio) {
+    if (_backend_compression_ratios.size() >= MAX_TRACKED_BACKENDS &&
+        !_backend_compression_ratios.contains(id)) {
+        return;  // Bounded (Rule #4)
+    }
+    _backend_compression_ratios[id] = std::max(compression_ratio, 1.0);
 }
 
 future<> HealthService::run_loop() {
@@ -134,7 +147,12 @@ future<> HealthService::run_loop() {
                         absl::flat_hash_map<BackendId, double> load_scores;
                         for (const auto& [id, m] : _backend_vllm_metrics) {
                             if (m.valid) {
-                                load_scores[id] = m.load_score();
+                                double cr = 1.0;
+                                auto cr_it = _backend_compression_ratios.find(id);
+                                if (cr_it != _backend_compression_ratios.end()) {
+                                    cr = cr_it->second;
+                                }
+                                load_scores[id] = m.load_score(cr);
                             }
                         }
                         if (!load_scores.empty()) {

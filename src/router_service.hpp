@@ -324,7 +324,8 @@ public:
     // Priority: priority group (default 0 = highest, lower priority backends used for fallback)
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr,
                                                uint32_t weight = 100, uint32_t priority = 0,
-                                               bool supports_token_ids = true) override;
+                                               bool supports_token_ids = true,
+                                               double compression_ratio = 1.0) override;
 
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id) override;
@@ -368,6 +369,7 @@ public:
         bool is_draining;
         bool is_dead;
         bool supports_token_ids;  // Whether backend supports vLLM prompt_token_ids
+        double compression_ratio;  // KV-cache compression ratio (>= 1.0, 1.0 = no compression)
         int64_t drain_start_ms;  // 0 if not draining
     };
 
@@ -485,7 +487,8 @@ public:
     // Allows unit tests to set up backend state without a running Seastar reactor.
     static void register_backend_for_testing(BackendId id, seastar::socket_address addr,
                                               uint32_t weight = 100, uint32_t priority = 0,
-                                              bool supports_token_ids = true);
+                                              bool supports_token_ids = true,
+                                              double compression_ratio = 1.0);
 
     // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
     static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);

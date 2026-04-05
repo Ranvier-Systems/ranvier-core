@@ -34,9 +34,22 @@ struct VLLMMetrics {
     // Whether this struct has been populated with real data
     bool valid = false;
 
+    // Compute effective cache pressure adjusted for KV-cache compression.
+    // compression_ratio >= 1.0: a backend with 6x compression at 50% raw usage
+    // has effective_cache_pressure = 0.083 (enormous headroom), while a
+    // non-compressed backend at 50% has 0.5.
+    //
+    // compression_ratio must be >= 1.0; values < 1.0 are clamped to 1.0.
+    double effective_cache_pressure(double compression_ratio) const {
+        double ratio = std::max(compression_ratio, 1.0);
+        return gpu_cache_usage_percent / ratio;
+    }
+
     // Compute a 0.0–1.0 load score for routing decisions.
     // Composite of request queue depth and KV cache pressure.
-    double load_score() const {
+    // compression_ratio adjusts cache pressure for backends with KV-cache
+    // compression (default 1.0 = no compression, backward compatible).
+    double load_score(double compression_ratio = 1.0) const {
         if (!valid) return 0.0;
 
         // Primary signal: request saturation
@@ -46,8 +59,8 @@ struct VLLMMetrics {
               / static_cast<double>(num_requests_running + 1)
             : 0.0;
 
-        // Secondary signal: KV cache pressure
-        double cache_pressure = gpu_cache_usage_percent;
+        // Secondary signal: KV cache pressure (compression-adjusted)
+        double cache_pressure = effective_cache_pressure(compression_ratio);
 
         // Weighted blend — request queue is the dominant signal
         double score = 0.7 * std::min(request_pressure / 3.0, 1.0)

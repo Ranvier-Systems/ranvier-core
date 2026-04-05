@@ -377,6 +377,56 @@ TEST_F(RouterServiceTest, BackendStatesIncludeSupportsTokenIds) {
     }
 }
 
+// =============================================================================
+// Compression Ratio Tests
+// =============================================================================
+
+TEST_F(RouterServiceTest, CompressionRatioDefaultIsOne) {
+    // Default registration should have compression_ratio = 1.0
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    auto states = router_->get_all_backend_states();
+    ASSERT_EQ(states.size(), 1u);
+    EXPECT_DOUBLE_EQ(states[0].compression_ratio, 1.0);
+}
+
+TEST_F(RouterServiceTest, CompressionRatioExplicitValue) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 6.0);
+    auto states = router_->get_all_backend_states();
+    ASSERT_EQ(states.size(), 1u);
+    EXPECT_DOUBLE_EQ(states[0].compression_ratio, 6.0);
+}
+
+TEST_F(RouterServiceTest, CompressionRatioMixedFleet) {
+    // Heterogeneous fleet: TurboQuant backend (6x) vs standard (1x)
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 6.0);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, true, 1.0);
+    auto states = router_->get_all_backend_states();
+    ASSERT_EQ(states.size(), 2u);
+    for (const auto& s : states) {
+        if (s.id == 1) {
+            EXPECT_DOUBLE_EQ(s.compression_ratio, 6.0);
+        } else if (s.id == 2) {
+            EXPECT_DOUBLE_EQ(s.compression_ratio, 1.0);
+        }
+    }
+}
+
+TEST_F(RouterServiceTest, CompressionRatioSurvivesReregister) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 6.0);
+    auto states = router_->get_all_backend_states();
+    EXPECT_DOUBLE_EQ(states[0].compression_ratio, 6.0);
+
+    // Re-register with different ratio
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 3.0);
+    states = router_->get_all_backend_states();
+    EXPECT_DOUBLE_EQ(states[0].compression_ratio, 3.0);
+}
+
 TEST_F(RouterServiceTest, UnregisterClearsDeadStatus) {
     RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
     RouterService::mark_backend_dead_for_testing(1);

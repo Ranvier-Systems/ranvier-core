@@ -180,6 +180,19 @@ struct RoutingConfig {
     std::chrono::milliseconds route_batch_flush_interval{20};              // Env: RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS
 
     // =========================================================================
+    // Compression-Aware Load Scoring
+    // =========================================================================
+    // Per-backend KV-cache compression ratio for heterogeneous GPU fleets.
+    // Backends with KV-cache compression (e.g., TurboQuant at 6x) have more
+    // effective cache capacity. This ratio adjusts cache pressure scoring:
+    //   effective_cache_pressure = raw_cache_usage / compression_ratio
+    //
+    // Default 1.0 (no compression). Set per-backend via YAML config or admin API.
+    // Technology-agnostic: useful for any fleet with varying GPU memory or
+    // quantization settings, not just TurboQuant.
+    double default_compression_ratio = 1.0;  // Fleet-wide default (env: RANVIER_DEFAULT_COMPRESSION_RATIO)
+
+    // =========================================================================
     // Cost-Based Routing (overlays on load-aware routing)
     // =========================================================================
     CostBasedRoutingConfig cost_routing;

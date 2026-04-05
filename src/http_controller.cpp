@@ -2093,6 +2093,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     sstring weight_str = req->get_query_param("weight");
     sstring priority_str = req->get_query_param("priority");
     sstring supports_token_ids_str = req->get_query_param("supports_token_ids");
+    sstring compression_ratio_str = req->get_query_param("compression_ratio");
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
@@ -2156,6 +2157,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
             co_return std::move(rep);
         }
         supports_token_ids = *supports_opt;
+    }
+
+    // compression_ratio: KV-cache compression ratio (>= 1.0).
+    // Falls back to fleet-wide default_compression_ratio from config when not specified.
+    double compression_ratio = _config.default_compression_ratio;
+    if (!compression_ratio_str.empty()) {
+        auto cr_opt = parse_double(std::string_view(compression_ratio_str));
+        if (!cr_opt || *cr_opt < 1.0) {
+            log_control.warn("POST /admin/backends: invalid compression_ratio '{}'", compression_ratio_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid compression_ratio: must be a number >= 1.0\"}");
+            co_return std::move(rep);
+        }
+        compression_ratio = *cr_opt;
     }
 
     // Resolve address: supports both direct IP addresses and hostnames
@@ -2227,13 +2242,23 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         _persistence->queue_save_backend(id, resolved_ip, port, weight, priority);
     }
 
-    co_await _router.register_backend_global(id, addr, weight, priority, supports_token_ids);
+    co_await _router.register_backend_global(id, addr, weight, priority, supports_token_ids, compression_ratio);
 
-    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={})",
-        id, ip_str, port, weight, priority, supports_token_ids);
+    // Notify HealthService of compression ratio for compression-aware load scoring.
+    // HealthService state lives on shard 0 — must submit_to(0) to avoid cross-shard
+    // write (Rule #14). Captures scalars by value (no heap ownership).
+    if (_health_service) {
+        co_await seastar::smp::submit_to(0, [hs = _health_service, id, compression_ratio] {
+            hs->set_backend_compression_ratio(id, compression_ratio);
+        });
+    }
+
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={})",
+        id, ip_str, port, weight, priority, supports_token_ids, compression_ratio);
     rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
         ", \"priority\": " + std::to_string(priority) +
-        ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") + "}");
+        ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") +
+        ", \"compression_ratio\": " + std::to_string(compression_ratio) + "}");
     co_return std::move(rep);
 }
 
@@ -2739,7 +2764,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
         oss << "      \"priority\": " << b.priority << ",\n";
         oss << "      \"is_draining\": " << (b.is_draining ? "true" : "false") << ",\n";
         oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false") << ",\n";
-        oss << "      \"supports_token_ids\": " << (b.supports_token_ids ? "true" : "false");
+        oss << "      \"supports_token_ids\": " << (b.supports_token_ids ? "true" : "false") << ",\n";
+        oss << "      \"compression_ratio\": " << b.compression_ratio;
         if (b.drain_start_ms > 0) {
             oss << ",\n      \"drain_start_ms\": " << b.drain_start_ms << "\n";
         } else {

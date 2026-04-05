@@ -109,6 +109,21 @@ TEST_F(ApplicationConfigTest, BuildControllerConfigCopiesCircuitBreakerSettings)
     EXPECT_TRUE(default_config.circuit_breaker.fallback_enabled);
 }
 
+TEST_F(ApplicationConfigTest, HttpControllerConfigCarriesCompressionRatio) {
+    // Regression test: HttpControllerConfig must have default_compression_ratio
+    // so the admin API can use it as fallback when no per-backend value is specified.
+    HttpControllerConfig ctrl_config;
+    EXPECT_DOUBLE_EQ(ctrl_config.default_compression_ratio, 1.0);
+
+    ctrl_config.default_compression_ratio = 6.0;
+    EXPECT_DOUBLE_EQ(ctrl_config.default_compression_ratio, 6.0);
+}
+
+TEST_F(ApplicationConfigTest, RoutingConfigCompressionRatioDefault) {
+    // RoutingConfig default_compression_ratio should be 1.0 (no compression)
+    EXPECT_DOUBLE_EQ(default_config.routing.default_compression_ratio, 1.0);
+}
+
 // =============================================================================
 // Application State Accessor Tests
 // =============================================================================
