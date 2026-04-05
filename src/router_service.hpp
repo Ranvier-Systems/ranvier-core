@@ -565,7 +565,12 @@ private:
 
     // Rule #17: Yielding per-shard TTL cleanup coroutine.
     // Named (not lambda) to avoid Rule #16 when called from smp::submit_to.
-    static seastar::future<> ttl_cleanup_on_shard(std::chrono::steady_clock::time_point cutoff);
+    // Compression-aware: each backend may have a different cutoff based on its
+    // compression_ratio. default_cutoff applies to backends not in the map.
+    // Rule #21: coroutine takes map by value (frame outlives caller stack).
+    static seastar::future<> ttl_cleanup_on_shard(
+        std::chrono::steady_clock::time_point default_cutoff,
+        absl::flat_hash_map<BackendId, std::chrono::steady_clock::time_point> backend_cutoffs);
 
     // Check for backends that have been draining long enough and fully remove them
     void run_draining_reaper();

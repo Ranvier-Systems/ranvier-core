@@ -150,11 +150,13 @@ where `cost_scale = min(estimated_cost / max_cost_per_backend, 1.0)`. Larger req
 
 **Independence from TurboQuant:** Yes. Useful any time backends have different remaining capacity.
 
-### P2: Compression-Aware Route TTL
+### P2: Compression-Aware Route TTL ✅
+
+**Status:** Implemented
 
 **Problem:** `ttl_seconds` (default 1 hour) governs how long Ranvier assumes a learned route is valid. But on a TurboQuant backend, the underlying KV-cache entry survives longer (6x more fits in memory, so less eviction pressure). The fixed TTL doesn't reflect this.
 
-**Proposal:** Scale route TTL by the backend's compression ratio:
+**Solution:** Scale route TTL by the backend's compression ratio:
 
 ```
 effective_ttl = base_ttl * min(compression_ratio, max_ttl_multiplier)
@@ -162,11 +164,20 @@ effective_ttl = base_ttl * min(compression_ratio, max_ttl_multiplier)
 
 Routes to compressed backends persist longer in the ART. Routes to non-compressed backends expire at the base rate.
 
-**Where:**
-- `src/router_service.cpp` — TTL check in route expiry logic
-- Bounded by a `max_ttl_multiplier` to prevent excessively stale routes
+**Changed files:**
+- `src/config_schema.hpp` — `RoutingConfig::max_ttl_multiplier` (env: `RANVIER_MAX_TTL_MULTIPLIER`, default 4.0, range 1.0–10.0)
+- `src/config_loader.cpp` — YAML + env var parsing, validation (1.0–10.0)
+- `src/radix_tree.hpp` — New `remove_expired(CutoffFn)` template overload for per-backend cutoffs
+- `src/router_service.cpp` — `run_ttl_cleanup()` builds per-backend cutoff map from `compression_ratio`; `ttl_cleanup_on_shard()` accepts per-backend cutoffs
+- `src/router_service.hpp` — Updated `ttl_cleanup_on_shard()` signature
 
-**Complexity:** Low.
+**Tests:** 5 new tests in `tests/unit/radix_tree_test.cpp` (per-backend selective expiry, all/none expired, multi-backend, route count), 5 new tests in `tests/unit/config_test.cpp` (default value, boundary validation, invalid values).
+
+**Configuration:** `routing.max_ttl_multiplier` (default 4.0). Set to 1.0 to disable. A backend with `compression_ratio=6.0` gets `effective_ttl = base_ttl * 4.0` (capped). Non-compressed backends use `base_ttl` unchanged.
+
+**Complexity:** Low. Per-backend cutoff map built once per 60s cleanup cycle. Fast path (no compressed backends) uses original single-cutoff `remove_expired`. Zero new async boundaries.
+
+**Independence from TurboQuant:** Yes. Any backend with `compression_ratio > 1.0` benefits.
 
 **Note:** This interacts with [push-based cache eviction notifications](push-cache-eviction-notifications.md). If push notifications are implemented, TTL becomes a fallback rather than the primary expiry mechanism, and this optimization matters less.
 
