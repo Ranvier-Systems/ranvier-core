@@ -68,11 +68,13 @@ A TurboQuant backend at 50% raw usage with 6x compression has `effective_cache_p
 
 **Complexity:** Low. Config + formula change using existing data flow. Zero new async boundaries on the hot path.
 
-### P1: Effective Capacity in Cost-Based Routing
+### P1: Effective Capacity in Cost-Based Routing ✅
+
+**Status:** Implemented
 
 **Problem:** `CostBasedRoutingConfig::max_cost_per_backend` is a flat cap. The cost budget approximates how much KV-cache a request will generate (in tokens). But the same token budget costs ~6x less actual memory on a compressed backend.
 
-**Proposal:** Scale the cost budget ceiling per backend:
+**Solution:** Scale the cost budget ceiling per backend:
 
 ```
 effective_max_cost = max_cost_per_backend * compression_ratio
@@ -80,11 +82,14 @@ effective_max_cost = max_cost_per_backend * compression_ratio
 
 TurboQuant backends accept proportionally more concurrent cost budget. This naturally steers large/long-context requests toward backends with more effective headroom.
 
-**Where:**
-- `src/router_service.cpp` — `reserve_cost_budget()`, cost threshold checks
-- `src/router_service.cpp` — `BackendInfo::current_cost_budget` comparison logic
+**Changed files:**
+- `src/router_service.cpp` — `reserve_cost_budget()`: effective max scaled by `compression_ratio`
+- `src/router_service.cpp` — `find_backend_with_budget()`: per-backend effective max in eligibility check
+- `src/router_service.cpp` — Step 4 cost-aware override: budget threshold scaled by selected backend's `compression_ratio`
 
-**Complexity:** Low. Multiplier on existing budget math.
+**Tests:** 5 new tests in `tests/unit/router_service_test.cpp` covering effective capacity scaling, redirect behavior with compressed/uncompressed backends, and budget reservation with compression ratios.
+
+**Complexity:** Low. Multiplier on existing budget math. Zero new async boundaries.
 
 **Independence from TurboQuant:** Yes. Any capacity asymmetry between backends benefits from this.
 

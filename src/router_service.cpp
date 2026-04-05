@@ -742,7 +742,10 @@ bool reserve_cost_budget(BackendId id, double cost) {
     if (it == g_shard_state->backends.end()) return false;
 
     double max_budget = g_shard_state->config.cost_routing_max_cost;
-    bool within_budget = (it->second.current_cost_budget + cost <= max_budget);
+    // Scale budget ceiling by compression ratio: compressed backends have more
+    // effective KV-cache capacity, so they can accept proportionally more cost.
+    double effective_max = max_budget * it->second.compression_ratio;
+    bool within_budget = (it->second.current_cost_budget + cost <= effective_max);
     // Always add cost to ensure symmetric reserve/release. The budget is advisory —
     // routing decisions check budget *before* reserving, and this function's return
     // value is informational only. Asymmetric reserve/release causes budget drift.
@@ -817,7 +820,9 @@ static std::optional<BackendId> find_backend_with_budget(
         if (id == exclude_id) continue;
         auto it = g_shard_state->backends.find(id);
         if (it == g_shard_state->backends.end()) continue;
-        if (it->second.current_cost_budget + request_cost <= max_budget) {
+        // Scale budget ceiling by backend's compression ratio
+        double effective_max = max_budget * it->second.compression_ratio;
+        if (it->second.current_cost_budget + request_cost <= effective_max) {
             if (eligible_count < MAX_ELIGIBLE) {
                 eligible[eligible_count++] = id;
             }
@@ -2156,7 +2161,13 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     double cost_at_decision = 0.0;
 
     if (g_shard_state && state.config.cost_routing_enabled && estimated_cost > 0.0) {
-        double selected_cost = get_backend_cost(final_backend);
+        double selected_cost = 0.0;
+        double selected_compression = 1.0;
+        auto sel_it = state.backends.find(final_backend);
+        if (sel_it != state.backends.end()) {
+            selected_cost = sel_it->second.current_cost_budget;
+            selected_compression = sel_it->second.compression_ratio;
+        }
         double max_budget = state.config.cost_routing_max_cost;
         cost_at_decision = selected_cost;
 
@@ -2182,27 +2193,32 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
             }
         }
         // 4b. Large request budget check
-        else if (selected_cost + estimated_cost > max_budget) {
-            auto alt = find_backend_with_budget(live_backends, estimated_cost,
-                                                max_budget, final_backend);
-            if (alt.has_value()) {
-                BackendId prev = final_backend;
-                final_backend = *alt;
-                was_cost_redirect = true;
-                cost_at_decision = get_backend_cost(final_backend);
-                state.stats.cost_redirects++;
-                log_router.debug("[{}] Cost budget redirect: backend {} budget={:.1f} + cost={:.1f} > max={:.1f}, "
-                                 "redirected to backend {} (budget={:.1f})",
-                                 request_id, prev, selected_cost, estimated_cost, max_budget,
-                                 *alt, get_backend_cost(*alt));
-            } else {
-                // No backend has budget — route anyway (best effort, advisory budget)
-                state.stats.budget_exhausted++;
-                log_router.debug("[{}] Cost budget exhausted: all backends over budget, "
-                                 "routing to backend {} anyway (best effort)",
-                                 request_id, final_backend);
+        // Scale budget ceiling by selected backend's compression ratio:
+        // compressed backends have more effective KV-cache capacity.
+        else {
+            double effective_max = max_budget * selected_compression;
+            if (selected_cost + estimated_cost > effective_max) {
+                auto alt = find_backend_with_budget(live_backends, estimated_cost,
+                                                    max_budget, final_backend);
+                if (alt.has_value()) {
+                    BackendId prev = final_backend;
+                    final_backend = *alt;
+                    was_cost_redirect = true;
+                    cost_at_decision = get_backend_cost(final_backend);
+                    state.stats.cost_redirects++;
+                    log_router.debug("[{}] Cost budget redirect: backend {} budget={:.1f} + cost={:.1f} > max={:.1f}, "
+                                     "redirected to backend {} (budget={:.1f})",
+                                     request_id, prev, selected_cost, estimated_cost, effective_max,
+                                     *alt, get_backend_cost(*alt));
+                } else {
+                    // No backend has budget — route anyway (best effort, advisory budget)
+                    state.stats.budget_exhausted++;
+                    log_router.debug("[{}] Cost budget exhausted: all backends over budget, "
+                                     "routing to backend {} anyway (best effort)",
+                                     request_id, final_backend);
+                }
             }
-        }
+        } // else (large request path)
     }
 
     if (!request_id.empty() && final_backend == selected && !was_cost_redirect) {
