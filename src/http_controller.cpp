@@ -1316,6 +1316,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 }
             } catch (...) {
                 // Marker resolution failed — fall through to next strategy
+                log_proxy.debug("[{}] Marker boundary resolution failed: {}",
+                               request_id, std::current_exception());
             }
         }
 
@@ -1360,6 +1362,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     msg_token_count = msg_tok_result.tokens.size();
                 } catch (...) {
                     // Individual message tokenization failed — skip this message
+                    log_proxy.debug("[{}] Per-message tokenization failed: {}",
+                                   request_id, std::current_exception());
                     continue;
                 }
 
@@ -1910,8 +1914,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                             if (ctx->shard_metrics_active && shard_load_metrics_initialized()) {
                                 shard_load_metrics().decrement_active();
                             }
-                            try { co_await bundle.close(); } catch (...) {}
-                            try { co_await client_out.close(); } catch (...) {}
+                            try { co_await bundle.close(); } catch (...) {
+                                log_proxy.debug("[{}] Bundle close failed during retry cleanup",
+                                               ctx->request_id);
+                            }
+                            try { co_await client_out.close(); } catch (...) {
+                                log_proxy.debug("[{}] Client output close failed during retry cleanup",
+                                               ctx->request_id);
+                            }
                             std::rethrow_exception(retry_exception);
                         }
                         // Fall through to Phase 4 with updated ctx state
