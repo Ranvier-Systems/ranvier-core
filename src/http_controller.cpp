@@ -763,10 +763,11 @@ future<> HttpController::stream_backend_response(
             break;
         }
 
-        // Read with per-chunk timeout (use remaining time, capped at 30s per read)
+        // Read with per-chunk timeout (use remaining time, capped at per-chunk limit)
+        static constexpr auto kStreamChunkReadTimeout = std::chrono::seconds(30);
         auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
             ctx->request_deadline - lowres_clock::now());
-        auto read_timeout = std::min(remaining, std::chrono::seconds(30));
+        auto read_timeout = std::min(remaining, kStreamChunkReadTimeout);
         auto read_deadline = lowres_clock::now() + read_timeout;
 
         bool read_failed = false;
@@ -2576,7 +2577,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_tree(
     sstring depth_str = req->get_query_param("max_depth");
     if (!depth_str.empty()) {
         auto depth_opt = parse_uint32(std::string_view(depth_str));
-        if (depth_opt && *depth_opt > 0 && *depth_opt <= 256) {
+        static constexpr uint32_t kMaxAllowedDumpDepth = 256;
+        if (depth_opt && *depth_opt > 0 && *depth_opt <= kMaxAllowedDumpDepth) {
             max_depth = static_cast<int>(*depth_opt);
         }
     }

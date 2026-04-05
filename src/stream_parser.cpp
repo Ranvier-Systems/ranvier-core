@@ -197,20 +197,24 @@ ssize_t StreamParser::parse_headers(Result& res) {
         if (line_end == std::string_view::npos) line_end = headers.size();
         auto line = headers.substr(line_start, line_end - line_start);
 
-        if (icase_starts_with(line, "transfer-encoding:")) {
-            if (icase_contains(line.substr(18), "chunked")) {
+        static constexpr std::string_view kTransferEncoding = "transfer-encoding:";
+        static constexpr std::string_view kConnection = "connection:";
+        static constexpr std::string_view kContentLength = "content-length:";
+
+        if (icase_starts_with(line, kTransferEncoding)) {
+            if (icase_contains(line.substr(kTransferEncoding.size()), "chunked")) {
                 is_chunked = true;
             }
-        } else if (icase_starts_with(line, "connection:")) {
-            auto val = line.substr(11);
+        } else if (icase_starts_with(line, kConnection)) {
+            auto val = line.substr(kConnection.size());
             if (icase_contains(val, "close")) {
                 saw_connection_close = true;
             }
             if (icase_contains(val, "keep-alive")) {
                 saw_connection_keepalive = true;
             }
-        } else if (icase_starts_with(line, "content-length:")) {
-            auto val_str = line.substr(15);
+        } else if (icase_starts_with(line, kContentLength)) {
+            auto val_str = line.substr(kContentLength.size());
             while (!val_str.empty() && (val_str.front() == ' ' || val_str.front() == '\t')) {
                 val_str.remove_prefix(1);
             }

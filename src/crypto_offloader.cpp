@@ -96,36 +96,31 @@ bool CryptoOffloader::should_offload(CryptoOpType op_type, size_t data_size) con
     return estimated_latency > _config.offload_latency_threshold_us;
 }
 
-uint64_t CryptoOffloader::estimate_latency_us(CryptoOpType op_type, size_t data_size) const {
-    // Latency estimates based on typical OpenSSL performance
-    // These are conservative estimates for modern hardware
+// Conservative latency estimates for OpenSSL operations on modern hardware
+static constexpr uint64_t kAesBaselineUs = 5;           // Function call overhead
+static constexpr uint64_t kAesPerKbUs = 1;              // ~1GB/s → ~1μs per KB
+static constexpr size_t kBytesPerKb = 1024;
+static constexpr uint64_t kRsaHandshakeEstimateUs = 2000;  // RSA-2048 key gen: ~1-2ms
+static constexpr uint64_t kEcdsaVerifyEstimateUs = 500;    // ECDSA P-256 verify + cert chain
+static constexpr uint64_t kUnknownOpBaselineUs = 10;       // Fallback baseline
+static constexpr uint64_t kUnknownOpPerKbUs = 10;          // Worst-case per-KB estimate
 
+uint64_t CryptoOffloader::estimate_latency_us(CryptoOpType op_type, size_t data_size) const {
     switch (op_type) {
         case CryptoOpType::SYMMETRIC_ENCRYPT:
         case CryptoOpType::SYMMETRIC_DECRYPT:
             // AES-256-GCM: ~1GB/s on modern CPUs
-            // So 1KB takes ~1μs, 1MB takes ~1ms
-            // Add 5μs baseline for function call overhead
-            return 5 + (data_size / 1024);  // ~1μs per KB
+            return kAesBaselineUs + (data_size / kBytesPerKb) * kAesPerKbUs;
 
         case CryptoOpType::HANDSHAKE_INITIATE:
-            // Initial handshake involves RSA/ECDHE key generation
-            // RSA-2048: ~1-2ms, ECDHE P-256: ~0.5ms
-            // Conservative estimate: 2000μs
-            return 2000;
+            return kRsaHandshakeEstimateUs;
 
         case CryptoOpType::HANDSHAKE_CONTINUE:
-            // Handshake continuation involves signature verification
-            // RSA-2048 verify: ~0.1ms, ECDSA P-256 verify: ~0.2ms
-            // Plus potential certificate chain validation
-            // Conservative estimate: 500μs
-            return 500;
+            return kEcdsaVerifyEstimateUs;
 
         case CryptoOpType::UNKNOWN:
         default:
-            // Unknown operations: use size-based heuristic
-            // Assume worst case of 10μs per KB
-            return 10 + (data_size * 10 / 1024);
+            return kUnknownOpBaselineUs + (data_size * kUnknownOpPerKbUs / kBytesPerKb);
     }
 }
 
