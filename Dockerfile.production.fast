@@ -15,8 +15,9 @@ FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /src
 
-# Copy CMakeLists.txt
+# Copy CMakeLists.txt and cmake modules
 COPY CMakeLists.txt ./
+COPY cmake/ ./cmake/
 
 # Copy the source code, tests, and assets
 COPY src/ ./src/
