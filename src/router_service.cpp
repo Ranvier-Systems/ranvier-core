@@ -1742,6 +1742,10 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
         // Update MetricsService for ranvier_cache_hit_ratio gauge
         if (g_metrics) {
             metrics().record_cache_hit();
+            // Record prefix hit by compression tier
+            auto bi = state.backends.find(result.value());
+            double cr = (bi != state.backends.end()) ? bi->second.compression_ratio : 1.0;
+            metrics().record_prefix_hit_by_compression_tier(cr);
         }
     } else {
         if (!request_id.empty()) {
@@ -2012,6 +2016,10 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 state.stats.prefix_affinity_routes++;
                 if (g_metrics) {
                     metrics().record_cache_hit();
+                    // Record prefix hit by compression tier
+                    auto bi = state.backends.find(art_backend);
+                    double cr = (bi != state.backends.end()) ? bi->second.compression_ratio : 1.0;
+                    metrics().record_prefix_hit_by_compression_tier(cr);
                 }
 
                 selected = art_backend;

@@ -93,24 +93,31 @@ TurboQuant backends accept proportionally more concurrent cost budget. This natu
 
 **Independence from TurboQuant:** Yes. Any capacity asymmetry between backends benefits from this.
 
-### P1: Fleet-Wide Cache Efficiency Metrics
+### P1: Fleet-Wide Cache Efficiency Metrics ✅
+
+**Status:** Implemented
 
 **Problem:** Operators can't currently see the aggregate cache efficiency picture across a heterogeneous fleet.
 
-**Proposal:** New Prometheus gauges:
+**Solution:** New Prometheus gauges:
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `ranvier_backend_effective_cache_capacity` | gauge | Raw capacity * compression ratio, per backend |
 | `ranvier_backend_effective_cache_usage` | gauge | Raw usage / compression ratio, per backend |
 | `ranvier_fleet_effective_cache_capacity_total` | gauge | Sum across all backends |
-| `ranvier_prefix_hits_by_compression_tier` | counter | Cache hit rate bucketed by compression tier |
+| `ranvier_fleet_effective_cache_usage_total` | gauge | Sum of effective usage across all backends |
+| `ranvier_prefix_hits_by_compression_tier` | counter | Cache hit rate bucketed by compression tier (none/moderate/high) |
 
-**Where:**
-- `src/metrics_service.hpp` — new gauges
-- `src/health_service.cpp` — aggregate computation
+**Changed files:**
+- `src/health_service.hpp` — Fleet aggregate computation methods
+- `src/health_service.cpp` — `compute_fleet_effective_cache_capacity()`, `compute_fleet_effective_cache_usage()`, per-backend effective capacity/usage accessors, fleet-wide Prometheus gauges
+- `src/metrics_service.hpp` — Per-backend `backend_effective_cache_capacity`/`backend_effective_cache_usage` gauges, `prefix_hits_by_compression_tier` counter (3 tiers: none/moderate/high), `record_prefix_hit_by_compression_tier()` method
+- `src/router_service.cpp` — Calls `record_prefix_hit_by_compression_tier()` at both cache hit sites
 
-**Complexity:** Low. Derived metrics from existing data + new `compression_ratio` field.
+**Tests:** 15 new tests in `tests/unit/health_service_test.cpp` (fleet aggregates, per-backend effective metrics), 8 new tests in `tests/unit/metrics_service_test.cpp` (compression tier bucketing).
+
+**Complexity:** Low. Derived metrics from existing data + `compression_ratio` field. Zero new async boundaries. All gauge lambdas are lock-free (Rule #1).
 
 ### P2: Capacity-Aware Hash Fallback Selection
 
