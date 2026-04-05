@@ -26,6 +26,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 13. [Code Modularity (Low Priority)](#13-code-modularity-low-priority)
 14. [Shard 0 Role Isolation Analysis (2026-03-06)](#14-shard-0-role-isolation-analysis-2026-03-06)
 15. [Intelligence Layer Roadmap (2026-03-25)](#15-intelligence-layer-roadmap-2026-03-25)
+16. [KV-Cache Compression-Aware Routing (2026-04-05)](#16-kv-cache-compression-aware-routing-2026-04-05)
 
 ---
 
@@ -894,6 +895,25 @@ Remaining Tier 4 item (4.1 single-binary distribution) is deferred — not block
 
 - [ ] **[P4] Template ShardedConfig** (§13 item 22.4) — trivial, do whenever
 - [ ] **[P4] Generalize gossip message types** — only when 2nd product committed
+
+---
+
+## 16. KV-Cache Compression-Aware Routing (2026-04-05)
+
+Design exploration for making Ranvier's routing decisions aware of heterogeneous backend KV-cache capacity — motivated by Google's TurboQuant (~6x KV-cache compression, ICLR 2026), but applicable to any fleet where backends differ in effective cache capacity.
+
+**Full proposal:** [`docs/architecture/kv-cache-compression-integration.md`](docs/architecture/kv-cache-compression-integration.md)
+
+| Priority | Item | Complexity | TurboQuant-specific? |
+|----------|------|------------|---------------------|
+| P0 | Compression-aware load scoring (`load_score()` formula) | Low | No |
+| P1 | Effective capacity in cost-based routing | Low | No |
+| P1 | Fleet-wide cache efficiency metrics | Low | No |
+| P2 | Capacity-aware hash fallback selection | Medium | No |
+| P2 | Compression-aware route TTL | Low | No |
+| P3 | Tiered compression signaling (Ranvier → backend) | High | Partially |
+
+Core enabler: `compression_ratio` field in `BackendInfo` (static config initially, scraped later).
 
 ---
 
