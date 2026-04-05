@@ -141,8 +141,12 @@ seastar::future<std::optional<seastar::sstring>> LocalDiscoveryService::http_get
         }
 
         // 4. Close streams in all paths (success, failure, timeout)
-        try { co_await out.close(); } catch (...) {}
-        try { co_await in.close(); } catch (...) {}
+        try { co_await out.close(); } catch (...) {
+            log_discovery.debug("Port {} stream close failed on output", port);
+        }
+        try { co_await in.close(); } catch (...) {
+            log_discovery.debug("Port {} input stream close failed", port);
+        }
 
         if (ep) {
             std::rethrow_exception(ep);

@@ -291,8 +291,12 @@ HealthService::scrape_vllm_metrics(socket_address addr) {
         }
 
         // 4. Close streams in all paths (success, failure, timeout)
-        try { co_await out.close(); } catch (...) {}
-        try { co_await in.close(); } catch (...) {}
+        try { co_await out.close(); } catch (...) {
+            log_health.debug("Metrics scrape {} output stream close failed", addr);
+        }
+        try { co_await in.close(); } catch (...) {
+            log_health.debug("Metrics scrape {} input stream close failed", addr);
+        }
 
         if (ep) {
             std::rethrow_exception(ep);
