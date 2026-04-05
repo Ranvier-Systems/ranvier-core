@@ -42,11 +42,14 @@ inline const char* priority_level_to_string(PriorityLevel level) {
     return "normal";  // unreachable, but satisfies -Wreturn-type
 }
 
+// Number of priority tiers (matches PriorityLevel enum: CRITICAL, HIGH, NORMAL, LOW)
+inline constexpr size_t NUM_PRIORITY_TIERS = 4;
+
 // Minimal settings consumed by the scheduler.  The full BackpressureSettings
 // (in http_controller.hpp) is a superset; this struct keeps the scheduler
 // header free of unrelated fields.
 struct SchedulerSettings {
-    std::array<uint32_t, 4> tier_capacity = {64, 128, 256, 512};
+    std::array<uint32_t, NUM_PRIORITY_TIERS> tier_capacity = {64, 128, 256, 512};
     uint32_t max_per_agent_queued = 128;  // Per-agent queue depth limit
 };
 
@@ -68,10 +71,13 @@ using PauseCheckFn = std::function<bool(std::string_view agent_id)>;
 template<typename Context>
 class BasicRequestScheduler {
 public:
+    static constexpr size_t NUM_TIERS = NUM_PRIORITY_TIERS;
+    static constexpr size_t CRITICAL_TIER = static_cast<size_t>(PriorityLevel::CRITICAL);
+
     explicit BasicRequestScheduler(const SchedulerSettings& settings)
         : _max_per_agent_queued(settings.max_per_agent_queued > 0
               ? settings.max_per_agent_queued : DEFAULT_MAX_PER_AGENT_QUEUED) {
-        for (size_t i = 0; i < 4; ++i) {
+        for (size_t i = 0; i < NUM_TIERS; ++i) {
             _tier_capacity[i] = settings.tier_capacity[i] > 0
                 ? settings.tier_capacity[i] : DEFAULT_TIER_CAPACITY;
         }
@@ -87,8 +93,8 @@ public:
     // Returns true if enqueued, false if queue full or per-agent limit reached (caller returns 503).
     // Caller must signal the condition variable after a successful enqueue.
     bool enqueue(std::unique_ptr<Context> ctx) {
-        auto tier = static_cast<uint8_t>(ctx->priority);
-        if (tier >= 4) tier = 2;  // Fallback to NORMAL
+        auto tier = static_cast<size_t>(ctx->priority);
+        if (tier >= NUM_TIERS) tier = static_cast<size_t>(PriorityLevel::NORMAL);
 
         if (_queues[tier].size() >= _tier_capacity[tier]) {
             ++_overflow_drops[tier];
@@ -112,21 +118,34 @@ public:
     }
 
     // Dequeue highest-priority waiting request (fair within tier).
-    // CRITICAL always wins (never subject to pause — interactive typing must not block).
-    // Within each non-CRITICAL tier, picks the agent whose last_served timestamp
-    // is oldest, but SKIPS any request whose agent_id is paused.
+    // CRITICAL tier is checked first but still respects admin pause — an
+    // explicit pause is an authoritative control-plane action that overrides
+    // scheduling priority.  Within each tier, picks the agent whose
+    // last_served timestamp is oldest, but SKIPS any paused agent's request.
     std::optional<std::unique_ptr<Context>> dequeue() {
-        // CRITICAL always wins — no pause check
-        if (!_queues[0].empty()) {
-            auto ctx = std::move(_queues[0].front());
-            _queues[0].pop_front();
-            update_agent_served(ctx.get());
-            ++_total_dequeued;
-            return ctx;
+        // CRITICAL tier (highest priority, but still subject to pause)
+        if (!_queues[CRITICAL_TIER].empty()) {
+            for (size_t i = 0; i < _queues[CRITICAL_TIER].size(); ++i) {
+                if (_pause_check && !_queues[CRITICAL_TIER][i]->agent_id.empty()
+                    && _pause_check(_queues[CRITICAL_TIER][i]->agent_id)) {
+                    ++_paused_skips;
+                    continue;
+                }
+                // Found a non-paused CRITICAL request
+                if (i != 0) {
+                    std::swap(_queues[CRITICAL_TIER][0], _queues[CRITICAL_TIER][i]);
+                }
+                auto ctx = std::move(_queues[CRITICAL_TIER].front());
+                _queues[CRITICAL_TIER].pop_front();
+                update_agent_served(ctx.get());
+                ++_total_dequeued;
+                return ctx;
+            }
+            // All CRITICAL requests are from paused agents — fall through
         }
 
         // Iterate HIGH → NORMAL → LOW
-        for (size_t tier = 1; tier < 4; ++tier) {
+        for (size_t tier = CRITICAL_TIER + 1; tier < NUM_TIERS; ++tier) {
             if (_queues[tier].empty()) continue;
 
             // Find the best non-paused candidate (oldest last_served).
@@ -170,27 +189,42 @@ public:
         return std::nullopt;
     }
 
+    // Drain all queued contexts regardless of pause state.
+    // Used during shutdown to break promises and wake waiters.
+    // Returns the next context, or nullopt when all queues are empty.
+    std::optional<std::unique_ptr<Context>> drain_one() {
+        for (size_t tier = 0; tier < NUM_TIERS; ++tier) {
+            if (!_queues[tier].empty()) {
+                auto ctx = std::move(_queues[tier].front());
+                _queues[tier].pop_front();
+                return ctx;
+            }
+        }
+        return std::nullopt;
+    }
+
     // Per-tier queue depth for metrics
-    std::array<size_t, 4> queue_depths() const {
+    std::array<size_t, NUM_TIERS> queue_depths() const {
         return {_queues[0].size(), _queues[1].size(),
                 _queues[2].size(), _queues[3].size()};
     }
 
     // Single-tier depth (avoids temporary array in per-tier metric lambdas)
     size_t queue_depth(size_t tier) const {
-        return tier < 4 ? _queues[tier].size() : 0;
+        return tier < NUM_TIERS ? _queues[tier].size() : 0;
     }
 
     // Total enqueued across all tiers
     size_t total_queued() const {
-        return _queues[0].size() + _queues[1].size() +
-               _queues[2].size() + _queues[3].size();
+        size_t total = 0;
+        for (size_t i = 0; i < NUM_TIERS; ++i) total += _queues[i].size();
+        return total;
     }
 
     // Lifetime counters
     uint64_t total_enqueued_count() const { return _total_enqueued; }
     uint64_t total_dequeued_count() const { return _total_dequeued; }
-    const std::array<uint64_t, 4>& overflow_drops() const { return _overflow_drops; }
+    const std::array<uint64_t, NUM_TIERS>& overflow_drops() const { return _overflow_drops; }
     size_t agents_tracked() const { return _agent_last_served.size(); }
 
     // Per-agent drop counter and paused-skip counter
@@ -201,7 +235,7 @@ public:
     // O(total_queued) — called infrequently (admin API only).
     absl::flat_hash_map<std::string, size_t> queue_depths_by_agent() const {
         absl::flat_hash_map<std::string, size_t> result;
-        for (size_t tier = 0; tier < 4; ++tier) {
+        for (size_t tier = 0; tier < NUM_TIERS; ++tier) {
             for (const auto& ctx : _queues[tier]) {
                 if (!ctx->agent_id.empty()) {
                     ++result[ctx->agent_id];
@@ -217,9 +251,9 @@ private:
     static constexpr size_t MAX_AGENT_TRACKING = 256;
 
     // One bounded deque per priority tier (Rule #4: explicit MAX_SIZE + overflow counter)
-    std::array<std::deque<std::unique_ptr<Context>>, 4> _queues;
-    std::array<uint32_t, 4> _tier_capacity{};
-    std::array<uint64_t, 4> _overflow_drops{};
+    std::array<std::deque<std::unique_ptr<Context>>, NUM_TIERS> _queues;
+    std::array<uint32_t, NUM_TIERS> _tier_capacity{};
+    std::array<uint64_t, NUM_TIERS> _overflow_drops{};
 
     // Per-agent queue depth limit and pause check
     uint32_t _max_per_agent_queued{DEFAULT_MAX_PER_AGENT_QUEUED};
@@ -277,7 +311,7 @@ private:
     // O(total_queued) but called only on the enqueue path when agent_id is non-empty.
     size_t count_agent_queued(std::string_view aid) const {
         size_t count = 0;
-        for (size_t tier = 0; tier < 4; ++tier) {
+        for (size_t tier = 0; tier < NUM_TIERS; ++tier) {
             for (const auto& ctx : _queues[tier]) {
                 if (ctx->agent_id == aid) {
                     ++count;
