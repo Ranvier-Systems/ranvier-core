@@ -238,6 +238,12 @@ struct HttpControllerConfig {
     // Compression-aware load scoring: fleet-wide default when not specified per-backend
     double default_compression_ratio = 1.0;
 
+    // Cache events configuration (push-based cache eviction notifications)
+    CacheEventsConfig cache_events;
+
+    // Prefix token length for X-Ranvier-Prefix-Hash header injection
+    size_t prefix_token_length = 128;
+
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }
@@ -456,6 +462,14 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_agent_stats(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_pause_agent(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_resume_agent(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // Cache event handler (push-based cache eviction notifications)
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_cache_events(
+        std::unique_ptr<seastar::http::request> req,
+        std::unique_ptr<seastar::http::reply> rep);
+
+    // Cache event metrics (shard-local, deregistered in stop() — Rule #6)
+    seastar::metrics::metric_groups _cache_event_metrics;
 
     // Background dequeue loop for priority queue (gate-guarded, Rule #5)
     seastar::future<> process_priority_queue();

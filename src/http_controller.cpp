@@ -1,6 +1,7 @@
 #include "http_controller.hpp"
 #include "agent_registry.hpp"
 #include "boundary_detector.hpp"
+#include "cache_event_parser.hpp"
 #include "logging.hpp"
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
@@ -346,6 +347,18 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     r.add(operation_type::POST, url("/admin/agents/resume"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_resume_agent(std::move(req), std::move(rep));
     }, cors));
+
+    // 9. CACHE EVENTS ENDPOINT (push-based cache eviction notifications)
+    // Uses its own auth check (Bearer token from cache_events.auth_token config)
+    // rather than admin auth. Only registered when cache_events.enabled is true.
+    if (_config.cache_events.enabled) {
+        r.add(operation_type::POST, url("/v1/cache/events"),
+            new async_handler<std::function<future<std::unique_ptr<seastar::http::reply>>(
+                std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
+                [this](auto req, auto rep) {
+                    return this->handle_cache_events(std::move(req), std::move(rep));
+                }));
+    }
 
     // Start rate limiter cleanup timer (Hard Rule #5: timer with gate guard)
     _rate_limiter.start();
@@ -714,6 +727,22 @@ future<bool> HttpController::send_backend_request(ProxyContext* ctx, ConnectionB
     // Add traceparent header if tracing is enabled (sanitize to prevent injection)
     if (!ctx->backend_traceparent.empty()) {
         http_headers += "traceparent: " + sstring(sanitize_header_value(ctx->backend_traceparent)) + "\r\n";
+    }
+
+    // Inject X-Ranvier-Prefix-Hash header for push-based cache eviction.
+    // When cache_events.inject_prefix_hash_header is true and the request was
+    // routed via prefix mode with available tokens, compute and add the hash.
+    // Backends store this opaque value and echo it back on eviction events.
+    if (_config.cache_events.enabled && _config.cache_events.inject_prefix_hash_header &&
+        _config.is_prefix_mode() && !ctx->tokens.empty()) {
+        size_t prefix_len = std::min(ctx->tokens.size(), _config.prefix_token_length);
+        uint64_t prefix_hash = hash_prefix(ctx->tokens.data(), prefix_len,
+                                            _config.block_alignment);
+        char hex[PREFIX_HASH_HEX_BUF_SIZE];
+        encode_prefix_hash_hex(prefix_hash, hex);
+        http_headers += "X-Ranvier-Prefix-Hash: ";
+        http_headers += hex;
+        http_headers += "\r\n";
     }
 
     http_headers += "Connection: keep-alive\r\n\r\n";
@@ -2432,6 +2461,9 @@ future<> HttpController::stop() {
     // Deregister agent registry metrics before member destruction (Rule #6)
     _agent_metrics.clear();
 
+    // Deregister cache event metrics before member destruction (Rule #6)
+    _cache_event_metrics.clear();
+
     // Close gate if not already closed by wait_for_drain()
     if (!_request_gate.is_closed()) {
         co_await _request_gate.close();
@@ -2460,9 +2492,10 @@ future<> HttpController::wait_for_drain() {
         co_await _queue_gate.close();
     }
 
-    // Deregister scheduler/agent metrics before member destruction (Rule #6)
+    // Deregister scheduler/agent/cache event metrics before member destruction (Rule #6)
     _scheduler_metrics.clear();
     _agent_metrics.clear();
+    _cache_event_metrics.clear();
 
     // Stop rate limiter cleanup timer (Hard Rule #5: close gate before destruction)
     // This ensures no timer callbacks are in-flight when we proceed with shutdown
@@ -3326,6 +3359,117 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_s
 
     rep->write_body("json", oss.str());
     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+// ============================================================================
+// Cache Event Handler (Push-Based Cache Eviction Notifications)
+// ============================================================================
+//
+// Endpoint: POST /v1/cache/events
+// Accepts batched cache eviction events from backends. Events use prefix
+// hashes (echoed back from X-Ranvier-Prefix-Hash headers) for O(1) lookup.
+//
+// JSON parsing and validation are handled by parse_cache_events() in
+// cache_event_parser.hpp (pure function, testable without Seastar).
+// This handler manages auth, metrics, and async eviction dispatch.
+//
+// Rule #16: Uses coroutine, not .then() chains.
+// Rule #22: Coroutine params by value.
+// Rule #9: Every catch block logs at warn+.
+//
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_events(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    // Auth check: if auth_token is configured, verify Bearer token
+    if (!_config.cache_events.auth_token.empty()) {
+        auto auth_it = req->_headers.find("Authorization");
+        bool authorized = false;
+        if (auth_it != req->_headers.end()) {
+            auto token = extract_bearer_token(std::string_view(auth_it->second));
+            authorized = token.has_value() && *token == _config.cache_events.auth_token;
+        }
+        if (!authorized) {
+            metrics().record_cache_event_auth_failure();
+            RouterService::record_cache_event_auth_failure();
+            rep->set_status(seastar::http::reply::status_type{401});
+            rep->write_body("json", sstring("{\"error\": \"Unauthorized\"}"));
+            co_return std::move(rep);
+        }
+    }
+
+    // Access request body
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    std::string_view body_view(req->content.data(), req->content.size());
+#pragma GCC diagnostic pop
+
+    // Parse and validate JSON (pure function — no Seastar, no metrics)
+    auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    uint64_t max_age_ms = static_cast<uint64_t>(_config.cache_events.max_event_age_seconds) * 1000;
+
+    auto parsed = parse_cache_events(
+        body_view, _config.cache_events.max_events_per_request, max_age_ms, now_ms);
+
+    if (!parsed.ok) {
+        metrics().record_cache_event_parse_error();
+        RouterService::record_cache_event_parse_error();
+        if (!parsed.error.empty()) {
+            log_proxy.warn("Cache event parse error: {}", parsed.error);
+        }
+        rep->set_status(seastar::http::reply::status_type{400});
+        rep->write_body("json", sstring("{\"error\": \"" + parsed.error + "\"}"));
+        co_return std::move(rep);
+    }
+
+    // Dispatch validated events
+    uint32_t processed = 0;
+    uint32_t evictions_applied = 0;
+    uint32_t evictions_stale = 0;
+    uint32_t evictions_unknown = 0;
+
+    // Rule #2 exception: sequential co_await is intentional here.
+    // Each evict_by_prefix_hash_global() fans out to all shards (~20µs),
+    // not external I/O. Loop bounded by max_events_per_request (Rule #4).
+    // Parallelizing would create N_events × N_shards SMP messages at once.
+    for (const auto& ev : parsed.events) {
+        if (ev.age_expired) {
+            evictions_stale++;
+            metrics().record_cache_event_eviction_stale();
+            continue;
+        }
+
+        metrics().record_cache_event_received();
+        RouterService::record_cache_event_received();
+        processed++;
+
+        if (ev.event_type == "evicted") {
+            uint32_t evicted = co_await RouterService::evict_by_prefix_hash_global(
+                ev.prefix_hash, ev.backend_id, ev.timestamp_ms);
+
+            if (evicted > 0) {
+                evictions_applied++;
+                metrics().record_cache_event_eviction_applied();
+            } else {
+                evictions_unknown++;
+                metrics().record_cache_event_eviction_unknown();
+            }
+        }
+        // "loaded" events are Phase 3 — skip silently
+    }
+
+    // Build response
+    std::ostringstream oss;
+    oss << "{\"processed\": " << processed
+        << ", \"evictions_applied\": " << evictions_applied
+        << ", \"evictions_stale\": " << evictions_stale
+        << ", \"evictions_unknown\": " << evictions_unknown
+        << "}";
+
+    rep->write_body("json", sstring(oss.str()));
+    co_return std::move(rep);
 }
 
 } // namespace ranvier

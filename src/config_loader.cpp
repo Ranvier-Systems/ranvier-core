@@ -743,6 +743,23 @@ void RanvierConfig::apply_env_overrides() {
         routing.cost_routing.cost_imbalance_factor = *v;
     }
 
+    // Cache events overrides
+    if (auto v = get_env("RANVIER_CACHE_EVENTS_ENABLED")) {
+        cache_events.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env("RANVIER_CACHE_EVENTS_AUTH_TOKEN")) {
+        cache_events.auth_token = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_CACHE_EVENTS_MAX_EVENTS")) {
+        cache_events.max_events_per_request = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_CACHE_EVENTS_MAX_AGE")) {
+        cache_events.max_event_age_seconds = *v;
+    }
+    if (auto v = get_env("RANVIER_CACHE_EVENTS_INJECT_HEADER")) {
+        cache_events.inject_prefix_hash_header = (*v == "1" || *v == "true" || *v == "yes");
+    }
+
     // Dashboard overrides
     if (auto v = get_env("RANVIER_DASHBOARD_ENABLED")) {
         dashboard.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -1501,6 +1518,17 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
         }
 
+        // Cache events section
+        if (yaml["cache_events"]) {
+            YAML::Node ce = yaml["cache_events"];
+            if (ce["enabled"]) config.cache_events.enabled = ce["enabled"].as<bool>();
+            if (ce["auth_token"]) config.cache_events.auth_token = ce["auth_token"].as<std::string>();
+            if (ce["max_events_per_request"]) config.cache_events.max_events_per_request = ce["max_events_per_request"].as<uint32_t>();
+            if (ce["max_event_age_seconds"]) config.cache_events.max_event_age_seconds = ce["max_event_age_seconds"].as<uint32_t>();
+            if (ce["propagate_via_gossip"]) config.cache_events.propagate_via_gossip = ce["propagate_via_gossip"].as<bool>();
+            if (ce["inject_prefix_hash_header"]) config.cache_events.inject_prefix_hash_header = ce["inject_prefix_hash_header"].as<bool>();
+        }
+
         // Dashboard section
         if (yaml["dashboard"]) {
             YAML::Node db = yaml["dashboard"];
@@ -1796,6 +1824,14 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.routing.cost_routing.cost_imbalance_factor <= 0.0) {
         return "cost_routing.cost_imbalance_factor must be positive";
+    }
+
+    // Validate cache events settings
+    if (config.cache_events.max_events_per_request == 0) {
+        return "cache_events.max_events_per_request must be positive";
+    }
+    if (config.cache_events.max_event_age_seconds == 0) {
+        return "cache_events.max_event_age_seconds must be positive";
     }
 
     return std::nullopt;  // Valid

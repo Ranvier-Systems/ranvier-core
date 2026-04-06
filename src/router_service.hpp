@@ -481,6 +481,41 @@ public:
     GossipService* gossip_service() { return _gossip.get(); }
 
     // ==========================================================================
+    // Cache Event Support (Push-Based Cache Eviction Notifications)
+    // ==========================================================================
+
+    // Evict routes matching a prefix hash from a specific backend.
+    // Called from cache event handler. Dispatches to all shards via smp::invoke_on_all.
+    // Returns total number of routes evicted across all shards.
+    // Rule #22: all params by value (coroutine).
+    static seastar::future<uint32_t> evict_by_prefix_hash_global(
+        uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms);
+
+    // Shard-local eviction: removes routes matching (prefix_hash, backend_id) on this shard.
+    // Returns number of routes evicted on this shard.
+    static uint32_t evict_by_prefix_hash_local(
+        uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms);
+
+    // Update prefix hash index entry for a specific backend (for testing).
+    static void update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id);
+
+    // Get cache event stats for metrics (shard-local read).
+    struct CacheEventStatsSnapshot {
+        uint64_t events_received = 0;
+        uint64_t evictions_applied = 0;
+        uint64_t evictions_stale = 0;
+        uint64_t evictions_unknown = 0;
+        uint64_t auth_failures = 0;
+        uint64_t parse_errors = 0;
+    };
+    static CacheEventStatsSnapshot get_cache_event_stats();
+
+    // Record cache event statistics (shard-local, called from http_controller)
+    static void record_cache_event_received();
+    static void record_cache_event_auth_failure();
+    static void record_cache_event_parse_error();
+
+    // ==========================================================================
     // Testing Support
     // ==========================================================================
     // Reset shard-local state for unit testing. This clears all per-shard state

@@ -412,6 +412,26 @@ struct LocalModeConfig {
 };
 
 // =============================================================================
+// Cache Events Configuration (Push-Based Cache Eviction Notifications)
+// =============================================================================
+
+// Push-based cache eviction notifications allow backends to notify Ranvier
+// when they evict KV cache entries. This eliminates the minutes-to-hours
+// staleness window from TTL-based cleanup, reducing it to ~25ms.
+//
+// Phase 1 (MVP): Single-node eviction via HTTP POST /v1/cache/events.
+// Phase 2: Cluster propagation via gossip (not implemented yet).
+// Phase 3: "loaded" events and vLLM sidecar (not implemented yet).
+struct CacheEventsConfig {
+    bool enabled = false;                          // Opt-in (default disabled)
+    std::string auth_token;                        // Optional Bearer token for event endpoint
+    uint32_t max_events_per_request = 100;         // Bound batch size (Rule #4)
+    uint32_t max_event_age_seconds = 60;           // Reject events older than this
+    bool propagate_via_gossip = true;              // Forward to cluster peers (Phase 2, not yet implemented)
+    bool inject_prefix_hash_header = true;         // Add X-Ranvier-Prefix-Hash to proxied requests
+};
+
+// =============================================================================
 // Top-Level Configuration
 // =============================================================================
 
@@ -442,6 +462,7 @@ struct RanvierConfig {
     LocalModeConfig local_mode;
     AgentRegistryConfig agent_registry;
     DashboardConfig dashboard;
+    CacheEventsConfig cache_events;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);

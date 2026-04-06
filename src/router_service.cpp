@@ -325,6 +325,54 @@ struct ShardLocalState {
     seastar::gate load_sync_gate;
 
     // ========================================================================
+    // Cache Event State (Push-Based Cache Eviction Notifications)
+    // ========================================================================
+    // Reverse map: prefix_hash → set of BackendIds that have that prefix cached.
+    // Populated when routes are learned; cleared when routes expire/evict.
+    // Bounded by max_routes (same as RadixTree). No separate MAX_SIZE needed.
+    absl::flat_hash_map<uint64_t, absl::flat_hash_set<BackendId>> prefix_hash_index;
+
+    // Timestamp tracking for conflict resolution: last event timestamp per
+    // (prefix_hash, backend_id) pair. Events older than the last state change
+    // are discarded (reordering or delayed delivery).
+    struct CacheStateTimestamp {
+        uint64_t timestamp_ms = 0;
+    };
+    // Key type for (prefix_hash, backend_id) pairs
+    struct PrefixBackendKey {
+        uint64_t prefix_hash;
+        BackendId backend_id;
+        bool operator==(const PrefixBackendKey& o) const {
+            return prefix_hash == o.prefix_hash && backend_id == o.backend_id;
+        }
+        template <typename H>
+        friend H AbslHashValue(H h, const PrefixBackendKey& k) {
+            return H::combine(std::move(h), k.prefix_hash, k.backend_id);
+        }
+    };
+    absl::flat_hash_map<PrefixBackendKey, CacheStateTimestamp> cache_event_timestamps;
+    static constexpr size_t MAX_CACHE_TIMESTAMPS = 100000;  // Rule #4
+
+    // Cache event statistics (shard-local)
+    struct CacheEventStats {
+        uint64_t events_received = 0;
+        uint64_t evictions_applied = 0;
+        uint64_t evictions_stale = 0;
+        uint64_t evictions_unknown = 0;
+        uint64_t auth_failures = 0;
+        uint64_t parse_errors = 0;
+
+        void reset() {
+            events_received = 0;
+            evictions_applied = 0;
+            evictions_stale = 0;
+            evictions_unknown = 0;
+            auth_failures = 0;
+            parse_errors = 0;
+        }
+    } cache_event_stats;
+
+    // ========================================================================
     // Lifecycle Methods
     // ========================================================================
 
@@ -446,6 +494,11 @@ struct ShardLocalState {
             snapshot.clear();
         }
         cross_shard_load.clear();
+
+        // Clear cache event state
+        prefix_hash_index.clear();
+        cache_event_timestamps.clear();
+        cache_event_stats.reset();
 
         // Reset statistics
         stats.reset();
@@ -1055,12 +1108,17 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
 
         // Insert with REMOTE origin (learned from cluster gossip)
         tree->insert(route.tokens, route.backend, RouteOrigin::REMOTE);
+
+        // Update prefix hash reverse index for O(1) eviction lookup
+        {
+            size_t prefix_len = std::min(route.tokens.size(), state.config.prefix_token_length);
+            if (prefix_len > 0) {
+                uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
+                state.prefix_hash_index[ph].insert(route.backend);
+            }
+        }
     }
 }
-
-// FNV-1a hash constants for 64-bit
-constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
-constexpr uint64_t FNV_PRIME = 1099511628211ULL;
 
 // Jump consistent hash (Lamping & Veach, 2014).
 // Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
@@ -1077,25 +1135,6 @@ inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
              static_cast<double>((key >> 33) + 1)));
     }
     return static_cast<int32_t>(b);
-}
-
-// Hash function for prefix tokens using FNV-1a
-// Aligns to block_alignment boundary for vLLM compatibility
-inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
-    // Align to block_alignment boundary
-    size_t aligned_len = (count / block_alignment) * block_alignment;
-    if (aligned_len == 0) aligned_len = count;
-
-    uint64_t hash = FNV_OFFSET_BASIS;
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
-    size_t byte_len = aligned_len * sizeof(int32_t);
-
-    for (size_t i = 0; i < byte_len; ++i) {
-        hash ^= data[i];
-        hash *= FNV_PRIME;
-    }
-
-    return hash;
 }
 
 // ============================================================================
@@ -2879,6 +2918,15 @@ static void apply_local_batch_to_tree(const std::vector<PendingLocalRoute>& batc
 
         // Insert with LOCAL origin (direct request on this node)
         tree->insert(route.tokens, route.backend, RouteOrigin::LOCAL);
+
+        // Update prefix hash reverse index for O(1) eviction lookup
+        {
+            size_t prefix_len = std::min(route.tokens.size(), state.config.prefix_token_length);
+            if (prefix_len > 0) {
+                uint64_t ph = hash_prefix(route.tokens.data(), prefix_len, state.config.block_alignment);
+                state.prefix_hash_index[ph].insert(route.backend);
+            }
+        }
     }
 }
 
@@ -3762,6 +3810,111 @@ seastar::future<> RouterService::handle_node_state_change(BackendId backend, Nod
     }
 
     return seastar::make_ready_future<>();
+}
+
+// ============================================================================
+// Cache Event Support (Push-Based Cache Eviction Notifications)
+// ============================================================================
+
+uint32_t RouterService::evict_by_prefix_hash_local(
+    uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms) {
+    if (!g_shard_state) return 0;
+    auto& state = shard_state();
+
+    // Timestamp conflict resolution: discard events older than last state change
+    auto key = ShardLocalState::PrefixBackendKey{prefix_hash, backend_id};
+    auto ts_it = state.cache_event_timestamps.find(key);
+    if (ts_it != state.cache_event_timestamps.end() &&
+        event_timestamp_ms <= ts_it->second.timestamp_ms) {
+        state.cache_event_stats.evictions_stale++;
+        return 0;
+    }
+
+    // Bound timestamp map (Rule #4)
+    if (state.cache_event_timestamps.size() >= ShardLocalState::MAX_CACHE_TIMESTAMPS &&
+        ts_it == state.cache_event_timestamps.end()) {
+        // At capacity and this is a new key — skip storing to stay bounded.
+        // The eviction itself still proceeds.
+        log_router.warn("Cache event timestamp map at capacity ({}) on shard {}, "
+                        "skipping timestamp storage for new entry",
+                        ShardLocalState::MAX_CACHE_TIMESTAMPS, seastar::this_shard_id());
+    } else {
+        state.cache_event_timestamps[key] = {event_timestamp_ms};
+    }
+
+    // Look up the prefix hash in the reverse index
+    auto idx_it = state.prefix_hash_index.find(prefix_hash);
+    if (idx_it == state.prefix_hash_index.end() ||
+        idx_it->second.find(backend_id) == idx_it->second.end()) {
+        state.cache_event_stats.evictions_unknown++;
+        return 0;
+    }
+
+    // Remove the backend from the reverse index
+    idx_it->second.erase(backend_id);
+    if (idx_it->second.empty()) {
+        state.prefix_hash_index.erase(idx_it);
+    }
+
+    // Remove routes from the RadixTree for this backend
+    // Use remove_routes_by_backend which removes all routes for a backend+origin.
+    // For push-eviction, we remove both LOCAL and REMOTE routes since the backend
+    // is authoritative about its own cache state.
+    RadixTree* tree = state.tree.get();
+    if (!tree) return 0;
+
+    size_t removed = tree->remove_routes_by_backend(backend_id, RouteOrigin::LOCAL);
+    removed += tree->remove_routes_by_backend(backend_id, RouteOrigin::REMOTE);
+
+    if (removed > 0) {
+        state.cache_event_stats.evictions_applied++;
+        log_router.debug("Shard {}: Evicted {} routes for backend {} via push event (hash={})",
+                         seastar::this_shard_id(), removed, backend_id, prefix_hash);
+    }
+    return static_cast<uint32_t>(removed);
+}
+
+seastar::future<uint32_t> RouterService::evict_by_prefix_hash_global(
+    uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms) {
+    // Dispatch eviction to all shards and sum results
+    // Rule #14: use invoke_on_all pattern via parallel_for_each
+    uint32_t total_evicted = 0;
+    co_await seastar::parallel_for_each(
+        boost::irange(0u, seastar::smp::count),
+        [prefix_hash, backend_id, event_timestamp_ms, &total_evicted](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id,
+                [prefix_hash, backend_id, event_timestamp_ms] {
+                    return RouterService::evict_by_prefix_hash_local(
+                        prefix_hash, backend_id, event_timestamp_ms);
+                }).then([&total_evicted](uint32_t count) {
+                    total_evicted += count;
+                });
+        });
+    co_return total_evicted;
+}
+
+RouterService::CacheEventStatsSnapshot RouterService::get_cache_event_stats() {
+    if (!g_shard_state) return {};
+    auto& s = shard_state().cache_event_stats;
+    return {s.events_received, s.evictions_applied, s.evictions_stale,
+            s.evictions_unknown, s.auth_failures, s.parse_errors};
+}
+
+void RouterService::record_cache_event_received() {
+    if (g_shard_state) shard_state().cache_event_stats.events_received++;
+}
+
+void RouterService::record_cache_event_auth_failure() {
+    if (g_shard_state) shard_state().cache_event_stats.auth_failures++;
+}
+
+void RouterService::record_cache_event_parse_error() {
+    if (g_shard_state) shard_state().cache_event_stats.parse_errors++;
+}
+
+void RouterService::update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id) {
+    if (!g_shard_state) return;
+    shard_state().prefix_hash_index[prefix_hash].insert(backend_id);
 }
 
 // ============================================================================

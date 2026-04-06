@@ -234,6 +234,9 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.cost_routing_imbalance_factor = config.routing.cost_routing.cost_imbalance_factor;
     // Compression-aware load scoring
     cfg.default_compression_ratio = config.routing.default_compression_ratio;
+    // Cache events configuration (push-based eviction notifications)
+    cfg.cache_events = config.cache_events;
+    cfg.prefix_token_length = config.routing.prefix_token_length;
     return cfg;
 }
 
