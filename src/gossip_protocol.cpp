@@ -177,6 +177,73 @@ std::optional<NodeStatePacket> NodeStatePacket::deserialize(const uint8_t* data,
     return pkt;
 }
 
+std::vector<uint8_t> CacheEvictionPacket::serialize() const {
+    std::vector<uint8_t> buffer;
+    buffer.reserve(PACKET_SIZE);
+
+    buffer.push_back(static_cast<uint8_t>(type));
+    buffer.push_back(version);
+
+    // Sequence number (big-endian)
+    buffer.push_back((seq_num >> 24) & 0xFF);
+    buffer.push_back((seq_num >> 16) & 0xFF);
+    buffer.push_back((seq_num >> 8) & 0xFF);
+    buffer.push_back(seq_num & 0xFF);
+
+    // Backend ID (big-endian)
+    buffer.push_back((backend_id >> 24) & 0xFF);
+    buffer.push_back((backend_id >> 16) & 0xFF);
+    buffer.push_back((backend_id >> 8) & 0xFF);
+    buffer.push_back(backend_id & 0xFF);
+
+    // Prefix hash (big-endian, 8 bytes)
+    buffer.push_back((prefix_hash >> 56) & 0xFF);
+    buffer.push_back((prefix_hash >> 48) & 0xFF);
+    buffer.push_back((prefix_hash >> 40) & 0xFF);
+    buffer.push_back((prefix_hash >> 32) & 0xFF);
+    buffer.push_back((prefix_hash >> 24) & 0xFF);
+    buffer.push_back((prefix_hash >> 16) & 0xFF);
+    buffer.push_back((prefix_hash >> 8) & 0xFF);
+    buffer.push_back(prefix_hash & 0xFF);
+
+    return buffer;
+}
+
+std::optional<CacheEvictionPacket> CacheEvictionPacket::deserialize(const uint8_t* data, size_t len) {
+    if (len != PACKET_SIZE) {
+        return std::nullopt;
+    }
+
+    CacheEvictionPacket pkt;
+    pkt.type = static_cast<GossipPacketType>(data[0]);
+    pkt.version = data[1];
+
+    if (pkt.type != GossipPacketType::CACHE_EVICTION || pkt.version != PROTOCOL_VERSION) {
+        return std::nullopt;
+    }
+
+    pkt.seq_num = (static_cast<uint32_t>(data[2]) << 24) |
+                  (static_cast<uint32_t>(data[3]) << 16) |
+                  (static_cast<uint32_t>(data[4]) << 8) |
+                  static_cast<uint32_t>(data[5]);
+
+    pkt.backend_id = (static_cast<BackendId>(data[6]) << 24) |
+                     (static_cast<BackendId>(data[7]) << 16) |
+                     (static_cast<BackendId>(data[8]) << 8) |
+                     static_cast<BackendId>(data[9]);
+
+    pkt.prefix_hash = (static_cast<uint64_t>(data[10]) << 56) |
+                      (static_cast<uint64_t>(data[11]) << 48) |
+                      (static_cast<uint64_t>(data[12]) << 40) |
+                      (static_cast<uint64_t>(data[13]) << 32) |
+                      (static_cast<uint64_t>(data[14]) << 24) |
+                      (static_cast<uint64_t>(data[15]) << 16) |
+                      (static_cast<uint64_t>(data[16]) << 8) |
+                      static_cast<uint64_t>(data[17]);
+
+    return pkt;
+}
+
 //------------------------------------------------------------------------------
 // GossipProtocol Implementation
 //------------------------------------------------------------------------------
@@ -421,6 +488,75 @@ seastar::future<> GossipProtocol::broadcast_node_state(NodeState state, BackendI
     ++_node_state_sent;
 }
 
+seastar::future<> GossipProtocol::broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
+    if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
+        co_return;
+    }
+
+    // Gossip protection: reject during shutdown or re-sync
+    if (_consensus && !_consensus->is_accepting_tasks()) {
+        log_gossip_protocol().debug("Cache eviction broadcast rejected: gossip service not accepting tasks. "
+                                    "prefix_hash={:#x}, backend={}", prefix_hash, backend_id);
+        co_return;
+    }
+
+    log_gossip_protocol().debug("Broadcasting cache eviction: prefix_hash={:#x}, backend={} to {} peers",
+                                prefix_hash, backend_id, _peer_addresses->size());
+
+    // Serialize the packet once with seq_num=0, then stamp per-peer seq_num.
+    CacheEvictionPacket pkt;
+    pkt.backend_id = backend_id;
+    pkt.prefix_hash = prefix_hash;
+    pkt.seq_num = 0;
+    auto base_serialized = pkt.serialize();
+
+    // Send to each peer, stamping per-peer sequence numbers
+    co_await seastar::parallel_for_each(*_peer_addresses,
+        [this, base_serialized = std::move(base_serialized)](const seastar::socket_address& peer) mutable {
+
+        // Copy the pre-serialized buffer and stamp this peer's seq_num at bytes 2-5
+        auto serialized = std::vector<uint8_t>(base_serialized);
+        uint32_t seq_num = 0;
+        if (_config.gossip_reliable_delivery) {
+            seq_num = next_seq_num(peer);
+            serialized[2] = (seq_num >> 24) & 0xFF;
+            serialized[3] = (seq_num >> 16) & 0xFF;
+            serialized[4] = (seq_num >> 8) & 0xFF;
+            serialized[5] = seq_num & 0xFF;
+        }
+
+        // Track pending ACK if reliable delivery enabled
+        if (_config.gossip_reliable_delivery) {
+            if (_stats_pending_acks_count >= MAX_PENDING_ACKS) {
+                ++_pending_acks_overflow;
+                log_gossip_protocol().warn("Pending acks limit reached ({}), not tracking ACK for peer={}, seq_num={}",
+                                           MAX_PENDING_ACKS, peer, seq_num);
+            } else {
+                PendingAck pending;
+                pending.seq_num = seq_num;
+                pending.serialized_packet = serialized;
+                pending.next_retry = seastar::lowres_clock::now() + _config.gossip_ack_timeout;
+                pending.retry_count = 0;
+                _pending_acks[peer][seq_num] = std::move(pending);
+                ++_stats_pending_acks_count;
+            }
+        }
+
+        return _transport->send(peer, serialized).then([this] {
+            ++_packets_sent;
+        }).handle_exception([peer](auto ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_gossip_protocol().debug("Failed to send cache eviction to peer {}: {}", peer, e.what());
+            }
+        });
+    });
+
+    ++_cache_evictions_sent;
+}
+
 seastar::future<> GossipProtocol::broadcast_heartbeat() {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     // RAII Timer Safety: Holder must outlive the work — coroutine frame keeps it alive
@@ -518,6 +654,39 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
             return _node_state_callback(state_pkt->backend_id, state_pkt->state);
         }
         return seastar::make_ready_future<>();
+    }
+
+    // Handle cache eviction packets (Phase 2: cluster propagation)
+    if (type == GossipPacketType::CACHE_EVICTION) {
+        auto evict_pkt = CacheEvictionPacket::deserialize(ptr, len);
+        if (!evict_pkt) {
+            ++_packets_invalid;
+            return seastar::make_ready_future<>();
+        }
+
+        // Reliable delivery: suppress duplicates, send ACK
+        if (_config.gossip_reliable_delivery) {
+            if (is_duplicate(src_addr, evict_pkt->seq_num)) {
+                ++_duplicates_suppressed;
+                return send_ack(src_addr, evict_pkt->seq_num);
+            }
+        }
+
+        ++_cache_evictions_received;
+
+        seastar::future<> ack_future = seastar::make_ready_future<>();
+        if (_config.gossip_reliable_delivery) {
+            ack_future = send_ack(src_addr, evict_pkt->seq_num);
+        }
+
+        if (_cache_eviction_callback) {
+            auto evict_future = _cache_eviction_callback(
+                evict_pkt->prefix_hash, evict_pkt->backend_id);
+            return seastar::when_all_succeed(
+                std::move(ack_future), std::move(evict_future)).discard_result();
+        }
+
+        return ack_future;
     }
 
     // Handle ACK packets

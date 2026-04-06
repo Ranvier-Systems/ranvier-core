@@ -427,7 +427,7 @@ struct CacheEventsConfig {
     std::string auth_token;                        // Optional Bearer token for event endpoint
     uint32_t max_events_per_request = 100;         // Bound batch size (Rule #4)
     uint32_t max_event_age_seconds = 60;           // Reject events older than this
-    bool propagate_via_gossip = true;              // Forward to cluster peers (Phase 2, not yet implemented)
+    bool propagate_via_gossip = true;              // Forward evictions to cluster peers via gossip
     bool inject_prefix_hash_header = true;         // Add X-Ranvier-Prefix-Hash to proxied requests
 };
 
