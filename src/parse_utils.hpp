@@ -233,4 +233,107 @@ inline std::optional<double> parse_double(std::string_view input) {
     return value;
 }
 
+// =============================================================================
+// Prefix Hash Utilities
+// =============================================================================
+
+// FNV-1a constants for prefix hashing
+constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+
+/**
+ * Hash function for prefix tokens using FNV-1a.
+ * Aligns to block_alignment boundary for vLLM PagedAttention compatibility.
+ *
+ * Used by:
+ * - RouterService for consistent hash fallback routing
+ * - HttpController for X-Ranvier-Prefix-Hash header injection
+ * - Cache event handler for eviction lookup
+ *
+ * @param tokens Pointer to token ID array
+ * @param count Number of tokens
+ * @param block_alignment vLLM block alignment (typically 16)
+ * @return 64-bit FNV-1a hash of the aligned token prefix
+ */
+inline uint64_t hash_prefix(const int32_t* tokens, size_t count, uint32_t block_alignment) {
+    // Align to block_alignment boundary
+    size_t aligned_len = (count / block_alignment) * block_alignment;
+    if (aligned_len == 0) aligned_len = count;
+
+    uint64_t hash = FNV_OFFSET_BASIS;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(tokens);
+    size_t byte_len = aligned_len * sizeof(int32_t);
+
+    for (size_t i = 0; i < byte_len; ++i) {
+        hash ^= data[i];
+        hash *= FNV_PRIME;
+    }
+
+    return hash;
+}
+
+// Buffer size for hex-encoded prefix hash (16 hex chars + null terminator)
+constexpr size_t PREFIX_HASH_HEX_BUF_SIZE = 17;
+
+// Number of hex digits in an encoded prefix hash
+constexpr size_t PREFIX_HASH_HEX_LEN = 16;
+
+/**
+ * Encode a uint64_t hash as a 16-character lowercase hex string.
+ *
+ * @param hash The hash value to encode
+ * @param out Output buffer (must be at least PREFIX_HASH_HEX_BUF_SIZE bytes)
+ */
+inline void encode_prefix_hash_hex(uint64_t hash, char* out) {
+    snprintf(out, PREFIX_HASH_HEX_BUF_SIZE, "%016llx",
+             static_cast<unsigned long long>(hash));
+}
+
+/**
+ * Decode a hex string to a uint64_t hash.
+ *
+ * @param hex_str Hex string (up to 16 characters)
+ * @return Decoded hash value, or std::nullopt if invalid hex
+ */
+inline std::optional<uint64_t> decode_prefix_hash_hex(std::string_view hex_str) {
+    if (hex_str.empty() || hex_str.size() > 16) {
+        return std::nullopt;
+    }
+
+    uint64_t result = 0;
+    for (char c : hex_str) {
+        result <<= 4;
+        if (c >= '0' && c <= '9') {
+            result |= static_cast<uint64_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            result |= static_cast<uint64_t>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            result |= static_cast<uint64_t>(c - 'A' + 10);
+        } else {
+            return std::nullopt;
+        }
+    }
+    return result;
+}
+
+// =============================================================================
+// HTTP Auth Constants
+// =============================================================================
+
+constexpr std::string_view BEARER_PREFIX = "Bearer ";
+
+/**
+ * Extract the Bearer token from an Authorization header value.
+ *
+ * @param auth_header_value The full Authorization header value
+ * @return The token string, or std::nullopt if not a Bearer token
+ */
+inline std::optional<std::string_view> extract_bearer_token(std::string_view auth_header_value) {
+    if (auth_header_value.size() > BEARER_PREFIX.size() &&
+        auth_header_value.substr(0, BEARER_PREFIX.size()) == BEARER_PREFIX) {
+        return auth_header_value.substr(BEARER_PREFIX.size());
+    }
+    return std::nullopt;
+}
+
 } // namespace ranvier

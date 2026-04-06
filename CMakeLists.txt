@@ -408,6 +408,7 @@ target_link_libraries(text_validator_test
 gtest_discover_tests(text_validator_test)
 
 # ParseUtils Unit Tests (Pure C++, header-only)
+# Includes cache_event_parser.hpp tests which need RapidJSON (header-only)
 add_executable(parse_utils_test
   tests/unit/parse_utils_test.cpp
 )
@@ -415,6 +416,7 @@ target_include_directories(parse_utils_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(parse_utils_test
   PRIVATE
   GTest::gtest_main
+  rapidjson_interface
 )
 gtest_discover_tests(parse_utils_test)
 
@@ -1060,6 +1062,33 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(router_service_test)
+
+    # Cache Eviction Tests (Seastar-dependent — uses RouterService shard-local state)
+    # Tests push-based cache eviction: prefix hash index, timestamp conflict
+    # resolution, eviction logic, and metrics recording.
+    add_executable(cache_eviction_test
+      tests/unit/cache_eviction_test.cpp
+      src/router_service.cpp
+      src/node_slab.cpp
+      src/gossip_service.cpp
+      src/gossip_protocol.cpp
+      src/gossip_consensus.cpp
+      src/gossip_transport.cpp
+      src/crypto_offloader.cpp
+      src/dtls_context.cpp
+    )
+    target_include_directories(cache_eviction_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(cache_eviction_test
+      PRIVATE
+      Seastar::seastar
+      absl::flat_hash_map
+      absl::flat_hash_set
+      absl::inlined_vector
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      GTest::gtest_main
+    )
+    gtest_discover_tests(cache_eviction_test)
 
     # AsyncPersistence Concurrency Stress Tests (Requires Seastar types)
     # Tests concurrent enqueue from multiple threads, backpressure enforcement,

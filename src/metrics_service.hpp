@@ -253,7 +253,26 @@ public:
             seastar::metrics::make_gauge("prefix_hits_by_compression_tier",
                 seastar::metrics::description("Cache hits on backends with high KV-cache compression (ratio >= 4.0)"),
                 {{"compression_tier", "high"}},
-                [this] { return static_cast<double>(_prefix_hits_tier_high); })
+                [this] { return static_cast<double>(_prefix_hits_tier_high); }),
+
+            // Cache event metrics (push-based cache eviction notifications)
+            seastar::metrics::make_counter("cache_events_received_total", _cache_events_received,
+                seastar::metrics::description("Total cache eviction events received via push notifications")),
+
+            seastar::metrics::make_counter("cache_events_evictions_applied", _cache_events_evictions_applied,
+                seastar::metrics::description("Cache eviction events that matched and removed a route")),
+
+            seastar::metrics::make_counter("cache_events_evictions_stale", _cache_events_evictions_stale,
+                seastar::metrics::description("Cache eviction events ignored due to stale timestamp")),
+
+            seastar::metrics::make_counter("cache_events_evictions_unknown", _cache_events_evictions_unknown,
+                seastar::metrics::description("Cache eviction events for unknown prefix hashes")),
+
+            seastar::metrics::make_counter("cache_events_auth_failures", _cache_events_auth_failures,
+                seastar::metrics::description("Cache event requests rejected due to authentication failure")),
+
+            seastar::metrics::make_counter("cache_events_parse_errors", _cache_events_parse_errors,
+                seastar::metrics::description("Cache event requests with malformed or invalid JSON"))
         });
     }
 
@@ -383,6 +402,14 @@ public:
         _scheduler_wait_latency.record(seconds);
     }
 
+    // Cache event metrics recording (push-based cache eviction)
+    void record_cache_event_received() { _cache_events_received++; }
+    void record_cache_event_eviction_applied() { _cache_events_evictions_applied++; }
+    void record_cache_event_eviction_stale() { _cache_events_evictions_stale++; }
+    void record_cache_event_eviction_unknown() { _cache_events_evictions_unknown++; }
+    void record_cache_event_auth_failure() { _cache_events_auth_failures++; }
+    void record_cache_event_parse_error() { _cache_events_parse_errors++; }
+
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
 
@@ -511,6 +538,14 @@ private:
     uint64_t _prefix_boundary_used = 0;  // System message prefix boundary was used
     uint64_t _prefix_boundary_skipped = 0;  // Prefix boundary skipped (no system messages, too short, disabled)
     uint64_t _prefix_boundary_client = 0;  // Client-provided prefix_token_count was used
+
+    // Cache event counters (push-based cache eviction notifications)
+    uint64_t _cache_events_received = 0;
+    uint64_t _cache_events_evictions_applied = 0;
+    uint64_t _cache_events_evictions_stale = 0;
+    uint64_t _cache_events_evictions_unknown = 0;
+    uint64_t _cache_events_auth_failures = 0;
+    uint64_t _cache_events_parse_errors = 0;
 
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
