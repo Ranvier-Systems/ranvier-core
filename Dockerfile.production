@@ -5,7 +5,7 @@ FROM fedora:39 AS builder
 
 # Install Build Deps (libcurl-devel for OpenTelemetry, openssl-devel for DTLS gossip encryption)
 # Layer 1: System packages (rarely changes)
-RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl libcurl-devel openssl-devel \
+RUN dnf install -y git cmake gcc-c++ ninja-build python3 curl libcurl-devel openssl openssl-devel \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 

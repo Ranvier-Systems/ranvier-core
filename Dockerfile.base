@@ -30,6 +30,7 @@ RUN dnf install -y \
         python3-pip \
         curl \
         libcurl-devel \
+        openssl \
         openssl-devel \
         protobuf-devel \
         abseil-cpp-devel \
