@@ -83,6 +83,13 @@ public:
     // Called by RouterService when a new route is learned locally
     seastar::future<> broadcast_route(const std::vector<TokenId>& tokens, BackendId backend);
 
+    // Broadcast a cache eviction to all peers (Phase 2: cluster propagation)
+    // Called from HttpController when a local eviction is applied
+    seastar::future<> broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id);
+
+    // Set callback for handling received cache eviction notifications from peers
+    void set_cache_eviction_callback(CacheEvictionCallback callback);
+
     // Check if gossip is enabled
     bool is_enabled() const { return _config.enabled; }
 

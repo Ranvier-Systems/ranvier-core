@@ -46,6 +46,7 @@ enum class GossipPacketType : uint8_t {
     HEARTBEAT = 0x02,
     ROUTE_ACK = 0x03,
     NODE_STATE = 0x04,
+    CACHE_EVICTION = 0x05,
 };
 
 // Node state values
@@ -57,6 +58,7 @@ enum class NodeState : uint8_t {
 // Callback types
 using RouteLearnCallback = std::function<seastar::future<>(std::vector<TokenId>, BackendId)>;
 using NodeStateCallback = std::function<seastar::future<>(BackendId, NodeState)>;
+using CacheEvictionCallback = std::function<seastar::future<>(uint64_t prefix_hash, BackendId backend_id)>;
 
 // Wire format for route announcements (v2 with sequence numbers)
 struct RouteAnnouncementPacket {
@@ -103,6 +105,22 @@ struct NodeStatePacket {
     static std::optional<NodeStatePacket> deserialize(const uint8_t* data, size_t len);
 };
 
+// Wire format for cache eviction notifications (Phase 2: cluster propagation)
+// Format: [type:1][version:1][seq_num:4][backend_id:4][prefix_hash:8] = 18 bytes
+struct CacheEvictionPacket {
+    static constexpr uint8_t PROTOCOL_VERSION = 2;
+    static constexpr size_t PACKET_SIZE = 18;
+
+    GossipPacketType type = GossipPacketType::CACHE_EVICTION;
+    uint8_t version = PROTOCOL_VERSION;
+    uint32_t seq_num = 0;
+    BackendId backend_id = 0;
+    uint64_t prefix_hash = 0;
+
+    std::vector<uint8_t> serialize() const;
+    static std::optional<CacheEvictionPacket> deserialize(const uint8_t* data, size_t len);
+};
+
 // GossipProtocol: Manages message handling and reliable delivery
 //
 // This class handles the protocol logic:
@@ -134,10 +152,14 @@ public:
     void set_node_state_callback(NodeStateCallback callback) {
         _node_state_callback = std::move(callback);
     }
+    void set_cache_eviction_callback(CacheEvictionCallback callback) {
+        _cache_eviction_callback = std::move(callback);
+    }
 
     // Broadcast methods
     seastar::future<> broadcast_route(const std::vector<TokenId>& tokens, BackendId backend);
     seastar::future<> broadcast_node_state(NodeState state, BackendId local_backend_id);
+    seastar::future<> broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id);
     seastar::future<> broadcast_heartbeat();
 
     // Handle incoming packet (called from receive loop)
@@ -163,6 +185,8 @@ public:
     uint64_t pending_acks_count() const { return _stats_pending_acks_count; }
     uint64_t node_state_sent() const { return _node_state_sent; }
     uint64_t node_state_received() const { return _node_state_received; }
+    uint64_t cache_evictions_sent() const { return _cache_evictions_sent; }
+    uint64_t cache_evictions_received() const { return _cache_evictions_received; }
 
     // Clear reliable delivery state (used during resync/shutdown)
     void clear_pending_acks();
@@ -183,6 +207,7 @@ private:
     // Callbacks
     RouteLearnCallback _route_learn_callback;
     NodeStateCallback _node_state_callback;
+    CacheEvictionCallback _cache_eviction_callback;
 
     // Timers
     seastar::timer<> _heartbeat_timer;
@@ -228,6 +253,8 @@ private:
     uint64_t _stats_pending_acks_count = 0;
     uint64_t _node_state_sent = 0;
     uint64_t _node_state_received = 0;
+    uint64_t _cache_evictions_sent = 0;
+    uint64_t _cache_evictions_received = 0;
 
     // Internal methods
     seastar::future<> send_ack(const seastar::socket_address& peer, uint32_t seq_num);

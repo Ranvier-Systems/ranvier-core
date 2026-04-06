@@ -114,6 +114,12 @@ void GossipService::register_metrics() {
         seastar::metrics::make_counter("cluster_node_state_received",
             [this] { return _protocol->node_state_received(); },
             seastar::metrics::description("Total number of node state notifications received")),
+        seastar::metrics::make_counter("gossip_cache_evictions_sent_total",
+            [this] { return _protocol->cache_evictions_sent(); },
+            seastar::metrics::description("Total number of cache eviction packets sent to cluster peers")),
+        seastar::metrics::make_counter("gossip_cache_evictions_received_total",
+            [this] { return _protocol->cache_evictions_received(); },
+            seastar::metrics::description("Total number of cache eviction packets received from cluster peers")),
 
         // Transport metrics (DTLS)
         seastar::metrics::make_counter("cluster_dtls_handshakes_started",
@@ -328,6 +334,34 @@ seastar::future<> GossipService::broadcast_node_state(NodeState state) {
 
 bool GossipService::is_draining() const {
     return _consensus ? _consensus->is_draining() : false;
+}
+
+seastar::future<> GossipService::broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id) {
+    if (!_config.enabled || !_protocol || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    if (!is_accepting_tasks()) {
+        log_gossip.debug("Cache eviction broadcast rejected: gossip service not accepting tasks");
+        return seastar::make_ready_future<>();
+    }
+
+    seastar::gate::holder gate_holder;
+    try {
+        gate_holder = _gossip_task_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_gossip.debug("Cache eviction broadcast rejected: gossip gate closed");
+        return seastar::make_ready_future<>();
+    }
+
+    return _protocol->broadcast_cache_eviction(prefix_hash, backend_id).finally(
+        [gate_holder = std::move(gate_holder)] {});
+}
+
+void GossipService::set_cache_eviction_callback(CacheEvictionCallback callback) {
+    if (_protocol) {
+        _protocol->set_cache_eviction_callback(std::move(callback));
+    }
 }
 
 seastar::future<> GossipService::broadcast_route(const std::vector<TokenId>& tokens, BackendId backend) {

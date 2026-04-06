@@ -3452,6 +3452,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
             if (evicted > 0) {
                 evictions_applied++;
                 metrics().record_cache_event_eviction_applied();
+
+                // Propagate to cluster peers (Phase 2)
+                if (_config.cache_events.propagate_via_gossip) {
+                    // Rule #22: lambda captures scalars by value for cross-shard
+                    // Rule #14: submit to shard 0 where GossipService lives
+                    co_await seastar::smp::submit_to(0, [this, prefix_hash = ev.prefix_hash,
+                                                          backend_id = ev.backend_id] {
+                        if (_router.gossip_service()) {
+                            return _router.gossip_service()->broadcast_cache_eviction(
+                                prefix_hash, backend_id);
+                        }
+                        return seastar::make_ready_future<>();
+                    });
+                }
             } else {
                 evictions_unknown++;
                 metrics().record_cache_event_eviction_unknown();

@@ -1328,6 +1328,19 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
             return RouterService::handle_node_state_change(backend, state);
         });
 
+        // Set up callback to handle incoming cache eviction notifications from peers
+        // Use current time as effective timestamp for gossip-relayed evictions
+        // (peers trust the originating node's validation).
+        // Rule #18: future handled via .discard_result() — eviction count not needed for gossip relay
+        _gossip->set_cache_eviction_callback(
+            [](uint64_t prefix_hash, BackendId backend_id) {
+                auto now_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                return RouterService::evict_by_prefix_hash_global(
+                    prefix_hash, backend_id, now_ms).discard_result();
+            });
+
         // Pre-allocate buffer for route batching to avoid reallocations during operation
         _pending_remote_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
 
