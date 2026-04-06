@@ -1,8 +1,21 @@
 # Push-Based Cache Eviction Notifications
 
-**Status:** Proposal (Design Exploration)
-**Date:** 2026-03-20
+**Status:** Phases 1, 2, and 3a shipped. Phase 3b (sidecars) and Phase 4 (upstream) pending.
+**Date:** 2026-03-20 (original), 2026-04-06 (last update)
 **Author:** Generated exploration
+
+## Status Snapshot
+
+| Phase | Status | Scope |
+|---|---|---|
+| **1** | ✅ merged | `POST /v1/cache/events`, prefix hash reverse index, `evicted` handling, metrics |
+| **2** | ✅ merged | `CACHE_EVICTION` gossip packet `0x05`, cluster propagation, reliable delivery |
+| **3a** | ✅ merged | `loaded` events, `RouteOrigin::PUSH`, conflict-resolution timestamp tracking |
+| **3b** | ⏭ separate repo | vLLM/SGLang sidecars (Python, polls engine metrics, POSTs events) |
+| **3c** | 🟡 conditional | Hash-only routes for true cold-start (RadixTree side index or schema change) |
+| **4** | ⏭ future | Benchmarks, RFC, upstream PRs to vLLM/SGLang for native push support |
+
+3c is gated on operational telemetry: see "Loaded Events and Route Bootstrapping" below.
 
 ## Problem Statement
 
@@ -217,7 +230,35 @@ Total: 18 bytes fixed. Uses the same reliable delivery (ACK + retry) as `ROUTE_A
 1. **Cold-start sync**: When Ranvier starts with an empty RadixTree, backends can push their current cache contents so Ranvier doesn't need to "warm up" through inference traffic.
 2. **Partition recovery**: After a network partition heals, backends can re-announce their cache state.
 
-`loaded` events are treated as route learns with `RouteOrigin::PUSH` (new origin type, eviction priority between LOCAL and REMOTE).
+`loaded` events are treated as route learns with `RouteOrigin::PUSH` (new origin type). Eviction priority is `LOCAL < PUSH < REMOTE` — lower numeric value = higher trust = lower eviction priority. This ordering is encoded as the enum's numeric values and is load-bearing.
+
+#### Phase 3a Implementation: Strict Subset
+
+The shipped Phase 3a implementation does NOT materialize new routes from `loaded` events. The wire format carries only `prefix_hash` and `prefix_token_count` — no token IDs — and the RadixTree is keyed on token sequences. Without tokens we cannot insert a node.
+
+The implementation therefore handles `loaded` events as a **timestamp refresh / liveness ping** for `(prefix_hash, backend_id)` pairs that this shard already tracks in its `prefix_hash_index`:
+
+| Existing state on this shard | Phase 3a action |
+|---|---|
+| `(prefix_hash, backend_id)` already in `prefix_hash_index` | Refresh shared timestamp; counted as `loads_applied` |
+| `prefix_hash` known but for a different backend | Counted as `loads_ignored` (cannot insert without tokens) |
+| `prefix_hash` not in index at all | Counted as `loads_ignored` |
+| Event timestamp `<=` last stored timestamp for this pair | Counted as `loads_ignored` (stale or duplicate) |
+
+The shared timestamp map (`cache_event_timestamps`) is updated by both `evict` and successful `load` events, so a `load` at `t=2000` correctly blocks a stale `evict` at `t=1000` for the same pair (and vice versa).
+
+`load_route_global` is NOT propagated via gossip in Phase 3a. The reuse-`broadcast_route` plan recommended in earlier drafts requires the token vector, which `loaded` events do not carry. No new gossip packet type was added.
+
+#### Phase 3c: When (and only when) to extend this
+
+Phase 3c upgrades the strict subset to true cold-start sync — a backend reports a prefix Ranvier has never seen, and Ranvier inserts a real route. Two implementation options, neither is built:
+
+1. **Hash-only side index.** A `prefix_hash → backend` map separate from the RadixTree. Cheapest in code, but bypasses the RadixTree's prefix-matching, so it only helps requests that hit the exact same prefix hash — partial-prefix matches still miss.
+2. **Tokens in the wire format.** Extend the JSON schema so `loaded` events carry `tokens: [int]`. Backends already have the token sequence; the only cost is bandwidth (wire size grows from ~30 bytes to ~4 × token_count bytes per event). This is the "right" fix but requires a schema bump (`version: 2`) and backend cooperation.
+
+**Decision rule:** ship 3a, ship 3b, run for a few weeks in production, look at the breakdown of `loads_ignored`. If "unknown hash" dominates and the signal looks valuable, do option 2. If `loads_ignored` is a tiny fraction of `loads_applied`, leave 3c on the shelf forever.
+
+> ⚠️ **Telemetry caveat:** Phase 3a ships `loads_ignored` as a single counter, not labeled by reason (unknown hash vs. stale timestamp vs. different backend). Splitting it into a labeled counter is a small but necessary follow-up before the 3b rollout, otherwise the 3c go/no-go decision is blind.
 
 ## Consistency Model
 
@@ -226,8 +267,8 @@ Total: 18 bytes fixed. Uses the same reliable delivery (ACK + retry) as `ROUTE_A
 | Scenario | Resolution |
 |----------|------------|
 | Push says evicted, inferred says cached | **Evict.** Backend is the source of truth for its own cache. |
-| Push says loaded, no inferred route | **Learn.** Add route with PUSH origin. |
-| Push says loaded, inferred says different backend | **Keep inferred.** The most recent local observation wins for conflicting backends. |
+| Push says loaded, no inferred route | **Phase 3a:** ignored (no tokens). **Phase 3c (if shipped):** add route with `PUSH` origin. |
+| Push says loaded, inferred says different backend | **Phase 3a:** ignored (no tokens). **Phase 3c (if shipped):** PUSH outranks REMOTE; LOCAL wins over PUSH. |
 | No push support, inferred only | **Current behavior.** TTL-based expiry. |
 | Push timestamp older than last route learn | **Ignore.** Stale event (reordering or delayed delivery). |
 
@@ -337,8 +378,8 @@ RANVIER_CACHE_EVENTS_AUTH_TOKEN=secret
 | `ranvier_cache_events_evictions_applied` | counter | Evictions that matched and removed a route |
 | `ranvier_cache_events_evictions_stale` | counter | Evictions ignored (timestamp too old) |
 | `ranvier_cache_events_evictions_unknown` | counter | Evictions for unknown prefix hashes |
-| `ranvier_cache_events_loads_applied` | counter | Load events that created new routes |
-| `ranvier_cache_events_gossip_propagated` | counter | Evictions forwarded to cluster peers |
+| `ranvier_cache_events_loads_applied` | counter | Load events that refreshed a known `(prefix_hash, backend)` pair (Phase 3a strict subset) |
+| `ranvier_cache_events_loads_ignored` | counter | Load events ignored (unknown hash, stale ts, or known hash on different backend). **Currently a single counter — will be split by reason before Phase 3b ships.** |
 
 ### Hard Rules Compliance
 
@@ -391,34 +432,53 @@ Alternatively, a simpler approach: Ranvier sends the `X-Ranvier-Prefix-Hash` hea
 
 ## Implementation Phases
 
-### Phase 1: Foundation (MVP)
+### Phase 1: Foundation (MVP) ✅ shipped (#405)
 
-- [ ] Add `POST /v1/cache/events` endpoint to `HttpController`
-- [ ] Add `X-Ranvier-Prefix-Hash` header injection on proxied requests
-- [ ] Implement prefix hash reverse index in `RouterService`
-- [ ] Handle `evicted` events (remove routes from RadixTree)
-- [ ] Add `cache_events` config section
-- [ ] Add Prometheus metrics
-- [ ] Unit tests for event parsing, hash matching, route removal
+- [x] Add `POST /v1/cache/events` endpoint to `HttpController`
+- [x] Add `X-Ranvier-Prefix-Hash` header injection on proxied requests
+- [x] Implement prefix hash reverse index in `RouterService`
+- [x] Handle `evicted` events (remove routes from RadixTree)
+- [x] Add `cache_events` config section
+- [x] Add Prometheus metrics
+- [x] Unit tests for event parsing, hash matching, route removal
 
-### Phase 2: Cluster Propagation
+### Phase 2: Cluster Propagation ✅ shipped (#406)
 
-- [ ] Add `CACHE_EVICTION` gossip packet type (`0x05`)
-- [ ] Propagate eviction events to cluster peers
-- [ ] Integrate with batched shard broadcast (existing `flush_route_batch`)
-- [ ] Integration tests with multi-node cluster
+- [x] Add `CACHE_EVICTION` gossip packet type (`0x05`)
+- [x] Propagate eviction events to cluster peers
+- [x] Integrate with batched shard broadcast (existing `flush_route_batch`)
+- [x] Integration tests with multi-node cluster
 
-### Phase 3: Load Events + Sidecar
+### Phase 3a: Load Events + RouteOrigin::PUSH ✅ shipped (#410)
 
-- [ ] Handle `loaded` events (create routes with `RouteOrigin::PUSH`)
-- [ ] Add `RouteOrigin::PUSH` to RadixTree (eviction priority between LOCAL and REMOTE)
-- [ ] Build vLLM sidecar (Python, polls `/metrics`)
-- [ ] Build SGLang sidecar
+- [x] Add `RouteOrigin::PUSH` to RadixTree (numeric ordering `LOCAL < PUSH < REMOTE`)
+- [x] Implement `RouterService::load_route_local` / `load_route_global` (strict-subset semantics)
+- [x] Wire `loaded` branch in `handle_cache_events` and report `loads_applied` / `loads_ignored` in the response
+- [x] Add `cache_events_loads_applied` and `cache_events_loads_ignored` counters
+- [x] Unit tests for known/unknown/stale loads and shared-timestamp invariants
+
+### Phase 3b: Sidecars (separate repo)
+
+Lives in a separate `Ranvier-Systems` Python repo (recommended: `ranvier-cache-sidecar`). The JSON schema for `cache_event` v1 is the integration boundary — check it into ranvier-core under `schemas/` so both sides reference one source of truth.
+
+- [ ] Split `loads_ignored` into a labeled counter (reason: `unknown_hash` | `stale_ts` | `different_backend`) — prerequisite for the 3c go/no-go decision
+- [ ] vLLM sidecar (Python, polls `/metrics`)
+- [ ] SGLang sidecar
 - [ ] Publish sidecar container images
+- [ ] Synthetic event generator for benchmarks (unblocks Phase 4 in parallel)
+
+### Phase 3c: True Cold-Start Sync (conditional)
+
+Only ship if 3b telemetry shows `loads_ignored{reason=unknown_hash}` is a meaningful fraction of traffic.
+
+- [ ] Decide between hash-only side index vs. tokens in wire format (see "Loaded Events" section)
+- [ ] If schema change: bump `cache_event` to `version: 2`, add `tokens: [int]` field
+- [ ] Implement true `(prefix_hash, backend, tokens) → route` insertion with the conflict-resolution table above
+- [ ] Decide whether to gossip-propagate loads (cluster-wide cold-start sync)
 
 ### Phase 4: Upstream Engagement
 
-- [ ] Benchmark: prefill savings with push notifications vs. inferred-only
+- [ ] Benchmark: prefill savings with push notifications vs. inferred-only (can run in parallel with 3b using the synthetic generator)
 - [ ] Write blog post / RFC for OpenAI-compatible extension
 - [ ] Submit PRs to vLLM/SGLang for native push support
 
