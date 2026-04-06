@@ -496,6 +496,29 @@ public:
     static uint32_t evict_by_prefix_hash_local(
         uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms);
 
+    // Apply a "loaded" cache event from a backend.
+    //
+    // Loaded events do NOT carry token IDs in the wire format. The
+    // RadixTree is keyed on tokens, so we cannot insert a new route from
+    // (prefix_hash, backend_id) alone. The implementation is therefore the
+    // strict subset: a loaded event is only "applied" when this shard already
+    // has the (prefix_hash, backend_id) pair in its prefix_hash_index — in
+    // which case it acts as a timestamp refresh / liveness ping for conflict
+    // resolution against later evict events. Loaded events for unknown
+    // (hash, backend) pairs are counted as ignored.
+    //
+    // Returns count of shards on which the load was applied (0 = ignored
+    // everywhere). Materializing brand-new routes from a loaded event would
+    // require the wire format to carry tokens (or a hash → tokens side
+    // index) and is intentionally out of scope.
+    // Rule #22: all params by value (coroutine).
+    static seastar::future<uint32_t> load_route_global(
+        uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms);
+
+    // Shard-local "loaded" application; returns 1 if applied on this shard.
+    static uint32_t load_route_local(
+        uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms);
+
     // Update prefix hash index entry for a specific backend (for testing).
     static void update_prefix_hash_index_for_testing(uint64_t prefix_hash, BackendId backend_id);
 
@@ -507,6 +530,8 @@ public:
         uint64_t evictions_unknown = 0;
         uint64_t auth_failures = 0;
         uint64_t parse_errors = 0;
+        uint64_t loads_applied = 0;
+        uint64_t loads_ignored = 0;
     };
     static CacheEventStatsSnapshot get_cache_event_stats();
 

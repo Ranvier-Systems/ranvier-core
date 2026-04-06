@@ -361,6 +361,8 @@ struct ShardLocalState {
         uint64_t evictions_unknown = 0;
         uint64_t auth_failures = 0;
         uint64_t parse_errors = 0;
+        uint64_t loads_applied = 0;
+        uint64_t loads_ignored = 0;
 
         void reset() {
             events_received = 0;
@@ -369,6 +371,8 @@ struct ShardLocalState {
             evictions_unknown = 0;
             auth_failures = 0;
             parse_errors = 0;
+            loads_applied = 0;
+            loads_ignored = 0;
         }
     } cache_event_stats;
 
@@ -3910,7 +3914,78 @@ RouterService::CacheEventStatsSnapshot RouterService::get_cache_event_stats() {
     if (!g_shard_state) return {};
     auto& s = shard_state().cache_event_stats;
     return {s.events_received, s.evictions_applied, s.evictions_stale,
-            s.evictions_unknown, s.auth_failures, s.parse_errors};
+            s.evictions_unknown, s.auth_failures, s.parse_errors,
+            s.loads_applied, s.loads_ignored};
+}
+
+// ----------------------------------------------------------------------------
+// Loaded events
+//
+// See router_service.hpp doc on load_route_global for the design rationale.
+// Strict subset: we do not have token IDs in the wire format, and the
+// RadixTree is keyed on tokens, so we cannot materialize a brand-new route
+// from a loaded event. The most we can do is refresh the timestamp/liveness
+// state for (prefix_hash, backend_id) pairs we already know about, so that
+// subsequent evict events resolve correctly.
+// ----------------------------------------------------------------------------
+
+uint32_t RouterService::load_route_local(
+    uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms) {
+    if (!g_shard_state) return 0;
+    auto& state = shard_state();
+
+    // Conflict resolution: discard loads older than the most recent state
+    // change for this (prefix_hash, backend_id).
+    auto key = ShardLocalState::PrefixBackendKey{prefix_hash, backend_id};
+    auto ts_it = state.cache_event_timestamps.find(key);
+    if (ts_it != state.cache_event_timestamps.end() &&
+        event_timestamp_ms <= ts_it->second.timestamp_ms) {
+        state.cache_event_stats.loads_ignored++;
+        return 0;
+    }
+
+    // Bound timestamp map (Rule #4)
+    if (state.cache_event_timestamps.size() >= ShardLocalState::MAX_CACHE_TIMESTAMPS &&
+        ts_it == state.cache_event_timestamps.end()) {
+        log_router.warn("Cache event timestamp map at capacity ({}) on shard {}, "
+                        "skipping timestamp storage for new load entry",
+                        ShardLocalState::MAX_CACHE_TIMESTAMPS, seastar::this_shard_id());
+    } else {
+        state.cache_event_timestamps[key] = {event_timestamp_ms};
+    }
+
+    // Strict subset: only "applied" if we already track this
+    // (hash, backend) on this shard. Anything else is ignored.
+    auto idx_it = state.prefix_hash_index.find(prefix_hash);
+    if (idx_it == state.prefix_hash_index.end() ||
+        idx_it->second.find(backend_id) == idx_it->second.end()) {
+        state.cache_event_stats.loads_ignored++;
+        return 0;
+    }
+
+    state.cache_event_stats.loads_applied++;
+    log_router.debug("Shard {}: Refreshed load for backend {} (hash={}) via push event",
+                     seastar::this_shard_id(), backend_id, prefix_hash);
+    return 1;
+}
+
+seastar::future<uint32_t> RouterService::load_route_global(
+    uint64_t prefix_hash, BackendId backend_id, uint64_t event_timestamp_ms) {
+    // Rule #14: fan out to all shards. Each shard checks its own
+    // prefix_hash_index and updates its own timestamp map.
+    uint32_t total_applied = 0;
+    co_await seastar::parallel_for_each(
+        boost::irange(0u, seastar::smp::count),
+        [prefix_hash, backend_id, event_timestamp_ms, &total_applied](unsigned shard_id) {
+            return seastar::smp::submit_to(shard_id,
+                [prefix_hash, backend_id, event_timestamp_ms] {
+                    return RouterService::load_route_local(
+                        prefix_hash, backend_id, event_timestamp_ms);
+                }).then([&total_applied](uint32_t count) {
+                    total_applied += count;
+                });
+        });
+    co_return total_applied;
 }
 
 void RouterService::record_cache_event_received() {

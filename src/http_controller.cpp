@@ -3429,6 +3429,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
     uint32_t evictions_applied = 0;
     uint32_t evictions_stale = 0;
     uint32_t evictions_unknown = 0;
+    uint32_t loads_applied = 0;
+    uint32_t loads_ignored = 0;
 
     // Rule #2 exception: sequential co_await is intentional here.
     // Each evict_by_prefix_hash_global() fans out to all shards (~20µs),
@@ -3470,8 +3472,23 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
                 evictions_unknown++;
                 metrics().record_cache_event_eviction_unknown();
             }
+        } else if (ev.event_type == "loaded") {
+            // See RouterService::load_route_global for the strict-subset
+            // semantics. Loads are NOT propagated via gossip: broadcast_route
+            // requires the token vector, which loaded events do not carry.
+            // Cluster-wide load propagation becomes meaningful only if the
+            // wire format ever gains tokens.
+            uint32_t loaded = co_await RouterService::load_route_global(
+                ev.prefix_hash, ev.backend_id, ev.timestamp_ms);
+
+            if (loaded > 0) {
+                loads_applied++;
+                metrics().record_cache_event_load_applied();
+            } else {
+                loads_ignored++;
+                metrics().record_cache_event_load_ignored();
+            }
         }
-        // "loaded" events are Phase 3 — skip silently
     }
 
     // Build response
@@ -3480,6 +3497,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         << ", \"evictions_applied\": " << evictions_applied
         << ", \"evictions_stale\": " << evictions_stale
         << ", \"evictions_unknown\": " << evictions_unknown
+        << ", \"loads_applied\": " << loads_applied
+        << ", \"loads_ignored\": " << loads_ignored
         << "}";
 
     rep->write_body("json", sstring(oss.str()));

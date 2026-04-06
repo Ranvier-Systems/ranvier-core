@@ -272,7 +272,13 @@ public:
                 seastar::metrics::description("Cache event requests rejected due to authentication failure")),
 
             seastar::metrics::make_counter("cache_events_parse_errors", _cache_events_parse_errors,
-                seastar::metrics::description("Cache event requests with malformed or invalid JSON"))
+                seastar::metrics::description("Cache event requests with malformed or invalid JSON")),
+
+            seastar::metrics::make_counter("cache_events_loads_applied", _cache_events_loads_applied,
+                seastar::metrics::description("Cache load (\"loaded\") events that refreshed a known route")),
+
+            seastar::metrics::make_counter("cache_events_loads_ignored", _cache_events_loads_ignored,
+                seastar::metrics::description("Cache load (\"loaded\") events ignored (unknown hash, stale, or capacity)"))
         });
     }
 
@@ -409,6 +415,8 @@ public:
     void record_cache_event_eviction_unknown() { _cache_events_evictions_unknown++; }
     void record_cache_event_auth_failure() { _cache_events_auth_failures++; }
     void record_cache_event_parse_error() { _cache_events_parse_errors++; }
+    void record_cache_event_load_applied() { _cache_events_loads_applied++; }
+    void record_cache_event_load_ignored() { _cache_events_loads_ignored++; }
 
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
@@ -546,6 +554,8 @@ private:
     uint64_t _cache_events_evictions_unknown = 0;
     uint64_t _cache_events_auth_failures = 0;
     uint64_t _cache_events_parse_errors = 0;
+    uint64_t _cache_events_loads_applied = 0;
+    uint64_t _cache_events_loads_ignored = 0;
 
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load

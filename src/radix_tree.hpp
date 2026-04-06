@@ -81,8 +81,11 @@ namespace ranvier {
 // =============================================================================
 
 enum class RouteOrigin : uint8_t {
-    LOCAL = 0,   // Learned from direct request on this node
-    REMOTE = 1   // Learned from cluster gossip (can be evicted more aggressively)
+    LOCAL = 0,   // Learned from direct request on this node (highest trust)
+    PUSH   = 1,  // Backend-pushed "loaded" cache event
+    REMOTE = 2   // Learned from cluster gossip (can be evicted more aggressively)
+    // Numeric ordering is load-bearing: lower value = higher trust / lower
+    // eviction priority. Eviction precedence is REMOTE > PUSH > LOCAL.
 };
 
 enum class NodeType : uint8_t {
@@ -381,7 +384,11 @@ private:
         }
         result.prefix.assign(node->prefix.begin(), node->prefix.end());
         result.backend = node->leaf_value;
-        result.origin = (node->origin == RouteOrigin::LOCAL) ? "LOCAL" : "REMOTE";
+        switch (node->origin) {
+            case RouteOrigin::LOCAL:  result.origin = "LOCAL"; break;
+            case RouteOrigin::PUSH:   result.origin = "PUSH"; break;
+            case RouteOrigin::REMOTE: result.origin = "REMOTE"; break;
+        }
         result.last_accessed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             node->last_accessed.time_since_epoch()).count();
 
