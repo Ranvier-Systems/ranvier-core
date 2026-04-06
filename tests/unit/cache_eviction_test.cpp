@@ -165,6 +165,138 @@ TEST_F(CacheEvictionTest, RecordMetrics) {
 }
 
 // =============================================================================
+// Loaded Event Tests
+// =============================================================================
+//
+// Loaded events implement the strict subset: they only "apply"
+// when this shard already tracks (prefix_hash, backend_id) in its
+// prefix_hash_index. They never insert brand-new routes because the wire
+// format does not carry token IDs and the RadixTree is keyed on tokens.
+
+TEST_F(CacheEvictionTest, LoadAppliedForKnownRoute) {
+    auto [tokens, prefix_hash] = make_route(500);
+    BackendId backend = 5;
+
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::insert_route_for_testing(tokens, backend);
+    RouterService::update_prefix_hash_index_for_testing(prefix_hash, backend);
+
+    uint32_t applied = RouterService::load_route_local(prefix_hash, backend, 1000);
+    EXPECT_EQ(applied, 1u);
+
+    auto stats = RouterService::get_cache_event_stats();
+    EXPECT_EQ(stats.loads_applied, 1u);
+    EXPECT_EQ(stats.loads_ignored, 0u);
+}
+
+TEST_F(CacheEvictionTest, LoadIgnoredForUnknownHash) {
+    BackendId backend = 6;
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+
+    uint32_t applied = RouterService::load_route_local(0xFEEDFACEULL, backend, 1000);
+    EXPECT_EQ(applied, 0u);
+
+    auto stats = RouterService::get_cache_event_stats();
+    EXPECT_EQ(stats.loads_applied, 0u);
+    EXPECT_EQ(stats.loads_ignored, 1u);
+}
+
+TEST_F(CacheEvictionTest, LoadIgnoredForKnownHashDifferentBackend) {
+    auto [tokens, prefix_hash] = make_route(600);
+    BackendId backend1 = 11;
+    BackendId backend2 = 12;
+
+    RouterService::register_backend_for_testing(backend1, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::register_backend_for_testing(backend2, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8081));
+    RouterService::insert_route_for_testing(tokens, backend1);
+    RouterService::update_prefix_hash_index_for_testing(prefix_hash, backend1);
+
+    // backend2 claims to have it loaded — under option (a) we cannot
+    // materialize a new route, so this is ignored.
+    uint32_t applied = RouterService::load_route_local(prefix_hash, backend2, 1000);
+    EXPECT_EQ(applied, 0u);
+
+    auto stats = RouterService::get_cache_event_stats();
+    EXPECT_EQ(stats.loads_ignored, 1u);
+}
+
+TEST_F(CacheEvictionTest, LoadStaleTimestampRejected) {
+    auto [tokens, prefix_hash] = make_route(700);
+    BackendId backend = 7;
+
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::insert_route_for_testing(tokens, backend);
+    RouterService::update_prefix_hash_index_for_testing(prefix_hash, backend);
+
+    // First load at t=2000 establishes the timestamp.
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 2000), 1u);
+
+    // Older load at t=1000 is rejected as stale.
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 1000), 0u);
+
+    auto stats = RouterService::get_cache_event_stats();
+    EXPECT_GE(stats.loads_ignored, 1u);
+}
+
+TEST_F(CacheEvictionTest, LoadEqualTimestampRejected) {
+    // The timestamp check is <=, so a load with the same timestamp as the
+    // stored one is rejected (idempotent retry detection).
+    auto [tokens, prefix_hash] = make_route(750);
+    BackendId backend = 17;
+
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::insert_route_for_testing(tokens, backend);
+    RouterService::update_prefix_hash_index_for_testing(prefix_hash, backend);
+
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 5000), 1u);
+    // Same timestamp — must be rejected.
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 5000), 0u);
+
+    auto stats = RouterService::get_cache_event_stats();
+    EXPECT_EQ(stats.loads_applied, 1u);
+    EXPECT_GE(stats.loads_ignored, 1u);
+}
+
+TEST_F(CacheEvictionTest, LoadAdvancesSharedTimestamp) {
+    // Eviction and load share cache_event_timestamps. A load must bump the
+    // stored timestamp so subsequent older events of either type are rejected.
+    auto [tokens, prefix_hash] = make_route(770);
+    BackendId backend = 18;
+
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::insert_route_for_testing(tokens, backend);
+    RouterService::update_prefix_hash_index_for_testing(prefix_hash, backend);
+
+    // Load at t=3000 advances the shared timestamp.
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 3000), 1u);
+
+    // Newer load at t=4000 succeeds (route still tracked, ts strictly newer).
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 4000), 1u);
+
+    // Older load at t=2500 must be rejected — proves the second load
+    // updated the stored timestamp, not just the first.
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 2500), 0u);
+}
+
+TEST_F(CacheEvictionTest, LoadThenStaleEvictRejected) {
+    // A load at t=2000 should block a subsequent evict at t=1000.
+    auto [tokens, prefix_hash] = make_route(800);
+    BackendId backend = 8;
+
+    RouterService::register_backend_for_testing(backend, seastar::socket_address(seastar::net::inet_address("127.0.0.1"), 8080));
+    RouterService::insert_route_for_testing(tokens, backend);
+    RouterService::update_prefix_hash_index_for_testing(prefix_hash, backend);
+
+    EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 2000), 1u);
+
+    uint32_t evicted = RouterService::evict_by_prefix_hash_local(prefix_hash, backend, 1000);
+    EXPECT_EQ(evicted, 0u);
+
+    auto stats = RouterService::get_cache_event_stats();
+    EXPECT_GE(stats.evictions_stale, 1u);
+}
+
+// =============================================================================
 // CacheEventsConfig Tests
 // =============================================================================
 

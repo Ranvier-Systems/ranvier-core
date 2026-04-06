@@ -1188,6 +1188,26 @@ protected:
     }
 };
 
+TEST_F(RadixTreeRouteOriginTest, OriginNumericOrdering) {
+    // Numeric values are load-bearing: LOCAL < PUSH < REMOTE.
+    // Lower value = higher trust = lower eviction priority.
+    EXPECT_LT(static_cast<uint8_t>(RouteOrigin::LOCAL),
+              static_cast<uint8_t>(RouteOrigin::PUSH));
+    EXPECT_LT(static_cast<uint8_t>(RouteOrigin::PUSH),
+              static_cast<uint8_t>(RouteOrigin::REMOTE));
+}
+
+TEST_F(RadixTreeRouteOriginTest, PushOriginRoundTrips) {
+    tree.insert(tokens({9, 8, 7}), 42, RouteOrigin::PUSH);
+    bool seen = false;
+    tree.for_each_leaf([&](const RouteEntry& entry) {
+        EXPECT_EQ(entry.origin, RouteOrigin::PUSH);
+        EXPECT_EQ(entry.backend, 42);
+        seen = true;
+    });
+    EXPECT_TRUE(seen);
+}
+
 TEST_F(RadixTreeRouteOriginTest, DefaultOriginIsLocal) {
     tree.insert(tokens({1, 2, 3}), 1);
 
