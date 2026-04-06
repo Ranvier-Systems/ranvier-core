@@ -23,7 +23,7 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
     cd seastar && \
     ./install-dependencies.sh && \
     dnf clean all && \
-    ./configure.py --mode=release --prefix=/usr/local --c++-standard=20 && \
+    ./configure.py --mode=release --prefix=/usr/local --c++-standard=20 --without-tests --without-apps --without-demos && \
     ninja -j$(nproc) -C build/release install && \
     cd /tmp && \
     rm -rf seastar && \
