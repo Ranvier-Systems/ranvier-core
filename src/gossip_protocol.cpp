@@ -3,6 +3,7 @@
 // Manages message handling, reliable delivery, and DNS discovery.
 
 #include "gossip_protocol.hpp"
+#include "byte_order.hpp"
 #include "parse_utils.hpp"
 
 #include <algorithm>
@@ -30,30 +31,14 @@ std::vector<uint8_t> RouteAnnouncementPacket::serialize() const {
     buffer.push_back(static_cast<uint8_t>(type));
     buffer.push_back(version);
 
-    // Sequence number (big-endian)
-    buffer.push_back((seq_num >> 24) & 0xFF);
-    buffer.push_back((seq_num >> 16) & 0xFF);
-    buffer.push_back((seq_num >> 8) & 0xFF);
-    buffer.push_back(seq_num & 0xFF);
+    be_write_u32(buffer, seq_num);
+    be_write_u32(buffer, static_cast<uint32_t>(backend_id));
 
-    // Backend ID (big-endian)
-    buffer.push_back((backend_id >> 24) & 0xFF);
-    buffer.push_back((backend_id >> 16) & 0xFF);
-    buffer.push_back((backend_id >> 8) & 0xFF);
-    buffer.push_back(backend_id & 0xFF);
-
-    // Token count (big-endian)
     uint16_t count = static_cast<uint16_t>(std::min(tokens.size(), static_cast<size_t>(MAX_TOKENS)));
-    buffer.push_back((count >> 8) & 0xFF);
-    buffer.push_back(count & 0xFF);
+    be_write_u16(buffer, count);
 
-    // Tokens (big-endian)
     for (size_t i = 0; i < count; ++i) {
-        TokenId t = tokens[i];
-        buffer.push_back((t >> 24) & 0xFF);
-        buffer.push_back((t >> 16) & 0xFF);
-        buffer.push_back((t >> 8) & 0xFF);
-        buffer.push_back(t & 0xFF);
+        be_write_u32(buffer, static_cast<uint32_t>(tokens[i]));
     }
 
     return buffer;
@@ -72,17 +57,9 @@ std::optional<RouteAnnouncementPacket> RouteAnnouncementPacket::deserialize(cons
         return std::nullopt;
     }
 
-    pkt.seq_num = (static_cast<uint32_t>(data[2]) << 24) |
-                  (static_cast<uint32_t>(data[3]) << 16) |
-                  (static_cast<uint32_t>(data[4]) << 8) |
-                  static_cast<uint32_t>(data[5]);
-
-    pkt.backend_id = (static_cast<BackendId>(data[6]) << 24) |
-                     (static_cast<BackendId>(data[7]) << 16) |
-                     (static_cast<BackendId>(data[8]) << 8) |
-                     static_cast<BackendId>(data[9]);
-
-    pkt.token_count = (static_cast<uint16_t>(data[10]) << 8) | static_cast<uint16_t>(data[11]);
+    pkt.seq_num = be_read_u32(data + 2);
+    pkt.backend_id = static_cast<BackendId>(be_read_u32(data + 6));
+    pkt.token_count = be_read_u16(data + 10);
 
     size_t expected_size = HEADER_SIZE + pkt.token_count * sizeof(TokenId);
     if (len != expected_size || pkt.token_count > MAX_TOKENS) {
@@ -92,11 +69,7 @@ std::optional<RouteAnnouncementPacket> RouteAnnouncementPacket::deserialize(cons
     pkt.tokens.reserve(pkt.token_count);
     for (size_t i = 0; i < pkt.token_count; ++i) {
         size_t offset = HEADER_SIZE + i * sizeof(TokenId);
-        TokenId t = (static_cast<TokenId>(data[offset]) << 24) |
-                    (static_cast<TokenId>(data[offset + 1]) << 16) |
-                    (static_cast<TokenId>(data[offset + 2]) << 8) |
-                    static_cast<TokenId>(data[offset + 3]);
-        pkt.tokens.push_back(t);
+        pkt.tokens.push_back(static_cast<TokenId>(be_read_u32(data + offset)));
     }
 
     return pkt;
@@ -109,10 +82,7 @@ std::vector<uint8_t> RouteAckPacket::serialize() const {
     buffer.push_back(static_cast<uint8_t>(type));
     buffer.push_back(version);
 
-    buffer.push_back((seq_num >> 24) & 0xFF);
-    buffer.push_back((seq_num >> 16) & 0xFF);
-    buffer.push_back((seq_num >> 8) & 0xFF);
-    buffer.push_back(seq_num & 0xFF);
+    be_write_u32(buffer, seq_num);
 
     return buffer;
 }
@@ -130,10 +100,7 @@ std::optional<RouteAckPacket> RouteAckPacket::deserialize(const uint8_t* data, s
         return std::nullopt;
     }
 
-    pkt.seq_num = (static_cast<uint32_t>(data[2]) << 24) |
-                  (static_cast<uint32_t>(data[3]) << 16) |
-                  (static_cast<uint32_t>(data[4]) << 8) |
-                  static_cast<uint32_t>(data[5]);
+    pkt.seq_num = be_read_u32(data + 2);
 
     return pkt;
 }
@@ -146,10 +113,7 @@ std::vector<uint8_t> NodeStatePacket::serialize() const {
     buffer.push_back(version);
     buffer.push_back(static_cast<uint8_t>(state));
 
-    buffer.push_back((backend_id >> 24) & 0xFF);
-    buffer.push_back((backend_id >> 16) & 0xFF);
-    buffer.push_back((backend_id >> 8) & 0xFF);
-    buffer.push_back(backend_id & 0xFF);
+    be_write_u32(buffer, static_cast<uint32_t>(backend_id));
 
     return buffer;
 }
@@ -169,10 +133,7 @@ std::optional<NodeStatePacket> NodeStatePacket::deserialize(const uint8_t* data,
 
     pkt.state = static_cast<NodeState>(data[2]);
 
-    pkt.backend_id = (static_cast<BackendId>(data[3]) << 24) |
-                     (static_cast<BackendId>(data[4]) << 16) |
-                     (static_cast<BackendId>(data[5]) << 8) |
-                     static_cast<BackendId>(data[6]);
+    pkt.backend_id = static_cast<BackendId>(be_read_u32(data + 3));
 
     return pkt;
 }
@@ -184,27 +145,9 @@ std::vector<uint8_t> CacheEvictionPacket::serialize() const {
     buffer.push_back(static_cast<uint8_t>(type));
     buffer.push_back(version);
 
-    // Sequence number (big-endian)
-    buffer.push_back((seq_num >> 24) & 0xFF);
-    buffer.push_back((seq_num >> 16) & 0xFF);
-    buffer.push_back((seq_num >> 8) & 0xFF);
-    buffer.push_back(seq_num & 0xFF);
-
-    // Backend ID (big-endian)
-    buffer.push_back((backend_id >> 24) & 0xFF);
-    buffer.push_back((backend_id >> 16) & 0xFF);
-    buffer.push_back((backend_id >> 8) & 0xFF);
-    buffer.push_back(backend_id & 0xFF);
-
-    // Prefix hash (big-endian, 8 bytes)
-    buffer.push_back((prefix_hash >> 56) & 0xFF);
-    buffer.push_back((prefix_hash >> 48) & 0xFF);
-    buffer.push_back((prefix_hash >> 40) & 0xFF);
-    buffer.push_back((prefix_hash >> 32) & 0xFF);
-    buffer.push_back((prefix_hash >> 24) & 0xFF);
-    buffer.push_back((prefix_hash >> 16) & 0xFF);
-    buffer.push_back((prefix_hash >> 8) & 0xFF);
-    buffer.push_back(prefix_hash & 0xFF);
+    be_write_u32(buffer, seq_num);
+    be_write_u32(buffer, static_cast<uint32_t>(backend_id));
+    be_write_u64(buffer, prefix_hash);
 
     return buffer;
 }
@@ -222,24 +165,9 @@ std::optional<CacheEvictionPacket> CacheEvictionPacket::deserialize(const uint8_
         return std::nullopt;
     }
 
-    pkt.seq_num = (static_cast<uint32_t>(data[2]) << 24) |
-                  (static_cast<uint32_t>(data[3]) << 16) |
-                  (static_cast<uint32_t>(data[4]) << 8) |
-                  static_cast<uint32_t>(data[5]);
-
-    pkt.backend_id = (static_cast<BackendId>(data[6]) << 24) |
-                     (static_cast<BackendId>(data[7]) << 16) |
-                     (static_cast<BackendId>(data[8]) << 8) |
-                     static_cast<BackendId>(data[9]);
-
-    pkt.prefix_hash = (static_cast<uint64_t>(data[10]) << 56) |
-                      (static_cast<uint64_t>(data[11]) << 48) |
-                      (static_cast<uint64_t>(data[12]) << 40) |
-                      (static_cast<uint64_t>(data[13]) << 32) |
-                      (static_cast<uint64_t>(data[14]) << 24) |
-                      (static_cast<uint64_t>(data[15]) << 16) |
-                      (static_cast<uint64_t>(data[16]) << 8) |
-                      static_cast<uint64_t>(data[17]);
+    pkt.seq_num = be_read_u32(data + 2);
+    pkt.backend_id = static_cast<BackendId>(be_read_u32(data + 6));
+    pkt.prefix_hash = be_read_u64(data + 10);
 
     return pkt;
 }
