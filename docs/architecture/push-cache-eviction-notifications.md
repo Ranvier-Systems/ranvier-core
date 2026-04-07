@@ -258,7 +258,7 @@ Phase 3c upgrades the strict subset to true cold-start sync — a backend report
 
 **Decision rule:** ship 3a, ship 3b, run for a few weeks in production, look at the breakdown of `loads_ignored`. If "unknown hash" dominates and the signal looks valuable, do option 2. If `loads_ignored` is a tiny fraction of `loads_applied`, leave 3c on the shelf forever.
 
-> ⚠️ **Telemetry caveat:** Phase 3a ships `loads_ignored` as a single counter, not labeled by reason (unknown hash vs. stale timestamp vs. different backend). Splitting it into a labeled counter is a small but necessary follow-up before the 3b rollout, otherwise the 3c go/no-go decision is blind.
+> **Telemetry:** `loads_ignored` is a labeled counter with `reason` ∈ {`stale_ts`, `unknown_hash`, `different_backend`}. The 3c go/no-go decision keys on `reason="unknown_hash"` as a fraction of `loads_applied`.
 
 ## Consistency Model
 
@@ -379,7 +379,9 @@ RANVIER_CACHE_EVENTS_AUTH_TOKEN=secret
 | `ranvier_cache_events_evictions_stale` | counter | Evictions ignored (timestamp too old) |
 | `ranvier_cache_events_evictions_unknown` | counter | Evictions for unknown prefix hashes |
 | `ranvier_cache_events_loads_applied` | counter | Load events that refreshed a known `(prefix_hash, backend)` pair (Phase 3a strict subset) |
-| `ranvier_cache_events_loads_ignored` | counter | Load events ignored (unknown hash, stale ts, or known hash on different backend). **Currently a single counter — will be split by reason before Phase 3b ships.** |
+| `ranvier_cache_events_loads_ignored{reason="stale_ts"}` | counter | Load events ignored because the event timestamp `<=` the stored timestamp for this `(prefix_hash, backend_id)` pair (duplicate, retry, or reorder). |
+| `ranvier_cache_events_loads_ignored{reason="unknown_hash"}` | counter | Load events for a `prefix_hash` not tracked in this shard's index at all. This is the signal that matters for the Phase 3c go/no-go decision. |
+| `ranvier_cache_events_loads_ignored{reason="different_backend"}` | counter | Load events where the `prefix_hash` is known on this shard but for a different `backend_id`. Phase 3a cannot materialize a new route without tokens. |
 
 ### Hard Rules Compliance
 
@@ -461,7 +463,7 @@ Alternatively, a simpler approach: Ranvier sends the `X-Ranvier-Prefix-Hash` hea
 
 Lives in a separate `Ranvier-Systems` Python repo (recommended: `ranvier-cache-sidecar`). The JSON schema for `cache_event` v1 is the integration boundary — check it into ranvier-core under `schemas/` so both sides reference one source of truth.
 
-- [ ] Split `loads_ignored` into a labeled counter (reason: `unknown_hash` | `stale_ts` | `different_backend`) — prerequisite for the 3c go/no-go decision
+- [x] Split `loads_ignored` into a labeled counter (reason: `unknown_hash` | `stale_ts` | `different_backend`) — prerequisite for the 3c go/no-go decision
 - [ ] vLLM sidecar (Python, polls `/metrics`)
 - [ ] SGLang sidecar
 - [ ] Publish sidecar container images

@@ -362,7 +362,9 @@ struct ShardLocalState {
         uint64_t auth_failures = 0;
         uint64_t parse_errors = 0;
         uint64_t loads_applied = 0;
-        uint64_t loads_ignored = 0;
+        uint64_t loads_ignored_stale = 0;
+        uint64_t loads_ignored_unknown = 0;
+        uint64_t loads_ignored_different_backend = 0;
 
         void reset() {
             events_received = 0;
@@ -372,7 +374,9 @@ struct ShardLocalState {
             auth_failures = 0;
             parse_errors = 0;
             loads_applied = 0;
-            loads_ignored = 0;
+            loads_ignored_stale = 0;
+            loads_ignored_unknown = 0;
+            loads_ignored_different_backend = 0;
         }
     } cache_event_stats;
 
@@ -3915,7 +3919,8 @@ RouterService::CacheEventStatsSnapshot RouterService::get_cache_event_stats() {
     auto& s = shard_state().cache_event_stats;
     return {s.events_received, s.evictions_applied, s.evictions_stale,
             s.evictions_unknown, s.auth_failures, s.parse_errors,
-            s.loads_applied, s.loads_ignored};
+            s.loads_applied, s.loads_ignored_stale, s.loads_ignored_unknown,
+            s.loads_ignored_different_backend};
 }
 
 // ----------------------------------------------------------------------------
@@ -3940,7 +3945,8 @@ uint32_t RouterService::load_route_local(
     auto ts_it = state.cache_event_timestamps.find(key);
     if (ts_it != state.cache_event_timestamps.end() &&
         event_timestamp_ms <= ts_it->second.timestamp_ms) {
-        state.cache_event_stats.loads_ignored++;
+        state.cache_event_stats.loads_ignored_stale++;
+        metrics().record_cache_event_load_ignored_stale_ts();
         return 0;
     }
 
@@ -3957,9 +3963,14 @@ uint32_t RouterService::load_route_local(
     // Strict subset: only "applied" if we already track this
     // (hash, backend) on this shard. Anything else is ignored.
     auto idx_it = state.prefix_hash_index.find(prefix_hash);
-    if (idx_it == state.prefix_hash_index.end() ||
-        idx_it->second.find(backend_id) == idx_it->second.end()) {
-        state.cache_event_stats.loads_ignored++;
+    if (idx_it == state.prefix_hash_index.end()) {
+        state.cache_event_stats.loads_ignored_unknown++;
+        metrics().record_cache_event_load_ignored_unknown_hash();
+        return 0;
+    }
+    if (idx_it->second.find(backend_id) == idx_it->second.end()) {
+        state.cache_event_stats.loads_ignored_different_backend++;
+        metrics().record_cache_event_load_ignored_different_backend();
         return 0;
     }
 

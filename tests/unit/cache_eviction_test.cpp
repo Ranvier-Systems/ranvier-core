@@ -186,7 +186,9 @@ TEST_F(CacheEvictionTest, LoadAppliedForKnownRoute) {
 
     auto stats = RouterService::get_cache_event_stats();
     EXPECT_EQ(stats.loads_applied, 1u);
-    EXPECT_EQ(stats.loads_ignored, 0u);
+    EXPECT_EQ(stats.loads_ignored_stale, 0u);
+    EXPECT_EQ(stats.loads_ignored_unknown, 0u);
+    EXPECT_EQ(stats.loads_ignored_different_backend, 0u);
 }
 
 TEST_F(CacheEvictionTest, LoadIgnoredForUnknownHash) {
@@ -198,7 +200,7 @@ TEST_F(CacheEvictionTest, LoadIgnoredForUnknownHash) {
 
     auto stats = RouterService::get_cache_event_stats();
     EXPECT_EQ(stats.loads_applied, 0u);
-    EXPECT_EQ(stats.loads_ignored, 1u);
+    EXPECT_EQ(stats.loads_ignored_unknown, 1u);
 }
 
 TEST_F(CacheEvictionTest, LoadIgnoredForKnownHashDifferentBackend) {
@@ -217,7 +219,7 @@ TEST_F(CacheEvictionTest, LoadIgnoredForKnownHashDifferentBackend) {
     EXPECT_EQ(applied, 0u);
 
     auto stats = RouterService::get_cache_event_stats();
-    EXPECT_EQ(stats.loads_ignored, 1u);
+    EXPECT_EQ(stats.loads_ignored_different_backend, 1u);
 }
 
 TEST_F(CacheEvictionTest, LoadStaleTimestampRejected) {
@@ -235,7 +237,7 @@ TEST_F(CacheEvictionTest, LoadStaleTimestampRejected) {
     EXPECT_EQ(RouterService::load_route_local(prefix_hash, backend, 1000), 0u);
 
     auto stats = RouterService::get_cache_event_stats();
-    EXPECT_GE(stats.loads_ignored, 1u);
+    EXPECT_GE(stats.loads_ignored_stale, 1u);
 }
 
 TEST_F(CacheEvictionTest, LoadEqualTimestampRejected) {
@@ -254,7 +256,7 @@ TEST_F(CacheEvictionTest, LoadEqualTimestampRejected) {
 
     auto stats = RouterService::get_cache_event_stats();
     EXPECT_EQ(stats.loads_applied, 1u);
-    EXPECT_GE(stats.loads_ignored, 1u);
+    EXPECT_GE(stats.loads_ignored_stale, 1u);
 }
 
 TEST_F(CacheEvictionTest, LoadAdvancesSharedTimestamp) {

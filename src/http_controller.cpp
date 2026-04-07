@@ -3485,8 +3485,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
                 loads_applied++;
                 metrics().record_cache_event_load_applied();
             } else {
+                // Per-reason metrics are recorded inside load_route_local.
+                // This aggregate is only for the HTTP response body.
                 loads_ignored++;
-                metrics().record_cache_event_load_ignored();
             }
         }
     }
