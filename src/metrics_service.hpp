@@ -277,8 +277,24 @@ public:
             seastar::metrics::make_counter("cache_events_loads_applied", _cache_events_loads_applied,
                 seastar::metrics::description("Cache load (\"loaded\") events that refreshed a known route")),
 
-            seastar::metrics::make_counter("cache_events_loads_ignored", _cache_events_loads_ignored,
-                seastar::metrics::description("Cache load (\"loaded\") events ignored (unknown hash, stale, or capacity)"))
+            // Loads ignored, labeled by reason. Uses make_gauge with a lambda
+            // (same pattern as prefix_hits_by_compression_tier above) because
+            // Seastar's make_counter with labels requires a lambda, not a
+            // variable reference.
+            seastar::metrics::make_gauge("cache_events_loads_ignored",
+                seastar::metrics::description("Cache load (\"loaded\") events ignored, by reason"),
+                {{"reason", "stale_ts"}},
+                [this] { return static_cast<double>(_cache_events_loads_ignored_stale_ts); }),
+
+            seastar::metrics::make_gauge("cache_events_loads_ignored",
+                seastar::metrics::description("Cache load (\"loaded\") events ignored, by reason"),
+                {{"reason", "unknown_hash"}},
+                [this] { return static_cast<double>(_cache_events_loads_ignored_unknown_hash); }),
+
+            seastar::metrics::make_gauge("cache_events_loads_ignored",
+                seastar::metrics::description("Cache load (\"loaded\") events ignored, by reason"),
+                {{"reason", "different_backend"}},
+                [this] { return static_cast<double>(_cache_events_loads_ignored_different_backend); })
         });
     }
 
@@ -416,7 +432,9 @@ public:
     void record_cache_event_auth_failure() { _cache_events_auth_failures++; }
     void record_cache_event_parse_error() { _cache_events_parse_errors++; }
     void record_cache_event_load_applied() { _cache_events_loads_applied++; }
-    void record_cache_event_load_ignored() { _cache_events_loads_ignored++; }
+    void record_cache_event_load_ignored_stale_ts() { _cache_events_loads_ignored_stale_ts++; }
+    void record_cache_event_load_ignored_unknown_hash() { _cache_events_loads_ignored_unknown_hash++; }
+    void record_cache_event_load_ignored_different_backend() { _cache_events_loads_ignored_different_backend++; }
 
     // Get overflow count for backend metrics limit (for monitoring)
     uint64_t get_backend_metrics_overflow() const { return _backend_metrics_overflow; }
@@ -555,7 +573,9 @@ private:
     uint64_t _cache_events_auth_failures = 0;
     uint64_t _cache_events_parse_errors = 0;
     uint64_t _cache_events_loads_applied = 0;
-    uint64_t _cache_events_loads_ignored = 0;
+    uint64_t _cache_events_loads_ignored_stale_ts = 0;
+    uint64_t _cache_events_loads_ignored_unknown_hash = 0;
+    uint64_t _cache_events_loads_ignored_different_backend = 0;
 
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load

@@ -531,7 +531,9 @@ public:
         uint64_t auth_failures = 0;
         uint64_t parse_errors = 0;
         uint64_t loads_applied = 0;
-        uint64_t loads_ignored = 0;
+        uint64_t loads_ignored_stale = 0;
+        uint64_t loads_ignored_unknown = 0;
+        uint64_t loads_ignored_different_backend = 0;
     };
     static CacheEventStatsSnapshot get_cache_event_stats();
 
