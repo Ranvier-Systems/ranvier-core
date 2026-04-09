@@ -342,11 +342,14 @@ public:
         if (aligned_len == 0) return;
 
         // Encode aligned TokenIds to a byte buffer for the byte-level
-        // tree.  InlinedVector keeps small keys allocation-free; large
-        // keys spill to heap.  The output length is always a multiple
-        // of sizeof(TokenId), which enforces the leaf-alignment
-        // invariant (leaves only exist at TokenId-aligned byte depths).
-        absl::InlinedVector<uint8_t, 64> key_bytes;
+        // tree.  The InlinedVector's 1024-byte inline storage (= 256
+        // tokens) keeps the scratch buffer allocation-free for every
+        // realistic LLM prompt size; only pathologically long prompts
+        // (>256 tokens) spill to the heap.  The output length is
+        // always a multiple of sizeof(TokenId), which enforces the
+        // leaf-alignment invariant (leaves only exist at TokenId-
+        // aligned byte depths).
+        absl::InlinedVector<uint8_t, 1024> key_bytes;
         key_bytes.reserve(aligned_len * sizeof(TokenId));
         encode_tokens_be(tokens.subspan(0, aligned_len), key_bytes);
 
@@ -361,7 +364,10 @@ public:
     }
 
     std::optional<BackendId> lookup(std::span<const TokenId> tokens) {
-        absl::InlinedVector<uint8_t, 64> key_bytes;
+        // 1024-byte inline buffer = 256 tokens; covers every realistic
+        // LLM prompt without heap allocation on the hot path.  See the
+        // corresponding note in insert() above for the rationale.
+        absl::InlinedVector<uint8_t, 1024> key_bytes;
         key_bytes.reserve(tokens.size() * sizeof(TokenId));
         encode_tokens_be(tokens, key_bytes);
         return lookup_recursive(root_.get(),
@@ -375,7 +381,9 @@ public:
     // HARD RULE #1 (No Blocking on Hot Path):
     // This function runs on every incoming request. It MUST remain lock-free:
     //   - O(key_length) traversal via iterative loop (no recursion overhead)
-    //   - No heap allocations on cache hit (span is a view, not a copy)
+    //   - No heap allocations on cache hit for prompts up to 256 tokens
+    //     (the 1024-byte inline scratch buffer holds the byte-encoded
+    //     key; only pathologically long prompts spill to the heap)
     //   - No mutex, no atomics, no cross-shard access
     //   - LRU timestamp update is the only write (single steady_clock::now())
     //
@@ -388,7 +396,7 @@ public:
     //   - nodes_traversed: Number of nodes visited (for metrics)
     //
     LookupResult lookup_instrumented(std::span<const TokenId> tokens) {
-        absl::InlinedVector<uint8_t, 64> key_bytes;
+        absl::InlinedVector<uint8_t, 1024> key_bytes;
         key_bytes.reserve(tokens.size() * sizeof(TokenId));
         encode_tokens_be(tokens, key_bytes);
         return lookup_with_stats(root_.get(),
@@ -451,7 +459,10 @@ public:
     // and walk the byte-level tree.
     std::optional<DumpNode> dump_with_prefix(std::span<const TokenId> prefix_filter) const {
         // Encode TokenId prefix filter to byte form for internal walk.
-        absl::InlinedVector<uint8_t, 64> byte_filter;
+        // Uses the same 1024-byte inline capacity as the other public
+        // entry points for consistency; dump_with_prefix is an admin
+        // cold path so the stack cost is immaterial either way.
+        absl::InlinedVector<uint8_t, 1024> byte_filter;
         byte_filter.reserve(prefix_filter.size() * sizeof(TokenId));
         encode_tokens_be(prefix_filter, byte_filter);
 
