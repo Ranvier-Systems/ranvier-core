@@ -13,6 +13,7 @@
 
 #include <absl/container/inlined_vector.h>
 
+#include "byte_order.hpp"
 #include "types.hpp"
 #include "node_slab.hpp"
 
@@ -98,6 +99,81 @@ enum class NodeType : uint8_t {
 // Hard Rule #4: Every growing container needs an explicit MAX_SIZE.
 // Prefixes longer than this are split into chains of nodes.
 static constexpr size_t MAX_PREFIX_LENGTH = 256;
+
+// =============================================================================
+// TokenId <-> Byte Encoding (Big-Endian)
+// =============================================================================
+//
+// The tree operates internally on byte-level keys rather than TokenId-level
+// keys.  This is what ART actually requires for wide (non-byte) alphabets:
+// Node256 becomes a true direct-mapped 256-slot array with no collision
+// handling, and the "Node256 full" edge case is eliminated by construction.
+//
+// Big-endian is the chosen encoding because:
+//   1. LLM vocabulary IDs cluster in the low end of the TokenId range
+//      (typically < 128k, so the upper 1-2 bytes are usually 0x00).
+//   2. Big-endian places those common-zero bytes at the top of the tree,
+//      where path compression can collapse them into a single shared root
+//      prefix shared by every route.
+//   3. Lexicographic byte order matches numerical TokenId order, which
+//      simplifies reasoning about prefix matching.
+//
+// The encoding assumes TokenId is exactly 4 bytes.  The static_assert below
+// will fail the build if that ever changes, forcing a conscious revisit.
+//
+static_assert(sizeof(TokenId) == 4,
+              "Byte encoding assumes TokenId is exactly 4 bytes (int32_t). "
+              "If TokenId changes width, update encode/decode_token_be and "
+              "review the radix tree's byte-alignment invariants.");
+
+// Encode a single TokenId as 4 big-endian bytes, appending to `out`.
+// `Out` must support `push_back(uint8_t)` (e.g., std::vector<uint8_t>,
+// absl::InlinedVector<uint8_t, N>).
+//
+// Delegates to be_write_u32 in byte_order.hpp.  The cast through uint32_t
+// gives well-defined bit behavior for negative TokenIds (two's complement
+// preserved), even though tokenizers don't produce negative IDs in practice.
+template <typename Out>
+inline void encode_token_be(TokenId token, Out& out) {
+    be_write_u32(out, static_cast<uint32_t>(token));
+}
+
+// Encode a sequence of TokenIds as big-endian bytes, appending to `out`.
+// Caller should reserve `out.capacity() >= tokens.size() * sizeof(TokenId)`
+// beforehand to avoid reallocation on the hot path.
+template <typename Out>
+inline void encode_tokens_be(std::span<const TokenId> tokens, Out& out) {
+    for (TokenId t : tokens) {
+        encode_token_be(t, out);
+    }
+}
+
+// Decode 4 big-endian bytes starting at `bytes[offset]` into a TokenId.
+// Precondition: offset + sizeof(TokenId) <= bytes.size().
+//
+// Unlike be_read_u32 (raw pointer, no bounds check), this span-based wrapper
+// asserts the offset is in range — important because it's called from the
+// tree traversal loop where an out-of-range read would corrupt results
+// silently rather than crash cleanly.
+inline TokenId decode_token_be(std::span<const uint8_t> bytes, size_t offset) {
+    assert(offset + sizeof(TokenId) <= bytes.size() &&
+           "decode_token_be: offset out of range");
+    return static_cast<TokenId>(be_read_u32(bytes.data() + offset));
+}
+
+// Decode a TokenId-aligned byte sequence into TokenIds, appending to `out`.
+// Precondition: bytes.size() % sizeof(TokenId) == 0.
+// This alignment invariant is guaranteed for any byte sequence that
+// represents a complete root-to-leaf path in the radix tree, because all
+// inserts enter the tree through the TokenId-span public API.
+template <typename Out>
+inline void decode_tokens_be(std::span<const uint8_t> bytes, Out& out) {
+    assert(bytes.size() % sizeof(TokenId) == 0 &&
+           "decode_tokens_be: byte length must be TokenId-aligned");
+    for (size_t i = 0; i + sizeof(TokenId) <= bytes.size(); i += sizeof(TokenId)) {
+        out.push_back(decode_token_be(bytes, i));
+    }
+}
 
 // =============================================================================
 // Node Structures

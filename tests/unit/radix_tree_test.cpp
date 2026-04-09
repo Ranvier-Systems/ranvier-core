@@ -13,10 +13,16 @@
 #include "radix_tree.hpp"
 #include "node_slab.hpp"
 
-#include <vector>
-#include <optional>
-#include <thread>
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <limits>
+#include <optional>
+#include <span>
+#include <thread>
+#include <vector>
+
+#include <absl/container/inlined_vector.h>
 
 using namespace ranvier;
 
@@ -2843,4 +2849,232 @@ TEST_F(RadixTreeTest, TokenIdHashCollision_Node48UpdateColliding) {
 
     // Other colliding token should be unchanged
     EXPECT_EQ(tree.lookup(tokens({1, 256})).value(), 20);
+}
+
+// =============================================================================
+// TokenId <-> Byte Encoding Tests (Stage 0 scaffolding for multi-byte ART)
+// =============================================================================
+//
+// These tests cover the big-endian encode/decode helpers that the radix tree
+// will use to convert TokenId sequences to byte sequences internally.  They
+// have no dependency on RadixTree itself — they exercise the primitives in
+// isolation so that any encoding bug is caught at the smallest possible
+// surface area before it can propagate into tree semantics.
+
+TEST(TokenByteEncodingTest, EncodeSingleTokenProducesBigEndianBytes) {
+    // 0x12345678 should serialize as [0x12, 0x34, 0x56, 0x78] (MSB first).
+    std::vector<uint8_t> out;
+    encode_token_be(static_cast<TokenId>(0x12345678), out);
+
+    ASSERT_EQ(out.size(), 4u);
+    EXPECT_EQ(out[0], 0x12);
+    EXPECT_EQ(out[1], 0x34);
+    EXPECT_EQ(out[2], 0x56);
+    EXPECT_EQ(out[3], 0x78);
+}
+
+TEST(TokenByteEncodingTest, EncodeZeroProducesAllZeroBytes) {
+    std::vector<uint8_t> out;
+    encode_token_be(0, out);
+
+    ASSERT_EQ(out.size(), 4u);
+    EXPECT_EQ(out[0], 0x00);
+    EXPECT_EQ(out[1], 0x00);
+    EXPECT_EQ(out[2], 0x00);
+    EXPECT_EQ(out[3], 0x00);
+}
+
+TEST(TokenByteEncodingTest, EncodeSmallVocabTokensHaveZeroUpperBytes) {
+    // This property is the entire reason we chose big-endian: tokens that
+    // fit in the low bytes produce upper zero bytes, which path compression
+    // collapses at the root of the tree.
+    std::vector<uint8_t> out;
+    encode_token_be(42, out);
+
+    ASSERT_EQ(out.size(), 4u);
+    EXPECT_EQ(out[0], 0x00);  // Upper byte: zero (collapses in root prefix)
+    EXPECT_EQ(out[1], 0x00);  // Upper-mid byte: zero (collapses)
+    EXPECT_EQ(out[2], 0x00);  // Mid byte: zero for vocab < 256
+    EXPECT_EQ(out[3], 42);    // Low byte: the actual differentiating byte
+}
+
+TEST(TokenByteEncodingTest, EncodeCrossesByteBoundariesCorrectly) {
+    // Values that exercise each byte position independently.
+    struct Case { TokenId input; std::array<uint8_t, 4> expected; };
+    const std::vector<Case> cases = {
+        { 0x000000FF, {0x00, 0x00, 0x00, 0xFF} },
+        { 0x0000FF00, {0x00, 0x00, 0xFF, 0x00} },
+        { 0x00FF0000, {0x00, 0xFF, 0x00, 0x00} },
+        { 0x7F000000, {0x7F, 0x00, 0x00, 0x00} },  // sign bit clear
+        { 0x00010000, {0x00, 0x01, 0x00, 0x00} },  // 65536
+        { 0x00000100, {0x00, 0x00, 0x01, 0x00} },  // 256
+    };
+
+    for (const auto& c : cases) {
+        std::vector<uint8_t> out;
+        encode_token_be(c.input, out);
+        ASSERT_EQ(out.size(), 4u) << "input=" << c.input;
+        for (size_t i = 0; i < 4; ++i) {
+            EXPECT_EQ(out[i], c.expected[i])
+                << "mismatch at byte " << i << " for input=" << c.input;
+        }
+    }
+}
+
+TEST(TokenByteEncodingTest, EncodeNegativeTokenPreservesBitPattern) {
+    // TokenId is int32_t so negative inputs are legal at the type level
+    // even though the tokenizer never produces them.  The encoding must
+    // not lose bits; it goes through uint32_t to get well-defined behavior.
+    std::vector<uint8_t> out;
+    encode_token_be(static_cast<TokenId>(-1), out);  // 0xFFFFFFFF
+
+    ASSERT_EQ(out.size(), 4u);
+    EXPECT_EQ(out[0], 0xFF);
+    EXPECT_EQ(out[1], 0xFF);
+    EXPECT_EQ(out[2], 0xFF);
+    EXPECT_EQ(out[3], 0xFF);
+}
+
+TEST(TokenByteEncodingTest, RoundTripSingleToken) {
+    // Every representable TokenId must survive encode -> decode unchanged.
+    const std::vector<TokenId> samples = {
+        0,
+        1,
+        42,
+        255,
+        256,
+        65535,
+        65536,
+        1 << 24,
+        std::numeric_limits<TokenId>::max(),
+        std::numeric_limits<TokenId>::min(),
+        -1,
+        -42,
+    };
+
+    for (TokenId input : samples) {
+        std::vector<uint8_t> encoded;
+        encode_token_be(input, encoded);
+        ASSERT_EQ(encoded.size(), sizeof(TokenId));
+
+        TokenId decoded = decode_token_be(
+            std::span<const uint8_t>(encoded.data(), encoded.size()), 0);
+        EXPECT_EQ(decoded, input) << "round-trip failed for " << input;
+    }
+}
+
+TEST(TokenByteEncodingTest, EncodeSequenceAppendsInOrder) {
+    // Multiple tokens should serialize as concatenation in order.
+    const std::vector<TokenId> tokens = {0x01020304, 0x05060708};
+    std::vector<uint8_t> out;
+    encode_tokens_be(std::span<const TokenId>(tokens.data(), tokens.size()), out);
+
+    ASSERT_EQ(out.size(), 8u);
+    EXPECT_EQ(out[0], 0x01);
+    EXPECT_EQ(out[1], 0x02);
+    EXPECT_EQ(out[2], 0x03);
+    EXPECT_EQ(out[3], 0x04);
+    EXPECT_EQ(out[4], 0x05);
+    EXPECT_EQ(out[5], 0x06);
+    EXPECT_EQ(out[6], 0x07);
+    EXPECT_EQ(out[7], 0x08);
+}
+
+TEST(TokenByteEncodingTest, EncodeSequenceAppendsToExistingContent) {
+    // encode_tokens_be must append, not replace.  This matters because the
+    // tree's insert() path may encode into a scratch buffer that already
+    // holds something (e.g., a path accumulator during traversal).
+    std::vector<uint8_t> out = {0xAA, 0xBB};
+    const std::vector<TokenId> tokens = {0x00000001};
+    encode_tokens_be(std::span<const TokenId>(tokens.data(), tokens.size()), out);
+
+    ASSERT_EQ(out.size(), 6u);
+    EXPECT_EQ(out[0], 0xAA);  // Pre-existing bytes untouched.
+    EXPECT_EQ(out[1], 0xBB);
+    EXPECT_EQ(out[2], 0x00);  // Appended encoding starts here.
+    EXPECT_EQ(out[3], 0x00);
+    EXPECT_EQ(out[4], 0x00);
+    EXPECT_EQ(out[5], 0x01);
+}
+
+TEST(TokenByteEncodingTest, EncodeEmptySpanProducesNoOutput) {
+    std::vector<uint8_t> out;
+    encode_tokens_be(std::span<const TokenId>(), out);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(TokenByteEncodingTest, RoundTripMultipleTokens) {
+    // The end-to-end property: any TokenId sequence survives
+    // encode -> decode unchanged, in the same order.
+    const std::vector<TokenId> original = {
+        0, 1, 42, 255, 256, 1024, 65535, 65536,
+        std::numeric_limits<TokenId>::max(),
+        std::numeric_limits<TokenId>::min(),
+        -1, 0x12345678,
+    };
+
+    std::vector<uint8_t> encoded;
+    encode_tokens_be(std::span<const TokenId>(original.data(), original.size()), encoded);
+    EXPECT_EQ(encoded.size(), original.size() * sizeof(TokenId));
+
+    std::vector<TokenId> decoded;
+    decode_tokens_be(std::span<const uint8_t>(encoded.data(), encoded.size()), decoded);
+    EXPECT_EQ(decoded, original);
+}
+
+TEST(TokenByteEncodingTest, DecodeAppendsToExistingContent) {
+    // Symmetrical to EncodeSequenceAppendsToExistingContent: the decoder
+    // also appends, so call sites accumulating into a shared buffer work.
+    std::vector<TokenId> out = {999};
+    const std::vector<uint8_t> bytes = {0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02};
+    decode_tokens_be(std::span<const uint8_t>(bytes.data(), bytes.size()), out);
+
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_EQ(out[0], 999);  // Pre-existing entry untouched.
+    EXPECT_EQ(out[1], 1);
+    EXPECT_EQ(out[2], 2);
+}
+
+TEST(TokenByteEncodingTest, DecodeEmptySpanProducesNoOutput) {
+    std::vector<TokenId> out;
+    decode_tokens_be(std::span<const uint8_t>(), out);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(TokenByteEncodingTest, BigEndianOrderingMatchesLexicographic) {
+    // The "lexicographic byte order matches numeric TokenId order" property
+    // is important for reasoning about prefix matching and for the path
+    // compression story.  Verify it holds for a handful of pairs in the
+    // non-negative range (where signed ordering and unsigned ordering agree).
+    struct Pair { TokenId smaller; TokenId larger; };
+    const std::vector<Pair> pairs = {
+        {0, 1},
+        {42, 43},
+        {255, 256},
+        {65535, 65536},
+        {0x00FF00FF, 0x00FF0100},
+    };
+
+    for (const auto& p : pairs) {
+        std::vector<uint8_t> a, b;
+        encode_token_be(p.smaller, a);
+        encode_token_be(p.larger, b);
+        EXPECT_TRUE(std::lexicographical_compare(
+            a.begin(), a.end(), b.begin(), b.end()))
+            << "byte-lex order disagrees with numeric order for "
+            << p.smaller << " < " << p.larger;
+    }
+}
+
+TEST(TokenByteEncodingTest, EncodeIntoInlinedVector) {
+    // The primary caller (RadixTree) uses absl::InlinedVector for its
+    // path accumulators to keep the hot path allocation-free.  Verify the
+    // template-based helper works with that container type.
+    absl::InlinedVector<uint8_t, 16> out;
+    const std::vector<TokenId> tokens = {1, 2, 3};
+    encode_tokens_be(std::span<const TokenId>(tokens.data(), tokens.size()), out);
+
+    ASSERT_EQ(out.size(), 12u);  // 3 tokens * 4 bytes each
+    // Spot-check: third token's low byte should be at position 11.
+    EXPECT_EQ(out[11], 3);
 }
