@@ -2585,6 +2585,11 @@ static constexpr int DEFAULT_MAX_DUMP_DEPTH = 32;
 
 // Helper to serialize a DumpNode to JSON with bounded recursion depth.
 // When max_depth is reached, children are replaced with a count summary.
+//
+// Prefix and edge keys are raw bytes after the multi-byte ART refactor.
+// They're emitted as integers (0-255) rather than characters because
+// streaming a uint8_t directly would print it as an ASCII char, which
+// is gibberish for non-printable bytes and would corrupt the JSON.
 static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent_level = 0, int remaining_depth = DEFAULT_MAX_DUMP_DEPTH) {
     std::ostringstream ss;
     std::string indent(indent_level * 2, ' ');
@@ -2593,11 +2598,11 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
     ss << "{\n";
     ss << inner_indent << "\"type\": \"" << node.type << "\",\n";
 
-    // Prefix array
+    // Prefix array (raw bytes, emitted as integers).
     ss << inner_indent << "\"prefix\": [";
     for (size_t i = 0; i < node.prefix.size(); ++i) {
         if (i > 0) ss << ", ";
-        ss << node.prefix[i];
+        ss << static_cast<unsigned>(node.prefix[i]);
     }
     ss << "],\n";
 
@@ -2611,7 +2616,7 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
     ss << inner_indent << "\"origin\": \"" << node.origin << "\",\n";
     ss << inner_indent << "\"last_accessed_ms\": " << node.last_accessed_ms << ",\n";
 
-    // Children array (bounded by remaining_depth)
+    // Children array (bounded by remaining_depth); edge keys are bytes.
     ss << inner_indent << "\"children\": [";
     if (!node.children.empty()) {
         if (remaining_depth <= 0) {
@@ -2624,7 +2629,7 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
         ss << "\n";
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0) ss << ",\n";
-            ss << inner_indent << "  {\"edge\": " << node.children[i].first << ", \"node\": ";
+            ss << inner_indent << "  {\"edge\": " << static_cast<unsigned>(node.children[i].first) << ", \"node\": ";
             ss << dump_node_to_json(node.children[i].second, indent_level + 2, remaining_depth - 1);
             ss << "}";
         }

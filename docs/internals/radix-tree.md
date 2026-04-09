@@ -157,25 +157,25 @@ Stores up to 4 key-child pairs in parallel `std::vector`s (reserved to capacity 
 
 #### Node16: SIMD-Ready Medium Node
 
-Same structure as Node4 but with capacity 16. The keys layout (16 × 4-byte `TokenId` = 64 bytes) is designed to fit in two AVX2 registers for future SIMD optimization.
+Same structure as Node4 but with capacity 16. The keys vector stores 16 bytes (one per distinct byte value), which fits comfortably in a single AVX2 register for future SIMD optimization.
 
 **Use case:** Moderate branching, common for conversation turns where multiple user queries share a system prompt prefix.
 
 #### Node48: Indexed Lookup Node
 
-Uses a 256-byte index array mapping `key_byte(token) → position` in a compact children vector. The fast path is O(1): look up the index, verify the key matches. On collision (multiple tokens mapping to the same byte), falls back to linear scan of the keys vector.
+Uses a 256-byte `index[]` array that maps a byte key directly to a position in a compact children vector. The fast path is O(1): look up the index, dereference the child. Because the tree operates on raw bytes (not truncated TokenIds), each byte key maps to a unique slot — there is no collision handling.
 
 An `EMPTY_MARKER` sentinel (255) in the index array indicates unused slots.
 
-**Use case:** High-branching nodes where different token sequences diverge significantly.
+**Use case:** High-branching nodes where different byte values diverge significantly.
 
-#### Node256: Direct Access with Collision Handling
+#### Node256: Direct-Mapped Array
 
-Uses a 256-element children array indexed by `key_byte(token)`, plus a parallel 256-element keys array storing full `TokenId` values.
+A simple 256-element children array where the slot index *is* the byte key. Lookup, insert, and delete are all O(1) single-array-access operations. No separate keys array, no collision fallback, no "Node256 full" edge case — the byte alphabet is exactly 256, so the node can hold any child set by construction.
 
-**Why the keys array?** The `key_byte()` function extracts only the lower 8 bits of a `TokenId` for indexing. Token IDs 0, 256, 512, 768 all map to index 0. The keys array stores the full token ID to detect and handle these collisions. On a collision miss at the preferred slot, the implementation always falls through to a linear scan of all 256 slots — it does not short-circuit on `EMPTY_KEY` to avoid missing displaced entries. See `radix_tree.hpp:722-740`.
+This is the textbook ART representation and it's only possible because the tree keys on bytes rather than on the wider `TokenId` type. The earlier implementation used `key_byte(TokenId) = TokenId & 0xFF` as a lossy hash, which forced the node into an open-addressed hash table with a silent-drop bug when more than 256 distinct tokens shared a parent. The multi-byte ART refactor eliminated both the hashing and the bug.
 
-**Use case:** Maximum branching scenarios, rare in practice due to path compression.
+**Use case:** Maximum branching scenarios, rare in practice because most parent nodes see far fewer than 256 distinct byte values at any given depth.
 
 ### Growth and Shrinking
 
@@ -526,7 +526,7 @@ From production benchmarks (see `docs/performance.md`):
 
 | Method | Description |
 |--------|-------------|
-| `lookup_instrumented(tokens)` | Returns `LookupResult` with `backend`, `prefix_tokens_skipped`, `nodes_traversed` |
+| `lookup_instrumented(tokens)` | Returns `LookupResult` with `backend`, `prefix_bytes_skipped`, `nodes_traversed`. `prefix_bytes_skipped` is a byte count; `RouterService` divides by `sizeof(TokenId)` when recording the external `ranvier_radix_tree_average_prefix_skip_length` gauge so it retains its token-level semantic for dashboards. |
 | `get_tree_stats()` | Returns `TreeStats` with per-node-type counts and prefix length statistics |
 | `for_each_leaf(callback)` | Iterates all leaf nodes (used for persistence serialization) |
 | `dump()` / `dump_with_prefix(prefix)` | Serializes tree (or subtree) to `DumpNode` for admin API inspection |

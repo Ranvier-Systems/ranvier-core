@@ -98,7 +98,13 @@ enum class NodeType : uint8_t {
 
 // Hard Rule #4: Every growing container needs an explicit MAX_SIZE.
 // Prefixes longer than this are split into chains of nodes.
-static constexpr size_t MAX_PREFIX_LENGTH = 256;
+//
+// Units are BYTES.  Since the tree operates on big-endian TokenId bytes
+// internally (4 bytes per logical token), 1024 bytes corresponds to 256
+// logical tokens worth of path compression — matching the pre-refactor
+// logical capacity.  split_long_prefix() chains longer prefixes into a
+// series of nodes so no single node's prefix vector exceeds this bound.
+static constexpr size_t MAX_PREFIX_LENGTH = 1024;
 
 // =============================================================================
 // TokenId <-> Byte Encoding (Big-Endian)
@@ -181,10 +187,11 @@ inline void decode_tokens_be(std::span<const uint8_t> bytes, Out& out) {
 
 struct Node {
     NodeType type;
-    // Inline storage for up to 8 tokens eliminates heap allocation for short
-    // prefixes (the common case after path compression splits).  Falls back to
-    // heap transparently for longer prefixes.
-    absl::InlinedVector<TokenId, 8> prefix;
+    // Byte-level path compression prefix.  Inline storage for 32 bytes
+    // (= 8 TokenIds worth) eliminates heap allocation for short prefixes,
+    // the common case after path compression splits.  Longer prefixes
+    // spill to the heap transparently via absl::InlinedVector.
+    absl::InlinedVector<uint8_t, 32> prefix;
     std::optional<BackendId> leaf_value;
     RouteOrigin origin = RouteOrigin::LOCAL;
     std::chrono::steady_clock::time_point last_accessed;
@@ -199,7 +206,7 @@ struct Node {
 };
 
 struct Node4 : public Node {
-    std::vector<TokenId> keys;
+    std::vector<uint8_t> keys;
     std::vector<NodePtr> children;
 
     Node4() : Node(NodeType::Node4) {
@@ -209,7 +216,7 @@ struct Node4 : public Node {
 };
 
 struct Node16 : public Node {
-    std::vector<TokenId> keys;
+    std::vector<uint8_t> keys;
     std::vector<NodePtr> children;
 
     Node16() : Node(NodeType::Node16) {
@@ -223,7 +230,7 @@ struct Node48 : public Node {
 
     std::array<uint8_t, 256> index;
     std::vector<NodePtr> children;
-    std::vector<TokenId> keys;
+    std::vector<uint8_t> keys;
 
     Node48() : Node(NodeType::Node48) {
         index.fill(EMPTY_MARKER);
@@ -233,16 +240,14 @@ struct Node48 : public Node {
 };
 
 struct Node256 : public Node {
-    // CRITICAL: Must store full token IDs because key_byte() only uses lower 8 bits.
-    // Token IDs like 0, 256, 512 all map to index 0 - we need to verify the actual key.
-    static constexpr TokenId EMPTY_KEY = -1;  // Sentinel value for empty slots
-
+    // Byte-keyed direct-mapped array: the slot index IS the key.  No
+    // separate `keys` member is needed because the byte alphabet is
+    // exactly 256 — there are no collisions by construction, unlike the
+    // previous TokenId-keyed implementation that used lossy hashing.
+    // An empty slot is simply a null child pointer.
     std::array<NodePtr, 256> children;
-    std::array<TokenId, 256> keys;  // Full token IDs at each slot
 
-    Node256() : Node(NodeType::Node256) {
-        keys.fill(EMPTY_KEY);
-    }
+    Node256() : Node(NodeType::Node256) {}
 };
 
 // =============================================================================
@@ -277,7 +282,11 @@ struct CompactionStats {
 // Result from lookup with instrumentation data
 struct LookupResult {
     std::optional<BackendId> backend;
-    size_t prefix_tokens_skipped = 0; // Tokens skipped via path compression
+    // Bytes matched via path compression (bigger = better path compression).
+    // The public `ranvier_radix_tree_average_prefix_skip_length` metric is
+    // a *token* count — RouterService divides this by sizeof(TokenId) at
+    // the recording site to preserve the external token-semantic gauge.
+    size_t prefix_bytes_skipped = 0;
     size_t nodes_traversed = 0;       // Number of nodes visited during lookup
 };
 
@@ -332,8 +341,19 @@ public:
         size_t aligned_len = (tokens.size() / block_alignment_) * block_alignment_;
         if (aligned_len == 0) return;
 
+        // Encode aligned TokenIds to a byte buffer for the byte-level
+        // tree.  InlinedVector keeps small keys allocation-free; large
+        // keys spill to heap.  The output length is always a multiple
+        // of sizeof(TokenId), which enforces the leaf-alignment
+        // invariant (leaves only exist at TokenId-aligned byte depths).
+        absl::InlinedVector<uint8_t, 64> key_bytes;
+        key_bytes.reserve(aligned_len * sizeof(TokenId));
+        encode_tokens_be(tokens.subspan(0, aligned_len), key_bytes);
+
         auto [new_root, is_new_route] = insert_recursive(
-            std::move(root_), tokens.subspan(0, aligned_len), backend, origin);
+            std::move(root_),
+            std::span<const uint8_t>(key_bytes.data(), key_bytes.size()),
+            backend, origin);
         root_ = std::move(new_root);
         if (is_new_route) {
             route_count_++;
@@ -341,7 +361,11 @@ public:
     }
 
     std::optional<BackendId> lookup(std::span<const TokenId> tokens) {
-        return lookup_recursive(root_.get(), tokens);
+        absl::InlinedVector<uint8_t, 64> key_bytes;
+        key_bytes.reserve(tokens.size() * sizeof(TokenId));
+        encode_tokens_be(tokens, key_bytes);
+        return lookup_recursive(root_.get(),
+            std::span<const uint8_t>(key_bytes.data(), key_bytes.size()));
     }
 
     // =========================================================================
@@ -357,11 +381,18 @@ public:
     //
     // Returns LookupResult with:
     //   - backend: The matched BackendId (if found)
-    //   - prefix_tokens_skipped: Tokens matched via path compression
+    //   - prefix_bytes_skipped: Bytes matched via path compression
+    //       (RouterService divides by sizeof(TokenId) before recording
+    //        into the external `average_prefix_skip_length` gauge to
+    //        preserve the token-semantic metric that dashboards expect)
     //   - nodes_traversed: Number of nodes visited (for metrics)
     //
     LookupResult lookup_instrumented(std::span<const TokenId> tokens) {
-        return lookup_with_stats(root_.get(), tokens);
+        absl::InlinedVector<uint8_t, 64> key_bytes;
+        key_bytes.reserve(tokens.size() * sizeof(TokenId));
+        encode_tokens_be(tokens, key_bytes);
+        return lookup_with_stats(root_.get(),
+            std::span<const uint8_t>(key_bytes.data(), key_bytes.size()));
     }
 
     size_t route_count() const { return route_count_; }
@@ -380,7 +411,12 @@ public:
 
     template<typename Callback>
     void for_each_leaf(Callback&& callback) const {
-        std::vector<TokenId> path;
+        // Accumulate byte-level path during traversal; decode back to
+        // TokenIds only at leaf emission so the callback still receives
+        // a logical RouteEntry.  The byte accumulator is guaranteed to
+        // be TokenId-aligned at every leaf because inserts only enter
+        // the tree through the TokenId-span public API.
+        std::vector<uint8_t> path;
         for_each_leaf_recursive(root_.get(), path, std::forward<Callback>(callback));
     }
 
@@ -388,14 +424,21 @@ public:
     // Tree Dump/Serialization for Admin API
     // =============================================================================
 
-    // Represents a node in the serialized tree structure
+    // Represents a node in the serialized tree structure.
+    //
+    // NOTE: Prefix and child edge keys are exposed as raw bytes, not as
+    // logical TokenIds.  This is an honest representation of the tree's
+    // internal byte-level structure — a node's "prefix" may span part of
+    // a TokenId if it sits between two token boundaries after a split.
+    // Consumers that want token-level output can decode 4 consecutive
+    // root-to-leaf bytes at a time using decode_token_be().
     struct DumpNode {
         std::string type;                    // "Node4", "Node16", "Node48", "Node256"
-        std::vector<TokenId> prefix;         // Path compression prefix
+        std::vector<uint8_t> prefix;         // Path compression prefix (raw bytes)
         std::optional<BackendId> backend;    // Leaf value (if any)
         std::string origin;                  // "LOCAL" or "REMOTE"
         int64_t last_accessed_ms;            // Milliseconds since epoch
-        std::vector<std::pair<TokenId, DumpNode>> children;
+        std::vector<std::pair<uint8_t, DumpNode>> children;  // Edge key is a raw byte
     };
 
     // Dump the entire tree structure for inspection
@@ -403,18 +446,25 @@ public:
         return dump_node(root_.get());
     }
 
-    // Dump subtree starting from a specific prefix (returns nullopt if prefix not found)
+    // Dump subtree starting from a specific prefix (returns nullopt if prefix not found).
+    // Public API takes a TokenId prefix; internally we encode it to bytes
+    // and walk the byte-level tree.
     std::optional<DumpNode> dump_with_prefix(std::span<const TokenId> prefix_filter) const {
-        // Navigate to the node matching the prefix
+        // Encode TokenId prefix filter to byte form for internal walk.
+        absl::InlinedVector<uint8_t, 64> byte_filter;
+        byte_filter.reserve(prefix_filter.size() * sizeof(TokenId));
+        encode_tokens_be(prefix_filter, byte_filter);
+
+        // Navigate to the node matching the byte prefix
         Node* node = root_.get();
         size_t remaining_prefix = 0;
 
-        while (node != nullptr && remaining_prefix < prefix_filter.size()) {
+        while (node != nullptr && remaining_prefix < byte_filter.size()) {
             // Check how much of the node's prefix matches
             size_t match_len = 0;
             while (match_len < node->prefix.size() &&
-                   remaining_prefix + match_len < prefix_filter.size() &&
-                   node->prefix[match_len] == prefix_filter[remaining_prefix + match_len]) {
+                   remaining_prefix + match_len < byte_filter.size() &&
+                   node->prefix[match_len] == byte_filter[remaining_prefix + match_len]) {
                 match_len++;
             }
 
@@ -430,12 +480,12 @@ public:
             remaining_prefix += match_len;
 
             // If we've consumed the entire filter, return this subtree
-            if (remaining_prefix >= prefix_filter.size()) {
+            if (remaining_prefix >= byte_filter.size()) {
                 return dump_node(node);
             }
 
             // Navigate to child
-            node = find_child(node, prefix_filter[remaining_prefix]);
+            node = find_child(node, byte_filter[remaining_prefix]);
             remaining_prefix++;
         }
 
@@ -468,8 +518,8 @@ private:
         result.last_accessed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             node->last_accessed.time_since_epoch()).count();
 
-        // Collect children
-        visit_children(node, [this, &result](TokenId key, Node* child) {
+        // Collect children (edge keys are bytes in the byte-level tree).
+        visit_children(node, [this, &result](uint8_t key, Node* child) {
             result.children.emplace_back(key, dump_node(child));
         });
 
@@ -681,10 +731,14 @@ private:
     // identical access patterns.  These template helpers eliminate duplication
     // across the per-type switch branches.  Node256 (direct-index array) is
     // always handled separately.
+    //
+    // Keys are raw bytes after the multi-byte ART refactor — one slot per
+    // distinct byte value.  No collision handling is needed because the
+    // byte alphabet is exactly 256.
 
     // Linear-scan find on any node with .keys / .children vectors.
     template<typename SmallNodeT>
-    static Node* find_child_keyed(SmallNodeT* n, TokenId key) {
+    static Node* find_child_keyed(SmallNodeT* n, uint8_t key) {
         for (size_t i = 0; i < n->keys.size(); i++) {
             if (n->keys[i] == key) return n->children[i].get();
         }
@@ -693,7 +747,7 @@ private:
 
     // Move child out of a keyed node (leaves stale entry for set_child to update).
     template<typename SmallNodeT>
-    static NodePtr extract_child_keyed(SmallNodeT* n, TokenId key) {
+    static NodePtr extract_child_keyed(SmallNodeT* n, uint8_t key) {
         for (size_t i = 0; i < n->keys.size(); i++) {
             if (n->keys[i] == key) return std::move(n->children[i]);
         }
@@ -702,7 +756,7 @@ private:
 
     // Replace existing child in a keyed node.
     template<typename SmallNodeT>
-    static void set_child_keyed(SmallNodeT* n, TokenId key, NodePtr child) {
+    static void set_child_keyed(SmallNodeT* n, uint8_t key, NodePtr child) {
         for (size_t i = 0; i < n->keys.size(); i++) {
             if (n->keys[i] == key) {
                 n->children[i] = std::move(child);
@@ -721,7 +775,7 @@ private:
 
     // Erase child by key from a keyed node (used by compaction).
     template<typename SmallNodeT>
-    static NodeType remove_child_keyed(SmallNodeT* n, TokenId key) {
+    static NodeType remove_child_keyed(SmallNodeT* n, uint8_t key) {
         for (size_t i = 0; i < n->keys.size(); i++) {
             if (n->keys[i] == key) {
                 NodeType removed_type = n->children[i]->type;
@@ -737,7 +791,7 @@ private:
     // Node Visitor Helpers
     // -------------------------------------------------------------------------
 
-    // Visit all children of a node with a callback: void(TokenId key, Node* child)
+    // Visit all children of a node with a callback: void(uint8_t key, Node* child)
     template<typename Callback>
     static void visit_children(Node* node, Callback&& callback) {
         switch (node->type) {
@@ -753,8 +807,8 @@ private:
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
-                    if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) {
-                        callback(n->keys[i], n->children[i].get());
+                    if (n->children[i]) {
+                        callback(static_cast<uint8_t>(i), n->children[i].get());
                     }
                 }
                 break;
@@ -775,17 +829,12 @@ private:
                 size_t count = 0;
                 auto* n = static_cast<Node256*>(node);
                 for (int i = 0; i < 256; i++) {
-                    if (n->children[i] && n->keys[i] != Node256::EMPTY_KEY) count++;
+                    if (n->children[i]) count++;
                 }
                 return count;
             }
         }
         return 0;
-    }
-
-    // Get lower 8 bits of token for array indexing
-    static uint8_t key_byte(TokenId key) {
-        return static_cast<uint8_t>(key);
     }
 
     // -------------------------------------------------------------------------
@@ -795,13 +844,15 @@ private:
     // HARD RULE #1 (No Blocking on Hot Path):
     // find_child() is called on every tree traversal step. It MUST be lock-free:
     //   - Node4/Node16: O(n) linear scan (n <= 16, cache-friendly)
-    //   - Node48: O(1) index lookup with collision fallback
-    //   - Node256: O(1) direct array access with key verification
+    //   - Node48: O(1) index lookup (byte → slot index, no key verification
+    //     needed because the byte alphabet is exactly 256 and each byte maps
+    //     to a unique slot)
+    //   - Node256: O(1) direct array access — the byte IS the index
     //   - No heap allocations, no atomics, no cross-shard access
     //
 
-    // Find child by key - hot path, optimized for common cases
-    Node* find_child(Node* node, TokenId key) const {
+    // Find child by byte key - hot path, optimized for common cases
+    Node* find_child(Node* node, uint8_t key) const {
         switch (node->type) {
             case NodeType::Node4:
                 return find_child_keyed(static_cast<Node4*>(node), key);
@@ -809,47 +860,23 @@ private:
                 return find_child_keyed(static_cast<Node16*>(node), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
-                // O(1) index lookup with full key verification
-                // CRITICAL: key_byte() only uses lower 8 bits, so we must verify
-                // the actual key matches to handle token ID collisions (e.g., 0 vs 256)
-                uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) [[likely]] {
+                uint8_t idx = n->index[key];
+                if (idx != Node48::EMPTY_MARKER) [[likely]] {
                     return n->children[idx].get();
-                }
-                // Collision case: index points to different key, or was overwritten
-                // Fall back to linear search through keys
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        return n->children[i].get();
-                    }
                 }
                 return nullptr;
             }
             case NodeType::Node256: {
-                // O(1) lookup with full key verification
-                // CRITICAL: key_byte() only uses lower 8 bits, so we must verify
-                // the actual key matches to handle token ID collisions
+                // Direct-mapped array lookup.  The slot index IS the key —
+                // no hash, no collision fallback, no key verification.
                 auto* n = static_cast<Node256*>(node);
-                uint8_t idx = key_byte(key);
-                if (n->keys[idx] == key) [[likely]] {
-                    return n->children[idx].get();
-                }
-                // Collision case: preferred slot doesn't hold our key.
-                // Always linear scan — the entry may be displaced to any slot
-                // (the preferred slot could be empty if the original occupant
-                // was evicted, but displaced entries from collisions still exist).
-                for (int i = 0; i < 256; i++) {
-                    if (n->keys[i] == key) {
-                        return n->children[i].get();
-                    }
-                }
-                return nullptr;
+                return n->children[key].get();
             }
         }
         return nullptr;
     }
 
-    NodePtr extract_child(Node* node, TokenId key) {
+    NodePtr extract_child(Node* node, uint8_t key) {
         switch (node->type) {
             case NodeType::Node4:
                 return extract_child_keyed(static_cast<Node4*>(node), key);
@@ -857,39 +884,21 @@ private:
                 return extract_child_keyed(static_cast<Node16*>(node), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
-                uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
+                uint8_t idx = n->index[key];
+                if (idx != Node48::EMPTY_MARKER) {
                     return std::move(n->children[idx]);
                 }
-                // Collision case: linear search
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        return std::move(n->children[i]);
-                    }
-                }
-                break;
+                return nullptr;
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
-                uint8_t idx = key_byte(key);
-                if (n->keys[idx] == key) {
-                    // Move child out but preserve the key so set_child() can
-                    // find this slot again (matches Node4/Node16/Node48 behavior).
-                    return std::move(n->children[idx]);
-                }
-                // Collision case: always linear scan — entry may be displaced
-                for (int i = 0; i < 256; i++) {
-                    if (n->keys[i] == key) {
-                        return std::move(n->children[i]);
-                    }
-                }
-                break;
+                return std::move(n->children[key]);
             }
         }
         return nullptr;
     }
 
-    void set_child(Node* node, TokenId key, NodePtr child) {
+    void set_child(Node* node, uint8_t key, NodePtr child) {
         switch (node->type) {
             case NodeType::Node4:
                 set_child_keyed(static_cast<Node4*>(node), key, std::move(child));
@@ -899,36 +908,16 @@ private:
                 return;
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
-                uint8_t idx = n->index[key_byte(key)];
-                if (idx != Node48::EMPTY_MARKER && n->keys[idx] == key) {
+                uint8_t idx = n->index[key];
+                if (idx != Node48::EMPTY_MARKER) {
                     n->children[idx] = std::move(child);
-                    return;
                 }
-                // Collision case: linear search
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        n->children[i] = std::move(child);
-                        return;
-                    }
-                }
-                break;
+                return;
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
-                uint8_t idx = key_byte(key);
-                // Check if this is the right slot or we need to search
-                if (n->keys[idx] == key) {
-                    n->children[idx] = std::move(child);
-                    return;
-                }
-                // Collision case: find the actual entry
-                for (int i = 0; i < 256; i++) {
-                    if (n->keys[i] == key) {
-                        n->children[i] = std::move(child);
-                        return;
-                    }
-                }
-                break;
+                n->children[key] = std::move(child);
+                return;
             }
         }
     }
@@ -976,7 +965,7 @@ private:
         }
     }
 
-    NodePtr add_child(NodePtr parent, TokenId key, NodePtr child) {
+    NodePtr add_child(NodePtr parent, uint8_t key, NodePtr child) {
         switch (parent->type) {
             case NodeType::Node4: {
                 auto* n = static_cast<Node4*>(parent.get());
@@ -1000,12 +989,7 @@ private:
                 auto* n = static_cast<Node48*>(parent.get());
                 if (n->children.size() < 48) {
                     uint8_t pos = static_cast<uint8_t>(n->children.size());
-                    uint8_t key_idx = key_byte(key);
-                    // Only set index if slot is empty (avoid overwriting colliding keys)
-                    if (n->index[key_idx] == Node48::EMPTY_MARKER) {
-                        n->index[key_idx] = pos;
-                    }
-                    // Child is added regardless - may need linear search to find
+                    n->index[key] = pos;
                     n->children.push_back(std::move(child));
                     n->keys.push_back(key);
                     return parent;
@@ -1013,30 +997,20 @@ private:
                 return grow_to_node256(std::move(parent), key, std::move(child));
             }
             case NodeType::Node256: {
+                // Direct-mapped assignment.  The byte alphabet is exactly 256
+                // so there is no "full" state reachable from add_child — at
+                // most one entry per byte value, and if it's already present
+                // we simply overwrite (update semantics).  The old lossy-hash
+                // "Node256 is full" silent-drop case is gone by construction.
                 auto* n = static_cast<Node256*>(parent.get());
-                uint8_t idx = key_byte(key);
-                // Use preferred slot if empty or same key (update case)
-                if (n->keys[idx] == Node256::EMPTY_KEY || n->keys[idx] == key) {
-                    n->children[idx] = std::move(child);
-                    n->keys[idx] = key;
-                    return parent;
-                }
-                // Collision: find an empty slot
-                for (int i = 0; i < 256; i++) {
-                    if (n->keys[i] == Node256::EMPTY_KEY) {
-                        n->children[i] = std::move(child);
-                        n->keys[i] = key;
-                        return parent;
-                    }
-                }
-                // Node256 is full (shouldn't happen in practice)
+                n->children[key] = std::move(child);
                 return parent;
             }
         }
         return parent;
     }
 
-    NodePtr grow_to_node16(NodePtr parent, TokenId key, NodePtr child) {
+    NodePtr grow_to_node16(NodePtr parent, uint8_t key, NodePtr child) {
         auto* n4 = static_cast<Node4*>(parent.get());
         auto n16_ptr = make_node<Node16>();
         auto* n16 = static_cast<Node16*>(n16_ptr.get());
@@ -1050,73 +1024,46 @@ private:
         return n16_ptr;
     }
 
-    NodePtr grow_to_node48(NodePtr parent, TokenId key, NodePtr child) {
+    NodePtr grow_to_node48(NodePtr parent, uint8_t key, NodePtr child) {
         auto* n16 = static_cast<Node16*>(parent.get());
         auto n48_ptr = make_node<Node48>();
         auto* n48 = static_cast<Node48*>(n48_ptr.get());
 
         transfer_node_metadata(n48, n16);
         for (size_t i = 0; i < n16->keys.size(); i++) {
-            uint8_t key_idx = key_byte(n16->keys[i]);
-            // Only set index if slot is empty (first key with this key_byte wins)
-            if (n48->index[key_idx] == Node48::EMPTY_MARKER) {
-                n48->index[key_idx] = static_cast<uint8_t>(i);
-            }
+            // Each byte key has a unique slot in the index — no collisions.
+            n48->index[n16->keys[i]] = static_cast<uint8_t>(i);
             n48->children.push_back(std::move(n16->children[i]));
             n48->keys.push_back(n16->keys[i]);
         }
 
         uint8_t pos = static_cast<uint8_t>(n48->children.size());
-        uint8_t new_key_idx = key_byte(key);
-        if (n48->index[new_key_idx] == Node48::EMPTY_MARKER) {
-            n48->index[new_key_idx] = pos;
-        }
+        n48->index[key] = pos;
         n48->children.push_back(std::move(child));
         n48->keys.push_back(key);
 
         return n48_ptr;
     }
 
-    NodePtr grow_to_node256(NodePtr parent, TokenId key, NodePtr child) {
+    NodePtr grow_to_node256(NodePtr parent, uint8_t key, NodePtr child) {
         auto* n48 = static_cast<Node48*>(parent.get());
         auto n256_ptr = make_node<Node256>();
         auto* n256 = static_cast<Node256*>(n256_ptr.get());
 
         transfer_node_metadata(n256, n48);
 
-        // Copy existing children, handling potential collisions
+        // Move existing children into their direct-mapped slots.  Each
+        // byte key maps to exactly one slot; no collision handling is
+        // needed, and if Node48 had every possible entry (128 distinct
+        // keys wouldn't actually reach 48-item capacity, but still) the
+        // promotion is straightforward.
         for (size_t i = 0; i < n48->keys.size(); i++) {
-            uint8_t idx = key_byte(n48->keys[i]);
-            if (n256->keys[idx] == Node256::EMPTY_KEY) {
-                n256->children[idx] = std::move(n48->children[i]);
-                n256->keys[idx] = n48->keys[i];
-            } else {
-                // Collision: find an empty slot
-                for (int j = 0; j < 256; j++) {
-                    if (n256->keys[j] == Node256::EMPTY_KEY) {
-                        n256->children[j] = std::move(n48->children[i]);
-                        n256->keys[j] = n48->keys[i];
-                        break;
-                    }
-                }
-            }
+            uint8_t idx = n48->keys[i];
+            n256->children[idx] = std::move(n48->children[i]);
         }
 
-        // Add the new child
-        uint8_t new_idx = key_byte(key);
-        if (n256->keys[new_idx] == Node256::EMPTY_KEY) {
-            n256->children[new_idx] = std::move(child);
-            n256->keys[new_idx] = key;
-        } else {
-            // Collision: find an empty slot
-            for (int j = 0; j < 256; j++) {
-                if (n256->keys[j] == Node256::EMPTY_KEY) {
-                    n256->children[j] = std::move(child);
-                    n256->keys[j] = key;
-                    break;
-                }
-            }
-        }
+        // Add the new child directly into its slot.
+        n256->children[key] = std::move(child);
 
         return n256_ptr;
     }
@@ -1133,11 +1080,11 @@ private:
     }
 
     // Split a node whose prefix exceeds MAX_PREFIX_LENGTH into a chain.
-    // The node keeps the first MAX_PREFIX_LENGTH tokens; excess is pushed
-    // into a new child node linked via the first excess token as edge key.
+    // The node keeps the first MAX_PREFIX_LENGTH bytes; excess is pushed
+    // into a new child node linked via the first excess byte as edge key.
     void split_long_prefix(Node* node) {
         while (node->prefix.size() > MAX_PREFIX_LENGTH) {
-            TokenId edge_key = node->prefix[MAX_PREFIX_LENGTH];
+            uint8_t edge_key = node->prefix[MAX_PREFIX_LENGTH];
             auto new_child = make_node<Node4>();
 
             // Move the excess suffix (after edge key) to child prefix
@@ -1180,7 +1127,7 @@ private:
     // -------------------------------------------------------------------------
 
     void split_node(Node* node, size_t split_point) {
-        TokenId edge_key = node->prefix[split_point];
+        uint8_t edge_key = node->prefix[split_point];
         size_t num_children = child_count(node);
 
         // Create appropriately-sized child node
@@ -1297,8 +1244,8 @@ private:
             case NodeType::Node4: {
                 auto* d = static_cast<Node4*>(dest);
                 for (int i = 0; i < 256; i++) {
-                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
-                        d->keys.push_back(src->keys[i]);  // Use stored full key
+                    if (src->children[i]) {
+                        d->keys.push_back(static_cast<uint8_t>(i));
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -1307,8 +1254,8 @@ private:
             case NodeType::Node16: {
                 auto* d = static_cast<Node16*>(dest);
                 for (int i = 0; i < 256; i++) {
-                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
-                        d->keys.push_back(src->keys[i]);  // Use stored full key
+                    if (src->children[i]) {
+                        d->keys.push_back(static_cast<uint8_t>(i));
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -1317,14 +1264,10 @@ private:
             case NodeType::Node48: {
                 auto* d = static_cast<Node48*>(dest);
                 for (int i = 0; i < 256; i++) {
-                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
+                    if (src->children[i]) {
                         uint8_t pos = static_cast<uint8_t>(d->children.size());
-                        uint8_t key_idx = key_byte(src->keys[i]);
-                        // Only set index if slot is empty (collision handling)
-                        if (d->index[key_idx] == Node48::EMPTY_MARKER) {
-                            d->index[key_idx] = pos;
-                        }
-                        d->keys.push_back(src->keys[i]);
+                        d->index[i] = pos;
+                        d->keys.push_back(static_cast<uint8_t>(i));
                         d->children.push_back(std::move(src->children[i]));
                     }
                 }
@@ -1334,7 +1277,6 @@ private:
                 auto* d = static_cast<Node256*>(dest);
                 for (int i = 0; i < 256; i++) {
                     d->children[i] = std::move(src->children[i]);
-                    d->keys[i] = src->keys[i];  // Copy stored full keys
                 }
                 break;
             }
@@ -1343,12 +1285,12 @@ private:
 
     // Append a key+child to a keyed node (used after split when capacity is guaranteed).
     template<typename SmallNodeT>
-    static void append_child_keyed(SmallNodeT* n, TokenId key, NodePtr child) {
+    static void append_child_keyed(SmallNodeT* n, uint8_t key, NodePtr child) {
         n->keys.push_back(key);
         n->children.push_back(std::move(child));
     }
 
-    void add_single_child_after_split(Node* node, TokenId key, NodePtr child) {
+    void add_single_child_after_split(Node* node, uint8_t key, NodePtr child) {
         switch (node->type) {
             case NodeType::Node4:
                 append_child_keyed(static_cast<Node4*>(node), key, std::move(child));
@@ -1358,28 +1300,16 @@ private:
                 break;
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(node);
-                n->index[key_byte(key)] = 0;
+                // The node is empty post-split (caller just moved all
+                // children out), so position 0 is correct.
+                n->index[key] = 0;
                 n->children.push_back(std::move(child));
                 n->keys.push_back(key);
                 break;
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(node);
-                uint8_t idx = key_byte(key);
-                // Use preferred slot if empty (normal case after split)
-                if (n->keys[idx] == Node256::EMPTY_KEY) {
-                    n->children[idx] = std::move(child);
-                    n->keys[idx] = key;
-                } else {
-                    // Collision: find an empty slot
-                    for (int i = 0; i < 256; i++) {
-                        if (n->keys[i] == Node256::EMPTY_KEY) {
-                            n->children[i] = std::move(child);
-                            n->keys[i] = key;
-                            break;
-                        }
-                    }
-                }
+                n->children[key] = std::move(child);
                 break;
             }
         }
@@ -1410,7 +1340,7 @@ private:
                 break;
         }
 
-        visit_children(node, [this, &stats](TokenId, Node* child) {
+        visit_children(node, [this, &stats](uint8_t, Node* child) {
             calculate_tree_stats(child, stats);
         });
     }
@@ -1427,9 +1357,11 @@ private:
     //   - No heap allocations during traversal
     //
 
-    // Lookup with performance instrumentation
-    // Returns LookupResult with prefix_tokens_skipped and nodes_traversed
-    LookupResult lookup_with_stats(Node* node, std::span<const TokenId> tokens) {
+    // Lookup with performance instrumentation.  Takes a byte-encoded key
+    // (produced by the public entry point via encode_tokens_be); all
+    // prefix/edge comparisons operate byte-by-byte.
+    // Returns LookupResult with prefix_bytes_skipped and nodes_traversed.
+    LookupResult lookup_with_stats(Node* node, std::span<const uint8_t> key_bytes) {
         LookupResult result;
         std::optional<BackendId> best_match = std::nullopt;
         Node* best_match_node = nullptr;
@@ -1440,12 +1372,12 @@ private:
             // Check prefix match
             const auto& prefix = node->prefix;
             size_t prefix_len = prefix.size();
-            size_t tokens_len = tokens.size();
+            size_t bytes_len = key_bytes.size();
             size_t match_len = 0;
 
             // Fast prefix comparison
-            while (match_len < prefix_len && match_len < tokens_len) {
-                if (prefix[match_len] != tokens[match_len]) {
+            while (match_len < prefix_len && match_len < bytes_len) {
+                if (prefix[match_len] != key_bytes[match_len]) {
                     // Prefix mismatch - return best match so far
                     if (best_match_node) {
                         best_match_node->last_accessed = std::chrono::steady_clock::now();
@@ -1457,8 +1389,10 @@ private:
                 match_len++;
             }
 
-            // Track tokens skipped via path compression
-            result.prefix_tokens_skipped += match_len;
+            // Track bytes skipped via path compression.  RouterService
+            // divides this by sizeof(TokenId) before feeding the external
+            // `average_prefix_skip_length` gauge to keep its semantics.
+            result.prefix_bytes_skipped += match_len;
 
             // Input shorter than prefix - return best match
             if (match_len < prefix_len) {
@@ -1477,16 +1411,16 @@ private:
             }
 
             // Advance past matched prefix
-            tokens = tokens.subspan(match_len);
+            key_bytes = key_bytes.subspan(match_len);
 
-            // If no more tokens, we're done
-            if (tokens.empty()) [[unlikely]] {
+            // If no more bytes, we're done
+            if (key_bytes.empty()) [[unlikely]] {
                 break;
             }
 
-            // Find child for next token
-            node = find_child(node, tokens[0]);
-            tokens = tokens.subspan(1);
+            // Find child for next edge byte
+            node = find_child(node, key_bytes[0]);
+            key_bytes = key_bytes.subspan(1);
         }
 
         // Touch LRU for matched node
@@ -1505,14 +1439,20 @@ private:
     // Returns {node, is_new_route} where is_new_route is true only when a
     // previously non-existent leaf was created (not when an existing leaf was
     // updated). This allows insert() to keep route_count_ accurate.
+    //
+    // Operates on byte-encoded keys.  The caller (public insert()) is
+    // responsible for encoding TokenIds to bytes and for ensuring the
+    // input length is a multiple of sizeof(TokenId), which maintains
+    // the leaf-alignment invariant (leaves only exist at TokenId-aligned
+    // byte depths from the root).
     std::pair<NodePtr, bool> insert_recursive(NodePtr node,
-                             std::span<const TokenId> tokens,
+                             std::span<const uint8_t> key_bytes,
                              BackendId backend,
                              RouteOrigin origin) {
         // Calculate prefix match length
         size_t match_len = 0;
-        while (match_len < node->prefix.size() && match_len < tokens.size()) {
-            if (node->prefix[match_len] != tokens[match_len]) break;
+        while (match_len < node->prefix.size() && match_len < key_bytes.size()) {
+            if (node->prefix[match_len] != key_bytes[match_len]) break;
             match_len++;
         }
 
@@ -1521,7 +1461,7 @@ private:
             split_node(node.get(), match_len);
         }
 
-        auto remaining = tokens.subspan(match_len);
+        auto remaining = key_bytes.subspan(match_len);
 
         // Exact match - update leaf
         if (remaining.empty()) {
@@ -1538,7 +1478,7 @@ private:
         }
 
         // Traverse or create child
-        TokenId next_key = remaining[0];
+        uint8_t next_key = remaining[0];
         if (find_child(node.get(), next_key)) {
             auto child_ptr = extract_child(node.get(), next_key);
             auto [new_child, is_new] = insert_recursive(std::move(child_ptr), remaining.subspan(1), backend, origin);
@@ -1572,8 +1512,9 @@ private:
     //   - Used when metrics overhead is not needed
     //
 
-    // Iterative lookup for better performance (no recursion overhead)
-    std::optional<BackendId> lookup_recursive(Node* node, std::span<const TokenId> tokens) {
+    // Iterative lookup for better performance (no recursion overhead).
+    // Takes byte-encoded keys; the public lookup() wrapper handles encoding.
+    std::optional<BackendId> lookup_recursive(Node* node, std::span<const uint8_t> key_bytes) {
         std::optional<BackendId> best_match = std::nullopt;
         Node* best_match_node = nullptr;
 
@@ -1581,12 +1522,12 @@ private:
             // Check prefix match
             const auto& prefix = node->prefix;
             size_t prefix_len = prefix.size();
-            size_t tokens_len = tokens.size();
+            size_t bytes_len = key_bytes.size();
             size_t match_len = 0;
 
             // Fast prefix comparison
-            while (match_len < prefix_len && match_len < tokens_len) {
-                if (prefix[match_len] != tokens[match_len]) {
+            while (match_len < prefix_len && match_len < bytes_len) {
+                if (prefix[match_len] != key_bytes[match_len]) {
                     // Prefix mismatch - return best match so far
                     if (best_match_node) {
                         best_match_node->last_accessed = std::chrono::steady_clock::now();
@@ -1613,16 +1554,16 @@ private:
             }
 
             // Advance past matched prefix
-            tokens = tokens.subspan(match_len);
+            key_bytes = key_bytes.subspan(match_len);
 
-            // If no more tokens, we're done
-            if (tokens.empty()) [[unlikely]] {
+            // If no more bytes, we're done
+            if (key_bytes.empty()) [[unlikely]] {
                 break;
             }
 
-            // Find child for next token
-            node = find_child(node, tokens[0]);
-            tokens = tokens.subspan(1);
+            // Find child for next edge byte
+            node = find_child(node, key_bytes[0]);
+            key_bytes = key_bytes.subspan(1);
         }
 
         // Touch LRU for matched node
@@ -1638,18 +1579,30 @@ private:
     // -------------------------------------------------------------------------
 
     template<typename Callback>
-    void for_each_leaf_recursive(Node* node, std::vector<TokenId>& path, Callback&& callback) const {
+    void for_each_leaf_recursive(Node* node, std::vector<uint8_t>& path, Callback&& callback) const {
         if (!node) return;
 
         size_t prefix_start = path.size();
         path.insert(path.end(), node->prefix.begin(), node->prefix.end());
 
         if (node->leaf_value.has_value()) {
-            RouteEntry entry{path, node->leaf_value.value(), node->origin, node->last_accessed};
+            // Leaves must sit at TokenId-aligned byte depths because all
+            // inserts go through the TokenId-span public API.  Decode the
+            // accumulated byte path back to logical TokenIds for the
+            // callback — RouteEntry's tokens field is token-level.
+            assert(path.size() % sizeof(TokenId) == 0 &&
+                   "for_each_leaf: leaf is not at a TokenId-aligned byte depth");
+            std::vector<TokenId> token_path;
+            token_path.reserve(path.size() / sizeof(TokenId));
+            decode_tokens_be(
+                std::span<const uint8_t>(path.data(), path.size()),
+                token_path);
+            RouteEntry entry{std::move(token_path), node->leaf_value.value(),
+                             node->origin, node->last_accessed};
             callback(entry);
         }
 
-        visit_children(node, [&](TokenId key, Node* child) {
+        visit_children(node, [&](uint8_t key, Node* child) {
             path.push_back(key);
             for_each_leaf_recursive(child, path, callback);
             path.pop_back();
@@ -1671,7 +1624,7 @@ private:
             removed++;
         }
 
-        visit_children(node, [&](TokenId, Node* child) {
+        visit_children(node, [&](uint8_t, Node* child) {
             remove_expired_recursive(child, cutoff, removed);
         });
     }
@@ -1690,7 +1643,7 @@ private:
             }
         }
 
-        visit_children(node, [&](TokenId, Node* child) {
+        visit_children(node, [&](uint8_t, Node* child) {
             remove_expired_per_backend_recursive(child, cutoff_fn, removed);
         });
     }
@@ -1706,7 +1659,7 @@ private:
             removed++;
         }
 
-        visit_children(node, [&](TokenId, Node* child) {
+        visit_children(node, [&](uint8_t, Node* child) {
             remove_by_backend_recursive(child, backend, origin, removed);
         });
     }
@@ -1751,7 +1704,7 @@ private:
     // Compact helper for keyed node types (Node4/Node16/Node48).
     template<typename SmallNodeT>
     void compact_children_keyed(SmallNodeT* n, CompactionStats& stats,
-                                std::vector<TokenId>& keys_to_remove) {
+                                std::vector<uint8_t>& keys_to_remove) {
         for (size_t i = 0; i < n->keys.size(); i++) {
             Node* child = n->children[i].get();
             compact_children(child, stats);
@@ -1769,7 +1722,7 @@ private:
         if (!node) return;
 
         // Collect keys of children to remove (can't modify during iteration)
-        std::vector<TokenId> keys_to_remove;
+        std::vector<uint8_t> keys_to_remove;
         keys_to_remove.reserve(8); // Bounded allocation (Rule #4)
 
         switch (node->type) {
@@ -1792,7 +1745,7 @@ private:
                             n->children[i] = shrink_node(std::move(n->children[i]), stats);
                         }
                         if (is_node_empty(n->children[i].get())) {
-                            keys_to_remove.push_back(n->keys[i]);
+                            keys_to_remove.push_back(static_cast<uint8_t>(i));
                         }
                     }
                 }
@@ -1801,15 +1754,15 @@ private:
         }
 
         // Remove empty children (triggers SlabNodeDeleter, returns memory to free list)
-        for (TokenId key : keys_to_remove) {
+        for (uint8_t key : keys_to_remove) {
             NodeType removed_type = remove_child(node, key);
             stats.nodes_removed++;
             stats.bytes_reclaimed += node_byte_size(removed_type);
         }
     }
 
-    // Remove a child by key, returns the type of the removed node
-    NodeType remove_child(Node* parent, TokenId key) {
+    // Remove a child by byte key, returns the type of the removed node
+    NodeType remove_child(Node* parent, uint8_t key) {
         switch (parent->type) {
             case NodeType::Node4:
                 return remove_child_keyed(static_cast<Node4*>(parent), key);
@@ -1817,15 +1770,16 @@ private:
                 return remove_child_keyed(static_cast<Node16*>(parent), key);
             case NodeType::Node48: {
                 auto* n = static_cast<Node48*>(parent);
-                uint8_t indexed_pos = n->index[key_byte(key)];
+                uint8_t indexed_pos = n->index[key];
 
-                // Try indexed lookup first
-                if (indexed_pos != Node48::EMPTY_MARKER && n->keys[indexed_pos] == key) {
+                // Direct index lookup — each byte key maps to a unique
+                // slot, no collision handling needed.
+                if (indexed_pos != Node48::EMPTY_MARKER) {
                     NodeType removed_type = n->children[indexed_pos]->type;
                     n->children.erase(n->children.begin() + indexed_pos);
                     n->keys.erase(n->keys.begin() + indexed_pos);
-                    n->index[key_byte(key)] = Node48::EMPTY_MARKER;
-                    // Reindex
+                    n->index[key] = Node48::EMPTY_MARKER;
+                    // Reindex other entries whose slot position shifted down.
                     for (size_t i = 0; i < 256; i++) {
                         if (n->index[i] != Node48::EMPTY_MARKER && n->index[i] > indexed_pos) {
                             n->index[i]--;
@@ -1833,42 +1787,14 @@ private:
                     }
                     return removed_type;
                 }
-
-                // Collision case: linear search
-                for (size_t i = 0; i < n->keys.size(); i++) {
-                    if (n->keys[i] == key) {
-                        NodeType removed_type = n->children[i]->type;
-                        n->children.erase(n->children.begin() + static_cast<ptrdiff_t>(i));
-                        n->keys.erase(n->keys.begin() + static_cast<ptrdiff_t>(i));
-                        // Reindex
-                        for (size_t j = 0; j < 256; j++) {
-                            if (n->index[j] != Node48::EMPTY_MARKER && n->index[j] > i) {
-                                n->index[j]--;
-                            }
-                        }
-                        return removed_type;
-                    }
-                }
                 break;
             }
             case NodeType::Node256: {
                 auto* n = static_cast<Node256*>(parent);
-                uint8_t idx = key_byte(key);
-                // Check preferred slot first
-                if (n->children[idx] && n->keys[idx] == key) {
-                    NodeType removed_type = n->children[idx]->type;
-                    n->children[idx].reset();
-                    n->keys[idx] = Node256::EMPTY_KEY;
+                if (n->children[key]) {
+                    NodeType removed_type = n->children[key]->type;
+                    n->children[key].reset();
                     return removed_type;
-                }
-                // Collision case: linear search
-                for (int i = 0; i < 256; i++) {
-                    if (n->children[i] && n->keys[i] == key) {
-                        NodeType removed_type = n->children[i]->type;
-                        n->children[i].reset();
-                        n->keys[i] = Node256::EMPTY_KEY;
-                        return removed_type;
-                    }
                 }
                 break;
             }
@@ -1951,8 +1877,8 @@ private:
             case NodeType::Node256: {
                 auto* src = static_cast<Node256*>(node.get());
                 for (int i = 0; i < 256 && count < 4; i++) {
-                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
-                        n4->keys.push_back(src->keys[i]);  // Use stored full key
+                    if (src->children[i]) {
+                        n4->keys.push_back(static_cast<uint8_t>(i));
                         n4->children.push_back(std::move(src->children[i]));
                         count++;
                     }
@@ -1984,8 +1910,8 @@ private:
             case NodeType::Node256: {
                 auto* src = static_cast<Node256*>(node.get());
                 for (int i = 0; i < 256 && count < 16; i++) {
-                    if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
-                        n16->keys.push_back(src->keys[i]);  // Use stored full key
+                    if (src->children[i]) {
+                        n16->keys.push_back(static_cast<uint8_t>(i));
                         n16->children.push_back(std::move(src->children[i]));
                         count++;
                     }
@@ -2008,13 +1934,9 @@ private:
             auto* src = static_cast<Node256*>(node.get());
             size_t count = 0;
             for (int i = 0; i < 256 && count < 48; i++) {
-                if (src->children[i] && src->keys[i] != Node256::EMPTY_KEY) {
-                    uint8_t key_idx = key_byte(src->keys[i]);
-                    // Only set index if slot is empty (collision handling)
-                    if (n48->index[key_idx] == Node48::EMPTY_MARKER) {
-                        n48->index[key_idx] = static_cast<uint8_t>(count);
-                    }
-                    n48->keys.push_back(src->keys[i]);
+                if (src->children[i]) {
+                    n48->index[i] = static_cast<uint8_t>(count);
+                    n48->keys.push_back(static_cast<uint8_t>(i));
                     n48->children.push_back(std::move(src->children[i]));
                     count++;
                 }

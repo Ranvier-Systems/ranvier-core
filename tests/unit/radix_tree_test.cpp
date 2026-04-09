@@ -2029,20 +2029,32 @@ TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupTracksPrefixSkip) {
     auto result = tree.lookup_instrumented(tokens({1, 2, 3, 4, 5}));
 
     ASSERT_TRUE(result.backend.has_value());
-    // Should have skipped tokens via path compression
-    EXPECT_GT(result.prefix_tokens_skipped, 0u);
+    // Should have skipped bytes via path compression
+    EXPECT_GT(result.prefix_bytes_skipped, 0u);
 }
 
 TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupPrefixSkipMatchesInputLength) {
-    // Insert creates: root (empty prefix) -> child[1] with prefix {2,3,4,5}
-    // The first token (1) is consumed as a child edge, not a prefix skip
+    // Post multi-byte ART refactor, the tree operates on 4-byte-encoded
+    // tokens.  The single insert creates:
+    //   root (empty prefix)
+    //     -> child[0x00] with a 19-byte compressed prefix
+    //        (the remaining 19 bytes of the 20-byte encoded key)
+    //        and leaf_value = 42
+    //
+    // On lookup, the first edge byte (0x00) is consumed by find_child and
+    // not counted in prefix_bytes_skipped.  The remaining 19 bytes match
+    // the child's prefix and accumulate into prefix_bytes_skipped.
     tree.insert(tokens({1, 2, 3, 4, 5}), 42);
 
     auto result = tree.lookup_instrumented(tokens({1, 2, 3, 4, 5}));
 
-    // Only tokens 2,3,4,5 are skipped via prefix compression (4 tokens)
-    // Token 1 is consumed by traversing the child edge from root
-    EXPECT_EQ(result.prefix_tokens_skipped, 4u);
+    // 5 tokens * 4 bytes = 20 bytes total, minus 1 edge byte = 19.
+    EXPECT_EQ(result.prefix_bytes_skipped, 19u);
+
+    // Sanity: the token-equivalent (what the external Prometheus metric
+    // reports after integer division by sizeof(TokenId)) should round
+    // down to 4 — matching the original token-level expectation.
+    EXPECT_EQ(result.prefix_bytes_skipped / sizeof(TokenId), 4u);
 }
 
 TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupWithMultipleNodes) {
@@ -2082,7 +2094,7 @@ TEST_F(RadixTreeInstrumentedTest, InstrumentedLookupEmptyInput) {
     EXPECT_FALSE(result.backend.has_value());
     // Root node is always visited even with empty input (root has empty prefix)
     EXPECT_EQ(result.nodes_traversed, 1u);
-    EXPECT_EQ(result.prefix_tokens_skipped, 0u);
+    EXPECT_EQ(result.prefix_bytes_skipped, 0u);
 }
 
 // =============================================================================
@@ -2586,15 +2598,21 @@ TEST_F(RadixTreeCompactionTest, NodesRemovedCount) {
 }
 
 // =============================================================================
-// Token ID Hash Collision Tests
+// Token ID "Hash Collision" Tests (historical)
 // =============================================================================
 //
-// These tests verify that the radix tree correctly handles token IDs that
-// share the same lower 8 bits. The key_byte() function extracts only the
-// lower 8 bits for Node48/Node256 indexing, so tokens like 0, 256, 512
-// all map to index 0. The tree must store and verify full 32-bit keys.
+// These tests were originally regression coverage for a segfault caused by
+// the lossy key_byte() hash used by Node48/Node256 in the pre-refactor
+// tree: token IDs sharing the same lower 8 bits (0, 256, 512, ...) all
+// mapped to the same slot, and collision handling was incorrect.
 //
-// Regression test for: segfault under load due to hash collision corruption
+// After the multi-byte ART refactor, the tree keys on full byte sequences
+// so tokens 0 and 256 are STRUCTURALLY DISTINCT: their big-endian byte
+// encodings differ at byte position 2 (0x00_00_00_00 vs 0x00_00_01_00).
+// These tests therefore now verify the property trivially — no collision
+// handling is involved — but they remain valuable as regression coverage
+// and as a semantic cross-check that "distinct TokenId -> distinct route"
+// holds under the new representation.
 
 TEST_F(RadixTreeTest, TokenIdHashCollision_SameLower8Bits) {
     // Token IDs 0, 256, 512 all have lower 8 bits = 0
@@ -2753,24 +2771,29 @@ TEST_F(RadixTreeTest, TokenIdHashCollision_RemoveDoesNotAffectColliding) {
 }
 
 // =============================================================================
-// Node48-specific Hash Collision Tests
+// Node48-specific "Hash Collision" Tests (historical)
 // =============================================================================
-// Node48 uses index[key_byte(key)] to map 8-bit index -> child position.
-// This has the same collision issue as Node256: tokens with same lower 8 bits
-// would incorrectly share index entries.
+// Pre-refactor: Node48 used index[lower 8 bits of key] to map a truncated
+// token to a child slot, so tokens with the same low byte collided.  Post
+// multi-byte ART refactor: the tree keys on bytes directly, so tokens 0
+// and 256 are structurally distinct at byte position 2 and these tests
+// pass without any collision handling.  Kept as regression coverage.
 
 TEST_F(RadixTreeTest, TokenIdHashCollision_Node48Range) {
-    // Force tree into Node48 range (5-48 children at same prefix)
-    // Insert 10 routes at same prefix, then add colliding tokens
+    // Force the tree into a branching pattern that used to produce Node48
+    // under the old sizing rules.  Insert 10 routes at a shared prefix,
+    // then add tokens that shared a low byte with earlier entries.
 
     for (int i = 0; i < 10; i++) {
         tree.insert(tokens({1, static_cast<TokenId>(i)}), static_cast<BackendId>(i));
     }
 
-    // Now insert tokens that collide in lower 8 bits
-    // 0 and 256 both have key_byte() = 0, but 0 is already inserted
-    tree.insert(tokens({1, 256}), 100);  // Collides with tokens({1, 0})
-    tree.insert(tokens({1, 512}), 101);  // Also collides with tokens({1, 0})
+    // Under byte ART, tokens 0, 256, and 512 all produce distinct byte
+    // sequences (differing at byte position 2 of the encoded second token),
+    // so no collision handling is involved — they are simply separate
+    // children in the tree.
+    tree.insert(tokens({1, 256}), 100);  // Distinct from tokens({1, 0}) under byte ART
+    tree.insert(tokens({1, 512}), 101);  // Also distinct from tokens({1, 0})
 
     // Original route for token 0 should still work
     auto r0 = tree.lookup(tokens({1, 0}));
@@ -3077,4 +3100,144 @@ TEST(TokenByteEncodingTest, EncodeIntoInlinedVector) {
     ASSERT_EQ(out.size(), 12u);  // 3 tokens * 4 bytes each
     // Spot-check: third token's low byte should be at position 11.
     EXPECT_EQ(out[11], 3);
+}
+
+// =============================================================================
+// Multi-Byte ART Structural Tests (Stage 1)
+// =============================================================================
+//
+// These tests target properties that are specific to the byte-level tree:
+//   - Node256 can hold all 256 distinct byte values without overflowing
+//     (the "shouldn't happen in practice" silent-drop bug is structurally
+//     eliminated)
+//   - Leaves only exist at TokenId-aligned byte depths from the root
+//   - Mid-TokenId prefix splits work correctly
+//   - Distinct TokenId -> distinct route even when the pre-refactor lossy
+//     hash would have collided (cross-check with TokenIdHashCollision tests)
+
+TEST_F(RadixTreeTest, Node256NeverOverflows_256DistinctLowBytes) {
+    // Insert 256 tokens that differ only in their low byte.  Under the old
+    // TokenId-keyed Node256, this would fill a 256-slot hash table via
+    // collision handling; under byte ART, they all share the top 3 bytes
+    // (path compression) and differ at byte 3, which becomes a Node256
+    // whose entire 256-slot capacity is legitimately occupied with no
+    // collision handling whatsoever.
+    for (int i = 0; i < 256; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    // Every single route must be retrievable.  The pre-refactor tree
+    // could silently drop inserts past slot 256; this test would surface
+    // any drop because a missed insert returns nullopt on lookup.
+    for (int i = 0; i < 256; i++) {
+        auto result = tree.lookup(tokens({static_cast<TokenId>(i)}));
+        ASSERT_TRUE(result.has_value()) << "Missing route for token " << i;
+        EXPECT_EQ(result.value(), static_cast<BackendId>(i))
+            << "Wrong backend for token " << i;
+    }
+}
+
+TEST_F(RadixTreeTest, Node256NeverOverflows_AllBytePositions) {
+    // Stress multiple Node256s at different byte depths simultaneously
+    // by varying the low byte under several distinct shared prefixes.
+    // Each prefix produces its own Node256 at the low-byte position.
+    for (int prefix = 0; prefix < 3; prefix++) {
+        for (int lo = 0; lo < 256; lo++) {
+            tree.insert(
+                tokens({static_cast<TokenId>(prefix), static_cast<TokenId>(lo)}),
+                static_cast<BackendId>(prefix * 1000 + lo));
+        }
+    }
+
+    for (int prefix = 0; prefix < 3; prefix++) {
+        for (int lo = 0; lo < 256; lo++) {
+            auto result = tree.lookup(
+                tokens({static_cast<TokenId>(prefix), static_cast<TokenId>(lo)}));
+            ASSERT_TRUE(result.has_value())
+                << "Missing route for (prefix=" << prefix << ", lo=" << lo << ")";
+            EXPECT_EQ(result.value(), static_cast<BackendId>(prefix * 1000 + lo));
+        }
+    }
+}
+
+TEST_F(RadixTreeTest, LeafAlignmentInvariant_ForEachLeafYieldsWholeTokens) {
+    // for_each_leaf reassembles byte paths back into TokenId sequences;
+    // if any leaf sits at a non-TokenId-aligned byte depth, the debug
+    // assertion fires and the test crashes.  This test verifies the
+    // invariant holds across a varied set of insertions that exercise
+    // the split paths.
+    const std::vector<std::vector<TokenId>> routes = {
+        {1},
+        {1, 2},
+        {1, 2, 3},
+        {1, 2, 3, 4},
+        {100, 200, 300},
+        {256, 512, 1024},  // tokens that collide in the lossy lower-8-bit hash
+        {0, 0, 0},          // all-zero bytes — maximum path compression
+        {std::numeric_limits<TokenId>::max()},
+    };
+    for (size_t i = 0; i < routes.size(); i++) {
+        tree.insert(routes[i], static_cast<BackendId>(i + 1));
+    }
+
+    // Collect all leaves via for_each_leaf.  The callback's RouteEntry
+    // carries a vector<TokenId>, which is only populable without the
+    // assertion tripping if every leaf is at an aligned byte depth.
+    std::vector<std::vector<TokenId>> collected;
+    tree.for_each_leaf([&collected](const RouteEntry& entry) {
+        collected.push_back(entry.tokens);
+    });
+
+    EXPECT_EQ(collected.size(), routes.size());
+    // Every collected route must have a byte length that was divisible
+    // by sizeof(TokenId) — implicit in the vector<TokenId> type.
+    // Explicitly check it round-trips against the original set.
+    for (const auto& original : routes) {
+        EXPECT_NE(std::find(collected.begin(), collected.end(), original),
+                  collected.end())
+            << "for_each_leaf failed to yield an inserted route";
+    }
+}
+
+TEST_F(RadixTreeTest, MidTokenSplit_DivergentMidByte) {
+    // Tokens 0x00_00_00_01 and 0x00_00_01_00 differ at byte position 2
+    // (mid-token by construction — the bytes before and after the
+    // divergence both matter).  After the first insert, the whole key is
+    // compressed into a single prefix chain.  The second insert must
+    // split that prefix at byte position 2, creating an intermediate node
+    // whose byte depth from the root is 2 — NOT a multiple of 4.  Despite
+    // the internal node being at a non-aligned depth, both leaves must
+    // still end up at depth 4 (aligned) because they each carry a full
+    // 4-byte token from the root.
+    tree.insert(tokens({1}), 10);     // 0x00 0x00 0x00 0x01
+    tree.insert(tokens({256}), 20);   // 0x00 0x00 0x01 0x00
+
+    EXPECT_EQ(tree.lookup(tokens({1})).value(), 10);
+    EXPECT_EQ(tree.lookup(tokens({256})).value(), 20);
+
+    // And for_each_leaf should succeed without tripping the alignment
+    // assertion — the leaves sit at aligned depths even though the
+    // intermediate split node doesn't.
+    size_t leaf_count = 0;
+    tree.for_each_leaf([&leaf_count](const RouteEntry&) { leaf_count++; });
+    EXPECT_EQ(leaf_count, 2u);
+}
+
+TEST_F(RadixTreeTest, PathCompression_SharedRootPrefixForSmallVocab) {
+    // The big-endian encoding choice is justified by the claim that
+    // small-vocab tokens share leading zero bytes, which path compression
+    // collapses at the root.  Verify the claim indirectly: after inserting
+    // many small-vocab tokens, the average prefix length should be
+    // substantially greater than zero — if byte-level ART weren't
+    // compressing the shared high bytes, we'd see a flat tree with
+    // near-empty prefixes.
+    for (int i = 1; i < 100; i++) {
+        tree.insert(tokens({static_cast<TokenId>(i)}), static_cast<BackendId>(i));
+    }
+
+    auto stats = tree.get_tree_stats();
+    ASSERT_GT(stats.total_nodes, 0u);
+    EXPECT_GT(stats.average_prefix_length, 0.0)
+        << "Path compression collapsed no bytes — big-endian zero-prefix "
+           "property is not holding";
 }
