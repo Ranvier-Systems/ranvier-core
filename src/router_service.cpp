@@ -1892,11 +1892,19 @@ std::optional<BackendId> RouterService::lookup(const std::vector<int32_t>& token
         state.stats.radix_tree_lookup_hits++;
         if (g_metrics) {
             metrics().record_radix_tree_lookup_hit();
-            // Record prefix skip length for path compression efficiency tracking
-            // We record the total tokens skipped via path compression during this lookup.
-            // The MetricsService tracks the running average across all lookups.
-            if (lookup_result.prefix_tokens_skipped > 0) {
-                metrics().record_prefix_skip(lookup_result.prefix_tokens_skipped);
+            // Record prefix skip length for path compression efficiency tracking.
+            // The tree now reports this in BYTES (post multi-byte ART refactor);
+            // divide by sizeof(TokenId) here so the external Prometheus gauge
+            // `ranvier_radix_tree_average_prefix_skip_length` preserves its
+            // documented "tokens skipped" semantic for dashboards and rvctl.
+            // Integer truncation is acceptable: leaves are TokenId-aligned,
+            // so for lookups that terminate at a leaf the byte count is an
+            // exact multiple of sizeof(TokenId); for lookups that terminate
+            // mid-prefix the truncation loses at most 3 bytes of resolution
+            // (irrelevant at aggregate-average scale).
+            size_t tokens_skipped = lookup_result.prefix_bytes_skipped / sizeof(TokenId);
+            if (tokens_skipped > 0) {
+                metrics().record_prefix_skip(tokens_skipped);
             }
         }
     } else {

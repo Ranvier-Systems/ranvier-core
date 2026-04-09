@@ -1,7 +1,15 @@
 // Ranvier Core - Big-endian byte order helpers
 //
 // Header-only helpers for reading/writing big-endian integers to byte buffers.
-// Used by gossip packet serialization to avoid hand-rolled bit-shifting.
+// Used by:
+//   - Gossip packet serialization (std::vector<uint8_t> buffers)
+//   - Radix tree TokenId <-> byte encoding (hot path, uses
+//     absl::InlinedVector<uint8_t, N> to stay allocation-free)
+//
+// The write helpers are templated on the output container type so callers
+// can pass any buffer that supports `push_back(uint8_t)`.  Existing callers
+// using std::vector<uint8_t> are unaffected — the template is instantiated
+// implicitly from the call site.
 
 #pragma once
 
@@ -10,19 +18,22 @@
 
 namespace ranvier {
 
-inline void be_write_u16(std::vector<uint8_t>& buf, uint16_t v) {
+template <typename Out>
+inline void be_write_u16(Out& buf, uint16_t v) {
     buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
     buf.push_back(static_cast<uint8_t>(v & 0xFF));
 }
 
-inline void be_write_u32(std::vector<uint8_t>& buf, uint32_t v) {
+template <typename Out>
+inline void be_write_u32(Out& buf, uint32_t v) {
     buf.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
     buf.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
     buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
     buf.push_back(static_cast<uint8_t>(v & 0xFF));
 }
 
-inline void be_write_u64(std::vector<uint8_t>& buf, uint64_t v) {
+template <typename Out>
+inline void be_write_u64(Out& buf, uint64_t v) {
     buf.push_back(static_cast<uint8_t>((v >> 56) & 0xFF));
     buf.push_back(static_cast<uint8_t>((v >> 48) & 0xFF));
     buf.push_back(static_cast<uint8_t>((v >> 40) & 0xFF));
