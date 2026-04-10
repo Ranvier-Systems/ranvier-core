@@ -247,8 +247,9 @@ BENCHMARK OPTIONS:
                         See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --prefix-max-tokens N  Maximum prefix size in tokens (default: 8000)
-    --compare           Run A/B comparison (prefix vs round-robin). Runs TWO benchmarks
-                        (each for --duration), so total runtime is ~2x duration + 30s.
+    --compare           Run A/B comparison (prefix vs round-robin). Restarts Ranvier
+                        with the correct routing mode for each run and resets Prometheus
+                        histograms. Total runtime is ~2x duration + ~90s (restarts).
     --warmup            Run a 1-minute warm-up before the main benchmark (adds ~1m 10s)
     --output-dir DIR    Custom output directory (default: benchmark-reports)
     --client-tokenize   Tokenize on client (locust) instead of Ranvier server
@@ -1533,6 +1534,7 @@ run_benchmark() {
         -e NUM_BACKENDS="$NUM_BACKENDS" \
         -e VLLM_MODEL="$MODEL" \
         -e RANVIER_ROUTING_MODE="$ROUTING_MODE" \
+        -e BENCHMARK_MODE="$ROUTING_MODE" \
         -e PROMPT_DISTRIBUTION="$PROMPT_DIST" \
         -e SHARED_PREFIX_RATIO="$PREFIX_RATIO" \
         -e CLIENT_TOKENIZE="$CLIENT_TOKENIZE_VAL" \
@@ -1665,24 +1667,71 @@ if [[ "$WARMUP" = true ]]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Restart Ranvier with a specific routing mode (used in --compare)
+# -----------------------------------------------------------------------------
+
+restart_ranvier_with_mode() {
+    local MODE="$1"
+    log_info "Restarting Ranvier cluster with RANVIER_ROUTING_MODE=$MODE..."
+
+    # Stop existing containers
+    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+        stop ranvier1 ranvier2 ranvier3 2>/dev/null
+    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+        rm -f ranvier1 ranvier2 ranvier3 2>/dev/null
+
+    # Restart with the desired routing mode
+    export RANVIER_ROUTING_MODE="$MODE"
+    $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
+        up -d ranvier1 ranvier2 ranvier3 2>/dev/null
+
+    # Wait for all 3 nodes to be healthy
+    local MAX_WAIT=60
+    local ELAPSED=0
+    local HEALTHY=0
+    while [[ $ELAPSED -lt $MAX_WAIT ]]; do
+        HEALTHY=0
+        for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
+            if docker exec "$node" curl -sf http://localhost:9180/metrics > /dev/null 2>&1; then
+                HEALTHY=$((HEALTHY + 1))
+            fi
+        done
+        if [[ $HEALTHY -eq 3 ]]; then
+            break
+        fi
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+    done
+
+    if [[ $HEALTHY -eq 3 ]]; then
+        log_ok "Ranvier cluster healthy (mode=$MODE)"
+    else
+        log_error "Ranvier cluster did not become healthy after restart"
+        exit 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # Execute benchmarks
 # -----------------------------------------------------------------------------
 
 if [[ "$COMPARE" = true ]]; then
     log_header "A/B Comparison Mode"
-    # Calculate total time for comparison mode
+    # Calculate total time for comparison mode (extra 60s for container restart + health check)
     COMPARE_DURATION_SECS=$(parse_duration "$DURATION")
-    COMPARE_TOTAL_SECS=$((COMPARE_DURATION_SECS * 2 + 30))  # 2 benchmarks + 30s pause
+    COMPARE_TOTAL_SECS=$((COMPARE_DURATION_SECS * 2 + 90))  # 2 benchmarks + restart + health
     COMPARE_TOTAL_MINS=$((COMPARE_TOTAL_SECS / 60))
     COMPARE_TOTAL_SECS_REM=$((COMPARE_TOTAL_SECS % 60))
     log_info "Running two benchmarks: Round-Robin (baseline) vs Prefix-Aware (optimized)"
     log_info "Each benchmark: $DURATION | Total estimated time: ${COMPARE_TOTAL_MINS}m ${COMPARE_TOTAL_SECS_REM}s"
 
+    # Restart Ranvier in round_robin mode for baseline
+    restart_ranvier_with_mode "round_robin"
+
     REPORT_RR=$(run_benchmark "round_robin" "Round-Robin (Baseline)" "[1/2]")
 
-    # Brief pause between tests
-    log_info "Pausing 30s between tests to clear caches..."
-    sleep 30
+    # Restart Ranvier in prefix mode for optimized run (also resets Prometheus histograms)
+    restart_ranvier_with_mode "prefix"
 
     REPORT_PREFIX=$(run_benchmark "prefix" "Prefix-Aware (Optimized)" "[2/2]")
 
