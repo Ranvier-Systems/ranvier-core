@@ -60,15 +60,24 @@ def test_partial_tokenization_metric_increments(ranvier_cluster):
     before_deferred = sum_metric_by_substring(metrics_url, METRIC_TOKENIZATION_DEFERRED_FULL)
     print(f"  Before: partial={before_partial}, deferred_full={before_deferred}")
 
-    # Send a request with >100 bytes of content so the prefix truncation
-    # path actually fires.  The mock backend echoes "Response from backend N".
-    long_content = (
+    # The truncation budget is `prefix_token_length * partial_tokenize_bytes_per_token`
+    # = 128 * 6 = 768 bytes by default (see src/http_controller.cpp:114-116 and
+    # src/config_schema.hpp:59,257). Truncation only fires when the extracted
+    # text exceeds this budget, so we need a content string comfortably larger.
+    # Using ~2000 bytes gives us a wide safety margin against any future
+    # budget bumps.
+    base = (
         "This is a sufficiently long test prompt for the Ranvier partial "
-        "tokenization smoke test. It contains well over one hundred bytes "
-        "so that the routing tokenizer actually engages the byte-budget "
-        "truncation path introduced in v2.1.0 (BACKLOG §1.4)."
+        "tokenization smoke test. It contains well over the seven-hundred-"
+        "sixty-eight byte truncation threshold so that the routing tokenizer "
+        "actually engages the byte-budget truncation path introduced in "
+        "v2.1.0 (BACKLOG section 1.4). "
     )
-    assert len(long_content) > 100, "Test prompt must exceed 100 bytes"
+    long_content = base * 8  # ~2000 bytes
+    assert len(long_content) > 768, (
+        f"Test prompt must exceed the 768-byte routing budget; got "
+        f"{len(long_content)} bytes"
+    )
 
     status, response_text, _headers = send_chat_request(
         api_url,
