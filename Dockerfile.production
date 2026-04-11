@@ -39,6 +39,11 @@ COPY CMakeLists.txt ./
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY assets/ ./assets/
+# cmake/ holds helper scripts (e.g. embed_dashboard.cmake) that
+# CMakeLists.txt invokes via `-P` at build time. Without this copy,
+# a clean rebuild fails with "missing and no known rule to make it"
+# on cmake/embed_dashboard.cmake — added by PR #389 (VISION 4.2).
+COPY cmake/ ./cmake/
 
 # Layer 6: Build Ranvier (only this rebuilds on code changes)
 # OpenTelemetry uses PIMPL pattern to defer initialization until after main() starts
