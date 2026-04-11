@@ -219,6 +219,44 @@ struct RoutingConfig {
     double max_ttl_multiplier = 4.0;  // Env: RANVIER_MAX_TTL_MULTIPLIER
 
     // =========================================================================
+    // Partial Tokenization for Routing
+    // =========================================================================
+    // Tokenization dominates routing decision latency (~10.6ms of ~10.62ms on
+    // 4KB prompts). The ART lookup only needs the first `prefix_token_length`
+    // tokens, so tokenizing the full prompt wastes 7-10x the work.
+    //
+    // When enabled, the router tokenizes only a conservatively-sized prefix of
+    // the request body (target ≈ prefix_token_length tokens). Full
+    // tokenization is deferred until the forwarding path actually needs it
+    // — i.e. when token forwarding is enabled for /v1/completions and the
+    // client did NOT provide their own tokens. On the common path
+    // (/v1/chat/completions, or token forwarding disabled) the full
+    // tokenization is skipped entirely.
+    //
+    // INTERACTION WITH OTHER FLAGS (partial tokenization is BYPASSED when):
+    //   - `enable_token_forwarding` + /v1/completions: the forwarding path
+    //     needs the full token vector to inject into the request body.
+    //     Partial tokenization would force a second tokenization call and
+    //     end up slower than the status quo, so we skip truncation.
+    //   - `enable_multi_depth_routing`: multi-depth stores routes at each
+    //     message boundary, which requires tokens past the first
+    //     `prefix_token_length` positions.
+    // These flags are workload-specific optimizations (mixed-tokenizer
+    // fleets, multi-turn branching conversations) and are MUTUALLY
+    // EXCLUSIVE with partial tokenization's tail-latency win. Operators
+    // should pick one or the other based on their workload — see the
+    // startup log emitted by Application::build_controller_config_from().
+    //
+    // `partial_tokenize_bytes_per_token` is a conservative upper bound on the
+    // BPE byte/token ratio. Setting higher values produces larger prefixes
+    // (safer but slower); lower values produce smaller prefixes (faster but
+    // risks under-covering `prefix_token_length`). Default 6 is a safe upper
+    // bound for English BPE tokenizers — CJK-heavy or low-resource language
+    // workloads may need 8-10 to cover `prefix_token_length` tokens reliably.
+    bool enable_partial_tokenization = true;        // Master switch
+    size_t partial_tokenize_bytes_per_token = 6;    // Conservative BPE ratio
+
+    // =========================================================================
     // Cost-Based Routing (overlays on load-aware routing)
     // =========================================================================
     CostBasedRoutingConfig cost_routing;

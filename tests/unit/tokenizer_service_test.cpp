@@ -320,6 +320,189 @@ TEST(TokenizerServiceTypeTraitsTest, CrossShardConfigIsCopyable) {
     EXPECT_TRUE(std::is_copy_assignable_v<CrossShardTokenizationConfig>);
 }
 
+// =============================================================================
+// TokenizerService::truncate_for_routing (BACKLOG §1.4)
+// =============================================================================
+//
+// Pure-computation tests for the byte-budget truncation helper. These are
+// reactor-free: the function is a static method with no Seastar, no I/O,
+// and no allocation (returns a zero-copy string_view).
+
+class TokenizerTruncateForRoutingTest : public ::testing::Test {
+protected:
+    // Fixed ratio/target to keep arithmetic obvious: budget == 60 bytes.
+    static constexpr size_t kTarget = 10;
+    static constexpr size_t kBpt = 6;
+    static constexpr size_t kBudget = kTarget * kBpt;  // 60
+};
+
+TEST_F(TokenizerTruncateForRoutingTest, ShorterThanBudgetReturnsFullText) {
+    // "hello world" is 11 bytes, well under the 60-byte budget.
+    std::string_view text = "hello world";
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), text.size());
+    EXPECT_EQ(out, text);
+    // Zero-copy: returned view points into the same buffer.
+    EXPECT_EQ(out.data(), text.data());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, ExactlyAtBudgetReturnsFullText) {
+    // text.size() == budget must NOT truncate (guards the `<=` vs `<` edge).
+    std::string text(kBudget, 'a');
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kBudget);
+    EXPECT_EQ(out.data(), text.data());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, OneByteOverBudgetTruncatesToBudget) {
+    std::string text(kBudget + 1, 'a');
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kBudget);
+    EXPECT_EQ(out.data(), text.data());  // Zero-copy
+    EXPECT_EQ(out, std::string(kBudget, 'a'));
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, PureAsciiTruncationIsExact) {
+    // Double the budget in ASCII — truncate to exactly the budget.
+    std::string text(kBudget * 2, 'x');
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kBudget);
+    EXPECT_EQ(out, std::string(kBudget, 'x'));
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, ZeroCopyInvariant) {
+    std::string text(200, 'z');
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    // Returned view must reference the same underlying buffer — no
+    // allocation, no copy.
+    EXPECT_EQ(out.data(), text.data());
+    EXPECT_EQ(out.size(), kBudget);
+}
+
+// Helpers for the UTF-8 boundary tests. Each test builds a string where a
+// multi-byte sequence is positioned so that its LAST byte lands at index
+// `kBudget` (i.e. at the budget boundary, which is the first byte NOT
+// included in the returned view). The expected return size is the index
+// of the sequence's first (start) byte — everything before it.
+
+TEST_F(TokenizerTruncateForRoutingTest, BacksUpOneByteForTwoByteUtf8Boundary) {
+    // 2-byte "é" (U+00E9 = 0xC3 0xA9) placed so that 0xA9 lands at kBudget.
+    // Backup: end=kBudget → end=kBudget-1 (start byte 0xC3, exit).
+    constexpr size_t kStartIndex = kBudget - 1;
+    std::string text(kStartIndex, 'a');
+    text += "\xC3\xA9";
+    text += std::string(10, 'b');  // Padding to push size > kBudget
+    ASSERT_EQ(static_cast<unsigned char>(text[kStartIndex]), 0xC3u);
+    ASSERT_EQ(static_cast<unsigned char>(text[kBudget]),     0xA9u);
+
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kStartIndex);
+    EXPECT_EQ(out, std::string(kStartIndex, 'a'));
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, BacksUpTwoBytesForThreeByteUtf8Boundary) {
+    // 3-byte "汉" (U+6C49 = 0xE6 0xB1 0x89) placed so that 0x89 lands at
+    // kBudget. Backup: end=kBudget → kBudget-1 → kBudget-2 (start byte, exit).
+    constexpr size_t kStartIndex = kBudget - 2;
+    std::string text(kStartIndex, 'a');
+    text += "\xE6\xB1\x89";
+    text += std::string(10, 'b');
+    ASSERT_EQ(static_cast<unsigned char>(text[kStartIndex]), 0xE6u);
+    ASSERT_EQ(static_cast<unsigned char>(text[kBudget]),     0x89u);
+
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kStartIndex);
+    EXPECT_EQ(out, std::string(kStartIndex, 'a'));
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, BacksUpThreeBytesForFourByteUtf8Boundary) {
+    // 4-byte "😀" (U+1F600 = 0xF0 0x9F 0x98 0x80) placed so that 0x80
+    // lands at kBudget. Backup walks all three continuation bytes.
+    constexpr size_t kStartIndex = kBudget - 3;
+    std::string text(kStartIndex, 'a');
+    text += "\xF0\x9F\x98\x80";
+    text += std::string(10, 'b');
+    ASSERT_EQ(static_cast<unsigned char>(text[kStartIndex]), 0xF0u);
+    ASSERT_EQ(static_cast<unsigned char>(text[kBudget]),     0x80u);
+
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kStartIndex);
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, NoBackupWhenBoundaryIsStartByte) {
+    // A 2-byte "é" starts exactly at kBudget (not straddling). text[kBudget]
+    // is the start byte 0xC3 — not a continuation — so the backup loop
+    // doesn't fire and we return exactly `kBudget` bytes.
+    std::string text(kBudget, 'a');
+    text += "\xC3\xA9";
+    text += std::string(10, 'b');
+    ASSERT_EQ(static_cast<unsigned char>(text[kBudget]), 0xC3u);
+
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kBudget);  // No backup — budget is exact.
+    EXPECT_EQ(out, std::string(kBudget, 'a'));
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, NoBackupWhenBoundaryIsAscii) {
+    // Byte at position `kBudget` is ASCII ('b'), loop must not fire.
+    std::string text(kBudget * 2, 'a');
+    text[kBudget] = 'b';
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_EQ(out.size(), kBudget);
+    EXPECT_EQ(out[kBudget - 1], 'a');  // Last byte of returned view
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, ZeroTargetTokensReturnsEmpty) {
+    std::string_view text = "hello world";
+    auto out = TokenizerService::truncate_for_routing(text, 0, kBpt);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, ZeroBytesPerTokenReturnsEmpty) {
+    std::string_view text = "hello world";
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, 0);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, EmptyInputReturnsEmpty) {
+    std::string_view text = "";
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, PathologicalAllContinuationBytesTerminates) {
+    // Malformed input: a run of continuation bytes with no start byte. The
+    // UTF-8 backup loop walks all the way to end=0 and stops (guarded by
+    // `end > 0`). The test verifies the algorithm terminates without
+    // out-of-bounds access on adversarial input and produces an empty
+    // view (which the tokenizer will subsequently handle as a no-op).
+    std::string text(kBudget * 2, '\x80');  // 0x80 = continuation byte
+    auto out = TokenizerService::truncate_for_routing(text, kTarget, kBpt);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, BudgetSmallerThanFirstMultiByteChar) {
+    // Legitimate UTF-8 input where the budget lands in the middle of the
+    // very first multi-byte sequence. The backup loop must walk back
+    // through the continuation bytes to end=0 (guarded by `end > 0`) and
+    // return an empty view rather than split the character. This differs
+    // from PathologicalAllContinuationBytesTerminates in that the input
+    // is well-formed — we just can't fit any characters in the budget.
+    std::string text = "\xF0\x9F\x98\x80";  // 4-byte 😀
+    text += std::string(20, 'a');
+    // target=1, bpt=1 → byte_budget=1. text[1] is a continuation byte of 😀.
+    auto out = TokenizerService::truncate_for_routing(text, /*target_tokens=*/1, /*bytes_per_token=*/1);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(TokenizerTruncateForRoutingTest, DefaultBytesPerTokenIsSix) {
+    // Callers relying on the default argument should see bpt=6.
+    // 200 bytes / 6 bpt * 20 tokens = 120 byte budget.
+    std::string text(200, 'x');
+    auto out = TokenizerService::truncate_for_routing(text, /*target_tokens=*/20);
+    EXPECT_EQ(out.size(), 20u * 6u);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -67,6 +67,67 @@ struct async_handler : public seastar::httpd::handler_base {
     }
 };
 
+// =============================================================================
+// Partial tokenization for routing (BACKLOG §1.4)
+// =============================================================================
+
+namespace {
+
+// Result of computing the (possibly truncated) text that should be tokenized
+// for routing. `text` is always a view into the caller's input buffer —
+// either the original view unchanged, or a truncated prefix of it. When
+// `was_truncated` is true, the forwarded-body path must re-tokenize the
+// full input if it needs the complete token vector.
+struct RoutingTextResult {
+    std::string_view text;            // Original or truncated view (zero-copy)
+    bool was_truncated = false;
+    size_t bytes_saved = 0;           // 0 when not truncated
+};
+
+// Decide whether to truncate the routing input to a byte budget and, if so,
+// apply the truncation.  Pure computation: no I/O, no metrics, no logging —
+// the caller is responsible for those (it has the tracing span + request
+// id in scope).  See RoutingConfig::enable_partial_tokenization for the
+// full rationale, the list of interacting flags, and the boundary
+// detection Strategy 2 skip.
+//
+// `text_extraction_ok` guards the validate→tokenize invariant: truncation
+// is only applied to text that came from RapidJSON (which UTF-8 validates
+// during JSON extraction), so the deferred full-tokenization path never
+// re-tokenizes an unvalidated raw-body tail.
+RoutingTextResult compute_routing_text(
+        std::string_view text,
+        const HttpControllerConfig& config,
+        bool text_extraction_ok,
+        bool is_completions_endpoint) {
+    const bool needs_full_tokens =
+        (config.enable_token_forwarding && is_completions_endpoint)
+        || config.enable_multi_depth_routing;
+    const bool eligible =
+        config.enable_partial_tokenization
+        && text_extraction_ok
+        && !needs_full_tokens;
+    if (!eligible) {
+        return {text, false, 0};
+    }
+
+    const size_t budget = config.prefix_token_length
+        * config.partial_tokenize_bytes_per_token;
+    if (budget == 0 || text.size() <= budget) {
+        return {text, false, 0};
+    }
+
+    auto truncated = TokenizerService::truncate_for_routing(
+        text, config.prefix_token_length, config.partial_tokenize_bytes_per_token);
+    if (truncated.size() >= text.size()) {
+        return {text, false, 0};
+    }
+
+    return {truncated, true, text.size() - truncated.size()};
+}
+
+} // anonymous namespace
+
 // Check admin authentication - returns pair<authorized, error_message>
 // If authorized, error_message contains the key identifier for audit logging
 // If not authorized, error_message contains the reason for failure
@@ -1133,6 +1194,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // reused during boundary detection to avoid redundant JSON re-parsing.
     std::optional<RequestRewriter::TextWithBoundaryInfo> text_extraction;
 
+    // Partial tokenization state (BACKLOG §1.4): `was_truncated` is set
+    // when the tokenization block below truncates the input for routing,
+    // and is read by the forwarded-body prep block to decide whether the
+    // deferred full-tokenization path must run. Hoisted here so both
+    // blocks share the same flag and the endpoint check is computed once.
+    // See RoutingConfig::enable_partial_tokenization for the full rationale.
+    const bool is_completions_endpoint = (endpoint == "/v1/completions");
+    bool was_truncated = false;
+
     // NOTE: tokenization_start collapsed into routing_start (phase-snapshot
     // optimization — only variable declarations between them, ~0 cycles).
 
@@ -1192,6 +1262,27 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             std::string_view text_to_tokenize = text_extraction.has_value()
                 ? std::string_view(text_extraction->text)
                 : body_view;
+
+            // Partial tokenization for routing (BACKLOG §1.4): possibly
+            // truncate `text_to_tokenize` to a byte budget so the router
+            // only tokenizes ~prefix_token_length tokens instead of the
+            // full prompt. The eligibility + truncation logic lives in
+            // `compute_routing_text` above; this call site handles
+            // logging, metrics, and state mutation.
+            if (auto trunc = compute_routing_text(
+                    text_to_tokenize, _config,
+                    text_extraction.has_value(), is_completions_endpoint);
+                trunc.was_truncated) {
+                log_proxy.debug(
+                    "[{}] Partial tokenization: {}B -> {}B "
+                    "(target {} tokens, {}B/token)",
+                    request_id, text_to_tokenize.size(), trunc.text.size(),
+                    _config.prefix_token_length,
+                    _config.partial_tokenize_bytes_per_token);
+                text_to_tokenize = trunc.text;
+                was_truncated = true;
+                metrics().record_tokenization_partial(trunc.bytes_saved);
+            }
 
             // Validate input before passing to tokenizer to prevent crashes
             // The tokenizer (Rust FFI) can segfault on malformed input
@@ -1351,7 +1442,13 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
 
         // Strategy 2: Proportional estimation (none/mistral — approximate)
-        if (!prefix_boundary_set && text_extraction.has_value()) {
+        // Partial tokenization safety: when `was_truncated` is true, `tokens`
+        // covers only a truncated prefix of `text_extraction->text`. The ratio
+        // estimate uses the full text length against the truncated token
+        // count, producing wildly incorrect boundaries — skip this strategy
+        // and fall through to Strategy 4 (system prefix tokenization), which
+        // tokenizes the system prefix independently and is truncation-safe.
+        if (!prefix_boundary_set && text_extraction.has_value() && !was_truncated) {
             auto ratio_result = detect_boundaries_by_char_ratio(
                 tokens.size(), *text_extraction, bd_config);
             if (ratio_result.detected) {
@@ -1495,7 +1592,6 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // - /v1/completions: vLLM supports prompt_token_ids, forward them for efficiency
     // - /v1/chat/completions: vLLM ignores prompt_token_ids, strip them to avoid warnings
     std::string forwarded_body;
-    bool is_completions_endpoint = (endpoint == "/v1/completions");
 
     if (is_completions_endpoint) {
         // /v1/completions supports prompt_token_ids - forward them for vLLM efficiency
@@ -1504,15 +1600,76 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             forwarded_body = std::string(body_view);
             log_proxy.debug("[{}] Forwarding client tokens to /v1/completions", request_id);
         } else if (_config.enable_token_forwarding && !tokens.empty()) {
-            // Server tokenized - add tokens to body for vLLM
-            auto rewrite_result = RequestRewriter::rewrite(body_view, tokens);
-            if (rewrite_result.success) {
-                forwarded_body = std::move(rewrite_result.body);
-                log_proxy.debug("[{}] Added {} token IDs to /v1/completions request",
-                               request_id, tokens.size());
+            // Select the token vector to inject into the forwarded body.
+            // On the common (non-truncated) path, the routing tokens ARE
+            // the full tokens. On the partial-tokenization path, we must
+            // re-tokenize the full text now — see BACKLOG §1.4.
+            //
+            // INVARIANT: `was_truncated` implies `text_extraction.has_value()`
+            // (enforced by the `partial_eligible` guard above), so the
+            // full text we re-tokenize here was UTF-8 validated by
+            // RapidJSON during JSON extraction.
+            std::vector<int32_t> full_tokens;
+            const std::vector<int32_t>* tokens_for_rewrite = &tokens;
+
+            if (was_truncated) {
+                try {
+                    auto full_result = co_await _tokenizer.local()
+                        .encode_threaded_async(std::string_view(text_extraction->text));
+                    full_tokens = std::move(full_result.tokens);
+                    metrics().record_deferred_full_tokenization();
+                    if (full_result.cache_hit) {
+                        metrics().record_tokenization_cache_hit();
+                    } else {
+                        metrics().record_tokenization_cache_miss();
+                        if (full_result.cross_shard) {
+                            metrics().record_tokenization_cross_shard();
+                        }
+                    }
+                    // encode_threaded_async returns an empty result (no
+                    // throw) when the local-fallback semaphore is full.
+                    // Guard against injecting an empty token vector.
+                    if (!full_tokens.empty()) {
+                        tokens_for_rewrite = &full_tokens;
+                        log_proxy.debug(
+                            "[{}] Deferred full tokenization: {} routing tokens -> "
+                            "{} full tokens for /v1/completions forwarding",
+                            request_id, tokens.size(), full_tokens.size());
+                    } else {
+                        log_proxy.debug(
+                            "[{}] Deferred full tokenization returned empty "
+                            "(thread pool/semaphore rejected); forwarding body "
+                            "without prompt_token_ids",
+                            request_id);
+                        tokens_for_rewrite = nullptr;
+                    }
+                } catch (...) {
+                    // Rule #9: log with context. Catches std::exception
+                    // and non-standard throws (e.g. Rust panics via FFI).
+                    // On failure, fall back to forwarding the original
+                    // body unchanged — the request still proceeds, just
+                    // without prompt_token_ids injection.
+                    log_proxy.warn(
+                        "[{}] Deferred full tokenization failed ({}), "
+                        "forwarding body without prompt_token_ids",
+                        request_id, std::current_exception());
+                    metrics().record_tokenizer_error();
+                    tokens_for_rewrite = nullptr;
+                }
+            }
+
+            if (tokens_for_rewrite != nullptr) {
+                auto rewrite_result = RequestRewriter::rewrite(body_view, *tokens_for_rewrite);
+                if (rewrite_result.success) {
+                    forwarded_body = std::move(rewrite_result.body);
+                    log_proxy.debug("[{}] Added {} token IDs to /v1/completions request",
+                                   request_id, tokens_for_rewrite->size());
+                } else {
+                    forwarded_body = std::string(body_view);
+                    log_proxy.debug("[{}] Token rewrite failed: {}", request_id, rewrite_result.error);
+                }
             } else {
                 forwarded_body = std::string(body_view);
-                log_proxy.debug("[{}] Token rewrite failed: {}", request_id, rewrite_result.error);
             }
         } else {
             forwarded_body = std::string(body_view);

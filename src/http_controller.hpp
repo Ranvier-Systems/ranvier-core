@@ -244,6 +244,15 @@ struct HttpControllerConfig {
     // Prefix token length for X-Ranvier-Prefix-Hash header injection
     size_t prefix_token_length = 128;
 
+    // Partial tokenization for routing: truncate input to a byte budget before
+    // tokenizing so the router only pays for the first `prefix_token_length`
+    // tokens. Full tokenization is deferred to the forwarding path only when
+    // token forwarding is enabled for /v1/completions (uncommon). Disabled
+    // automatically when multi-depth routing is active, because that path
+    // needs all message boundaries. See RoutingConfig::enable_partial_tokenization.
+    bool enable_partial_tokenization = true;
+    size_t partial_tokenize_bytes_per_token = 6;
+
     // Helper methods for routing mode checks
     bool is_prefix_mode() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
     bool is_hash_mode() const { return routing_mode == RoutingConfig::RoutingMode::HASH; }

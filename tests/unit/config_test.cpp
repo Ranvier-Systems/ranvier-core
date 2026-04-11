@@ -45,6 +45,8 @@ protected:
         // Client token env vars
         unsetenv("RANVIER_ACCEPT_CLIENT_TOKENS");
         unsetenv("RANVIER_MAX_TOKEN_ID");
+        unsetenv("RANVIER_PARTIAL_TOKENIZATION");
+        unsetenv("RANVIER_PARTIAL_TOKENIZE_BYTES_PER_TOKEN");
         // Cost estimation env vars
         unsetenv("RANVIER_COST_ESTIMATION_ENABLED");
         unsetenv("RANVIER_COST_ESTIMATION_OUTPUT_MULTIPLIER");
@@ -925,6 +927,103 @@ TEST_F(ConfigTest, RoutingConfigStructDefaults) {
     EXPECT_FALSE(routing.accept_client_tokens);
     EXPECT_EQ(routing.max_token_id, 200000);  // Default supports Llama-3 vocab size
     EXPECT_FALSE(routing.enable_token_forwarding);
+
+    // Partial tokenization for routing (BACKLOG §1.4)
+    // Defaults: enabled with conservative 6 bytes/token BPE ratio.
+    EXPECT_TRUE(routing.enable_partial_tokenization);
+    EXPECT_EQ(routing.partial_tokenize_bytes_per_token, 6u);
+}
+
+// =============================================================================
+// Partial Tokenization Configuration (BACKLOG §1.4)
+// =============================================================================
+
+TEST_F(ConfigTest, PartialTokenizationEnvOverride) {
+    // Both env vars should propagate to the loaded config.
+    setenv("RANVIER_PARTIAL_TOKENIZATION", "false", 1);
+    setenv("RANVIER_PARTIAL_TOKENIZE_BYTES_PER_TOKEN", "10", 1);
+
+    auto config = RanvierConfig::defaults();
+
+    EXPECT_FALSE(config.routing.enable_partial_tokenization);
+    EXPECT_EQ(config.routing.partial_tokenize_bytes_per_token, 10u);
+
+    unsetenv("RANVIER_PARTIAL_TOKENIZATION");
+    unsetenv("RANVIER_PARTIAL_TOKENIZE_BYTES_PER_TOKEN");
+}
+
+TEST_F(ConfigTest, PartialTokenizationBoolAliasesTrue) {
+    // Load from a YAML baseline with the flag explicitly disabled so that
+    // a successful env override flips it from false → true. Without this
+    // baseline the test would vacuously pass against the struct default
+    // (also true), proving nothing about env var parsing.
+    writeTestConfig("test_config.yaml", R"(
+routing:
+  enable_partial_tokenization: false
+)");
+
+    for (const char* truthy : {"1", "true", "yes"}) {
+        setenv("RANVIER_PARTIAL_TOKENIZATION", truthy, 1);
+        auto config = RanvierConfig::load("test_config.yaml");
+        EXPECT_TRUE(config.routing.enable_partial_tokenization)
+            << "Failed for value: " << truthy;
+        unsetenv("RANVIER_PARTIAL_TOKENIZATION");
+    }
+}
+
+TEST_F(ConfigTest, PartialTokenizationBoolAliasesFalse) {
+    // Non-truthy values should disable the flag. Empty string is NOT in
+    // this list: RanvierConfig::get_env() treats empty env vars as absent
+    // (val[0] != '\0'), so an empty RANVIER_PARTIAL_TOKENIZATION falls
+    // through to the struct default (true), not false.
+    for (const char* falsy : {"0", "false", "no"}) {
+        setenv("RANVIER_PARTIAL_TOKENIZATION", falsy, 1);
+        auto config = RanvierConfig::defaults();
+        EXPECT_FALSE(config.routing.enable_partial_tokenization)
+            << "Failed for value: " << falsy;
+        unsetenv("RANVIER_PARTIAL_TOKENIZATION");
+    }
+}
+
+TEST_F(ConfigTest, PartialTokenizationEmptyEnvFallsBackToDefault) {
+    // Guard the "empty env var == absent" contract documented above.
+    setenv("RANVIER_PARTIAL_TOKENIZATION", "", 1);
+    auto config = RanvierConfig::defaults();
+    EXPECT_TRUE(config.routing.enable_partial_tokenization);  // Default
+    unsetenv("RANVIER_PARTIAL_TOKENIZATION");
+}
+
+TEST_F(ConfigTest, PartialTokenizationYamlLoad) {
+    writeTestConfig("test_config.yaml", R"(
+routing:
+  enable_partial_tokenization: false
+  partial_tokenize_bytes_per_token: 8
+)");
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    EXPECT_FALSE(config.routing.enable_partial_tokenization);
+    EXPECT_EQ(config.routing.partial_tokenize_bytes_per_token, 8u);
+}
+
+TEST_F(ConfigTest, PartialTokenizationEnvOverridesYaml) {
+    // Env vars take precedence over YAML values.
+    writeTestConfig("test_config.yaml", R"(
+routing:
+  enable_partial_tokenization: true
+  partial_tokenize_bytes_per_token: 6
+)");
+
+    setenv("RANVIER_PARTIAL_TOKENIZATION", "false", 1);
+    setenv("RANVIER_PARTIAL_TOKENIZE_BYTES_PER_TOKEN", "12", 1);
+
+    auto config = RanvierConfig::load("test_config.yaml");
+
+    EXPECT_FALSE(config.routing.enable_partial_tokenization);
+    EXPECT_EQ(config.routing.partial_tokenize_bytes_per_token, 12u);
+
+    unsetenv("RANVIER_PARTIAL_TOKENIZATION");
+    unsetenv("RANVIER_PARTIAL_TOKENIZE_BYTES_PER_TOKEN");
 }
 
 // =============================================================================
