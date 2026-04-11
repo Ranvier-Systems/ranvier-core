@@ -14,16 +14,17 @@ Requirements:
     - Docker and docker-compose installed
     - pytest (optional, can run with unittest)
     - requests library
+
+The shared docker-compose harness (constants, helpers, lifecycle) lives in
+``tests/integration/conftest.py``.  This file only contains the test methods
+themselves — any change to cluster bring-up/teardown belongs in conftest.
 """
 
 import json
 import os
-import re
-import subprocess
 import sys
 import time
 import unittest
-from typing import Optional
 
 try:
     import requests
@@ -31,293 +32,33 @@ except ImportError:
     print("Error: 'requests' library is required. Install with: pip install requests")
     sys.exit(1)
 
-
-# Configuration
-COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.test.yml")
-PROJECT_NAME = "ranvier-integration-test"
-
-# Detect if running in Docker (use host.docker.internal) or native (use localhost)
-def get_docker_host() -> str:
-    """Get the hostname to reach Docker-exposed ports."""
-    # Check if host.docker.internal resolves (Docker Desktop / DinD)
-    import socket
-    try:
-        socket.gethostbyname("host.docker.internal")
-        return "host.docker.internal"
-    except socket.gaierror:
-        return "localhost"
-
-DOCKER_HOST = get_docker_host()
-
-# Node endpoints (mapped ports from docker-compose)
-NODES = {
-    "node1": {"api": f"http://{DOCKER_HOST}:8081", "metrics": f"http://{DOCKER_HOST}:9181"},
-    "node2": {"api": f"http://{DOCKER_HOST}:8082", "metrics": f"http://{DOCKER_HOST}:9182"},
-    "node3": {"api": f"http://{DOCKER_HOST}:8083", "metrics": f"http://{DOCKER_HOST}:9183"},
-}
-
-# Backend addresses (as seen from inside the Docker network)
-BACKENDS = {
-    1: {"ip": "172.28.1.10", "port": 8000},
-    2: {"ip": "172.28.1.11", "port": 8000},
-}
-
-# Timeouts
-STARTUP_TIMEOUT = 30  # seconds to wait for cluster to start
-PROPAGATION_TIMEOUT = 15  # seconds to wait for gossip propagation
-PEER_TIMEOUT = 10  # seconds for peer failure detection
-
-# Detect docker compose command (plugin vs standalone)
-COMPOSE_CMD = None
+from conftest import (
+    BACKENDS,
+    COMPOSE_FILE,
+    ClusterTestCase,
+    NODES,
+    PEER_TIMEOUT,
+    PROPAGATION_TIMEOUT,
+    check_container_running,
+    get_all_metrics,
+    get_compose_cmd,
+    get_metric_value,
+    run_compose,
+    wait_for_healthy,
+    DOCKER_HOST,
+)
 
 
-def get_compose_cmd() -> list[str]:
-    """Detect and return the docker compose command."""
-    global COMPOSE_CMD
-    if COMPOSE_CMD is not None:
-        return COMPOSE_CMD
-
-    # Try 'docker compose' (plugin) first
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker", "compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    # Fall back to 'docker-compose' (standalone)
-    try:
-        result = subprocess.run(
-            ["docker-compose", "--version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker-compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    raise RuntimeError(
-        "Neither 'docker compose' nor 'docker-compose' found. "
-        "Please install Docker with Compose plugin or docker-compose standalone."
-    )
-
-
-def run_compose(args: list[str], check: bool = True, show_output: bool = False) -> subprocess.CompletedProcess:
-    """Run docker-compose command with the test configuration."""
-    compose_cmd = get_compose_cmd()
-    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME] + args
-    print(f"  Running: {' '.join(cmd)}")
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if show_output or result.returncode != 0:
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-
-    if check and result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-
-    return result
-
-
-def check_container_running(container_name: str) -> bool:
-    """Check if a container is still running (not exited/crashed)."""
-    try:
-        compose_cmd = get_compose_cmd()
-        result = subprocess.run(
-            compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "ps", "-q", container_name],
-            capture_output=True,
-            text=True
-        )
-        # If container is running, ps -q returns its ID; if exited, returns empty
-        return result.returncode == 0 and len(result.stdout.strip()) > 0
-    except (FileNotFoundError, RuntimeError):
-        # compose command not available, skip check
-        return True
-
-
-def wait_for_healthy(url: str, timeout: int = 60, container_name: str = None) -> bool:
-    """Wait for an endpoint to become healthy."""
-    start = time.time()
-    while time.time() - start < timeout:
-        # Check if container crashed (fast fail)
-        if container_name and not check_container_running(container_name):
-            print(f"    Container {container_name} has exited!")
-            return False
-        try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(1)
-    return False
-
-
-def get_metric_value(metrics_url: str, metric_name: str, debug: bool = False, retries: int = 3) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint.
-
-    Searches for metrics containing the metric_name (Seastar may prefix with group names).
-    Retries on transient failures.
-    """
-    for attempt in range(retries):
-        try:
-            resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-            if resp.status_code != 200:
-                if attempt < retries - 1:
-                    time.sleep(1)
-                    continue
-                return None
-
-            # Parse Prometheus text format
-            for line in resp.text.split("\n"):
-                if line.startswith("#"):
-                    continue
-                # Search for metric name anywhere in the line (Seastar prefixes vary)
-                if metric_name in line:
-                    # Extract the value (last number on the line)
-                    match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                    if match:
-                        if debug:
-                            print(f"    Found: {line.strip()}")
-                        return float(match.group(1))
-
-            if debug:
-                # Print available metrics for debugging
-                print(f"    Available metrics containing 'cluster' or 'peer':")
-                for line in resp.text.split("\n"):
-                    if not line.startswith("#") and ("cluster" in line.lower() or "peer" in line.lower()):
-                        print(f"      {line.strip()[:100]}")
-            return None
-        except requests.exceptions.RequestException as e:
-            if debug:
-                print(f"    Request error (attempt {attempt + 1}): {e}")
-            if attempt < retries - 1:
-                time.sleep(1)
-            else:
-                return None
-    return None
-
-
-def get_all_metrics(metrics_url: str) -> dict:
-    """Get all metrics from the Prometheus endpoint."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return {}
-
-        metrics = {}
-        for line in resp.text.split("\n"):
-            if line.startswith("#") or not line.strip():
-                continue
-            # Parse metric line
-            match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([\d.eE+-]+)", line)
-            if match:
-                name = match.group(1)
-                value = float(match.group(3))
-                if name not in metrics:
-                    metrics[name] = []
-                metrics[name].append(value)
-        return metrics
-    except requests.exceptions.RequestException:
-        return {}
-
-
-class ClusterIntegrationTest(unittest.TestCase):
+class ClusterIntegrationTest(ClusterTestCase):
     """Integration tests for multi-node Ranvier cluster."""
 
-    @classmethod
-    def setUpClass(cls):
-        """Start the Docker Compose cluster."""
-        print("\n" + "=" * 60)
-        print("Setting up test cluster...")
-        print("=" * 60)
-
-        # Ensure clean state
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-
-        # Check if we should skip building (env var or images already exist)
-        skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
-
-        if not skip_build:
-            # Check if the required Docker images already exist by trying to create
-            # containers without building. If images exist, this succeeds quickly.
-            try:
-                compose_cmd = get_compose_cmd()
-                create_result = subprocess.run(
-                    compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
-                                   "create", "--no-build"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if create_result.returncode == 0:
-                    print("\nDocker images already exist. Skipping build.")
-                    print("  (Set SKIP_BUILD=0 to force rebuild)")
-                    skip_build = True
-                    # Clean up the created containers so 'up -d' works fresh
-                    subprocess.run(
-                        compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
-                                       "rm", "-f"],
-                        capture_output=True, timeout=30
-                    )
-            except (subprocess.TimeoutExpired, Exception):
-                # If check fails, just proceed with build
-                pass
-
-        if not skip_build:
-            print("\nBuilding containers (this may take a while on first run)...")
-            result = run_compose(["build"], check=False, show_output=True)
-            if result.returncode != 0:
-                raise RuntimeError("Failed to build containers")
-
-        print("\nStarting cluster...")
-        result = run_compose(["up", "-d"], check=False, show_output=True)
-        if result.returncode != 0:
-            raise RuntimeError("Failed to start cluster")
-
-        # Wait for all nodes to become healthy
-        print("\nWaiting for nodes to become healthy...")
-        all_healthy = True
-        # Map node names to container names
-        container_names = {"node1": "ranvier1", "node2": "ranvier2", "node3": "ranvier3"}
-        for name, endpoints in NODES.items():
-            print(f"  Waiting for {name}...")
-            container = container_names.get(name)
-            if not wait_for_healthy(f"{endpoints['metrics']}/metrics", timeout=STARTUP_TIMEOUT, container_name=container):
-                print(f"  ERROR: {name} did not become healthy")
-                all_healthy = False
-            else:
-                print(f"  {name} is healthy")
-
-        if not all_healthy:
-            # Print logs for debugging
-            print("\nContainer logs:")
-            run_compose(["logs", "--tail=50"], check=False, show_output=True)
-            raise RuntimeError("Not all nodes became healthy")
-
-        # Give gossip time to establish peer connections
-        print("\nWaiting for gossip connections to establish...")
-        time.sleep(5)
-
-        print("\nCluster is ready for testing")
-        print("=" * 60 + "\n")
-
-    @classmethod
-    def tearDownClass(cls):
-        """Tear down the Docker Compose cluster."""
-        print("\n" + "=" * 60)
-        print("Tearing down test cluster...")
-        print("=" * 60)
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-        print("Cleanup complete")
+    # Unique compose project so a pytest-session cluster running in parallel
+    # on the same host can't collide with this unittest-style suite.
+    PROJECT_NAME = "ranvier-integration-test"
+    # Keep backends-registration as test_02 for functional parity with the
+    # pre-refactor suite.  This is the one test method that exercises the
+    # admin API end-to-end, so we don't want setUpClass to pre-register.
+    AUTO_REGISTER_BACKENDS = False
 
     def test_01_cluster_peers_connected(self):
         """Verify that all nodes have connected to their peers."""
@@ -522,7 +263,9 @@ class ClusterIntegrationTest(unittest.TestCase):
                     else:
                         # On final failure, check container status
                         print(f"    Checking {name} container status...")
-                        container_ok = check_container_running(f"ranvier{name[-1]}")
+                        container_ok = check_container_running(
+                            f"ranvier{name[-1]}", self.PROJECT_NAME
+                        )
                         if not container_ok:
                             self.fail(f"{name} container has crashed!")
                         raise
@@ -545,11 +288,11 @@ class ClusterIntegrationTest(unittest.TestCase):
         # Stop and remove node3 using docker-compose
         # We must remove the container because Seastar doesn't restart cleanly
         print("\n  Stopping and removing node3...")
-        result = run_compose(["stop", "ranvier3"], check=False)
+        result = run_compose(["stop", "ranvier3"], project_name=self.PROJECT_NAME, check=False)
         self.assertEqual(result.returncode, 0, "Failed to stop ranvier3")
 
         # Remove the stopped container so it can be recreated fresh
-        result = run_compose(["rm", "-f", "ranvier3"], check=False)
+        result = run_compose(["rm", "-f", "ranvier3"], project_name=self.PROJECT_NAME, check=False)
         self.assertEqual(result.returncode, 0, "Failed to remove ranvier3")
 
         # Wait for peer timeout (gossip_peer_timeout_seconds = 6)
@@ -581,7 +324,7 @@ class ClusterIntegrationTest(unittest.TestCase):
         # We use 'up -d' instead of 'start' because test_06 removed the container
         # and Seastar containers don't restart cleanly with stop/start anyway
         print("  Recreating node3...")
-        result = run_compose(["up", "-d", "ranvier3"], check=False)
+        result = run_compose(["up", "-d", "ranvier3"], project_name=self.PROJECT_NAME, check=False)
         if result.returncode != 0:
             print(f"    Up command failed with code {result.returncode}")
             if result.stderr:
@@ -592,11 +335,15 @@ class ClusterIntegrationTest(unittest.TestCase):
         time.sleep(2)
 
         # Check container status
-        container_running = check_container_running("ranvier3")
+        container_running = check_container_running("ranvier3", self.PROJECT_NAME)
         print(f"  Container ranvier3 running: {container_running}")
         if not container_running:
             # Try to get logs
-            log_result = run_compose(["logs", "--tail=20", "ranvier3"], check=False)
+            log_result = run_compose(
+                ["logs", "--tail=20", "ranvier3"],
+                project_name=self.PROJECT_NAME,
+                check=False,
+            )
             print(f"  Recent logs: {log_result.stdout[:500] if log_result.stdout else 'none'}")
             self.fail("ranvier3 container is not running after recreate")
 
@@ -605,11 +352,16 @@ class ClusterIntegrationTest(unittest.TestCase):
         healthy = wait_for_healthy(
             f"{NODES['node3']['metrics']}/metrics",
             timeout=60,
-            container_name="ranvier3"
+            container_name="ranvier3",
+            project_name=self.PROJECT_NAME,
         )
         if not healthy:
             # Get logs on failure
-            log_result = run_compose(["logs", "--tail=30", "ranvier3"], check=False)
+            log_result = run_compose(
+                ["logs", "--tail=30", "ranvier3"],
+                project_name=self.PROJECT_NAME,
+                check=False,
+            )
             print(f"  ranvier3 logs: {log_result.stdout[:1000] if log_result.stdout else 'none'}")
             self.fail("node3 did not become healthy within 60 seconds")
 

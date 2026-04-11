@@ -321,9 +321,9 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 ## 6. Integration Tests (End-to-End Validation)
 ### 6.1 Test Infrastructure Setup
 
-- [ ] **Create shared test fixtures**
-  _Description:_ Create `tests/integration/conftest.py` with pytest fixtures for cluster lifecycle, health polling, and request utilities.
-  _Files:_ `tests/integration/conftest.py` (new)
+- [x] **Create shared test fixtures** ✅
+  _Description:_ Created `tests/integration/conftest.py` with a `ranvier_cluster` session fixture, a `cluster_metrics` snapshot fixture, a `ClusterTestCase` unittest base class (sharing the same `_bring_up_cluster` / `_tear_down_cluster` helpers), and the deduplicated docker-compose / metric / request helpers. `test_cluster.py` is migrated to the new harness; `test_prefix_routing.py`, `test_load_aware_routing.py`, `test_negative_paths.py`, and `test_graceful_shutdown.py` are pending follow-up PRs. Landed alongside smoke tests in `test_intelligence_layer.py` (§15 1.2 / 1.4 + v2.1.0 partial tokenization).
+  _Files:_ `tests/integration/conftest.py`, `tests/integration/test_cluster.py`, `tests/integration/test_intelligence_layer.py`
   _Complexity:_ Low
 
 - [ ] **Enhance mock backend capabilities**
