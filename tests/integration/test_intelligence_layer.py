@@ -28,6 +28,7 @@ the sandbox — the developer runs these in their Docker environment.
 from __future__ import annotations
 
 from conftest import (
+    metric_is_registered,
     send_chat_request,
     sum_metric_by_labels,
     sum_metric_by_substring,
@@ -55,6 +56,24 @@ def test_partial_tokenization_metric_increments(ranvier_cluster):
     """
     metrics_url = ranvier_cluster.nodes["node1"]["metrics"]
     api_url = ranvier_cluster.nodes["node1"]["api"]
+
+    # Distinguish "binary lacks the feature" from "counter didn't bump".
+    # Both produce a 0 from sum_metric_by_substring, so we check
+    # registration up front and fail with an actionable message if the
+    # counter is missing. Common cause: stale Docker image predating the
+    # partial-tokenization PR (#417) — rebuild with `docker compose build`.
+    assert metric_is_registered(metrics_url, METRIC_TOKENIZATION_PARTIAL), (
+        f"{METRIC_TOKENIZATION_PARTIAL} is not exposed in /metrics — the "
+        f"running Ranvier binary predates BACKLOG §1.4 (PR #417). Rebuild "
+        f"the image with `docker compose -f docker-compose.test.yml build` "
+        f"and retry."
+    )
+    assert metric_is_registered(metrics_url, METRIC_TOKENIZATION_DEFERRED_FULL), (
+        f"{METRIC_TOKENIZATION_DEFERRED_FULL} is not exposed in /metrics — "
+        f"the running Ranvier binary predates BACKLOG §1.4 (PR #417). "
+        f"Rebuild the image with "
+        f"`docker compose -f docker-compose.test.yml build` and retry."
+    )
 
     before_partial = sum_metric_by_substring(metrics_url, METRIC_TOKENIZATION_PARTIAL)
     before_deferred = sum_metric_by_substring(metrics_url, METRIC_TOKENIZATION_DEFERRED_FULL)

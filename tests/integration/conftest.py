@@ -355,6 +355,19 @@ def sum_metric_by_substring(metrics_url: str, substring: str) -> float:
     return total
 
 
+def metric_is_registered(metrics_url: str, substring: str) -> bool:
+    """Return True if any metric line contains ``substring``.
+
+    Used to distinguish "counter exists but hasn't incremented" (legit
+    assertion failure) from "counter isn't even registered" (the running
+    binary predates the feature — likely a stale Docker image). Both cases
+    produce a ``0`` from :func:`sum_metric_by_substring`, so tests that
+    care about the distinction should consult this helper first.
+    """
+    all_metrics = get_all_metrics(metrics_url)
+    return any(substring in name for name in all_metrics)
+
+
 def sum_metric_by_labels(
     metrics_url: str,
     metric_substring: str,
