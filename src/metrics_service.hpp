@@ -91,6 +91,15 @@ public:
             seastar::metrics::make_counter("tokenization_cross_shard", _tokenization_cross_shard,
                 seastar::metrics::description("Total number of tokenization cache misses dispatched to other shards via P2C")),
 
+            seastar::metrics::make_counter("tokenization_partial_total", _tokenization_partial_total,
+                seastar::metrics::description("Cumulative count (monotonic since process start) of routing tokenizations that were truncated to a byte budget (partial tokenization for routing)")),
+
+            seastar::metrics::make_counter("tokenization_partial_bytes_saved", _tokenization_partial_bytes_saved,
+                seastar::metrics::description("Cumulative bytes of text NOT tokenized due to partial tokenization truncation (monotonic since process start). Rate over time indicates how much tokenization work was avoided by routing-only truncation.")),
+
+            seastar::metrics::make_counter("tokenization_deferred_full_total", _tokenization_deferred_full_total,
+                seastar::metrics::description("Cumulative count (monotonic since process start) of full tokenizations triggered after routing for token forwarding on /v1/completions (deferred full tokenization)")),
+
             seastar::metrics::make_counter("prefix_boundary_used", _prefix_boundary_used,
                 seastar::metrics::description("Total number of requests where system message prefix boundary was identified and used for routing")),
 
@@ -368,6 +377,18 @@ public:
     uint64_t get_tokenization_cache_misses() const { return _tokenization_cache_misses; }
     uint64_t get_tokenization_cross_shard() const { return _tokenization_cross_shard; }
 
+    // Partial tokenization metrics (BACKLOG §1.4): truncating the routing
+    // input to a byte budget so only ~prefix_token_length tokens are
+    // produced instead of tokenizing the entire prompt.
+    void record_tokenization_partial(size_t bytes_saved) {
+        _tokenization_partial_total++;
+        _tokenization_partial_bytes_saved += bytes_saved;
+    }
+    void record_deferred_full_tokenization() { _tokenization_deferred_full_total++; }
+    uint64_t get_tokenization_partial_total() const { return _tokenization_partial_total; }
+    uint64_t get_tokenization_partial_bytes_saved() const { return _tokenization_partial_bytes_saved; }
+    uint64_t get_tokenization_deferred_full_total() const { return _tokenization_deferred_full_total; }
+
     // Record prefix boundary detection results
     void record_prefix_boundary_used() { _prefix_boundary_used++; }
     void record_prefix_boundary_skipped() { _prefix_boundary_skipped++; }
@@ -561,6 +582,9 @@ private:
     uint64_t _tokenization_cache_hits = 0;    // Tokenization cache hits (avoided FFI)
     uint64_t _tokenization_cache_misses = 0;  // Tokenization cache misses (required FFI)
     uint64_t _tokenization_cross_shard = 0;   // Cache misses dispatched to other shards via P2C
+    uint64_t _tokenization_partial_total = 0;        // Routing tokenizations that were truncated
+    uint64_t _tokenization_partial_bytes_saved = 0;  // Cumulative bytes not tokenized due to truncation
+    uint64_t _tokenization_deferred_full_total = 0;  // Full tokenizations triggered post-routing for token forwarding
     uint64_t _prefix_boundary_used = 0;  // System message prefix boundary was used
     uint64_t _prefix_boundary_skipped = 0;  // Prefix boundary skipped (no system messages, too short, disabled)
     uint64_t _prefix_boundary_client = 0;  // Client-provided prefix_token_count was used

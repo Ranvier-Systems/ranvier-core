@@ -237,6 +237,30 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     // Cache events configuration (push-based eviction notifications)
     cfg.cache_events = config.cache_events;
     cfg.prefix_token_length = config.routing.prefix_token_length;
+    // Partial tokenization for routing (BACKLOG §1.4)
+    cfg.enable_partial_tokenization = config.routing.enable_partial_tokenization;
+    cfg.partial_tokenize_bytes_per_token = config.routing.partial_tokenize_bytes_per_token;
+
+    // Operator visibility: surface whether partial tokenization will
+    // actually fire on the hot path. Bypassed when token forwarding or
+    // multi-depth routing is also enabled — both need the full token
+    // vector. Fires once per config build (startup + SIGHUP reload), not
+    // per request. See RoutingConfig::enable_partial_tokenization.
+    if (cfg.enable_partial_tokenization) {
+        if (cfg.enable_token_forwarding || cfg.enable_multi_depth_routing) {
+            log_main.info(
+                "Partial tokenization enabled but BYPASSED on the routing hot "
+                "path: enable_token_forwarding={}, enable_multi_depth_routing={}. "
+                "Disable one of these to restore the tail-latency optimization.",
+                cfg.enable_token_forwarding, cfg.enable_multi_depth_routing);
+        } else {
+            log_main.info(
+                "Partial tokenization enabled (budget={}B = {} tokens x {} B/token)",
+                cfg.partial_tokenize_bytes_per_token * cfg.prefix_token_length,
+                cfg.prefix_token_length,
+                cfg.partial_tokenize_bytes_per_token);
+        }
+    }
     return cfg;
 }
 

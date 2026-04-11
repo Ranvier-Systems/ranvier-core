@@ -205,6 +205,46 @@ public:
     // NOT thread-safe - must only be called from the owning shard
     std::vector<int32_t> encode(std::string_view text) const;
 
+    // Truncate text to a byte budget estimated to produce at least
+    // `target_tokens` tokens.  Pure computation (no I/O, no state) used by
+    // the router hot path to avoid tokenizing more text than necessary for
+    // prefix lookup.
+    //
+    // BPE tokenizers average ~4 bytes/token for English text, but can be as
+    // low as 1 byte/token for common words or punctuation.  Using a
+    // conservative upper bound of 6 bytes/token guarantees that the
+    // resulting text encodes to at least `target_tokens` tokens in the
+    // common case.  Callers that care about covering additional context
+    // (e.g. multi-depth boundaries) should avoid truncation altogether.
+    //
+    // Returns a string_view into the original text (zero-copy).  The
+    // truncation never splits a UTF-8 multi-byte sequence.  Hard Rule #1:
+    // no I/O, no futures, no locks — safe to call from the reactor.
+    static std::string_view truncate_for_routing(
+            std::string_view text,
+            size_t target_tokens,
+            size_t bytes_per_token = 6) {
+        // Zero target → nothing to tokenize; return empty view into text.
+        if (target_tokens == 0 || bytes_per_token == 0) {
+            return text.substr(0, 0);
+        }
+
+        const size_t byte_budget = target_tokens * bytes_per_token;
+        if (text.size() <= byte_budget) {
+            return text;  // Already within budget
+        }
+
+        // Truncate to byte budget, but don't split a UTF-8 character.
+        // UTF-8 continuation bytes match the pattern 10xxxxxx (0x80 mask
+        // with 0xC0). Walk backward until we land on a code-point boundary.
+        size_t end = byte_budget;
+        while (end > 0 &&
+               (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80) {
+            --end;
+        }
+        return text.substr(0, end);
+    }
+
     // OPTIMIZED API: Text -> Integers with LRU caching (SYNCHRONOUS)
     // For hot paths (handle_proxy), use this to avoid redundant tokenization.
     // Returns pair<tokens, cache_hit> for metrics recording.

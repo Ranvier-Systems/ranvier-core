@@ -137,6 +137,12 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<size_t>("RANVIER_PREFIX_TOKEN_LENGTH")) {
         routing.prefix_token_length = *v;
     }
+    if (auto v = get_env("RANVIER_PARTIAL_TOKENIZATION")) {
+        routing.enable_partial_tokenization = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_PARTIAL_TOKENIZE_BYTES_PER_TOKEN")) {
+        routing.partial_tokenize_bytes_per_token = *v;
+    }
     if (auto v = get_env("RANVIER_ENABLE_PREFIX_BOUNDARY")) {
         routing.enable_prefix_boundary = (*v == "1" || *v == "true" || *v == "yes");
     }
@@ -910,6 +916,12 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             }
             if (r["prefix_token_length"]) {
                 config.routing.prefix_token_length = r["prefix_token_length"].as<size_t>();
+            }
+            if (r["enable_partial_tokenization"]) {
+                config.routing.enable_partial_tokenization = r["enable_partial_tokenization"].as<bool>();
+            }
+            if (r["partial_tokenize_bytes_per_token"]) {
+                config.routing.partial_tokenize_bytes_per_token = r["partial_tokenize_bytes_per_token"].as<size_t>();
             }
             if (r["enable_prefix_boundary"]) {
                 config.routing.enable_prefix_boundary = r["enable_prefix_boundary"].as<bool>();
