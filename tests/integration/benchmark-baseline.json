@@ -1,7 +1,7 @@
 {
-  "version": "2.0.0-intelligence-layer",
-  "description": "Benchmark baseline for Ranvier Core CI regression testing (§15 intelligence layer enabled)",
-  "updated_at": "2026-04-02T02:00:10Z",
+  "version": "2.1.0-partial-tokenization",
+  "description": "Benchmark baseline for Ranvier Core CI regression testing (§15 intelligence layer + partial tokenization)",
+  "updated_at": "2026-04-11T00:00:00Z",
   "updated_by": "run-benchmark.sh",
   "features_enabled": [
     "cost_estimation",
@@ -11,7 +11,8 @@
     "agent_registry",
     "vllm_metrics",
     "load_aware_routing",
-    "cost_based_routing"
+    "cost_based_routing",
+    "partial_tokenization"
   ],
   "test_config": {
     "users": 100,
@@ -20,14 +21,14 @@
     "environment": "docker-compose.test.yml (mock backends, §15 features enabled, CI mode)"
   },
   "metrics": {
-    "p50_latency_ms": 49.00,
-    "p90_latency_ms": 66.00,
-    "p99_latency_ms": 85.00,
-    "avg_latency_ms": 52.00,
-    "min_latency_ms": 30.00,
-    "max_latency_ms": 120.00,
-    "throughput_rps": 502.27,
-    "total_requests": 29684,
+    "p50_latency_ms": 46.00,
+    "p90_latency_ms": 52.00,
+    "p99_latency_ms": 59.00,
+    "avg_latency_ms": 48.00,
+    "min_latency_ms": 28.00,
+    "max_latency_ms": 110.00,
+    "throughput_rps": 513.58,
+    "total_requests": 30336,
     "failure_rate_percent": 0.00,
     "success_rate_percent": 100.00
   },
@@ -46,10 +47,10 @@
   },
   "notes": [
     "Baseline captured from CI environment (100 users, 0.1-0.5s wait, ubuntu-latest runner)",
-    "All §15 intelligence layer features enabled",
-    "P99 increased from ~56ms (pre-§15) to ~85ms with intelligence layer — acceptable",
+    "All §15 intelligence layer features enabled + partial tokenization for routing",
+    "Partial tokenization delta vs 2.0.0: P99 85ms -> 59ms (-30%), throughput 502->513 rps (+2%)",
     "Intelligence layer Prometheus counters read zero on mock backends (expected)",
-    "P99 latency target: <94ms for CI (10% regression budget over 85ms)",
+    "P99 latency target: <65ms for CI (10% regression budget over 59ms)",
     "Update baseline via: gh workflow run benchmark.yml -f update_baseline=true"
   ]
 }

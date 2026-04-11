@@ -4,6 +4,50 @@ All notable changes to Ranvier Core will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.1.0] - 2026-04-11
+
+Performance release. Introduces partial tokenization for routing — truncates
+input text to a byte budget before tokenizing, since the ART lookup only
+needs the first `prefix_token_length` tokens (default 128). Full tokenization
+is deferred and only performed when token forwarding to `/v1/completions`
+backends is enabled.
+
+### Added
+
+- **Partial Tokenization for Routing** — Two-phase tokenization: a truncated
+  input (default 768 bytes, ~128 tokens) is tokenized for routing, and full
+  tokenization is deferred to the forwarding path only when needed. Disabled
+  automatically when multi-depth routing is enabled or token forwarding
+  requires the full token vector. Config: `routing.enable_partial_tokenization`
+  (default true), `routing.partial_tokenize_byte_budget` (default 768),
+  `routing.partial_tokenize_bytes_per_token` (default 6).
+  Env: `RANVIER_PARTIAL_TOKENIZATION`, `RANVIER_PARTIAL_TOKENIZE_BUDGET`.
+- **TokenizerService::truncate_for_routing()** — UTF-8-safe byte budget
+  truncation utility. Returns a `string_view` into the original text
+  (zero-copy).
+- **Metrics**: `ranvier_tokenization_partial_total`,
+  `ranvier_tokenization_partial_bytes_saved`,
+  `ranvier_tokenization_deferred_full_total`.
+
+### Performance
+
+CI benchmark (100 users, 60s, docker-compose mock backends) vs v2.0.0 baseline:
+
+| Metric        | v2.0.0  | v2.1.0  | Delta  |
+|---------------|---------|---------|--------|
+| P50 latency   | 49ms    | 46ms    | -6%    |
+| P90 latency   | 66ms    | 52ms    | -21%   |
+| P99 latency   | 85ms    | 59ms    | -30%   |
+| Throughput    | 502 rps | 513 rps | +2%    |
+| Failure rate  | 0%      | 0%      | —      |
+
+The P99 improvement reflects reduced thread pool queue contention and
+context-switch overhead — tokenization still runs off-reactor, but the
+smaller input produces tokens faster, freeing thread pool capacity.
+Real-world impact on GPU-backed deployments (where tokenization is the
+dominant per-request cost) is expected to be even more significant;
+re-validation on 8x A100 pending GPU availability.
+
 ## [2.0.0] - 2026-04-05
 
 Intelligence Layer release. Transforms Ranvier from a "smart router" into a full
