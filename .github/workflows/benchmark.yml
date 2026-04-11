@@ -4,14 +4,20 @@
 #
 # Triggers:
 #   - After Docker Publish workflow completes (tests the newly-pushed image)
-#   - Manual trigger (with option to update baseline)
+#   - Manual trigger via workflow_dispatch. To benchmark a PR, open the
+#     Actions tab, select this workflow, click "Run workflow", pick the PR's
+#     branch, and enable "build_from_source" so the image is rebuilt from
+#     the PR ref rather than the published :latest tag.
 #
 # Fail conditions:
 #   - P99 latency regresses >10%
 #   - Throughput drops >5%
 #
-# NOTE: Uses pre-built ranvier image from GHCR to avoid long C++ compile times.
-# Only the lightweight mock-backend and locust images are built locally.
+# NOTE: Uses pre-built ranvier image from GHCR by default to avoid long C++
+# compile times. When build_from_source=true, the image is rebuilt locally
+# using Dockerfile.production.fast against the pre-built base image, which
+# keeps build times manageable (only Ranvier sources are recompiled).
+# The lightweight mock-backend and locust images are always built locally.
 name: Benchmark Regression Test
 
 on:
@@ -22,6 +28,11 @@ on:
       - completed
   workflow_dispatch:
     inputs:
+      build_from_source:
+        description: 'Build Ranvier image from the selected ref (required to benchmark a PR; otherwise uses published :latest)'
+        required: false
+        type: boolean
+        default: false
       update_baseline:
         description: 'Update baseline after intentional performance changes'
         required: false
@@ -41,6 +52,7 @@ on:
 env:
   REGISTRY: ghcr.io
   RANVIER_IMAGE: ghcr.io/ranvier-systems/ranvier:latest
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
   BENCHMARK_USERS: ${{ inputs.benchmark_users || 100 }}
   BENCHMARK_DURATION: ${{ inputs.benchmark_duration || '60s' }}
   BENCHMARK_SPAWN_RATE: 10
@@ -55,7 +67,10 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 min was enough for the pull-and-benchmark path, but build_from_source
+    # adds a from-source Ranvier compile (cache-warm: a few minutes;
+    # cache-cold: up to ~15 min). Bump to 30 so cold PR runs don't time out.
+    timeout-minutes: 30
     permissions:
       contents: write
       pull-requests: write
@@ -76,6 +91,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull pre-built Ranvier image
+        if: ${{ !inputs.build_from_source }}
         run: |
           echo "Pulling pre-built Ranvier image from GHCR..."
           echo "This avoids the ~15 minute C++ compile time."
@@ -93,6 +109,24 @@ jobs:
             echo "  make docker-build"
             exit 1
           fi
+
+      - name: Build Ranvier image from source
+        if: ${{ inputs.build_from_source }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.production.fast
+          # --load into the local Docker daemon so docker-compose.test.yml
+          # can find ranvier:latest. Single-platform (runner arch) is fine
+          # for benchmarking; no need for multi-arch here.
+          load: true
+          tags: ranvier:latest
+          cache-from: type=gha,scope=benchmark-app
+          cache-to: type=gha,mode=max,scope=benchmark-app
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            UID=10001
+            GID=10001
 
       - name: Build supporting images
         run: |
