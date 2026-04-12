@@ -517,8 +517,9 @@ class NegativePathTest(ClusterTestCase):
             "  burst_size: 1\n"
         )
         subprocess.run(
-            ["docker", "exec", container, "sh", "-c",
-             f"cat > /app/ranvier.yaml << 'RATEEOF'\n{rate_limit_yaml}RATEEOF"],
+            ["docker", "exec", "-i", container, "sh", "-c",
+             "cat > /app/ranvier.yaml"],
+            input=rate_limit_yaml,
             capture_output=True, text=True, timeout=10
         )
 
