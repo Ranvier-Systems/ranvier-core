@@ -20,14 +20,18 @@ Requirements:
     - pytest (optional, can run with unittest)
     - requests library
     - concurrent.futures for parallel requests
+
+The shared docker-compose harness (constants, helpers, lifecycle) lives in
+``tests/integration/conftest.py``.  This file only contains the
+load-aware-routing-specific test methods and the TTFT-measuring chat helper
+they share (``send_chat_request_with_ttft``).  Any change to cluster
+bring-up / teardown belongs in conftest.
 """
 
 import concurrent.futures
 import json
 import os
-import re
 import statistics
-import subprocess
 import sys
 import time
 import unittest
@@ -39,13 +43,22 @@ except ImportError:
     print("Error: 'requests' library is required. Install with: pip install requests")
     sys.exit(1)
 
+from conftest import (
+    COMPOSE_FILE,
+    ClusterTestCase,
+    DOCKER_HOST,
+    NODES,
+    REQUEST_TIMEOUT,
+    extract_backend_id,
+    get_all_metrics,
+    get_compose_cmd,
+    get_metric_value,
+)
+
 
 # =============================================================================
-# Configuration
+# Load-aware-routing-specific configuration
 # =============================================================================
-
-COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.test.yml")
-PROJECT_NAME = "ranvier-load-aware-test"
 
 # Test parameters
 HEAVY_LOAD_USERS = 30  # Concurrent users for heavy load test
@@ -54,173 +67,19 @@ REQUESTS_PER_USER = 10  # Requests each user sends
 TTFT_IMPROVEMENT_THRESHOLD = 0.25  # >25% improvement expected
 
 
-def get_docker_host() -> str:
-    """Get the hostname to reach Docker-exposed ports."""
-    import socket
-    try:
-        socket.gethostbyname("host.docker.internal")
-        return "host.docker.internal"
-    except socket.gaierror:
-        return "localhost"
-
-
-DOCKER_HOST = get_docker_host()
-
-# Node endpoints (mapped ports from docker-compose)
-NODES = {
-    "node1": {"api": f"http://{DOCKER_HOST}:8081", "metrics": f"http://{DOCKER_HOST}:9181"},
-    "node2": {"api": f"http://{DOCKER_HOST}:8082", "metrics": f"http://{DOCKER_HOST}:9182"},
-    "node3": {"api": f"http://{DOCKER_HOST}:8083", "metrics": f"http://{DOCKER_HOST}:9183"},
-}
-
-# Backend addresses (as seen from inside the Docker network)
-BACKENDS = {
-    1: {"ip": "172.28.1.10", "port": 8000},
-    2: {"ip": "172.28.1.11", "port": 8000},
-}
-
-# Timeouts
-STARTUP_TIMEOUT = 60
-REQUEST_TIMEOUT = 30
-
-
 # =============================================================================
-# Docker Compose Helpers
+# Load-aware-routing-specific helpers
 # =============================================================================
-
-COMPOSE_CMD = None
-
-
-def get_compose_cmd() -> List[str]:
-    """Detect and return the docker compose command."""
-    global COMPOSE_CMD
-    if COMPOSE_CMD is not None:
-        return COMPOSE_CMD
-
-    # Try 'docker compose' (plugin) first
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker", "compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    # Fall back to 'docker-compose' (standalone)
-    try:
-        result = subprocess.run(
-            ["docker-compose", "--version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker-compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    raise RuntimeError(
-        "Neither 'docker compose' nor 'docker-compose' found. "
-        "Please install Docker with Compose plugin or docker-compose standalone."
-    )
-
-
-def run_compose(args: List[str], check: bool = True, show_output: bool = False,
-                env: Dict[str, str] = None) -> subprocess.CompletedProcess:
-    """Run docker-compose command with the test configuration."""
-    compose_cmd = get_compose_cmd()
-    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME] + args
-    print(f"  Running: {' '.join(cmd)}")
-
-    run_env = os.environ.copy()
-    if env:
-        run_env.update(env)
-
-    result = subprocess.run(cmd, capture_output=True, text=True, env=run_env)
-
-    if show_output or result.returncode != 0:
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-
-    if check and result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-
-    return result
-
-
-def wait_for_healthy(url: str, timeout: int = 60) -> bool:
-    """Wait for an endpoint to become healthy."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(1)
-    return False
-
-
-# =============================================================================
-# Metrics Helpers
-# =============================================================================
-
-def get_metric_value(metrics_url: str, metric_name: str, labels: Dict[str, str] = None) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return None
-
-        for line in resp.text.split("\n"):
-            if line.startswith("#"):
-                continue
-            if metric_name in line:
-                if labels:
-                    all_match = all(f'{k}="{v}"' in line for k, v in labels.items())
-                    if not all_match:
-                        continue
-
-                match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                if match:
-                    return float(match.group(1))
-        return None
-    except requests.exceptions.RequestException:
-        return None
-
-
-def get_all_metrics(metrics_url: str) -> Dict[str, List[float]]:
-    """Get all metrics from the Prometheus endpoint."""
-    try:
-        resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-        if resp.status_code != 200:
-            return {}
-
-        metrics = {}
-        for line in resp.text.split("\n"):
-            if line.startswith("#") or not line.strip():
-                continue
-            match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([\d.eE+-]+)", line)
-            if match:
-                name = match.group(1)
-                value = float(match.group(3))
-                if name not in metrics:
-                    metrics[name] = []
-                metrics[name].append(value)
-        return metrics
-    except requests.exceptions.RequestException:
-        return {}
 
 
 def get_load_aware_metrics(metrics_url: str) -> Dict[str, float]:
-    """Get load-aware routing related metrics."""
+    """Get load-aware routing related metrics.
+
+    Seastar prefixes every exported metric with ``seastar_ranvier_``.
+    Returns the fallback counter, the per-backend active-requests gauges,
+    and the usual cache hit/miss totals so tests can correlate routing
+    decisions with cache activity.
+    """
     metrics = get_all_metrics(metrics_url)
 
     return {
@@ -239,29 +98,29 @@ def get_backend_active_requests(metrics_url: str, backend_id: int) -> Optional[f
     return get_metric_value(
         metrics_url,
         "seastar_ranvier_backend_active_requests",
-        {"backend_id": str(backend_id)}
+        labels={"backend_id": str(backend_id)},
     )
 
 
-# =============================================================================
-# Request Helpers
-# =============================================================================
-
-def send_chat_request(
+def send_chat_request_with_ttft(
     api_url: str,
     messages: List[Dict[str, str]],
     stream: bool = True,
-    timeout: int = REQUEST_TIMEOUT
+    timeout: int = REQUEST_TIMEOUT,
 ) -> Tuple[int, str, Dict[str, str], float]:
-    """Send a chat completion request and return (status_code, response_text, headers, ttft).
+    """Send a chat completion request and return ``(status, body, headers, ttft)``.
 
-    TTFT (Time to First Token) is measured as the time from request start to first
-    streaming chunk received.
+    TTFT (Time to First Token) is measured as the time from request start
+    to the first streaming chunk received.  This 4-tuple shape is
+    load-aware-specific — the conftest ``send_chat_request`` helper
+    returns only a 3-tuple because most test suites don't measure TTFT.
+    Keeping this wrapper local avoids polluting the shared harness with
+    a metric that only this file consumes.
     """
     request_body = {
         "model": "test-model",
         "messages": messages,
-        "stream": stream
+        "stream": stream,
     }
 
     start_time = time.time()
@@ -273,7 +132,7 @@ def send_chat_request(
             json=request_body,
             headers={"Content-Type": "application/json"},
             stream=stream,
-            timeout=timeout
+            timeout=timeout,
         )
 
         response_text = ""
@@ -304,44 +163,6 @@ def send_chat_request(
         return 0, str(e), {}, time.time() - start_time
 
 
-def extract_backend_id(response_text: str, headers: Dict[str, str] = None) -> Optional[int]:
-    """Extract backend ID from mock backend response or headers."""
-    if headers:
-        backend_header = headers.get("X-Backend-ID") or headers.get("x-backend-id")
-        if backend_header:
-            try:
-                return int(backend_header)
-            except ValueError:
-                pass
-
-    if response_text:
-        match = re.search(r"backend\s+(\d+)", response_text.lower())
-        if match:
-            return int(match.group(1))
-
-    return None
-
-
-def register_backends(api_url: str) -> bool:
-    """Register all backends on a node. Returns True if successful."""
-    for backend_id, backend_info in BACKENDS.items():
-        url = (
-            f"{api_url}/admin/backends"
-            f"?id={backend_id}"
-            f"&ip={backend_info['ip']}"
-            f"&port={backend_info['port']}"
-        )
-        try:
-            resp = requests.post(url, timeout=10)
-            if resp.status_code != 200:
-                print(f"    Failed to register backend {backend_id}: {resp.text}")
-                return False
-        except requests.exceptions.RequestException as e:
-            print(f"    Failed to register backend {backend_id}: {e}")
-            return False
-    return True
-
-
 # =============================================================================
 # Test Prompts
 # =============================================================================
@@ -360,6 +181,7 @@ def generate_prompt(user_id: int, request_id: int) -> List[Dict[str, str]]:
 # =============================================================================
 # Load Testing Helpers
 # =============================================================================
+
 
 def run_concurrent_load_test(
     api_url: str,
@@ -386,7 +208,7 @@ def run_concurrent_load_test(
         user_results = []
         for req_id in range(requests_per_user):
             prompt = generate_prompt(user_id, req_id)
-            status, response, headers, ttft = send_chat_request(api_url, prompt)
+            status, response, headers, ttft = send_chat_request_with_ttft(api_url, prompt)
             backend_id = extract_backend_id(response, headers)
             user_results.append((status, ttft, backend_id))
             # Small delay between user requests
@@ -436,83 +258,17 @@ def calculate_ttft_stats(ttft_values: List[float]) -> Dict[str, float]:
 # Test Suite
 # =============================================================================
 
-class LoadAwareRoutingTest(unittest.TestCase):
+
+class LoadAwareRoutingTest(ClusterTestCase):
     """E2E tests for load-aware routing behavior."""
 
-    @classmethod
-    def setUpClass(cls):
-        """Start the Docker Compose cluster."""
-        print("\n" + "=" * 70)
-        print("Setting up test cluster for Load-Aware Routing tests...")
-        print("=" * 70)
-
-        # Ensure clean state
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-
-        # Check for pre-built images
-        skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
-
-        if not skip_build:
-            try:
-                compose_cmd = get_compose_cmd()
-                create_result = subprocess.run(
-                    compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
-                                   "create", "--no-build"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if create_result.returncode == 0:
-                    print("\nDocker images already exist. Skipping build.")
-                    skip_build = True
-                    subprocess.run(
-                        compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "rm", "-f"],
-                        capture_output=True, timeout=30
-                    )
-            except (subprocess.TimeoutExpired, Exception):
-                pass
-
-        if not skip_build:
-            print("\nBuilding containers...")
-            result = run_compose(["build"], check=False, show_output=True)
-            if result.returncode != 0:
-                raise RuntimeError("Failed to build containers")
-
-        print("\nStarting cluster...")
-        result = run_compose(["up", "-d"], check=False, show_output=True)
-        if result.returncode != 0:
-            raise RuntimeError("Failed to start cluster")
-
-        # Wait for all nodes to become healthy
-        print("\nWaiting for nodes to become healthy...")
-        for name, endpoints in NODES.items():
-            print(f"  Waiting for {name}...")
-            if not wait_for_healthy(f"{endpoints['metrics']}/metrics", timeout=STARTUP_TIMEOUT):
-                print(f"  ERROR: {name} did not become healthy")
-                run_compose(["logs", "--tail=50"], check=False, show_output=True)
-                raise RuntimeError(f"{name} did not become healthy")
-            print(f"  {name} is healthy")
-
-        # Register backends on all nodes
-        print("\nRegistering backends on all nodes...")
-        for node_name, node_endpoints in NODES.items():
-            print(f"  Registering on {node_name}...")
-            if not register_backends(node_endpoints["api"]):
-                raise RuntimeError(f"Failed to register backends on {node_name}")
-
-        # Wait for gossip
-        print("\nWaiting for gossip connections...")
-        time.sleep(3)
-
-        print("\nCluster is ready for load-aware routing tests")
-        print("=" * 70 + "\n")
-
-    @classmethod
-    def tearDownClass(cls):
-        """Tear down the Docker Compose cluster."""
-        print("\n" + "=" * 70)
-        print("Tearing down test cluster...")
-        print("=" * 70)
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-        print("Cleanup complete")
+    # Unique compose project so this unittest-style suite is isolated from
+    # other test files' clusters at the compose-project level.
+    PROJECT_NAME = "ranvier-load-aware-test"
+    # The pre-migration setUpClass registered backends on every node during
+    # bring-up.  Opt into the ClusterTestCase auto-registration path to
+    # preserve that behavior.
+    AUTO_REGISTER_BACKENDS = True
 
     # =========================================================================
     # Load-Aware Routing Tests
@@ -736,7 +492,7 @@ class LoadAwareRoutingTest(unittest.TestCase):
             futures = []
             for _ in range(NORMAL_LOAD_USERS * REQUESTS_PER_USER):
                 futures.append(executor.submit(
-                    send_chat_request, api_url, same_prompt
+                    send_chat_request_with_ttft, api_url, same_prompt
                 ))
 
             for future in concurrent.futures.as_completed(futures):
@@ -812,6 +568,7 @@ class LoadAwareRoutingTest(unittest.TestCase):
 # =============================================================================
 # Main
 # =============================================================================
+
 
 def main():
     """Run the load-aware routing integration tests."""
