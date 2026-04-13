@@ -127,31 +127,11 @@ def send_chat_request(
     return status, body, headers
 
 
-def _docker_cp_write(container: str, container_path: str, content: str) -> bool:
-    """Write *content* to *container_path* inside a running container.
-
-    The Ranvier containers use ``read_only: true``, so shell-level writes
-    (``echo >``, ``printf >``, heredocs) silently fail.  ``docker cp``
-    writes at the Docker daemon level and bypasses the read-only mount.
-    """
-    host_tmp = f"/tmp/_ranvier_cp_{os.getpid()}.tmp"
-    try:
-        with open(host_tmp, "w") as f:
-            f.write(content)
-        result = subprocess.run(
-            ["docker", "cp", host_tmp, f"{container}:{container_path}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            print(f"    docker cp to {container}:{container_path} failed: "
-                  f"{result.stderr.strip()}")
-            return False
-        return True
-    finally:
-        try:
-            os.unlink(host_tmp)
-        except OSError:
-            pass
+# Path where Ranvier loads its YAML config inside the container.
+# The containers use read_only: true so /app/ is not writable, but /tmp/
+# is a tmpfs mount.  docker-compose.test.yml passes
+# ``--config /tmp/ranvier.yaml`` so reload_config() reads from here.
+_CONTAINER_CONFIG_PATH = "/tmp/ranvier.yaml"
 
 
 # =============================================================================
@@ -449,7 +429,11 @@ class NegativePathTest(ClusterTestCase):
         invalid_yaml = "{{{{invalid: yaml: [unterminated"
 
         print("  Writing invalid YAML to container config...")
-        _docker_cp_write(container, "/app/ranvier.yaml", invalid_yaml)
+        subprocess.run(
+            ["docker", "exec", container, "sh", "-c",
+             f"echo '{invalid_yaml}' > {_CONTAINER_CONFIG_PATH}"],
+            capture_output=True, text=True, timeout=10
+        )
 
         try:
             # Send SIGHUP to trigger config reload
@@ -486,12 +470,13 @@ class NegativePathTest(ClusterTestCase):
             )
 
         finally:
-            # Restore env-var-only defaults by writing an empty config file.
-            # (The container's read_only: true FS prevents rm -f, but an
-            # empty YAML causes RanvierConfig::load() to fall back to
-            # env var overrides — identical to no-file behaviour.)
+            # Remove the config file to restore env-var-only defaults.
+            # /tmp/ is writable (tmpfs), so rm works here.
             print("  Restoring original config state...")
-            _docker_cp_write(container, "/app/ranvier.yaml", "")
+            subprocess.run(
+                ["docker", "exec", container, "rm", "-f", _CONTAINER_CONFIG_PATH],
+                capture_output=True, text=True, timeout=10
+            )
 
             # Send SIGHUP again to reload (will fall back to defaults + env vars)
             subprocess.run(
@@ -530,11 +515,16 @@ class NegativePathTest(ClusterTestCase):
             "  requests_per_second: 2\n"
             "  burst_size: 1\n"
         )
-        _docker_cp_write(container, "/app/ranvier.yaml", rate_limit_yaml)
+        subprocess.run(
+            ["docker", "exec", "-i", container, "sh", "-c",
+             f"cat > {_CONTAINER_CONFIG_PATH}"],
+            input=rate_limit_yaml,
+            capture_output=True, text=True, timeout=10
+        )
 
         # Verify the file was written correctly
         verify_result = subprocess.run(
-            ["docker", "exec", container, "cat", "/app/ranvier.yaml"],
+            ["docker", "exec", container, "cat", _CONTAINER_CONFIG_PATH],
             capture_output=True, text=True, timeout=10
         )
         print(f"    Written config:\n{verify_result.stdout.strip()}")
@@ -644,10 +634,12 @@ class NegativePathTest(ClusterTestCase):
                 )
 
         finally:
-            # Overwrite with empty config to restore env-var-only defaults.
-            # (rm -f fails on read_only: true FS; empty YAML has same effect.)
+            # Remove the config file to restore env-var-only defaults
             print("\n  Removing config file (restoring env-var-only defaults)...")
-            _docker_cp_write(container, "/app/ranvier.yaml", "")
+            subprocess.run(
+                ["docker", "exec", container, "rm", "-f", _CONTAINER_CONFIG_PATH],
+                capture_output=True, text=True, timeout=10
+            )
             subprocess.run(
                 ["docker", "kill", "--signal=HUP", container],
                 capture_output=True, text=True, timeout=10
@@ -711,7 +703,10 @@ class NegativePathTest(ClusterTestCase):
             if pre_status != 200:
                 print(f"  Ranvier returning {pre_status}, clearing residual rate limit config...")
                 node1_container = CONTAINER_NAMES["node1"]
-                _docker_cp_write(node1_container, "/app/ranvier.yaml", "")
+                subprocess.run(
+                    ["docker", "exec", node1_container, "rm", "-f", _CONTAINER_CONFIG_PATH],
+                    capture_output=True, text=True, timeout=10
+                )
                 time.sleep(12)  # Wait for RELOAD_COOLDOWN to expire
                 subprocess.run(
                     ["docker", "kill", "--signal=HUP", node1_container],
