@@ -1448,6 +1448,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // count, producing wildly incorrect boundaries — skip this strategy
         // and fall through to Strategy 4 (system prefix tokenization), which
         // tokenizes the system prefix independently and is truncation-safe.
+        //
+        // IMPORTANT: Strategy 4 depends on the tokenization cache absorbing
+        // repeated system prefixes.  If the system prefix text exceeds
+        // tokenization_cache_max_text, every request will make a blocking FFI
+        // call (5-13ms).  Ensure tokenization_cache_max_text >= the largest
+        // expected system prefix size.
         if (!prefix_boundary_set && text_extraction.has_value() && !was_truncated) {
             auto ratio_result = detect_boundaries_by_char_ratio(
                 tokens.size(), *text_extraction, bd_config);
@@ -1546,11 +1552,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
                 // Use async tokenization to avoid blocking reactor on cache miss.
                 // System messages have ~90%+ cache hit rate so this is usually instant.
+                // NOTE: If the system prefix exceeds tokenization_cache_max_text
+                // bytes, the result will NOT be cached and every request pays the
+                // full FFI cost (5-13ms).  Monitor cache_miss rate on this path.
                 auto sys_tok_result = co_await _tokenizer.local().encode_threaded_async(system_prefix_text);
                 if (sys_tok_result.cache_hit) {
                     metrics().record_tokenization_cache_hit();
                 } else {
                     metrics().record_tokenization_cache_miss();
+                    if (system_prefix_text.size() > 8192) {
+                        log_proxy.debug("[{}] Strategy 4: system prefix is {}B "
+                                       "(cache miss on large text — verify "
+                                       "tokenization_cache_max_text is adequate)",
+                                       request_id, system_prefix_text.size());
+                    }
                 }
                 const auto& system_tokens = sys_tok_result.tokens;
                 // Only use as boundary if system tokens meet minimum threshold
