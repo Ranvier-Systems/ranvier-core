@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
+.PHONY: all build clean test test-unit test-integration test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
 
 # Default target
 all: build
@@ -54,19 +54,62 @@ test-integration:
 		echo "Installing Python 'requests' library..."; \
 		pip3 install --user requests || pip install --user requests; \
 	fi
+	@if ! python3 -c "import pytest" 2>/dev/null; then \
+		echo "Installing Python 'pytest' library..."; \
+		pip3 install --user pytest || pip install --user pytest; \
+	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/4: Cluster Behavior ==="
+	@echo "=== Test Suite 1/6: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/4: Prefix Routing ==="
+	@echo "=== Test Suite 2/6: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/4: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/6: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
 	@echo ""
-	@echo "=== Test Suite 4/4: Negative Paths ==="
+	@echo "=== Test Suite 4/6: Negative Paths ==="
 	@python3 tests/integration/test_negative_paths.py
+	@echo ""
+	@echo "=== Test Suite 5/6: Load-Aware Routing ==="
+	@python3 tests/integration/test_load_aware_routing.py
+	@echo ""
+	@echo "=== Test Suite 6/6: Intelligence Layer ==="
+	@python3 -m pytest tests/integration/test_intelligence_layer.py -v -s
+
+# Run integration tests via pytest (single command, JUnit XML output for CI)
+# pytest discovers both unittest.TestCase and native pytest tests automatically
+test-integration-ci:
+	@echo "======================================"
+	@echo "Running Integration Tests (pytest/CI)"
+	@echo "======================================"
+	@echo ""
+	@echo "Prerequisites:"
+	@echo "  - Docker with Compose (plugin or standalone)"
+	@echo "  - Python 3 with 'requests' and 'pytest' libraries"
+	@echo ""
+	@if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1) && \
+	    ! command -v docker-compose >/dev/null 2>&1; then \
+		echo "Error: Neither 'docker compose' nor 'docker-compose' found"; \
+		exit 1; \
+	fi
+	@if ! python3 -c "import requests" 2>/dev/null; then \
+		echo "Installing Python 'requests' library..."; \
+		pip3 install --user requests || pip install --user requests; \
+	fi
+	@if ! python3 -c "import pytest" 2>/dev/null; then \
+		echo "Installing Python 'pytest' library..."; \
+		pip3 install --user pytest || pip install --user pytest; \
+	fi
+	@echo "Running all integration tests via pytest..."
+	@python3 -m pytest tests/integration/test_cluster.py \
+		tests/integration/test_prefix_routing.py \
+		tests/integration/test_graceful_shutdown.py \
+		tests/integration/test_negative_paths.py \
+		tests/integration/test_load_aware_routing.py \
+		tests/integration/test_intelligence_layer.py \
+		-v -s --tb=short --junitxml=integration-results.xml
 
 # Helper to detect docker compose command
 DOCKER_COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; fi)
@@ -618,10 +661,11 @@ help:
 	@echo "  make docker-build   - Build production Docker image"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  make test           - Run all tests (currently: unit tests)"
-	@echo "  make test-unit      - Run unit tests"
-	@echo "  make test-integration - Run multi-node integration tests"
-	@echo "  make test-validation  - Run validation suite unit tests"
+	@echo "  make test              - Run all tests (currently: unit tests)"
+	@echo "  make test-unit         - Run unit tests"
+	@echo "  make test-integration  - Run multi-node integration tests (sequential)"
+	@echo "  make test-integration-ci - Run integration tests via pytest (JUnit XML output)"
+	@echo "  make test-validation   - Run validation suite unit tests"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"

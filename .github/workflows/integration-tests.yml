@@ -1,0 +1,185 @@
+# End-to-end integration tests for Ranvier Core
+# Runs the full pytest integration suite against a 3-node Docker Compose cluster
+# with mock backends, producing JUnit XML results for the Actions test summary.
+#
+# Triggers:
+#   - After Docker Publish workflow completes (tests the newly-pushed image)
+#   - Manual trigger via workflow_dispatch. To test a PR, open the Actions tab,
+#     select this workflow, click "Run workflow", pick the PR's branch, and
+#     enable "build_from_source".
+#
+# NOTE: Uses the pre-built ranvier image from GHCR by default to avoid long C++
+# compile times. When build_from_source=true, the image is rebuilt locally via
+# Dockerfile.production.fast against the pre-built base image.
+name: Integration Tests
+
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      build_from_source:
+        description: 'Build Ranvier image from the selected ref (required for PR branches; otherwise uses published :latest)'
+        required: false
+        type: boolean
+        default: false
+      test_filter:
+        description: 'Run specific test files (space-separated basenames, e.g. "test_cluster.py test_negative_paths.py"). Empty = all.'
+        required: false
+        type: string
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  RANVIER_IMAGE: ghcr.io/ranvier-systems/ranvier:latest
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
+
+jobs:
+  integration:
+    # Run on manual dispatch unconditionally, or after a successful Docker Publish
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pre-built Ranvier image
+        if: ${{ !inputs.build_from_source }}
+        run: |
+          echo "Pulling pre-built Ranvier image from GHCR..."
+          if docker pull ${{ env.RANVIER_IMAGE }}; then
+            echo "Successfully pulled ${{ env.RANVIER_IMAGE }}"
+            docker tag ${{ env.RANVIER_IMAGE }} ranvier:latest
+          else
+            echo "::error::Failed to pull pre-built image. Ensure docker-publish.yml has run, or use build_from_source=true."
+            exit 1
+          fi
+
+      - name: Build Ranvier image from source
+        if: ${{ inputs.build_from_source }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.production.fast
+          load: true
+          tags: ranvier:latest
+          cache-from: type=gha,scope=integration-app
+          cache-to: type=gha,mode=max,scope=integration-app
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            UID=10001
+            GID=10001
+
+      - name: Build supporting images
+        run: |
+          echo "Building mock-backend image..."
+          docker build -t ranvier-mock-backend:latest -f tests/integration/Dockerfile.mock-backend tests/integration/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install requests pytest
+
+      - name: Start test environment
+        run: |
+          echo "Starting Ranvier 3-node test cluster with mock backends..."
+          docker compose -f docker-compose.test.yml up -d --wait
+
+          echo "Waiting for services to be ready..."
+          sleep 10
+
+          docker compose -f docker-compose.test.yml ps
+
+          for i in 1 2 3; do
+            echo "Checking ranvier$i health..."
+            timeout 30 bash -c "until curl -sf http://172.28.2.$i:8080/health > /dev/null 2>&1; do sleep 1; done" || {
+              echo "::error::ranvier$i failed health check"
+              docker compose -f docker-compose.test.yml logs ranvier$i
+              exit 1
+            }
+            echo "ranvier$i is healthy"
+          done
+
+      - name: Run integration tests
+        id: tests
+        run: |
+          # Determine which test files to run
+          if [ -n "${{ inputs.test_filter }}" ]; then
+            TEST_FILES=""
+            for f in ${{ inputs.test_filter }}; do
+              TEST_FILES="$TEST_FILES tests/integration/$f"
+            done
+            echo "Running filtered tests: $TEST_FILES"
+          else
+            TEST_FILES="tests/integration/test_cluster.py \
+              tests/integration/test_prefix_routing.py \
+              tests/integration/test_graceful_shutdown.py \
+              tests/integration/test_negative_paths.py \
+              tests/integration/test_load_aware_routing.py \
+              tests/integration/test_intelligence_layer.py"
+            echo "Running all integration tests"
+          fi
+
+          python -m pytest $TEST_FILES \
+            -v -s --tb=short \
+            --junitxml=integration-results.xml \
+            2>&1 | tee integration-test.log
+
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "test_exit_code=$TEST_EXIT" >> $GITHUB_OUTPUT
+          exit $TEST_EXIT
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: |
+            integration-results.xml
+            integration-test.log
+          retention-days: 30
+
+      - name: Publish test summary
+        uses: dorny/test-reporter@v2
+        if: always() && hashFiles('integration-results.xml') != ''
+        with:
+          name: Integration Test Results
+          path: integration-results.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== Ranvier Node Logs ==="
+          docker compose -f docker-compose.test.yml logs ranvier1 ranvier2 ranvier3 --tail=100
+          echo ""
+          echo "=== Mock Backend Logs ==="
+          docker compose -f docker-compose.test.yml logs backend1 backend2 --tail=50
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f docker-compose.test.yml down -v --remove-orphans
