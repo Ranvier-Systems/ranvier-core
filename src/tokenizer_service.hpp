@@ -31,7 +31,10 @@ class ShardLoadBalancer;
 struct TokenizationCacheConfig {
     bool enabled = true;           // Enable/disable caching
     size_t max_entries = 1000;     // Maximum cache entries (Rule #4: bounded container)
-    size_t max_text_length = 8192; // Don't cache texts longer than this (avoid memory bloat)
+    size_t max_text_length = 65536; // Don't cache texts longer than this
+    // Aligned with ThreadPoolTokenizationConfig::max_text_length.  Old default
+    // of 8192 prevented caching large system prefixes used in boundary detection,
+    // causing 5-7ms P50 regression at 20+ concurrent users.
 };
 
 /**

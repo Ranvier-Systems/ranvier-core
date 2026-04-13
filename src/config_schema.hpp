@@ -288,7 +288,11 @@ struct AssetsConfig {
     // Expected hit rates: system messages 80-90%, role tags 95%+
     bool tokenization_cache_enabled = true;    // Enable LRU cache for tokenization results
     size_t tokenization_cache_size = 1000;     // Maximum cache entries (Rule #4: bounded)
-    size_t tokenization_cache_max_text = 8192; // Don't cache texts longer than this (bytes)
+    size_t tokenization_cache_max_text = 65536; // Don't cache texts longer than this (bytes)
+    // NOTE: Previous default of 8192 caused boundary detection regression — large
+    // system prefixes (2K-8K tokens) exceeded the limit and were never cached,
+    // forcing a blocking FFI call on every request.  Aligned with thread pool
+    // max_text_length (65536).  Worst-case memory: 1000 entries × 64KB ≈ 64MB/shard.
 
     // Tokenizer thread pool settings
     // Offloads tokenization FFI to dedicated OS threads, fully freeing reactors.
