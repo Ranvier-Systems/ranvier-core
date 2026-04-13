@@ -13,6 +13,11 @@ This test suite validates failure handling and resilience behaviors:
 All tests use Docker Compose (docker-compose.test.yml) with a 3-node cluster
 and mock backends, following the same pattern as the existing happy-path suites.
 
+The shared docker-compose harness (constants, helpers, lifecycle) lives in
+``tests/integration/conftest.py``.  This file only contains the
+negative-path-specific test methods and the network-partitioning helpers
+they share.  Any change to cluster bring-up / teardown belongs in conftest.
+
 Usage:
     python3 tests/integration/test_negative_paths.py
 
@@ -22,16 +27,14 @@ Requirements:
 """
 
 import concurrent.futures
-import json
 import os
-import re
 import socket
 import subprocess
 import sys
 import time
 import unittest
 import urllib.parse
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 try:
     import requests
@@ -39,148 +42,23 @@ except ImportError:
     print("Error: 'requests' library is required. Install with: pip install requests")
     sys.exit(1)
 
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.test.yml")
-PROJECT_NAME = "ranvier-negative-path-test"
-
-
-def get_docker_host() -> str:
-    """Get the hostname to reach Docker-exposed ports."""
-    try:
-        socket.gethostbyname("host.docker.internal")
-        return "host.docker.internal"
-    except socket.gaierror:
-        return "localhost"
-
-
-DOCKER_HOST = get_docker_host()
-
-# Node endpoints (mapped ports from docker-compose)
-NODES = {
-    "node1": {"api": f"http://{DOCKER_HOST}:8081", "metrics": f"http://{DOCKER_HOST}:9181"},
-    "node2": {"api": f"http://{DOCKER_HOST}:8082", "metrics": f"http://{DOCKER_HOST}:9182"},
-    "node3": {"api": f"http://{DOCKER_HOST}:8083", "metrics": f"http://{DOCKER_HOST}:9183"},
-}
-
-# Backend addresses (as seen from inside the Docker network)
-BACKENDS = {
-    1: {"ip": "172.28.1.10", "port": 8000},
-    2: {"ip": "172.28.1.11", "port": 8000},
-}
-
-# Container names used in docker-compose
-CONTAINER_NAMES = {
-    "node1": "ranvier1",
-    "node2": "ranvier2",
-    "node3": "ranvier3",
-    "backend1": "backend1",
-    "backend2": "backend2",
-}
-
-# Timeouts
-STARTUP_TIMEOUT = 60
-PEER_TIMEOUT = 10
-REQUEST_TIMEOUT = 30
+from conftest import (
+    ClusterTestCase,
+    COMPOSE_FILE,
+    CONTAINER_NAMES,
+    DOCKER_HOST,
+    NODES,
+    PEER_TIMEOUT,
+    REQUEST_TIMEOUT,
+    get_compose_cmd,
+    get_metric_value,
+    send_chat_request as _conftest_send_chat_request,
+)
 
 
 # =============================================================================
-# Docker Compose Helpers
+# File-specific helpers
 # =============================================================================
-
-COMPOSE_CMD = None
-
-
-def get_compose_cmd() -> List[str]:
-    """Detect and return the docker compose command."""
-    global COMPOSE_CMD
-    if COMPOSE_CMD is not None:
-        return COMPOSE_CMD
-
-    # Try 'docker compose' (plugin) first
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker", "compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    # Fall back to 'docker-compose' (standalone)
-    try:
-        result = subprocess.run(
-            ["docker-compose", "--version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker-compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    raise RuntimeError(
-        "Neither 'docker compose' nor 'docker-compose' found. "
-        "Please install Docker with Compose plugin or docker-compose standalone."
-    )
-
-
-def run_compose(args: List[str], check: bool = True, show_output: bool = False) -> subprocess.CompletedProcess:
-    """Run docker-compose command with the test configuration."""
-    compose_cmd = get_compose_cmd()
-    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME] + args
-    print(f"  Running: {' '.join(cmd)}")
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if show_output or result.returncode != 0:
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-
-    if check and result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-
-    return result
-
-
-def check_container_running(container_name: str) -> bool:
-    """Check if a container is still running."""
-    try:
-        compose_cmd = get_compose_cmd()
-        result = subprocess.run(
-            compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "ps", "-q", container_name],
-            capture_output=True,
-            text=True
-        )
-        return result.returncode == 0 and len(result.stdout.strip()) > 0
-    except (FileNotFoundError, RuntimeError):
-        return True
-
-
-def wait_for_healthy(url: str, timeout: int = 60, container_name: str = None) -> bool:
-    """Wait for an endpoint to become healthy."""
-    start = time.time()
-    while time.time() - start < timeout:
-        if container_name and not check_container_running(container_name):
-            print(f"    Container {container_name} has exited!")
-            return False
-        try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(1)
-    return False
 
 
 def docker_network_disconnect(network: str, container: str) -> bool:
@@ -208,12 +86,12 @@ def docker_network_connect(network: str, container: str, ip: str = None) -> bool
         return False
 
 
-def get_docker_network_name() -> str:
+def get_docker_network_name(project_name: str) -> str:
     """Get the actual Docker network name for the test project.
 
     Docker Compose creates networks with the project name prefix.
     The network defined in docker-compose.test.yml is 'ranvier-test',
-    so the full name is '{PROJECT_NAME}_ranvier-test'.
+    so the full name is '{project_name}_ranvier-test'.
     """
     try:
         result = subprocess.run(
@@ -221,66 +99,11 @@ def get_docker_network_name() -> str:
             capture_output=True, text=True, timeout=10
         )
         for line in result.stdout.strip().split("\n"):
-            if PROJECT_NAME in line and "ranvier-test" in line:
+            if project_name in line and "ranvier-test" in line:
                 return line.strip()
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
-    return f"{PROJECT_NAME}_ranvier-test"
-
-
-# =============================================================================
-# Metrics Helpers
-# =============================================================================
-
-def get_metric_value(metrics_url: str, metric_name: str, retries: int = 3) -> Optional[float]:
-    """Extract a specific metric value from Prometheus endpoint."""
-    for attempt in range(retries):
-        try:
-            resp = requests.get(f"{metrics_url}/metrics", timeout=5)
-            if resp.status_code != 200:
-                if attempt < retries - 1:
-                    time.sleep(1)
-                    continue
-                return None
-
-            for line in resp.text.split("\n"):
-                if line.startswith("#"):
-                    continue
-                if metric_name in line:
-                    match = re.search(r"(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*$", line)
-                    if match:
-                        return float(match.group(1))
-            return None
-        except requests.exceptions.RequestException:
-            if attempt < retries - 1:
-                time.sleep(1)
-            else:
-                return None
-    return None
-
-
-# =============================================================================
-# Request Helpers
-# =============================================================================
-
-def register_backends(api_url: str) -> bool:
-    """Register all backends on a node. Returns True if successful."""
-    for backend_id, backend_info in BACKENDS.items():
-        url = (
-            f"{api_url}/admin/backends"
-            f"?id={backend_id}"
-            f"&ip={backend_info['ip']}"
-            f"&port={backend_info['port']}"
-        )
-        try:
-            resp = requests.post(url, timeout=10)
-            if resp.status_code != 200:
-                print(f"    Failed to register backend {backend_id}: {resp.text}")
-                return False
-        except requests.exceptions.RequestException as e:
-            print(f"    Failed to register backend {backend_id}: {e}")
-            return False
-    return True
+    return f"{project_name}_ranvier-test"
 
 
 def send_chat_request(
@@ -288,136 +111,45 @@ def send_chat_request(
     prompt: str = "test",
     timeout: int = REQUEST_TIMEOUT
 ) -> Tuple[int, str, Dict[str, str]]:
-    """Send a chat completion request. Returns (status_code, body, headers)."""
-    payload = {
-        "model": "test-model",
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": True
-    }
-    try:
-        resp = requests.post(
-            f"{api_url}/v1/chat/completions",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            stream=True,
-            timeout=timeout
-        )
+    """Send a chat completion request. Returns (status_code, body, headers).
 
-        response_text = ""
-        if resp.status_code == 200:
-            for line in resp.iter_lines():
-                if line:
-                    decoded = line.decode("utf-8")
-                    if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                        try:
-                            chunk = json.loads(decoded[6:])
-                            if "choices" in chunk and chunk["choices"]:
-                                delta = chunk["choices"][0].get("delta", {})
-                                if "content" in delta:
-                                    response_text += delta["content"]
-                        except json.JSONDecodeError:
-                            pass
-        else:
-            response_text = resp.text
+    Thin wrapper around the conftest helper -- maps the conftest exception
+    status ``0`` to ``-1`` to preserve the original local semantics.
+    """
+    status, body, headers = _conftest_send_chat_request(
+        api_url,
+        [{"role": "user", "content": prompt}],
+        timeout=timeout,
+        retries=1,
+    )
+    if status == 0:
+        status = -1
+    return status, body, headers
 
-        return resp.status_code, response_text, dict(resp.headers)
 
-    except requests.exceptions.RequestException as e:
-        return -1, str(e), {}
+# Path where Ranvier loads its YAML config inside the container.
+# The containers use read_only: true so /app/ is not writable, but /tmp/
+# is a tmpfs mount.  docker-compose.test.yml passes
+# ``--config /tmp/ranvier.yaml`` so reload_config() reads from here.
+_CONTAINER_CONFIG_PATH = "/tmp/ranvier.yaml"
 
 
 # =============================================================================
 # Test Suite
 # =============================================================================
 
-class NegativePathTest(unittest.TestCase):
+class NegativePathTest(ClusterTestCase):
     """Integration tests for negative/failure paths."""
+
+    PROJECT_NAME = "ranvier-negative-path-test"
+    AUTO_REGISTER_BACKENDS = True
 
     @classmethod
     def setUpClass(cls):
-        """Start the Docker Compose cluster."""
-        print("\n" + "=" * 70)
-        print("Setting up test cluster for Negative Path tests...")
-        print("=" * 70)
-
-        # Ensure clean state
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-
-        # Check for pre-built images
-        skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
-
-        if not skip_build:
-            try:
-                compose_cmd = get_compose_cmd()
-                create_result = subprocess.run(
-                    compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
-                                   "create", "--no-build"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if create_result.returncode == 0:
-                    print("\nDocker images already exist. Skipping build.")
-                    skip_build = True
-                    subprocess.run(
-                        compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "rm", "-f"],
-                        capture_output=True, timeout=30
-                    )
-            except (subprocess.TimeoutExpired, Exception):
-                pass
-
-        if not skip_build:
-            print("\nBuilding containers...")
-            result = run_compose(["build"], check=False, show_output=True)
-            if result.returncode != 0:
-                raise RuntimeError("Failed to build containers")
-
-        print("\nStarting cluster...")
-        result = run_compose(["up", "-d"], check=False, show_output=True)
-        if result.returncode != 0:
-            raise RuntimeError("Failed to start cluster")
-
-        # Wait for all nodes to become healthy
-        print("\nWaiting for nodes to become healthy...")
-        all_healthy = True
-        for name, endpoints in NODES.items():
-            container = CONTAINER_NAMES.get(name)
-            print(f"  Waiting for {name}...")
-            if not wait_for_healthy(f"{endpoints['metrics']}/metrics", timeout=STARTUP_TIMEOUT, container_name=container):
-                print(f"  ERROR: {name} did not become healthy")
-                all_healthy = False
-            else:
-                print(f"  {name} is healthy")
-
-        if not all_healthy:
-            print("\nContainer logs:")
-            run_compose(["logs", "--tail=50"], check=False, show_output=True)
-            raise RuntimeError("Not all nodes became healthy")
-
-        # Register backends on all nodes
-        print("\nRegistering backends on all nodes...")
-        for node_name, node_endpoints in NODES.items():
-            print(f"  Registering on {node_name}...")
-            if not register_backends(node_endpoints["api"]):
-                raise RuntimeError(f"Failed to register backends on {node_name}")
-
-        # Wait for gossip connections
-        print("\nWaiting for gossip connections...")
-        time.sleep(5)
-
-        # Discover the actual Docker network name
-        cls.docker_network = get_docker_network_name()
+        super().setUpClass()
+        cls.docker_network = get_docker_network_name(cls.PROJECT_NAME)
         print(f"\nDocker network: {cls.docker_network}")
 
-        print("\nCluster is ready for negative path tests")
-        print("=" * 70 + "\n")
-
-    @classmethod
-    def tearDownClass(cls):
-        """Tear down the Docker Compose cluster."""
-        print("\n" + "=" * 70)
-        print("Tearing down test cluster...")
-        print("=" * 70)
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-        print("Cleanup complete")
 
     # =========================================================================
     # Test 1: Split-Brain Detection and Recovery
@@ -699,8 +431,7 @@ class NegativePathTest(unittest.TestCase):
         print("  Writing invalid YAML to container config...")
         subprocess.run(
             ["docker", "exec", container, "sh", "-c",
-             "cp /app/ranvier.yaml /app/ranvier.yaml.bak 2>/dev/null; "
-             f"echo '{invalid_yaml}' > /app/ranvier.yaml"],
+             f"echo '{invalid_yaml}' > {_CONTAINER_CONFIG_PATH}"],
             capture_output=True, text=True, timeout=10
         )
 
@@ -739,18 +470,11 @@ class NegativePathTest(unittest.TestCase):
             )
 
         finally:
-            # Restore the original state: if a backup exists, restore it;
-            # otherwise remove the file entirely (it didn't exist before).
-            # The container originally has NO ranvier.yaml (config from env vars).
+            # Remove the config file to restore env-var-only defaults.
+            # /tmp/ is writable (tmpfs), so rm works here.
             print("  Restoring original config state...")
             subprocess.run(
-                ["docker", "exec", container, "sh", "-c",
-                 "if [ -f /app/ranvier.yaml.bak ]; then "
-                 "  cp /app/ranvier.yaml.bak /app/ranvier.yaml && "
-                 "  rm -f /app/ranvier.yaml.bak; "
-                 "else "
-                 "  rm -f /app/ranvier.yaml; "
-                 "fi"],
+                ["docker", "exec", container, "rm", "-f", _CONTAINER_CONFIG_PATH],
                 capture_output=True, text=True, timeout=10
             )
 
@@ -792,14 +516,15 @@ class NegativePathTest(unittest.TestCase):
             "  burst_size: 1\n"
         )
         subprocess.run(
-            ["docker", "exec", container, "sh", "-c",
-             f"cat > /app/ranvier.yaml << 'RATEEOF'\n{rate_limit_yaml}RATEEOF"],
+            ["docker", "exec", "-i", container, "sh", "-c",
+             f"cat > {_CONTAINER_CONFIG_PATH}"],
+            input=rate_limit_yaml,
             capture_output=True, text=True, timeout=10
         )
 
         # Verify the file was written correctly
         verify_result = subprocess.run(
-            ["docker", "exec", container, "cat", "/app/ranvier.yaml"],
+            ["docker", "exec", container, "cat", _CONTAINER_CONFIG_PATH],
             capture_output=True, text=True, timeout=10
         )
         print(f"    Written config:\n{verify_result.stdout.strip()}")
@@ -909,10 +634,10 @@ class NegativePathTest(unittest.TestCase):
                 )
 
         finally:
-            # Remove the config file to restore env-var-only config (rate limit disabled)
+            # Remove the config file to restore env-var-only defaults
             print("\n  Removing config file (restoring env-var-only defaults)...")
             subprocess.run(
-                ["docker", "exec", container, "rm", "-f", "/app/ranvier.yaml"],
+                ["docker", "exec", container, "rm", "-f", _CONTAINER_CONFIG_PATH],
                 capture_output=True, text=True, timeout=10
             )
             subprocess.run(
@@ -979,7 +704,7 @@ class NegativePathTest(unittest.TestCase):
                 print(f"  Ranvier returning {pre_status}, clearing residual rate limit config...")
                 node1_container = CONTAINER_NAMES["node1"]
                 subprocess.run(
-                    ["docker", "exec", node1_container, "rm", "-f", "/app/ranvier.yaml"],
+                    ["docker", "exec", node1_container, "rm", "-f", _CONTAINER_CONFIG_PATH],
                     capture_output=True, text=True, timeout=10
                 )
                 time.sleep(12)  # Wait for RELOAD_COOLDOWN to expire
@@ -1211,7 +936,6 @@ class NegativePathTest(unittest.TestCase):
         )
 
         print("  PASSED: Server handles oversized requests gracefully")
-
 
 # =============================================================================
 # Main

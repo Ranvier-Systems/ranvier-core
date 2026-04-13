@@ -85,7 +85,7 @@ services:
       - RANVIER_AGENT_AUTO_DETECT=true
       - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
       - RANVIER_COST_ROUTING_ENABLED=true
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M", "--config", "/tmp/ranvier.yaml"]
     depends_on:
       - backend1
       - backend2
@@ -135,7 +135,7 @@ services:
       - RANVIER_AGENT_AUTO_DETECT=true
       - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
       - RANVIER_COST_ROUTING_ENABLED=true
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M", "--config", "/tmp/ranvier.yaml"]
     depends_on:
       - backend1
       - backend2
@@ -185,7 +185,7 @@ services:
       - RANVIER_AGENT_AUTO_DETECT=true
       - RANVIER_HEALTH_ENABLE_VLLM_METRICS=true
       - RANVIER_COST_ROUTING_ENABLED=true
-    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M"]
+    command: ["./ranvier_server", "--smp", "1", "--memory", "512M", "--reserve-memory", "128M", "--config", "/tmp/ranvier.yaml"]
     depends_on:
       - backend1
       - backend2

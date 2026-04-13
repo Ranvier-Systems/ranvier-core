@@ -22,15 +22,11 @@ Requirements:
 """
 
 import json
-import os
-import re
-import signal
 import subprocess
 import sys
-import threading
 import time
 import unittest
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -39,106 +35,24 @@ except ImportError:
     print("Error: 'requests' library required. Install: pip install requests")
     sys.exit(1)
 
+from conftest import (
+    ClusterTestCase,
+    NODES,
+    run_compose as _conftest_run_compose,
+    wait_for_healthy,
+)
 
-# Configuration
-COMPOSE_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "docker-compose.test.yml")
-PROJECT_NAME = "ranvier-integration-test"
+_PROJECT_NAME = "ranvier-graceful-shutdown-test"
 
-# Detect Docker host
-def get_docker_host() -> str:
-    """Get the hostname to reach Docker-exposed ports."""
-    import socket
-    try:
-        socket.gethostbyname("host.docker.internal")
-        return "host.docker.internal"
-    except socket.gaierror:
-        return "localhost"
 
-DOCKER_HOST = get_docker_host()
+def run_compose(args, check=True, **kwargs):
+    """Local wrapper that injects the project name for this test suite."""
+    return _conftest_run_compose(args, project_name=_PROJECT_NAME, check=check, **kwargs)
 
-# Node endpoints
-NODES = {
-    "node1": {"api": f"http://{DOCKER_HOST}:8081", "metrics": f"http://{DOCKER_HOST}:9181"},
-    "node2": {"api": f"http://{DOCKER_HOST}:8082", "metrics": f"http://{DOCKER_HOST}:9182"},
-    "node3": {"api": f"http://{DOCKER_HOST}:8083", "metrics": f"http://{DOCKER_HOST}:9183"},
-}
 
 # Test timeouts
 HEALTH_TIMEOUT = 5
 DRAIN_WAIT_TIMEOUT = 10
-STARTUP_TIMEOUT = 60
-
-# Detect docker compose command
-COMPOSE_CMD = None
-
-
-def get_compose_cmd() -> list:
-    """Detect and return the docker compose command."""
-    global COMPOSE_CMD
-    if COMPOSE_CMD is not None:
-        return COMPOSE_CMD
-
-    # Try 'docker compose' (plugin) first
-    try:
-        result = subprocess.run(
-            ["docker", "compose", "version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker", "compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    # Fall back to 'docker-compose' (standalone)
-    try:
-        result = subprocess.run(
-            ["docker-compose", "--version"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            COMPOSE_CMD = ["docker-compose"]
-            return COMPOSE_CMD
-    except FileNotFoundError:
-        pass
-
-    raise RuntimeError("Neither 'docker compose' nor 'docker-compose' found.")
-
-
-def run_compose(args: list, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess:
-    """Run docker-compose command with the test configuration."""
-    compose_cmd = get_compose_cmd()
-    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME] + args
-    print(f"  Running: {' '.join(cmd)}")
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-    if result.returncode != 0:
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
-
-    if check and result.returncode != 0:
-        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
-
-    return result
-
-
-def wait_for_healthy(url: str, timeout: int = STARTUP_TIMEOUT) -> bool:
-    """Wait for an endpoint to become healthy."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            resp = requests.get(url, timeout=HEALTH_TIMEOUT)
-            if resp.status_code == 200:
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(1)
-    return False
 
 
 def get_health_status(api_url: str) -> Tuple[int, Optional[str]]:
@@ -232,89 +146,11 @@ def get_container_logs(container_name: str, tail: int = 50) -> str:
         return ""
 
 
-class GracefulShutdownTest(unittest.TestCase):
+class GracefulShutdownTest(ClusterTestCase):
     """Integration tests for graceful shutdown lifecycle."""
 
-    @classmethod
-    def setUpClass(cls):
-        """Ensure cluster is running before tests."""
-        print("\n" + "=" * 60)
-        print("Graceful Shutdown Test Suite")
-        print("=" * 60)
-
-        # Check if cluster is already running
-        node1_api = NODES["node1"]["api"]
-        if wait_for_healthy(f"{node1_api}/health", timeout=5):
-            print("Cluster already running, using existing setup")
-            cls._cluster_started_by_us = False
-
-            # Ensure all nodes are healthy (node3 may have been stopped by previous tests)
-            for name, endpoints in NODES.items():
-                if not wait_for_healthy(f"{endpoints['api']}/health", timeout=5):
-                    print(f"  {name} not healthy, restarting...")
-                    container_name = name.replace("node", "ranvier")
-                    run_compose(["up", "-d", container_name], check=False)
-                    if not wait_for_healthy(f"{endpoints['api']}/health", timeout=30):
-                        print(f"  WARNING: {name} could not be restored")
-                    else:
-                        print(f"  {name} restored")
-                else:
-                    print(f"  {name} healthy")
-
-            time.sleep(1)  # Allow gossip to stabilize
-            return
-
-        # Start cluster
-        print("Starting test cluster...")
-        cls._cluster_started_by_us = True
-
-        run_compose(["down", "-v", "--remove-orphans"], check=False)
-
-        # Check for pre-built images
-        skip_build = os.environ.get("SKIP_BUILD", "").lower() in ("1", "true", "yes")
-
-        if not skip_build:
-            # Try to create containers without building to see if images exist
-            try:
-                compose_cmd = get_compose_cmd()
-                create_result = subprocess.run(
-                    compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME,
-                                   "create", "--no-build"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if create_result.returncode == 0:
-                    print("Docker images already exist. Skipping build.")
-                    skip_build = True
-                    # Clean up the created containers
-                    subprocess.run(
-                        compose_cmd + ["-f", COMPOSE_FILE, "-p", PROJECT_NAME, "rm", "-f"],
-                        capture_output=True, timeout=30
-                    )
-            except (subprocess.TimeoutExpired, Exception):
-                pass
-
-        if not skip_build:
-            print("Building images (set SKIP_BUILD=1 to skip)...")
-            run_compose(["build"], timeout=600)
-
-        print("Starting services...")
-        run_compose(["up", "-d", "backend1", "backend2", "ranvier1", "ranvier2", "ranvier3"])
-
-        # Wait for all nodes
-        for name, endpoints in NODES.items():
-            print(f"  Waiting for {name}...")
-            if not wait_for_healthy(f"{endpoints['api']}/health"):
-                raise RuntimeError(f"Node {name} failed to start")
-
-        print("Cluster ready")
-        time.sleep(2)  # Allow gossip to stabilize
-
-    @classmethod
-    def tearDownClass(cls):
-        """Clean up if we started the cluster."""
-        if getattr(cls, '_cluster_started_by_us', False):
-            print("\nStopping cluster...")
-            run_compose(["down", "-v", "--remove-orphans"], check=False)
+    PROJECT_NAME = "ranvier-graceful-shutdown-test"
+    AUTO_REGISTER_BACKENDS = True
 
     def setUp(self):
         """Verify cluster health before each test."""
