@@ -47,6 +47,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      checks: write
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -162,7 +164,7 @@ jobs:
           retention-days: 30
 
       - name: Publish test summary
-        uses: dorny/test-reporter@v2
+        uses: dorny/test-reporter@v3
         if: always() && hashFiles('integration-results.xml') != ''
         with:
           name: Integration Test Results
