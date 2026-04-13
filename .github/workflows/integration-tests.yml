@@ -104,28 +104,11 @@ jobs:
       - name: Install test dependencies
         run: pip install requests pytest
 
-      - name: Start test environment
-        run: |
-          echo "Starting Ranvier 3-node test cluster with mock backends..."
-          docker compose -f docker-compose.test.yml up -d --wait
-
-          echo "Waiting for services to be ready..."
-          sleep 10
-
-          docker compose -f docker-compose.test.yml ps
-
-          for i in 1 2 3; do
-            echo "Checking ranvier$i health..."
-            timeout 30 bash -c "until curl -sf http://172.28.2.$i:8080/health > /dev/null 2>&1; do sleep 1; done" || {
-              echo "::error::ranvier$i failed health check"
-              docker compose -f docker-compose.test.yml logs ranvier$i
-              exit 1
-            }
-            echo "ranvier$i is healthy"
-          done
-
       - name: Run integration tests
         id: tests
+        env:
+          # Images are already built/pulled — tell conftest to skip docker build
+          SKIP_BUILD: '1'
         run: |
           # Determine which test files to run
           if [ -n "${{ inputs.test_filter }}" ]; then
@@ -144,6 +127,7 @@ jobs:
             echo "Running all integration tests"
           fi
 
+          # conftest.py manages the cluster lifecycle (up/down) per test class
           python -m pytest $TEST_FILES \
             -v -s --tb=short \
             --junitxml=integration-results.xml \
@@ -175,13 +159,17 @@ jobs:
       - name: Dump logs on failure
         if: failure()
         run: |
-          echo "=== Ranvier Node Logs ==="
-          docker compose -f docker-compose.test.yml logs ranvier1 ranvier2 ranvier3 --tail=100
-          echo ""
-          echo "=== Mock Backend Logs ==="
-          docker compose -f docker-compose.test.yml logs backend1 backend2 --tail=50
+          # conftest.py uses these project names for cluster management
+          for project in ranvier-unittest ranvier-pytest-session; do
+            echo "=== Logs for project: $project ==="
+            docker compose -f docker-compose.test.yml -p "$project" logs --tail=100 2>/dev/null || true
+            echo ""
+          done
 
       - name: Cleanup
         if: always()
         run: |
-          docker compose -f docker-compose.test.yml down -v --remove-orphans
+          # Tear down clusters from both project names used by conftest.py
+          for project in ranvier-unittest ranvier-pytest-session; do
+            docker compose -f docker-compose.test.yml -p "$project" down -v --remove-orphans 2>/dev/null || true
+          done
