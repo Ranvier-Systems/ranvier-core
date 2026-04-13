@@ -22,7 +22,7 @@ protected:
 TEST_F(TokenizationCacheConfigTest, DefaultConfigIsEnabled) {
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.max_entries, 1000u);
-    EXPECT_EQ(config.max_text_length, 8192u);
+    EXPECT_EQ(config.max_text_length, 65536u);
 }
 
 TEST_F(TokenizationCacheConfigTest, ConfigCanBeCustomized) {
@@ -258,6 +258,109 @@ TEST_F(TokenizationCacheTextLengthTest, OneByteTooLongIsNotCached) {
     cache.insert(too_long, {1, 2, 3});
 
     EXPECT_EQ(cache.size(), 0u);
+}
+
+// =============================================================================
+// Large System Prefix Regression Tests
+// =============================================================================
+// Regression: before the max_text_length increase (8192 → 65536), large system
+// prefixes used in boundary detection Strategy 4 were silently rejected by the
+// cache, causing a blocking FFI call (5-13ms) on every request at ≥20 users.
+// These tests enforce that the default config caches texts representative of
+// real-world large system prefixes.
+
+class LargeSystemPrefixCacheTest : public ::testing::Test {
+protected:
+    // Use DEFAULT config — the point is to verify the default accommodates
+    // large system prefixes without requiring operator tuning.
+    TokenizationCacheConfig default_config;
+};
+
+TEST_F(LargeSystemPrefixCacheTest, DefaultMaxTextCoversLargeSystemPrefix) {
+    // A 2K-token system prefix at ~4 bytes/token ≈ 8KB text.
+    // This must be cacheable with the default config to prevent the
+    // boundary detection latency regression.
+    EXPECT_GE(default_config.max_text_length, 8192u)
+        << "Default max_text_length must accommodate 2K-token system prefixes "
+           "(~8KB text) to prevent boundary detection regression";
+}
+
+TEST_F(LargeSystemPrefixCacheTest, DefaultMaxTextCoversXLargeSystemPrefix) {
+    // An 8K-token system prefix at ~4 bytes/token ≈ 32KB text.
+    // Stress benchmarks generate prefixes up to 8K tokens.
+    EXPECT_GE(default_config.max_text_length, 32768u)
+        << "Default max_text_length must accommodate 8K-token system prefixes "
+           "(~32KB text) used in stress benchmarks";
+}
+
+TEST_F(LargeSystemPrefixCacheTest, CachesRealisticLargeSystemPrefix) {
+    TokenizationCache cache(default_config);
+
+    // Simulate a 16KB system prefix (4K tokens × ~4 bytes/token)
+    std::string large_prefix(16384, 'A');
+    std::vector<int32_t> tokens(4000);
+    for (int i = 0; i < 4000; ++i) tokens[i] = i;
+
+    cache.insert(large_prefix, tokens);
+    EXPECT_EQ(cache.size(), 1u)
+        << "16KB system prefix must be accepted by cache with default config";
+
+    auto result = cache.lookup(large_prefix);
+    ASSERT_NE(result, nullptr)
+        << "16KB system prefix must be retrievable after insert";
+    EXPECT_EQ(result->size(), 4000u);
+}
+
+TEST_F(LargeSystemPrefixCacheTest, CachesRealisticXLargeSystemPrefix) {
+    TokenizationCache cache(default_config);
+
+    // Simulate a 32KB system prefix (8K tokens × ~4 bytes/token)
+    std::string xlarge_prefix(32768, 'B');
+    std::vector<int32_t> tokens(8000);
+    for (int i = 0; i < 8000; ++i) tokens[i] = i;
+
+    cache.insert(xlarge_prefix, tokens);
+    EXPECT_EQ(cache.size(), 1u)
+        << "32KB system prefix must be accepted by cache with default config";
+
+    auto result = cache.lookup(xlarge_prefix);
+    ASSERT_NE(result, nullptr)
+        << "32KB system prefix must be retrievable after insert";
+    EXPECT_EQ(result->size(), 8000u);
+}
+
+TEST_F(LargeSystemPrefixCacheTest, OldDefaultWouldHaveRejectedLargePrefix) {
+    // Prove that the old default (8192) was the root cause: a cache configured
+    // with the old limit silently drops large prefixes.
+    TokenizationCacheConfig old_config;
+    old_config.max_text_length = 8192;  // The old default
+    TokenizationCache cache(old_config);
+
+    std::string large_prefix(16384, 'C');  // 16KB > 8192
+    cache.insert(large_prefix, {1, 2, 3});
+    EXPECT_EQ(cache.size(), 0u)
+        << "Old default (8192) would reject 16KB prefix — this was the regression";
+}
+
+TEST_F(LargeSystemPrefixCacheTest, MultipleLargePrefixesCoexist) {
+    // Stress benchmark generates 5 unique large prefixes.
+    // All 5 should fit in the cache simultaneously.
+    TokenizationCache cache(default_config);
+
+    for (int i = 0; i < 5; ++i) {
+        // Varying sizes: 8KB, 12KB, 16KB, 24KB, 32KB
+        size_t size = (i + 2) * 4096;
+        if (size > default_config.max_text_length) {
+            // Skip sizes exceeding the limit (tests the boundary)
+            continue;
+        }
+        std::string prefix(size, static_cast<char>('A' + i));
+        cache.insert(prefix, {static_cast<int32_t>(i)});
+    }
+
+    // All inserted entries should be present (cache has 1000 entry capacity)
+    EXPECT_GE(cache.size(), 4u)
+        << "At least 4 of the 5 benchmark-sized prefixes must be cacheable";
 }
 
 // =============================================================================
