@@ -326,8 +326,8 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Files:_ `tests/integration/conftest.py`, `tests/integration/test_cluster.py`, `tests/integration/test_intelligence_layer.py`
   _Complexity:_ Low
 
-- [ ] **Enhance mock backend capabilities**
-  _Description:_ Extend `mock_backend.py` with configurable latency injection, failure mode simulation (5xx, timeouts, connection resets), request logging endpoint (`/debug/requests`), and prefix echo mode.
+- [x] **Enhance mock backend capabilities** ✅
+  _Description:_ Added per-chunk latency injection (`MOCK_LATENCY_MS` env, `POST /admin/latency?ms=N`, `X-Mock-Latency-Ms` header), sticky failure-mode simulation (`POST /admin/failure-mode?mode=none|status_500|status_503|timeout|reset`, `X-Mock-Failure-Mode` header — `reset` flushes one partial SSE chunk then `shutdown(SHUT_RDWR)`+`close()` for truncation tests; `timeout` blocks 60s without writing), a bounded (cap 200) ring-buffer request log via `GET /debug/requests` + `DELETE /debug/requests`, and prefix-echo mode (`MOCK_PREFIX_ECHO=1` env, `X-Mock-Prefix-Echo: 1` header) where the first SSE chunk's `delta.content` is the first 32 chars of the last user message. All knobs default off; existing `Response from backend N` happy-path text is unchanged.
   _Files:_ `tests/integration/mock_backend.py`
   _Complexity:_ Medium
 
