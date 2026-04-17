@@ -179,6 +179,19 @@ public:
                     return static_cast<double>(_cache_hits) / static_cast<double>(total);
                 }),
 
+            seastar::metrics::make_counter("cache_hits_total", _cache_hits,
+                seastar::metrics::description("Total ART cache hits (prefix route found)")),
+            seastar::metrics::make_counter("cache_misses_total", _cache_misses,
+                seastar::metrics::description("Total ART cache misses (hash fallback used)")),
+
+            seastar::metrics::make_gauge("art_size",
+                seastar::metrics::description("Number of routes currently stored in the ART per shard"),
+                [this] { return static_cast<double>(_art_size); }),
+            seastar::metrics::make_counter("art_evictions_total", _art_evictions,
+                seastar::metrics::description("Total number of ART route evictions")),
+            seastar::metrics::make_counter("art_inserts_total", _art_inserts,
+                seastar::metrics::description("Total number of new routes inserted into ART")),
+
             // Per-priority request counters and active gauges
             seastar::metrics::make_gauge("proxy_requests_by_priority",
                 seastar::metrics::description("Total proxy requests by priority tier"),
@@ -317,6 +330,11 @@ public:
     void record_rate_limited() { _requests_rate_limited++; }
     void record_connection_error() { _requests_connection_error++; }
     void record_stale_connection_retry() { _stale_connection_retries++; }
+
+    // ART diagnostic metrics
+    void update_art_size(uint64_t size) { _art_size = size; }
+    void record_art_eviction() { _art_evictions++; }
+    void record_art_insert() { _art_inserts++; }
 
     // Cache hit/miss tracking for ranvier_cache_hit_ratio gauge
     // These are shard-local (lock-free) for hot path efficiency
@@ -621,6 +639,11 @@ private:
     // Shard-local for lock-free hot path performance
     uint64_t _cache_hits = 0;
     uint64_t _cache_misses = 0;
+
+    // ART diagnostic counters (shard-local, lock-free)
+    uint64_t _art_size = 0;
+    uint64_t _art_evictions = 0;
+    uint64_t _art_inserts = 0;
 
     // Radix tree lookup counters for efficiency tracking
     // Hits: lookup found a valid Backend

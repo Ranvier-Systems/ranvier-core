@@ -1569,14 +1569,37 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                 }
                 const auto& system_tokens = sys_tok_result.tokens;
                 // Only use as boundary if system tokens meet minimum threshold
-                // and are shorter than full tokens (otherwise it's not a prefix)
-                if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
-                    system_tokens.size() < tokens.size()) {
-                    prefix_boundary = system_tokens.size();
-                    prefix_boundary_set = true;
-                    metrics().record_prefix_boundary_used();
-                    log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
-                                    request_id, prefix_boundary);
+                // and are shorter than the effective token count.
+                //
+                // When partial tokenization is active (was_truncated), tokens.size()
+                // only reflects the truncated routing tokens (~prefix_token_length),
+                // NOT the full prompt.  A system message with 2000 tokens correctly
+                // exceeds 128 routing tokens — that doesn't mean "no prefix exists",
+                // it means the entire routing token window IS the prefix.  In that
+                // case, clamp the boundary to tokens.size() so learn_route_global
+                // stores exactly the routing tokens (all of which belong to the
+                // system message).
+                if (system_tokens.size() >= _config.min_prefix_boundary_tokens) {
+                    if (system_tokens.size() < tokens.size()) {
+                        prefix_boundary = system_tokens.size();
+                        prefix_boundary_set = true;
+                        metrics().record_prefix_boundary_used();
+                        log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
+                                        request_id, prefix_boundary);
+                    } else if (was_truncated && tokens.size() >= _config.min_prefix_boundary_tokens) {
+                        // Partial tokenization: system message spans the entire
+                        // routing window.  Clamp boundary to the routing token
+                        // count so the ART stores at a consistent depth derived
+                        // from the system prefix alone (no user-query tokens).
+                        prefix_boundary = tokens.size();
+                        prefix_boundary_set = true;
+                        metrics().record_prefix_boundary_used();
+                        log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens "
+                                       "(system prefix >= routing window, clamped)",
+                                       request_id, prefix_boundary);
+                    } else {
+                        metrics().record_prefix_boundary_skipped();
+                    }
                 } else {
                     metrics().record_prefix_boundary_skipped();
                 }
