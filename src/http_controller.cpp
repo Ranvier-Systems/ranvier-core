@@ -1568,15 +1568,17 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     }
                 }
                 const auto& system_tokens = sys_tok_result.tokens;
-                // Only use as boundary if system tokens meet minimum threshold
-                // and are shorter than full tokens (otherwise it's not a prefix)
-                if (system_tokens.size() >= _config.min_prefix_boundary_tokens &&
-                    system_tokens.size() < tokens.size()) {
-                    prefix_boundary = system_tokens.size();
+                auto s4_result = resolve_system_prefix_boundary(
+                    system_tokens.size(), tokens.size(), was_truncated, bd_config);
+                if (s4_result.detected) {
+                    prefix_boundary = s4_result.prefix_boundary;
                     prefix_boundary_set = true;
                     metrics().record_prefix_boundary_used();
-                    log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens (system messages)",
-                                    request_id, prefix_boundary);
+                    log_proxy.debug("[{}] Identified shared prefix boundary: {} tokens "
+                                   "(system prefix tokenization{})",
+                                   request_id, prefix_boundary,
+                                   (system_tokens.size() >= tokens.size()
+                                    ? ", clamped to routing window" : ""));
                 } else {
                     metrics().record_prefix_boundary_skipped();
                 }

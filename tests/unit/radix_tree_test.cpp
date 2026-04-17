@@ -689,6 +689,153 @@ TEST_F(RadixTreeBlockAlignmentTest, LargeBlockAlignment) {
 }
 
 // =============================================================================
+// Prefix Routing Consistency Tests
+// =============================================================================
+//
+// These model the exact scenario from the cache hit rate regression:
+// routes stored at an aligned boundary must be found by lookups with
+// varying token counts (longer, equal, or differently-suffixed).
+
+class RadixTreeRoutingConsistencyTest : public ::testing::Test {
+protected:
+    // Default block_alignment=16 matches production config
+    RadixTree tree;
+
+    // Generate a deterministic token vector of length n
+    std::vector<TokenId> make_tokens(size_t n, int32_t seed = 1) {
+        std::vector<TokenId> v;
+        v.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            v.push_back(static_cast<int32_t>(seed * 1000 + i));
+        }
+        return v;
+    }
+
+    // Same prefix, different suffix starting at `diverge_at`
+    std::vector<TokenId> make_tokens_divergent(size_t n, size_t diverge_at, int32_t seed = 1) {
+        auto v = make_tokens(n, seed);
+        for (size_t i = diverge_at; i < n; ++i) {
+            v[i] = static_cast<int32_t>(-(seed * 1000 + i));
+        }
+        return v;
+    }
+};
+
+TEST_F(RadixTreeRoutingConsistencyTest, LookupLongerThanStored) {
+    // Store at 128 tokens (aligned), lookup with 200 tokens sharing the same prefix
+    auto stored = make_tokens(128);
+    tree.insert(stored, 5);
+
+    // Lookup with a longer sequence that shares the first 128 tokens
+    auto longer = make_tokens(200);
+    auto result = tree.lookup(longer);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 5);
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, LookupExactLength) {
+    auto stored = make_tokens(128);
+    tree.insert(stored, 5);
+
+    auto result = tree.lookup(stored);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 5);
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, LookupShorterThanStored_NoMatch) {
+    // Store at 128 tokens. Lookup with only 64 tokens — no leaf at 64.
+    auto stored = make_tokens(128);
+    tree.insert(stored, 5);
+
+    auto shorter = make_tokens(64);
+    auto result = tree.lookup(shorter);
+
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, SameSystemPrefixDifferentUserQuery) {
+    // Models: two requests with identical system message (first 40 tokens)
+    // but different user queries (tokens 40+).  Route stored at 32 tokens
+    // (aligned from a 40-token boundary).  Both lookups should match.
+    auto req1 = make_tokens(128, /*seed=*/1);
+    auto req2 = make_tokens(128, /*seed=*/1);
+    // Diverge at token 40 (simulating different user queries)
+    for (size_t i = 40; i < 128; ++i) {
+        req2[i] = -req2[i];
+    }
+
+    // Store at 40-token boundary — alignment truncates to 32
+    std::vector<TokenId> prefix(req1.begin(), req1.begin() + 40);
+    tree.insert(prefix, 7);
+    EXPECT_EQ(tree.route_count(), 1u);
+
+    // Both requests should find the route at depth 32 via longest prefix match
+    auto r1 = tree.lookup(req1);
+    auto r2 = tree.lookup(req2);
+
+    ASSERT_TRUE(r1.has_value());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r1.value(), 7);
+    EXPECT_EQ(r2.value(), 7);
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, DivergentAfterAlignedBoundary) {
+    // Store at exactly 32 tokens (aligned boundary).  Two lookups diverge
+    // at token 33 but share tokens 0-31.  Both should hit.
+    auto route_tokens = make_tokens(32);
+    tree.insert(route_tokens, 3);
+
+    auto lookup_a = make_tokens(128, /*seed=*/1);
+    auto lookup_b = make_tokens_divergent(128, 33, /*seed=*/1);
+
+    ASSERT_TRUE(tree.lookup(lookup_a).has_value());
+    ASSERT_TRUE(tree.lookup(lookup_b).has_value());
+    EXPECT_EQ(tree.lookup(lookup_a).value(), 3);
+    EXPECT_EQ(tree.lookup(lookup_b).value(), 3);
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, MultipleSharedPrefixesDifferentBackends) {
+    // Five RAG prefixes, each stored at 128 tokens (aligned).
+    // Each should route to a different backend.
+    for (int i = 0; i < 5; ++i) {
+        auto prefix = make_tokens(128, /*seed=*/i + 1);
+        tree.insert(prefix, i + 1);
+    }
+    EXPECT_EQ(tree.route_count(), 5u);
+
+    // Lookups with longer sequences sharing the respective prefix
+    for (int i = 0; i < 5; ++i) {
+        auto query = make_tokens(200, /*seed=*/i + 1);
+        auto result = tree.lookup(query);
+        ASSERT_TRUE(result.has_value()) << "Prefix " << i << " not found";
+        EXPECT_EQ(result.value(), i + 1);
+    }
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, RouteUpdatePreservesConsistency) {
+    // Store route, then overwrite with different backend (simulates
+    // learn_route_global re-learning after load-aware redirect).
+    auto prefix = make_tokens(128);
+    tree.insert(prefix, 3);
+    EXPECT_EQ(tree.lookup(prefix).value(), 3);
+
+    tree.insert(prefix, 5);
+    EXPECT_EQ(tree.lookup(prefix).value(), 5);
+    EXPECT_EQ(tree.route_count(), 1u);
+}
+
+TEST_F(RadixTreeRoutingConsistencyTest, ShortTokensBelowAlignment_NotStored) {
+    // Tokens shorter than block_alignment (16) are not stored.
+    // This models short prompts (< 16 tokens) that miss the ART.
+    auto short_tokens = make_tokens(10);
+    tree.insert(short_tokens, 1);
+
+    EXPECT_EQ(tree.route_count(), 0u);
+    EXPECT_FALSE(tree.lookup(short_tokens).has_value());
+}
+
+// =============================================================================
 // LRU Infrastructure Tests (route_count, for_each_leaf, TTL, eviction)
 // =============================================================================
 

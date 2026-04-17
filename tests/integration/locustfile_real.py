@@ -2538,7 +2538,13 @@ class BenchmarkStats:
                     if bucket and bucket != "unknown":
                         self.ttft_cache_hit_by_bucket[bucket].append(metrics.ttft_ms)
                 else:
-                    # Different backend - cache miss (routing failure)
+                    # Different backend - cache miss (routing changed)
+                    # Update the expected backend to the new one so we
+                    # track the ART's CURRENT learned route, not the
+                    # stale first-request backend.  Without this update
+                    # the client-side hit rate stays artificially low
+                    # when the ART re-learns routes during warm-up.
+                    self.prefix_to_backend[metrics.prompt_prefix_hash] = metrics.backend_id
                     self.cache_misses += 1
                     self.ttft_cache_miss.append(metrics.ttft_ms)
                     metrics.is_cache_hit = False
