@@ -195,4 +195,51 @@ inline BoundaryDetectionResult detect_boundaries_by_char_ratio(
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Strategy 4: System Prefix Boundary from Independent Tokenization
+// ---------------------------------------------------------------------------
+// Given the token count of the system prefix (from independent tokenization)
+// and the routing token count, determine the prefix_boundary.
+//
+// Under partial tokenization the routing token count is capped at
+// ~prefix_token_length, which can be much smaller than the system message.
+// The old check `system_tokens < routing_tokens` fails in that case,
+// dropping the boundary entirely.  This function encapsulates the correct
+// logic for all combinations.
+//
+// Returns detected=false if:
+//   - system_token_count < min_prefix_boundary_tokens
+//   - system message is absent (system_token_count == 0)
+//   - routing_token_count < min_prefix_boundary_tokens (with truncation)
+inline BoundaryDetectionResult resolve_system_prefix_boundary(
+        size_t system_token_count,
+        size_t routing_token_count,
+        bool was_truncated,
+        const BoundaryDetectionConfig& config) {
+
+    BoundaryDetectionResult result;
+
+    if (system_token_count < config.min_prefix_boundary_tokens) {
+        return result;
+    }
+
+    if (system_token_count < routing_token_count) {
+        // Normal case: system prefix is shorter than the routing window.
+        result.prefix_boundary = system_token_count;
+        result.detected = true;
+    } else if (was_truncated && routing_token_count >= config.min_prefix_boundary_tokens) {
+        // Partial tokenization: the system message spans the entire routing
+        // window (or beyond).  All routing tokens belong to the system
+        // prefix.  Clamp the boundary to the routing token count so
+        // learn_route_global stores at a depth derived exclusively from
+        // system-prefix content.
+        result.prefix_boundary = routing_token_count;
+        result.detected = true;
+    }
+    // else: system_token_count >= routing_token_count but no truncation —
+    // the "system message" is the entire prompt, no useful prefix boundary.
+
+    return result;
+}
+
 } // namespace ranvier

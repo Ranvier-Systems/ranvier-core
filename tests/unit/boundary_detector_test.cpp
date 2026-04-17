@@ -420,3 +420,146 @@ TEST_F(ProportionalEstimateTest, ProportionalAccuracy) {
     // System boundary = char_ends[0] * ratio = 200 * 250/1000 = 50
     EXPECT_EQ(result.prefix_boundary, 50u);
 }
+
+// =============================================================================
+// Strategy 4: System Prefix Boundary Resolution Tests
+// =============================================================================
+//
+// These test the resolve_system_prefix_boundary() function which encapsulates
+// the condition logic for Strategy 4 (independent system prefix tokenization).
+// The key regression was that partial tokenization produces ~128 routing tokens
+// while the system message can be 2000+ tokens, causing the old
+// `system_tokens < routing_tokens` check to fail for large RAG prefixes.
+
+class SystemPrefixBoundaryTest : public ::testing::Test {
+protected:
+    BoundaryDetectionConfig config{false, 4};  // single-depth, min_tokens=4
+};
+
+// --- Normal case (no partial tokenization) ---
+
+TEST_F(SystemPrefixBoundaryTest, SystemShorterThanRouting) {
+    // System message: 40 tokens, routing: 200 tokens (full prompt)
+    auto result = resolve_system_prefix_boundary(40, 200, false, config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 40u);
+}
+
+TEST_F(SystemPrefixBoundaryTest, SystemEqualsRouting_NoTruncation) {
+    // System message IS the entire prompt (no user query)
+    auto result = resolve_system_prefix_boundary(200, 200, false, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, SystemLargerThanRouting_NoTruncation) {
+    // Edge case: system_tokens > routing_tokens without truncation
+    // (shouldn't happen in practice but must not crash)
+    auto result = resolve_system_prefix_boundary(300, 200, false, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+// --- Partial tokenization (the regression scenario) ---
+
+TEST_F(SystemPrefixBoundaryTest, LargeSystemWithPartialTokenization) {
+    // THE BUG: 2000-token RAG system message, 128 routing tokens from
+    // partial tokenization.  Old code: 2000 < 128 = false → skipped.
+    auto result = resolve_system_prefix_boundary(2000, 128, true, config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 128u);
+}
+
+TEST_F(SystemPrefixBoundaryTest, XLargeSystemWithPartialTokenization) {
+    // 8000-token system message (max RAG prefix in stress test)
+    auto result = resolve_system_prefix_boundary(8000, 128, true, config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 128u);
+}
+
+TEST_F(SystemPrefixBoundaryTest, SystemExactlyEqualsRouting_Truncated) {
+    // System message exactly matches the routing window
+    auto result = resolve_system_prefix_boundary(128, 128, true, config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 128u);
+}
+
+TEST_F(SystemPrefixBoundaryTest, SmallSystemWithPartialTokenization) {
+    // Short system message (40 tokens) with partial tokenization (128 routing)
+    // System is SHORTER than routing → normal case even with truncation
+    auto result = resolve_system_prefix_boundary(40, 128, true, config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 40u);
+}
+
+// --- Minimum token threshold ---
+
+TEST_F(SystemPrefixBoundaryTest, SystemBelowMinTokens) {
+    // System message too short (2 tokens, min is 4)
+    auto result = resolve_system_prefix_boundary(2, 200, false, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, SystemBelowMinTokens_Truncated) {
+    // Even with truncation, tiny system messages are rejected
+    auto result = resolve_system_prefix_boundary(2, 128, true, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, RoutingBelowMinTokens_Truncated) {
+    // Routing window too small after truncation (e.g., very short text)
+    auto result = resolve_system_prefix_boundary(100, 3, true, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, SystemExactlyAtMinTokens) {
+    auto result = resolve_system_prefix_boundary(4, 200, false, config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 4u);
+}
+
+// --- Zero / edge cases ---
+
+TEST_F(SystemPrefixBoundaryTest, ZeroSystemTokens) {
+    auto result = resolve_system_prefix_boundary(0, 200, false, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, ZeroRoutingTokens) {
+    auto result = resolve_system_prefix_boundary(40, 0, false, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, ZeroRoutingTokens_Truncated) {
+    auto result = resolve_system_prefix_boundary(40, 0, true, config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+// --- Config variations ---
+
+TEST_F(SystemPrefixBoundaryTest, HighMinTokenThreshold) {
+    BoundaryDetectionConfig strict_config{false, 64};
+    auto result = resolve_system_prefix_boundary(40, 200, false, strict_config);
+
+    EXPECT_FALSE(result.detected);
+}
+
+TEST_F(SystemPrefixBoundaryTest, MinTokensOfOne) {
+    BoundaryDetectionConfig lax_config{false, 1};
+    auto result = resolve_system_prefix_boundary(1, 200, false, lax_config);
+
+    ASSERT_TRUE(result.detected);
+    EXPECT_EQ(result.prefix_boundary, 1u);
+}
