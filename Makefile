@@ -60,23 +60,26 @@ test-integration:
 	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/6: Cluster Behavior ==="
+	@echo "=== Test Suite 1/7: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/6: Prefix Routing ==="
+	@echo "=== Test Suite 2/7: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/6: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/7: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
 	@echo ""
-	@echo "=== Test Suite 4/6: Negative Paths ==="
+	@echo "=== Test Suite 4/7: Negative Paths ==="
 	@python3 tests/integration/test_negative_paths.py
 	@echo ""
-	@echo "=== Test Suite 5/6: Load-Aware Routing ==="
+	@echo "=== Test Suite 5/7: Load-Aware Routing ==="
 	@python3 tests/integration/test_load_aware_routing.py
 	@echo ""
-	@echo "=== Test Suite 6/6: Intelligence Layer ==="
+	@echo "=== Test Suite 6/7: Intelligence Layer ==="
 	@python3 -m pytest tests/integration/test_intelligence_layer.py -v -s
+	@echo ""
+	@echo "=== Test Suite 7/7: HTTP Pipeline ==="
+	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 
 # Run integration tests via pytest (single command, JUnit XML output for CI)
 # pytest discovers both unittest.TestCase and native pytest tests automatically
@@ -109,6 +112,7 @@ test-integration-ci:
 		tests/integration/test_negative_paths.py \
 		tests/integration/test_load_aware_routing.py \
 		tests/integration/test_intelligence_layer.py \
+		tests/integration/test_http_pipeline.py \
 		-v -s --tb=short --junitxml=integration-results.xml
 
 # Helper to detect docker compose command

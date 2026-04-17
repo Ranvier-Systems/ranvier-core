@@ -343,9 +343,9 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 6.2 HTTP Request Pipeline Tests
 
-- [ ] **Create HTTP pipeline test suite**
-  _Description:_ Create `test_http_pipeline.py` with tests for: POST `/v1/chat/completions` returns valid streaming response, request headers forwarded correctly, Content-Type validation, invalid JSON returns 400.
-  _Files:_ `tests/integration/test_http_pipeline.py` (new)
+- [x] **Create HTTP pipeline test suite** ✅
+  _Description:_ Created `tests/integration/test_http_pipeline.py` with `HttpPipelineTest` (tests 01–07, 10), `HttpPipelineNoBackendTest` (test 08), and `HttpPipelineTokenForwardingTest` (test 09) — three `ClusterTestCase` subclasses covering SSE streaming validation, X-Request-ID forwarding via `/debug/requests`, Content-Type enforcement, malformed-JSON rejection, 12-message array handling, 404/405/503 error responses, token-forwarding injection (prompt_token_ids), and disabled-forwarding body preservation.  Added to `test-integration` (Suite 7/7) and `test-integration-ci` pytest invocation in `Makefile`.
+  _Files:_ `tests/integration/test_http_pipeline.py` (new), `Makefile`
   _Complexity:_ Medium
 
 - [ ] **Create streaming response test suite**
@@ -353,8 +353,8 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Files:_ `tests/integration/test_streaming.py` (new)
   _Complexity:_ Medium
 
-- [ ] **Test request rewriting with token injection**
-  _Description:_ Verify token IDs injected when forwarding enabled, original request preserved when disabled, large message arrays (10+) handled correctly.
+- [x] **Test request rewriting with token injection** ✅
+  _Description:_ Covered by `tests/integration/test_http_pipeline.py`: `test_09_token_forwarding_injects_token_ids` (forwarding enabled, inspects `/debug/requests` for `prompt_token_ids`), `test_10_token_forwarding_disabled_preserves_original` (forwarding disabled, body unchanged), and `test_05_large_message_array` (12-message array).
   _Files:_ `tests/integration/test_http_pipeline.py`
   _Complexity:_ Low
 
@@ -428,8 +428,8 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 6.7 Edge Cases and Error Handling Tests
 
-- [ ] **Test error response validation**
-  _Description:_ Verify: 404 for unknown endpoints, 405 for unsupported methods, 503 when no backends, structured JSON error bodies.
+- [x] **Test error response validation** ✅
+  _Description:_ Covered by `tests/integration/test_http_pipeline.py`: `test_06_unknown_endpoint_returns_404`, `test_07_wrong_method_returns_405`, `test_08_503_when_no_backends` (asserts JSON body with `error` key), and `test_04_invalid_json_returns_400` (structured error).
   _Files:_ `tests/integration/test_http_pipeline.py`
   _Complexity:_ Low
 
