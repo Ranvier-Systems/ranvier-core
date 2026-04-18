@@ -399,14 +399,14 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 6.5 Observability Tests
 
-- [ ] **Create metrics test suite**
+- [x] **Create metrics test suite**
   _Description:_ Create `test_metrics.py` with tests for: `/metrics` returns valid Prometheus format, request count increments, latency histograms recorded, backend health metrics accurate.
-  _Files:_ `tests/integration/test_metrics.py` (new)
+  _Files:_ `tests/integration/test_metrics.py` (new) — implemented in `MetricsTest` (tests 01–05).
   _Complexity:_ Medium
 
-- [ ] **Test cluster metrics**
+- [x] **Test cluster metrics**
   _Description:_ Verify: `cluster_peers_alive` reflects actual peers, gossip counters increment during sync, per-shard metrics available.
-  _Files:_ `tests/integration/test_metrics.py`
+  _Files:_ `tests/integration/test_metrics.py` — implemented in `MetricsTest` (tests 06–08).
   _Complexity:_ Low
 
 ### 6.6 Lifecycle and Persistence Tests
