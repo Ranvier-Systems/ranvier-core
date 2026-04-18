@@ -138,22 +138,28 @@ jobs:
       - name: Start test environment
         run: |
           echo "Starting Ranvier test cluster with mock backends..."
-          # Don't use --build since we already have the images
-          docker compose -f docker-compose.test.yml up -d --wait
+          # The 'full' profile brings up ranvier2/ranvier3 alongside ranvier1
+          # and the backends (ranvier2/3 are profile-gated in
+          # docker-compose.test.yml since #434). The 'benchmark' profile
+          # (locust) is intentionally NOT activated here — locust is an
+          # ephemeral workload launched via 'docker compose run --rm' in
+          # the next step and has no healthcheck for 'up --wait'.
+          # Don't use --build since we already have the images.
+          docker compose -f docker-compose.test.yml --profile full up -d --wait
 
           # Wait for services to be healthy
           echo "Waiting for services to be ready..."
           sleep 10
 
           # Verify services are running
-          docker compose -f docker-compose.test.yml ps
+          docker compose -f docker-compose.test.yml --profile full ps
 
           # Check Ranvier nodes are responding
           for i in 1 2 3; do
             echo "Checking ranvier$i health..."
             timeout 30 bash -c "until curl -sf http://172.28.2.$i:8080/health > /dev/null 2>&1; do sleep 1; done" || {
               echo "::error::ranvier$i failed health check"
-              docker compose -f docker-compose.test.yml logs ranvier$i
+              docker compose -f docker-compose.test.yml --profile full logs ranvier$i
               exit 1
             }
             echo "ranvier$i is healthy"
@@ -175,7 +181,7 @@ jobs:
           # Note: locust service uses locustio/locust image with ENTRYPOINT ["locust"]
           # so we only pass arguments, not the command itself
           # CI mode uses shorter wait times (0.1-0.5s) vs default (1-3s) for higher throughput
-          docker compose -f docker-compose.test.yml run --rm \
+          docker compose -f docker-compose.test.yml --profile full --profile benchmark run --rm \
             -e RANVIER_NODE1=http://172.28.2.1:8080 \
             -e RANVIER_NODE2=http://172.28.2.2:8080 \
             -e RANVIER_NODE3=http://172.28.2.3:8080 \
@@ -263,7 +269,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker compose -f docker-compose.test.yml down -v --remove-orphans
+          docker compose -f docker-compose.test.yml --profile full --profile benchmark down -v --remove-orphans
 
       - name: Fail on regression
         if: steps.compare.outputs.regression_detected == 'true' && github.event.inputs.update_baseline != 'true'
