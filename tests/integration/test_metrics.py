@@ -318,27 +318,38 @@ class MetricsTest(ClusterTestCase):
 
     def test_07_gossip_counters_increment(self):
         """Gossip sync counters advance over a short observation window."""
-        print("\nTest: gossip sync counters increment over 2 seconds")
+        print("\nTest: gossip sync counters increment")
         metrics_url = NODES["node1"]["metrics"]
 
         sent_before = sum_metric_by_substring(metrics_url, "router_cluster_sync_sent")
         recv_before = sum_metric_by_substring(metrics_url, "router_cluster_sync_received")
         print(f"  before: sent={sent_before}, received={recv_before}")
 
-        # Gossip interval is 500 ms, so 2 s covers at least 4 rounds.
-        time.sleep(2.0)
-
-        sent_after = sum_metric_by_substring(metrics_url, "router_cluster_sync_sent")
-        recv_after = sum_metric_by_substring(metrics_url, "router_cluster_sync_received")
+        # Test config (tests/integration/configs/node*.yaml) sets
+        # gossip_heartbeat_interval_seconds=2 — timers are armed periodically,
+        # so a fixed 2 s sleep can land inside a single interval if we
+        # snapshot just after a tick fires.  Poll with a 10 s deadline so
+        # this stays robust on slow CI runners.
+        deadline = time.time() + 10.0
+        sent_after = sent_before
+        recv_after = recv_before
+        while time.time() < deadline:
+            sent_after = sum_metric_by_substring(metrics_url, "router_cluster_sync_sent")
+            recv_after = sum_metric_by_substring(metrics_url, "router_cluster_sync_received")
+            if sent_after > sent_before and recv_after > recv_before:
+                break
+            time.sleep(0.5)
         print(f"  after:  sent={sent_after}, received={recv_after}")
 
         self.assertGreater(
             sent_after - sent_before, 0,
-            f"router_cluster_sync_sent did not advance (before={sent_before}, after={sent_after})",
+            f"router_cluster_sync_sent did not advance within 10 s "
+            f"(before={sent_before}, after={sent_after})",
         )
         self.assertGreater(
             recv_after - recv_before, 0,
-            f"router_cluster_sync_received did not advance (before={recv_before}, after={recv_after})",
+            f"router_cluster_sync_received did not advance within 10 s "
+            f"(before={recv_before}, after={recv_after})",
         )
 
     def test_08_per_shard_metrics_available(self):
