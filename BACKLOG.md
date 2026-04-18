@@ -331,13 +331,13 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Files:_ `tests/integration/mock_backend.py`
   _Complexity:_ Medium
 
-- [ ] **Add Docker Compose test profiles**
-  _Description:_ Add single-node profile for fast isolated tests, health check failure simulation service, and configurable backend response modes.
-  _Files:_ `docker-compose.test.yml`
+- [x] **Add Docker Compose test profiles** ✅
+  _Description:_ Added three profiles to `docker-compose.test.yml`: the default profile now covers only backend1 + backend2 + ranvier1 (single-node fast path); `full` adds ranvier2/ranvier3 to restore the historical 3-node topology; and `fault-injection` adds a new `backend-unhealthy` service (static IP 172.28.1.12, host port 21436, `BACKEND_ID=unhealthy`, `MOCK_FAILURE_MODE=status_503`) used by future §6.4 circuit-breaker tests to register an always-failing backend. Configurable backend response modes are already provided by the enhanced `mock_backend.py` (`MOCK_LATENCY_MS`, `MOCK_FAILURE_MODE`, `MOCK_PREFIX_ECHO` env vars + `/admin/*` endpoints + `X-Mock-*` headers); the compose file now documents these knobs in a comment block above backend1. `tests/integration/conftest.py::run_compose` passes `--profile full` by default (overridable via `RANVIER_COMPOSE_PROFILE`), so every existing `ClusterTestCase` keeps seeing the 3-node cluster. `make integration-up` activates `--profile full`; `make integration-down` tears down both `full` and `fault-injection` profiles.
+  _Files:_ `docker-compose.test.yml`, `tests/integration/conftest.py`
   _Complexity:_ Low
 
-- [ ] **Add Makefile test targets**
-  _Description:_ Add `test-integration-fast` (single-node), `test-integration-full` (multi-node), and `test-integration-ci` (JUnit XML output) targets.
+- [x] **Add Makefile test targets** ✅
+  _Description:_ Split the monolithic `test-integration` target: `test-integration-full` (new) runs all 9 multi-node suites (the historical behavior); `test-integration-fast` (new) runs only the three single-node-capable suites (`test_http_pipeline`, `test_streaming`, `test_metrics`), skipping the slow cluster/prefix/load-aware/negative-paths/graceful-shutdown/intelligence-layer suites for a faster inner loop; `test-integration` is now an alias for `test-integration-full` so existing CI scripts keep working. `test-integration-ci` already covers all 9 suites via a single pytest invocation with JUnit XML output and was left unchanged. Updated `help` target to advertise the new targets. NOTE: `test-integration-fast` still uses multi-node compose under the hood because each `ClusterTestCase` drives its own `_bring_up_cluster`; the speed win comes from running fewer suites. Truly single-node isolation (skipping ranvier2/ranvier3) is a follow-up once each suite is audited for single-node safety and can set `RANVIER_COMPOSE_PROFILE=""`.
   _Files:_ `Makefile`
   _Complexity:_ Low
 
