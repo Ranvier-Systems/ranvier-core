@@ -16,33 +16,33 @@ The integration tests use Docker Compose to spin up a 3-node Ranvier cluster wit
 ## Architecture
 
 ```
-                    ┌─────────────────────────────────────────────────┐
-                    │           Docker Network (172.28.0.0/16)        │
+                    ┌──────────────────────────────────────────────────┐
+                    │           Docker Network (172.28.0.0/16)         │
                     │                                                  │
   ┌─────────────────┼──────────────────────────────────────────────────┼──────────┐
   │                 │                                                  │          │
   │   ┌─────────────▼─────────────┐    ┌────────────────────────────┐  │          │
   │   │       Mock Backends       │    │      Ranvier Cluster       │  │          │
   │   │                           │    │                            │  │          │
-  │   │  ┌─────────┐ ┌─────────┐  │    │ ┌────────┐ ┌────────┐     │  │          │
+  │   │  ┌─────────┐ ┌─────────┐  │    │ ┌────────┐   ┌────────┐    │  │          │
   │   │  │Backend 1│ │Backend 2│  │    │ │ Node 1 │◄─►│ Node 2 │    │  │          │
-  │   │  │:21434   │ │:21435   │  │    │ │ :8081  │ │ :8082  │     │  │          │
-  │   │  │         │ │         │  │    │ └────┬───┘ └───┬────┘     │  │          │
-  │   │  └─────────┘ └─────────┘  │    │      │  Gossip │          │  │          │
-  │   │      172.28.1.10/11       │    │      │   UDP   │          │  │          │
-  │   │                           │    │      │  :9190  │          │  │          │
-  │   └───────────────────────────┘    │      └────┬────┘          │  │          │
-  │                                    │           │               │  │          │
-  │                                    │      ┌────▼────┐          │  │          │
-  │                                    │      │ Node 3  │          │  │          │
-  │                                    │      │ :8083   │          │  │          │
-  │                                    │      └─────────┘          │  │          │
-  │                                    │       172.28.2.1-3        │  │          │
+  │   │  │:21434   │ │:21435   │  │    │ │ :8081  │   │ :8082  │    │  │          │
+  │   │  │         │ │         │  │    │ └────┬───┘   └───┬────┘    │  │          │
+  │   │  └─────────┘ └─────────┘  │    │      │  Gossip   │         │  │          │
+  │   │      172.28.1.10/11       │    │      │   UDP     │         │  │          │
+  │   │                           │    │      │  :9190    │         │  │          │
+  │   └───────────────────────────┘    │      └────┬──────┘         │  │          │
+  │                                    │           │                │  │          │
+  │                                    │      ┌────▼────┐           │  │          │
+  │                                    │      │ Node 3  │           │  │          │
+  │                                    │      │ :8083   │           │  │          │
+  │                                    │      └─────────┘           │  │          │
+  │                                    │       172.28.2.1-3         │  │          │
   │                                    └────────────────────────────┘  │          │
   │                                                                    │          │
   └────────────────────────────────────────────────────────────────────┘          │
-                                                                                   │
-      External Ports:                                                              │
+                                                                                  │
+      External Ports:                                                             │
       - 8081-8083: Ranvier API                                                    │
       - 9181-9183: Prometheus Metrics                                             │
       - 21434-21435: Mock Backends                                                │
@@ -59,12 +59,60 @@ The integration tests use Docker Compose to spin up a 3-node Ranvier cluster wit
 ### Quick Start
 
 ```bash
-# Run all integration tests
-make test-integration
+# Run all integration tests (9 suites, multi-node cluster)
+make test-integration           # alias for test-integration-full
+
+# Run only the single-node-capable subset (faster inner loop)
+make test-integration-fast      # http_pipeline + streaming + metrics
+
+# Run all suites via pytest with JUnit XML output (for CI)
+make test-integration-ci
 
 # Or directly with Python
 python3 tests/integration/test_cluster.py
 ```
+
+`test-integration-fast` skips the six slow multi-node suites
+(`test_cluster`, `test_prefix_routing`, `test_load_aware_routing`,
+`test_negative_paths`, `test_graceful_shutdown`,
+`test_intelligence_layer`). Each remaining suite still spins up its own
+compose cluster via `conftest._bring_up_cluster`, so the speed win comes
+from running fewer suites — not from a leaner topology. True
+single-node isolation is a follow-up (see "Compose Profiles" below).
+
+### Compose Profiles
+
+`docker-compose.test.yml` defines three profiles:
+
+| Profile            | Services added                          | When to use                                               |
+|--------------------|-----------------------------------------|-----------------------------------------------------------|
+| _(default)_        | `backend1`, `backend2`, `ranvier1`      | Single-node fast path                                     |
+| `full`             | + `ranvier2`, `ranvier3`                | Historical 3-node cluster (default for `ClusterTestCase`) |
+| `fault-injection`  | + `backend-unhealthy` (172.28.1.12)     | §6.4 circuit-breaker / health-check tests                 |
+| `benchmark`        | + `locust`                              | Load testing (`make benchmark`)                           |
+
+`conftest._bring_up_cluster` passes `--profile full` by default so every
+existing `ClusterTestCase` suite keeps seeing the 3-node cluster.
+Override with:
+
+```bash
+RANVIER_COMPOSE_PROFILE=full              python3 -m pytest tests/integration/test_metrics.py   # default
+RANVIER_COMPOSE_PROFILE=""                python3 -m pytest tests/integration/test_metrics.py   # single-node (requires suite audit)
+RANVIER_COMPOSE_PROFILE=full,fault-injection  python3 -m pytest tests/integration/test_metrics.py
+```
+
+### Mock Backend Response Modes
+
+`mock_backend.py` honors these env vars (settable on any backend service
+in `docker-compose.test.yml`):
+
+- `MOCK_LATENCY_MS=<int>` — per-chunk SSE delay in milliseconds
+- `MOCK_FAILURE_MODE=none|status_500|status_503|timeout|reset` — sticky failure mode
+- `MOCK_PREFIX_ECHO=0|1` — echo first 32 chars of the last user message as the first SSE `delta.content`
+
+The same knobs are also settable at runtime via `POST /admin/latency`,
+`POST /admin/failure-mode`, and per-request `X-Mock-Latency-Ms` /
+`X-Mock-Failure-Mode` / `X-Mock-Prefix-Echo` headers.
 
 ### Build Optimization
 
@@ -86,11 +134,18 @@ make docker-build
 
 ### Manual Testing
 
-For debugging or manual testing, you can start the cluster separately:
+For debugging or manual testing, you can start the cluster separately.
+`make integration-up` activates `--profile full` so you get the full
+3-node cluster; `make integration-down` tears down both the `full` and
+`fault-injection` profiles.
 
 ```bash
-# Start the cluster
+# Start the cluster (3-node, --profile full)
 make integration-up
+
+# Also start the always-unhealthy backend (for circuit-breaker tests)
+docker compose -f docker-compose.test.yml -p ranvier-integration-test \
+    --profile full --profile fault-injection up -d
 
 # View logs
 make integration-logs
@@ -321,24 +376,24 @@ make benchmark-down
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Docker Network (172.28.0.0/16)               │
-│                                                                  │
-│  ┌─────────────┐    ┌─────────────────────────────────────────┐ │
-│  │   Locust    │    │           Ranvier Cluster               │ │
-│  │  (Load Gen) │    │                                         │ │
+┌────────────────────────────────────────────────────────────────┐
+│                    Docker Network (172.28.0.0/16)              │
+│                                                                │
+│  ┌─────────────┐    ┌────────────────────────────────────────┐ │
+│  │   Locust    │    │           Ranvier Cluster              │ │
+│  │  (Load Gen) │    │                                        │ │
 │  │             │───►│  ┌────────┐ ┌────────┐ ┌────────┐      │ │
 │  │ Simulates   │    │  │ Node 1 │ │ Node 2 │ │ Node 3 │      │ │
 │  │ N users     │    │  └───┬────┘ └───┬────┘ └───┬────┘      │ │
-│  └─────────────┘    │      │          │          │            │ │
-│                      │      └──────────┼──────────┘            │ │
-│                      │                 ▼                       │ │
-│                      │  ┌──────────────────────────────────┐  │ │
-│                      │  │         Mock Backends            │  │ │
-│                      │  │   Backend 1      Backend 2       │  │ │
-│                      │  └──────────────────────────────────┘  │ │
-│                      └─────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+│  └─────────────┘    │      │          │          │           │ │
+│                     │      └──────────┼──────────┘           │ │
+│                     │                 ▼                      │ │
+│                     │  ┌──────────────────────────────────┐  │ │
+│                     │  │         Mock Backends            │  │ │
+│                     │  │   Backend 1      Backend 2       │  │ │
+│                     │  └──────────────────────────────────┘  │ │
+│                     └────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Performance Notes

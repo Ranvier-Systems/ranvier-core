@@ -68,6 +68,14 @@ COMPOSE_FILE = os.path.abspath(
 # ``ClusterTestCase.PROJECT_NAME`` to stay isolated.
 PYTEST_PROJECT_NAME = "ranvier-pytest-session"
 
+# Compose profile(s) to activate during cluster bring-up. Defaults to
+# ``full`` so the historical 3-node topology (ranvier1 + ranvier2 +
+# ranvier3) is preserved after ranvier2/ranvier3 moved behind the ``full``
+# profile in docker-compose.test.yml. Override with
+# ``RANVIER_COMPOSE_PROFILE=<name>`` (comma-separated for multiple), or
+# set it empty to request the default-profile single-node subset.
+COMPOSE_PROFILE = os.environ.get("RANVIER_COMPOSE_PROFILE", "full")
+
 # Timeouts (seconds)
 STARTUP_TIMEOUT = 60
 PROPAGATION_TIMEOUT = 15
@@ -176,7 +184,13 @@ def run_compose(
     :class:`subprocess.CalledProcessError` on non-zero exit.
     """
     compose_cmd = get_compose_cmd()
-    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", project_name] + args
+    profile_args: List[str] = []
+    if COMPOSE_PROFILE:
+        for profile in COMPOSE_PROFILE.split(","):
+            profile = profile.strip()
+            if profile:
+                profile_args += ["--profile", profile]
+    cmd = compose_cmd + ["-f", COMPOSE_FILE, "-p", project_name] + profile_args + args
     print(f"  Running: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, capture_output=True, text=True)

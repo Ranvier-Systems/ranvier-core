@@ -1,11 +1,20 @@
 # Docker Compose for Multi-Node Integration Testing
 # Sets up 3 Ranvier nodes and 2 mock backends for cluster testing
 #
+# Profiles:
+#   (default)          backend1, backend2, ranvier1 — single-node fast path
+#   full               adds ranvier2, ranvier3 — the historical 3-node cluster
+#   fault-injection    adds backend-unhealthy — always-failing backend for
+#                      circuit-breaker / health-check tests (§6.4)
+#   benchmark          adds locust — load-testing harness
+#
 # Usage:
 #   Pre-build for faster repeated runs:
 #     make docker-build
-#   Then run tests:
-#     make test-integration
+#   Run the multi-node suites (default historical behavior):
+#     make test-integration           # == test-integration-full
+#   Run only the single-node-capable suites:
+#     make test-integration-fast
 
 networks:
   ranvier-test:
@@ -16,6 +25,17 @@ networks:
 
 services:
   # Mock backend servers (simulating vLLM endpoints)
+  #
+  # The mock_backend.py image supports several env-var knobs for response
+  # shaping (see tests/integration/mock_backend.py). Set on any backend
+  # service to override default behavior:
+  #   MOCK_LATENCY_MS=<int>              per-chunk SSE delay in ms
+  #   MOCK_FAILURE_MODE=none|status_500| sticky failure mode
+  #                    |status_503|timeout|reset
+  #   MOCK_PREFIX_ECHO=0|1               echo first 32 chars of last user msg
+  #                                      as the first SSE delta.content
+  # The same knobs are also settable at runtime via /admin/* endpoints and
+  # per-request via X-Mock-* headers.
   backend1:
     image: ranvier-mock-backend:latest
     build:
@@ -43,6 +63,28 @@ services:
       - "21435:8000"
     environment:
       - BACKEND_ID=2
+
+  # Always-unhealthy backend for §6.4 circuit-breaker / health-check tests.
+  # Opt in with: docker compose --profile fault-injection up.
+  # MOCK_FAILURE_MODE=status_503 is consumed by mock_backend.py once it is
+  # taught to honor the env var at startup; until then tests can flip the
+  # mode at runtime via POST /admin/failure-mode on port 21436.
+  backend-unhealthy:
+    image: ranvier-mock-backend:latest
+    build:
+      context: ./tests/integration
+      dockerfile: Dockerfile.mock-backend
+    container_name: backend-unhealthy
+    networks:
+      ranvier-test:
+        ipv4_address: 172.28.1.12
+    ports:
+      - "21436:8000"
+    environment:
+      - BACKEND_ID=unhealthy
+      - MOCK_FAILURE_MODE=status_503
+    profiles:
+      - fault-injection
 
   # Ranvier Node 1 (Primary for registration tests)
   ranvier1:
@@ -145,6 +187,8 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+    profiles:
+      - full
 
   # Ranvier Node 3
   ranvier3:
@@ -195,6 +239,8 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+    profiles:
+      - full
 
   # Locust load testing service
   locust:

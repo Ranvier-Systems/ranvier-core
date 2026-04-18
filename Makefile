@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
 
 # Default target
 all: build
@@ -34,9 +34,14 @@ test-unit: build
 	@echo "Running unit tests..."
 	@cd build && ctest --output-on-failure
 
-# Run integration tests with Docker Compose
-# This starts a 3-node cluster with 2 mock backends, runs tests, and cleans up
-test-integration:
+# Run integration tests with Docker Compose.
+# Default alias: run the full multi-node suite so existing CI scripts and
+# historical invocations keep working unchanged.
+test-integration: test-integration-full
+
+# Run ALL integration suites on the full 3-node cluster (historical default).
+# Starts a 3-node cluster with 2 mock backends, runs tests, and cleans up.
+test-integration-full:
 	@echo "======================================"
 	@echo "Running Multi-Node Integration Tests"
 	@echo "======================================"
@@ -87,6 +92,47 @@ test-integration:
 	@echo "=== Test Suite 9/9: Metrics ==="
 	@python3 -m pytest tests/integration/test_metrics.py -v -s
 
+# Run only the single-node-capable integration suites (fast path).
+# The speed win comes from skipping the slow multi-node suites
+# (cluster, prefix_routing, load_aware_routing, negative_paths,
+# graceful_shutdown, intelligence_layer). Each listed suite uses
+# ClusterTestCase, which still spins up a docker-compose cluster
+# per-file via conftest._bring_up_cluster — true single-node
+# isolation (stopping ranvier2/ranvier3) is a follow-up once
+# RANVIER_COMPOSE_PROFILE=<empty> is plumbed through every suite.
+test-integration-fast:
+	@echo "======================================"
+	@echo "Running Single-Node Integration Tests"
+	@echo "======================================"
+	@echo ""
+	@echo "Suites: test_http_pipeline, test_streaming, test_metrics"
+	@echo "(skipping multi-node suites: cluster, prefix_routing,"
+	@echo " load_aware_routing, negative_paths, graceful_shutdown,"
+	@echo " intelligence_layer)"
+	@echo ""
+	@if ! (command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1) && \
+	    ! command -v docker-compose >/dev/null 2>&1; then \
+		echo "Error: Neither 'docker compose' nor 'docker-compose' found"; \
+		exit 1; \
+	fi
+	@if ! python3 -c "import requests" 2>/dev/null; then \
+		echo "Installing Python 'requests' library..."; \
+		pip3 install --user requests || pip install --user requests; \
+	fi
+	@if ! python3 -c "import pytest" 2>/dev/null; then \
+		echo "Installing Python 'pytest' library..."; \
+		pip3 install --user pytest || pip install --user pytest; \
+	fi
+	@echo ""
+	@echo "=== Test Suite 1/3: HTTP Pipeline ==="
+	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
+	@echo ""
+	@echo "=== Test Suite 2/3: Streaming ==="
+	@python3 -m pytest tests/integration/test_streaming.py -v -s
+	@echo ""
+	@echo "=== Test Suite 3/3: Metrics ==="
+	@python3 -m pytest tests/integration/test_metrics.py -v -s
+
 # Run integration tests via pytest (single command, JUnit XML output for CI)
 # pytest discovers both unittest.TestCase and native pytest tests automatically
 test-integration-ci:
@@ -127,10 +173,12 @@ test-integration-ci:
 DOCKER_COMPOSE := $(shell if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then echo "docker compose"; elif command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; fi)
 COMPOSE_ARGS := -f docker-compose.test.yml -p ranvier-integration-test
 
-# Start the integration test cluster (for manual testing/debugging)
+# Start the integration test cluster (for manual testing/debugging).
+# Uses --profile full to pull in ranvier2/ranvier3, which otherwise stay
+# gated behind the 'full' profile (single-node is the default topology).
 integration-up:
 	@echo "Starting integration test cluster..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) up -d --build
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile full up -d --build
 	@echo ""
 	@echo "Cluster started. Endpoints:"
 	@echo "  Node 1: http://localhost:8081 (metrics: http://localhost:9181)"
@@ -145,7 +193,7 @@ integration-up:
 # Stop the integration test cluster
 integration-down:
 	@echo "Stopping integration test cluster..."
-	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) down -v --remove-orphans
+	@$(DOCKER_COMPOSE) $(COMPOSE_ARGS) --profile full --profile fault-injection down -v --remove-orphans
 
 # View logs from the integration test cluster
 integration-logs:
@@ -673,11 +721,13 @@ help:
 	@echo "  make docker-build   - Build production Docker image"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  make test              - Run all tests (currently: unit tests)"
-	@echo "  make test-unit         - Run unit tests"
-	@echo "  make test-integration  - Run multi-node integration tests (sequential)"
-	@echo "  make test-integration-ci - Run integration tests via pytest (JUnit XML output)"
-	@echo "  make test-validation   - Run validation suite unit tests"
+	@echo "  make test                    - Run all tests (currently: unit tests)"
+	@echo "  make test-unit               - Run unit tests"
+	@echo "  make test-integration        - Run all integration tests (alias for test-integration-full)"
+	@echo "  make test-integration-fast   - Run single-node integration tests (fast)"
+	@echo "  make test-integration-full   - Run all integration tests (multi-node)"
+	@echo "  make test-integration-ci     - Run integration tests via pytest (JUnit XML output)"
+	@echo "  make test-validation         - Run validation suite unit tests"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"
