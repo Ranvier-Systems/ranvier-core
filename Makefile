@@ -60,29 +60,32 @@ test-integration:
 	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/8: Cluster Behavior ==="
+	@echo "=== Test Suite 1/9: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/8: Prefix Routing ==="
+	@echo "=== Test Suite 2/9: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/8: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/9: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
 	@echo ""
-	@echo "=== Test Suite 4/8: Negative Paths ==="
+	@echo "=== Test Suite 4/9: Negative Paths ==="
 	@python3 tests/integration/test_negative_paths.py
 	@echo ""
-	@echo "=== Test Suite 5/8: Load-Aware Routing ==="
+	@echo "=== Test Suite 5/9: Load-Aware Routing ==="
 	@python3 tests/integration/test_load_aware_routing.py
 	@echo ""
-	@echo "=== Test Suite 6/8: Intelligence Layer ==="
+	@echo "=== Test Suite 6/9: Intelligence Layer ==="
 	@python3 -m pytest tests/integration/test_intelligence_layer.py -v -s
 	@echo ""
-	@echo "=== Test Suite 7/8: HTTP Pipeline ==="
+	@echo "=== Test Suite 7/9: HTTP Pipeline ==="
 	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 	@echo ""
-	@echo "=== Test Suite 8/8: Streaming ==="
+	@echo "=== Test Suite 8/9: Streaming ==="
 	@python3 -m pytest tests/integration/test_streaming.py -v -s
+	@echo ""
+	@echo "=== Test Suite 9/9: Metrics ==="
+	@python3 -m pytest tests/integration/test_metrics.py -v -s
 
 # Run integration tests via pytest (single command, JUnit XML output for CI)
 # pytest discovers both unittest.TestCase and native pytest tests automatically
@@ -117,6 +120,7 @@ test-integration-ci:
 		tests/integration/test_intelligence_layer.py \
 		tests/integration/test_http_pipeline.py \
 		tests/integration/test_streaming.py \
+		tests/integration/test_metrics.py \
 		-v -s --tb=short --junitxml=integration-results.xml
 
 # Helper to detect docker compose command
