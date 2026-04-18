@@ -317,38 +317,60 @@ class MetricsTest(ClusterTestCase):
             )
 
     def test_07_gossip_counters_increment(self):
-        """Gossip sync counters advance over a short observation window."""
-        print("\nTest: gossip sync counters increment")
-        metrics_url = NODES["node1"]["metrics"]
+        """Gossip sync counters advance when new routes are learned.
 
-        sent_before = sum_metric_by_substring(metrics_url, "router_cluster_sync_sent")
-        recv_before = sum_metric_by_substring(metrics_url, "router_cluster_sync_received")
-        print(f"  before: sent={sent_before}, received={recv_before}")
+        ``router_cluster_sync_sent`` / ``router_cluster_sync_received`` count
+        per-peer route announcement packets — they only advance when a node
+        actually broadcasts a learned prefix route (see
+        ``GossipProtocol::broadcast_route`` in src/gossip_protocol.cpp).
+        Idle heartbeats use a broadcast path that doesn't touch these
+        counters, so the test must drive traffic that forces new routes to
+        be learned, then assert the counters moved as a result.
+        """
+        print("\nTest: gossip sync counters increment when routes broadcast")
+        node1_metrics = NODES["node1"]["metrics"]
+        node1_api = NODES["node1"]["api"]
 
-        # Test config (tests/integration/configs/node*.yaml) sets
-        # gossip_heartbeat_interval_seconds=2 — timers are armed periodically,
-        # so a fixed 2 s sleep can land inside a single interval if we
-        # snapshot just after a tick fires.  Poll with a 10 s deadline so
-        # this stays robust on slow CI runners.
+        sent_before = sum_metric_by_substring(node1_metrics, "router_cluster_sync_sent")
+        # Peers learn the new route from node1's broadcast — read the
+        # received counter on a peer to observe the other direction.
+        node2_metrics = NODES["node2"]["metrics"]
+        recv_before = sum_metric_by_substring(node2_metrics, "router_cluster_sync_received")
+        print(f"  before: node1.sent={sent_before}, node2.received={recv_before}")
+
+        # Unique prompts force new prefix routes to be learned on node1,
+        # which triggers broadcast_route() to every peer.  Three sends
+        # because the tokenizer may coalesce similar prompts into an
+        # existing route.
+        unique_suffix = str(int(time.time() * 1000))
+        for i in range(3):
+            status, _body, _headers = send_chat_request(
+                node1_api,
+                [{"role": "user", "content": f"gossip probe {unique_suffix}-{i}"}],
+            )
+            self.assertEqual(status, 200, f"request {i}: HTTP {status}")
+
+        # Poll with a 10 s deadline: the broadcast happens asynchronously
+        # after the response body closes, and slow CI runners add jitter.
         deadline = time.time() + 10.0
         sent_after = sent_before
         recv_after = recv_before
         while time.time() < deadline:
-            sent_after = sum_metric_by_substring(metrics_url, "router_cluster_sync_sent")
-            recv_after = sum_metric_by_substring(metrics_url, "router_cluster_sync_received")
+            sent_after = sum_metric_by_substring(node1_metrics, "router_cluster_sync_sent")
+            recv_after = sum_metric_by_substring(node2_metrics, "router_cluster_sync_received")
             if sent_after > sent_before and recv_after > recv_before:
                 break
             time.sleep(0.5)
-        print(f"  after:  sent={sent_after}, received={recv_after}")
+        print(f"  after:  node1.sent={sent_after}, node2.received={recv_after}")
 
         self.assertGreater(
             sent_after - sent_before, 0,
-            f"router_cluster_sync_sent did not advance within 10 s "
+            f"router_cluster_sync_sent on node1 did not advance within 10 s "
             f"(before={sent_before}, after={sent_after})",
         )
         self.assertGreater(
             recv_after - recv_before, 0,
-            f"router_cluster_sync_received did not advance within 10 s "
+            f"router_cluster_sync_received on node2 did not advance within 10 s "
             f"(before={recv_before}, after={recv_after})",
         )
 
