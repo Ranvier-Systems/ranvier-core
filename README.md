@@ -8,32 +8,28 @@ A high-performance LLM traffic controller that reduces GPU cache thrashing by ro
 
 **Best for:** RAG, multi-turn chat with system prompts, few-shot learning. **Less benefit for:** short prompts (<500 tokens), small models (<8B).
 
-```bash
-# Quick start (requires Docker)
-docker run -p 8080:8080 ghcr.io/ranvier-systems/ranvier:latest
-```
-
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://isocpp.org/)
 [![Architecture](https://img.shields.io/badge/Architecture-Defined-blue)](docs/architecture/VISION.md)
 
 ---
 
-## Quick Start (Local Mode)
+## Quick Start
+
+Run with Docker — no configuration needed:
 
 ```bash
-ranvier --local
+docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 \
+  ghcr.io/ranvier-systems/ranvier:latest
 ```
 
-Auto-discovers Ollama, vLLM, LM Studio, and other local LLM servers.
-Routes requests by intent, priority, and cost — no configuration needed.
-Point your IDE to `http://localhost:8080` and start coding.
-
-See [Getting Started with Ranvier Local](docs/guides/getting-started-local.md) for details.
+Point your client at `http://localhost:8080` and start sending requests.
+For deployment options (Kubernetes, building from source), see [Deployment](#-deployment) below.
 
 ---
 
 ## ⚡ The Problem: "Blind" Routing
+
 Standard load balancers (Nginx, HAProxy) route LLM requests based on *server availability* (Least Connections or Round Robin). They treat LLM requests as generic HTTP packets.
 
 In the era of **KV-Caching**, this is inefficient.
@@ -42,6 +38,7 @@ In the era of **KV-Caching**, this is inefficient.
 * **Result:** `GPU-2` must re-compute the entire 4,000-token prefill. Throughput collapses; latency spikes.
 
 ## 🧠 The Solution: Content-Aware Routing
+
 **Ranvier** acts as a "Layer 7+" Load Balancer. It inspects the **semantic content** (token sequence) of the incoming request and routes it to the GPU that already holds the relevant KV Cache.
 
 Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltatory Conduction) to increase speed, Ranvier allows LLM inference to skip the prefill phase by jumping straight to the cached state.
@@ -75,17 +72,21 @@ Real-world results from 8x A100 GPUs (30-minute validated runs, February 2026):
 
 ### Performance by Model Size
 
-| Model | Cache Hit Rate | XLarge TTFT Improvement | P99 Latency | Throughput |
-|-------|----------------|-------------------------|-------------|------------|
+| Model | Cache Hit Rate | TTFT Improvement | P99 Latency | Throughput |
+|-------|----------------|------------------|-------------|------------|
 | **Llama-3.1-70B** | 25% → **98%** | **44%** faster | ~same | ~same |
 | CodeLlama-13b | 12% → **58-98%** | **33%** faster | **-60% to -85%** | **+4% to +22%** |
 | Llama-3.1-8B | 12% → **68-98%** | **40%** faster | flat | ~same |
 
-*70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).
-13B ranges: 58% hits / -80% P99 (current arch, 30u batched routes) to 98% / -85%
-(Instance 3, per-request SMP). Clean runs consistently show P99 -60% to -80%.*
+<sub>Hardware: 70B on 80GB A100s (TP=2, 4 backends); 13B/8B on 40GB A100s (8 backends).
+The 13B P99 range reflects two routing modes: 30μs batched routes give 58% hits / -80% P99,
+while per-request SMP reaches 98% / -85%. Clean runs consistently land at P99 -60% to -80%.</sub>
 
-**Key insight:** Benefits scale with model size — larger models save more computation per cache hit. The 13B model is the sweet spot: queue buildup under load makes routing dramatically effective (-60% to -85% P99, +4% to +22% throughput). 70B shows the highest per-request benefit (44% TTFT) but is compute-bound rather than queue-bound.
+**Key insight:** Benefits scale with model size — larger models save more computation per cache hit.
+
+- **70B** shows the highest per-request benefit (**44%** TTFT) but is compute-bound, so throughput stays flat.
+- **13B** is the sweet spot: queue buildup under load makes routing dramatically effective (**-60% to -85%** P99, **+4% to +22%** throughput).
+- **8B** still gains TTFT but has too little prefill work for the routing overhead to move P99 or throughput.
 
 **Best suited for:**
 - RAG applications with shared context documents
