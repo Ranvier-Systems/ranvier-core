@@ -28,7 +28,7 @@ import time
 import unittest
 
 try:
-    import requests  # noqa: F401  (imported for parity with sibling suites)
+    import requests
 except ImportError:
     print("Error: 'requests' library is required. Install with: pip install requests")
     sys.exit(1)
@@ -705,6 +705,123 @@ class ConfigLoadingTest(ClusterTestCase):
 
         print("  PASSED: Invalid YAML at startup produces clear error or clean fallback")
 
+    # =========================================================================
+    # Test 6: Missing config file falls back to defaults + env overrides
+    # =========================================================================
+
+    def test_06_missing_config_file_uses_defaults(self):
+        """When /tmp/ranvier.yaml doesn't exist, startup must use built-in
+        defaults (config_infra.hpp) with env-var overrides layered on top.
+
+        Code path: config_loader.cpp:796-799 -- if the ifstream fails to
+        open the file, ``RanvierConfig::load()`` calls
+        apply_env_overrides() on a freshly-default-constructed config and
+        returns it.  The default ``server.metrics_port`` is 9180
+        (config_infra.hpp:35); no env var in docker-compose.test.yml
+        overrides it, so the effective port stays 9180.
+
+        We prove the defaults path by:
+          * deleting any lingering /tmp/ranvier.yaml,
+          * driving a full stop/start cycle so the server re-enters
+            RanvierConfig::load() from scratch,
+          * querying the metrics endpoint both externally (via the
+            9181->9180 port mapping) and internally (docker exec curl
+            http://localhost:9180/metrics) -- the internal probe is
+            what actually proves the server bound to 9180 rather than
+            some other default.
+        """
+        print("\nTest: Missing config file uses built-in defaults")
+
+        node1_metrics = NODES["node1"]["metrics"]
+        container = CONTAINER_NAMES["node1"]
+
+        # Idempotently ensure no YAML exists.  If the live container is
+        # already down from a failed earlier test, this silently no-ops.
+        print(f"  Removing {_CONTAINER_CONFIG_PATH} (if present)...")
+        if check_container_running(container, self.PROJECT_NAME):
+            _remove_container_config(container)
+        else:
+            # Container is down -- nothing to remove; stop/start below
+            # will start from a fresh tmpfs anyway.
+            print("    Container is not running; tmpfs is already gone.")
+
+        # Drive a clean startup.  stop/start (rather than SIGHUP) is the
+        # correct primitive here: SIGHUP runs reload_config() against the
+        # already-initialized server, which skips the startup-only code
+        # paths we actually want to exercise (port binding, etc.).
+        print("  Stopping ranvier1...")
+        run_compose(
+            ["stop", "ranvier1"],
+            project_name=self.PROJECT_NAME,
+            check=False,
+        )
+        print("  Starting ranvier1...")
+        run_compose(
+            ["start", "ranvier1"],
+            project_name=self.PROJECT_NAME,
+            check=False,
+        )
+
+        # Wait for ranvier1 to come up healthy on its (default) metrics
+        # port.  Failure here would mean either the defaults themselves
+        # don't produce a valid config (regression), or the env overrides
+        # on a fresh config contradict each other -- both worth catching.
+        print("  Waiting for ranvier1 to become healthy...")
+        healthy = wait_for_healthy(
+            f"{node1_metrics}/metrics",
+            timeout=STARTUP_TIMEOUT,
+            container_name=container,
+            project_name=self.PROJECT_NAME,
+        )
+        self.assertTrue(
+            healthy,
+            "ranvier1 should start healthy when the config file is absent "
+            "(defaults + env overrides path)"
+        )
+
+        # External probe: /metrics on 9181 (host) -> 9180 (container).
+        # A 200 here proves the mapping-target port is actually open,
+        # which is only true if the server bound to 9180 internally.
+        print(f"  External probe: {node1_metrics}/metrics ...")
+        ext_resp = requests.get(f"{node1_metrics}/metrics", timeout=5)
+        self.assertEqual(
+            ext_resp.status_code, 200,
+            f"External /metrics should return 200 (via 9181->9180 mapping), "
+            f"got {ext_resp.status_code}"
+        )
+        self.assertIn(
+            "#", ext_resp.text,
+            "Prometheus metrics output should contain '# HELP' / '# TYPE' comments"
+        )
+
+        # Internal probe: confirm the server bound to exactly port 9180
+        # (the built-in default from config_infra.hpp).  A different
+        # default (say 9090) would silently pass the external probe if
+        # the compose mapping happened to match -- the internal curl
+        # removes that ambiguity.  ``docker exec`` uses the container's
+        # own network namespace, so localhost:9180 is the bind address.
+        print(f"  Internal probe: docker exec {container} curl http://localhost:9180/metrics ...")
+        int_result = subprocess.run(
+            ["docker", "exec", container,
+             "curl", "-sf", "-o", "/dev/null", "-w", "%{http_code}",
+             "http://localhost:9180/metrics"],
+            capture_output=True, text=True, timeout=10,
+        )
+        http_code = (int_result.stdout or "").strip()
+        self.assertEqual(
+            http_code, "200",
+            f"Internal curl on http://localhost:9180/metrics should return 200 "
+            f"(proving server bound to default metrics_port=9180). "
+            f"Got exit={int_result.returncode}, http_code={http_code!r}, "
+            f"stderr={int_result.stderr!r}"
+        )
+
+        # No cleanup step required: ranvier1 is healthy with no config
+        # file, which is the correct steady state for this project (env
+        # vars supply everything the tests need).
+
+        print("  PASSED: Missing config file -> defaults + env overrides, metrics on :9180")
+
 
 # =============================================================================
 # Main
@@ -721,6 +838,7 @@ def main():
     print("  - --dry-run validates without starting the server")
     print("  - --dry-run rejects invalid config with exit 1")
     print("  - Invalid YAML at startup produces a clear error (or clean fallback)")
+    print("  - Missing config file uses built-in defaults + env overrides")
     print("")
 
     try:
