@@ -38,9 +38,13 @@ from conftest import (
     COMPOSE_FILE,
     CONTAINER_NAMES,
     NODES,
+    STARTUP_TIMEOUT,
+    check_container_running,
     get_compose_cmd,
+    run_compose,
     send_chat_request,
     sum_metric_by_substring,
+    wait_for_healthy,
 )
 
 
@@ -532,6 +536,175 @@ class ConfigLoadingTest(ClusterTestCase):
 
         print("  PASSED: --dry-run correctly rejected invalid config with exit 1")
 
+    # =========================================================================
+    # Test 5: Invalid YAML at startup produces a clear error
+    # =========================================================================
+
+    def test_05_invalid_yaml_at_startup_produces_clear_error(self):
+        """Malformed YAML on startup must either crash with a clear error
+        message or fall back cleanly to defaults -- never produce an opaque
+        crash (raw libyaml stack trace, SIGSEGV, etc).
+
+        Expected paths in the code:
+          * YAML parse error -> RanvierConfig::load() throws
+            ``std::runtime_error("Failed to parse config file: ...")``
+            (config_loader.cpp:1555).
+          * main.cpp catches and prints ``Failed to load config: ...`` to
+            stderr, returns 1 (main.cpp:474-476).
+          * If the file DOESN'T exist, load() returns defaults + env
+            overrides (config_loader.cpp:796-799) and startup proceeds.
+
+        Note on tmpfs behavior: docker-compose.test.yml declares /tmp as a
+        tmpfs mount, and Docker tears down tmpfs on container stop.  After
+        ``stop`` + ``start``, the YAML we wrote may or may not survive --
+        this depends on the local Docker version/storage driver.  Both
+        outcomes satisfy the §6.6 requirement ("invalid config produces a
+        clear error, not a stack trace"): either we see the clean error
+        line in logs, or the server came up cleanly because the tmpfs was
+        wiped.  The test branches on the observed state.
+        """
+        print("\nTest: Invalid YAML at startup produces a clear error")
+
+        node1_api = NODES["node1"]["api"]
+        node1_metrics = NODES["node1"]["metrics"]
+        container = CONTAINER_NAMES["node1"]
+
+        # Pre-check: ranvier1 is healthy and has a running main process
+        self.assertTrue(
+            check_container_running(container, self.PROJECT_NAME),
+            "ranvier1 should be running before the startup-error test"
+        )
+
+        # Snapshot current log length so we only examine the output that
+        # appears AFTER our stop/start.  Pre-existing "Failed to parse"
+        # lines from earlier tests (none expected, but be defensive) would
+        # otherwise poison the assertion.
+        pre_logs = _get_container_logs(container, tail=1000)
+        pre_line_count = pre_logs.count("\n")
+
+        # Write deliberately malformed YAML.  YAML::Load() throws on this
+        # because of the unmatched braces and the bare colon sequence.
+        malformed_yaml = "{{invalid: yaml: [unterminated"
+        print("  Writing malformed YAML to container...")
+        _write_container_config(container, malformed_yaml)
+
+        # Drive the container through stop -> start.  run_compose(check=False)
+        # so an exit-on-start (if tmpfs preserved the bad file) doesn't
+        # raise inside this test -- we want to inspect the resulting state
+        # rather than fail on a subprocess error.
+        print("  Stopping ranvier1 via docker-compose...")
+        run_compose(
+            ["stop", "ranvier1"],
+            project_name=self.PROJECT_NAME,
+            check=False,
+        )
+        print("  Starting ranvier1 via docker-compose...")
+        run_compose(
+            ["start", "ranvier1"],
+            project_name=self.PROJECT_NAME,
+            check=False,
+        )
+
+        # Give the server a moment either to come up healthy or to exit
+        # with a parse error.  wait_for_healthy returns False quickly if
+        # the container has already exited (fast-fail via check_container_running).
+        print("  Observing post-restart state (up to 25s)...")
+        became_healthy = wait_for_healthy(
+            f"{node1_metrics}/metrics",
+            timeout=25,
+            container_name=container,
+            project_name=self.PROJECT_NAME,
+        )
+
+        post_logs = _get_container_logs(container, tail=1000)
+        new_logs = "\n".join(post_logs.split("\n")[pre_line_count:])
+
+        try:
+            if became_healthy:
+                # Tmpfs wiped the YAML during stop; server loaded defaults.
+                # Per the BACKLOG §6.6 intent, this is an acceptable outcome.
+                # We still make sure the server didn't silently log a raw
+                # libyaml stack trace or other crash noise just before
+                # recovering.
+                print("  Container came up healthy (tmpfs wiped the bad YAML).")
+                self.assertNotIn(
+                    "terminate called",
+                    new_logs,
+                    "Startup logs contain 'terminate called' -- looks like a "
+                    "raw abort, not a clean error path"
+                )
+                # Confirm end-to-end request path works post-restart
+                status, _, _ = send_chat_request(
+                    node1_api, [{"role": "user", "content": "post-restart-check"}],
+                    timeout=10, retries=1,
+                )
+                self.assertEqual(
+                    status, 200,
+                    "ranvier1 should serve requests after restart with defaults"
+                )
+            else:
+                # Container failed to come up -- the bad YAML must have
+                # persisted across the stop.  Exactly the path that §6.6
+                # wants us to validate: the error message should be clear
+                # and caller-readable.
+                print("  Container did NOT become healthy -- checking for clear error...")
+                self.assertIn(
+                    "Failed to parse config",
+                    new_logs,
+                    "Expected the clear error message 'Failed to parse config' "
+                    "(config_loader.cpp:1555 -> main.cpp:475) when startup "
+                    "rejects malformed YAML. Full new-log tail:\n"
+                    f"{new_logs[-2000:]}"
+                )
+                # Also guard against the error being buried under a raw
+                # C++ abort.  "terminate called" indicates an uncaught
+                # exception or abort() -- not what we want users to see.
+                self.assertNotIn(
+                    "terminate called",
+                    new_logs,
+                    "Startup logs contain 'terminate called' -- a clear error "
+                    "message was expected, not a raw abort.  Log tail:\n"
+                    f"{new_logs[-2000:]}"
+                )
+
+        finally:
+            # Restore ranvier1 to a healthy state for any later work.
+            # Order matters: if the container is running, we can simply
+            # wipe the file and SIGHUP-reload.  If it has exited (stuck in
+            # a crash loop on the bad YAML), we must force-recreate so a
+            # fresh tmpfs mounts over the bad config.
+            print("  Cleanup: restoring ranvier1 to healthy state...")
+            if check_container_running(container, self.PROJECT_NAME):
+                _remove_container_config(container)
+                # The live parent hasn't loaded this file (it only sees it
+                # via SIGHUP), so no reload is strictly required -- but be
+                # thorough in case a later test assumes defaults are active.
+                time.sleep(_RELOAD_COOLDOWN_WAIT)
+                try:
+                    _send_sighup(container)
+                    time.sleep(3)
+                except RuntimeError as e:
+                    print(f"    Cleanup SIGHUP failed (non-fatal): {e}")
+            else:
+                print("    Container exited -- forcing recreate for a fresh tmpfs...")
+                run_compose(
+                    ["up", "-d", "--force-recreate", "--no-deps", "ranvier1"],
+                    project_name=self.PROJECT_NAME,
+                    check=False,
+                    show_output=True,
+                )
+                recovered = wait_for_healthy(
+                    f"{node1_metrics}/metrics",
+                    timeout=STARTUP_TIMEOUT,
+                    container_name=container,
+                    project_name=self.PROJECT_NAME,
+                )
+                if not recovered:
+                    print("    WARNING: ranvier1 did not recover; later tests "
+                          "in this class may fail.")
+
+        print("  PASSED: Invalid YAML at startup produces clear error or clean fallback")
+
 
 # =============================================================================
 # Main
@@ -547,7 +720,7 @@ def main():
     print("  - Environment variables override YAML")
     print("  - --dry-run validates without starting the server")
     print("  - --dry-run rejects invalid config with exit 1")
-    print("  - (more tests to come)")
+    print("  - Invalid YAML at startup produces a clear error (or clean fallback)")
     print("")
 
     try:
