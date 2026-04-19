@@ -40,6 +40,7 @@ from conftest import (
     NODES,
     get_compose_cmd,
     send_chat_request,
+    sum_metric_by_substring,
 )
 
 
@@ -98,6 +99,53 @@ def _get_container_logs(container: str, tail: int = 200) -> str:
     )
     # docker logs writes container stdout to our stdout and stderr to stderr.
     return (result.stdout or "") + (result.stderr or "")
+
+
+# Log lines emitted by application.cpp during reload_config().
+_RELOAD_SUCCESS_LINE = "Configuration reloaded successfully on all cores"
+_RELOAD_FAILURE_LINES = (
+    "Config reload failed - validation error",
+    "Config reload failed:",
+    "Config reload rate-limited",
+)
+
+
+def wait_for_reload_success(
+    testcase: unittest.TestCase,
+    container: str,
+    pre_line_count: int,
+    *,
+    timeout: float = 10.0,
+) -> str:
+    """Poll container logs until a reload-success line appears after the cutoff.
+
+    Returns the "new portion" of the logs (everything past ``pre_line_count``
+    lines) so callers can run additional assertions on it without re-reading
+    docker logs.  Fails the test fast if a reload-failure line appears in the
+    new portion first -- that way callers get a clear diagnostic instead of a
+    generic timeout.
+    """
+    deadline = time.time() + timeout
+    last_new_portion = ""
+    while time.time() < deadline:
+        logs = _get_container_logs(container, tail=500)
+        new_portion = "\n".join(logs.split("\n")[pre_line_count:])
+        last_new_portion = new_portion
+        if _RELOAD_SUCCESS_LINE in new_portion:
+            return new_portion
+        for bad in _RELOAD_FAILURE_LINES:
+            if bad in new_portion:
+                testcase.fail(
+                    f"Config reload did not succeed -- log line found: '{bad}'. "
+                    f"Recent logs:\n{new_portion[-2000:]}"
+                )
+        time.sleep(0.5)
+
+    testcase.fail(
+        f"Expected '{_RELOAD_SUCCESS_LINE}' in container logs after SIGHUP. "
+        f"Recent logs:\n{last_new_portion[-2000:]}"
+    )
+    return last_new_portion  # unreachable, keeps mypy happy
 
 
 # =============================================================================
@@ -172,42 +220,12 @@ class ConfigLoadingTest(ClusterTestCase):
             # then propagates via invoke_on_all across shards -- a few
             # seconds is enough, but we poll to be robust under slow CI.
             print("  Waiting for 'Configuration reloaded successfully' log line...")
-            success_line = "Configuration reloaded successfully on all cores"
-            deadline = time.time() + 10
-            reloaded = False
-            while time.time() < deadline:
-                logs = _get_container_logs(container, tail=500)
-                # Only consider lines after the pre-SIGHUP cutoff
-                new_portion = "\n".join(logs.split("\n")[pre_line_count:])
-                if success_line in new_portion:
-                    reloaded = True
-                    break
-                # Guard against a validation error or rate-limit rejection
-                # getting silently swallowed: fail fast with a helpful message
-                for bad in (
-                    "Config reload failed - validation error",
-                    "Config reload failed:",
-                    "Config reload rate-limited",
-                ):
-                    if bad in new_portion:
-                        self.fail(
-                            f"Config reload did not succeed -- log line found: '{bad}'. "
-                            f"Recent logs:\n{new_portion[-2000:]}"
-                        )
-                time.sleep(0.5)
-
-            self.assertTrue(
-                reloaded,
-                f"Expected '{success_line}' in container logs after SIGHUP. "
-                f"Recent logs:\n{_get_container_logs(container, tail=200)[-2000:]}"
-            )
+            new_portion = wait_for_reload_success(self, container, pre_line_count)
 
             # Cross-check: SIGHUP receipt was logged too (belt and suspenders --
             # confirms our signal reached the handler, not just that *some*
             # earlier reload succeeded).
             sighup_line = "SIGHUP received - triggering configuration reload"
-            logs = _get_container_logs(container, tail=500)
-            new_portion = "\n".join(logs.split("\n")[pre_line_count:])
             self.assertIn(
                 sighup_line, new_portion,
                 "Expected SIGHUP receipt to be logged after our docker kill --signal=HUP"
@@ -240,6 +258,127 @@ class ConfigLoadingTest(ClusterTestCase):
 
         print("  PASSED: Valid YAML loaded and applied via SIGHUP")
 
+    # =========================================================================
+    # Test 2: Environment variables override YAML values
+    # =========================================================================
+
+    def test_02_env_vars_override_yaml(self):
+        """Verify apply_env_overrides() wins when YAML and env disagree.
+
+        docker-compose.test.yml sets ``RANVIER_MIN_TOKEN_LENGTH=2`` on every
+        Ranvier node.  We write a YAML file that claims
+        ``routing.min_token_length: 99`` and SIGHUP.  RanvierConfig::load()
+        parses YAML first, then apply_env_overrides() clobbers with the env
+        value -- so the effective threshold after reload is 2, not 99.
+
+        Observable consequence: in PREFIX routing mode (the default), the
+        HTTP path learns routes only when ``ctx->tokens.size() >=
+        min_token_length`` (http_controller.cpp:975).  Normal chat prompts
+        easily exceed 2 tokens but fall far below 99.  So if env wins,
+        ``routes_total`` on node1 increases after a few requests; if YAML
+        wins, it stays flat.
+        """
+        print("\nTest: Environment variables override YAML")
+
+        node1_api = NODES["node1"]["api"]
+        node1_metrics = NODES["node1"]["metrics"]
+        container = CONTAINER_NAMES["node1"]
+
+        # Wait out any residual RELOAD_COOLDOWN from test_01's cleanup SIGHUP.
+        # test_01 ends with a SIGHUP + 3s settle, so ~9s of cooldown remains
+        # when we enter here.  12s is the safe margin used throughout the
+        # sibling suites.
+        print(f"  Waiting {_RELOAD_COOLDOWN_WAIT}s for reload cooldown to expire...")
+        time.sleep(_RELOAD_COOLDOWN_WAIT)
+
+        # Baseline: how many routes has node1 learned so far?  The cluster
+        # has been serving health and warm-up traffic since setUpClass, so
+        # the counter is rarely zero -- we rely on a DELTA, not an absolute.
+        initial_routes = sum_metric_by_substring(node1_metrics, "routes_total")
+        print(f"  Initial routes_total on node1: {initial_routes}")
+
+        # YAML sets an impossibly high threshold.  If env didn't override
+        # YAML, the following warm-up traffic would NOT learn any routes.
+        yaml_text = (
+            "routing:\n"
+            "  min_token_length: 99\n"
+        )
+
+        pre_logs = _get_container_logs(container, tail=500)
+        pre_line_count = pre_logs.count("\n")
+
+        print(f"  Writing YAML with routing.min_token_length=99 to {container}...")
+        _write_container_config(container, yaml_text)
+
+        try:
+            print("  Sending SIGHUP to apply YAML (env should override)...")
+            _send_sighup(container)
+
+            print("  Waiting for 'Configuration reloaded successfully' log line...")
+            wait_for_reload_success(self, container, pre_line_count)
+
+            # Give shards a moment for the new config to settle on every core
+            # (invoke_on_all finished before the log line, but route-learning
+            # reads shard-local config -- small settle avoids a race).
+            time.sleep(1)
+
+            # Send a handful of chat requests with distinct, moderately-long
+            # prompts.  Each prompt tokenizes to well over 2 tokens (env
+            # threshold) but well under 99 (YAML threshold).  Distinct
+            # content makes each request a new prefix in the ART, so each
+            # should produce a fresh entry in routes_total.
+            num_requests = 6
+            print(f"  Sending {num_requests} learning-eligible requests to node1...")
+            successful = 0
+            for i in range(num_requests):
+                prompt = (
+                    f"env-override-verification-request-{i} "
+                    "please reply with any content so route learning can run"
+                )
+                status, _, _ = send_chat_request(
+                    node1_api, [{"role": "user", "content": prompt}],
+                    timeout=15, retries=1,
+                )
+                if status == 200:
+                    successful += 1
+
+            self.assertGreater(
+                successful, 0,
+                f"At least some requests should succeed ({successful}/{num_requests})"
+            )
+
+            # Allow the batched route-learning buffer to flush into the ART
+            # before we sample the metric.  router_service batches local
+            # route learning (see comment near RouterService::learn_route_global).
+            time.sleep(3)
+
+            final_routes = sum_metric_by_substring(node1_metrics, "routes_total")
+            delta = final_routes - initial_routes
+            print(f"  Final routes_total on node1: {final_routes} (delta {delta:+.0f})")
+
+            # If YAML had won, min_token_length would be 99 and NONE of our
+            # short prompts would trigger learning -- delta would be 0.  A
+            # positive delta is the observable proof that env overrode YAML.
+            self.assertGreater(
+                delta, 0,
+                f"routes_total should increase after sending learning-eligible "
+                f"requests if env (RANVIER_MIN_TOKEN_LENGTH=2) overrode YAML "
+                f"(min_token_length=99).  Observed delta={delta}. "
+                f"A zero delta means YAML's 99 won, i.e. env override is broken."
+            )
+
+        finally:
+            print("  Cleanup: removing config file and reloading defaults...")
+            _remove_container_config(container)
+            time.sleep(_RELOAD_COOLDOWN_WAIT)
+            try:
+                _send_sighup(container)
+                time.sleep(3)
+            except RuntimeError as e:
+                print(f"    Cleanup SIGHUP failed (non-fatal): {e}")
+
+        print("  PASSED: Env var RANVIER_MIN_TOKEN_LENGTH=2 overrode YAML=99")
+
 
 # =============================================================================
 # Main
@@ -252,6 +391,7 @@ def main():
     print("=" * 70)
     print("\nThese tests validate startup/reload config behavior:")
     print("  - YAML config loaded correctly")
+    print("  - Environment variables override YAML")
     print("  - (more tests to come)")
     print("")
 
