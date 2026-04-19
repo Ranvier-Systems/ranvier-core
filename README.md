@@ -24,11 +24,11 @@ docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 \
 ```
 
 Point your client at `http://localhost:8080` and start sending requests.
-For deployment options (Kubernetes, building from source), see [Deployment](#-deployment) below.
+For deployment options (Kubernetes, building from source), see [Deployment](#deployment) below.
 
 ---
 
-## ⚡ The Problem: "Blind" Routing
+## The Problem: "Blind" Routing
 
 Standard load balancers (Nginx, HAProxy) route LLM requests based on *server availability* (Least Connections or Round Robin). They treat LLM requests as generic HTTP packets.
 
@@ -37,7 +37,7 @@ In the era of **KV-Caching**, this is inefficient.
 * **Request B** (asking a question about that PDF) gets routed to `GPU-2` by Round Robin.
 * **Result:** `GPU-2` must re-compute the entire 4,000-token prefill. Throughput collapses; latency spikes.
 
-## 🧠 The Solution: Content-Aware Routing
+## The Solution: Content-Aware Routing
 
 **Ranvier** acts as a "Layer 7+" Load Balancer. It inspects the **semantic content** (token sequence) of the incoming request and routes it to the GPU that already holds the relevant KV Cache.
 
@@ -50,7 +50,7 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ---
 
-## 🚀 Performance Characteristics
+## Performance Characteristics
 
 | Metric | Measured | Notes |
 |--------|----------|-------|
@@ -66,7 +66,7 @@ Just as the **Nodes of Ranvier** allow biological signals to "jump" gaps (Saltat
 
 ---
 
-## 📊 Benchmark Results
+## Benchmark Results
 
 Real-world results from 8x A100 GPUs (30-minute validated runs, February 2026):
 
@@ -98,7 +98,7 @@ See [Benchmark Guide](docs/benchmarks/benchmark-guide-8xA100.md) for detailed me
 
 ---
 
-## 🗺️ Architecture & Vision
+## Architecture & Vision
 
 Ranvier is evolving from a prefix-aware router into a full **Intelligence Layer for AI Inference Infrastructure**.
 
@@ -132,7 +132,7 @@ Other backends with prefix/KV cache reuse (SGLang RadixAttention, TensorRT-LLM, 
 
 ---
 
-## 🛠️ Configuration
+## Configuration
 Ranvier maps generic HTTP endpoints to specific Tokenizer/Model backends.
 
 ```yaml
@@ -177,7 +177,7 @@ graph TD
 
 ---
 
-## 🐳 Deployment
+## Deployment
 
 ### Docker
 
@@ -213,7 +213,7 @@ docker run --cap-add=IPC_LOCK -p 8080:8080 -p 9180:9180 ranvier:latest
 
 ---
 
-## 🔧 Development Setup
+## Development Setup
 
 ### Prerequisites
 - Docker with BuildKit enabled
@@ -275,7 +275,7 @@ See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed co
 
 ---
 
-## 📖 Documentation
+## Documentation
 
 ### Guides
 - [Getting Started with Ranvier Local](docs/guides/getting-started-local.md)
