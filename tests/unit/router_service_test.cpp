@@ -1116,7 +1116,8 @@ protected:
         cfg_.prefix_token_length = 128;
         cfg_.block_alignment = 1;
         cfg_.backend_drain_timeout = std::chrono::seconds(2);
-        cfg_.load_aware_routing = false;  // Not used by bounded_load
+        // Built-in load awareness (cap/probe) is gated on load_aware_routing.
+        cfg_.load_aware_routing = true;
         cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
         cfg_.bounded_load_epsilon = 0.25;
 
@@ -1243,6 +1244,63 @@ TEST_F(BoundedLoadTest, ARTHitOverriddenWhenOverCap) {
         << "Bounded-load should override ART hit when backend is over cap";
 }
 
+// ---- load_aware_routing=false disables built-in bounded-load awareness ----
+//
+// These tests pin the semantics introduced when bounded_load_select and the
+// Step 3 ART re-check were gated on load_aware_routing: with the flag off,
+// BOUNDED_LOAD must behave like pure jump-hash (no cap/probe, no ART override).
+
+TEST_F(BoundedLoadTest, NoDivertWhenLoadAwareDisabled) {
+    cfg_.load_aware_routing = false;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    auto preferred = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(preferred.backend_id.has_value());
+    BackendId primary = preferred.backend_id.value();
+
+    // Load the primary heavily — with LA enabled this would trigger probing.
+    BackendRequestGuard g1(primary);
+    BackendRequestGuard g2(primary);
+    BackendRequestGuard g3(primary);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary)
+        << "With load_aware_routing=false, bounded-load should stay on the primary "
+           "regardless of load (pure jump-hash behavior)";
+}
+
+TEST_F(BoundedLoadTest, NoARTOverrideWhenLoadAwareDisabled) {
+    cfg_.load_aware_routing = false;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    // Overload backend 3 — with LA enabled, Step 3 would re-check the cap and
+    // divert away from the ART hit. With LA disabled, the ART hit must stick.
+    BackendRequestGuard g1(3);
+    BackendRequestGuard g2(3);
+    BackendRequestGuard g3(3);
+    BackendRequestGuard g4(3);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3)
+        << "With load_aware_routing=false, Step 3 ART re-check is a no-op — "
+           "the ART hit must be respected even when the backend is over cap";
+    EXPECT_TRUE(result.art_hit);
+}
+
 // =============================================================================
 // 22. Hash Strategy: Power of Two Choices (P2C)
 // =============================================================================
@@ -1260,7 +1318,8 @@ protected:
         cfg_.prefix_token_length = 128;
         cfg_.block_alignment = 1;
         cfg_.backend_drain_timeout = std::chrono::seconds(2);
-        cfg_.load_aware_routing = false;  // Not used by P2C
+        // Built-in load awareness (primary-vs-secondary bias) is gated on load_aware_routing.
+        cfg_.load_aware_routing = true;
         cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
         cfg_.p2c_load_bias = 2;
 
@@ -1329,6 +1388,36 @@ TEST_F(P2CTest, SticksWithPrimaryWhenLoadBalanced) {
     ASSERT_TRUE(result.backend_id.has_value());
     EXPECT_EQ(result.backend_id.value(), primary)
         << "P2C should stick with primary when load difference is within bias";
+}
+
+TEST_F(P2CTest, NoSecondarySwitchWhenLoadAwareDisabled) {
+    // With load_aware_routing=false, p2c_select returns the primary without
+    // reading the secondary's load — pure jump-hash behavior.
+    cfg_.load_aware_routing = false;
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_four_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    auto preferred = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(preferred.backend_id.has_value());
+    BackendId primary = preferred.backend_id.value();
+
+    // Heavily load the primary — with LA enabled this would trigger the
+    // primary→secondary switch. With LA disabled it must stick.
+    BackendRequestGuard g1(primary);
+    BackendRequestGuard g2(primary);
+    BackendRequestGuard g3(primary);
+    BackendRequestGuard g4(primary);
+    BackendRequestGuard g5(primary);
+
+    auto result = router_->get_backend_for_prefix(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), primary)
+        << "With load_aware_routing=false, P2C should stay on the primary "
+           "regardless of load (pure jump-hash behavior)";
 }
 
 // =============================================================================
@@ -1724,7 +1813,8 @@ TEST_F(CrossShardLoadSyncTest, LoadAwareRoutingWithCrossShardHints) {
     // Test that bounded-load hash strategy works correctly when cross_shard_load_sync is enabled.
     // The load values used by bounded_load_select come from get_backend_load(),
     // which now includes cross-shard hints when enabled.
-    cfg_.load_aware_routing = false;
+    // Built-in bounded-load awareness is gated on load_aware_routing.
+    cfg_.load_aware_routing = true;
     cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
     cfg_.bounded_load_epsilon = 0.25;
     cfg_.cross_shard_load_sync = true;
@@ -2280,7 +2370,10 @@ protected:
         cfg_.prefix_token_length = 128;
         cfg_.block_alignment = 1;
         cfg_.backend_drain_timeout = std::chrono::seconds(2);
-        cfg_.load_aware_routing = false;  // Isolate capacity-aware from median-based
+        // Keep built-in bounded-load awareness on (it's what consumes the
+        // capacity-adjusted load); the legacy median override is not used
+        // by BOUNDED_LOAD regardless.
+        cfg_.load_aware_routing = true;
         cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
         cfg_.bounded_load_epsilon = 0.25;
         cfg_.capacity_headroom_weight = 10.0;  // Strong signal for test visibility
@@ -2451,6 +2544,52 @@ TEST_F(CapacityAwareHashTest, P2CStrategyRespectsHeadroom) {
 
     // Backend 2 (low pressure) should handle more requests
     EXPECT_GT(backend2_count, backend1_count);
+}
+
+TEST_F(CapacityAwareHashTest, P2CARTOverrideUsesCapacityAdjustedLoad) {
+    // Regression: before metric alignment, the P2C Step 3 ART override used
+    // get_composite_backend_load(), which ignores cache-pressure. That meant
+    // an ART hit on a cache-full backend would stick, even though the
+    // hash-fallback path (p2c_select) would have diverted via capacity-
+    // adjusted load. With the fix, both paths see the same signal.
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+    cfg_.p2c_load_bias = 0;  // No bias — any load difference triggers a switch
+    router_.reset();
+    RouterService::reset_shard_state_for_testing(nullptr);
+    router_ = std::make_unique<RouterService>(cfg_);
+
+    register_backends(2);
+
+    // Backend 1 has a hot KV cache (high pressure); backend 2 is nearly empty.
+    // Zero in-flight requests on both, so composite load is identical.
+    RouterService::set_cache_headroom_for_testing(1, 0.9);
+    RouterService::set_cache_headroom_for_testing(2, 0.1);
+
+    // Pin an ART route for each distinct prefix to backend 1 — this forces
+    // the Step 3 ART override path (not the hash-fallback path).
+    int redirected = 0;
+    int stuck_on_1 = 0;
+    for (int i = 0; i < 100; ++i) {
+        std::vector<int32_t> tokens(128, 1000 + i);  // Distinct prefix per iteration
+        RouterService::insert_route_for_testing(tokens, 1);
+
+        auto result = router_->get_backend_for_prefix(tokens, "art-" + std::to_string(i), 0, 5000.0);
+        ASSERT_TRUE(result.backend_id.has_value());
+        ASSERT_TRUE(result.art_hit) << "Expected ART hit for freshly-inserted route";
+
+        if (*result.backend_id == 1) {
+            stuck_on_1++;
+        } else if (*result.backend_id == 2) {
+            redirected++;
+        }
+    }
+
+    // Because the override now uses capacity-adjusted load, backend 1's cache
+    // pressure is visible to Step 3 and the ART hit gets diverted to backend 2.
+    // Pre-fix, `redirected` would be ~0 (composite load identical on both).
+    EXPECT_GT(redirected, stuck_on_1)
+        << "P2C ART override should see cache-pressure penalty and divert "
+           "to the low-pressure backend (capacity-adjusted metric alignment)";
 }
 
 TEST_F(CapacityAwareHashTest, ZeroEstimatedCostUsesBaselineHeadroom) {

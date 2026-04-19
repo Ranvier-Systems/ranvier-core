@@ -1169,6 +1169,15 @@ static BackendId bounded_load_select(
     if (n <= 0) return 0;
     if (n == 1) return live_backends[0];
 
+    // Honor the load_aware_routing toggle uniformly across strategies.
+    // When disabled, fall back to pure jump-hash with no cap/probe — this
+    // gives operators a real escape hatch to run consistent hashing without
+    // any load-driven diversion, matching the JUMP strategy's behavior when
+    // load_aware_routing=false.
+    if (g_shard_state && !g_shard_state->config.load_aware_routing) {
+        return live_backends[jump_consistent_hash(prefix_hash, n)];
+    }
+
     // Compute total capacity-adjusted load across all live backends for average.
     // When cache headroom data is available and capacity_headroom_weight > 0,
     // backends with fuller caches appear more loaded — especially for large requests.
@@ -1245,6 +1254,12 @@ static BackendId p2c_select(
     if (n <= 0) return 0;
     if (n == 1) return live_backends[0];
 
+    // Honor the load_aware_routing toggle uniformly: when disabled, always
+    // return the primary (hash-selected) backend without comparing loads.
+    if (g_shard_state && !g_shard_state->config.load_aware_routing) {
+        return live_backends[jump_consistent_hash(prefix_hash, n)];
+    }
+
     int32_t primary_idx = jump_consistent_hash(prefix_hash, n);
     // XOR with salt to get a different bucket for the secondary choice
     int32_t secondary_idx = jump_consistent_hash(prefix_hash ^ request_salt, n);
@@ -1308,6 +1323,30 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
     log_router.info("Hash strategy: {} (epsilon={}, p2c_bias={})",
                     strategy_name, routing_config.bounded_load_epsilon,
                     routing_config.p2c_load_bias);
+
+    // When the hash strategy has built-in load awareness, the external median
+    // override (load_imbalance_factor/floor) is not applied. Honor the
+    // load_aware_routing toggle uniformly so operators can opt into pure
+    // consistent hashing, but make the semantics explicit in the startup log.
+    {
+        const bool strategy_has_builtin_la =
+            routing_config.hash_strategy == RoutingConfig::HashStrategy::BOUNDED_LOAD ||
+            routing_config.hash_strategy == RoutingConfig::HashStrategy::P2C;
+        if (strategy_has_builtin_la) {
+            if (routing_config.load_aware_routing) {
+                log_router.info("load_aware_routing=true with hash strategy '{}': the "
+                                "strategy's built-in load awareness is used; "
+                                "load_imbalance_factor/floor (median override) apply "
+                                "only to jump/modular.",
+                                strategy_name);
+            } else {
+                log_router.info("load_aware_routing=false with hash strategy '{}': "
+                                "built-in cap/probe and secondary selection are disabled; "
+                                "routing falls back to pure consistent hashing.",
+                                strategy_name);
+            }
+        }
+    }
 
     // Create GossipService if cluster mode is enabled
     if (_cluster_config.enabled) {
@@ -2296,55 +2335,77 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // Step 3: Apply load-aware override.
     // BOUNDED_LOAD and P2C have load awareness built in for both ART and hash paths.
     // JUMP and MODULAR use the legacy median-based threshold.
+    //
+    // All three paths respect the load_aware_routing toggle: when disabled,
+    // Step 3 is a no-op and routing returns the ART/hash choice unmodified.
+    // This matches the gating inside bounded_load_select / p2c_select /
+    // apply_load_aware_selection so the toggle has a single, consistent meaning.
     BackendId final_backend = selected;
-    switch (state.config.hash_strategy) {
-    case RoutingConfig::HashStrategy::BOUNDED_LOAD: {
-        // For ART hits under bounded-load, check if the ART-selected backend
-        // exceeds the capacity cap. If so, fall back to bounded-load selection.
-        if (art_hit) {
-            uint64_t total_load = 0;
-            for (BackendId id : live_backends) {
-                total_load += get_capacity_adjusted_load(id, estimated_cost);
-            }
-            double avg = static_cast<double>(total_load) / static_cast<double>(live_backends.size());
-            uint64_t cap = std::max(static_cast<uint64_t>(1),
-                                    static_cast<uint64_t>(std::ceil(avg * (1.0 + state.config.bounded_load_epsilon))));
-            uint64_t sel_load = get_capacity_adjusted_load(selected, estimated_cost);
-            if (sel_load >= cap) {
-                prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
-                final_backend = bounded_load_select(prefix_hash, live_backends,
-                                                    state.config.bounded_load_epsilon, request_id,
-                                                    estimated_cost);
-            }
-        }
-        // Hash path: already handled in step 2
-        break;
-    }
-    case RoutingConfig::HashStrategy::P2C:
-        // For ART hits under P2C, check if ART-selected backend is overloaded
-        // vs a random alternative. Use same bias threshold.
-        if (art_hit && live_backends.size() >= 2) {
-            auto [least_id, least_load] = get_least_loaded_backend(live_backends);
-            uint64_t sel_load = get_composite_backend_load(selected);
-            if (least_id != 0 && least_load + state.config.p2c_load_bias < sel_load) {
-                final_backend = least_id;
-                g_shard_state->stats.load_aware_fallbacks++;
-                if (g_metrics) {
-                    metrics().record_load_aware_fallback();
+    if (state.config.load_aware_routing) {
+        switch (state.config.hash_strategy) {
+        case RoutingConfig::HashStrategy::BOUNDED_LOAD: {
+            // For ART hits under bounded-load, check if the ART-selected backend
+            // exceeds the capacity cap. If so, fall back to bounded-load selection.
+            if (art_hit) {
+                uint64_t total_load = 0;
+                for (BackendId id : live_backends) {
+                    total_load += get_capacity_adjusted_load(id, estimated_cost);
                 }
-                log_router.debug("[{}] P2C (ART override): backend {} has {} in-flight, "
-                                 "least-loaded backend {} has {} (bias={})",
-                                 request_id, selected, sel_load, least_id, least_load,
-                                 state.config.p2c_load_bias);
+                double avg = static_cast<double>(total_load) / static_cast<double>(live_backends.size());
+                uint64_t cap = std::max(static_cast<uint64_t>(1),
+                                        static_cast<uint64_t>(std::ceil(avg * (1.0 + state.config.bounded_load_epsilon))));
+                uint64_t sel_load = get_capacity_adjusted_load(selected, estimated_cost);
+                if (sel_load >= cap) {
+                    prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+                    final_backend = bounded_load_select(prefix_hash, live_backends,
+                                                        state.config.bounded_load_epsilon, request_id,
+                                                        estimated_cost);
+                }
             }
+            // Hash path: already handled in step 2
+            break;
         }
-        break;
-    case RoutingConfig::HashStrategy::JUMP:
-    case RoutingConfig::HashStrategy::MODULAR:
-    default:
-        // Legacy median-based load-aware override for both ART and hash paths
-        final_backend = apply_load_aware_selection(selected, live_backends, request_id, source);
-        break;
+        case RoutingConfig::HashStrategy::P2C:
+            // For ART hits under P2C, check if ART-selected backend is overloaded
+            // vs the least-loaded alternative. Use same bias threshold.
+            //
+            // Metric alignment: compare capacity-adjusted loads to match
+            // p2c_select()'s primary/secondary comparison. Without this, the
+            // ART override would see a different (lower) "selected load" than
+            // the hash-fallback path, biasing against diversion when cache
+            // pressure is high.
+            if (art_hit && live_backends.size() >= 2) {
+                uint64_t sel_load = get_capacity_adjusted_load(selected, estimated_cost);
+                BackendId least_id = 0;
+                uint64_t least_load = UINT64_MAX;
+                for (BackendId id : live_backends) {
+                    uint64_t load = get_capacity_adjusted_load(id, estimated_cost);
+                    if (load < least_load) {
+                        least_load = load;
+                        least_id = id;
+                    }
+                }
+                if (least_id != 0 && least_id != selected &&
+                    least_load + state.config.p2c_load_bias < sel_load) {
+                    final_backend = least_id;
+                    g_shard_state->stats.load_aware_fallbacks++;
+                    if (g_metrics) {
+                        metrics().record_load_aware_fallback();
+                    }
+                    log_router.debug("[{}] P2C (ART override): backend {} has {} in-flight, "
+                                     "least-loaded backend {} has {} (bias={})",
+                                     request_id, selected, sel_load, least_id, least_load,
+                                     state.config.p2c_load_bias);
+                }
+            }
+            break;
+        case RoutingConfig::HashStrategy::JUMP:
+        case RoutingConfig::HashStrategy::MODULAR:
+        default:
+            // Legacy median-based load-aware override for both ART and hash paths
+            final_backend = apply_load_aware_selection(selected, live_backends, request_id, source);
+            break;
+        }
     }
 
     // Track GPU-load-driven redirect for observability.
