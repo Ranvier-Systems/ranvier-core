@@ -195,6 +195,8 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             self._handle_admin_latency()
         elif parsed.path == "/admin/failure-mode":
             self._handle_admin_failure_mode()
+        elif parsed.path == "/admin/prefix-echo":
+            self._handle_admin_prefix_echo()
         else:
             print(f"[Backend {BACKEND_ID}] Unknown path: {parsed.path}", flush=True)
             self.send_response(404)
@@ -243,6 +245,22 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             _failure_mode = mode
         print(f"[Backend {BACKEND_ID}] Failure mode set to: {mode}", flush=True)
         self._send_json(200, {"failure_mode": mode})
+
+    def _handle_admin_prefix_echo(self):
+        """Toggle prefix-echo mode. POST /admin/prefix-echo?enabled=1|0
+
+        Runtime equivalent of the ``MOCK_PREFIX_ECHO`` env var and the
+        ``X-Mock-Prefix-Echo`` header, for tests that go through the
+        Ranvier proxy (which does not forward arbitrary request headers
+        to the backend).
+        """
+        global _prefix_echo_enabled
+        params = parse_qs(urlparse(self.path).query)
+        enabled = params.get("enabled", ["1"])[0] == "1"
+        with _state_lock:
+            _prefix_echo_enabled = enabled
+        print(f"[Backend {BACKEND_ID}] Prefix echo set to: {enabled}", flush=True)
+        self._send_json(200, {"prefix_echo": enabled})
 
     # ---- /debug/requests -----------------------------------------------------
 

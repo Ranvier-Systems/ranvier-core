@@ -438,10 +438,12 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
   _Files:_ `tests/integration/test_streaming.py`
   _Complexity:_ Medium
 
-- [ ] **Test concurrent request handling**
-  _Description:_ Verify: 100 concurrent requests without errors, request ordering preserved per-connection, no cross-contamination under load.
-  _Files:_ `tests/integration/test_http_pipeline.py`
+- [x] **Test concurrent request handling** ✅
+  _Description:_ Covered by `tests/integration/test_http_pipeline.py`: `test_11_100_concurrent_requests_without_errors` (20-worker `ThreadPoolExecutor` drives 100 streaming requests and asserts all 200 with non-empty bodies), `test_12_no_cross_contamination_under_load` (50 concurrent streams with unique per-request prompts and the mock backend's `/admin/prefix-echo` toggle assert each response echoes its own prompt prefix — direct shared-state detector), and `test_13_request_ordering_preserved_per_connection` (10 sequential requests on a single `requests.Session` assert keep-alive responses arrive in order).  Added `POST /admin/prefix-echo?enabled=1|0` to `mock_backend.py` because Ranvier constructs a fresh header set for the backend hop (see test_02's X-Custom-Header note).
+  _Files:_ `tests/integration/test_http_pipeline.py`, `tests/integration/mock_backend.py`
   _Complexity:_ Medium
+
+**§6 complete** — all 21 integration test items delivered across 12 test suites.
 
 
 ---

@@ -13,12 +13,14 @@ lifecycle management.  Depends on the enhanced mock backend's
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import sys
 import time
 import unittest
 import uuid
+from collections import Counter
 
 try:
     import requests
@@ -76,6 +78,23 @@ def clear_debug_requests(backend_id):
     resp.raise_for_status()
 
 
+def set_prefix_echo(backend_id, enabled):
+    """Toggle prefix-echo mode on a mock backend via its admin port.
+
+    Needed because Ranvier constructs a fresh header set for the backend
+    hop (see test_02's note on X-Custom-Header), so ``X-Mock-Prefix-Echo``
+    sent by the client does not reach the backend.  Tests that need prefix
+    echo must flip the sticky admin flag directly.
+    """
+    port = BACKEND_DEBUG_PORTS[backend_id]
+    resp = requests.post(
+        f"http://{DOCKER_HOST}:{port}/admin/prefix-echo",
+        params={"enabled": "1" if enabled else "0"},
+        timeout=5,
+    )
+    resp.raise_for_status()
+
+
 def find_request_by_id(request_id):
     """Search both backends' debug logs for a request matching *request_id*.
 
@@ -86,6 +105,63 @@ def find_request_by_id(request_id):
             if entry.get("headers", {}).get("X-Request-ID") == request_id:
                 return bid, entry
     return None, None
+
+
+def _send_and_drain(api_url, prompt, extra_headers=None, timeout=30, session=None):
+    """Send a streaming chat request and drain the SSE response.
+
+    Returns ``(status, full_text, first_chunk_content, headers)``.
+
+    ``first_chunk_content`` is the ``delta.content`` of the first data chunk
+    with non-empty content.  The concurrency tests rely on this to isolate
+    the prefix-echo chunk from later canned tokens without having to parse
+    chunk boundaries twice.  ``session`` lets the per-connection ordering
+    test reuse a single keep-alive connection.
+    """
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+    }
+    headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    poster = session if session is not None else requests
+    resp = poster.post(
+        f"{api_url}/v1/chat/completions",
+        json=body,
+        headers=headers,
+        stream=True,
+        timeout=timeout,
+    )
+
+    full_text = ""
+    first_chunk_content = ""
+    if resp.status_code == 200:
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            decoded = raw.decode("utf-8")
+            if decoded == "data: [DONE]":
+                break
+            if not decoded.startswith("data: "):
+                continue
+            try:
+                chunk = json.loads(decoded[len("data: "):])
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                if not first_chunk_content:
+                    first_chunk_content = content
+                full_text += content
+
+    return resp.status_code, full_text, first_chunk_content, dict(resp.headers)
 
 
 # ============================================================================
@@ -367,6 +443,199 @@ class HttpPipelineTest(ClusterTestCase):
             "No token IDs should be injected when forwarding is disabled",
         )
         print("  PASSED")
+
+    # ------------------------------------------------------------------
+    # test_11: 100 concurrent requests all succeed
+    # ------------------------------------------------------------------
+
+    def test_11_100_concurrent_requests_without_errors(self):
+        """100 concurrent streaming requests complete without errors.
+
+        Uses 20 worker threads so ~20 requests are in-flight at any moment
+        given the mock backend's ~10ms per-chunk latency.  The run exercises
+        Seastar's shard-per-core dispatch, connection pooling to the backend,
+        and the SSE-forwarding path under sustained overlap.
+        """
+        print("\nTest: 100 concurrent requests without errors")
+        api_url = NODES["node1"]["api"]
+        num_requests = 100
+
+        def worker(i):
+            prompt = f"concurrent-{i}: test message"
+            try:
+                status, text, _first, resp_headers = _send_and_drain(
+                    api_url,
+                    prompt,
+                    extra_headers={"X-Request-ID": f"concurrent-{i}"},
+                    timeout=60,
+                )
+                return i, status, text, resp_headers.get("X-Backend-ID"), None
+            except Exception as e:
+                return i, 0, "", None, e
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(worker, i) for i in range(num_requests)]
+            for fut in concurrent.futures.as_completed(futures, timeout=60):
+                results.append(fut.result())
+
+        exceptions = [(i, exc) for i, _s, _t, _b, exc in results if exc is not None]
+        bad_status = [
+            (i, status) for i, status, _t, _b, exc in results
+            if exc is None and status != 200
+        ]
+        empty_body = [
+            i for i, status, text, _b, exc in results
+            if exc is None and status == 200 and not text
+        ]
+        successes = [
+            r for r in results
+            if r[4] is None and r[1] == 200 and r[2]
+        ]
+        backend_dist = Counter(r[3] for r in successes)
+
+        print(f"  Successes: {len(successes)} / {num_requests}")
+        print(f"  Failures:  exceptions={len(exceptions)} "
+              f"bad_status={len(bad_status)} empty_body={len(empty_body)}")
+        print(f"  Backend distribution: {dict(backend_dist)}")
+        for i, exc in exceptions[:5]:
+            print(f"  exception[{i}]: {exc!r}")
+        for i, status in bad_status[:5]:
+            print(f"  bad_status[{i}]: {status}")
+
+        self.assertEqual(
+            exceptions, [],
+            f"{len(exceptions)} worker(s) raised; first: {exceptions[:1]!r}",
+        )
+        self.assertEqual(
+            bad_status, [],
+            f"{len(bad_status)} request(s) returned non-200; first: {bad_status[:1]!r}",
+        )
+        self.assertEqual(
+            empty_body, [],
+            f"{len(empty_body)} request(s) returned 200 with empty body: {empty_body[:5]!r}",
+        )
+        self.assertEqual(len(successes), num_requests)
+        print("  PASSED")
+
+    # ------------------------------------------------------------------
+    # test_12: No cross-contamination between concurrent streams
+    # ------------------------------------------------------------------
+
+    def test_12_no_cross_contamination_under_load(self):
+        """Under load, every stream echoes its own prompt — not another's.
+
+        Enables the mock backend's prefix-echo mode so the first SSE chunk
+        carries the first 32 chars of the last user message.  If the proxy
+        ever routes a response chunk to the wrong client connection, the
+        echoed prefix will mismatch and this assertion will catch it — the
+        most direct test for shared-state bugs in the streaming pipeline.
+        """
+        print("\nTest: No cross-contamination under load")
+        api_url = NODES["node1"]["api"]
+        num_requests = 50
+
+        prompts = [
+            f"unique-{i:04d}-{uuid.uuid4().hex[:8]}: cross-contamination check"
+            for i in range(num_requests)
+        ]
+
+        def worker(i):
+            prompt = prompts[i]
+            expected_prefix = prompt[:32]
+            try:
+                status, _text, first_chunk, _headers = _send_and_drain(
+                    api_url,
+                    prompt,
+                    extra_headers={"X-Request-ID": f"contamination-{i}"},
+                    timeout=60,
+                )
+                return i, status, first_chunk, expected_prefix, None
+            except Exception as e:
+                return i, 0, "", "", e
+
+        for bid in (1, 2):
+            set_prefix_echo(bid, True)
+        try:
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                futures = [executor.submit(worker, i) for i in range(num_requests)]
+                for fut in concurrent.futures.as_completed(futures, timeout=60):
+                    results.append(fut.result())
+        finally:
+            for bid in (1, 2):
+                set_prefix_echo(bid, False)
+
+        exceptions = [(i, exc) for i, _s, _f, _e, exc in results if exc is not None]
+        mismatches = [
+            (i, status, got, expected)
+            for i, status, got, expected, exc in results
+            if exc is None and (status != 200 or got != expected)
+        ]
+
+        for i, exc in exceptions[:5]:
+            print(f"  exception[{i}]: {exc!r}")
+        for i, status, got, expected in mismatches[:5]:
+            print(f"  mismatch[{i}]: status={status} "
+                  f"got={got!r} expected={expected!r}")
+
+        self.assertEqual(
+            exceptions, [],
+            f"{len(exceptions)} worker(s) raised; first: {exceptions[:1]!r}",
+        )
+        self.assertEqual(
+            mismatches, [],
+            f"{len(mismatches)} response(s) did not echo their own prompt prefix — "
+            "evidence of cross-contamination between concurrent streams",
+        )
+        print(f"  PASSED ({num_requests} concurrent streams, all echoed own prompt)")
+
+    # ------------------------------------------------------------------
+    # test_13: Per-connection request ordering preserved
+    # ------------------------------------------------------------------
+
+    def test_13_request_ordering_preserved_per_connection(self):
+        """Sequential requests on one connection return responses in order.
+
+        Reuses a single ``requests.Session`` so the underlying TCP/HTTP
+        connection is kept alive across the 10 requests (HTTP keep-alive on
+        the client side).  Each response must echo its own sequence number;
+        a mismatch would indicate Ranvier reordered responses on a shared
+        connection — a correctness violation for HTTP/1.1 pipelining and
+        any future multiplexed transport.
+        """
+        print("\nTest: Request ordering preserved per connection")
+        api_url = NODES["node1"]["api"]
+        num_requests = 10
+
+        for bid in (1, 2):
+            set_prefix_echo(bid, True)
+        try:
+            with requests.Session() as session:
+                for i in range(num_requests):
+                    prompt = f"seq-{i}: ordering check with padding text"
+                    expected_prefix = prompt[:32]
+                    status, _text, first_chunk, _headers = _send_and_drain(
+                        api_url,
+                        prompt,
+                        extra_headers={"X-Request-ID": f"sequence-{i}"},
+                        timeout=30,
+                        session=session,
+                    )
+                    self.assertEqual(
+                        status, 200,
+                        f"Request {i} returned status {status}",
+                    )
+                    self.assertEqual(
+                        first_chunk, expected_prefix,
+                        f"Request {i}: expected echoed prefix {expected_prefix!r}, "
+                        f"got {first_chunk!r} — responses out of order on shared connection?",
+                    )
+        finally:
+            for bid in (1, 2):
+                set_prefix_echo(bid, False)
+
+        print(f"  PASSED ({num_requests} sequential requests, all in order)")
 
 
 # ============================================================================
