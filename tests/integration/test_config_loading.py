@@ -379,6 +379,92 @@ class ConfigLoadingTest(ClusterTestCase):
 
         print("  PASSED: Env var RANVIER_MIN_TOKEN_LENGTH=2 overrode YAML=99")
 
+    # =========================================================================
+    # Test 3: --dry-run validates without starting the server
+    # =========================================================================
+
+    def test_03_dry_run_validates_without_starting(self):
+        """Run ``./ranvier_server --dry-run`` via docker exec and assert it
+        validates + exits without touching the live server.
+
+        main.cpp short-circuits on --dry-run at line 463 -- before any
+        Seastar initialization -- so no --smp/--memory args are needed and
+        the running parent process is unaffected.  Output format is fixed
+        by run_dry_run_validation() at src/main.cpp:114:
+          * Banner: ``Ranvier Core - Dry Run Validation``
+          * Result:  ``Result: PASSED`` (exit 0) or ``Result: FAILED`` (exit 1)
+
+        Whether /tmp/ranvier.yaml exists at exec time is irrelevant: dry-run
+        handles "file not found, using defaults" identically.  We run with
+        the container's default env (valid, since the cluster is healthy),
+        which means PASSED is the expected outcome.
+        """
+        print("\nTest: --dry-run validates without starting the server")
+
+        node1_api = NODES["node1"]["api"]
+        container = CONTAINER_NAMES["node1"]
+
+        # Sanity: node1 is healthy before we exec anything
+        pre_status, _, _ = send_chat_request(
+            node1_api, [{"role": "user", "content": "pre-dry-run-check"}],
+            timeout=10, retries=1,
+        )
+        self.assertEqual(
+            pre_status, 200,
+            "Node1 should be healthy before --dry-run test"
+        )
+
+        # Run the dry-run validation inside the container.  The binary lives
+        # at ./ranvier_server in the workdir (see docker-compose.test.yml).
+        # --dry-run is parsed before Seastar starts, so no --smp/--memory is
+        # required; we intentionally omit them to also regression-test that
+        # the short-circuit really happens before Seastar's arg parser.
+        print(f"  Running: docker exec {container} ./ranvier_server --dry-run "
+              f"--config {_CONTAINER_CONFIG_PATH}")
+        result = subprocess.run(
+            ["docker", "exec", container,
+             "./ranvier_server", "--dry-run", "--config", _CONTAINER_CONFIG_PATH],
+            capture_output=True, text=True, timeout=30,
+        )
+
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        print(f"  Exit code: {result.returncode}")
+        # Show a trimmed dump for easy post-mortem on CI failures
+        if result.returncode != 0 or "PASSED" not in stdout:
+            print(f"  STDOUT:\n{stdout}")
+            print(f"  STDERR:\n{stderr}")
+
+        self.assertEqual(
+            result.returncode, 0,
+            f"--dry-run should exit 0 on a valid config.  Exit={result.returncode}. "
+            f"stdout tail:\n{stdout[-1000:]}\nstderr tail:\n{stderr[-500:]}"
+        )
+        self.assertIn(
+            "Dry Run Validation", stdout,
+            "Expected 'Dry Run Validation' banner in --dry-run stdout"
+        )
+        self.assertIn(
+            "PASSED", stdout,
+            "Expected 'PASSED' result line in --dry-run stdout"
+        )
+
+        # Crucial side-effect check: --dry-run must NOT have disrupted the
+        # parent ranvier_server process that's serving traffic.  If the
+        # exec had somehow signalled the parent (it can't, but prove it),
+        # this request would hang or return non-200.
+        print("  Verifying the running server is unaffected by the exec...")
+        post_status, _, _ = send_chat_request(
+            node1_api, [{"role": "user", "content": "post-dry-run-check"}],
+            timeout=10, retries=1,
+        )
+        self.assertEqual(
+            post_status, 200,
+            "Node1 should still serve requests after --dry-run exec"
+        )
+
+        print("  PASSED: --dry-run validated config, exited 0, live server unaffected")
+
 
 # =============================================================================
 # Main
@@ -392,6 +478,7 @@ def main():
     print("\nThese tests validate startup/reload config behavior:")
     print("  - YAML config loaded correctly")
     print("  - Environment variables override YAML")
+    print("  - --dry-run validates without starting the server")
     print("  - (more tests to come)")
     print("")
 
