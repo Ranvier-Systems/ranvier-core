@@ -101,6 +101,17 @@ struct ProxyContext {
     BackendId current_backend;            // May differ from target_id after fallback
     seastar::socket_address current_addr;
 
+    // Backend the ART should learn from after a successful response.
+    // 0 = skip learning entirely (fast-lane redirects: transient signal,
+    // no stable affinity target).
+    // Otherwise the consistent-hash assignment from before any routing-time
+    // load/cost override, so the ART converges on cache-affinity targets
+    // rather than transient diversions. Re-pointed at current_backend when
+    // a circuit-breaker or connection-failure fallback fires post-routing
+    // (the original is unreachable; learning it would pin future requests
+    // of this prefix to a dead path).
+    BackendId learn_target_backend = 0;
+
     // Timing
     std::chrono::steady_clock::time_point request_start;
     std::chrono::steady_clock::time_point connect_start;
