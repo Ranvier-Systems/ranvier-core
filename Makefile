@@ -65,35 +65,38 @@ test-integration-full:
 	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/10: Cluster Behavior ==="
+	@echo "=== Test Suite 1/11: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/10: Prefix Routing ==="
+	@echo "=== Test Suite 2/11: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/10: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/11: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
 	@echo ""
-	@echo "=== Test Suite 4/10: Negative Paths ==="
+	@echo "=== Test Suite 4/11: Negative Paths ==="
 	@python3 tests/integration/test_negative_paths.py
 	@echo ""
-	@echo "=== Test Suite 5/10: Load-Aware Routing ==="
+	@echo "=== Test Suite 5/11: Load-Aware Routing ==="
 	@python3 tests/integration/test_load_aware_routing.py
 	@echo ""
-	@echo "=== Test Suite 6/10: Intelligence Layer ==="
+	@echo "=== Test Suite 6/11: Intelligence Layer ==="
 	@python3 -m pytest tests/integration/test_intelligence_layer.py -v -s
 	@echo ""
-	@echo "=== Test Suite 7/10: HTTP Pipeline ==="
+	@echo "=== Test Suite 7/11: HTTP Pipeline ==="
 	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 	@echo ""
-	@echo "=== Test Suite 8/10: Streaming ==="
+	@echo "=== Test Suite 8/11: Streaming ==="
 	@python3 -m pytest tests/integration/test_streaming.py -v -s
 	@echo ""
-	@echo "=== Test Suite 9/10: Metrics ==="
+	@echo "=== Test Suite 9/11: Metrics ==="
 	@python3 -m pytest tests/integration/test_metrics.py -v -s
 	@echo ""
-	@echo "=== Test Suite 10/10: Persistence Recovery ==="
+	@echo "=== Test Suite 10/11: Persistence Recovery ==="
 	@python3 tests/integration/test_persistence_recovery.py
+	@echo ""
+	@echo "=== Test Suite 11/11: Health & Circuit Breaker ==="
+	@python3 tests/integration/test_health_circuit_breaker.py
 
 # Run only the single-node-capable integration suites (fast path).
 # The speed win comes from skipping the slow multi-node suites
@@ -171,6 +174,7 @@ test-integration-ci:
 		tests/integration/test_streaming.py \
 		tests/integration/test_metrics.py \
 		tests/integration/test_persistence_recovery.py \
+		tests/integration/test_health_circuit_breaker.py \
 		-v -s --tb=short --junitxml=integration-results.xml
 
 # Helper to detect docker compose command

@@ -377,24 +377,24 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 6.4 Resilience and Fault Tolerance Tests
 
-- [ ] **Create health/circuit breaker test suite**
+- [x] **Create health/circuit breaker test suite**
   _Description:_ Create `test_health_circuit_breaker.py` with tests for: unhealthy backend detection and removal, backend recovery and re-addition, health check interval configuration.
-  _Files:_ `tests/integration/test_health_circuit_breaker.py` (new)
+  _Files:_ `tests/integration/test_health_circuit_breaker.py` (new) — implemented in `HealthCircuitBreakerTest` (tests 01–10) using the mock backend's `/admin/failure-mode` injection and the `fault-injection` compose profile's always-failing backend.
   _Complexity:_ Medium
 
-- [ ] **Test circuit breaker state transitions**
+- [x] **Test circuit breaker state transitions**
   _Description:_ Verify: consecutive failures trigger open state, half-open state allows probes, successful probe closes circuit.
-  _Files:_ `tests/integration/test_health_circuit_breaker.py`
+  _Files:_ `tests/integration/test_health_circuit_breaker.py` — implemented in `HealthCircuitBreakerTest` (tests 01–10).
   _Complexity:_ Medium
 
-- [ ] **Test connection pool resilience**
+- [x] **Test connection pool resilience**
   _Description:_ Verify: connection reuse across requests, recovery after backend restart, timeout handling for slow backends.
-  _Files:_ `tests/integration/test_health_circuit_breaker.py`
+  _Files:_ `tests/integration/test_health_circuit_breaker.py` — implemented in `HealthCircuitBreakerTest` (tests 01–10).
   _Complexity:_ Medium
 
-- [ ] **Test rate limiting behavior**
+- [x] **Test rate limiting behavior**
   _Description:_ Verify: requests exceeding limit return 429, limit resets after window, rate limit metrics exposed.
-  _Files:_ `tests/integration/test_health_circuit_breaker.py`
+  _Files:_ `tests/integration/test_health_circuit_breaker.py` — implemented in `HealthCircuitBreakerTest` (tests 01–10); end-to-end enforcement is already covered by `test_negative_paths.py::test_04_rate_limit_exceeded`, so this suite validates metric registration (test_09) and defers behavioural coverage (test_10) to avoid duplicating the SIGHUP config-reload flow.
   _Complexity:_ Low
 
 ### 6.5 Observability Tests
