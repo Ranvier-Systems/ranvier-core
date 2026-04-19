@@ -465,6 +465,73 @@ class ConfigLoadingTest(ClusterTestCase):
 
         print("  PASSED: --dry-run validated config, exited 0, live server unaffected")
 
+    # =========================================================================
+    # Test 4: --dry-run with invalid config fails loudly
+    # =========================================================================
+
+    def test_04_dry_run_with_invalid_config_fails(self):
+        """Write a clearly-invalid YAML and confirm --dry-run rejects it
+        with a non-zero exit code and a FAILED result line.
+
+        ``server.api_port: 0`` triggers the first rule in
+        RanvierConfig::validate() (config_loader.cpp:1569): returns
+        ``"server.api_port must be non-zero"``.  The dry-run summary then
+        prints ``Result: FAILED (<n> errors)`` and exits 1.
+
+        docker-compose.test.yml does NOT set RANVIER_API_PORT, so our YAML
+        value really reaches validation -- apply_env_overrides() can't
+        rescue it.
+        """
+        print("\nTest: --dry-run rejects invalid config")
+
+        container = CONTAINER_NAMES["node1"]
+
+        # Deliberately invalid: api_port must be non-zero per validate().
+        yaml_text = (
+            "server:\n"
+            "  api_port: 0\n"
+        )
+
+        print(f"  Writing invalid YAML (api_port: 0) to {container}...")
+        _write_container_config(container, yaml_text)
+
+        try:
+            print(f"  Running: docker exec {container} ./ranvier_server --dry-run "
+                  f"--config {_CONTAINER_CONFIG_PATH}")
+            result = subprocess.run(
+                ["docker", "exec", container,
+                 "./ranvier_server", "--dry-run", "--config", _CONTAINER_CONFIG_PATH],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            print(f"  Exit code: {result.returncode}")
+            # Dump on unexpected success -- easier post-mortem than the bare assert
+            if result.returncode == 0 or "FAILED" not in stdout:
+                print(f"  STDOUT:\n{stdout}")
+                print(f"  STDERR:\n{stderr}")
+
+            self.assertEqual(
+                result.returncode, 1,
+                f"--dry-run should exit 1 on invalid config (api_port: 0), "
+                f"got {result.returncode}.\n"
+                f"stdout tail:\n{stdout[-1000:]}\nstderr tail:\n{stderr[-500:]}"
+            )
+            self.assertIn(
+                "FAILED", stdout,
+                "Expected 'FAILED' result line in --dry-run stdout for invalid config"
+            )
+
+        finally:
+            # Leave the container's config pristine for any later tests.
+            # No SIGHUP needed: the live parent process never loaded this
+            # file (it was only read by the exec'd --dry-run child).
+            print("  Cleanup: removing invalid config file...")
+            _remove_container_config(container)
+
+        print("  PASSED: --dry-run correctly rejected invalid config with exit 1")
+
 
 # =============================================================================
 # Main
@@ -479,6 +546,7 @@ def main():
     print("  - YAML config loaded correctly")
     print("  - Environment variables override YAML")
     print("  - --dry-run validates without starting the server")
+    print("  - --dry-run rejects invalid config with exit 1")
     print("  - (more tests to come)")
     print("")
 
