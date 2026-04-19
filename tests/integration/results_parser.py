@@ -46,6 +46,23 @@ from typing import Optional, Dict, Any, List
 
 
 # =============================================================================
+# Per-bucket reporting guards
+# =============================================================================
+# TTFT below this floor is treated as a measurement artifact (empty SSE role
+# delta or similar) rather than real model latency. 8B+ LLMs cannot physically
+# produce a first real token this fast.
+TTFT_FLOOR_MS = 100.0
+# Buckets with fewer than this many samples do not produce meaningful P50/P99.
+MIN_BUCKET_SAMPLES = 10
+# Below this baseline, an improvement-% computation divides by near-zero and
+# produces nonsense — report it as "baseline too low" instead.
+MIN_IMPROVEMENT_DENOMINATOR_MS = 50.0
+# Any improvement beyond this magnitude is always an artifact, never a real
+# performance change. Display as ">cap"/"<-cap" and exclude from pp deltas.
+IMPROVEMENT_CAP_PCT = 1000.0
+
+
+# =============================================================================
 # Data Classes
 # =============================================================================
 
@@ -101,11 +118,17 @@ class BenchmarkResults:
     ttft_large_miss_p50_ms: Optional[float] = None
     ttft_large_miss_p99_ms: Optional[float] = None
     ttft_large_improvement_pct: Optional[float] = None
+    ttft_large_total_count: Optional[int] = None
+    ttft_large_hit_count: Optional[int] = None
+    ttft_large_miss_count: Optional[int] = None
     ttft_xlarge_hit_p50_ms: Optional[float] = None
     ttft_xlarge_hit_p99_ms: Optional[float] = None
     ttft_xlarge_miss_p50_ms: Optional[float] = None
     ttft_xlarge_miss_p99_ms: Optional[float] = None
     ttft_xlarge_improvement_pct: Optional[float] = None
+    ttft_xlarge_total_count: Optional[int] = None
+    ttft_xlarge_hit_count: Optional[int] = None
+    ttft_xlarge_miss_count: Optional[int] = None
 
     # Standard Locust metrics
     total_requests: int = 0
@@ -277,12 +300,18 @@ def parse_json_stats(content: str) -> Dict[str, Any]:
                     results["ttft_large_miss_p50_ms"] = b.get("cache_miss_ttft_p50_ms")
                     results["ttft_large_miss_p99_ms"] = b.get("cache_miss_ttft_p99_ms")
                     results["ttft_large_improvement_pct"] = b.get("ttft_improvement_pct")
+                    results["ttft_large_total_count"] = b.get("requests")
+                    results["ttft_large_hit_count"] = b.get("cache_hit_count")
+                    results["ttft_large_miss_count"] = b.get("cache_miss_count")
                 elif bucket_name == "xlarge":
                     results["ttft_xlarge_hit_p50_ms"] = b.get("cache_hit_ttft_p50_ms")
                     results["ttft_xlarge_hit_p99_ms"] = b.get("cache_hit_ttft_p99_ms")
                     results["ttft_xlarge_miss_p50_ms"] = b.get("cache_miss_ttft_p50_ms")
                     results["ttft_xlarge_miss_p99_ms"] = b.get("cache_miss_ttft_p99_ms")
                     results["ttft_xlarge_improvement_pct"] = b.get("ttft_improvement_pct")
+                    results["ttft_xlarge_total_count"] = b.get("requests")
+                    results["ttft_xlarge_hit_count"] = b.get("cache_hit_count")
+                    results["ttft_xlarge_miss_count"] = b.get("cache_miss_count")
 
     except json.JSONDecodeError:
         pass
@@ -368,6 +397,8 @@ def parse_bucket_ttft(content: str) -> Dict[str, Any]:
             bucket = match.group(1)
             # Groups: 1=bucket, 2=reqs, 3=p50, 4=p99, 5=hit_p50, 6=miss_p50, 7=improvement
 
+            total_count = int(match.group(2))
+
             # Parse hit_p50 (group 5)
             hit_p50_str = match.group(5)
             hit_p50 = float(hit_p50_str.replace("ms", "")) if hit_p50_str != "N/A" else None
@@ -384,10 +415,12 @@ def parse_bucket_ttft(content: str) -> Dict[str, Any]:
                 results["ttft_large_hit_p50_ms"] = hit_p50
                 results["ttft_large_miss_p50_ms"] = miss_p50
                 results["ttft_large_improvement_pct"] = improvement
+                results["ttft_large_total_count"] = total_count
             elif bucket == "xlarge":
                 results["ttft_xlarge_hit_p50_ms"] = hit_p50
                 results["ttft_xlarge_miss_p50_ms"] = miss_p50
                 results["ttft_xlarge_improvement_pct"] = improvement
+                results["ttft_xlarge_total_count"] = total_count
 
     # Also parse the highlighted summary lines for large/xlarge improvements
     # Example: "Large Prefix (2000-4000 tokens) TTFT Improvement: 18.2%"
@@ -571,13 +604,24 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         if results.total_requests > 0 and results.failure_rate_pct == 0.0 and results.failed_requests > 0:
             results.failure_rate_pct = (results.failed_requests / results.total_requests) * 100
 
-        # Per-bucket stats from JSON (priority source)
+        # Per-bucket stats from JSON (priority source).
+        # Counts are authoritative — take them whenever present, even when
+        # some P50 values are missing (e.g. bucket with zero cache hits).
+        if json_stats.get("ttft_large_total_count") is not None:
+            results.ttft_large_total_count = json_stats.get("ttft_large_total_count")
+            results.ttft_large_hit_count = json_stats.get("ttft_large_hit_count")
+            results.ttft_large_miss_count = json_stats.get("ttft_large_miss_count")
         if json_stats.get("ttft_large_hit_p50_ms"):
             results.ttft_large_hit_p50_ms = json_stats["ttft_large_hit_p50_ms"]
             results.ttft_large_hit_p99_ms = json_stats.get("ttft_large_hit_p99_ms")
             results.ttft_large_miss_p50_ms = json_stats.get("ttft_large_miss_p50_ms")
             results.ttft_large_miss_p99_ms = json_stats.get("ttft_large_miss_p99_ms")
             results.ttft_large_improvement_pct = json_stats.get("ttft_large_improvement_pct")
+
+        if json_stats.get("ttft_xlarge_total_count") is not None:
+            results.ttft_xlarge_total_count = json_stats.get("ttft_xlarge_total_count")
+            results.ttft_xlarge_hit_count = json_stats.get("ttft_xlarge_hit_count")
+            results.ttft_xlarge_miss_count = json_stats.get("ttft_xlarge_miss_count")
         if json_stats.get("ttft_xlarge_hit_p50_ms"):
             results.ttft_xlarge_hit_p50_ms = json_stats["ttft_xlarge_hit_p50_ms"]
             results.ttft_xlarge_hit_p99_ms = json_stats.get("ttft_xlarge_hit_p99_ms")
@@ -629,6 +673,10 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
             results.ttft_xlarge_miss_p99_ms = bucket_stats["ttft_xlarge_miss_p99_ms"]
         if bucket_stats.get("ttft_xlarge_improvement_pct") and not results.ttft_xlarge_improvement_pct:
             results.ttft_xlarge_improvement_pct = bucket_stats["ttft_xlarge_improvement_pct"]
+        if bucket_stats.get("ttft_large_total_count") and not results.ttft_large_total_count:
+            results.ttft_large_total_count = bucket_stats["ttft_large_total_count"]
+        if bucket_stats.get("ttft_xlarge_total_count") and not results.ttft_xlarge_total_count:
+            results.ttft_xlarge_total_count = bucket_stats["ttft_xlarge_total_count"]
 
         # Benchmark mode
         mode_match = re.search(r"Benchmark Mode: (\w+)", content)
@@ -802,6 +850,52 @@ def print_summary(results: BenchmarkResults):
 # Comparison Functions
 # =============================================================================
 
+def _sanitize_bucket_ttft(value: Optional[float], count: Optional[int]) -> Optional[float]:
+    """Drop per-bucket TTFT values that are measurement artifacts or have too few samples.
+
+    Returns None when:
+      - value is missing
+      - the sample count (hit_count for hit metrics, miss_count for miss metrics)
+        is known and below MIN_BUCKET_SAMPLES
+      - the value is below TTFT_FLOOR_MS (physically impossible for an 8B+ LLM)
+    """
+    if value is None:
+        return None
+    if count is not None and count < MIN_BUCKET_SAMPLES:
+        return None
+    if value < TTFT_FLOOR_MS:
+        return None
+    return value
+
+
+def _sample_tag(baseline_count: Optional[int], new_count: Optional[int]) -> str:
+    """Format a ``[n=baseline/new]`` tag, or empty string when both counts are unknown.
+
+    Accepts floats (CSV round-trip may widen ints) and always renders as integers.
+    """
+    def _fmt(v):
+        if v is None:
+            return "?"
+        try:
+            return str(int(v))
+        except (TypeError, ValueError):
+            return str(v)
+    if baseline_count is None and new_count is None:
+        return ""
+    return f" [n={_fmt(baseline_count)}/{_fmt(new_count)}]"
+
+
+def _format_improvement_pct(pct: Optional[float]) -> str:
+    """Format a per-run improvement percentage, collapsing extreme artifacts to a cap marker."""
+    if pct is None:
+        return "N/A"
+    if pct > IMPROVEMENT_CAP_PCT:
+        return f">+{int(IMPROVEMENT_CAP_PCT)}%"
+    if pct < -IMPROVEMENT_CAP_PCT:
+        return f"<-{int(IMPROVEMENT_CAP_PCT)}%"
+    return f"{pct:.1f}"
+
+
 def format_change(
     baseline: Optional[float],
     new: Optional[float],
@@ -841,6 +935,12 @@ def format_change(
         return f"{new:.2f} (NEW)"
 
     pct = (diff / baseline) * 100
+
+    # Cap percentage changes that are always measurement artifacts.
+    if abs(pct) > IMPROVEMENT_CAP_PCT:
+        cap_str = f">+{int(IMPROVEMENT_CAP_PCT)}%" if pct > 0 else f"<-{int(IMPROVEMENT_CAP_PCT)}%"
+        sign = "+" if diff > 0 else ""
+        return f"{sign}{diff:.2f} ({cap_str}) ARTIFACT"
 
     if lower_is_better:
         if pct < -1:
@@ -903,34 +1003,147 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     lines.append("PER-BUCKET TTFT IMPROVEMENT (Large Prefixes)")
     lines.append("-" * 80)
     lines.append("  (Prefix-aware routing benefits large prefixes most)")
+    lines.append(
+        f"  Guards: floor={TTFT_FLOOR_MS:.0f}ms, min-samples={MIN_BUCKET_SAMPLES}, "
+        f"min-denominator={MIN_IMPROVEMENT_DENOMINATOR_MS:.0f}ms, cap=±{int(IMPROVEMENT_CAP_PCT)}%"
+    )
     lines.append("")
+    lines.append(f"{'Metric':<40} {'Baseline':>12} {'New':>12} {'Change':>30}")
 
-    # (key, display_name, lower_is_better, is_improvement_pct)
-    bucket_metrics = [
-        ("ttft_large_hit_p50_ms", "Large Hit P50 (ms)", True, False),
-        ("ttft_large_hit_p99_ms", "Large Hit P99 (ms)", True, False),
-        ("ttft_large_miss_p50_ms", "Large Miss P50 (ms)", True, False),
-        ("ttft_large_miss_p99_ms", "Large Miss P99 (ms)", True, False),
-        ("ttft_large_improvement_pct", "Large Improvement (%)", False, True),
-        ("ttft_xlarge_hit_p50_ms", "XLarge Hit P50 (ms)", True, False),
-        ("ttft_xlarge_hit_p99_ms", "XLarge Hit P99 (ms)", True, False),
-        ("ttft_xlarge_miss_p50_ms", "XLarge Miss P50 (ms)", True, False),
-        ("ttft_xlarge_miss_p99_ms", "XLarge Miss P99 (ms)", True, False),
-        ("ttft_xlarge_improvement_pct", "XLarge Improvement (%)", False, True),
-    ]
-
-    lines.append(f"{'Metric':<25} {'Baseline':>12} {'New':>12} {'Change':>30}")
     has_bucket_data = False
-    for key, name, lower_is_better, is_improvement_pct in bucket_metrics:
-        baseline_val = getattr(baseline, key, None)
-        new_val = getattr(new, key, None)
-        if baseline_val is None and new_val is None:
+    for bucket in ("large", "xlarge"):
+        title = bucket.capitalize()
+
+        b_total = getattr(baseline, f"ttft_{bucket}_total_count", None)
+        n_total = getattr(new, f"ttft_{bucket}_total_count", None)
+        b_hit_c = getattr(baseline, f"ttft_{bucket}_hit_count", None)
+        n_hit_c = getattr(new, f"ttft_{bucket}_hit_count", None)
+        b_miss_c = getattr(baseline, f"ttft_{bucket}_miss_count", None)
+        n_miss_c = getattr(new, f"ttft_{bucket}_miss_count", None)
+
+        b_hit_p50 = getattr(baseline, f"ttft_{bucket}_hit_p50_ms", None)
+        n_hit_p50 = getattr(new, f"ttft_{bucket}_hit_p50_ms", None)
+        b_hit_p99 = getattr(baseline, f"ttft_{bucket}_hit_p99_ms", None)
+        n_hit_p99 = getattr(new, f"ttft_{bucket}_hit_p99_ms", None)
+        b_miss_p50 = getattr(baseline, f"ttft_{bucket}_miss_p50_ms", None)
+        n_miss_p50 = getattr(new, f"ttft_{bucket}_miss_p50_ms", None)
+        b_miss_p99 = getattr(baseline, f"ttft_{bucket}_miss_p99_ms", None)
+        n_miss_p99 = getattr(new, f"ttft_{bucket}_miss_p99_ms", None)
+        b_improv = getattr(baseline, f"ttft_{bucket}_improvement_pct", None)
+        n_improv = getattr(new, f"ttft_{bucket}_improvement_pct", None)
+
+        if all(v is None for v in (b_hit_p50, n_hit_p50, b_miss_p50, n_miss_p50,
+                                   b_hit_p99, n_hit_p99, b_miss_p99, n_miss_p99,
+                                   b_total, n_total)):
             continue
         has_bucket_data = True
-        baseline_str = f"{baseline_val:.1f}" if baseline_val is not None else "N/A"
-        new_str = f"{new_val:.1f}" if new_val is not None else "N/A"
-        change_str = format_change(baseline_val, new_val, lower_is_better, is_improvement_pct)
-        lines.append(f"{name:<25} {baseline_str:>12} {new_str:>12} {change_str:>30}")
+
+        def _int_str(v):
+            if v is None:
+                return "?"
+            try:
+                return str(int(v))
+            except (TypeError, ValueError):
+                return str(v)
+
+        b_total_str = _int_str(b_total)
+        n_total_str = _int_str(n_total)
+        lines.append(f"{title} bucket  (baseline n={b_total_str}, new n={n_total_str})")
+
+        # Whole-bucket insufficient data shortcut.
+        b_below = (b_total is not None and b_total < MIN_BUCKET_SAMPLES)
+        n_below = (n_total is not None and n_total < MIN_BUCKET_SAMPLES)
+        if b_below or n_below:
+            side = []
+            if b_below:
+                side.append(f"baseline n={_int_str(b_total)}")
+            if n_below:
+                side.append(f"new n={_int_str(n_total)}")
+            lines.append(
+                f"  insufficient data ({', '.join(side)}; need >= {MIN_BUCKET_SAMPLES})"
+            )
+            lines.append("")
+            continue
+
+        # Sanitize each percentile against TTFT_FLOOR_MS and per-side sample counts.
+        sb_hit_p50 = _sanitize_bucket_ttft(b_hit_p50, b_hit_c)
+        sn_hit_p50 = _sanitize_bucket_ttft(n_hit_p50, n_hit_c)
+        sb_hit_p99 = _sanitize_bucket_ttft(b_hit_p99, b_hit_c)
+        sn_hit_p99 = _sanitize_bucket_ttft(n_hit_p99, n_hit_c)
+        sb_miss_p50 = _sanitize_bucket_ttft(b_miss_p50, b_miss_c)
+        sn_miss_p50 = _sanitize_bucket_ttft(n_miss_p50, n_miss_c)
+        sb_miss_p99 = _sanitize_bucket_ttft(b_miss_p99, b_miss_c)
+        sn_miss_p99 = _sanitize_bucket_ttft(n_miss_p99, n_miss_c)
+
+        hit_tag = _sample_tag(b_hit_c, n_hit_c)
+        miss_tag = _sample_tag(b_miss_c, n_miss_c)
+        rows = [
+            (f"{title} Hit P50 (ms){hit_tag}",  sb_hit_p50,  sn_hit_p50),
+            (f"{title} Hit P99 (ms){hit_tag}",  sb_hit_p99,  sn_hit_p99),
+            (f"{title} Miss P50 (ms){miss_tag}", sb_miss_p50, sn_miss_p50),
+            (f"{title} Miss P99 (ms){miss_tag}", sb_miss_p99, sn_miss_p99),
+        ]
+        for name, bv, nv in rows:
+            if bv is None and nv is None:
+                bv_str, nv_str, change_str = "N/A", "N/A", "insufficient data"
+            else:
+                bv_str = f"{bv:.1f}" if bv is not None else "N/A"
+                nv_str = f"{nv:.1f}" if nv is not None else "N/A"
+                change_str = format_change(bv, nv, True, False)
+            lines.append(f"  {name:<38} {bv_str:>12} {nv_str:>12} {change_str:>30}")
+
+        # Per-run improvement % row. The raw value is computed as
+        #   (miss_p50 - hit_p50) / miss_p50 * 100
+        # in locustfile_real.py, so it is unreliable whenever either
+        # hit_p50 or miss_p50 fails sanitation (sub-floor or too few samples),
+        # when the denominator miss_p50 is below MIN_IMPROVEMENT_DENOMINATOR_MS,
+        # or when the magnitude exceeds IMPROVEMENT_CAP_PCT.
+        def _guard_improv(
+            raw: Optional[float],
+            hit_sanitized: Optional[float],
+            miss_sanitized: Optional[float],
+            miss_raw: Optional[float],
+        ) -> (Optional[float], Optional[str]):
+            if raw is None:
+                return None, None
+            if abs(raw) > IMPROVEMENT_CAP_PCT:
+                return None, "artifact"
+            if hit_sanitized is None or miss_sanitized is None:
+                return None, "artifact"
+            if miss_raw is None or miss_raw < MIN_IMPROVEMENT_DENOMINATOR_MS:
+                return None, "baseline too low"
+            return raw, None
+
+        b_improv_guarded, b_reason = _guard_improv(b_improv, sb_hit_p50, sb_miss_p50, b_miss_p50)
+        n_improv_guarded, n_reason = _guard_improv(n_improv, sn_hit_p50, sn_miss_p50, n_miss_p50)
+
+        if b_improv_guarded is None or n_improv_guarded is None:
+            # Prefer "artifact" over "baseline too low" since it's the stronger signal.
+            reasons = [r for r in (b_reason, n_reason) if r]
+            change_str = "artifact" if "artifact" in reasons else (
+                "baseline too low" if "baseline too low" in reasons else "N/A"
+            )
+            b_display = (_format_improvement_pct(b_improv_guarded)
+                         if b_improv_guarded is not None
+                         else ("N/A" if b_improv is None else _format_improvement_pct(b_improv)))
+            n_display = (_format_improvement_pct(n_improv_guarded)
+                         if n_improv_guarded is not None
+                         else ("N/A" if n_improv is None else _format_improvement_pct(n_improv)))
+            # When the raw value was an artifact, hide the misleading digits too.
+            if b_improv_guarded is None and b_reason == "artifact" and b_improv is not None \
+                    and abs(b_improv) <= IMPROVEMENT_CAP_PCT:
+                b_display = "artifact"
+            if n_improv_guarded is None and n_reason == "artifact" and n_improv is not None \
+                    and abs(n_improv) <= IMPROVEMENT_CAP_PCT:
+                n_display = "artifact"
+        else:
+            change_str = format_change(b_improv_guarded, n_improv_guarded, False, True)
+            b_display = _format_improvement_pct(b_improv_guarded)
+            n_display = _format_improvement_pct(n_improv_guarded)
+
+        improv_name = f"{title} Improvement (%)"
+        lines.append(f"  {improv_name:<38} {b_display:>12} {n_display:>12} {change_str:>30}")
+        lines.append("")
 
     if not has_bucket_data:
         lines.append("  (No per-bucket data available)")
@@ -1036,10 +1249,28 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     if new.cache_hit_rate_pct and baseline.cache_hit_rate_pct:
         improvement = new.cache_hit_rate_pct - baseline.cache_hit_rate_pct
         lines.append(f"  Cache Hit Rate: {baseline.cache_hit_rate_pct:.1f}% -> {new.cache_hit_rate_pct:.1f}% (+{improvement:.1f}%)")
-    if new.ttft_large_improvement_pct:
-        lines.append(f"  Large Prefix TTFT Improvement: {new.ttft_large_improvement_pct:.1f}%")
-    if new.ttft_xlarge_improvement_pct:
-        lines.append(f"  XLarge Prefix TTFT Improvement: {new.ttft_xlarge_improvement_pct:.1f}%")
+    for bucket_key, bucket_label in (("large", "Large"), ("xlarge", "XLarge")):
+        improv = getattr(new, f"ttft_{bucket_key}_improvement_pct", None)
+        miss_p50 = getattr(new, f"ttft_{bucket_key}_miss_p50_ms", None)
+        total = getattr(new, f"ttft_{bucket_key}_total_count", None)
+        if improv is None:
+            continue
+        if total is not None and total < MIN_BUCKET_SAMPLES:
+            lines.append(
+                f"  {bucket_label} Prefix TTFT Improvement: insufficient data (n={total})"
+            )
+            continue
+        if abs(improv) > IMPROVEMENT_CAP_PCT:
+            lines.append(
+                f"  {bucket_label} Prefix TTFT Improvement: {_format_improvement_pct(improv)} (artifact)"
+            )
+            continue
+        if miss_p50 is not None and miss_p50 < MIN_IMPROVEMENT_DENOMINATOR_MS:
+            lines.append(
+                f"  {bucket_label} Prefix TTFT Improvement: N/A (baseline miss P50 too low: {miss_p50:.1f}ms)"
+            )
+            continue
+        lines.append(f"  {bucket_label} Prefix TTFT Improvement: {improv:.1f}%")
 
     lines.append("=" * 80)
 
