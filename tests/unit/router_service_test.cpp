@@ -2625,3 +2625,299 @@ TEST_F(CapacityAwareHashTest, SetCacheHeadroomForTestingStoresData) {
     ASSERT_TRUE(result.backend_id.has_value());
     EXPECT_EQ(*result.backend_id, 1);
 }
+
+// =============================================================================
+// Route-learning policy under transient diverts (Finding D follow-up)
+// =============================================================================
+//
+// When Step 3 (load-aware) or Step 4b (cost budget) overrides the consistent-
+// hash assignment, the request runs on the diverted backend but the ART must
+// learn the *original* backend so future requests with the same prefix converge
+// on the cache-affinity target. Step 4a fast-lane redirects skip learning
+// entirely (transient cheapest-now signal). These tests pin those semantics by
+// inspecting RouteResult.original_selected — the field HttpController uses to
+// pick the learn target.
+
+class OriginalSelectedTest : public ::testing::Test {
+protected:
+    RoutingConfig cfg_;
+    std::unique_ptr<RouterService> router_;
+
+    void SetUp() override {
+        cfg_ = RoutingConfig{};
+        cfg_.routing_mode = RoutingConfig::RoutingMode::PREFIX;
+        cfg_.max_routes = 1000;
+        cfg_.ttl_seconds = std::chrono::seconds(3600);
+        cfg_.prefix_token_length = 128;
+        cfg_.block_alignment = 1;
+        cfg_.backend_drain_timeout = std::chrono::seconds(2);
+        cfg_.load_aware_routing = true;
+        cfg_.hash_strategy = RoutingConfig::HashStrategy::BOUNDED_LOAD;
+        cfg_.bounded_load_epsilon = 0.25;
+
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+
+    void TearDown() override {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+    }
+
+    void register_backends(int count) {
+        for (int i = 1; i <= count; ++i) {
+            std::string ip = "10.0.0." + std::to_string(i);
+            RouterService::register_backend_for_testing(
+                i, make_addr(ip.c_str(), 8080));
+        }
+    }
+
+    void recreate_with_cfg() {
+        router_.reset();
+        RouterService::reset_shard_state_for_testing(nullptr);
+        router_ = std::make_unique<RouterService>(cfg_);
+    }
+};
+
+// Step 3 ART override (BOUNDED_LOAD): request runs on the diverted backend,
+// but original_selected exposes the ART hit so HttpController learns it.
+TEST_F(OriginalSelectedTest, BoundedLoadARTOverrideExposesOriginalART) {
+    register_backends(4);
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Pin the ART to backend 3 — this is what we want to keep learning.
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    // Overload backend 3 so the Step 3 ART re-check diverts away from it.
+    BackendRequestGuard g1(3);
+    BackendRequestGuard g2(3);
+    BackendRequestGuard g3(3);
+    BackendRequestGuard g4(3);
+
+    auto result = router_->route_request(tokens, "art-divert");
+
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_NE(result.backend_id.value(), 3)
+        << "Step 3 ART override should divert away from over-cap backend 3";
+    EXPECT_EQ(result.original_selected, 3)
+        << "original_selected must hold the pre-divert ART hit so HttpController "
+           "learns the consistent-hash target, not the transiently-loaded one";
+    EXPECT_TRUE(result.cache_hit) << "cache_hit observability still reports the ART hit";
+}
+
+// Regression guard: a straight ART hit (no divert) must report
+// original_selected == backend_id, so HttpController's learn path is unchanged.
+TEST_F(OriginalSelectedTest, StraightARTHitOriginalEqualsBackend) {
+    register_backends(4);
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    RouterService::insert_route_for_testing(tokens, 2);
+
+    auto result = router_->route_request(tokens, "art-clean");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 2);
+    EXPECT_EQ(result.original_selected, result.backend_id.value());
+    EXPECT_FALSE(result.was_load_redirect);
+    EXPECT_FALSE(result.was_cost_redirect);
+    EXPECT_FALSE(result.was_fast_lane);
+}
+
+// Hash fallback with no Step 3/4 divert: original_selected matches backend_id.
+// Internal bounded-load probing inside the hash strategy is treated as part of
+// the strategy's own decision, not a divert.
+TEST_F(OriginalSelectedTest, HashFallbackOriginalEqualsBackend) {
+    register_backends(4);
+    std::vector<int32_t> tokens = {11, 21, 31, 41, 51};
+
+    auto result = router_->route_request(tokens, "hash-clean");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.original_selected, result.backend_id.value())
+        << "post-probe bounded-load result is the strategy's choice — original_selected "
+           "must equal backend_id when no Step 3/4 override fires";
+    EXPECT_FALSE(result.was_load_redirect);
+    EXPECT_FALSE(result.was_cost_redirect);
+}
+
+// Step 4b cost budget redirect (non-fast-lane): original_selected reflects the
+// pre-divert backend, so HttpController learns the consistent-hash target.
+TEST_F(OriginalSelectedTest, CostBudgetRedirectExposesOriginalART) {
+    // Cost-routing config: small_threshold=500, max_cost=10000. A 2000-unit
+    // request bypasses the fast lane (>=500) and triggers the budget check.
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+    cfg_.load_aware_routing = false;  // Isolate cost from load behavior
+    cfg_.cost_routing.enabled = true;
+    cfg_.cost_routing.max_cost_per_backend = 10000.0;
+    cfg_.cost_routing.small_request_threshold = 500.0;
+    cfg_.cost_routing.enable_fast_lane = true;
+    cfg_.cost_routing.cost_imbalance_factor = 2.0;
+    recreate_with_cfg();
+
+    register_backends(3);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Pin ART to backend 1 (the one we want preserved).
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    // Backend 1 nearly full, others have room — Step 4b will divert.
+    reserve_cost_budget(1, 9000.0);
+    reserve_cost_budget(2, 1000.0);
+    reserve_cost_budget(3, 2000.0);
+
+    auto result = router_->route_request(tokens, "cost-divert", 0, 2000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_NE(result.backend_id.value(), 1) << "Cost budget should divert from backend 1";
+    EXPECT_TRUE(result.was_cost_redirect);
+    EXPECT_FALSE(result.was_fast_lane);
+    EXPECT_EQ(result.original_selected, 1)
+        << "Cost budget redirect is transient — learn the original ART target";
+}
+
+// Step 4a fast-lane: HttpController checks RouteResult.was_fast_lane and skips
+// learning entirely. Pin both flags so the policy is observable from the unit.
+TEST_F(OriginalSelectedTest, FastLaneSetsFastLaneFlagForSkipPolicy) {
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+    cfg_.load_aware_routing = false;
+    cfg_.cost_routing.enabled = true;
+    cfg_.cost_routing.max_cost_per_backend = 10000.0;
+    cfg_.cost_routing.small_request_threshold = 500.0;
+    cfg_.cost_routing.enable_fast_lane = true;
+    cfg_.cost_routing.cost_imbalance_factor = 2.0;
+    recreate_with_cfg();
+
+    register_backends(3);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    // Pin ART to backend 1 (expensive) — fast-lane redirects to cheapest.
+    RouterService::insert_route_for_testing(tokens, 1);
+    reserve_cost_budget(1, 8000.0);
+    reserve_cost_budget(2, 7000.0);
+    // Backend 3 is cheapest.
+
+    // Small request (cost 100 < threshold 500) triggers fast lane.
+    auto result = router_->route_request(tokens, "fl-skip", 0, 100.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 3);
+    EXPECT_TRUE(result.was_cost_redirect);
+    EXPECT_TRUE(result.was_fast_lane)
+        << "was_fast_lane must be set so HttpController can skip learning entirely "
+           "(fast-lane is a transient per-request signal, not an affinity target)";
+    // original_selected still reflects the ART hit for completeness, but the
+    // HttpController policy keys on was_fast_lane to skip learning.
+    EXPECT_EQ(result.original_selected, 1);
+}
+
+// Observability check: was_cost_redirect still reports the divert even though
+// learning will use the original. The two signals are independent — operators
+// see the divert in metrics; the ART converges on the affinity target.
+//
+// (was_load_redirect would be the analogous assertion, but it only fires when
+// GPU load metrics exist for the original backend — see route_request's
+// get_cached_gpu_load() check — and there's no shard-local test hook for that.
+// was_cost_redirect is deterministic from cost-routing config alone.)
+TEST_F(OriginalSelectedTest, DivertObservabilityPreservedOnCostRedirect) {
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+    cfg_.load_aware_routing = false;
+    cfg_.cost_routing.enabled = true;
+    cfg_.cost_routing.max_cost_per_backend = 10000.0;
+    cfg_.cost_routing.small_request_threshold = 500.0;
+    cfg_.cost_routing.enable_fast_lane = true;
+    cfg_.cost_routing.cost_imbalance_factor = 2.0;
+    recreate_with_cfg();
+
+    register_backends(3);
+    std::vector<int32_t> tokens = {1, 2, 3, 4, 5};
+
+    RouterService::insert_route_for_testing(tokens, 1);
+    reserve_cost_budget(1, 9000.0);
+    reserve_cost_budget(2, 1000.0);
+    reserve_cost_budget(3, 2000.0);
+
+    auto result = router_->route_request(tokens, "obs-cost", 0, 2000.0);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Both signals fire: divert observability AND original-target preservation.
+    EXPECT_TRUE(result.was_cost_redirect)
+        << "Operators must still see the divert in metrics even though learning "
+           "uses the original backend";
+    EXPECT_FALSE(result.was_fast_lane);
+    EXPECT_NE(result.backend_id.value(), 1);
+    EXPECT_EQ(result.original_selected, 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+// Step 3 P2C ART override (separate code path from BOUNDED_LOAD): same
+// invariant — original_selected exposes the pre-divert ART hit.
+TEST_F(OriginalSelectedTest, P2CARTOverrideExposesOriginalART) {
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::P2C;
+    cfg_.p2c_load_bias = 0;  // Any load difference triggers divert
+    recreate_with_cfg();
+
+    register_backends(4);
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    // Pin ART to backend 3.
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    // Load backend 3; others are idle. Step 3 P2C ART override compares
+    // sel_load vs least_load; least_load=0 < sel_load=4 with bias=0 -> divert.
+    BackendRequestGuard g1(3);
+    BackendRequestGuard g2(3);
+    BackendRequestGuard g3(3);
+    BackendRequestGuard g4(3);
+
+    auto result = router_->route_request(tokens, "p2c-art-divert");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_NE(result.backend_id.value(), 3)
+        << "P2C Step 3 ART override should divert away from over-loaded backend 3";
+    EXPECT_EQ(result.original_selected, 3)
+        << "P2C divert is transient — original_selected must hold the ART hit";
+    EXPECT_TRUE(result.cache_hit);
+}
+
+// Step 3 legacy median LA override (JUMP strategy via apply_load_aware_selection):
+// third divert source — same invariant.
+TEST_F(OriginalSelectedTest, LegacyMedianLAOverrideExposesOriginalART) {
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+    cfg_.load_aware_routing = true;
+    cfg_.load_imbalance_factor = 2.0;
+    cfg_.load_imbalance_floor = 2;
+    recreate_with_cfg();
+
+    register_backends(4);
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+
+    RouterService::insert_route_for_testing(tokens, 3);
+
+    // Backend 3 load=3, others=0. median=0, threshold=0*2.0+2=2. 3 > 2 -> divert.
+    BackendRequestGuard g1(3);
+    BackendRequestGuard g2(3);
+    BackendRequestGuard g3(3);
+
+    auto result = router_->route_request(tokens, "jump-la-divert");
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_NE(result.backend_id.value(), 3)
+        << "Legacy median LA override should divert away from outlier backend 3";
+    EXPECT_EQ(result.original_selected, 3)
+        << "Legacy LA divert is transient — original_selected must hold the ART hit";
+    EXPECT_TRUE(result.cache_hit);
+}
+
+// Hash-fallback regression guard: no Step 3/4 divert under JUMP + load_aware
+// off, original_selected matches backend_id end-to-end.
+TEST_F(OriginalSelectedTest, JumpHashNoDivertOriginalMatches) {
+    cfg_.hash_strategy = RoutingConfig::HashStrategy::JUMP;
+    cfg_.load_aware_routing = false;
+    recreate_with_cfg();
+
+    register_backends(4);
+    std::vector<int32_t> tokens = {7, 14, 21, 28, 35};
+
+    auto first = router_->route_request(tokens, "jump-1");
+    ASSERT_TRUE(first.backend_id.has_value());
+    EXPECT_EQ(first.original_selected, first.backend_id.value());
+
+    // Repeat: deterministic hashing — same backend, same original.
+    auto second = router_->route_request(tokens, "jump-2");
+    ASSERT_TRUE(second.backend_id.has_value());
+    EXPECT_EQ(second.backend_id.value(), first.backend_id.value());
+    EXPECT_EQ(second.original_selected, second.backend_id.value());
+}

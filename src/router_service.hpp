@@ -90,6 +90,13 @@ struct RouteResult {
     bool was_cost_redirect = false;          // True if cost budget changed backend
     bool was_fast_lane = false;              // True if small-request fast lane was used
     double backend_cost_at_decision = 0.0;   // Cost budget when route was chosen
+
+    // The ART/hash choice BEFORE Step 3/4 transient overrides (load + cost
+    // redirects). Equal to backend_id when no divert occurred. Lets the
+    // route-learning policy preserve consistent-hash cache affinity instead
+    // of pinning prefixes to load-driven targets. Zero when no backend was
+    // selected.
+    BackendId original_selected = 0;
 };
 
 // Result from get_backend_for_prefix(), distinguishing ART hits from hash fallback.
@@ -105,6 +112,11 @@ struct PrefixRouteResult {
     bool was_cost_redirect = false;          // True if cost budget changed backend
     bool was_fast_lane = false;              // True if small-request fast lane was used
     double backend_cost_at_decision = 0.0;   // Cost budget when route was chosen
+
+    // The ART/hash choice BEFORE Step 3/4 transient overrides. For BOUNDED_LOAD
+    // and P2C this is the post-probe / post-secondary result — internal probing
+    // is part of the strategy itself, not a transient divert.
+    BackendId original_selected = 0;
 };
 
 // ============================================================================

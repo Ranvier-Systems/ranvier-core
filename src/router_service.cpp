@@ -2035,6 +2035,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
 
         if (random_id.has_value()) {
             result.backend_id = random_id.value();
+            result.original_selected = random_id.value();
             if (!request_id.empty()) {
                 log_router.debug("[{}] Fail-open routing: {} tokens -> backend {} (split-brain active)",
                                  request_id, tokens.size(), random_id.value());
@@ -2062,6 +2063,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
             result.was_cost_redirect = prefix_result.was_cost_redirect;
             result.was_fast_lane = prefix_result.was_fast_lane;
             result.backend_cost_at_decision = prefix_result.backend_cost_at_decision;
+            result.original_selected = prefix_result.original_selected;
         } else {
             result.error_message = "No backends registered";
         }
@@ -2074,6 +2076,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
         if (hash_backend.has_value()) {
             result.backend_id = hash_backend.value();
             result.cache_hit = true;  // Hash always provides affinity
+            result.original_selected = hash_backend.value();
         } else {
             result.error_message = "No backends registered";
         }
@@ -2085,6 +2088,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
         if (random_id.has_value()) {
             result.backend_id = random_id.value();
             result.cache_hit = false;  // Random never uses cache
+            result.original_selected = random_id.value();
         } else {
             result.error_message = "No backends registered";
         }
@@ -2211,7 +2215,10 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     }
     if (prefix_len == 0) {
         // No tokens to route on, fall back to first backend (not an ART hit)
-        return {live_backends[0], false};
+        PrefixRouteResult r;
+        r.backend_id = live_backends[0];
+        r.original_selected = live_backends[0];
+        return r;
     }
 
     // HYBRID ROUTING: ART lookup first, hash fallback
@@ -2513,7 +2520,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     }
 
     return {final_backend, art_hit, load_at_decision, was_load_redirect,
-            was_cost_redirect, was_fast_lane, cost_at_decision};
+            was_cost_redirect, was_fast_lane, cost_at_decision, selected};
 }
 
 std::optional<BackendId> RouterService::get_backend_by_hash(const std::vector<int32_t>& tokens,

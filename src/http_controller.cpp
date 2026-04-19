@@ -732,6 +732,11 @@ future<ConnectionBundle> HttpController::establish_backend_connection(ProxyConte
                     ctx->current_backend = fallback.value();
                     ctx->current_addr = fallback_addr.value();
                     ctx->fallback_attempts++;
+                    // Original backend unreachable; re-point so the ART learns
+                    // the working path. (See ProxyContext::learn_target_backend.)
+                    if (ctx->learn_target_backend != 0) {
+                        ctx->learn_target_backend = ctx->current_backend;
+                    }
                     // Don't increment retry_attempt for fallback - this is a different backend
                     continue;
                 }
@@ -961,25 +966,30 @@ future<> HttpController::stream_backend_response(
                                 ctx->request_id, ctx->current_backend, first_byte_latency);
             }
 
-            // Learn route in the ART for future prefix matching
-            // Use prefix_boundaries for multi-depth routing, or prefix_boundary for single-depth
-            if (_config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length) {
+            // Learn route in the ART for future prefix matching.
+            // Use prefix_boundaries for multi-depth routing, or prefix_boundary
+            // for single-depth. learn_target_backend (not current_backend) so
+            // the ART converges on the consistent-hash assignment rather than
+            // transient load/cost diversions; 0 means skip learning entirely.
+            if (ctx->learn_target_backend != 0 &&
+                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length) {
+                BackendId learn_backend = ctx->learn_target_backend;
                 // Route learning is best-effort; don't fail the request if it fails
                 if (!ctx->prefix_boundaries.empty() && _config.enable_multi_depth_routing) {
                     // Multi-depth routing: store routes at multiple boundaries
-                    (void)_router.learn_route_global_multi(ctx->tokens, ctx->current_backend, ctx->request_id, ctx->prefix_boundaries)
+                    (void)_router.learn_route_global_multi(ctx->tokens, learn_backend, ctx->request_id, ctx->prefix_boundaries)
                         .handle_exception([request_id = ctx->request_id](auto) {
                             log_proxy.debug("[{}] Multi-depth route learning failed (non-fatal)", request_id);
                         });
                     // Persistence for multi-depth (dedup handled internally per-boundary)
                     if (_persistence) {
-                        _persistence->queue_save_route(ctx->tokens, ctx->current_backend);
+                        _persistence->queue_save_route(ctx->tokens, learn_backend);
                     }
                 } else {
                     // Single-depth routing: use prefix_boundary or default
                     // Skip persistence if route was deduplicated (§21.7)
-                    (void)_router.learn_route_global(ctx->tokens, ctx->current_backend, ctx->request_id, ctx->prefix_boundary)
-                        .then([this, tokens = ctx->tokens, backend = ctx->current_backend](bool is_new_route) {
+                    (void)_router.learn_route_global(ctx->tokens, learn_backend, ctx->request_id, ctx->prefix_boundary)
+                        .then([this, tokens = ctx->tokens, backend = learn_backend](bool is_new_route) {
                             if (is_new_route && _persistence) {
                                 _persistence->queue_save_route(tokens, backend);
                             }
@@ -1717,6 +1727,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
     BackendId target_id;
     std::string routing_mode_str;
+    // Hoisted out of the route_span block: the circuit-breaker fallback below
+    // mutates it. See ProxyContext::learn_target_backend for the policy.
+    BackendId learn_target = 0;
 
     // Start route lookup span
     {
@@ -1744,6 +1757,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         }
 
         target_id = route_result.backend_id.value();
+        learn_target = route_result.was_fast_lane ? 0 : route_result.original_selected;
         if (route_result.was_load_redirect) {
             log_proxy.debug("[{}] Load redirect: original backend overloaded (gpu_load={:.2f}), "
                             "redirected to backend {}",
@@ -1790,6 +1804,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             cost_guard = CostBudgetGuard(target_id, cost.cost_units);
             metrics().record_fallback();
             log_proxy.info("[{}] Using fallback backend {}", request_id, target_id);
+            // Original backend's circuit is open; re-point so the ART learns
+            // the working path instead of a dead one. (0 stays 0 — fast-lane
+            // redirects are non-learning regardless of where the request lands.)
+            if (learn_target != 0) {
+                learn_target = target_id;
+            }
         } else {
             log_proxy.warn("[{}] All backends unavailable (circuit breaker open)", request_id);
             metrics().record_failure();
@@ -1894,6 +1914,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->target_addr = target_addr;
     ctx->current_backend = target_id;
     ctx->current_addr = target_addr;
+    ctx->learn_target_backend = learn_target;
     ctx->request_start = request_start;
     ctx->connect_timeout = connect_timeout;
     ctx->request_timeout = request_timeout;
