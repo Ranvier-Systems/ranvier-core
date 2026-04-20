@@ -31,41 +31,17 @@ except ImportError:
 from conftest import (
     ClusterTestCase,
     DOCKER_HOST,
+    MOCK_BACKEND_PORTS,
     NODES,
     REQUEST_TIMEOUT,
-    run_compose,
+    free_docker_subnet,
     send_chat_request,
 )
-
-# Mock backend debug ports (host-mapped from docker-compose.test.yml)
-BACKEND_DEBUG_PORTS = {1: 21434, 2: 21435}
-
-# docker-compose.test.yml pins a single subnet (172.28.0.0/16).  When
-# test-integration-ci runs every suite in one pytest session, the session
-# fixture (ranvier-pytest-session) or a previous ClusterTestCase may still
-# hold that subnet.  Tearing down known projects before each class prevents
-# "Pool overlaps with other one on this address space".
-_SUBNET_HOLDING_PROJECTS = (
-    "ranvier-pytest-session",
-    "ranvier-integration-test",
-    "ranvier-http-pipeline-test",
-    "ranvier-http-pipeline-nobackend-test",
-    "ranvier-http-pipeline-tokenfwd-test",
-)
-
-
-def _free_docker_subnet():
-    for project in _SUBNET_HOLDING_PROJECTS:
-        run_compose(
-            ["down", "-v", "--remove-orphans"],
-            project_name=project,
-            check=False,
-        )
 
 
 def get_debug_requests(backend_id):
     """Fetch the /debug/requests log from a mock backend."""
-    port = BACKEND_DEBUG_PORTS[backend_id]
+    port = MOCK_BACKEND_PORTS[backend_id]
     resp = requests.get(f"http://{DOCKER_HOST}:{port}/debug/requests", timeout=5)
     resp.raise_for_status()
     return resp.json()
@@ -73,7 +49,7 @@ def get_debug_requests(backend_id):
 
 def clear_debug_requests(backend_id):
     """Clear the /debug/requests log on a mock backend."""
-    port = BACKEND_DEBUG_PORTS[backend_id]
+    port = MOCK_BACKEND_PORTS[backend_id]
     resp = requests.delete(f"http://{DOCKER_HOST}:{port}/debug/requests", timeout=5)
     resp.raise_for_status()
 
@@ -86,7 +62,7 @@ def set_prefix_echo(backend_id, enabled):
     sent by the client does not reach the backend.  Tests that need prefix
     echo must flip the sticky admin flag directly.
     """
-    port = BACKEND_DEBUG_PORTS[backend_id]
+    port = MOCK_BACKEND_PORTS[backend_id]
     resp = requests.post(
         f"http://{DOCKER_HOST}:{port}/admin/prefix-echo",
         params={"enabled": "1" if enabled else "0"},
@@ -100,7 +76,7 @@ def find_request_by_id(request_id):
 
     Returns ``(backend_id, entry)`` on match, ``(None, None)`` otherwise.
     """
-    for bid in (1, 2):
+    for bid in MOCK_BACKEND_PORTS:
         for entry in get_debug_requests(bid):
             if entry.get("headers", {}).get("X-Request-ID") == request_id:
                 return bid, entry
@@ -177,7 +153,7 @@ class HttpPipelineTest(ClusterTestCase):
 
     @classmethod
     def setUpClass(cls):
-        _free_docker_subnet()
+        free_docker_subnet()
         super().setUpClass()
 
     # ------------------------------------------------------------------
@@ -651,7 +627,7 @@ class HttpPipelineNoBackendTest(ClusterTestCase):
 
     @classmethod
     def setUpClass(cls):
-        _free_docker_subnet()
+        free_docker_subnet()
         super().setUpClass()
 
     def test_08_503_when_no_backends(self):
@@ -699,7 +675,7 @@ class HttpPipelineTokenForwardingTest(ClusterTestCase):
     def setUpClass(cls):
         cls._saved_env = os.environ.get("RANVIER_ENABLE_TOKEN_FORWARDING")
         os.environ["RANVIER_ENABLE_TOKEN_FORWARDING"] = "1"
-        _free_docker_subnet()
+        free_docker_subnet()
         super().setUpClass()
 
     @classmethod

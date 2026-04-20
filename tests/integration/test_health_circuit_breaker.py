@@ -62,14 +62,18 @@ except ImportError:
     print("Error: 'requests' library is required. Install with: pip install requests")
     sys.exit(1)
 
-import conftest
 from conftest import (
     ClusterTestCase,
     DOCKER_HOST,
+    MOCK_BACKEND_PORTS,
     NODES,
     REQUEST_TIMEOUT,
+    docker_network_connect,
+    docker_network_disconnect,
     extract_backend_id,
+    get_docker_network_name,
     metric_is_registered,
+    run_compose,
     send_chat_request as _conftest_send_chat_request,
     sum_metric_by_substring,
 )
@@ -78,49 +82,6 @@ from conftest import (
 # =============================================================================
 # File-specific helpers
 # =============================================================================
-#
-# These are deliberately duplicated from test_negative_paths.py. The suites
-# are expected to evolve independently and pulling them into conftest would
-# entangle two otherwise-isolated files.
-
-def docker_network_disconnect(network: str, container: str) -> bool:
-    """Disconnect a container from a Docker network."""
-    try:
-        result = subprocess.run(
-            ["docker", "network", "disconnect", "--force", network, container],
-            capture_output=True, text=True, timeout=15,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
-def docker_network_connect(network: str, container: str, ip: Optional[str] = None) -> bool:
-    """Reconnect a container to a Docker network."""
-    try:
-        cmd = ["docker", "network", "connect"]
-        if ip:
-            cmd += ["--ip", ip]
-        cmd += [network, container]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
-def get_docker_network_name(project_name: str) -> str:
-    """Resolve the project-prefixed docker network name."""
-    try:
-        result = subprocess.run(
-            ["docker", "network", "ls", "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in result.stdout.strip().split("\n"):
-            if project_name in line and "ranvier-test" in line:
-                return line.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return f"{project_name}_ranvier-test"
 
 
 def send_chat_request(

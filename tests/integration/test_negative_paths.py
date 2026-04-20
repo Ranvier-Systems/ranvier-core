@@ -43,14 +43,18 @@ except ImportError:
     sys.exit(1)
 
 from conftest import (
-    ClusterTestCase,
     COMPOSE_FILE,
+    CONTAINER_CONFIG_PATH as _CONTAINER_CONFIG_PATH,
     CONTAINER_NAMES,
+    ClusterTestCase,
     DOCKER_HOST,
     NODES,
     PEER_TIMEOUT,
     REQUEST_TIMEOUT,
+    docker_network_connect,
+    docker_network_disconnect,
     get_compose_cmd,
+    get_docker_network_name,
     get_metric_value,
     send_chat_request as _conftest_send_chat_request,
 )
@@ -59,51 +63,6 @@ from conftest import (
 # =============================================================================
 # File-specific helpers
 # =============================================================================
-
-
-def docker_network_disconnect(network: str, container: str) -> bool:
-    """Disconnect a container from a Docker network."""
-    try:
-        result = subprocess.run(
-            ["docker", "network", "disconnect", "--force", network, container],
-            capture_output=True, text=True, timeout=15
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
-def docker_network_connect(network: str, container: str, ip: str = None) -> bool:
-    """Reconnect a container to a Docker network."""
-    try:
-        cmd = ["docker", "network", "connect"]
-        if ip:
-            cmd += ["--ip", ip]
-        cmd += [network, container]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
-def get_docker_network_name(project_name: str) -> str:
-    """Get the actual Docker network name for the test project.
-
-    Docker Compose creates networks with the project name prefix.
-    The network defined in docker-compose.test.yml is 'ranvier-test',
-    so the full name is '{project_name}_ranvier-test'.
-    """
-    try:
-        result = subprocess.run(
-            ["docker", "network", "ls", "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=10
-        )
-        for line in result.stdout.strip().split("\n"):
-            if project_name in line and "ranvier-test" in line:
-                return line.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return f"{project_name}_ranvier-test"
 
 
 def send_chat_request(
@@ -125,13 +84,6 @@ def send_chat_request(
     if status == 0:
         status = -1
     return status, body, headers
-
-
-# Path where Ranvier loads its YAML config inside the container.
-# The containers use read_only: true so /app/ is not writable, but /tmp/
-# is a tmpfs mount.  docker-compose.test.yml passes
-# ``--config /tmp/ranvier.yaml`` so reload_config() reads from here.
-_CONTAINER_CONFIG_PATH = "/tmp/ranvier.yaml"
 
 
 # =============================================================================

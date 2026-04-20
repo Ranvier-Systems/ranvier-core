@@ -121,6 +121,35 @@ CONTAINER_NAMES: Dict[str, str] = {
     "backend2": "backend2",
 }
 
+# Mock backend host-mapped ports (from docker-compose.test.yml)
+MOCK_BACKEND_PORTS: Dict[int, int] = {1: 21434, 2: 21435}
+
+# Container paths
+CONTAINER_CONFIG_PATH = "/tmp/ranvier.yaml"
+CONTAINER_DB_PATH = "/tmp/ranvier.db"
+
+# Application reload cooldown (RELOAD_COOLDOWN in application.cpp is 10 s)
+CONFIG_RELOAD_COOLDOWN_WAIT = 12
+
+# All known compose project names (used by free_docker_subnet)
+ALL_PROJECT_NAMES = (
+    "ranvier-pytest-session",
+    "ranvier-unittest",
+    "ranvier-integration-test",
+    "ranvier-http-pipeline-test",
+    "ranvier-http-pipeline-nobackend-test",
+    "ranvier-http-pipeline-tokenfwd-test",
+    "ranvier-streaming-test",
+    "ranvier-metrics-test",
+    "ranvier-graceful-shutdown-test",
+    "ranvier-negative-path-test",
+    "ranvier-prefix-routing-test",
+    "ranvier-load-aware-test",
+    "ranvier-health-circuit-breaker-test",
+    "ranvier-config-loading-test",
+    "ranvier-persistence-test",
+)
+
 
 # =============================================================================
 # Docker Compose helpers
@@ -258,6 +287,109 @@ def wait_for_healthy(
             pass
         time.sleep(1)
     return False
+
+
+# =============================================================================
+# Docker network helpers
+# =============================================================================
+
+
+def docker_network_disconnect(network: str, container: str) -> bool:
+    """Disconnect a container from a Docker network."""
+    try:
+        result = subprocess.run(
+            ["docker", "network", "disconnect", "--force", network, container],
+            capture_output=True, text=True, timeout=15,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def docker_network_connect(
+    network: str, container: str, ip: Optional[str] = None
+) -> bool:
+    """Reconnect a container to a Docker network."""
+    try:
+        cmd = ["docker", "network", "connect"]
+        if ip:
+            cmd += ["--ip", ip]
+        cmd += [network, container]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def get_docker_network_name(project_name: str) -> str:
+    """Get the actual Docker network name for a compose project.
+
+    Docker Compose creates networks with the project name prefix.
+    The network defined in docker-compose.test.yml is 'ranvier-test',
+    so the full name is '{project_name}_ranvier-test'.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "network", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.strip().split("\n"):
+            if project_name in line and "ranvier-test" in line:
+                return line.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return f"{project_name}_ranvier-test"
+
+
+# =============================================================================
+# Container signal / log helpers
+# =============================================================================
+
+
+def signal_container(container_name: str, signal: str = "SIGTERM") -> bool:
+    """Send a signal to a Docker container."""
+    try:
+        result = subprocess.run(
+            ["docker", "kill", f"--signal={signal}", container_name],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def get_container_logs(container_name: str, tail: int = 100) -> str:
+    """Get recent container logs (stdout + stderr concatenated)."""
+    try:
+        result = subprocess.run(
+            ["docker", "logs", "--tail", str(tail), container_name],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout + result.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+# =============================================================================
+# Subnet cleanup
+# =============================================================================
+
+
+def free_docker_subnet() -> None:
+    """Tear down all known compose projects that hold the shared subnet.
+
+    ``docker-compose.test.yml`` pins a single subnet (172.28.0.0/16).
+    When ``test-integration-ci`` runs every suite in one pytest session,
+    the session fixture or a previous ``ClusterTestCase`` may still hold
+    that subnet.  Tearing down known projects prevents
+    "Pool overlaps with other one on this address space".
+    """
+    for project in ALL_PROJECT_NAMES:
+        run_compose(
+            ["down", "-v", "--remove-orphans"],
+            project_name=project,
+            check=False,
+        )
 
 
 # =============================================================================

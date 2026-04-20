@@ -360,19 +360,19 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 6.3 Routing Logic Tests
 
-- [ ] **Create prefix affinity routing test suite**
-  _Description:_ Create `test_prefix_routing.py` with tests for: same prefix routes to same backend consistently, different prefixes can route to different backends, route learning verified via metrics, min token length threshold respected.
-  _Files:_ `tests/integration/test_prefix_routing.py` (new)
-  _Complexity:_ Medium
-
-- [ ] **Extend route propagation tests**
-  _Description:_ Add tests for: routes learned on Node1 visible on Node2 after gossip interval, updates propagate within timeout, verify `router_cluster_sync_*` metrics.
-  _Files:_ `tests/integration/test_cluster.py`
-  _Complexity:_ Medium
-
-- [ ] **Test backend selection and lifecycle**
-  _Description:_ Verify: requests route to healthy backends only, backend registration creates routable backend, backend removal stops routing.
+- [x] **Create prefix affinity routing test suite** ✅
+  _Description:_ Already covered by the pre-existing `tests/integration/test_prefix_routing.py` (8 tests): `test_01_same_prefix_routes_consistently`, `test_04_different_prefixes_can_route_differently`, `test_02_route_learning_creates_cache_entry` + `test_07_metrics_reflect_routing_behavior` (route learning via metrics), and `test_06_backend_affinity_persists_under_load`. Min token length threshold is exercised indirectly (compose sets `RANVIER_MIN_TOKEN_LENGTH=2`; all test prompts exceed it). This file predates the §6 backlog and already satisfies the acceptance criteria.
   _Files:_ `tests/integration/test_prefix_routing.py`
+  _Complexity:_ Medium
+
+- [x] **Extend route propagation tests** ✅
+  _Description:_ Already covered across two pre-existing suites: `test_cluster.py::test_04_verify_route_propagation` asserts routes learned on Node1 are visible on Node2/Node3 after the gossip interval and `test_05_request_on_other_nodes` verifies propagated routes serve requests; `test_metrics.py::test_07_gossip_counters_increment` asserts `router_cluster_sync_sent` and `router_cluster_sync_received` deltas are positive over a 2-second window (gossip interval = 500ms).
+  _Files:_ `tests/integration/test_cluster.py`, `tests/integration/test_metrics.py`
+  _Complexity:_ Medium
+
+- [x] **Test backend selection and lifecycle** ✅
+  _Description:_ Already covered across pre-existing suites: `test_prefix_routing.py::test_01` through `test_08` exercise backend registration → routable backend (every test registers backends then routes through them); `test_health_circuit_breaker.py::test_05_fallback_to_healthy_backend` verifies requests route to healthy backends only when one is failing; `test_health_circuit_breaker.py::test_01_unhealthy_backend_detected` verifies unhealthy backends are detected. Backend removal stopping routing is covered by `test_cluster.py::test_06_stop_node_and_verify_peer_count` (node removal) and `test_health_circuit_breaker.py::test_07_recovery_after_backend_restart` (backend stop → traffic shifts to remaining backend).
+  _Files:_ `tests/integration/test_prefix_routing.py`, `tests/integration/test_health_circuit_breaker.py`, `tests/integration/test_cluster.py`
   _Complexity:_ Low
 
 ### 6.4 Resilience and Fault Tolerance Tests
@@ -411,9 +411,9 @@ The `rvctl` CLI tool (tools/rvctl) provides operator-friendly access to Ranvier'
 
 ### 6.6 Lifecycle and Persistence Tests
 
-- [ ] **Create graceful shutdown test suite**
-  _Description:_ Create `test_graceful_shutdown.py` with tests for: in-flight requests complete, new connections rejected after signal, shutdown within timeout, exit code 0 for clean shutdown.
-  _Files:_ `tests/integration/test_graceful_shutdown.py` (new)
+- [x] **Create graceful shutdown test suite** ✅
+  _Description:_ Already covered by the pre-existing `tests/integration/test_graceful_shutdown.py`: `test_01_graceful_shutdown_completes_requests` sends SIGTERM and verifies in-flight requests complete (health endpoint returns 503 during drain, then connection refused after stop) and shutdown occurs within the timeout; `test_02_node_isolation_during_shutdown` verifies other nodes remain healthy during a peer's shutdown. The suite uses `signal_container_shutdown()` (SIGTERM via `docker kill`) and verifies clean exit via container state inspection. This file predates the §6 backlog and already satisfies the acceptance criteria.
+  _Files:_ `tests/integration/test_graceful_shutdown.py`
   _Complexity:_ Medium
 
 - [x] **Create persistence recovery test suite** ✅
