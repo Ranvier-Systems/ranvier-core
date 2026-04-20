@@ -1140,3 +1140,16 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(tokenizer_thread_pool_concurrency_test)
 endif()
+
+# Aggregate target that depends on every *_test executable. Lets CI build only
+# the unit-test binaries (`ninja unit_tests`) instead of the default `all`,
+# which would also pull in unused upstream targets like
+# `opentelemetry_otlp_recordable` that are not deps of `ranvier_server` and
+# may fail to compile due to upstream version skew.
+get_property(_ranvier_all_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+add_custom_target(unit_tests)
+foreach(_t ${_ranvier_all_targets})
+  if(_t MATCHES "_test$")
+    add_dependencies(unit_tests ${_t})
+  endif()
+endforeach()

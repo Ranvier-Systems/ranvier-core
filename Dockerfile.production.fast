@@ -50,8 +50,11 @@ RUN mkdir -p /src/build/runtime-libs && \
 FROM builder AS test
 WORKDIR /src/build
 # The builder stage only ninja-compiles ranvier_server to keep publish lean.
-# Here we build the remaining targets (unit test executables).
-RUN ninja
+# Build only the *_test executables via the CMake aggregate target — using
+# the default `all` target would also build unused upstream targets like
+# `opentelemetry_otlp_recordable` (not a ranvier_server dep, fails on a
+# proto/source version skew).
+RUN ninja unit_tests
 CMD ["ctest", "--output-on-failure"]
 
 # ---------------------------------------------------------
