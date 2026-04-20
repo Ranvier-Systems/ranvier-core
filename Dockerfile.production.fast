@@ -42,7 +42,20 @@ RUN mkdir -p /src/build/runtime-libs && \
     echo "=== Libraries collected ===" && ls -la /src/build/runtime-libs/
 
 # ---------------------------------------------------------
-# STAGE 2: Runner (Lightweight, Runtime only)
+# STAGE 2: Test (Builds and runs unit tests via ctest)
+# ---------------------------------------------------------
+# Extends the builder stage with the full set of test binaries (gtest-based).
+# The publish job does not target this stage, so production images are
+# unaffected. CI builds this stage with `--target test` and runs ctest.
+FROM builder AS test
+WORKDIR /src/build
+# The builder stage only ninja-compiles ranvier_server to keep publish lean.
+# Here we build the remaining targets (unit test executables).
+RUN ninja
+CMD ["ctest", "--output-on-failure"]
+
+# ---------------------------------------------------------
+# STAGE 3: Runner (Lightweight, Runtime only)
 # ---------------------------------------------------------
 FROM fedora:39
 
