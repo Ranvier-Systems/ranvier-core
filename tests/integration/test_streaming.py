@@ -29,41 +29,17 @@ except ImportError:
 from conftest import (
     ClusterTestCase,
     DOCKER_HOST,
+    MOCK_BACKEND_PORTS,
     NODES,
     REQUEST_TIMEOUT,
-    run_compose,
+    free_docker_subnet,
     send_chat_request,
 )
-
-# Mock backend admin/debug ports (host-mapped from docker-compose.test.yml).
-# Backend ``/admin/*`` and ``/debug/*`` share the single listening port.
-BACKEND_ADMIN_PORTS = {1: 21434, 2: 21435}
-
-# Projects that hold 172.28.0.0/16 — tear them down before bringing up this
-# class so a prior suite (pytest session or another unittest class) can't
-# keep the subnet pinned.  Mirrors test_http_pipeline.py's approach.
-_SUBNET_HOLDING_PROJECTS = (
-    "ranvier-pytest-session",
-    "ranvier-integration-test",
-    "ranvier-http-pipeline-test",
-    "ranvier-http-pipeline-nobackend-test",
-    "ranvier-http-pipeline-tokenfwd-test",
-    "ranvier-streaming-test",
-)
-
-
-def _free_docker_subnet():
-    for project in _SUBNET_HOLDING_PROJECTS:
-        run_compose(
-            ["down", "-v", "--remove-orphans"],
-            project_name=project,
-            check=False,
-        )
 
 
 def _set_failure_mode(backend_id: int, mode: str) -> None:
     """Set sticky failure mode on one backend via its admin port."""
-    port = BACKEND_ADMIN_PORTS[backend_id]
+    port = MOCK_BACKEND_PORTS[backend_id]
     resp = requests.post(
         f"http://{DOCKER_HOST}:{port}/admin/failure-mode",
         params={"mode": mode},
@@ -73,12 +49,12 @@ def _set_failure_mode(backend_id: int, mode: str) -> None:
 
 
 def _set_all_failure_modes(mode: str) -> None:
-    for bid in BACKEND_ADMIN_PORTS:
+    for bid in MOCK_BACKEND_PORTS:
         _set_failure_mode(bid, mode)
 
 
 def _get_debug_requests(backend_id: int):
-    port = BACKEND_ADMIN_PORTS[backend_id]
+    port = MOCK_BACKEND_PORTS[backend_id]
     resp = requests.get(
         f"http://{DOCKER_HOST}:{port}/debug/requests", timeout=5,
     )
@@ -87,7 +63,7 @@ def _get_debug_requests(backend_id: int):
 
 
 def _clear_debug_requests(backend_id: int):
-    port = BACKEND_ADMIN_PORTS[backend_id]
+    port = MOCK_BACKEND_PORTS[backend_id]
     resp = requests.delete(
         f"http://{DOCKER_HOST}:{port}/debug/requests", timeout=5,
     )
@@ -96,7 +72,7 @@ def _clear_debug_requests(backend_id: int):
 
 def _find_request_by_id(request_id: str):
     """Return ``(backend_id, entry)`` for the first match across both backends."""
-    for bid in BACKEND_ADMIN_PORTS:
+    for bid in MOCK_BACKEND_PORTS:
         for entry in _get_debug_requests(bid):
             if entry.get("headers", {}).get("X-Request-ID") == request_id:
                 return bid, entry
@@ -156,7 +132,7 @@ class StreamingTest(ClusterTestCase):
 
     @classmethod
     def setUpClass(cls):
-        _free_docker_subnet()
+        free_docker_subnet()
         super().setUpClass()
 
     def setUp(self):
@@ -315,7 +291,7 @@ class StreamingTest(ClusterTestCase):
         print("\nTest: Stream interruption mid-response (reset mode)")
         api_url = NODES["node1"]["api"]
 
-        for bid in BACKEND_ADMIN_PORTS:
+        for bid in MOCK_BACKEND_PORTS:
             _clear_debug_requests(bid)
 
         # Task instructs us to forward ``X-Mock-Failure-Mode: reset`` through
@@ -440,7 +416,7 @@ class StreamingTest(ClusterTestCase):
         print("\nTest: Large request body (>1 MB)")
         api_url = NODES["node1"]["api"]
 
-        for bid in BACKEND_ADMIN_PORTS:
+        for bid in MOCK_BACKEND_PORTS:
             _clear_debug_requests(bid)
 
         # Distinct from test_negative_paths.py::test_05b_oversized_request_body

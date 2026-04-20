@@ -30,41 +30,17 @@ from conftest import (
     BACKENDS,
     ClusterTestCase,
     NODES,
+    free_docker_subnet,
     get_all_metrics,
     metric_is_registered,
-    run_compose,
     send_chat_request,
     sum_metric_by_substring,
 )
 
 
-# Prometheus line regex: metric_name{labels}? value.
-# Applied after stripping ``# HELP``/``# TYPE`` comments and blank lines.
 _PROM_LINE_RE = re.compile(
     r"^[a-zA-Z_:][a-zA-Z0-9_:]*(\{.*\})?\s+[\d.eE+-]+$"
 )
-
-# Projects that hold 172.28.0.0/16 — tear them down before bringing up this
-# class so a prior suite (pytest session or another unittest class) can't
-# keep the subnet pinned.  Mirrors test_streaming.py / test_http_pipeline.py.
-_SUBNET_HOLDING_PROJECTS = (
-    "ranvier-pytest-session",
-    "ranvier-integration-test",
-    "ranvier-http-pipeline-test",
-    "ranvier-http-pipeline-nobackend-test",
-    "ranvier-http-pipeline-tokenfwd-test",
-    "ranvier-streaming-test",
-    "ranvier-metrics-test",
-)
-
-
-def _free_docker_subnet():
-    for project in _SUBNET_HOLDING_PROJECTS:
-        run_compose(
-            ["down", "-v", "--remove-orphans"],
-            project_name=project,
-            check=False,
-        )
 
 
 def _fetch_raw_metrics(metrics_url: str) -> str:
@@ -82,7 +58,7 @@ class MetricsTest(ClusterTestCase):
 
     @classmethod
     def setUpClass(cls):
-        _free_docker_subnet()
+        free_docker_subnet()
         super().setUpClass()
 
     # ------------------------------------------------------------------

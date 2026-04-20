@@ -38,7 +38,9 @@ except ImportError:
 from conftest import (
     ClusterTestCase,
     NODES,
+    get_container_logs,
     run_compose as _conftest_run_compose,
+    signal_container as _signal_container,
     wait_for_healthy,
 )
 
@@ -120,30 +122,7 @@ def send_chat_request(api_url: str, prompt: str = "test") -> Tuple[int, Dict]:
 
 def signal_container_shutdown(container_name: str) -> bool:
     """Send SIGTERM to a container to initiate graceful shutdown."""
-    try:
-        result = subprocess.run(
-            ["docker", "kill", "--signal=SIGTERM", container_name],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-
-def get_container_logs(container_name: str, tail: int = 50) -> str:
-    """Get recent container logs."""
-    try:
-        result = subprocess.run(
-            ["docker", "logs", "--tail", str(tail), container_name],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        return result.stdout + result.stderr
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
+    return _signal_container(container_name, "SIGTERM")
 
 
 class GracefulShutdownTest(ClusterTestCase):

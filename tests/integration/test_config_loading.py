@@ -36,6 +36,8 @@ except ImportError:
 from conftest import (
     ClusterTestCase,
     COMPOSE_FILE,
+    CONFIG_RELOAD_COOLDOWN_WAIT as _RELOAD_COOLDOWN_WAIT,
+    CONTAINER_CONFIG_PATH as _CONTAINER_CONFIG_PATH,
     CONTAINER_NAMES,
     NODES,
     STARTUP_TIMEOUT,
@@ -46,17 +48,6 @@ from conftest import (
     sum_metric_by_substring,
     wait_for_healthy,
 )
-
-
-# Path where Ranvier loads its YAML config inside the container.
-# docker-compose.test.yml passes ``--config /tmp/ranvier.yaml``; the container
-# is read_only but /tmp is a tmpfs mount, so we can write the file with
-# ``docker exec`` + shell redirection.  Matches test_negative_paths.py.
-_CONTAINER_CONFIG_PATH = "/tmp/ranvier.yaml"
-
-# Application::reload_config() enforces a 10-second cooldown between SIGHUPs.
-# Wait slightly longer to be safe when tests need to chain reloads.
-_RELOAD_COOLDOWN_WAIT = 12
 
 
 def _write_container_config(container: str, yaml_text: str) -> None:

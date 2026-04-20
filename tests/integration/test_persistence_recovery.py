@@ -64,39 +64,27 @@ except ImportError:
 
 from conftest import (
     BACKENDS,
+    CONTAINER_DB_PATH as DB_PATH_IN_CONTAINER,
     ClusterTestCase,
     NODES,
+    get_container_logs as _get_container_logs,
     register_backends,
     send_chat_request,
+    signal_container as signal_container_shutdown,
     wait_for_healthy,
 )
 
 _PROJECT_NAME = "ranvier-persistence-test"
 
-# The ranvier containers mount /tmp as tmpfs and point
-# RANVIER_DB_PATH there (see docker-compose.test.yml).
-DB_PATH_IN_CONTAINER = "/tmp/ranvier.db"
-
 
 # =============================================================================
-# Docker helpers (duplicated from test_graceful_shutdown.py — see scope
-# guardrails in the task brief; factoring into conftest is a separate
-# cleanup.)
+# Docker helpers
 # =============================================================================
 
 
-def signal_container_shutdown(container_name: str, signal: str = "SIGTERM") -> bool:
-    """Send a signal to a container."""
-    try:
-        result = subprocess.run(
-            ["docker", "kill", f"--signal={signal}", container_name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+def get_container_logs(container_name: str, tail: int = 300) -> str:
+    """Wrapper with a larger default tail for persistence log inspection."""
+    return _get_container_logs(container_name, tail=tail)
 
 
 def docker_start_container(container_name: str) -> bool:
@@ -115,20 +103,6 @@ def docker_start_container(container_name: str) -> bool:
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
-
-
-def get_container_logs(container_name: str, tail: int = 300) -> str:
-    """Get recent container logs (stdout+stderr concatenated)."""
-    try:
-        result = subprocess.run(
-            ["docker", "logs", "--tail", str(tail), container_name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.stdout + result.stderr
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
 
 
 def wait_for_container_exit(container_name: str, timeout: int = 30) -> bool:
