@@ -1,6 +1,6 @@
 # Source Code Map
 
-This guide maps source files to logical modules, helping contributors navigate the ~27,650 LOC codebase.
+This guide maps source files to logical modules, helping contributors navigate the ~35,790 LOC codebase.
 
 ## Core Application
 
@@ -9,11 +9,14 @@ This guide maps source files to logical modules, helping contributors navigate t
 | `main.cpp` | Entry point, Seastar reactor loop, signal setup |
 | `application.*` | Service lifecycle management, startup/shutdown orchestration |
 | `config.hpp` | Backward-compatible facade (includes schema + loader) |
-| `config_schema.hpp` | Pure configuration data structures (all `*Config` structs) |
+| `config_schema.hpp` | Ranvier-specific configuration data structures (all `*Config` structs) |
+| `config_infra.hpp` | Generic infrastructure config structs (server, pool, TLS, auth, DB, telemetry, etc.) |
 | `config_loader.*` | YAML loading, validation, environment variable overrides |
 | `sharded_config.hpp` | Per-shard configuration for lock-free access |
 | `types.hpp` | Common type definitions (TokenId, BackendId) |
 | `logging.hpp` | Structured logging utilities |
+| `byte_order.hpp` | Big-endian read/write helpers for byte buffers (gossip, radix tree) |
+| `mpsc_ring_buffer.hpp` | Lock-free bounded MPSC ring buffer primitive (used by async persistence) |
 
 ## Routing Engine (The "Brain")
 
@@ -25,6 +28,10 @@ This guide maps source files to logical modules, helping contributors navigate t
 | `shard_load_balancer.hpp` | P2C algorithm for cross-core request distribution |
 | `shard_load_metrics.hpp` | Per-shard load tracking (active requests, queue depth) |
 | `cross_shard_request.hpp` | Safe cross-shard request context transfer |
+| `request_scheduler.hpp` | Priority-aware request queueing with per-agent fair scheduling |
+| `intent_classifier.*` | Classifies requests as AUTOCOMPLETE / EDIT / CHAT for routing hints |
+| `backend_registry.hpp` | Abstract backend lifecycle interface (decouples health/discovery from router) |
+| `cache_event_parser.hpp` | Pure parser for `POST /v1/cache/events` JSON payloads |
 | `tokenizer_service.*` | HuggingFace tokenizer integration (GPT-2) |
 | `tokenizer_thread_pool.*` | Dedicated worker pool for blocking tokenizer FFI calls |
 | `request_rewriter.hpp` | Token injection for pre-tokenized forwarding |
@@ -44,6 +51,8 @@ This guide maps source files to logical modules, helping contributors navigate t
 | `proxy_retry_policy.hpp` | Retry/backoff/fallback decisions for backend proxying |
 | `text_validator.hpp` | UTF-8 and null-byte input validation |
 | `parse_utils.hpp` | Safe integer parsing via `std::from_chars` |
+| `agent_registry.*` | Identifies AI coding agents (Cursor, Claude Code, Cline, Aider) and exposes pause/resume + priority controls |
+| `dashboard/` | Embedded admin dashboard (`index.html` + CMake-generated `dashboard_resource.hpp`) |
 
 ## Cluster State (Gossip)
 
@@ -63,8 +72,11 @@ The gossip subsystem is split into focused modules:
 | File | Description |
 |------|-------------|
 | `k8s_discovery_service.*` | Kubernetes API integration (endpoints, services) |
+| `local_discovery.*` | Auto-discovery of local LLM servers (Ollama, vLLM, LM Studio, llama.cpp) via semantic liveness probes |
 | `health_service.*` | Backend health checking |
 | `circuit_breaker.hpp` | Circuit breaker pattern for failing backends |
+| `vllm_metrics.hpp` | Per-backend vLLM metrics struct (queue depth, KV cache, GPU memory) |
+| `prometheus_parser.hpp` | Lightweight parser for vLLM `/metrics` Prometheus text output |
 
 ## Persistence
 
@@ -79,6 +91,8 @@ The gossip subsystem is split into focused modules:
 | File | Description |
 |------|-------------|
 | `metrics_service.hpp` | Prometheus metrics (counters, histograms, gauges) |
+| `metrics_helpers.hpp` | Reusable metrics infrastructure (histogram buckets, bounded per-backend maps) |
+| `metrics_auth_handler.hpp` | Optional Bearer token + IP allowlist auth for the `/metrics` endpoint |
 | `tracing_service.*` | OpenTelemetry span propagation |
 
 ## Architecture Notes
