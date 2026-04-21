@@ -874,138 +874,84 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 > **Commit range:** 8be20f2 → 16f3454. **vLLM:** v0.15.1 (pinned). **Instance:** Lambda Labs
 > 8xA100 40GB. Default config (BOUNDED_LOAD hash, load-aware ON, 10ms flush, prefix mode).
 >
-> This instance was used for a systematic investigation of three regressions identified through
-> benchmark analysis: (1) boundary detection latency, (2) cache hit rate plateau, and
-> (3) BOUNDED_LOAD double load-awareness. Four fixes were developed and validated across
-> multiple benchmark iterations.
+> Systematic investigation of three regressions identified through benchmark analysis. Four
+> fixes developed and validated across multiple iterations.
 
-#### Fixes Developed During This Investigation
+#### Fixes and Cumulative Impact
 
-| Fix | Commit | PR | Impact |
-|-----|--------|-----|--------|
-| Tokenization cache `max_text_length` 8192→65536 | 8cf01d9 | — | Boundary detect 5-7ms → <1ms at 20+ users |
-| Strategy 4 boundary detection under partial tokenization | addd633 | #430 | Cache hit rate 40% → 60% |
-| Uniform `load_aware_routing` toggle across hash strategies | fb5ad97 | #441 | BOUNDED_LOAD/P2C now respect the toggle |
-| Learn consistent-hash backend, not diverted backend | adaec51 | #442 | Prevents cumulative ART drift under load |
+| Fix | PR | Impact |
+|-----|----|--------|
+| Tokenization cache `max_text_length` 8192→65536 | — | Boundary detect 5-7ms → <1ms at 20+ users |
+| Strategy 4 boundary detection under partial tokenization | #430 | Cache hit rate 40% → 60% |
+| Uniform `load_aware_routing` toggle across hash strategies | #441 | BOUNDED_LOAD/P2C now respect the toggle |
+| Learn consistent-hash backend, not diverted backend | #442 | Prevents cumulative ART drift under load |
 
-#### Progression of Results (13B, 30 users, BOUNDED_LOAD + load-aware)
+Progression (13B, 30 users):
 
-Each row shows the cumulative effect of fixes applied:
+| Phase | Cache Hit % | P99 TTFT | Throughput | BD P50 |
+|-------|-------------|----------|------------|--------|
+| Pre-fix (8be20f2) | 34-48% | Usually worse | +2-15% | 5-7ms |
+| + max_text_length | 34-48% | Volatile | +2-15% | <1ms |
+| + Strategy 4 boundary | 54-62% | Trending better | +5-19% | 0.2-0.4ms |
+| **All fixes (16f3454)** | **63%** | **-58.8%** | **+23.1%** | **0.12ms** |
 
-| Phase | Commit | Cache Hit % | P99 TTFT | Throughput | BD P50 | Notes |
-|-------|--------|-------------|----------|------------|--------|-------|
-| Pre-fix | 8be20f2 | 34-48% | Usually worse | +2-15% | 5-7ms | Boundary detect bottleneck |
-| + max_text_length | 8cf01d9 | 34-48% | Volatile | +2-15% | <1ms | BD fixed, cache rate unchanged |
-| + Strategy 4 boundary | addd633 | 54-62% | Trending better | +5-19% | 0.2-0.4ms | Cache rate improved |
-| + load-aware + learn fixes | 16f3454 | **63%** | **-58.8%** | **+23.1%** | **0.12ms** | All metrics green |
-
-#### Validated Results (commit 16f3454, post all fixes)
+#### Validated Results (commit 16f3454)
 
 **CodeLlama-13b, 30 users, 30 minutes (reference config):**
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
 | Cache Hit Rate | 14.8% | 63.2% | **+48.4%** |
-| Overall P50 TTFT | 870ms | 780ms | **-10.3%** |
-| Overall P99 TTFT | 9,700ms | 4,000ms | **-58.8%** |
-| Cache Hit P50 | 886ms | 795ms | **-10.3%** |
+| P50 TTFT | 870ms | 780ms | **-10.3%** |
+| P99 TTFT | 9,700ms | 4,000ms | **-58.8%** |
 | Cache Hit P99 | 11,385ms | 3,644ms | **-68.0%** |
-| Cache Miss P50 | 866ms | 730ms | **-15.6%** |
-| Cache Miss P99 | 9,385ms | 4,498ms | **-52.1%** |
 | Throughput (req/s) | 38.6 | 47.5 | **+23.1%** |
-| Total Requests | 12,059 | 14,741 | +22.2% |
-| Incomplete Rate | 0% | 0% | 0% |
-| Error Rate | 0% | 0% | 0% |
+| Incomplete / Error Rate | 0% / 0% | 0% / 0% | |
 | Validation | FAILED | **PASSED** | |
 
-Per-bucket breakdown (with sample counts from reporting fix #439):
+Per-bucket (sample counts from reporting fix #439):
 
-| Bucket | Baseline Hits → New Hits | Hit P99 Change | Miss P99 Change |
-|--------|--------------------------|----------------|-----------------|
-| Large [n=3527/4483] | 607 → **3,285** (5.4x) | **-63.0%** | -35.9% |
-| XLarge [n=4872/5862] | 706 → **3,536** (5.0x) | **-87.0%** | -58.8% |
+| Bucket | Baseline Hits → New Hits | Hit P99 Change |
+|--------|--------------------------|----------------|
+| Large [n=3527/4483] | 607 → **3,285** (5.4x) | **-63.0%** |
+| XLarge [n=4872/5862] | 706 → **3,536** (5.0x) | **-87.0%** |
 
-Routing overhead:
+Routing overhead: 0.31ms total (tokenization 0.18ms, boundary detect 0.12ms, ART 0.02ms).
 
-| Component | P50 |
-|-----------|-----|
-| Total routing decision | 0.31ms |
-| Tokenization (primary) | 0.18ms |
-| Boundary detection | 0.12ms |
-| ART lookup | 0.02ms |
-| Backend connect | 0.06ms |
+**Other concurrency levels (13B, 30 minutes):**
 
-**CodeLlama-13b, 20 users, 30 minutes:**
+| Users | Cache Hit % | P99 TTFT | Throughput | Notes |
+|-------|-------------|----------|------------|-------|
+| 20 | 63.4% | **-36.7%** | +2.9% | Cache Hit P99 -49.8% |
+| 10 | 53.6% | +88.9%† | +2.5% | 0 incompletes (RR had 6.9%) |
 
-| Metric | Round-Robin | Prefix-Aware | Change |
-|--------|-------------|--------------|--------|
-| Cache Hit Rate | 12.8% | 63.4% | **+50.6%** |
-| P50 TTFT | 710ms | 740ms | +4.2% |
-| P99 TTFT | 3,000ms | 1,900ms | **-36.7%** |
-| Cache Hit P99 | 3,061ms | 1,538ms | **-49.8%** |
-| Throughput (req/s) | 32.9 | 33.8 | +2.9% |
-| Incomplete Rate | 4.8% | 5.4% | +0.6pp |
-| Validation | PASSED | PASSED | |
-
-**CodeLlama-13b, 10 users, 30 minutes:**
-
-| Metric | Round-Robin | Prefix-Aware | Change |
-|--------|-------------|--------------|--------|
-| Cache Hit Rate | 11.5% | 53.6% | **+42.1%** |
-| P50 TTFT | 660ms | 610ms | **-7.6%** |
-| P99 TTFT | 1,800ms | 3,400ms | +88.9% |
-| Throughput (req/s) | 17.8 | 18.2 | +2.5% |
-| Incomplete Rate | 6.9% | 0% | **-6.9pp** |
-| Validation | PASSED | PASSED | |
-
-The 10-user P99 regression (+88.9%) is misleading: the round-robin baseline dropped 412
-requests as incompletes (6.9%), artificially lowering its reported P99 by excluding the
-slowest tail. Prefix-aware completed every request, including the slow tail. The 10-user
-run also showed 14.73ms boundary detection (cold-start artifact — first run on instance
-before tokenizer cache warmed).
-
-#### Hash Strategy Comparison (pre-final-fixes, commit addd633)
-
-JUMP hash was tested against the default BOUNDED_LOAD during investigation:
-
-| Config (30 users) | Cache Hit % | P99 TTFT | Throughput |
-|--------------------|-------------|----------|------------|
-| JUMP + load-aware OFF | 61.8% | **-39.7%** | **+19.2%** |
-| JUMP + load-aware ON | 59.3% | +18.8% | +9.5% |
-| BOUNDED_LOAD + load-aware ON | 62.2% | **-31.7%** | +7.9% |
-
-After the routing fixes (#441, #442) landed, the gap between JUMP and BOUNDED_LOAD closed.
-Both produce ~63% cache hit rates. The default BOUNDED_LOAD configuration is recommended
-as it provides built-in capacity-aware load balancing.
+†10-user P99 is misleading: round-robin dropped 412 requests as incompletes, excluding
+the slowest tail from its P99. Prefix-aware completed every request.
 
 #### Key Findings
 
 1. **Boundary detection was the dominant overhead at 20+ users.** A tokenization cache limit
-   of 8192 bytes caused large system prefixes to bypass the cache entirely, creating a 5-7ms
-   P50 bottleneck. Fixed by raising to 65536 bytes (aligned with thread pool limit).
+   of 8192 bytes caused large system prefixes to bypass the cache, creating a 5-7ms P50
+   bottleneck.
 
 2. **Strategy 4 boundary detection failed silently under partial tokenization.** When system
    prefixes exceeded the 128 routing token window, `prefix_boundary` was left at 0 for ~70%
-   of stress-test requests, preventing the ART from building stable routes. Fixed cache hit
-   rate from ~40% to ~60%.
+   of stress-test requests, preventing the ART from building stable routes.
 
 3. **BOUNDED_LOAD's built-in load awareness conflicted with the external load-aware toggle.**
    Two independent diversion mechanisms made competing decisions, scattering requests and
-   preventing stable ART affinity. Fixed by gating built-in checks on `load_aware_routing`.
+   preventing stable ART affinity.
 
-4. **Learning the diverted backend caused cumulative ART drift.** When load-aware routing
-   diverted a request to a less-loaded backend, the ART stored that transient assignment as
-   permanent. Under bursty load, routes drifted away from their consistent-hash targets.
-   Fixed by always learning the original consistent-hash backend.
+4. **Learning the diverted backend caused cumulative ART drift.** Under bursty load, routes
+   drifted away from their consistent-hash targets as transient load-driven assignments
+   overwrote stable ones.
 
 5. **The ~63% cache hit rate ceiling is the expected behavior** of the batched route learning
-   architecture (backlog §21.1), not a bug. Instance 3's 97% rate was achieved with
-   per-request SMP broadcasts, which were replaced by 10ms batched flushes to reduce
-   hot-path overhead.
+   architecture (backlog §21.1). Instance 3's 97% was achieved with per-request SMP
+   broadcasts, replaced by 10ms batched flushes to reduce hot-path overhead.
 
-6. **Lambda Labs instance saturation affected P99 variance.** During this investigation
-   (April 2026), available instances were scarce — consistent with higher fleet utilization
-   and noisier neighbors compared to February runs.
+6. **Lambda Labs instance saturation affected P99 variance.** During April 2026, available
+   instances were scarce — consistent with higher fleet utilization and noisier neighbors.
 
 ---
 
