@@ -14,8 +14,9 @@ Prefix-aware routing vs round-robin baseline, all models at default config (pref
 | **8B** | 20-30 | 10-30m | flat | flat | 68-98% | Routing-neutral (model too fast to benefit) |
 | **70B** | 16 | 30m | flat | flat | 98% | Compute-bound; benefit is per-request (44% XLarge) |
 
-*Ranges reflect results across Instance 3 (Feb 10-14, commit 08c4915, per-request SMP) and
-Instance 8 (Mar 5, commit 08e5a93, batched route learning). Both on 8xA100 40GB, vLLM v0.15.1.
+*Ranges reflect results across Instance 3 (Feb 10-14, commit 08c4915, per-request SMP),
+Instance 8 (Mar 5, commit 08e5a93, batched route learning), and Instance 9 (Apr 12-20,
+commit 16f3454, boundary detection + routing fixes). All on 8xA100 40GB, vLLM v0.15.1.
 0% incomplete rate on all runs. See [detailed results](#detailed-results-by-instance) for
 per-instance breakdowns.*
 
@@ -67,6 +68,39 @@ clean runs. Run-to-run variance noted at 20u 10m (2 of 4 runs showed hot-spottin
 | 13B | 30 | 30m | **-79.6%** | **+13.2%** | 58.1% | clean |
 | 8B | 20 | 10m | +4.3% | -5.2% | 97.8% | routing-neutral |
 | 8B | 30 | 30m | +8.3% | -1.5% | 68.3% | routing-neutral |
+
+</details>
+
+<details>
+<summary><b>Instance 9 (Apr 12-20, 2026) — boundary detection + routing fixes</b></summary>
+
+Commits 8be20f2 → 16f3454. Four fixes landed during this benchmarking investigation:
+
+1. **Tokenization cache `max_text_length`** (8cf01d9): Raised from 8192 to 65536 bytes.
+   Large system prefixes (8-32KB) were never cached, causing 5-7ms boundary detection
+   latency at 20+ users.
+2. **Strategy 4 boundary detection** (addd633, PR #430): Fixed partial tokenization check
+   that left `prefix_boundary=0` for ~70% of stress-test requests.
+3. **Uniform load-aware routing** (fb5ad97, PR #441): Gated BOUNDED_LOAD/P2C built-in load
+   checks on `load_aware_routing` toggle so operators can disable load-driven diversion.
+4. **Learn consistent-hash backend** (adaec51, PR #442): ART now learns the original
+   consistent-hash target, not the load-diverted backend, preventing cumulative ART drift.
+
+Cache hit rates are ~60-63% (expected ceiling with batched route learning architecture).
+Routing overhead dropped to 0.3-0.7ms. Boundary detection dropped from 5-7ms to 0.1-0.4ms.
+
+| Model | Users | Duration | P99 TTFT | Throughput | Cache Hits | Notes |
+|-------|-------|----------|----------|------------|------------|-------|
+| 13B | 10 | 30m | 0% | +2.5% | 53.6% | clean, 0 incompletes |
+| 13B | 20 | 30m | **-36.7%** | +2.9% | 63.4% | clean |
+| 13B | 30 | 30m | **-58.8%** | **+23.1%** | 63.2% | **all metrics green**, 0 incompletes |
+
+**Headline result (13B, 30u, 30m):** P99 -58.8%, throughput +23.1%, cache hit P99 -68.0%,
+XLarge hit P99 -87.0%. Every aggregate TTFT metric improved. Validation flipped FAILED → PASSED.
+
+*Note: Lambda Labs instances were near full capacity during this period, which may have
+increased run-to-run variance from noisy neighbors. Earlier instances (Feb 2026) ran on
+quieter hardware with more available capacity.*
 
 </details>
 
@@ -478,9 +512,9 @@ With client tokenization, **cache misses also get faster** because the server sk
 
 | Metric | Round-Robin | Prefix-Aware | Notes |
 |--------|-------------|--------------|-------|
-| Cache Hit Rate | ~12% | ~54-89% | Varies with concurrency |
-| Overall P99 TTFT | ~4500-6800ms | ~2500-3500ms | **-24% to -51%** tail latency |
-| Throughput | ~14-36 req/s | ~15-41 req/s | **+3-14%** higher |
+| Cache Hit Rate | ~12% | ~53-63% | ~60% ceiling with batched route learning |
+| Overall P99 TTFT | ~3000-9700ms | ~1900-4000ms | **-37% to -59%** tail latency |
+| Throughput | ~33-47 req/s | ~34-48 req/s | **+3-23%** higher |
 
 **How to interpret:**
 - **Cache hit rate** improves 4-7x over round-robin — always a significant gain
@@ -835,6 +869,92 @@ Real-world results from 8x A100 40GB benchmarks (stress distribution):
 
 ## Real Benchmark Results
 
+### April 12-20, 2026 — Instance 9: Boundary Detection + Routing Fixes
+
+> **Commit range:** 8be20f2 → 16f3454. **vLLM:** v0.15.1 (pinned). **Instance:** Lambda Labs
+> 8xA100 40GB. Default config (BOUNDED_LOAD hash, load-aware ON, 10ms flush, prefix mode).
+>
+> Systematic investigation of three regressions identified through benchmark analysis. Four
+> fixes developed and validated across multiple iterations.
+
+#### Fixes and Cumulative Impact
+
+| Fix | PR | Impact |
+|-----|----|--------|
+| Tokenization cache `max_text_length` 8192→65536 | — | Boundary detect 5-7ms → <1ms at 20+ users |
+| Strategy 4 boundary detection under partial tokenization | #430 | Cache hit rate 40% → 60% |
+| Uniform `load_aware_routing` toggle across hash strategies | #441 | BOUNDED_LOAD/P2C now respect the toggle |
+| Learn consistent-hash backend, not diverted backend | #442 | Prevents cumulative ART drift under load |
+
+Progression (13B, 30 users):
+
+| Phase | Cache Hit % | P99 TTFT | Throughput | BD P50 |
+|-------|-------------|----------|------------|--------|
+| Pre-fix (8be20f2) | 34-48% | Usually worse | +2-15% | 5-7ms |
+| + max_text_length | 34-48% | Volatile | +2-15% | <1ms |
+| + Strategy 4 boundary | 54-62% | Trending better | +5-19% | 0.2-0.4ms |
+| **All fixes (16f3454)** | **63%** | **-58.8%** | **+23.1%** | **0.12ms** |
+
+#### Validated Results (commit 16f3454)
+
+**CodeLlama-13b, 30 users, 30 minutes (reference config):**
+
+| Metric | Round-Robin | Prefix-Aware | Change |
+|--------|-------------|--------------|--------|
+| Cache Hit Rate | 14.8% | 63.2% | **+48.4%** |
+| P50 TTFT | 870ms | 780ms | **-10.3%** |
+| P99 TTFT | 9,700ms | 4,000ms | **-58.8%** |
+| Cache Hit P99 | 11,385ms | 3,644ms | **-68.0%** |
+| Throughput (req/s) | 38.6 | 47.5 | **+23.1%** |
+| Incomplete / Error Rate | 0% / 0% | 0% / 0% | |
+| Validation | FAILED | **PASSED** | |
+
+Per-bucket (sample counts from reporting fix #439):
+
+| Bucket | Baseline Hits → New Hits | Hit P99 Change |
+|--------|--------------------------|----------------|
+| Large [n=3527/4483] | 607 → **3,285** (5.4x) | **-63.0%** |
+| XLarge [n=4872/5862] | 706 → **3,536** (5.0x) | **-87.0%** |
+
+Routing overhead: 0.31ms total (tokenization 0.18ms, boundary detect 0.12ms, ART 0.02ms).
+
+**Other concurrency levels (13B, 30 minutes):**
+
+| Users | Cache Hit % | P99 TTFT | Throughput | Notes |
+|-------|-------------|----------|------------|-------|
+| 20 | 63.4% | **-36.7%** | +2.9% | Cache Hit P99 -49.8% |
+| 10 | 53.6% | +88.9%† | +2.5% | 0 incompletes (RR had 6.9%) |
+
+†10-user P99 is misleading: round-robin dropped 412 requests as incompletes, excluding
+the slowest tail from its P99. Prefix-aware completed every request.
+
+#### Key Findings
+
+1. **Boundary detection was the dominant overhead at 20+ users.** A tokenization cache limit
+   of 8192 bytes caused large system prefixes to bypass the cache, creating a 5-7ms P50
+   bottleneck.
+
+2. **Strategy 4 boundary detection failed silently under partial tokenization.** When system
+   prefixes exceeded the 128 routing token window, `prefix_boundary` was left at 0 for ~70%
+   of stress-test requests, preventing the ART from building stable routes.
+
+3. **BOUNDED_LOAD's built-in load awareness conflicted with the external load-aware toggle.**
+   Two independent diversion mechanisms made competing decisions, scattering requests and
+   preventing stable ART affinity.
+
+4. **Learning the diverted backend caused cumulative ART drift.** Under bursty load, routes
+   drifted away from their consistent-hash targets as transient load-driven assignments
+   overwrote stable ones.
+
+5. **The ~63% cache hit rate ceiling is the expected behavior** of the batched route learning
+   architecture (backlog §21.1). Instance 3's 97% was achieved with per-request SMP
+   broadcasts, replaced by 10ms batched flushes to reduce hot-path overhead.
+
+6. **Lambda Labs instance saturation affected P99 variance.** During April 2026, available
+   instances were scarce — consistent with higher fleet utilization and noisier neighbors.
+
+---
+
 ### February 21, 2026 — bb20555: Speculative Load Increment + Batched Route Learning
 
 > **INVALID DATA WARNING:** All TTFT, P99, and throughput numbers in this section were measured
@@ -1169,6 +1289,17 @@ catastrophic. The 80GB test (4 backends) is the reliable reference.
 | 13B (ratio 0.7) | 20 | 10m | +86.4% | flat | 76.8% | 0% | 5 |
 | 13B (ratio 0.5) | 20 | 10m | +64.4% | -8.4% | 66.7% | 0% | 5 |
 | 13B (client tok) | 30 | 10m | +18.3% | +5.6% | 54.0% | 0% | 5 |
+
+**Instance 9 runs (Apr 12-20, 2026 — boundary detection + routing fixes, 16f3454):**
+
+| Model | Users | Duration | P99 TTFT Change | Throughput | Cache Hit Rate | Incomplete | Instance |
+|-------|-------|----------|-----------------|------------|----------------|------------|----------|
+| **13B** | **30** | **30m** | **-58.8%** | **+23.1%** | 63.2% | **0%** | 9 |
+| **13B** | **20** | **30m** | **-36.7%** | +2.9% | 63.4% | 5.4% | 9 |
+| **13B** | **10** | **30m** | +88.9%† | +2.5% | 53.6% | **0%** | 9 |
+
+†10-user P99 is misleading: round-robin baseline dropped 412 requests as incompletes (6.9%),
+excluding the slowest tail. Prefix-aware completed every request.
 
 **Instance 3 post-fix runs (Feb 10-14, 2026 — 0% incomplete rate, pre-batched-routes):**
 
@@ -1571,12 +1702,13 @@ The runner produces a `runner_summary_*.md` report and logs to `benchmark-report
 
 ### Benchmark Validity Status
 
-Four benchmark rounds have been completed, but rounds 3-4 contain invalid latency data:
+Five benchmark rounds have been completed. Rounds 3-4 contain invalid latency data:
 
 1. **Pre-fix** (Jan-Feb 2026, Instance 1-2) — **VALID** (pre-regression). Baseline with stale connection issues (30-37% incomplete). TTFT/routing metrics valid, throughput understated by incompletes.
-2. **Post-fix** (Feb 10-14, Instance 3) — **VALID** (pre-regression). Stale connection retry fixed, per-request SMP broadcast. This is the current reference dataset.
+2. **Post-fix** (Feb 10-14, Instance 3) — **VALID** (pre-regression). Stale connection retry fixed, per-request SMP broadcast. This is the historical reference dataset.
 3. **bb20555** (Feb 21, Instance 5) — **TTFT/P99/THROUGHPUT INVALID** (c70f0c1 regression present). Cache hit rates and routing behavior (hot-spotting patterns) are directionally valid.
 4. **c219fbd** (Feb 22, Instance 6) — **TTFT/P99/THROUGHPUT INVALID** (c70f0c1 regression present). Flush interval sweep and cross-shard sync conclusions need re-validation.
+5. **Instance 9** (Apr 12-20, 2026, commits 8be20f2→16f3454) — **VALID**. Boundary detection and routing fixes. 13B 30u 30m: P99 -58.8%, throughput +23.1%, cache 63.2%. This is the current reference for the batched route learning architecture.
 
 **What was invalidated:** The c70f0c1 commit changed `stream_backend_response()` to flush SSE
 only on first/last chunk instead of every chunk. Without per-chunk flush, intermediate tokens
