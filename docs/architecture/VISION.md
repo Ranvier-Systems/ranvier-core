@@ -1,9 +1,13 @@
 # Ranvier Intelligence Layer - Architecture & Vision
 
-[![Status: Architecture Defined](https://img.shields.io/badge/Status-Architecture%20Defined-blue)](VISION.md)
+[![Status: Phases 1-4 Shipped](https://img.shields.io/badge/Status-Phases%201--4%20Shipped-brightgreen)](../../CHANGELOG.md)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](../LICENSE)
 
-> **Goal**: Transform Ranvier from a "smart router" into a full "Intelligence Layer for Inference Infrastructure" with two product lines: Ranvier Cloud and Ranvier Local.
+> **Status (2026-04-26)**: All phases described in this document — Foundation (1.x), Cloud Intelligence (2.x), Ranvier Local (3.x), and Polish (4.x) — shipped in **v2.0.0** (2026-04-05), with performance follow-ups in **v2.1.0** (2026-04-11). See [CHANGELOG.md](../../CHANGELOG.md) for the per-feature delivery record.
+>
+> This document is preserved as the original design rationale. Treat the "What to Build", "Files to Modify", and effort estimates as historical context rather than active work items — the shipped implementation may have diverged from these sketches. For current and upcoming work, see [BACKLOG.md](../../BACKLOG.md) and the issue tracker.
+>
+> **Original goal**: Transform Ranvier from a "smart router" into a full "Intelligence Layer for Inference Infrastructure" with two product lines: Ranvier Cloud and Ranvier Local.
 
 ---
 
