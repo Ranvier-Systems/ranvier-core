@@ -7,7 +7,10 @@
 #include <seastar/core/timer.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
+#include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -72,12 +75,31 @@ struct RemoveRoutesForBackendOp {
 
 struct ClearAllOp {};
 
+// Per-API-key attribution log row (memo §7.4). Single enqueue per request,
+// from the terminal phase of handle_proxy. Plain std::string fields — the
+// existing codebase relies on Seastar's do_foreign_free for cross-shard
+// destruction of SaveBackendOp.ip / SaveRouteOp.tokens, and this op follows
+// the same pattern. (Hard Rule #14 verified — sound.)
+struct LogRequestOp {
+    std::string request_id;
+    std::string api_key_id;
+    int64_t     timestamp_ms = 0;
+    std::string endpoint;
+    std::optional<BackendId> backend_id;
+    int32_t     status_code = 0;
+    int32_t     latency_ms = 0;
+    int64_t     input_tokens = 0;
+    int64_t     output_tokens = 0;
+    double      cost_units = 0.0;
+};
+
 using PersistenceOp = std::variant<
     SaveRouteOp,
     SaveBackendOp,
     RemoveBackendOp,
     RemoveRoutesForBackendOp,
-    ClearAllOp
+    ClearAllOp,
+    LogRequestOp
 >;
 
 // ============================================================================
@@ -90,6 +112,12 @@ struct AsyncPersistenceConfig {
     size_t max_queue_depth = 100000;                // Backpressure threshold
     bool enable_stats_logging = true;               // Log queue statistics
     std::chrono::seconds stats_interval{60};        // Stats logging interval
+
+    // Per-API-key attribution (memo §7). When persistence_enabled is false,
+    // queue_log_request() silently drops; the request_attribution table is
+    // still created but stays empty.
+    bool attribution_persistence_enabled = true;
+    uint32_t attribution_max_request_rows = 1'000'000;
 };
 
 // ============================================================================
@@ -182,6 +210,22 @@ public:
     void queue_remove_routes_for_backend(BackendId backend_id);
     void queue_clear_all();
 
+    // Per-API-key attribution: enqueue one LogRequestOp from handle_proxy's
+    // terminal phase. Silently dropped when attribution_persistence_enabled
+    // is false. By value + move (Hard Rule #21).
+    void queue_log_request(LogRequestOp op);
+
+    // Read-only attribution query for /admin/keys/usage (memo §8). Aggregates
+    // per-key stats from a single bounded SELECT and computes percentiles in
+    // memory via std::nth_element on the latency vector.
+    //
+    // Runs the SQLite read on the persistence worker thread via
+    // seastar::async, returning to the caller's shard with the result vector
+    // copied locally (Hard Rule #14).
+    seastar::future<std::vector<AttributionSummaryRow>> query_attribution_summary(
+        int64_t from_ms, int64_t to_ms, std::string api_key_id_filter,
+        size_t row_limit, bool* truncated);
+
     // -------------------------------------------------------------------------
     // Read Operations (Synchronous, for Startup/Recovery)
     // -------------------------------------------------------------------------
@@ -252,6 +296,12 @@ private:
     void execute(const RemoveBackendOp& op, RouteAccumulator& routes);
     void execute(const RemoveRoutesForBackendOp& op, RouteAccumulator& routes);
     void execute(const ClearAllOp& op, RouteAccumulator& routes);
+    void execute(LogRequestOp& op, RouteAccumulator& routes);
+
+    // Probe row count and prune oldest rows when over the configured cap.
+    // Memo §7.3 Option A. Runs at most once per pruning_probe_threshold log
+    // inserts (bounded — Hard Rule #4 / #17).
+    void maybe_prune_request_attribution();
 
     // --- Statistics ---
 
@@ -305,6 +355,13 @@ private:
     std::atomic<uint64_t> _ops_processed{0};
     std::atomic<uint64_t> _ops_dropped{0};
     std::atomic<uint64_t> _batches_flushed{0};
+
+    // Per-API-key attribution counters (consumer-shard only — no atomics).
+    // _log_requests_since_prune triggers a probe-and-prune pass when it
+    // crosses pruning_probe_threshold.
+    uint64_t _log_requests_inserted = 0;
+    uint64_t _log_requests_since_prune = 0;
+    static constexpr uint64_t kPruningProbeThreshold = 1000;
 };
 
 } // namespace ranvier

@@ -68,6 +68,14 @@ public:
         // Maintenance returns success by default
         ON_CALL(*this, checkpoint()).WillByDefault(Return(true));
         ON_CALL(*this, verify_integrity()).WillByDefault(Return(true));
+
+        // Per-API-key attribution (memo §7) — defaults: log_request succeeds,
+        // counts return 0, prune is a no-op, query returns empty vector.
+        ON_CALL(*this, log_request(_)).WillByDefault(Return(true));
+        ON_CALL(*this, request_attribution_count()).WillByDefault(Return(size_t{0}));
+        ON_CALL(*this, prune_request_attribution(_)).WillByDefault(Return(size_t{0}));
+        ON_CALL(*this, query_request_attribution(_, _, _, _))
+            .WillByDefault(Return(std::vector<RequestAttributionRecord>{}));
     }
 
     // Lifecycle
@@ -107,6 +115,15 @@ public:
     MOCK_METHOD(bool, checkpoint, (), (override));
     MOCK_METHOD(bool, verify_integrity, (), (override));
     MOCK_METHOD(size_t, last_load_skipped_count, (), (const, override));
+
+    // Per-API-key attribution
+    MOCK_METHOD(bool, log_request, (const RequestAttributionRecord& rec), (override));
+    MOCK_METHOD(size_t, request_attribution_count, (), (override));
+    MOCK_METHOD(size_t, prune_request_attribution, (uint32_t max_rows), (override));
+    MOCK_METHOD(std::vector<RequestAttributionRecord>, query_request_attribution,
+                (int64_t from_ms, int64_t to_ms,
+                 const std::string& api_key_id_filter, size_t row_limit),
+                (override));
 
 private:
     bool _open = false;

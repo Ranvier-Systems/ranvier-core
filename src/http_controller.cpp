@@ -2287,6 +2287,42 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         auto backend_end = std::chrono::steady_clock::now();
         record_proxy_completion_metrics(*ctx, backend_end);
 
+        // Per-API-key attribution: enqueue one request_attribution row from
+        // the terminal phase. Single enqueue per request, regardless of which
+        // outcome branch above fired. Memo §7.4. Silently dropped when
+        // _persistence is null or attribution_persistence_enabled is false.
+        if (_persistence != nullptr) {
+            LogRequestOp op;
+            op.request_id   = ctx->request_id;
+            op.api_key_id   = ctx->api_key_id;
+            op.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            op.endpoint     = ctx->endpoint;
+            // Backend may not have been chosen on early failures.
+            if (ctx->current_backend != 0) {
+                op.backend_id = ctx->current_backend;
+            }
+            // Status code derived from the outcome flags. We don't track HTTP
+            // status explicitly on the proxy path; this is a best-effort
+            // mapping for downstream reporting.
+            if (ctx->client_disconnected) {
+                op.status_code = 499;  // Nginx convention
+            } else if (ctx->timed_out) {
+                op.status_code = 504;
+            } else if (ctx->connection_error || ctx->connection_failed) {
+                op.status_code = 502;
+            } else {
+                op.status_code = 200;
+            }
+            op.latency_ms = static_cast<int32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    backend_end - ctx->request_start).count());
+            op.input_tokens  = static_cast<int64_t>(ctx->estimated_input_tokens);
+            op.output_tokens = static_cast<int64_t>(ctx->estimated_output_tokens);
+            op.cost_units    = ctx->estimated_cost_units;
+            _persistence->queue_log_request(std::move(op));
+        }
+
         // Cost budget release is handled by CostBudgetGuard destructor (RAII).
 
         // Return connection to pool or close it

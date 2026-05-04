@@ -310,6 +310,12 @@ AsyncPersistenceConfig Application::build_persistence_config() const {
     cfg.max_queue_depth = kPersistenceMaxQueueDepth;
     cfg.enable_stats_logging = true;
     cfg.stats_interval = kPersistenceStatsInterval;
+
+    // Per-API-key attribution (memo §7). Plumbed through from the top-level
+    // AttributionConfig so the persistence worker knows whether to drop log
+    // ops and what row cap to enforce.
+    cfg.attribution_persistence_enabled = _config.attribution.persistence_enabled;
+    cfg.attribution_max_request_rows    = _config.attribution.max_request_rows;
     return cfg;
 }
 

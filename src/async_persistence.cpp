@@ -189,6 +189,12 @@ void AsyncPersistenceManager::queue_remove_routes_for_backend(BackendId backend_
     try_enqueue(std::move(op));
 }
 
+void AsyncPersistenceManager::queue_log_request(LogRequestOp op) {
+    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
+    if (!_config.attribution_persistence_enabled) return;
+    try_enqueue(std::move(op));
+}
+
 void AsyncPersistenceManager::queue_clear_all() {
     if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
@@ -385,6 +391,130 @@ void AsyncPersistenceManager::execute(const ClearAllOp& /*op*/, RouteAccumulator
     } else {
         log_async_persist.warn("Failed to clear persistence data");
     }
+}
+
+void AsyncPersistenceManager::execute(LogRequestOp& op, RouteAccumulator& routes) {
+    // Flush any accumulated routes first to maintain ordering with attribution
+    // log inserts (operators expect that a SaveRouteOp enqueued before a
+    // LogRequestOp lands in the DB before it).
+    routes.flush();
+
+    // Build the attribution record. Hard Rule #7 — this is dumb storage;
+    // service layer (handle_proxy) owns all sanitisation/clamping.
+    RequestAttributionRecord rec;
+    rec.request_id    = std::move(op.request_id);
+    rec.api_key_id    = std::move(op.api_key_id);
+    rec.timestamp_ms  = op.timestamp_ms;
+    rec.endpoint      = std::move(op.endpoint);
+    rec.backend_id    = op.backend_id;
+    rec.status_code   = op.status_code;
+    rec.latency_ms    = op.latency_ms;
+    rec.input_tokens  = op.input_tokens;
+    rec.output_tokens = op.output_tokens;
+    rec.cost_units    = op.cost_units;
+
+    if (_store->log_request(rec)) {
+        _ops_processed++;
+        _log_requests_inserted++;
+        _log_requests_since_prune++;
+        // Periodic prune probe (memo §7.3 Option A) — bounded by threshold,
+        // not per-flush.
+        if (_log_requests_since_prune >= kPruningProbeThreshold) {
+            _log_requests_since_prune = 0;
+            maybe_prune_request_attribution();
+        }
+    } else {
+        log_async_persist.warn("Failed to log request attribution row "
+                               "(request_id={})", rec.request_id);
+    }
+}
+
+void AsyncPersistenceManager::maybe_prune_request_attribution() {
+    if (!is_open() || _config.attribution_max_request_rows == 0) return;
+
+    const size_t count = _store->request_attribution_count();
+    if (count <= _config.attribution_max_request_rows) {
+        return;
+    }
+    const size_t pruned = _store->prune_request_attribution(_config.attribution_max_request_rows);
+    if (pruned > 0) {
+        log_async_persist.info(
+            "attribution: pruned {} oldest request_attribution rows "
+            "(count={} > max_request_rows={})",
+            pruned, count, _config.attribution_max_request_rows);
+    }
+}
+
+// Read-only attribution query (memo §8). Runs the SQLite SELECT on the
+// persistence worker thread via seastar::async, then computes per-key
+// percentiles in C++ before returning the aggregated rows.
+seastar::future<std::vector<AttributionSummaryRow>>
+AsyncPersistenceManager::query_attribution_summary(
+    int64_t from_ms, int64_t to_ms, std::string api_key_id_filter,
+    size_t row_limit, bool* truncated) {
+
+    if (!is_open()) {
+        if (truncated) *truncated = false;
+        return seastar::make_ready_future<std::vector<AttributionSummaryRow>>();
+    }
+
+    // Run the SQLite read off the reactor. Inputs captured by value.
+    return seastar::async([this,
+                           from_ms, to_ms,
+                           filter = std::move(api_key_id_filter),
+                           row_limit, truncated]() mutable {
+        std::vector<RequestAttributionRecord> rows =
+            _store->query_request_attribution(from_ms, to_ms, filter, row_limit);
+
+        if (truncated) {
+            *truncated = (rows.size() >= row_limit);
+        }
+
+        // Aggregate by api_key_id. The SQL ORDER BY (api_key_id, latency_ms)
+        // means rows for one key are contiguous and already sorted by
+        // latency, so we can compute percentiles by index.
+        std::vector<AttributionSummaryRow> out;
+        if (rows.empty()) return out;
+
+        auto compute_pct = [](const std::vector<int32_t>& sorted_lat, double q) -> int32_t {
+            if (sorted_lat.empty()) return 0;
+            // sorted_lat is ascending; pick the q-quantile by nearest-rank.
+            size_t idx = static_cast<size_t>(q * (sorted_lat.size() - 1));
+            if (idx >= sorted_lat.size()) idx = sorted_lat.size() - 1;
+            return sorted_lat[idx];
+        };
+
+        size_t i = 0;
+        while (i < rows.size()) {
+            const std::string& key = rows[i].api_key_id;
+            AttributionSummaryRow agg;
+            agg.api_key_id = key;
+            std::vector<int32_t> latencies;
+            latencies.reserve(64);
+            size_t j = i;
+            while (j < rows.size() && rows[j].api_key_id == key) {
+                const auto& r = rows[j];
+                agg.request_count++;
+                if (r.status_code >= 200 && r.status_code < 400) {
+                    agg.success_count++;
+                } else {
+                    agg.error_count++;
+                }
+                latencies.push_back(r.latency_ms);
+                agg.input_tokens_sum  += r.input_tokens;
+                agg.output_tokens_sum += r.output_tokens;
+                agg.cost_units_sum    += r.cost_units;
+                ++j;
+            }
+            // latencies are already sorted ascending by SQL ORDER BY clause.
+            agg.latency_ms_p50 = compute_pct(latencies, 0.50);
+            agg.latency_ms_p95 = compute_pct(latencies, 0.95);
+            agg.latency_ms_p99 = compute_pct(latencies, 0.99);
+            out.push_back(std::move(agg));
+            i = j;
+        }
+        return out;
+    });
 }
 
 // ============================================================================
