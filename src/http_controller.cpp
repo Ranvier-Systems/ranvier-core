@@ -362,7 +362,16 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         }));
 
     // Define the check once as a local lambda to keep the calls clean.
-    auto rate_limit_check = [this](const auto& req) { return this->check_rate_limit(req); };
+    auto rate_limit_check = [this](const auto& req) -> bool {
+        if (this->check_rate_limit(req)) {
+            return true;
+        }
+        // Rate-limited: attribute to the per-API-key counter before the
+        // wrapper records the unlabelled metric and returns 503. Memo §6.1.
+        auto attr = this->resolve_api_key(req);
+        metrics().record_api_key_rate_limited(attr.label);
+        return false;
+    };
 
     // 1. DATA PLANE (rate limited)
     r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(rate_limit_check, [this](auto req, auto rep) {
@@ -724,6 +733,16 @@ void HttpController::record_proxy_completion_metrics(
     metrics().record_request_latency(total_latency);
     // Record in new advanced histogram with optimized buckets
     metrics().record_router_total_latency(total_latency);
+
+    // Per-API-key attribution: record latency histograms + token/cost sums
+    // for this request's api_key label. Memo §6.1.
+    metrics().record_api_key_completion(
+        ctx.api_key_label,
+        total_latency,
+        total_latency,
+        ctx.estimated_input_tokens,
+        ctx.estimated_output_tokens,
+        ctx.estimated_cost_units);
 }
 
 // Establish connection to backend with retry and fallback logic
@@ -1205,6 +1224,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Track request start time for latency metrics (ingress timestamp)
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
+    // Per-API-key attribution: bump the labelled requests_total at ingress.
+    // Memo §6.1 — this is the ranvier_http_requests_total{api_key=...} signal.
+    metrics().record_api_key_request_received(api_key_attr.label);
 
     // Track shard load metrics for P2C load balancing
     // Use a flag to track if we need to decrement on exit (for streaming lambda handoff)
@@ -2236,22 +2258,29 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // Phase 4: Handle completion status and send appropriate client response
         if (ctx->client_disconnected) {
             log_proxy.info("[{}] Client disconnected mid-stream", ctx->request_id);
+            // Client-disconnect is not a success or a timeout; attribute as a
+            // failure for the per-key counter so it shows up in usage reports.
+            metrics().record_api_key_failure(ctx->api_key_label);
         } else if (ctx->timed_out) {
             log_proxy.warn("[{}] Request timed out", ctx->request_id);
             _circuit_breaker.record_failure(ctx->current_backend);
             metrics().record_timeout();
+            metrics().record_api_key_timeout(ctx->api_key_label);
             co_await write_client_error(&client_out, "Request timed out", ctx->client_expects_streaming);
         } else if (ctx->connection_error) {
             log_proxy.warn("[{}] Backend connection error occurred", ctx->request_id);
             metrics().record_connection_error();
+            metrics().record_api_key_failure(ctx->api_key_label);
             co_await write_client_error(&client_out, "Backend connection lost", ctx->client_expects_streaming);
         } else if (ctx->connection_failed) {
             log_proxy.warn("[{}] Backend connection failed during stale retry", ctx->request_id);
             metrics().record_failure();
+            metrics().record_api_key_failure(ctx->api_key_label);
             co_await write_client_error(&client_out, "Backend connection failed", ctx->client_expects_streaming);
         } else {
             log_proxy.info("[{}] Request completed successfully", ctx->request_id);
             metrics().record_success();
+            metrics().record_api_key_success(ctx->api_key_label);
         }
 
         // Phase 5: Record metrics and cleanup

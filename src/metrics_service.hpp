@@ -8,11 +8,20 @@
 
 #pragma once
 
+#include "config_infra.hpp"
+#include "config_schema.hpp"
 #include "health_service.hpp"
 #include "metrics_helpers.hpp"
 
+#include <absl/container/flat_hash_map.h>
+
 #include <array>
 #include <chrono>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include <seastar/util/log.hh>
 
 namespace ranvier {
 
@@ -565,6 +574,119 @@ public:
     // Called during init; null-safe (gauges return 0 when unset).
     void set_health_service(HealthService* hs) { _health_service = hs; }
 
+    // =========================================================================
+    // Per-API-Key Attribution (memo §6)
+    // =========================================================================
+
+    // Initialise the per-API-key label table on this shard. Pre-registers the
+    // three sentinels (_unauthenticated, _invalid, _overflow) plus up to
+    // (max_label_cardinality - 3) keys from auth.api_keys. Called once per
+    // shard during application start, after init_metrics().
+    //
+    // Idempotent: safe to call multiple times — subsequent calls are no-ops
+    // once the overflow counter is registered.
+    void init_api_key_attribution(const AuthConfig& auth, const AttributionConfig& cfg) {
+        if (_api_key_attribution_initialized) {
+            return;
+        }
+        _api_key_max_cardinality = std::max<uint32_t>(cfg.max_label_cardinality, 4);
+
+        // Register the global (un-labelled) overflow counter.
+        _api_key_metrics.add_group("ranvier", {
+            seastar::metrics::make_counter("api_key_label_overflow_total",
+                _api_key_label_overflow,
+                seastar::metrics::description(
+                    "Times the per-shard api_key label cardinality bound was hit "
+                    "and the request was attributed to the _overflow sentinel "
+                    "(see attribution.max_label_cardinality)."))
+        });
+
+        // Pre-register the three sentinels. They never count toward the bound.
+        // Only _overflow is cached as a member pointer because it is the only
+        // sentinel hit on the hot path (see get_or_overflow_slot).
+        register_slot_unbounded("_unauthenticated");
+        register_slot_unbounded("_invalid");
+        _overflow_slot = register_slot_unbounded("_overflow");
+
+        // Boot-time pre-fill from configured api_keys (memo §6.2).
+        // sanitise_api_key_label is replicated locally to avoid a circular
+        // include of http_controller.hpp from metrics_service.hpp.
+        const uint32_t budget = _api_key_max_cardinality - 3;
+        uint32_t prefilled = 0;
+        for (const auto& k : auth.api_keys) {
+            if (prefilled >= budget) break;
+            // Use ApiKey::name when present (operator-chosen audit identifier),
+            // else fall back to the key's log identifier (truncated key).
+            std::string id = k.name.empty() ? k.get_log_identifier() : k.name;
+            std::string label = sanitise_label(id);
+            // Don't double-register sentinels accidentally.
+            if (label == "_unauthenticated" || label == "_invalid" || label == "_overflow") {
+                continue;
+            }
+            if (_api_key_slots.find(label) != _api_key_slots.end()) {
+                continue;
+            }
+            register_slot_bounded(std::move(label));
+            ++prefilled;
+        }
+        if (auth.api_keys.size() > budget) {
+            log_metrics().warn(
+                "attribution: configured api_keys ({}) exceed pre-fill budget ({}); "
+                "excess keys observed at runtime will fall to the _overflow sentinel",
+                auth.api_keys.size(), budget);
+        }
+
+        _api_key_attribution_initialized = true;
+    }
+
+    // Bump the per-shard requests_total counter for this api_key label.
+    // Called once per request, near the top of handle_proxy.
+    void record_api_key_request_received(std::string_view label) {
+        if (auto* slot = get_or_overflow_slot(label)) {
+            slot->requests_total++;
+        }
+    }
+
+    // Per-key outcome counters. Exactly one of these fires per request that
+    // completes a terminal branch.
+    void record_api_key_success(std::string_view label) {
+        if (auto* slot = get_or_overflow_slot(label)) slot->requests_success++;
+    }
+    void record_api_key_failure(std::string_view label) {
+        if (auto* slot = get_or_overflow_slot(label)) slot->requests_failed++;
+    }
+    void record_api_key_timeout(std::string_view label) {
+        if (auto* slot = get_or_overflow_slot(label)) slot->requests_timeout++;
+    }
+    void record_api_key_rate_limited(std::string_view label) {
+        if (auto* slot = get_or_overflow_slot(label)) slot->requests_rate_limited++;
+    }
+
+    // Final per-request attribution: latency histograms + token/cost sums.
+    // Called from record_proxy_completion_metrics().
+    void record_api_key_completion(std::string_view label,
+                                   double request_latency_seconds,
+                                   double total_latency_seconds,
+                                   uint64_t input_tokens,
+                                   uint64_t output_tokens,
+                                   double cost_units) {
+        auto* slot = get_or_overflow_slot(label);
+        if (!slot) return;
+        slot->request_duration.record(request_latency_seconds);
+        slot->router_total_latency.record(total_latency_seconds);
+        slot->input_tokens_sum  += input_tokens;
+        slot->output_tokens_sum += output_tokens;
+        slot->cost_units_sum    += cost_units;
+    }
+
+    // Test / observability accessors.
+    uint64_t get_api_key_label_overflow() const { return _api_key_label_overflow; }
+    size_t   get_api_key_slot_count() const { return _api_key_slots.size(); }
+    const ApiKeyMetrics* get_api_key_slot(std::string_view label) const {
+        auto it = _api_key_slots.find(std::string(label));
+        return it == _api_key_slots.end() ? nullptr : it->second.get();
+    }
+
     // Helper to convert chrono duration to seconds
     template<typename Duration>
     static double to_seconds(Duration d) {
@@ -572,8 +694,151 @@ public:
     }
 
 private:
+    // Logger for attribution-related warns (slot overflow, pre-fill warning).
+    // Lazy-init seastar::logger to avoid header-static-init order issues.
+    static seastar::logger& log_metrics() {
+        static seastar::logger l("metrics_service");
+        return l;
+    }
+
+    // Sanitise a name into a Prometheus label value. Mirrors
+    // HttpController::sanitise_api_key_label() — duplicated here to avoid a
+    // circular include of http_controller.hpp from metrics_service.hpp.
+    static std::string sanitise_label(std::string_view name) {
+        constexpr size_t kMaxLen = 64;
+        std::string out;
+        out.reserve(std::min(name.size(), kMaxLen));
+        for (char c : name) {
+            if (out.size() >= kMaxLen) break;
+            if (c >= 'A' && c <= 'Z') {
+                out.push_back(static_cast<char>(c - 'A' + 'a'));
+            } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+                out.push_back(c);
+            } else {
+                out.push_back('_');
+            }
+        }
+        if (out.empty()) return "_unnamed";
+        return out;
+    }
+
+    // Look up the slot for a given label. If absent and the cardinality bound
+    // would not be exceeded, register a new slot. Otherwise attribute to the
+    // _overflow sentinel and bump the unbounded overflow counter (memo §6.2).
+    //
+    // Hard Rule #1 (lock-free metrics): no atomics, no mutexes — the slot map
+    // is shard-local, lookups happen on the producer (request handling) path
+    // only; Prometheus scrapes read the slot's counter/histogram fields
+    // directly through the registered lambdas.
+    //
+    // Hard Rule #4 (bounded containers): cardinality bound is explicit; new
+    // labels collapse to _overflow once the cap is hit.
+    ApiKeyMetrics* get_or_overflow_slot(std::string_view label) {
+        if (!_api_key_attribution_initialized) {
+            // Attribution not initialised on this shard yet — silently no-op.
+            return nullptr;
+        }
+        auto it = _api_key_slots.find(std::string(label));
+        if (it != _api_key_slots.end()) {
+            return it->second.get();
+        }
+        // Slot absent. Either we register a new one or attribute to overflow.
+        if (_api_key_slots.size() >= _api_key_max_cardinality) {
+            ++_api_key_label_overflow;
+            if (!_api_key_overflow_warned) {
+                _api_key_overflow_warned = true;
+                std::string truncated(label.substr(0, std::min<size_t>(label.size(), 32)));
+                log_metrics().warn(
+                    "attribution: api_key label cardinality bound ({}) reached on this "
+                    "shard; new label '{}' attributed to _overflow (further overflows "
+                    "silently counted in ranvier_api_key_label_overflow_total)",
+                    _api_key_max_cardinality, truncated);
+            }
+            return _overflow_slot;
+        }
+        return register_slot_bounded(std::string(label));
+    }
+
+    // Register a new slot WITHOUT consuming the cardinality budget (used for
+    // sentinels). Returns the registered slot pointer.
+    ApiKeyMetrics* register_slot_unbounded(std::string label) {
+        auto [it, inserted] = _api_key_slots.try_emplace(label, std::make_unique<ApiKeyMetrics>());
+        ApiKeyMetrics* slot = it->second.get();
+        if (inserted) {
+            slot->label = label;
+            wire_slot_metrics(*slot);
+            slot->registered = true;
+        }
+        return slot;
+    }
+
+    // Register a new slot WITHIN the cardinality budget. Caller must check
+    // size() before calling. Returns the registered slot pointer.
+    ApiKeyMetrics* register_slot_bounded(std::string label) {
+        auto [it, inserted] = _api_key_slots.try_emplace(label, std::make_unique<ApiKeyMetrics>());
+        ApiKeyMetrics* slot = it->second.get();
+        if (inserted) {
+            slot->label = label;
+            wire_slot_metrics(*slot);
+            slot->registered = true;
+        }
+        return slot;
+    }
+
+    // Wire up the per-slot Prometheus series. Lambdas capture &slot, which is
+    // stable because the slot lives inside a unique_ptr in _api_key_slots.
+    // Hard Rule #6 (deregister metrics first in stop()): _api_key_metrics is
+    // cleared first by stop() before the slot map is destroyed.
+    void wire_slot_metrics(ApiKeyMetrics& slot) {
+        namespace sm = seastar::metrics;
+        const auto& l = slot.label;
+        _api_key_metrics.add_group("ranvier", {
+            sm::make_gauge("http_requests_total_by_key",
+                sm::description("HTTP requests received, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.requests_total); }),
+            sm::make_gauge("http_requests_success_by_key",
+                sm::description("Successful HTTP requests, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.requests_success); }),
+            sm::make_gauge("http_requests_failed_by_key",
+                sm::description("Failed HTTP requests, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.requests_failed); }),
+            sm::make_gauge("http_requests_timeout_by_key",
+                sm::description("Timed-out HTTP requests, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.requests_timeout); }),
+            sm::make_gauge("http_requests_rate_limited_by_key",
+                sm::description("Rate-limited HTTP requests, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.requests_rate_limited); }),
+            sm::make_gauge("request_input_tokens_sum_by_key",
+                sm::description("Cumulative estimated input tokens, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.input_tokens_sum); }),
+            sm::make_gauge("request_output_tokens_sum_by_key",
+                sm::description("Cumulative estimated output tokens, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return static_cast<double>(slot.output_tokens_sum); }),
+            sm::make_gauge("request_cost_units_sum_by_key",
+                sm::description("Cumulative estimated cost units, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return slot.cost_units_sum; }),
+            sm::make_histogram("http_request_duration_seconds_by_key",
+                sm::description("HTTP request duration in seconds, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return slot.request_duration.data; }),
+            sm::make_histogram("router_request_total_latency_seconds_by_key",
+                sm::description("End-to-end request latency in seconds, segmented by api_key"),
+                {{"api_key", l}},
+                [&slot] { return slot.router_total_latency.data; })
+        });
+    }
+
     seastar::metrics::metric_groups _metrics;
     seastar::metrics::metric_groups _backend_metrics;
+    seastar::metrics::metric_groups _api_key_metrics;  // Per-API-key labelled series
 
     // HealthService pointer for vLLM gauge lambdas (nullable, not owned)
     HealthService* _health_service = nullptr;
@@ -679,6 +944,17 @@ private:
 
     // Per-backend metrics for GPU model comparison
     std::unordered_map<BackendId, BackendMetrics> _per_backend_metrics;
+
+    // Per-API-key attribution table (memo §6.2). Shard-local; bounded by
+    // AttributionConfig::max_label_cardinality. unique_ptr keeps slot
+    // addresses stable across map rehashes — necessary because the Prometheus
+    // gauge/histogram lambdas registered above capture `&slot`.
+    absl::flat_hash_map<std::string, std::unique_ptr<ApiKeyMetrics>> _api_key_slots;
+    uint32_t _api_key_max_cardinality = 256;        // Effective bound (incl. sentinels)
+    uint64_t _api_key_label_overflow = 0;           // ranvier_api_key_label_overflow_total
+    bool _api_key_attribution_initialized = false;  // Set by init_api_key_attribution()
+    bool _api_key_overflow_warned = false;          // Memo §6.2: warn once per shard
+    ApiKeyMetrics* _overflow_slot = nullptr;        // Cached for hot path
 
     // Get or create per-backend metrics and register with Seastar
     // Metrics are shard-local (lock-free) to maintain hot path efficiency
@@ -809,12 +1085,18 @@ public:
     // After stop() returns, no metrics lambda can access `this`.
     void stop() {
         // FIRST: Deregister all metrics before any other cleanup.
-        // This removes all lambdas from Prometheus scrape path.
+        // This removes all lambdas from Prometheus scrape path. Clear the
+        // per-api-key group BEFORE the slot map (Hard Rule #6) — its gauge
+        // lambdas capture &slot pointers into _api_key_slots.
         _metrics.clear();
         _backend_metrics.clear();
+        _api_key_metrics.clear();
 
         // Now safe to clear internal state
         _per_backend_metrics.clear();
+        _api_key_slots.clear();
+        _overflow_slot = nullptr;
+        _api_key_attribution_initialized = false;
     }
 };
 

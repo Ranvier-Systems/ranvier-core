@@ -765,6 +765,14 @@ seastar::future<> Application::startup() {
                 metrics().set_health_service(_health_checker.get());
             });
         }).then([this] {
+            // Initialise per-API-key attribution on every shard. This
+            // pre-registers the three sentinel labels and any pre-configured
+            // api_keys, sized to AttributionConfig::max_label_cardinality.
+            // See docs/architecture/per-api-key-attribution.md §6.2.
+            return seastar::smp::invoke_on_all([this] {
+                metrics().init_api_key_attribution(_config.auth, _config.attribution);
+            });
+        }).then([this] {
             // 11. Initialize K8s discovery (if enabled)
             init_k8s_discovery();
 
