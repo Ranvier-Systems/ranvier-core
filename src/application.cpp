@@ -236,6 +236,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.default_compression_ratio = config.routing.default_compression_ratio;
     // Cache events configuration (push-based eviction notifications)
     cfg.cache_events = config.cache_events;
+    // Per-API-key attribution (memo §6, §7, §8)
+    cfg.attribution = config.attribution;
     cfg.prefix_token_length = config.routing.prefix_token_length;
     // Partial tokenization for routing (BACKLOG §1.4)
     cfg.enable_partial_tokenization = config.routing.enable_partial_tokenization;

@@ -431,6 +431,9 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     }, cors));
 
     // 4. API KEY MANAGEMENT
+    r.add(operation_type::GET, url("/admin/keys/usage"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_keys_usage(std::move(req), std::move(rep));
+    }, cors));
     r.add(operation_type::POST, url("/admin/keys/reload"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_keys_reload(std::move(req), std::move(rep));
     }, cors));
@@ -3697,6 +3700,111 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_s
 
     rep->write_body("json", oss.str());
     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+}
+
+// ============================================================================
+// Per-API-Key Usage Endpoint (GET /admin/keys/usage)
+// ============================================================================
+//
+// Returns per-API-key historical aggregates over a query window. Reads from
+// the request_attribution SQLite table via the persistence worker. The window
+// is bounded by AttributionConfig::admin_query_max_window_hours and the
+// row count by ::admin_query_max_rows.
+//
+// Memo §8. Hard Rule #16 (lambda coroutine): the handler is a coroutine
+// top-to-bottom; the SQLite read runs in seastar::async on the persistence
+// worker thread, returning to the caller's shard via the future plumbing.
+//
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_usage(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    // Parse query parameters. All parsing happens up front so we never hit a
+    // partial-parse / partial-IO state.
+    auto parse_int64 = [](std::string_view s) -> std::optional<int64_t> {
+        if (s.empty()) return std::nullopt;
+        int64_t v = 0;
+        auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (ec != std::errc{} || ptr != s.data() + s.size()) return std::nullopt;
+        return v;
+    };
+
+    sstring from_str  = req->get_query_param("from");
+    sstring to_str    = req->get_query_param("to");
+    sstring key_str   = req->get_query_param("key");
+    sstring limit_str = req->get_query_param("limit");
+
+    auto from_opt = parse_int64(std::string_view(from_str.c_str(), from_str.size()));
+    auto to_opt   = parse_int64(std::string_view(to_str.c_str(),   to_str.size()));
+    if (!from_opt || !to_opt) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json",
+            "{\"error\": \"required query params: from, to (unix milliseconds)\"}");
+        co_return std::move(rep);
+    }
+    int64_t from_ms = *from_opt;
+    int64_t to_ms   = *to_opt;
+    if (to_ms <= from_ms) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"to must be greater than from\"}");
+        co_return std::move(rep);
+    }
+
+    const auto& acfg = _config.attribution;
+    const int64_t max_window_ms =
+        static_cast<int64_t>(acfg.admin_query_max_window_hours) * 3600LL * 1000LL;
+    if (to_ms - from_ms > max_window_ms) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json",
+            "{\"error\": \"query window exceeds admin_query_max_window_hours="
+            + std::to_string(acfg.admin_query_max_window_hours) + "\"}");
+        co_return std::move(rep);
+    }
+
+    size_t row_limit = acfg.admin_query_max_rows;
+    if (!limit_str.empty()) {
+        if (auto v = parse_int64(std::string_view(limit_str.c_str(), limit_str.size())); v) {
+            if (*v > 0) {
+                row_limit = std::min<size_t>(static_cast<size_t>(*v), acfg.admin_query_max_rows);
+            }
+        }
+    }
+
+    if (_persistence == nullptr) {
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->write_body("json", "{\"error\": \"persistence not enabled\"}");
+        co_return std::move(rep);
+    }
+
+    bool truncated = false;
+    auto rows = co_await _persistence->query_attribution_summary(
+        from_ms, to_ms,
+        std::string(key_str.c_str(), key_str.size()),
+        row_limit, &truncated);
+
+    // Build the JSON response. Stream directly to ostringstream.
+    std::ostringstream oss;
+    oss << "{\"window\": {\"from_ms\": " << from_ms
+        << ", \"to_ms\": " << to_ms << "}, \"rows\": [";
+    bool first = true;
+    for (const auto& r : rows) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << "{\"api_key_id\": \"" << escape_json_string(r.api_key_id) << "\""
+            << ", \"request_count\":  " << r.request_count
+            << ", \"success_count\":  " << r.success_count
+            << ", \"error_count\":    " << r.error_count
+            << ", \"latency_ms_p50\": " << r.latency_ms_p50
+            << ", \"latency_ms_p95\": " << r.latency_ms_p95
+            << ", \"latency_ms_p99\": " << r.latency_ms_p99
+            << ", \"input_tokens_sum\":  " << r.input_tokens_sum
+            << ", \"output_tokens_sum\": " << r.output_tokens_sum
+            << ", \"cost_units_sum\":    " << r.cost_units_sum
+            << "}";
+    }
+    oss << "], \"truncated\": " << (truncated ? "true" : "false") << "}";
+    rep->write_body("json", oss.str());
+    co_return std::move(rep);
 }
 
 // ============================================================================

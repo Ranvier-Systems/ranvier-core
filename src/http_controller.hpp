@@ -261,6 +261,10 @@ struct HttpControllerConfig {
     // Cache events configuration (push-based cache eviction notifications)
     CacheEventsConfig cache_events;
 
+    // Per-API-key attribution configuration (memo §6, §7, §8). Copied from
+    // AttributionConfig at init.
+    AttributionConfig attribution;
+
     // Prefix token length for X-Ranvier-Prefix-Hash header injection
     size_t prefix_token_length = 128;
 
@@ -467,6 +471,14 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_routes(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // GET /admin/keys/usage — per-API-key historical usage (memo §8).
+    // Reads from the request_attribution SQLite table via the persistence
+    // worker. Bounded by AttributionConfig::admin_query_max_window_hours and
+    // ::admin_query_max_rows.
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_usage(
+        std::unique_ptr<seastar::http::request> req,
+        std::unique_ptr<seastar::http::reply> rep);
 
     // State inspection handlers (for rvctl CLI)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_tree(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
