@@ -14,6 +14,7 @@
 #include "metrics_helpers.hpp"
 
 #include <absl/container/flat_hash_map.h>
+#include <fmt/format.h>
 
 #include <array>
 #include <chrono>
