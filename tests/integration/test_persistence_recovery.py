@@ -253,6 +253,37 @@ def count_routes_in_db(container_name: str) -> Tuple[int, Optional[str]]:
         conn.close()
 
 
+def db_has_table(container_name: str, table_name: str) -> Tuple[bool, Optional[str]]:
+    """Return (exists, error). exists is False on error."""
+    conn = snapshot_db(container_name)
+    if conn is None:
+        return False, "could not snapshot DB"
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        ).fetchone()
+        return row is not None, None
+    except sqlite3.Error as e:
+        return False, f"sqlite error: {e}"
+    finally:
+        conn.close()
+
+
+def count_request_attribution_in_db(container_name: str) -> Tuple[int, Optional[str]]:
+    """Return (count, error). count is -1 on error or missing table."""
+    conn = snapshot_db(container_name)
+    if conn is None:
+        return -1, "could not snapshot DB"
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM request_attribution").fetchone()
+        return int(row[0]), None
+    except sqlite3.Error as e:
+        return -1, f"sqlite error: {e}"
+    finally:
+        conn.close()
+
+
 def wait_for_persisted_backends(
     container_name: str, expected: int, timeout: int = 15
 ) -> int:
@@ -615,6 +646,195 @@ class PersistenceRecoveryTest(ClusterTestCase):
         self.assertEqual(
             status, 200, f"Server should serve requests from a fresh DB: {body[:200]}"
         )
+
+
+    # -------------------------------------------------------------------------
+    # Test 06: request_attribution table appears on a fresh DB
+    # -------------------------------------------------------------------------
+    def test_06_request_attribution_table_created(self):
+        """A fresh DB must include the request_attribution table from boot.
+
+        Memo §7.2: pure CREATE TABLE IF NOT EXISTS, idempotent. The table
+        is created alongside backends/routes by SqlitePersistence::open().
+        Sending a chat request also exercises the LogRequestOp path so the
+        table picks up at least one row.
+        """
+        container = "ranvier1"
+
+        # The table is created at open() — assert before driving traffic.
+        exists, err = db_has_table(container, "request_attribution")
+        self.assertTrue(
+            exists,
+            "request_attribution table must exist on a fresh DB. "
+            f"db_has_table error: {err}. Migration may not have run.",
+        )
+
+        # Sending traffic exercises LogRequestOp insertion.
+        status, body, _ = send_chat_request(
+            NODES["node1"]["api"],
+            [{"role": "user", "content": "attribution-row-smoke"}],
+            stream=True,
+        )
+        self.assertEqual(status, 200, "Chat must succeed for attribution")
+        self.assertTrue(body, "Chat must return a non-empty body")
+
+        # Poll for the row to land — the persistence flush timer is 100ms.
+        deadline = time.time() + 10.0
+        rows = -1
+        while time.time() < deadline:
+            rows, _err = count_request_attribution_in_db(container)
+            if rows >= 1:
+                break
+            time.sleep(0.5)
+        self.assertGreaterEqual(
+            rows, 1,
+            "request_attribution must have at least one row after a chat "
+            "request. queue_log_request() may not be wired into "
+            "handle_proxy's terminal phase.",
+        )
+        print(f"  [✓] request_attribution table present, rows={rows}")
+
+    # -------------------------------------------------------------------------
+    # Test 07: older-schema DB (only backends/routes) gains the new table
+    # -------------------------------------------------------------------------
+    def test_07_older_schema_migration(self):
+        """A DB with only backends/routes must gain request_attribution on boot.
+
+        Simulates an upgrade from an older Ranvier version: drop the
+        request_attribution table inside the container (using the live
+        SQLite client), SIGKILL, restart, and assert the table reappears
+        with no data loss in the existing tables.
+        """
+        node_metrics = NODES["node1"]["metrics"]
+        container = "ranvier1"
+
+        if not wait_for_healthy(f"{node_metrics}/metrics", timeout=30):
+            self.skipTest(f"{container} not healthy at test start")
+
+        # Confirm the table is present pre-mutation.
+        exists_before, _ = db_has_table(container, "request_attribution")
+        self.assertTrue(
+            exists_before,
+            "request_attribution must exist before the older-schema mutation "
+            "so the test exercises the migration path on restart.",
+        )
+
+        # Drop the new table from the live DB. The Ranvier process is still
+        # running, so a SIGKILL after this prevents it from re-creating the
+        # table via a normal-path open() during shutdown.
+        print(f"  Dropping request_attribution table inside {container}...")
+        drop = docker_exec(
+            container,
+            "sqlite3 /tmp/ranvier.db 'DROP TABLE IF EXISTS request_attribution;'",
+        )
+        if drop.returncode != 0:
+            self.skipTest(
+                f"sqlite3 not available inside the test container: "
+                f"rc={drop.returncode} stderr={drop.stderr!r}"
+            )
+
+        # SIGKILL avoids any graceful-shutdown side-effect that might
+        # rewrite the schema.
+        self.assertTrue(
+            signal_container_shutdown(container, "SIGKILL"),
+            "SIGKILL delivery failed",
+        )
+        self.assertTrue(
+            wait_for_container_exit(container, timeout=15),
+            f"{container} did not exit after SIGKILL",
+        )
+
+        # docker start preserves tmpfs; the on-disk DB now has only
+        # backends/routes and the boot-time migration must add the missing
+        # table.
+        print(f"  Restarting {container}...")
+        self.assertTrue(
+            docker_start_container(container),
+            f"docker start {container} failed",
+        )
+        self.assertTrue(
+            wait_for_healthy(f"{node_metrics}/metrics", timeout=45),
+            f"{container} must come up after older-schema simulation",
+        )
+
+        # Assert the table reappeared after CREATE TABLE IF NOT EXISTS ran
+        # at startup. Tolerate a transient read failure during the first
+        # few hundred ms after boot — snapshot_db retries are not built in.
+        deadline = time.time() + 10.0
+        exists_after = False
+        while time.time() < deadline:
+            exists_after, _ = db_has_table(container, "request_attribution")
+            if exists_after:
+                break
+            time.sleep(0.5)
+        self.assertTrue(
+            exists_after,
+            "request_attribution must be re-created on boot when the older "
+            "schema is detected. Migration may have regressed.",
+        )
+        print("  [✓] request_attribution re-created on older-schema boot")
+
+    # -------------------------------------------------------------------------
+    # Test 08: corrupt-DB recovery still recreates request_attribution
+    # -------------------------------------------------------------------------
+    def test_08_corrupt_db_recreates_request_attribution(self):
+        """The corrupt-DB recovery path must recreate all 3 tables, including the new one.
+
+        Mirrors test_04: write garbage into the DB file, SIGKILL, restart.
+        The startup recovery path either clears the corrupted store or
+        starts fresh — either way it must end up with a usable DB
+        containing the request_attribution table.
+        """
+        node_metrics = NODES["node1"]["metrics"]
+        container = "ranvier1"
+
+        if not wait_for_healthy(f"{node_metrics}/metrics", timeout=30):
+            self.skipTest(f"{container} not healthy at test start")
+
+        print(f"  Corrupting /tmp/ranvier.db inside {container}...")
+        corrupt = docker_exec(
+            container,
+            "echo 'CORRUPTED_NOT_A_SQLITE_FILE_TEST_08' > /tmp/ranvier.db && "
+            "rm -f /tmp/ranvier.db-wal /tmp/ranvier.db-shm",
+        )
+        self.assertEqual(
+            corrupt.returncode, 0,
+            f"docker exec corruption failed: rc={corrupt.returncode}",
+        )
+
+        self.assertTrue(
+            signal_container_shutdown(container, "SIGKILL"),
+            "SIGKILL delivery failed",
+        )
+        self.assertTrue(
+            wait_for_container_exit(container, timeout=15),
+            f"{container} did not exit after SIGKILL",
+        )
+
+        print(f"  Restarting {container}...")
+        self.assertTrue(
+            docker_start_container(container),
+            f"docker start {container} failed",
+        )
+        self.assertTrue(
+            wait_for_healthy(f"{node_metrics}/metrics", timeout=45),
+            f"{container} must recover from a broken DB",
+        )
+
+        deadline = time.time() + 10.0
+        exists_after = False
+        while time.time() < deadline:
+            exists_after, _ = db_has_table(container, "request_attribution")
+            if exists_after:
+                break
+            time.sleep(0.5)
+        self.assertTrue(
+            exists_after,
+            "After corrupt-DB recovery, request_attribution must be present "
+            "alongside backends/routes. The recovery path may not be "
+            "rebuilding all tables.",
+        )
+        print("  [✓] request_attribution rebuilt by corrupt-DB recovery")
 
 
 def main():

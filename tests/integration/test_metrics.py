@@ -34,6 +34,7 @@ from conftest import (
     get_all_metrics,
     metric_is_registered,
     send_chat_request,
+    sum_metric_by_labels,
     sum_metric_by_substring,
 )
 
@@ -349,6 +350,117 @@ class MetricsTest(ClusterTestCase):
             f"router_cluster_sync_received on node2 did not advance within 10 s "
             f"(before={recv_before}, after={recv_after})",
         )
+
+    # ------------------------------------------------------------------
+    # Per-API-key attribution labels (memo §6, §9)
+    # ------------------------------------------------------------------
+    # The integration cluster runs without any configured api_keys (see
+    # tests/integration/configs/node1.yaml — no auth section), so every
+    # request hits the parse-only resolver's "_unauthenticated" branch.
+    # That covers the data-plane attribution path even without a per-key
+    # config; tests assert the new {api_key="..."} series appear.
+    # Tests for the alice/bob/configured-key path in memo §9 require a
+    # custom config and are deferred to the cardinality test below.
+
+    def test_09_per_api_key_labels_unauthenticated(self):
+        """Unauthenticated traffic should populate {api_key="_unauthenticated"}."""
+        print("\nTest: per-api-key labels — _unauthenticated sentinel")
+        metrics_url = NODES["node1"]["metrics"]
+        api_url = NODES["node1"]["api"]
+
+        # Earlier tests drove traffic; capture the count and add a fresh
+        # request so the assertion is independent of test ordering.
+        before = sum_metric_by_labels(
+            metrics_url, "http_requests_total_by_key",
+            {"api_key": "_unauthenticated"},
+        )
+        status, _body, _headers = send_chat_request(
+            api_url,
+            [{"role": "user", "content": "attribution unauthenticated probe"}],
+        )
+        self.assertEqual(status, 200, f"chat probe failed: HTTP {status}")
+        time.sleep(0.2)
+        after = sum_metric_by_labels(
+            metrics_url, "http_requests_total_by_key",
+            {"api_key": "_unauthenticated"},
+        )
+        self.assertGreater(
+            after, before,
+            "ranvier_http_requests_total_by_key{api_key=\"_unauthenticated\"} "
+            f"did not advance ({before} -> {after}). The per-key recording "
+            "site at handle_proxy ingress may be missing.",
+        )
+        print(f"  http_requests_total_by_key{{api_key=_unauthenticated}}: "
+              f"{before} -> {after}")
+
+    def test_10_per_api_key_labels_invalid(self):
+        """Malformed Authorization header should populate {api_key="_invalid"}."""
+        print("\nTest: per-api-key labels — _invalid sentinel")
+        metrics_url = NODES["node1"]["metrics"]
+        api_url = NODES["node1"]["api"]
+
+        before = sum_metric_by_labels(
+            metrics_url, "http_requests_total_by_key",
+            {"api_key": "_invalid"},
+        )
+        # Malformed: present but not "Bearer <token>".
+        status, _body, _headers = send_chat_request(
+            api_url,
+            [{"role": "user", "content": "attribution invalid probe"}],
+            extra_headers={"Authorization": "NotBearer xyz"},
+        )
+        # Auth is not enforced on the data plane — the request proceeds and
+        # the resolver attributes to the _invalid sentinel.
+        self.assertEqual(status, 200, f"chat probe failed: HTTP {status}")
+        time.sleep(0.2)
+        after = sum_metric_by_labels(
+            metrics_url, "http_requests_total_by_key",
+            {"api_key": "_invalid"},
+        )
+        self.assertGreater(
+            after, before,
+            "ranvier_http_requests_total_by_key{api_key=\"_invalid\"} did "
+            f"not advance ({before} -> {after}). The resolver may be "
+            "missing the malformed-header branch.",
+        )
+        print(f"  http_requests_total_by_key{{api_key=_invalid}}: "
+              f"{before} -> {after}")
+
+    def test_11_per_api_key_histogram_buckets_labelled(self):
+        """Latency histograms emit {api_key=..., le=...} bucket lines."""
+        print("\nTest: per-api-key histogram bucket lines carry api_key label")
+        raw = _fetch_raw_metrics(NODES["node1"]["metrics"])
+
+        # Look for the histogram by-key bucket lines for the
+        # _unauthenticated sentinel — earlier tests have driven traffic.
+        bucket_lines = [
+            line for line in raw.split("\n")
+            if "http_request_duration_seconds_by_key_bucket" in line
+            and 'api_key="_unauthenticated"' in line
+            and 'le="' in line
+            and not line.startswith("#")
+        ]
+        self.assertGreaterEqual(
+            len(bucket_lines), 1,
+            "No http_request_duration_seconds_by_key_bucket line found "
+            'with both api_key="_unauthenticated" and le="..." labels. '
+            "Per-key latency histogram registration may be missing.",
+        )
+        print(f"  found {len(bucket_lines)} per-key histogram bucket lines")
+
+    def test_12_per_api_key_overflow_counter_registered(self):
+        """The overflow counter must be registered even when no overflow has occurred."""
+        print("\nTest: ranvier_api_key_label_overflow_total registered")
+        # The overflow counter is unlabelled. With 3 sentinels + a zero
+        # boot-time pre-fill (no api_keys configured), it stays at 0
+        # unless the cardinality bound was hit. We just want presence.
+        for name, endpoints in NODES.items():
+            self.assertTrue(
+                metric_is_registered(endpoints["metrics"], "api_key_label_overflow_total"),
+                f"{name}: api_key_label_overflow_total not registered. "
+                "init_api_key_attribution() may not have been called.",
+            )
+        print(f"  api_key_label_overflow_total registered on all {len(NODES)} nodes")
 
     def test_08_per_shard_metrics_available(self):
         """Seastar exports per-shard series labelled ``shard="0"`` — document and lock it."""

@@ -160,6 +160,15 @@ struct ProxyContext {
     // Actual intent-based route selection is not yet implemented.
     RequestIntent intent = RequestIntent::CHAT;
 
+    // Per-API-key attribution (populated by resolve_api_key() on entry to
+    // handle_proxy(), before any routing decisions). Empty api_key_id means the
+    // request arrived without authentication on the data plane — see
+    // docs/architecture/per-api-key-attribution.md §5 (Option A).
+    std::string api_key_id;       // ApiKey::name, or "" if unauthenticated/invalid
+    std::string api_key_label;    // sanitised label for metrics; one of:
+                                  //   sanitise(api_key_id) | "_unauthenticated"
+                                  //   | "_invalid" | "_overflow"
+
     // Agent identification for fair scheduling (User-Agent header value)
     std::string user_agent;
 
@@ -251,6 +260,10 @@ struct HttpControllerConfig {
 
     // Cache events configuration (push-based cache eviction notifications)
     CacheEventsConfig cache_events;
+
+    // Per-API-key attribution configuration (memo §6, §7, §8). Copied from
+    // AttributionConfig at init.
+    AttributionConfig attribution;
 
     // Prefix token length for X-Ranvier-Prefix-Hash header injection
     size_t prefix_token_length = 128;
@@ -459,6 +472,14 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
 
+    // GET /admin/keys/usage — per-API-key historical usage (memo §8).
+    // Reads from the request_attribution SQLite table via the persistence
+    // worker. Bounded by AttributionConfig::admin_query_max_window_hours and
+    // ::admin_query_max_rows.
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_usage(
+        std::unique_ptr<seastar::http::request> req,
+        std::unique_ptr<seastar::http::reply> rep);
+
     // State inspection handlers (for rvctl CLI)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_tree(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_cluster(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
@@ -520,6 +541,21 @@ private:
 
     // Auth helper with detailed info - returns pair<authorized, error_or_key_name>
     std::pair<bool, std::string> check_admin_auth_with_info(const seastar::http::request& req) const;
+
+    // Per-API-key attribution: parse the Authorization header and return
+    // (api_key_id, api_key_label). Does NOT enforce auth on the data plane —
+    // requests without a valid key still proceed; their label is one of the
+    // sentinels ("_unauthenticated", "_invalid"). See
+    // docs/architecture/per-api-key-attribution.md §5 (Option A).
+    struct ApiKeyAttribution {
+        std::string id;
+        std::string label;
+    };
+    ApiKeyAttribution resolve_api_key(const seastar::http::request& req) const;
+
+    // Sanitise an api_key_id into a Prometheus-safe label value.
+    // Lowercase, [^a-z0-9_] → '_', truncated to 64 chars, "_unnamed" if empty.
+    static std::string sanitise_api_key_label(std::string_view name);
 
     // Get client IP from request (checks X-Forwarded-For header)
     static std::string get_client_ip(const seastar::http::request& req);

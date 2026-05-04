@@ -490,3 +490,34 @@ telemetry:
   #     jaegertracing/all-in-one:latest
   #   Then set: enabled: true, otlp_endpoint: "http://localhost:9411"
   #   View traces at: http://localhost:16686
+
+# =============================================================================
+# Per-API-Key Attribution Configuration
+# =============================================================================
+# Per-API-key attribution for observability (Prometheus labels) and historical
+# reporting (SQLite rows). Parse-only: requests without a valid key still serve;
+# they attribute to the "_unauthenticated" sentinel. See
+# docs/architecture/per-api-key-attribution.md.
+attribution:
+  # Max distinct api_key label values per shard before new keys collapse to the
+  # "_overflow" sentinel. Bounds Prometheus active-series count.
+  # (RANVIER_ATTRIBUTION_MAX_LABEL_CARDINALITY)
+  max_label_cardinality: 256
+
+  # Gate the request_attribution SQLite table and per-request enqueue.
+  # When false, no per-request rows are persisted; metric labels are still recorded.
+  # (RANVIER_ATTRIBUTION_PERSISTENCE_ENABLED)
+  persistence_enabled: true
+
+  # Row-count cap on the request_attribution table. Oldest rows pruned by id.
+  # (RANVIER_ATTRIBUTION_MAX_REQUEST_ROWS)
+  max_request_rows: 1000000
+
+  # Bound on the GET /admin/keys/usage query window.
+  # (RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_WINDOW_HOURS)
+  admin_query_max_window_hours: 168  # 7 days
+
+  # Bound on rows materialised for a single /admin/keys/usage query (in-memory
+  # percentile computation budget).
+  # (RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_ROWS)
+  admin_query_max_rows: 100000

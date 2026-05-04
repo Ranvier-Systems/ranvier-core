@@ -86,6 +86,36 @@ bool SqlitePersistence::create_tables() {
     exec_sql("ALTER TABLE backends ADD COLUMN weight INTEGER NOT NULL DEFAULT 100");
     exec_sql("ALTER TABLE backends ADD COLUMN priority INTEGER NOT NULL DEFAULT 0");
 
+    // Per-API-key attribution table (memo §7.1). Additive migration:
+    // CREATE TABLE IF NOT EXISTS is idempotent, so older databases (with only
+    // backends/routes) gain this table on next open with no data loss.
+    const char* request_attribution_sql = R"(
+        CREATE TABLE IF NOT EXISTS request_attribution (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id    TEXT    NOT NULL,
+            api_key_id    TEXT    NOT NULL,
+            timestamp_ms  INTEGER NOT NULL,
+            endpoint      TEXT    NOT NULL,
+            backend_id    INTEGER,
+            status_code   INTEGER NOT NULL,
+            latency_ms    INTEGER NOT NULL,
+            input_tokens  INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            cost_units    REAL    NOT NULL
+        )
+    )";
+    const char* idx_key_ts_sql = R"(
+        CREATE INDEX IF NOT EXISTS idx_request_attribution_key_ts
+        ON request_attribution(api_key_id, timestamp_ms)
+    )";
+    const char* idx_ts_sql = R"(
+        CREATE INDEX IF NOT EXISTS idx_request_attribution_ts
+        ON request_attribution(timestamp_ms)
+    )";
+    if (!exec_sql(request_attribution_sql) || !exec_sql(idx_key_ts_sql) || !exec_sql(idx_ts_sql)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -481,6 +511,145 @@ bool SqlitePersistence::verify_integrity() {
 
 size_t SqlitePersistence::last_load_skipped_count() const {
     return _last_load_skipped_count;
+}
+
+// =============================================================================
+// Per-API-Key Attribution (memo §7)
+// =============================================================================
+
+bool SqlitePersistence::log_request(const RequestAttributionRecord& rec) {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (!_db) return false;
+
+    // Hard Rule #7 (no business logic in persistence): no validation,
+    // sanitisation, or clamping. Service layer owns those concerns; this
+    // function is dumb storage.
+    const char* sql =
+        "INSERT INTO request_attribution "
+        "(request_id, api_key_id, timestamp_ms, endpoint, backend_id, "
+        " status_code, latency_ms, input_tokens, output_tokens, cost_units) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return false;
+
+    sqlite3_bind_text  (stmt, 1, rec.request_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text  (stmt, 2, rec.api_key_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64 (stmt, 3, rec.timestamp_ms);
+    sqlite3_bind_text  (stmt, 4, rec.endpoint.c_str(), -1, SQLITE_TRANSIENT);
+    if (rec.backend_id.has_value()) {
+        sqlite3_bind_int(stmt, 5, *rec.backend_id);
+    } else {
+        sqlite3_bind_null(stmt, 5);
+    }
+    sqlite3_bind_int   (stmt, 6, rec.status_code);
+    sqlite3_bind_int   (stmt, 7, rec.latency_ms);
+    sqlite3_bind_int64 (stmt, 8, rec.input_tokens);
+    sqlite3_bind_int64 (stmt, 9, rec.output_tokens);
+    sqlite3_bind_double(stmt,10, rec.cost_units);
+
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
+size_t SqlitePersistence::request_attribution_count() {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (!_db) return 0;
+
+    const char* sql = "SELECT COUNT(*) FROM request_attribution";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return 0;
+
+    size_t count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = static_cast<size_t>(sqlite3_column_int64(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+size_t SqlitePersistence::prune_request_attribution(uint32_t max_rows) {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (!_db || max_rows == 0) return 0;
+
+    // Memo §7.3 Option A: keep at most max_rows rows, dropping oldest by id.
+    // Single statement; SQLite handles the count internally.
+    const char* sql =
+        "DELETE FROM request_attribution "
+        "WHERE id <= (SELECT MAX(id) - ? FROM request_attribution)";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return 0;
+
+    sqlite3_bind_int(stmt, 1, static_cast<int>(max_rows));
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return 0;
+    return static_cast<size_t>(sqlite3_changes(_db));
+}
+
+std::vector<RequestAttributionRecord> SqlitePersistence::query_request_attribution(
+        int64_t from_ms, int64_t to_ms, const std::string& api_key_id_filter,
+        size_t row_limit) {
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    std::vector<RequestAttributionRecord> rows;
+    if (!_db || row_limit == 0) return rows;
+
+    // Single capped SELECT — bounded by row_limit (memo §8.4). Ordering by
+    // (api_key_id, latency_ms) lets the caller compute per-key percentiles
+    // without a second pass.
+    const bool with_filter = !api_key_id_filter.empty();
+    const char* sql_filtered =
+        "SELECT request_id, api_key_id, timestamp_ms, endpoint, backend_id, "
+        "       status_code, latency_ms, input_tokens, output_tokens, cost_units "
+        "FROM request_attribution "
+        "WHERE timestamp_ms >= ? AND timestamp_ms < ? AND api_key_id = ? "
+        "ORDER BY api_key_id, latency_ms "
+        "LIMIT ?";
+    const char* sql_unfiltered =
+        "SELECT request_id, api_key_id, timestamp_ms, endpoint, backend_id, "
+        "       status_code, latency_ms, input_tokens, output_tokens, cost_units "
+        "FROM request_attribution "
+        "WHERE timestamp_ms >= ? AND timestamp_ms < ? "
+        "ORDER BY api_key_id, latency_ms "
+        "LIMIT ?";
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = with_filter ? sql_filtered : sql_unfiltered;
+    if (sqlite3_prepare_v2(_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return rows;
+
+    sqlite3_bind_int64(stmt, 1, from_ms);
+    sqlite3_bind_int64(stmt, 2, to_ms);
+    if (with_filter) {
+        sqlite3_bind_text (stmt, 3, api_key_id_filter.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, static_cast<int64_t>(row_limit));
+    } else {
+        sqlite3_bind_int64(stmt, 3, static_cast<int64_t>(row_limit));
+    }
+
+    rows.reserve(std::min<size_t>(row_limit, 4096));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        RequestAttributionRecord rec;
+        rec.request_id   = safe_column_text(stmt, 0);
+        rec.api_key_id   = safe_column_text(stmt, 1);
+        rec.timestamp_ms = sqlite3_column_int64(stmt, 2);
+        rec.endpoint     = safe_column_text(stmt, 3);
+        if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
+            rec.backend_id = static_cast<BackendId>(sqlite3_column_int(stmt, 4));
+        }
+        rec.status_code   = sqlite3_column_int  (stmt, 5);
+        rec.latency_ms    = sqlite3_column_int  (stmt, 6);
+        rec.input_tokens  = sqlite3_column_int64(stmt, 7);
+        rec.output_tokens = sqlite3_column_int64(stmt, 8);
+        rec.cost_units    = sqlite3_column_double(stmt, 9);
+        rows.push_back(std::move(rec));
+    }
+    sqlite3_finalize(stmt);
+    return rows;
 }
 
 // Factory function implementation

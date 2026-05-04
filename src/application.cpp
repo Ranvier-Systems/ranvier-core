@@ -236,6 +236,8 @@ HttpControllerConfig Application::build_controller_config_from(const RanvierConf
     cfg.default_compression_ratio = config.routing.default_compression_ratio;
     // Cache events configuration (push-based eviction notifications)
     cfg.cache_events = config.cache_events;
+    // Per-API-key attribution (memo §6, §7, §8)
+    cfg.attribution = config.attribution;
     cfg.prefix_token_length = config.routing.prefix_token_length;
     // Partial tokenization for routing (BACKLOG §1.4)
     cfg.enable_partial_tokenization = config.routing.enable_partial_tokenization;
@@ -310,6 +312,12 @@ AsyncPersistenceConfig Application::build_persistence_config() const {
     cfg.max_queue_depth = kPersistenceMaxQueueDepth;
     cfg.enable_stats_logging = true;
     cfg.stats_interval = kPersistenceStatsInterval;
+
+    // Per-API-key attribution (memo §7). Plumbed through from the top-level
+    // AttributionConfig so the persistence worker knows whether to drop log
+    // ops and what row cap to enforce.
+    cfg.attribution_persistence_enabled = _config.attribution.persistence_enabled;
+    cfg.attribution_max_request_rows    = _config.attribution.max_request_rows;
     return cfg;
 }
 
@@ -763,6 +771,14 @@ seastar::future<> Application::startup() {
             // Wire HealthService into MetricsService for vLLM gauge lambdas
             return seastar::smp::invoke_on_all([this] {
                 metrics().set_health_service(_health_checker.get());
+            });
+        }).then([this] {
+            // Initialise per-API-key attribution on every shard. This
+            // pre-registers the three sentinel labels and any pre-configured
+            // api_keys, sized to AttributionConfig::max_label_cardinality.
+            // See docs/architecture/per-api-key-attribution.md §6.2.
+            return seastar::smp::invoke_on_all([this] {
+                metrics().init_api_key_attribution(_config.auth, _config.attribution);
             });
         }).then([this] {
             // 11. Initialize K8s discovery (if enabled)

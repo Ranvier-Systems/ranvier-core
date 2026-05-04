@@ -93,6 +93,14 @@ public:
     bool verify_integrity() override;
     size_t last_load_skipped_count() const override;
 
+    // Per-API-key attribution (memo §7)
+    bool log_request(const RequestAttributionRecord& rec) override;
+    size_t request_attribution_count() override;
+    size_t prune_request_attribution(uint32_t max_rows) override;
+    std::vector<RequestAttributionRecord> query_request_attribution(
+        int64_t from_ms, int64_t to_ms, const std::string& api_key_id_filter,
+        size_t row_limit) override;
+
 private:
     bool create_tables();
     bool exec_sql(const char* sql);
