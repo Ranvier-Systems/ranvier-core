@@ -474,6 +474,40 @@ struct CacheEventsConfig {
 };
 
 // =============================================================================
+// Per-API-Key Attribution Configuration
+// =============================================================================
+
+// Attribution configuration for per-API-key observability and historical
+// reporting. See docs/architecture/per-api-key-attribution.md.
+//
+// Scope: parse-only attribution. Does not enforce data-plane authentication.
+// Requests that arrive without a valid Authorization header are still served;
+// they simply attribute to the "_unauthenticated" sentinel label.
+struct AttributionConfig {
+    // Maximum distinct api_key label values per shard before new keys collapse
+    // to the "_overflow" sentinel. Bounds Prometheus cardinality (Hard Rule #4).
+    // Default 256 is conservative: 256 keys * ~10 series * shards stays well
+    // under typical Prometheus active-series budgets.
+    uint32_t max_label_cardinality = 256;
+
+    // Gate the request_attribution SQLite table and per-request enqueue.
+    // When false, no per-request rows are persisted; metric labels are still
+    // recorded.
+    bool persistence_enabled = true;
+
+    // Bound on the new SQLite table. When row count exceeds this, the
+    // persistence worker prunes oldest rows by id.
+    uint32_t max_request_rows = 1000000;
+
+    // Bound on the GET /admin/keys/usage query window.
+    uint32_t admin_query_max_window_hours = 168;  // 7 days
+
+    // Bound on rows materialised for a single /admin/keys/usage query
+    // (memory-bound for in-memory percentile computation).
+    uint32_t admin_query_max_rows = 100000;
+};
+
+// =============================================================================
 // Top-Level Configuration
 // =============================================================================
 
@@ -505,6 +539,7 @@ struct RanvierConfig {
     AgentRegistryConfig agent_registry;
     DashboardConfig dashboard;
     CacheEventsConfig cache_events;
+    AttributionConfig attribution;
 
     // Load configuration from YAML file (blocking - use only before reactor starts)
     static RanvierConfig load(const std::string& config_path);
