@@ -183,6 +183,71 @@ bool HttpController::check_admin_auth(const seastar::http::request& req) const {
     return authorized;
 }
 
+// Sanitise an api_key_id into a Prometheus-safe label value.
+// Cheap string ops (no allocation beyond the result string). See
+// docs/architecture/per-api-key-attribution.md §6.3.
+std::string HttpController::sanitise_api_key_label(std::string_view name) {
+    constexpr size_t kMaxLen = 64;
+    std::string out;
+    out.reserve(std::min(name.size(), kMaxLen));
+    for (char c : name) {
+        if (out.size() >= kMaxLen) break;
+        if (c >= 'A' && c <= 'Z') {
+            out.push_back(static_cast<char>(c - 'A' + 'a'));
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) {
+        return "_unnamed";
+    }
+    return out;
+}
+
+// Per-API-key attribution: parse-only resolution from the Authorization header.
+// Does NOT reject unauthenticated requests on the data plane (see memo §5
+// Option A). Pure computation — no I/O, no futures, no throws.
+HttpController::ApiKeyAttribution
+HttpController::resolve_api_key(const seastar::http::request& req) const {
+    static constexpr std::string_view kBearerPrefix = "Bearer ";
+
+    // No keys configured → all requests are "_unauthenticated" (correct: there
+    // is nothing to attribute against).
+    auto auth_it = req._headers.find("Authorization");
+    if (auth_it == req._headers.end()) {
+        return {"", "_unauthenticated"};
+    }
+
+    std::string_view auth_header(auth_it->second);
+    if (auth_header.size() <= kBearerPrefix.size() ||
+        auth_header.substr(0, kBearerPrefix.size()) != kBearerPrefix) {
+        return {"", "_invalid"};
+    }
+
+    std::string_view token_view = auth_header.substr(kBearerPrefix.size());
+    if (token_view.empty()) {
+        return {"", "_invalid"};
+    }
+
+    if (!_config.auth.is_enabled()) {
+        // A header was sent but no keys are configured. Treat as unauthenticated
+        // for attribution; there is no key to attribute to.
+        return {"", "_unauthenticated"};
+    }
+
+    // validate_token returns (valid, key_name_for_audit). On valid, the second
+    // element is the operator-chosen ApiKey::name (or "legacy-key").
+    std::string token(token_view);
+    auto [valid, key_name] = _config.auth.validate_token(token);
+    if (!valid) {
+        return {"", "_invalid"};
+    }
+    auto label = sanitise_api_key_label(key_name);
+    return {std::move(key_name), std::move(label)};
+}
+
 // Get client IP from request, checking X-Forwarded-For for proxied requests
 // Uses string_view internally to minimize copies during header inspection
 std::string HttpController::get_client_ip(const seastar::http::request& req) {
@@ -1057,6 +1122,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         request_id = generate_request_id();
     }
 
+    // Per-API-key attribution: resolve once at entry, before any routing
+    // decisions. Parse-only (Option A) — does NOT reject unauthenticated
+    // requests on the data plane. See
+    // docs/architecture/per-api-key-attribution.md §5.
+    ApiKeyAttribution api_key_attr = resolve_api_key(*req);
+
     // Extract W3C Trace Context for distributed tracing
     std::string traceparent_header = extract_traceparent(req->_headers);
     std::optional<TraceContext> trace_ctx;
@@ -1927,6 +1998,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->estimated_cost_units = cost.cost_units;
     ctx->priority = priority;
     ctx->intent = intent;
+    ctx->api_key_id = std::move(api_key_attr.id);
+    ctx->api_key_label = std::move(api_key_attr.label);
 
     // Detect whether client expects streaming (SSE) or non-streaming (JSON) response.
     // OpenAI-compatible APIs use "stream":true/false in the request body.

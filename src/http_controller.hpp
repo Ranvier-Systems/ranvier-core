@@ -160,6 +160,15 @@ struct ProxyContext {
     // Actual intent-based route selection is not yet implemented.
     RequestIntent intent = RequestIntent::CHAT;
 
+    // Per-API-key attribution (populated by resolve_api_key() on entry to
+    // handle_proxy(), before any routing decisions). Empty api_key_id means the
+    // request arrived without authentication on the data plane — see
+    // docs/architecture/per-api-key-attribution.md §5 (Option A).
+    std::string api_key_id;       // ApiKey::name, or "" if unauthenticated/invalid
+    std::string api_key_label;    // sanitised label for metrics; one of:
+                                  //   sanitise(api_key_id) | "_unauthenticated"
+                                  //   | "_invalid" | "_overflow"
+
     // Agent identification for fair scheduling (User-Agent header value)
     std::string user_agent;
 
@@ -520,6 +529,21 @@ private:
 
     // Auth helper with detailed info - returns pair<authorized, error_or_key_name>
     std::pair<bool, std::string> check_admin_auth_with_info(const seastar::http::request& req) const;
+
+    // Per-API-key attribution: parse the Authorization header and return
+    // (api_key_id, api_key_label). Does NOT enforce auth on the data plane —
+    // requests without a valid key still proceed; their label is one of the
+    // sentinels ("_unauthenticated", "_invalid"). See
+    // docs/architecture/per-api-key-attribution.md §5 (Option A).
+    struct ApiKeyAttribution {
+        std::string id;
+        std::string label;
+    };
+    ApiKeyAttribution resolve_api_key(const seastar::http::request& req) const;
+
+    // Sanitise an api_key_id into a Prometheus-safe label value.
+    // Lowercase, [^a-z0-9_] → '_', truncated to 64 chars, "_unnamed" if empty.
+    static std::string sanitise_api_key_label(std::string_view name);
 
     // Get client IP from request (checks X-Forwarded-For header)
     static std::string get_client_ip(const seastar::http::request& req);
