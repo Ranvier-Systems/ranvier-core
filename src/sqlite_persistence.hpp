@@ -12,30 +12,38 @@ class AsyncPersistenceManager;
 /**
  * @brief SQLite-backed persistence store for routes and backends.
  *
- * THREADING MODEL:
- * This class uses std::mutex for thread safety because SQLite is not
- * thread-safe. All public methods MUST be called from seastar::async
- * context, NOT from the reactor thread.
+ * THREADING MODEL (Hard Rule #12):
+ * This class wraps blocking sqlite3_* calls. All public methods MUST be
+ * called from a dedicated OS worker thread, NEVER from a reactor thread.
+ * The mutex protects against accidental concurrent access; the calls
+ * themselves still block, so they must run off-reactor.
  *
  * DO NOT call these methods directly from HttpController, RouterService,
- * or any other reactor-thread code. Use AsyncPersistenceManager instead,
- * which wraps all calls in seastar::async to run on a thread pool.
+ * or any other reactor-thread code. Use AsyncPersistenceManager — it owns
+ * a std::thread worker that drains the persistence queue and invokes the
+ * methods below directly. seastar::async() is NOT a valid offload mechanism:
+ * it runs on the reactor (a stackful coroutine, not a thread-pool dispatch),
+ * so wrapping these calls in seastar::async would still stall the shard.
  *
  * The mutex is SAFE here because:
- *   1. seastar::async runs on a separate thread pool (not the reactor)
- *   2. AsyncPersistenceManager serializes batch processing via semaphore
- *   3. The reactor thread never blocks on these mutexes
+ *   1. The worker thread is a real kernel thread, not a Seastar fiber, so
+ *      blocking on the mutex / on SQLite I/O does not block any reactor.
+ *   2. AsyncPersistenceManager has a single worker, so contention on the
+ *      mutex is effectively only with the recovery-path callers (load_*,
+ *      checkpoint, verify_integrity) which run during startup/shutdown.
+ *   3. The reactor thread never acquires this mutex.
  *
  * CORRECT CALL PATTERN:
- *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
- *                                                    ↓
- *                                          (thread pool, mutex OK)
+ *   HttpController → AsyncPersistenceManager → MPSC ring → worker std::thread
+ *                  (reactor, lock-free)                  ↓
+ *                                              SqlitePersistence (blocking)
  *
  * DANGEROUS PATTERN (must not exist):
  *   HttpController → SqlitePersistence::method()  ← BLOCKS REACTOR!
  *
  * @see AsyncPersistenceManager for the reactor-safe wrapper.
- * @see docs/claude-context.md "No Locks/Async Only" section.
+ * @see src/tokenizer_thread_pool.cpp for the worker-thread + alien pattern.
+ * @see .dev-context/claude-context.md Hard Rule #12.
  */
 class SqlitePersistence : public PersistenceStore {
     // Only AsyncPersistenceManager (and factory function) may construct instances
@@ -58,10 +66,12 @@ public:
     SqlitePersistence& operator=(SqlitePersistence&&) = delete;
 
     // -------------------------------------------------------------------------
-    // Public Interface (called from seastar::async context only)
+    // Public Interface (called from the persistence worker thread only)
     // -------------------------------------------------------------------------
     // WARNING: All methods below acquire _mutex and may block.
-    // Only call from AsyncPersistenceManager within seastar::async context.
+    // Only call from AsyncPersistenceManager's dedicated std::thread worker,
+    // or from startup/shutdown recovery paths. NEVER from a reactor thread
+    // (including from inside seastar::async — that runs on the reactor too).
 
     // Lifecycle
     bool open(const std::string& path) override;

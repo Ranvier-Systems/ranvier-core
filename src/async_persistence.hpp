@@ -2,12 +2,15 @@
 
 #include "persistence.hpp"
 #include "mpsc_ring_buffer.hpp"
+#include <seastar/core/alien.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
-#include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
+#include <atomic>
 #include <memory>
+#include <optional>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -20,28 +23,37 @@ namespace ranvier {
  * IMPORTANT: This is the ONLY valid entry point for persistence operations
  * from reactor-thread code (HttpController, RouterService, etc.).
  *
- * THREADING MODEL:
- * The underlying SqlitePersistence uses std::mutex because SQLite is not
- * thread-safe. To avoid blocking the Seastar reactor thread, this class:
+ * THREADING MODEL (Hard Rule #12):
+ * SQLite is not thread-safe and its calls block. To keep them off the
+ * reactor, this class owns a single dedicated OS worker thread (std::thread)
+ * that drains the operation queue and invokes SqlitePersistence directly.
+ * Completion / shutdown signalling back to the reactor uses
+ * seastar::alien::run_on().
  *
- *   1. Provides fire-and-forget queue_*() methods for writes (non-blocking)
- *   2. Processes queued operations in batches via seastar::async()
- *   3. Runs SQLite operations on Seastar's thread pool (not the reactor)
+ *   1. queue_*() methods are fire-and-forget, lock-free, callable from any
+ *      shard. They push into the MPSC ring buffer.
+ *   2. The worker thread is the sole consumer: it drains batches and runs
+ *      blocking sqlite3_* calls on its own kernel thread.
+ *   3. seastar::async() is NOT used. seastar::async runs on the reactor
+ *      (it's a stackful coroutine, not a thread-pool dispatch). Wrapping
+ *      blocking SQLite in seastar::async would stall the shard for the
+ *      duration of every flush — which was the previous (broken) design.
  *
  * LOCK-FREE MPSC QUEUE:
  * The operation queue uses a bounded multi-producer single-consumer ring
  * buffer (Vyukov-style) with per-slot sequence numbers. Multiple reactor
  * shards (producers) CAS-compete on the tail index to enqueue operations
- * lock-free. The persistence worker (sole consumer) drains batches via
- * extract_batch()/drain_queue().
+ * lock-free. The dedicated worker thread (sole consumer) drains batches
+ * via extract_batch()/drain_queue().
  *
  * ARCHITECTURAL GUARANTEE:
- *   HttpController → AsyncPersistenceManager → seastar::async → SqlitePersistence
- *                 ↑ (lock-free enqueue)                ↓
- *           (reactor thread)                  (thread pool, mutex OK)
+ *   HttpController → AsyncPersistenceManager → MPSC ring → worker std::thread
+ *                  (any reactor shard, lock-free)        ↓
+ *                                            (blocking SQLite, mutex OK)
  *
  * @see SqlitePersistence for the underlying mutex-protected implementation.
- * @see docs/claude-context.md "No Locks/Async Only" section.
+ * @see src/tokenizer_thread_pool.cpp for the canonical alien::run_on pattern.
+ * @see .dev-context/claude-context.md Hard Rule #12.
  */
 
 // ============================================================================
@@ -103,23 +115,24 @@ struct AsyncPersistenceConfig {
  * the underlying SqlitePersistence implementation directly.
  *
  * WHY THIS CLASS EXISTS:
- * The "No Locks/Async Only" rule in Seastar means reactor threads must never
- * block. However, SQLite requires mutex protection because it's not thread-safe.
- * This class bridges the gap by:
- *   1. Accepting operations on the reactor thread (lock-free enqueue)
- *   2. Processing them in seastar::async() on a separate thread pool
- *   3. Using mutex protection safely (thread pool threads can block)
+ * The "No Locks/Async Only" rule in Seastar means reactor threads must
+ * never block. SQLite, however, is a blocking C library. This class
+ * bridges the gap by running the blocking calls on a dedicated OS thread
+ * (NOT a Seastar thread / seastar::async — those run on the reactor).
  *
  * Architecture:
- *   - Lock-free MPSC ring buffer between reactor (producer) and worker (consumer)
- *   - Background timer drains ring buffer and writes to SQLite in batches
- *   - SQLite operations run in seastar::async (off the reactor thread)
- *   - Semaphore ensures batches are processed in order
+ *   - Lock-free MPSC ring buffer: any reactor shard can enqueue.
+ *   - One std::thread worker drains the ring buffer in batches and calls
+ *     SqlitePersistence directly. Batching is driven by the worker's own
+ *     idle-sleep (flush_interval) when the queue is empty.
+ *   - On shutdown, the worker drains remaining ops, then signals the
+ *     reactor via seastar::alien::run_on() so stop() can resolve its
+ *     future without joining a thread on the reactor.
  *
  * Thread Safety:
  *   - Queue is a lock-free MPSC ring buffer (no mutex on reactor thread)
- *   - SQLite operations serialized via semaphore
- *   - Shutdown flag is atomic for visibility across shards
+ *   - Single consumer (the worker thread) — no batch serialisation needed
+ *   - Stopping/shutdown flags are atomic for visibility across threads
  *   - Clear-all uses an atomic generation counter checked by the consumer
  */
 
@@ -136,7 +149,7 @@ public:
     // The injected store must already be open, or open() must be called separately.
     AsyncPersistenceManager(AsyncPersistenceConfig config, std::unique_ptr<PersistenceStore> store);
 
-    ~AsyncPersistenceManager() = default;
+    ~AsyncPersistenceManager();
 
     // Non-copyable, non-movable (owns unique resources)
     AsyncPersistenceManager(const AsyncPersistenceManager&) = delete;
@@ -156,11 +169,16 @@ public:
     // Check if the persistence store is open and ready.
     bool is_open() const;
 
-    // Start the async manager (arms flush timer).
-    // Must be called after open() succeeds.
-    seastar::future<> start();
+    // Start the async manager: spawns the dedicated SQLite worker thread
+    // and arms the stats timer. Must be called after open() succeeds.
+    //
+    // alien_instance: Seastar's alien instance (lives on app_template).
+    //   Used by the worker thread to signal completion back to this shard.
+    //   Must outlive this AsyncPersistenceManager.
+    seastar::future<> start(seastar::alien::instance& alien_instance);
 
-    // Stop the async manager (flushes remaining queue).
+    // Stop the async manager: rejects new enqueues, lets the worker drain
+    // the remaining queue, then resolves when the worker has exited.
     // Must be called before close(). Safe to call multiple times.
     seastar::future<> stop();
 
@@ -236,10 +254,14 @@ private:
 
     // --- Batch Processing ---
 
-    // Timer callback that triggers batch processing.
-    void on_flush_timer();
+    // Worker thread main loop. Drains the queue in batches and processes
+    // them synchronously (blocking SQLite calls run here, off the reactor).
+    // On shutdown, drains remaining ops, then signals the reactor via
+    // seastar::alien::run_on() so stop() can resolve its future.
+    void worker_loop();
 
-    // Process a batch of operations (runs in seastar::async).
+    // Process a batch of operations. Runs ON THE WORKER THREAD ONLY.
+    // Never call this from a reactor context — it blocks on SQLite.
     void process_batch(std::vector<PersistenceOp> batch);
 
     // Helper class to accumulate routes for batch insertion.
@@ -263,7 +285,7 @@ private:
     std::unique_ptr<PersistenceStore> _store;  // Owned persistence engine
 
     // Lock-free MPSC ring buffer: multiple reactor shards produce, single
-    // consumer (flush timer -> seastar::async worker) drains batches.
+    // consumer (the worker thread) drains batches.
     // Capacity is next power-of-two >= max_queue_depth.
     std::unique_ptr<MpscRingBuffer<PersistenceOp>> _ring;
     std::atomic<size_t> _queue_size{0};  // Maintained for metrics compatibility
@@ -271,35 +293,45 @@ private:
     // Generation counter for queue_clear_all(). Producer increments; consumer
     // checks before processing each batch and discards if generation changed.
     std::atomic<uint64_t> _clear_generation{0};
-    uint64_t _last_processed_generation{0};  // Consumer-only, no atomic needed
+    uint64_t _last_processed_generation{0};  // Worker-only, no atomic needed
 
-    // Timers
-    seastar::timer<> _flush_timer;
+    // Stats timer (logs queue depth periodically). Runs on the reactor.
     seastar::timer<> _stats_timer;
 
-    // Synchronization
-    //
-    // TIMER CALLBACK SAFETY (RAII Guard Pattern):
-    // Timer callbacks capture `this`, creating a potential use-after-free if the
-    // callback executes after destruction begins. The race window is:
-    //   1. Timer fires, callback is queued on reactor
-    //   2. stop() is called, cancels timer (but callback is already queued)
-    //   3. stop() returns, destructor can begin
-    //   4. Queued callback executes with dangling `this`
-    //
-    // Solution: _timer_gate ensures timer callbacks cannot execute during shutdown.
-    // - Timer callbacks acquire a gate::holder at entry (fails if gate is closed)
-    // - stop() closes the gate FIRST (waits for in-flight callbacks to complete)
-    // - Only then are timers cancelled and resources freed
-    //
-    // This guarantees: No timer callback can access `this` after stop() returns.
-    //
-    seastar::gate _timer_gate;              // RAII guard for timer callback lifetime
-    seastar::gate _flush_gate;              // Tracks in-flight flush operations
-    seastar::semaphore _batch_semaphore{1}; // Serializes batch processing
+    // RAII guard for the stats timer callback: closed in stop() before the
+    // timer is cancelled, so no in-flight callback can access `this` after
+    // stop() returns.
+    seastar::gate _timer_gate;
 
-    // State
+    // ----- Worker thread plumbing -----
+
+    // Dedicated OS worker thread that drains _ring and calls SQLite directly.
+    // Spawned in start(), joined in stop().
+    std::unique_ptr<std::thread> _worker_thread;
+
+    // Alien instance for worker → reactor signalling. Lifetime managed by
+    // app_template; non-owning pointer here. Set in start().
+    seastar::alien::instance* _alien_instance = nullptr;
+
+    // Reactor shard that owns this manager (the one that called start()).
+    // Worker uses this as the target shard for seastar::alien::run_on().
+    unsigned _owner_shard = 0;
+
+    // Resolved by the worker (via alien::run_on) once it has fully drained
+    // and is about to exit. stop() awaits this before joining the thread,
+    // so the reactor never blocks on std::thread::join().
+    std::optional<seastar::promise<>> _worker_done;
+
+    // Worker-thread shutdown signal: set in stop(), read by worker_loop().
+    std::atomic<bool> _shutdown{false};
+
+    // Producer-side stop signal: set in stop(), checked by queue_*() to
+    // reject new enqueues immediately.
     std::atomic<bool> _stopping{false};
+
+    // Set true once start() has spawned the worker; stop() is a no-op
+    // otherwise. Idempotent shutdown.
+    bool _started = false;
 
     // Statistics
     std::atomic<uint64_t> _ops_processed{0};
