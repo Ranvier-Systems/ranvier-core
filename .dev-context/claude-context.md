@@ -335,11 +335,13 @@ For additional Seastar pitfalls not yet elevated to Hard Rules, see `.dev-contex
 
 **THE PATTERN:** Writing `for (auto& item : items) { co_await process(item); }` to iterate over a collection of async operations.
 
-**THE CONSEQUENCE:** O(n) latency instead of O(1). If processing 100 K8s endpoints takes 10ms each, the loop takes 1000ms--blocking the reactor for the entire second. Seastar's event loop cannot multiplex; it waits for each await.
+**THE CONSEQUENCE:** O(n) latency for *this request* instead of O(1). If processing 100 K8s endpoints takes 10ms each, the request takes 1000ms end-to-end. The reactor itself is **not** stalled — each `co_await` suspends the fiber and the shard happily serves other requests in the meantime. The bug is per-request tail latency (and timeouts further down the chain), not throughput collapse.
 
-**THE LESSON:** *Hard Rule: Replace sequential awaits with `seastar::parallel_for_each` or `max_concurrent_for_each`.* Batch concurrent operations with a semaphore (e.g., 16 in-flight) to bound parallelism without serializing.
+**THE LESSON:** *Hard Rule: Replace sequential awaits with `seastar::parallel_for_each` or `max_concurrent_for_each`.* Batch concurrent operations with a semaphore (e.g., 16 in-flight) to bound parallelism without serializing. Only keep serial ordering when each iteration genuinely depends on the previous result.
 
 **PROMPT GUARD:** "Never co_await inside a loop over external resources; use parallel_for_each with a concurrency limit."
+
+*Corrected 2026-05-05: previous wording said the loop "blocks the reactor" and that "Seastar's event loop cannot multiplex." That was wrong — the reactor multiplexes across fibers; only this fiber's progress is serialized. The real symptom is per-request latency.*
 
 ---
 
@@ -453,25 +455,37 @@ For additional Seastar pitfalls not yet elevated to Hard Rules, see `.dev-contex
 
 #### 12. The Blocking-ifstream-in-Coroutine Anti-Pattern
 
-**THE PATTERN:** Using `std::ifstream` or `std::ofstream` inside a coroutine or Seastar method: `std::ifstream file(path); buffer << file.rdbuf();`
+**THE PATTERN:** Using `std::ifstream`, `std::ofstream`, raw `::read`/`::write` on fds, blocking SQL drivers, synchronous `getaddrinfo`/curl, or any other blocking syscall on the reactor thread. Also includes the common false-fix: wrapping the blocking call in `seastar::async(...)` or `seastar::thread(...)` and assuming that "offloads to a thread pool."
 
-**THE CONSEQUENCE:** `std::ifstream` performs blocking I/O. In Seastar, this stalls the reactor thread--stopping all network I/O, timer callbacks, and request processing on that shard. A 10ms disk read becomes 10ms of zero throughput.
+**THE CONSEQUENCE:** Blocking I/O on the reactor thread stalls every fiber on that shard — network I/O, timer callbacks, request processing. A 10ms disk read becomes 10ms of zero throughput. **Critically: `seastar::async`/`seastar::thread` do NOT fix this.** A `seastar::thread` is a stackful coroutine that runs *on the reactor*; the blocking call still blocks the reactor exactly as if it had been called directly. The wrapper only helps if the work being wrapped is itself non-blocking (e.g., uses `.get()` on Seastar futures).
 
-**THE LESSON:** *Hard Rule: Use Seastar file I/O APIs.* Use `seastar::open_file_dma()` + `seastar::make_file_input_stream()` for async file reads. For small files during startup only, document the blocking nature explicitly.
+**THE LESSON:** *Hard Rule: Use Seastar file I/O APIs for files. For genuinely blocking C libraries (SQLite, blocking DNS, etc.), run them on a dedicated OS thread and signal back via `seastar::alien::run_on()`.*
 
-**PROMPT GUARD:** "Never use std::ifstream/ofstream in Seastar code--use seastar::open_file_dma and seastar::make_file_input_stream for async file I/O."
+- Files: `seastar::open_file_dma()` + `seastar::make_file_input_stream()`.
+- Blocking C libraries: dedicated `std::thread` worker pulling from an MPSC queue, results posted back to the originating shard with `seastar::alien::run_on`. See `src/tokenizer_thread_pool.cpp` for the canonical implementation.
+- Startup-only blocking I/O (before the reactor starts) is fine — `main.cpp` dry-run and initial config load qualify. Document it explicitly.
+
+**PROMPT GUARD:** "Never use std::ifstream/ofstream/blocking syscalls in Seastar code. `seastar::async` does NOT offload blocking work to a thread pool — it runs on the reactor. For files use seastar::open_file_dma; for blocking libraries use a dedicated OS thread + seastar::alien."
+
+*Corrected 2026-05-05: previous wording only addressed file I/O and offered no guidance for blocking C libraries. The codebase's `async_persistence` and config-reload paths wrapped blocking SQLite/ifstream in `seastar::async` under the false assumption that it offloads to a thread pool — see BACKLOG follow-ups.*
 
 ---
 
 #### 13. The Thread-Local-Raw-New Anti-Pattern
 
-**THE PATTERN:** Using `thread_local T* g_ptr = nullptr;` with `g_ptr = new T();` for per-shard state.
+**THE PATTERN:** Using `thread_local T* g_ptr = nullptr;` with `g_ptr = new T();` for per-shard state, with no `delete`.
 
-**THE CONSEQUENCE:** No corresponding `delete` call exists. Thread-local variables aren't destroyed by unique_ptr RAII. Memory leaks accumulate over the process lifetime. Tools like valgrind report leaks at exit.
+**THE CONSEQUENCE:** Memory leaks at process exit. But the more dangerous variant is the **subtle false fix**: switching to `thread_local std::unique_ptr<T>` only solves the problem if `T`'s destructor is trivial. The unique_ptr is destroyed at *thread-exit time*, which on Seastar shards happens **after** the reactor has already torn down. Any destructor that touches reactor primitives (metric registrations, gates, foreign_ptrs, futures) will run against a dead reactor — typically manifests as use-after-free or hangs at shutdown rather than a clean leak report.
 
-**THE LESSON:** *Hard Rule: Use `thread_local std::unique_ptr<T>` or add explicit destroy function.* Alternatively, use Seastar's `seastar::sharded<T>` service pattern which handles per-shard lifecycle correctly.
+**THE LESSON:** *Hard Rule: Per-shard state needs an explicit destroy function called during the shard's `stop()`, BEFORE the reactor tears down.* Acceptable patterns:
 
-**PROMPT GUARD:** "Never use raw 'new' with thread_local pointers--use unique_ptr or add an explicit destroy/cleanup function called during shutdown."
+1. **Preferred:** `seastar::sharded<T>` — handles lifecycle ordering correctly.
+2. Raw `thread_local T*` paired with an explicit `destroy_X()` invoked from the service's `stop()` (and verify it's actually wired up — `cleanup_*` functions that exist but are never called are worse than none).
+3. `thread_local std::unique_ptr<T>` is acceptable **only** when `~T()` is trivial / pure-memory and touches no reactor state. Even then, prefer (1) or (2) for clarity.
+
+**PROMPT GUARD:** "thread_local std::unique_ptr is NOT a fix on its own — its destructor runs after reactor teardown. Every per-shard thread_local needs an explicit destroy hook called from stop(), or use seastar::sharded<T>."
+
+*Corrected 2026-05-05: previous wording recommended `thread_local std::unique_ptr<T>` as an equally-good alternative to an explicit destroy hook. That's only true for trivially-destructible state. For anything touching reactor primitives, the unique_ptr destruction happens too late.*
 
 ---
 
@@ -792,7 +806,11 @@ return seastar::do_with(std::move(text), [](auto& text) {
 
 **THE CONSEQUENCE:** `do_with` allocates the object on the heap and passes a reference to the lambda. If the lambda parameter isn't a reference (`auto` without `&`), C++ creates a copy that is destroyed when the lambda returns--before the future resolves. This is a use-after-free that the compiler will **not** warn about. Symptoms include intermittent crashes under load, often in completely unrelated code due to heap corruption.
 
-**THE LESSON:** *Hard Rule: Always use `auto&` or explicit `Type&` in `do_with` lambda parameters. Prefer coroutines over `do_with` for new code*--coroutines manage stack variable lifetimes naturally.
+**THE LESSON:** *Hard Rule: In new code, prefer C++20 coroutines and let the coroutine frame own the variable — `do_with` is rarely needed.* When `do_with` is unavoidable (e.g., pre-coroutine code paths, or anchoring a `foreign_ptr` for an `invoke_on_all` chain that doesn't return a future to the caller), always use `auto&` or explicit `Type&` in the lambda parameters.
+
+Two structural defenses that prevent this bug entirely:
+1. **Coroutines:** `co_await slow_op(buffer)` keeps `buffer` on the coroutine frame for the full duration. No do_with, no missing-reference bug possible.
+2. **Move-only types:** if the captured object is move-only (no copy ctor), the buggy `[](auto obj){...}` form fails to compile. Marking heavy types `noncopyable` (e.g., `std::unique_ptr<T>`, types with deleted copy) turns this from a silent runtime use-after-free into a compile error.
 
 ```cpp
 // CORRECT: reference parameter
@@ -806,7 +824,9 @@ seastar::future<> handle(Buffer buffer) {
 }
 ```
 
-**PROMPT GUARD:** "Always use auto& (with &) in do_with lambda parameters. Prefer coroutines over do_with for new code--they eliminate this entire class of lifetime bugs."
+**PROMPT GUARD:** "Prefer coroutines over do_with for new code — they eliminate this class of lifetime bugs entirely. When do_with is unavoidable, always use auto& in the lambda. Move-only types turn missing-& into a compile error rather than runtime UAF."
+
+*Corrected 2026-05-05: previous wording presented `do_with` and coroutines as roughly co-equal options. C++20 coroutines remove the need for `do_with` in nearly all cases. Also added the move-only-type defense, which converts silent runtime UAF into a compile error.*
 
 ---
 
