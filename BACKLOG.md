@@ -928,7 +928,7 @@ Code follow-ups from the Rules 2/12/13/20 doc-correction pass. Canonical rule wo
 
 The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(...)` under the assumption that this offloads to a thread pool. It does not — `seastar::async` runs in a `seastar::thread` that executes on the reactor, so the blocking call still stalls the shard. Reference fix pattern: `src/tokenizer_thread_pool.cpp` (dedicated OS worker thread + `seastar::alien::run_on` for completion signaling).
 
-- [ ] **[P0] Refactor `AsyncPersistenceManager` SQLite path to a dedicated worker thread**
+- [x] **[P0] Refactor `AsyncPersistenceManager` SQLite path to a dedicated worker thread**
   _Locations:_ `src/async_persistence.cpp:147` (shutdown flush), `src/async_persistence.cpp:284` (periodic flush), `src/async_persistence.hpp:25-44` and `src/sqlite_persistence.hpp:17-30` (false "thread pool" docstrings).
   _Justification:_ Every persisted route/backend mutation currently stalls the shard for the duration of the SQLite call. Highest-frequency offender.
   _Approach:_ Mirror `tokenizer_thread_pool` — MPSC queue drained by a `std::thread`, completion posted back via `seastar::alien::run_on`. Update the docstrings to reflect reality.
