@@ -1,6 +1,8 @@
 #include "async_persistence.hpp"
 #include <seastar/core/alien.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/util/log.hh>
 #include <algorithm>
 #include <chrono>
@@ -97,14 +99,23 @@ bool AsyncPersistenceManager::is_open() const {
 }
 
 AsyncPersistenceManager::~AsyncPersistenceManager() {
-    // Defensive: if the caller forgot to await stop(), the worker thread may
-    // still be running. We can't await a future here, but joining a thread
-    // whose loop has been signalled to exit is bounded. Force the signal and
-    // join. This is a safety net only — proper shutdown should go through
-    // stop().
+    // Defensive safety net for the case where the caller forgot to await
+    // stop(). Properly shutting down via stop() is REQUIRED for a clean
+    // teardown — this branch is BEST-EFFORT only.
+    //
+    // KNOWN HAZARD: when we reach here without stop(), the worker's
+    // post-drain seastar::alien::run_on() will have queued a lambda
+    // capturing [this] on the reactor's mailbox. join() returns as soon as
+    // the worker thread exits, which races with the lambda actually
+    // running on the reactor. If *this is destroyed before the lambda
+    // fires, the lambda accesses freed memory (UAF). Mitigating this
+    // robustly would require extra synchronisation (atomic suppression +
+    // barrier) that has its own races; not worth fixing for a path that
+    // is already a programmer error. Always call stop() and await its
+    // future before destroying.
     if (_worker_thread && _worker_thread->joinable()) {
         log_async_persist.warn("AsyncPersistenceManager destructed without stop() — "
-                               "joining worker thread");
+                               "joining worker thread (best-effort)");
         _shutdown.store(true, std::memory_order_release);
         _worker_thread->join();
     }
@@ -164,10 +175,16 @@ seastar::future<> AsyncPersistenceManager::stop() {
     //   2. Set _shutdown, signalling the worker to drain remaining ops and
     //      exit its loop.
     //   3. Worker, on exit, calls alien::run_on to fulfil _worker_done on
-    //      this shard. We await that future — the reactor is NOT blocked
-    //      on a thread join.
-    //   4. Once the future resolves, the thread has already exited; join is
-    //      effectively instantaneous.
+    //      this shard. We await that future (with timeout) — the reactor
+    //      is NOT blocked on a thread join.
+    //   4. Once the future resolves OR the timeout fires, the thread has
+    //      already exited; join is effectively instantaneous.
+    //
+    // NOTE: stop() is one-way. _started is intentionally left true after
+    // stop() resolves; restart is not supported because seastar::gate
+    // (used for _timer_gate) cannot be reopened, so a second start() would
+    // silently break stats logging. start() detects this via the _started
+    // check and ignores re-invocation.
     _worker_done.emplace();
     auto done_future = _worker_done->get_future();
 
@@ -176,13 +193,34 @@ seastar::future<> AsyncPersistenceManager::stop() {
         // Tell the worker to drain remaining queue and exit.
         _shutdown.store(true, std::memory_order_release);
     }).then([this, done_future = std::move(done_future)]() mutable {
-        return std::move(done_future);
+        // Bound the wait. If the worker's alien::run_on dispatch fails
+        // (reactor torn down, allocation failure, etc.), the promise is
+        // never resolved and stop() would otherwise hang forever. The
+        // worker thread itself exits regardless of dispatch success, so
+        // joining below is safe even on timeout.
+        constexpr auto WORKER_EXIT_TIMEOUT = std::chrono::seconds(5);
+        return seastar::with_timeout(
+                   seastar::lowres_clock::now() + WORKER_EXIT_TIMEOUT,
+                   std::move(done_future))
+            .handle_exception([](std::exception_ptr ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const seastar::timed_out_error&) {
+                    log_async_persist.error(
+                        "Persistence worker did not signal completion "
+                        "within 5s — alien dispatch may have failed; "
+                        "joining anyway");
+                } catch (const std::exception& e) {
+                    log_async_persist.error(
+                        "Persistence worker completion future failed: {}",
+                        e.what());
+                }
+            });
     }).then([this] {
         if (_worker_thread && _worker_thread->joinable()) {
             _worker_thread->join();
         }
         _worker_thread.reset();
-        _started = false;
         log_async_persist.info("Async persistence manager stopped");
     });
 }

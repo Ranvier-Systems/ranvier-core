@@ -178,8 +178,13 @@ public:
     seastar::future<> start(seastar::alien::instance& alien_instance);
 
     // Stop the async manager: rejects new enqueues, lets the worker drain
-    // the remaining queue, then resolves when the worker has exited.
-    // Must be called before close(). Safe to call multiple times.
+    // the remaining queue, then resolves when the worker has exited (or
+    // after a 5-second timeout if the worker's alien::run_on dispatch
+    // fails). Must be called before close(). Safe to call multiple times.
+    //
+    // ONE-WAY: stop() cannot be reversed by another start(). Internal
+    // state (notably _timer_gate) is not designed to be re-armed. start()
+    // ignores re-invocation after the manager has been started once.
     seastar::future<> stop();
 
     // Close the persistence store (flushes WAL and closes database).
