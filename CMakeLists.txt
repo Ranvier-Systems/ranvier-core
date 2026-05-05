@@ -263,6 +263,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/application.cpp
       src/async_persistence.cpp
       src/config_loader.cpp
+      src/config_loader_async.cpp
       src/crypto_offloader.cpp
       src/dtls_context.cpp
       src/gossip_consensus.cpp
@@ -949,6 +950,7 @@ if(Seastar_FOUND)
       src/agent_registry.cpp
       src/application.cpp
       src/config_loader.cpp
+      src/config_loader_async.cpp
       src/crypto_offloader.cpp
       src/gossip_consensus.cpp
       src/gossip_protocol.cpp

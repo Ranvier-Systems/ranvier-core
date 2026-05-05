@@ -506,8 +506,15 @@ struct RanvierConfig {
     DashboardConfig dashboard;
     CacheEventsConfig cache_events;
 
-    // Load configuration from YAML file (blocking - use only before reactor starts)
+    // Load configuration from YAML file (blocking - use only before reactor starts).
+    // For the on-reactor hot-reload path, see `load_config_async()` declared in
+    // config_loader_async.hpp; both paths share `load_from_string()` below.
     static RanvierConfig load(const std::string& config_path);
+
+    // Parse a YAML config from an in-memory string.
+    // Used by both the sync `load()` path and the async DMA-read path.
+    // Throws std::runtime_error on malformed YAML; applies env overrides on success.
+    static RanvierConfig load_from_string(const std::string& yaml_text);
 
     // Load with defaults (no file)
     static RanvierConfig defaults();

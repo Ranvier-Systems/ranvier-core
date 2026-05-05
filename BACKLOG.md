@@ -935,11 +935,10 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
   _Verification:_ Latency measurement under sustained write load before/after in the Docker testbed.
   _Complexity:_ Medium-High (new thread, lifecycle, shutdown ordering).
 
-- [ ] **[P0] Remove blocking `ifstream` from hot config reload**
-  _Location:_ `src/application.cpp:1435` wraps `RanvierConfig::load(path)` (which calls `std::ifstream` at `src/config_loader.cpp:795`) in `seastar::async`.
-  _Justification:_ Hot reload stalls all shards via the subsequent `invoke_on_all`. Lower frequency than persistence but same root cause.
-  _Approach:_ Use `seastar::open_file_dma` + `seastar::make_file_input_stream`, then parse YAML from the buffer; or piggyback on the persistence worker once it lands.
-  _Complexity:_ Low-Medium.
+- [x] **[P0] Remove blocking `ifstream` from hot config reload**
+  _Location:_ `src/application.cpp:1435` wrapped `RanvierConfig::load(path)` (which called `std::ifstream` at `src/config_loader.cpp:795`) in `seastar::async`.
+  _Justification:_ Hot reload stalled all shards via the subsequent `invoke_on_all`. Lower frequency than persistence but same root cause.
+  _Resolution:_ Added `load_config_async()` (`src/config_loader_async.{hpp,cpp}`) using `seastar::open_file_dma` + `dma_read_bulk` with a 10MB cap. Sync `RanvierConfig::load()` was refactored to share its YAML parsing body with the async path via the new public `RanvierConfig::load_from_string()` helper, so startup callers in `main.cpp` and the unit tests retain identical behaviour. `Application::reload_config` now awaits `load_config_async(_config_path)` directly — no more `seastar::async` wrapper. Missing-file semantics (return defaults + env overrides) are preserved by catching `std::system_error{ENOENT}` from `open_file_dma`.
 
 ### P1 — Latency and lifecycle bugs
 
