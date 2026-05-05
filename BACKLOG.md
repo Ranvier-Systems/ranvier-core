@@ -27,6 +27,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 14. [Shard 0 Role Isolation Analysis (2026-03-06)](#14-shard-0-role-isolation-analysis-2026-03-06)
 15. [Intelligence Layer Roadmap (2026-03-25)](#15-intelligence-layer-roadmap-2026-03-25)
 16. [KV-Cache Compression-Aware Routing (2026-04-05)](#16-kv-cache-compression-aware-routing-2026-04-05)
+17. [Hard Rules Audit Follow-ups (2026-05-05)](#17-hard-rules-audit-follow-ups-2026-05-05)
 
 ---
 
@@ -919,6 +920,55 @@ Core enabler: `compression_ratio` field in `BackendInfo` (static config initiall
 
 ---
 
+## 17. Hard Rules Audit Follow-ups (2026-05-05)
+
+Code follow-ups from the Rules 2/12/13/20 doc-correction pass. Canonical rule wording was updated in `.dev-context/claude-context.md` on 2026-05-05; this section tracks the code sites that violated the corrected rules. Each item should land as its own PR — they have independent scope and risk profiles.
+
+### P0 — Reactor stalls from `seastar::async` misuse (Rule #12)
+
+The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(...)` under the assumption that this offloads to a thread pool. It does not — `seastar::async` runs in a `seastar::thread` that executes on the reactor, so the blocking call still stalls the shard. Reference fix pattern: `src/tokenizer_thread_pool.cpp` (dedicated OS worker thread + `seastar::alien::run_on` for completion signaling).
+
+- [ ] **[P0] Refactor `AsyncPersistenceManager` SQLite path to a dedicated worker thread**
+  _Locations:_ `src/async_persistence.cpp:147` (shutdown flush), `src/async_persistence.cpp:284` (periodic flush), `src/async_persistence.hpp:25-44` and `src/sqlite_persistence.hpp:17-30` (false "thread pool" docstrings).
+  _Justification:_ Every persisted route/backend mutation currently stalls the shard for the duration of the SQLite call. Highest-frequency offender.
+  _Approach:_ Mirror `tokenizer_thread_pool` — MPSC queue drained by a `std::thread`, completion posted back via `seastar::alien::run_on`. Update the docstrings to reflect reality.
+  _Verification:_ Latency measurement under sustained write load before/after in the Docker testbed.
+  _Complexity:_ Medium-High (new thread, lifecycle, shutdown ordering).
+
+- [ ] **[P0] Remove blocking `ifstream` from hot config reload**
+  _Location:_ `src/application.cpp:1435` wraps `RanvierConfig::load(path)` (which calls `std::ifstream` at `src/config_loader.cpp:795`) in `seastar::async`.
+  _Justification:_ Hot reload stalls all shards via the subsequent `invoke_on_all`. Lower frequency than persistence but same root cause.
+  _Approach:_ Use `seastar::open_file_dma` + `seastar::make_file_input_stream`, then parse YAML from the buffer; or piggyback on the persistence worker once it lands.
+  _Complexity:_ Low-Medium.
+
+### P1 — Latency and lifecycle bugs
+
+- [ ] **[P1] Wire up `cleanup_shard_load_metrics()` (Rule #13)**
+  _Location:_ `src/shard_load_metrics.hpp:140` — `thread_local std::unique_ptr<ShardLoadMetrics>`. `cleanup_shard_load_metrics()` is defined at line 165 but never called. The unique_ptr destructor runs at thread-exit, after the reactor has torn down.
+  _Justification:_ Per the corrected Rule #13, `thread_local std::unique_ptr` only works for trivially-destructible state. If `~ShardLoadMetrics` ever touches reactor primitives (metric registrations etc.) this becomes a shutdown-order bug.
+  _Approach:_ Call `cleanup_shard_load_metrics()` from the appropriate service `stop()` (mirror `stop_metrics()` in `metrics_service.hpp:843`).
+  _Complexity:_ Trivial.
+
+- [ ] **[P1] Parallelize gossip SRV lookups (Rule #2)**
+  _Location:_ `src/gossip_protocol.cpp:716-729` — serial `co_await _dns_resolver.get_host_by_name(srv.target)` over an unbounded SRV record list (comment at line 727 admits it could reach 500+).
+  _Justification:_ Per-discovery-cycle latency = N × DNS RTT. The `maybe_yield()` at line 728 helps other shard work but does not parallelize this loop.
+  _Approach:_ `seastar::max_concurrent_for_each(srv_records, 16, ...)`.
+  _Complexity:_ Low.
+
+### P2 — Cleanup
+
+- [ ] **[P2] Drop unnecessary `do_with` in coroutine broadcasts (Rule #20)**
+  _Locations:_ `src/router_service.cpp:3494` (`broadcast_gpu_load`), `src/router_service.cpp:3517` (`broadcast_cache_headroom`).
+  _Justification:_ Both are already inside a coroutine; the coroutine frame already keeps `shared` alive across the awaited `invoke_on_all`. The current `do_with` adds no safety, just noise. Per the corrected Rule #20, coroutines are the preferred pattern.
+  _Approach:_ Replace `co_await seastar::do_with(std::move(shared), [](auto& shared) { return invoke_on_all(...); })` with the inner call directly using the local.
+  _Complexity:_ Trivial.
+
+### Optional follow-up
+
+- [ ] **[P3] Add CI grep for `seastar::async(`**
+  _Justification:_ The misuse was systemic enough that a lint will catch the next instance faster than another audit. Allowlist the legitimate sites once they're identified.
+
+---
 
 ---
 
