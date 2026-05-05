@@ -415,8 +415,9 @@ seastar::future<> Application::init_persistence() {
         log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
     }
 
-    // Start async persistence manager (arms flush timer)
-    co_await _async_persistence->start();
+    // Start async persistence manager (spawns SQLite worker thread + stats timer).
+    // The alien instance is owned by app_template and outlives the manager.
+    co_await _async_persistence->start(*seastar::alien::internal::default_instance);
 
     // Distribute async persistence manager to all HttpController shards
     co_await _controller.invoke_on_all([this](HttpController& c) {

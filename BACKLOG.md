@@ -928,7 +928,7 @@ Code follow-ups from the Rules 2/12/13/20 doc-correction pass. Canonical rule wo
 
 The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(...)` under the assumption that this offloads to a thread pool. It does not — `seastar::async` runs in a `seastar::thread` that executes on the reactor, so the blocking call still stalls the shard. Reference fix pattern: `src/tokenizer_thread_pool.cpp` (dedicated OS worker thread + `seastar::alien::run_on` for completion signaling).
 
-- [ ] **[P0] Refactor `AsyncPersistenceManager` SQLite path to a dedicated worker thread**
+- [x] **[P0] Refactor `AsyncPersistenceManager` SQLite path to a dedicated worker thread**
   _Locations:_ `src/async_persistence.cpp:147` (shutdown flush), `src/async_persistence.cpp:284` (periodic flush), `src/async_persistence.hpp:25-44` and `src/sqlite_persistence.hpp:17-30` (false "thread pool" docstrings).
   _Justification:_ Every persisted route/backend mutation currently stalls the shard for the duration of the SQLite call. Highest-frequency offender.
   _Approach:_ Mirror `tokenizer_thread_pool` — MPSC queue drained by a `std::thread`, completion posted back via `seastar::alien::run_on`. Update the docstrings to reflect reality.
@@ -954,6 +954,13 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
   _Justification:_ Per-discovery-cycle latency = N × DNS RTT. The `maybe_yield()` at line 728 helps other shard work but does not parallelize this loop.
   _Approach:_ `seastar::max_concurrent_for_each(srv_records, 16, ...)`.
   _Complexity:_ Low.
+
+- [ ] **[P1] Pin foreign worker threads to non-reactor cores**
+  _Locations:_ `src/async_persistence.cpp` (single persistence worker, post-Rule-#12 refactor), `src/tokenizer_thread_pool.cpp` (one worker per shard). Both spawn plain `std::thread` workers with no CPU affinity set.
+  _Justification:_ Reactor threads are pinned to specific cores. Foreign threads with no affinity are placed by the kernel scheduler, which can land them on a reactor core and cause context-switch latency spikes when the worker is active. The deployment workaround — running with `--smp=N-1` on an N-core box so the kernel has a free core — is config-only and not guaranteed (the scheduler may still preempt). An explicit pin makes it deterministic. The tokenizer pool has the same exposure and should be done in the same change for consistency; the persistence worker is a single thread so it just needs one non-reactor core, while the tokenizer pool has `smp::count` workers and would need a different placement strategy (e.g. round-robin across non-reactor cores, or accept that they share with reactors and rely on `--smp=N-K`).
+  _Approach:_ `pthread_setaffinity_np` in `start()` after the `std::thread` is constructed. Take the target cpuset from config or compute it as "all cores not in Seastar's cpuset." Side note: revisit whether `SCHED_BATCH` / nice value adjustments are also worthwhile to lower the worker's priority relative to reactors.
+  _Verification:_ Same latency benchmark as the Rule #12 refactor — sustained-write load with and without the pin, looking for tail-latency differences. Confirm with `taskset -p $(pgrep -f ranvier)` that the worker landed where expected.
+  _Complexity:_ Low (one syscall per worker), but the shared design decision across persistence + tokenizer pool needs a brief writeup before coding.
 
 ### P2 — Cleanup
 

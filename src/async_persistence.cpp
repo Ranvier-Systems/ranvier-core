@@ -1,7 +1,11 @@
 #include "async_persistence.hpp"
-#include <seastar/core/thread.hh>
+#include <seastar/core/alien.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/util/log.hh>
 #include <algorithm>
+#include <chrono>
 
 namespace ranvier {
 
@@ -94,9 +98,37 @@ bool AsyncPersistenceManager::is_open() const {
     return _store && _store->is_open();
 }
 
-seastar::future<> AsyncPersistenceManager::start() {
+AsyncPersistenceManager::~AsyncPersistenceManager() {
+    // Defensive safety net for the case where the caller forgot to await
+    // stop(). Properly shutting down via stop() is REQUIRED for a clean
+    // teardown — this branch is BEST-EFFORT only.
+    //
+    // KNOWN HAZARD: when we reach here without stop(), the worker's
+    // post-drain seastar::alien::run_on() will have queued a lambda
+    // capturing [this] on the reactor's mailbox. join() returns as soon as
+    // the worker thread exits, which races with the lambda actually
+    // running on the reactor. If *this is destroyed before the lambda
+    // fires, the lambda accesses freed memory (UAF). Mitigating this
+    // robustly would require extra synchronisation (atomic suppression +
+    // barrier) that has its own races; not worth fixing for a path that
+    // is already a programmer error. Always call stop() and await its
+    // future before destroying.
+    if (_worker_thread && _worker_thread->joinable()) {
+        log_async_persist.warn("AsyncPersistenceManager destructed without stop() — "
+                               "joining worker thread (best-effort)");
+        _shutdown.store(true, std::memory_order_release);
+        _worker_thread->join();
+    }
+}
+
+seastar::future<> AsyncPersistenceManager::start(seastar::alien::instance& alien_instance) {
     if (!_store || !_store->is_open()) {
         log_async_persist.warn("AsyncPersistenceManager started without an open persistence store");
+        return seastar::make_ready_future<>();
+    }
+
+    if (_started) {
+        log_async_persist.warn("AsyncPersistenceManager::start() called twice — ignoring");
         return seastar::make_ready_future<>();
     }
 
@@ -106,49 +138,90 @@ seastar::future<> AsyncPersistenceManager::start() {
                            _config.max_batch_size,
                            _config.max_queue_depth);
 
-    _flush_timer.set_callback([this] { on_flush_timer(); });
-    _flush_timer.arm_periodic(_config.flush_interval);
+    _alien_instance = &alien_instance;
+    _owner_shard = seastar::this_shard_id();
+    _shutdown.store(false, std::memory_order_release);
+    _stopping.store(false, std::memory_order_release);
+
+    // Spawn the dedicated SQLite worker thread.
+    // IMPORTANT: alien_instance is captured by reference; its lifetime is
+    // owned by app_template and outlives this manager.
+    _worker_thread = std::make_unique<std::thread>([this]() {
+        worker_loop();
+    });
 
     if (_config.enable_stats_logging) {
         _stats_timer.set_callback([this] { log_stats(); });
         _stats_timer.arm_periodic(_config.stats_interval);
     }
 
+    _started = true;
     return seastar::make_ready_future<>();
 }
 
 seastar::future<> AsyncPersistenceManager::stop() {
-    log_async_persist.info("Stopping async persistence manager...");
-    _stopping.store(true, std::memory_order_relaxed);
-
-    // RAII Timer Safety: Close the timer gate FIRST to ensure no timer callbacks
-    // can execute during or after shutdown. This waits for any in-flight timer
-    // callbacks to complete before proceeding.
-    //
-    // Order is critical:
-    //   1. Close _timer_gate (waits for in-flight callbacks)
-    //   2. Cancel timers (prevents future callbacks)
-    //   3. Close _flush_gate (waits for in-flight flush operations)
-    //   4. Flush remaining queue
-    //
-    // This guarantees no timer callback can access `this` after stop() returns.
-    return _timer_gate.close().then([this] {
-        _flush_timer.cancel();
-        _stats_timer.cancel();
-
-        // Wait for in-flight batches, then flush remaining queue
-        return _flush_gate.close();
-    }).then([this] {
-        auto final_batch = drain_queue();
-
-        if (!final_batch.empty() && is_open()) {
-            log_async_persist.info("Flushing {} pending operations before shutdown",
-                                   final_batch.size());
-            return seastar::async([this, batch = std::move(final_batch)]() mutable {
-                process_batch(std::move(batch));
-            });
-        }
+    if (!_started) {
         return seastar::make_ready_future<>();
+    }
+    if (_stopping.exchange(true, std::memory_order_acq_rel)) {
+        // stop() already in progress / completed.
+        return seastar::make_ready_future<>();
+    }
+
+    log_async_persist.info("Stopping async persistence manager...");
+
+    // Order is critical:
+    //   1. Close timer gate, cancel stats timer (no more reactor callbacks).
+    //   2. Set _shutdown, signalling the worker to drain remaining ops and
+    //      exit its loop.
+    //   3. Worker, on exit, calls alien::run_on to fulfil _worker_done on
+    //      this shard. We await that future (with timeout) — the reactor
+    //      is NOT blocked on a thread join.
+    //   4. Once the future resolves OR the timeout fires, the thread has
+    //      already exited; join is effectively instantaneous.
+    //
+    // NOTE: stop() is one-way. _started is intentionally left true after
+    // stop() resolves; restart is not supported because seastar::gate
+    // (used for _timer_gate) cannot be reopened, so a second start() would
+    // silently break stats logging. start() detects this via the _started
+    // check and ignores re-invocation.
+    _worker_done.emplace();
+    auto done_future = _worker_done->get_future();
+
+    return _timer_gate.close().then([this] {
+        _stats_timer.cancel();
+        // Tell the worker to drain remaining queue and exit.
+        _shutdown.store(true, std::memory_order_release);
+    }).then([this, done_future = std::move(done_future)]() mutable {
+        // Bound the wait. If the worker's alien::run_on dispatch fails
+        // (reactor torn down, allocation failure, etc.), the promise is
+        // never resolved and stop() would otherwise hang forever. The
+        // worker thread itself exits regardless of dispatch success, so
+        // joining below is safe even on timeout.
+        constexpr auto WORKER_EXIT_TIMEOUT = std::chrono::seconds(5);
+        return seastar::with_timeout(
+                   seastar::lowres_clock::now() + WORKER_EXIT_TIMEOUT,
+                   std::move(done_future))
+            .handle_exception([](std::exception_ptr ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const seastar::timed_out_error&) {
+                    log_async_persist.error(
+                        "Persistence worker did not signal completion "
+                        "within 5s — alien dispatch may have failed; "
+                        "joining anyway");
+                } catch (const std::exception& e) {
+                    log_async_persist.error(
+                        "Persistence worker completion future failed: {}",
+                        e.what());
+                }
+            });
+    }).then([this] {
+        if (_worker_thread && _worker_thread->joinable()) {
+            _worker_thread->join();
+        }
+        _worker_thread.reset();
+        log_async_persist.info("Async persistence manager stopped");
     });
 }
 
@@ -258,43 +331,52 @@ size_t AsyncPersistenceManager::queue_depth() const {
 // Batch Processing
 // ============================================================================
 
-void AsyncPersistenceManager::on_flush_timer() {
-    // RAII Timer Safety: Acquire gate holder to prevent execution during shutdown.
-    // If the gate is closed (stop() in progress), this throws gate_closed_exception
-    // and the callback safely exits without accessing any member state.
-    seastar::gate::holder timer_holder;
-    try {
-        timer_holder = _timer_gate.hold();
-    } catch (const seastar::gate_closed_exception&) {
-        // Gate closed - stop() is in progress, exit safely
-        return;
+void AsyncPersistenceManager::worker_loop() {
+    log_async_persist.debug("Persistence worker thread started");
+
+    // Process batches as long as the manager is running. extract_batch() and
+    // drain_queue() are both single-consumer operations on the MPSC ring;
+    // this thread is the sole consumer.
+    while (!_shutdown.load(std::memory_order_acquire)) {
+        auto batch = extract_batch();
+        if (!batch.empty()) {
+            process_batch(std::move(batch));
+            continue;
+        }
+        // Queue empty: sleep for the configured flush interval. This is the
+        // batching knob — short interval = lower latency, more wakeups.
+        std::this_thread::sleep_for(_config.flush_interval);
     }
 
-    if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
+    // Shutdown requested. Drain whatever the producers left behind so we
+    // don't lose pending writes. Producers are gated by _stopping (set in
+    // stop() before _shutdown), so the queue size is bounded from here on.
+    while (true) {
+        auto batch = extract_batch();
+        if (batch.empty()) break;
+        process_batch(std::move(batch));
+    }
 
-    auto batch = extract_batch();
-    if (batch.empty()) return;
+    log_async_persist.debug("Persistence worker thread draining complete");
 
-    // Process batch off the reactor thread, serialized by semaphore.
-    // Note: timer_holder is moved into the lambda to extend its lifetime
-    // until the async operation completes.
-    (void)seastar::try_with_gate(_flush_gate, [this, batch = std::move(batch), timer_holder = std::move(timer_holder)]() mutable {
-        return seastar::get_units(_batch_semaphore, 1).then(
-            [this, batch = std::move(batch)](seastar::semaphore_units<> units) mutable {
-                return seastar::async(
-                    [this, batch = std::move(batch), units = std::move(units)]() mutable {
-                        process_batch(std::move(batch));
-                    });
-            });
-    }).handle_exception([](std::exception_ptr ep) {
+    // Signal the reactor that we're done. Use alien::run_on to deliver the
+    // promise resolution onto the owner shard. The thread itself exits
+    // immediately after this dispatch returns; stop() then joins us.
+    if (_alien_instance != nullptr) {
         try {
-            std::rethrow_exception(ep);
-        } catch (const seastar::gate_closed_exception&) {
-            // Expected during shutdown
+            seastar::alien::run_on(*_alien_instance, _owner_shard, [this]() noexcept {
+                if (_worker_done.has_value()) {
+                    _worker_done->set_value();
+                }
+            });
         } catch (const std::exception& e) {
-            log_async_persist.error("Error in flush operation: {}", e.what());
+            // If alien dispatch fails (reactor torn down already), there's
+            // nothing useful we can do. stop() may hang on the future, but
+            // that mirrors the pre-existing failure mode.
+            log_async_persist.error("Worker failed to signal completion via alien: {}",
+                                    e.what());
         }
-    });
+    }
 }
 
 void AsyncPersistenceManager::process_batch(std::vector<PersistenceOp> batch) {
