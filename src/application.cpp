@@ -1327,6 +1327,21 @@ seastar::future<> Application::stop_services() {
                 log_main.debug("  Shard load balancer stopped");
             });
         })
+        .then([] {
+            // -------------------------------------------------------------------------
+            // Step 4a2: Tear down per-shard ShardLoadMetrics while the reactor is
+            // still up. The thread_local unique_ptr would otherwise destruct at
+            // thread-exit, after Seastar has stopped — safe today because
+            // ~ShardLoadMetrics is trivial, but a latent shutdown-order trap if
+            // the type ever gains reactor-touching state (Rule #13). Runs after
+            // every consumer (HttpController, ShardLoadBalancer) is stopped.
+            // -------------------------------------------------------------------------
+            return seastar::smp::invoke_on_all([] {
+                cleanup_shard_load_metrics();
+            }).then([] {
+                log_main.debug("  Shard load metrics cleaned up on all shards");
+            });
+        })
         .then([this] {
             // -------------------------------------------------------------------------
             // Step 4b: Stop sharded tokenizer service

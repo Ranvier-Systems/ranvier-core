@@ -942,11 +942,12 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
 
 ### P1 — Latency and lifecycle bugs
 
-- [ ] **[P1] Wire up `cleanup_shard_load_metrics()` (Rule #13)**
+- [x] **[P1] Wire up `cleanup_shard_load_metrics()` (Rule #13)**
   _Location:_ `src/shard_load_metrics.hpp:140` — `thread_local std::unique_ptr<ShardLoadMetrics>`. `cleanup_shard_load_metrics()` is defined at line 165 but never called. The unique_ptr destructor runs at thread-exit, after the reactor has torn down.
   _Justification:_ Per the corrected Rule #13, `thread_local std::unique_ptr` only works for trivially-destructible state. If `~ShardLoadMetrics` ever touches reactor primitives (metric registrations etc.) this becomes a shutdown-order bug.
-  _Approach:_ Call `cleanup_shard_load_metrics()` from the appropriate service `stop()` (mirror `stop_metrics()` in `metrics_service.hpp:843`).
+  _Resolution:_ Added a new step in `Application::stop_services()` (`src/application.cpp`) that runs `seastar::smp::invoke_on_all([] { cleanup_shard_load_metrics(); })` after `_load_balancer.stop()` and before `_tokenizer.stop()` — i.e. after both consumers (`HttpController` and `ShardLoadBalancer`) are stopped, while every shard's reactor is still alive. Mirrors the symmetric init at line 653-656. No started-flag added (resetting a null `unique_ptr` is a no-op; lazy init in `shard_load_metrics()` re-creates on demand). Today's `ShardLoadMetrics` is trivially destructible (four `uint64_t` counters + `uint32_t` shard id), so this is preventive — it makes destruction order deterministic before any future field that touches reactor state turns the latent issue into a live shutdown bug.
   _Complexity:_ Trivial.
+  _Follow-up flagged:_ `stop_metrics()` in `src/metrics_service.hpp:843` is also defined but never called from `Application::stop_services()` (only from unit tests). The audit referenced it as a precedent, but the precedent itself is unwired. Deliberately not bundled here — deregistering Prometheus lambdas mid-scrape has its own risk profile.
 
 - [ ] **[P1] Parallelize gossip SRV lookups (Rule #2)**
   _Location:_ `src/gossip_protocol.cpp:716-729` — serial `co_await _dns_resolver.get_host_by_name(srv.target)` over an unbounded SRV record list (comment at line 727 admits it could reach 500+).
