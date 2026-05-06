@@ -13,12 +13,19 @@
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
+
+// Bound the fan-out of per-SRV-target DNS A-record lookups in refresh_peers().
+// SRV record sets can reach 500+ entries; serial resolution scales as N x RTT,
+// while this cap collapses wall-clock latency to ~ceil(N/16) x RTT without
+// flooding the resolver.
+constexpr size_t MAX_CONCURRENT_DNS_RESOLUTIONS = 16;
 
 //------------------------------------------------------------------------------
 // Packet Serialization
@@ -706,35 +713,51 @@ seastar::future<> GossipProtocol::refresh_peers() {
         std::vector<seastar::socket_address> discovered_addresses;
 
         if (_config.discovery_type == DiscoveryType::SRV) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             auto srv_records = co_await _dns_resolver.get_srv_records(
                 seastar::net::dns_resolver::srv_proto::udp,
                 "_gossip",
                 _config.discovery_dns_name);
+#pragma GCC diagnostic pop
 
+            // Rule #2: resolve SRV targets in parallel with bounded concurrency.
+            // The batch handles reactor fairness via its own scheduling, so no
+            // explicit maybe_yield is required. discovered_addresses is mutated
+            // from inside the lambda; this is safe because refresh_peers() runs
+            // shard-0-only (line above) and Seastar coroutines on a single shard
+            // only interleave at co_await suspension points -- emplace_back
+            // executes between awaits without preemption. Same precedent as
+            // local_discovery.cpp:82's results.push_back. The per-target
+            // try/catch is kept inside the lambda so one bad SRV target logs
+            // and lets siblings complete (max_concurrent_for_each would
+            // otherwise abort the batch on the first exception).
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-            for (const auto& srv : srv_records) {
-                try {
-                    auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
-                    for (const auto& addr : host_entry.addr_list) {
-                        discovered_addresses.emplace_back(addr, srv.port);
-                        log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+            co_await seastar::max_concurrent_for_each(
+                srv_records, MAX_CONCURRENT_DNS_RESOLUTIONS,
+                [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
+                    try {
+                        auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
+                        for (const auto& addr : host_entry.addr_list) {
+                            discovered_addresses.emplace_back(addr, srv.port);
+                            log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                        }
+                    } catch (const std::exception& e) {
+                        log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                     }
-                } catch (const std::exception& e) {
-                    log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
-                }
-                // Rule #17: Yield between DNS resolutions to avoid reactor stall
-                // when SRV record count is large (unbounded, could reach 500+)
-                co_await seastar::coroutine::maybe_yield();
-            }
+                });
+#pragma GCC diagnostic pop
         } else if (_config.discovery_type == DiscoveryType::A) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
+#pragma GCC diagnostic pop
 
             for (const auto& addr : host_entry.addr_list) {
                 discovered_addresses.emplace_back(addr, _config.gossip_port);
                 log_gossip_protocol().debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
             }
-#pragma GCC diagnostic pop
         }
 
         if (discovered_addresses.empty()) {
