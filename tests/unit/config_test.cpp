@@ -395,6 +395,97 @@ server:
     EXPECT_THROW(RanvierConfig::load("test_invalid.yaml"), std::runtime_error);
 }
 
+// =============================================================================
+// load_from_string() — shared parser used by both sync load() and the on-reactor
+// load_config_async() path. These tests cover the parser directly without
+// touching the filesystem so they double as the "in-memory buffer" path that
+// load_config_async() exercises after dma_read_bulk.
+// =============================================================================
+
+TEST_F(ConfigTest, LoadFromStringEmptyReturnsDefaults) {
+    auto config = RanvierConfig::load_from_string("");
+
+    // Empty YAML should behave identically to a missing file:
+    // null root node, no fields populated, env overrides applied.
+    EXPECT_EQ(config.server.api_port, 8080);
+    EXPECT_EQ(config.server.bind_address, "0.0.0.0");
+    EXPECT_EQ(config.database.path, "ranvier.db");
+}
+
+TEST_F(ConfigTest, LoadFromStringParsesValidYaml) {
+    const std::string yaml = R"(
+server:
+  bind_address: "10.0.0.1"
+  api_port: 4242
+  metrics_port: 4243
+
+routing:
+  min_token_length: 16
+)";
+
+    auto config = RanvierConfig::load_from_string(yaml);
+
+    EXPECT_EQ(config.server.bind_address, "10.0.0.1");
+    EXPECT_EQ(config.server.api_port, 4242);
+    EXPECT_EQ(config.server.metrics_port, 4243);
+    EXPECT_EQ(config.routing.min_token_length, 16u);
+
+    // Unspecified fields fall through to defaults.
+    EXPECT_EQ(config.database.path, "ranvier.db");
+}
+
+TEST_F(ConfigTest, LoadFromStringMatchesLoadFromFile) {
+    const std::string yaml = R"(
+server:
+  api_port: 9090
+  metrics_port: 9091
+
+pool:
+  max_connections_per_host: 25
+  idle_timeout_seconds: 90
+)";
+    writeTestConfig("test_match.yaml", yaml);
+
+    auto from_file = RanvierConfig::load("test_match.yaml");
+    auto from_string = RanvierConfig::load_from_string(yaml);
+
+    // The async path reads the file via dma_read_bulk and feeds the buffer
+    // into load_from_string(); the result must match the sync ifstream path.
+    EXPECT_EQ(from_file.server.api_port, from_string.server.api_port);
+    EXPECT_EQ(from_file.server.metrics_port, from_string.server.metrics_port);
+    EXPECT_EQ(from_file.pool.max_connections_per_host,
+              from_string.pool.max_connections_per_host);
+    EXPECT_EQ(from_file.pool.idle_timeout.count(),
+              from_string.pool.idle_timeout.count());
+}
+
+TEST_F(ConfigTest, LoadFromStringInvalidYamlThrows) {
+    const std::string bad_yaml = R"(
+server:
+  api_port: [unterminated list
+    nested: broken
+)";
+
+    EXPECT_THROW(RanvierConfig::load_from_string(bad_yaml), std::runtime_error);
+}
+
+TEST_F(ConfigTest, LoadFromStringAppliesEnvOverrides) {
+    setenv("RANVIER_API_PORT", "6543", 1);
+
+    const std::string yaml = R"(
+server:
+  api_port: 1234
+  metrics_port: 1235
+)";
+
+    auto config = RanvierConfig::load_from_string(yaml);
+
+    // Env var must win over the in-string value, matching load()'s behavior.
+    EXPECT_EQ(config.server.api_port, 6543);
+    // Untouched-by-env values stay as parsed.
+    EXPECT_EQ(config.server.metrics_port, 1235);
+}
+
 // Test config struct initialization
 TEST_F(ConfigTest, StructsHaveCorrectDefaults) {
     ServerConfig server;
