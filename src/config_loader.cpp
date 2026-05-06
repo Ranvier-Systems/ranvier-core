@@ -1,8 +1,13 @@
 // Ranvier Core - Configuration Loader Implementation
 //
 // YAML parsing, environment variable overrides, and validation logic.
-// Note: This file uses std::ifstream which is blocking I/O.
-// Config loading happens before Seastar reactor starts, so this is acceptable.
+// The blocking sync entry point `RanvierConfig::load(path)` uses std::ifstream
+// and is intended for the pre-reactor startup path in `main()`. After the
+// Seastar reactor is running (e.g. SIGHUP-driven hot-reload), callers must use
+// `load_config_async()` from `config_loader_async.hpp`, which performs the
+// file read via `seastar::open_file_dma` + `dma_read_bulk` and then calls into
+// `RanvierConfig::load_from_string()` to share the YAML parsing logic with the
+// sync path.
 
 #include "config_loader.hpp"
 
@@ -790,17 +795,22 @@ RanvierConfig RanvierConfig::defaults() {
 // =============================================================================
 
 RanvierConfig RanvierConfig::load(const std::string& config_path) {
-    RanvierConfig config;
-
     std::ifstream file(config_path);
     if (!file.is_open()) {
         // File not found - use defaults with env overrides
-        config.apply_env_overrides();
-        return config;
+        return RanvierConfig::defaults();
     }
 
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return load_from_string(buffer.str());
+}
+
+RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
+    RanvierConfig config;
+
     try {
-        YAML::Node yaml = YAML::Load(file);
+        YAML::Node yaml = YAML::Load(yaml_text);
 
         // Server section
         if (yaml["server"]) {

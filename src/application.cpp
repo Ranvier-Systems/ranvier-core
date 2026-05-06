@@ -1,6 +1,7 @@
 // Ranvier Core - Application Bootstrap and Lifecycle Implementation
 
 #include "application.hpp"
+#include "config_loader_async.hpp"
 #include "dashboard_resource.hpp"
 #include "gossip_service.hpp"
 #include "logging.hpp"
@@ -1430,12 +1431,13 @@ seastar::future<> Application::reload_config() {
 
     log_main.info("Reloading configuration from {}", _config_path);
 
-    // Load configuration asynchronously to avoid blocking the reactor.
-    // seastar::async() offloads the blocking std::ifstream I/O to the thread pool.
-    // This is the ONLY safe way to reload config after the Seastar reactor starts.
-    return seastar::async([path = _config_path] {
-        return RanvierConfig::load(path);
-    }).then([this, now](RanvierConfig new_config) {
+    // Read the YAML file via Seastar DMA and parse on the calling shard.
+    // The previous seastar::async() wrapper here was a Rule #12 violation:
+    // seastar::async runs in a seastar::thread that executes on the reactor,
+    // so the std::ifstream inside still stalled this shard for the duration
+    // of the read. load_config_async() uses open_file_dma + dma_read_bulk,
+    // which is reactor-safe (Rule #12, corrected 2026-05-05).
+    return load_config_async(_config_path).then([this, now](RanvierConfig new_config) {
         // Validate the new configuration
         auto validation_error = RanvierConfig::validate(new_config);
         if (validation_error) {
