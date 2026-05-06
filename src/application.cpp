@@ -1342,6 +1342,35 @@ seastar::future<> Application::stop_services() {
                 log_main.debug("  Shard load metrics cleaned up on all shards");
             });
         })
+        .then([] {
+            // -------------------------------------------------------------------------
+            // Step 4a3: Tear down per-shard MetricsService. Deregisters every
+            // Prometheus lambda capturing `this` (Rule #6) and frees the raw
+            // thread_local g_metrics pointer that would otherwise leak at process
+            // exit. Sibling of step 4a2 — kept as a separate invoke_on_all so a
+            // future async signature on stop_metrics() does not reshape the
+            // lambda. Ordering preconditions:
+            //   (a) every caller of metrics() must be quiescent. The full caller
+            //       set (http_controller, router_service, stream_parser, plus
+            //       the circuit-cleanup callback registered against
+            //       HttpController) is driven by HttpController, which stopped
+            //       in step 4. Tokenizer/persistence/sharded_config do not
+            //       touch metrics(), so later steps are safe.
+            //   (b) no Prometheus scrape may be in flight. The metrics HTTP
+            //       server was stopped in step 3 (stop_servers()); Seastar's
+            //       http_server::stop() drains in-flight connections before
+            //       returning, so handlers cannot still be reading metrics
+            //       state by the time we reach this step.
+            // stop_metrics() self-guards on g_metrics != nullptr, so shards
+            // that never lazy-initialised (or where the metrics HTTP server
+            // was disabled) are no-ops.
+            // -------------------------------------------------------------------------
+            return seastar::smp::invoke_on_all([] {
+                stop_metrics();
+            }).then([] {
+                log_main.debug("  Metrics service stopped on all shards");
+            });
+        })
         .then([this] {
             // -------------------------------------------------------------------------
             // Step 4b: Stop sharded tokenizer service
