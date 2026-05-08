@@ -4,121 +4,120 @@ Analysis of the top potential performance issues along the LLM inference request
 path documented in [request-lifecycle.md](request-lifecycle.md).
 
 Each finding references the lifecycle phase, source location, estimated severity,
-and a recommended mitigation.
+and a recommended mitigation. Findings that have since been mitigated in `src/`
+are marked **RESOLVED** with a pointer to the current implementation.
 
 ---
 
-## 1. CRITICAL — `learn_route_global()` Broadcasts to All Shards on Every Cache Miss
+## 1. RESOLVED — `learn_route_global()` Per-Request Cross-Shard Broadcast Storm
 
 **Phase:** 8 (Stream Response — route learning)
-**File:** `src/router_service.cpp:1619-1750`
+**File:** `src/router_service.cpp:2616-2690`
 
-On every successful 2xx response where tokens meet the minimum length,
-`learn_route_global()` performs:
+Originally, every successful 2xx with sufficient tokens triggered an immediate
+`smp::submit_to(0, ...)` gossip broadcast plus a `parallel_for_each` over all
+shards (each with its own `foreign_ptr<vector<int32_t>>` allocation). On an
+8-core box this cost ~9 cross-shard messages and ~9 heap allocations per
+learned route, contending with real request work in the streaming hot path.
 
-1. Allocate `foreign_ptr<vector<int32_t>>` copy of the token vector
-2. `smp::submit_to(0, ...)` — gossip broadcast to shard 0
-3. `parallel_for_each(all shards)` — one `smp::submit_to` per shard, each
-   allocating another `foreign_ptr` copy and inserting into the local ART
-
-For an 8-core system with 128-token prefixes, that is:
-- **9 cross-shard messages** per learned route (1 gossip + 8 shard inserts)
-- **9 heap allocations** of ~512 bytes each (token vector copies)
-- **9 `foreign_ptr` destructions** bouncing back to the originating shard
-
-This runs inline in the streaming hot path (fire-and-forget, but the futures
-are still scheduled on the reactor). Under high request volume with low ART
-hit rates (cold start, new prompts), this creates an SMP message storm that
-competes with real request processing.
-
-**Mitigation:** Batch route learning. Accumulate learned routes in a shard-local
-buffer and flush to all shards periodically (e.g., every 100ms or 64 routes),
-reducing SMP messages from O(routes × shards) to O(batches × shards).
-`flush_route_batch()` already exists for gossip-received routes — apply the
-same pattern to locally-learned routes.
+**Current implementation:** `learn_route_global()` no longer broadcasts inline.
+It validates the prefix, performs a shard-local ART dedup check (see Finding
+#7), and then calls `buffer_local_route()` to append the route into a
+shard-local `pending_local_routes` vector (`src/router_service.cpp:253`). A
+per-shard periodic timer (`_batch_flush_timer`, armed in
+`start_batch_flush_timer()` at `src/router_service.cpp:2883`) and a
+buffer-full trigger drain the buffer via `flush_local_route_batch()`,
+broadcasting in batches rather than per-request. SMP traffic drops from
+O(routes × shards) to O(batches × shards).
 
 ---
 
-## 2. CRITICAL — Tokenization Fallback Blocks the Reactor for 5–13ms
+## 2. RESOLVED — Tokenization Fallback Blocking the Reactor
 
 **Phase:** 2 (Tokenization)
-**File:** `src/tokenizer_service.cpp:352-374`
+**File:** `src/tokenizer_service.cpp:370-381`
 
-When both the thread pool queue is full and cross-shard dispatch is unavailable
-(all remote shards busy), `encode_threaded_async()` falls back to
-`tokenize_locally()`, which calls `_impl->Encode()` — a synchronous Rust FFI
-call that blocks the reactor for 5–13ms.
+Originally, when the thread pool queue was full and cross-shard dispatch was
+unavailable, `encode_threaded_async()` fell through to `tokenize_locally()`,
+making a synchronous Rust FFI `Encode()` call on the reactor (5–13ms stall).
+Multiple shards could hit this simultaneously under load spikes.
 
-During that time, **all** other requests on the same shard stall: no reads,
-no writes, no timer callbacks. On a system handling 1000 req/s across 8 cores,
-a 10ms stall on one shard delays ~12 requests.
+**Current implementation:** Local fallback is now gated by a per-shard
+semaphore `_local_tokenize_sem` (`src/tokenizer_service.hpp:341`). The fast
+path is:
 
-The fallback is designed as a last resort, but under load spikes (thread pool
-saturation + cross-shard backpressure), multiple shards can hit it
-simultaneously.
+```cpp
+if (!_local_tokenize_sem.try_wait(1)) {
+    ++_local_fallback_rejected;
+    co_return TokenizationResult{};   // empty -> caller falls back to hash/random routing
+}
+auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
+co_return tokenize_locally(text);
+```
 
-**Mitigation:**
-- Add a cap on local fallbacks (e.g., max 1 concurrent local tokenization per
-  shard via a semaphore). When the cap is reached, return empty tokens and fall
-  back to hash/random routing rather than blocking the reactor.
-- Instrument `_cross_shard_local_fallbacks` as a Prometheus counter with alert
-  threshold.
+The semaphore capacity is configured via `configure_local_fallback()`
+(`src/tokenizer_service.cpp:158`). Both `_cross_shard_local_fallbacks` and
+`_local_fallback_rejected` are exposed as Prometheus counters
+(`local_fallbacks` and `local_fallback_rejected`, registered at
+`src/tokenizer_service.cpp:168-171`).
 
 ---
 
-## 3. HIGH — `std::mutex` in Async Persistence Blocks the Reactor
+## 3. RESOLVED — `std::mutex` in Async Persistence Enqueue
 
 **Phase:** 8 (Stream Response — persistence queue)
-**File:** `src/async_persistence.cpp:202-213`
+**File:** `src/async_persistence.cpp:287-305`
 
-`try_enqueue()` acquires `std::lock_guard<std::mutex>` on every
-`queue_save_route()` call. This runs on the reactor thread during the streaming
-hot path (line 600 of `http_controller.cpp`).
+Originally, `try_enqueue()` acquired `std::lock_guard<std::mutex>` on every
+`queue_save_route()` call from the reactor, contending with the persistence
+worker's `extract_batch()` and violating Hard Rule #1.
+
+**Current implementation:** The mutex-guarded `std::deque` has been replaced
+with an MPSC ring buffer (`_ring`) plus an atomic `_queue_size` reservation
+counter:
 
 ```cpp
-bool AsyncPersistenceManager::try_enqueue(PersistenceOp op) {
-    std::lock_guard<std::mutex> lock(_queue_mutex);  // BLOCKS REACTOR
-    if (_queue.size() >= _config.max_queue_depth) { ... }
-    _queue.push_back(std::move(op));
-    ...
+const auto prev = _queue_size.fetch_add(1, std::memory_order_relaxed);
+if (prev >= _config.max_queue_depth) {
+    _queue_size.fetch_sub(1, std::memory_order_relaxed);
+    _ops_dropped++;
+    return false;
+}
+if (!_ring->try_push(std::move(op))) { ... }
+```
+
+The reactor never blocks. `extract_batch()` (`src/async_persistence.cpp:307`)
+and `drain_queue()` are single-consumer drains called only from the worker
+thread.
+
+---
+
+## 4. HIGH — Per-Request `std::string` Copy for Tokenizer Cache Insert
+
+**Phase:** 2 (Tokenization)
+**File:** `src/tokenizer_service.cpp:351-355`
+
+After a thread-pool tokenization completes, the result is inserted into the
+local cache keyed by a heap-allocated copy of the input text:
+
+```cpp
+std::string text_copy(text);
+if (!result.tokens.empty()) {
+    _cache.insert(text_copy, result.tokens);
 }
 ```
 
-The same mutex is contended by `extract_batch()` (called from the persistence
-worker thread), creating cross-thread contention on the reactor. Even a brief
-lock hold on the reactor violates Seastar's shared-nothing model (Hard Rule #1).
-
-**Mitigation:** Replace the mutex-guarded `std::deque` with a lock-free
-SPSC (single-producer, single-consumer) ring buffer. Each shard produces
-exclusively; the persistence worker consumes. This eliminates all mutex
-contention on the reactor thread. Alternatively, use a shard-local batch
-buffer flushed via `seastar::alien::submit_to_reactor()` from the worker.
-
----
-
-## 4. HIGH — Per-Request `std::string` Copies for Thread Pool Tokenization
-
-**Phase:** 2 (Tokenization)
-**File:** `src/tokenizer_service.cpp:325`
-
-When tokenization is dispatched to the thread pool, a `std::string` copy of the
-input text is captured in the continuation lambda for cache insertion:
-
-```cpp
-return std::move(*future_opt).then(
-    [this, local_shard, text_copy = std::string(text)]  // HEAP ALLOC
-    (ThreadPoolTokenizationResult pool_result) { ... });
-```
-
-For a typical 4KB request body, this is a guaranteed heap allocation on every
+For a typical 4KB request body, this is a guaranteed allocation per
 thread-pool-dispatched tokenization. With 80–90% cache hit rates for system
 messages, this primarily affects user messages — but those are exactly the
-requests that take the full 5–13ms tokenization path, adding allocation
-pressure to an already-expensive operation.
+requests that already paid the full 5–13ms tokenization cost, adding
+allocation pressure on top of an already-expensive operation. The same
+pattern recurs in `encode_cached_async()` at `src/tokenizer_service.cpp:306`.
 
 **Mitigation:** Use the text hash as the cache key instead of the full string.
-Compute the hash before dispatch, capture only the hash + tokens in the
-continuation. The cache already uses hash-based lookup internally.
+Compute the hash once before dispatch and pass only the hash + tokens through
+the continuation. The cache already uses hash-based lookup internally, so the
+external string key is redundant.
 
 ---
 
@@ -139,9 +138,11 @@ each chunk triggers an append that may reallocate the underlying buffer with a
 growth factor. For a 100KB response arriving in 50 chunks of ~2KB, this can
 cause 6–8 reallocations with O(n) copies each.
 
-The compaction at line 114 adds another `memmove` when read position exceeds 50%
-of the buffer, which is correct but doubles the copy work after each compaction
-cycle.
+The compaction at `src/stream_parser.cpp:118` adds another `memmove` when read
+position exceeds the configured threshold, which is correct but doubles the
+copy work after each compaction cycle. (Note: `sstring` does not expose
+`reserve()`, so up-front sizing is not currently available — see comment at
+`src/stream_parser.cpp:59`.)
 
 **Mitigation:** Pre-size the accumulator based on `Content-Length` if present
 in the response headers (many LLM backends provide it for non-streaming
@@ -154,82 +155,111 @@ parsing directly from the chain.
 ## 6. MEDIUM — Connection Retry Backoff Sleeps on the Reactor
 
 **Phase:** 6 (Connection Establishment)
-**File:** `src/http_controller.cpp:391`
+**File:** `src/http_controller.cpp:746-757`
 
 When a backend connection fails and retries are needed:
 
 ```cpp
-co_await seastar::sleep(ctx.current_backoff);
+co_await seastar::sleep(ctx->current_backoff);
 ```
 
 The backoff starts at 100ms and grows to 5s. While `seastar::sleep` is
-non-blocking (timer-based), the **request** holds its concurrency semaphore unit
-and gate holder for the entire retry duration. Under default config
-(max_retries=3), a connection to a dead backend can hold resources for up to
-100ms + 200ms + 400ms = 700ms before giving up.
+non-blocking (timer-based), the **request** holds its concurrency semaphore
+unit and gate holder for the entire retry duration. With a concurrency limit
+of (e.g.) 128, just 128 requests hitting a dead backend simultaneously
+exhaust the semaphore.
 
-With a concurrency limit of (e.g.) 128, just 128 requests hitting a dead
-backend simultaneously exhaust the semaphore, causing all subsequent requests to
-get 503 — even requests targeting healthy backends.
-
-**Mitigation:**
-- Release the semaphore unit before the retry sleep and re-acquire after.
-  This prevents dead-backend retries from consuming concurrency slots.
-- Alternatively, rely more aggressively on the circuit breaker: if
-  `record_failure()` transitions to OPEN, skip remaining retries entirely
-  and try fallback immediately.
-
----
-
-## 7. MEDIUM — Route Learning Fires on Every Snooped 2xx (No Dedup)
-
-**Phase:** 8 (Stream Response)
-**File:** `src/http_controller.cpp:582-601`
-
-Route learning is triggered on every successful response:
+**Partial mitigation already in place:** `establish_backend_connection()`
+short-circuits the retry loop when the circuit breaker for the current
+backend has transitioned to `OPEN`, breaking out before the next sleep
+(`src/http_controller.cpp:706-713`):
 
 ```cpp
-if (_config.should_learn_routes() && ctx.tokens.size() >= _config.min_token_length) {
-    (void)_router.learn_route_global(...);
-    _persistence->queue_save_route(ctx.tokens, ctx.current_backend);
+if (_circuit_breaker.get_state(ctx->current_backend) == CircuitState::OPEN) {
+    ++_retries_skipped_circuit_open;
+    metrics().record_retry_skipped_circuit_open();
+    ctx->connection_failed = true;
+    break;
 }
 ```
 
-If 100 requests share the same system prompt (common in RAG workloads), the
-same prefix→backend route is learned 100 times: 100 cross-shard broadcasts +
-100 persistence enqueues. The ART `insert()` overwrites the existing entry
-(idempotent), so 99 of those broadcasts produce no new state.
+This eliminates the worst case (sustained retries against a confirmed-dead
+backend), but the first failure still pays the initial backoff sleep before
+the breaker opens, and a half-open breaker can still incur retries.
 
-**Mitigation:** Check if the route already exists before broadcasting.
-`RadixTree::lookup()` is O(k) and shard-local (no SMP message). Add a
-short-circuit:
+**Remaining mitigation:** Release the semaphore unit before the retry sleep
+and re-acquire after, so retry-bound requests do not hold concurrency slots
+that healthy traffic could use.
+
+---
+
+## 7. RESOLVED — Route Learning Fired on Every Snooped 2xx (No Dedup)
+
+**Phase:** 8 (Stream Response)
+**File:** `src/router_service.cpp:2659-2675`, `src/http_controller.cpp:969-1001`
+
+Originally, route learning fired on every successful response, so 100 requests
+sharing the same system prompt produced 100 cross-shard broadcasts and 100
+persistence enqueues even though the ART entry was idempotent.
+
+**Current implementation:** `learn_route_global()` performs a shard-local ART
+dedup check before buffering:
 
 ```cpp
-if (tree->lookup(tokens).backend_id == backend) return;  // Already known
+RadixTree* tree = state.tree.get();
+if (tree) {
+    std::span<const TokenId> token_span(tokens.data(), tokens.size());
+    auto existing = tree->lookup(token_span);
+    if (existing.has_value() && existing.value() == backend) {
+        state.stats.routes_deduplicated_pre_buffer++;
+        return seastar::make_ready_future<bool>(false);
+    }
+}
 ```
 
-This converts O(requests × shards) SMP messages to O(unique_routes × shards).
+The lookup is O(k), shard-local, and returns `false` when the route is a
+duplicate. The single-depth call site in `http_controller.cpp` propagates this
+return value and only enqueues persistence when the route is genuinely new:
+
+```cpp
+(void)_router.learn_route_global(...)
+    .then([this, tokens = ctx->tokens, backend = learn_backend](bool is_new_route) {
+        if (is_new_route && _persistence) {
+            _persistence->queue_save_route(tokens, backend);
+        }
+    })
+```
+
+For multi-depth routing, dedup is handled per-boundary inside
+`learn_route_global_multi()` and `push_local_route()`.
 
 ---
 
 ## 8. MEDIUM — HTTP/1.1 Request Serialization via String Concatenation
 
 **Phase:** 7 (Send Request)
-**File:** `src/http_controller.cpp:425-437`
+**File:** `src/http_controller.cpp:786-814`
 
 Backend request headers are built via `sstring` concatenation:
 
 ```cpp
 sstring http_headers =
-    "POST " + sstring(ctx.endpoint) + " HTTP/1.1\r\n"
+    "POST " + sstring(ctx->endpoint) + " HTTP/1.1\r\n"
     "Host: " + host_value + "\r\n"
     "Content-Type: application/json\r\n"
-    ...
+    "Content-Length: " + to_sstring(ctx->forwarded_body.size()) + "\r\n"
+    "X-Request-ID: " + safe_request_id + "\r\n";
+// followed by conditional traceparent, X-Ranvier-Prefix-Hash,
+// and a trailing "Connection: keep-alive\r\n\r\n" via +=.
 ```
 
-Each `+` operator allocates a new `sstring`, copies left and right operands,
-and frees the old buffer. For 6 concatenation steps, that is 5 intermediate
-allocations. This runs on every proxied request.
+Each `+` allocates a new `sstring`, copies left and right operands, and
+frees the old buffer. The base block alone produces 5 intermediate
+allocations on every proxied request, with additional `+=` appends for
+optional headers. The body is already written separately via
+`bundle->out.write(ctx->forwarded_body)` (`src/http_controller.cpp:823`),
+so the issue is contained to the header buffer, but it still runs on every
+request.
 
 **Mitigation:** Use `fmt::format` or a pre-sized `sstring` with `reserve()`
 and `append()` to build headers in a single allocation. Alternatively,
@@ -238,55 +268,72 @@ a contiguous header buffer at all.
 
 ---
 
-## 9. LOW — JSON Parse in `extract_text_with_boundary_info()` on Every Request
+## 9. RESOLVED — Unconditional JSON Parse for Text Extraction
 
 **Phase:** 2–3 (Tokenization + Boundary Detection)
-**File:** `src/request_rewriter.hpp` (called from `http_controller.cpp:833`)
+**File:** `src/http_controller.cpp:1233-1271`
 
-Every non-RANDOM request parses the full JSON body via RapidJSON to extract
-text for tokenization. For requests where the client provides
-`prompt_token_ids`, the JSON parse for text extraction is wasted — the tokens
-are already available.
+Originally, `extract_text_with_boundary_info()` ran on every non-RANDOM
+request, parsing the full JSON body via RapidJSON even when the client had
+already supplied `prompt_token_ids`.
 
-**Mitigation:** Reorder the extraction logic: check for client-provided tokens
-first (Path A). Only parse the JSON body if client tokens are absent (Path B).
-The lifecycle doc shows this is already the intent, but the implementation
-calls `extract_text_with_boundary_info()` before checking the extracted
-boundaries, causing unnecessary work when client tokens are used but boundary
-detection still needs system message text.
+**Current implementation:** The tokenization phase now checks for client
+tokens first and only parses the body when local tokenization is required:
+
+```cpp
+// First, check if client provided pre-tokenized prompt_token_ids
+if (_config.accept_client_tokens) {
+    auto token_result = RequestRewriter::extract_prompt_token_ids(body_view, _config.max_token_id);
+    if (token_result.found) { ... tokens = std::move(token_result.tokens); used_client_tokens = true; }
+}
+
+// If no client tokens, tokenize locally
+if (!used_client_tokens) {
+    text_extraction = RequestRewriter::extract_text_with_boundary_info(
+        body_view, _config.enable_multi_depth_routing, _config.chat_template);
+    ...
+}
+```
+
+When the client provides tokens, the JSON body is no longer re-parsed for
+text extraction. Boundary info is still computed in the same single
+`extract_text_with_boundary_info()` call when local tokenization runs, so the
+boundary-detection phase no longer re-parses either.
 
 ---
 
-## 10. LOW — `lowres_clock::now()` Called Twice Per Chunk in Streaming Loop
+## 10. LOW — `lowres_clock::now()` Called Multiple Times Per Streaming Iteration
 
 **Phase:** 8 (Stream Response)
-**File:** `src/http_controller.cpp:476-488`
+**File:** `src/http_controller.cpp:853-866`
 
 ```cpp
-if (lowres_clock::now() >= ctx.request_deadline) { ... }       // Call 1
+if (lowres_clock::now() >= ctx->request_deadline) { ... }                 // Call 1
 auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
-    ctx.request_deadline - lowres_clock::now());                // Call 2
+    ctx->request_deadline - lowres_clock::now());                          // Call 2
+auto read_deadline = lowres_clock::now() + read_timeout;                   // Call 3
 ```
 
-`lowres_clock` updates at ~100Hz (10ms resolution), so two calls 3 lines apart
-return the same value. Minor, but the pattern repeats for every chunk in the
-streaming loop (potentially hundreds of chunks per response).
+`lowres_clock` updates at ~10ms resolution, so all three calls within a few
+lines return the same value. Minor, but the pattern repeats for every read
+iteration of the streaming loop (potentially hundreds of chunks per response).
 
-**Mitigation:** Capture `auto now = lowres_clock::now()` once and reuse it.
+**Mitigation:** Capture `auto now = lowres_clock::now()` once at the top of the
+loop iteration and reuse it.
 
 ---
 
 ## Summary
 
-| # | Severity | Phase | Issue | Est. Impact |
-|---|----------|-------|-------|-------------|
-| 1 | CRITICAL | 8 | Per-route cross-shard broadcast storm | O(shards) SMP msgs/request |
-| 2 | CRITICAL | 2 | Reactor-blocking tokenization fallback | 5–13ms stall per shard |
-| 3 | HIGH | 8 | `std::mutex` in persistence enqueue | Reactor contention |
-| 4 | HIGH | 2 | Heap alloc for tokenizer cache key | 4KB alloc/cache-miss |
-| 5 | MEDIUM | 8 | sstring reallocation in StreamParser | 6–8 reallocs/response |
-| 6 | MEDIUM | 6 | Retry sleep holds concurrency slot | Semaphore exhaustion risk |
-| 7 | MEDIUM | 8 | No route-learning deduplication | 99% redundant broadcasts |
-| 8 | MEDIUM | 7 | String concat for HTTP headers | 5 temp allocs/request |
-| 9 | LOW | 2–3 | Unnecessary JSON parse with client tokens | ~500µs wasted |
-| 10 | LOW | 8 | Duplicate `lowres_clock::now()` calls | Negligible |
+| #  | Status   | Phase | Issue                                              | Notes                                  |
+|----|----------|-------|----------------------------------------------------|----------------------------------------|
+| 1  | RESOLVED | 8     | Per-route cross-shard broadcast storm              | Batched via `pending_local_routes` + flush timer |
+| 2  | RESOLVED | 2     | Reactor-blocking tokenization fallback             | Gated by `_local_tokenize_sem`         |
+| 3  | RESOLVED | 8     | `std::mutex` in persistence enqueue                | Replaced with MPSC ring buffer         |
+| 4  | HIGH     | 2     | Heap alloc for tokenizer cache key                 | ~4KB alloc per cache-miss              |
+| 5  | MEDIUM   | 8     | sstring reallocation in StreamParser               | 6–8 reallocs per response              |
+| 6  | MEDIUM   | 6     | Retry sleep holds concurrency slot                 | Circuit-breaker short-circuit added; semaphore release still pending |
+| 7  | RESOLVED | 8     | No route-learning deduplication                    | ART dedup check in `learn_route_global` |
+| 8  | MEDIUM   | 7     | String concat for HTTP headers                     | 5+ temp allocs per request             |
+| 9  | RESOLVED | 2–3   | Unnecessary JSON parse with client tokens          | Client-token check now precedes parse  |
+| 10 | LOW      | 8     | Duplicate `lowres_clock::now()` calls              | 3 calls per streaming iteration        |
