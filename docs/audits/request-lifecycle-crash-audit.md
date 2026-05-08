@@ -1,7 +1,7 @@
 # Request Lifecycle: Crash Risk Assessment
 
 Static-analysis audit of the main inference request path, mapped against the
-phases documented in [request-lifecycle.md](./request-lifecycle.md). This
+phases documented in [request-lifecycle.md](../internals/request-lifecycle.md). This
 assessment was produced without compiling or running the code; each finding
 should be confirmed against the live source (file:line refs may drift) and
 verified with a targeted test or sanitiser run before remediation.

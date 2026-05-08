@@ -28,6 +28,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 15. [Intelligence Layer Roadmap (2026-03-25)](#15-intelligence-layer-roadmap-2026-03-25)
 16. [KV-Cache Compression-Aware Routing (2026-04-05)](#16-kv-cache-compression-aware-routing-2026-04-05)
 17. [Hard Rules Audit Follow-ups (2026-05-05)](#17-hard-rules-audit-follow-ups-2026-05-05)
+18. [Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)](#18-request-lifecycle-crash-risk-audit-follow-ups-2026-05-08)
 
 ---
 
@@ -982,6 +983,107 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
 
 - [ ] **[P3] Add CI grep for `seastar::async(`**
   _Justification:_ The misuse was systemic enough that a lint will catch the next instance faster than another audit. Allowlist the legitimate sites once they're identified.
+
+---
+
+## 18. Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)
+
+Code follow-ups from the request-lifecycle crash-risk assessment in [`docs/audits/request-lifecycle-crash-audit.md`](docs/audits/request-lifecycle-crash-audit.md). The audit was static-only (no build / sanitiser / fuzz run), so the first action on each item is to confirm the finding against current source — line numbers may have drifted. Each item should land as its own PR.
+
+The audit also recommends four cross-cutting fixes that close several findings at once; those are listed first under "Cross-cutting" because doing them collapses many of the per-finding entries below.
+
+### Cross-cutting (do these first)
+
+- [ ] **[P1] Adopt a `with_timeout` helper on the request hot path**
+  _Justification:_ Closes audit findings H3 (reactor-blocking FFI fallback) and M5 (thread-pool future with no timeout); also makes M15 easier to reason about.
+  _Approach:_ Single helper `co_await with_request_deadline(ctx, fut)` that maps `seastar::timed_out_error` to a structured request error. Apply to `encode_threaded_async`, `submit_async`, and the chunk-read site in `stream_backend_response`.
+  _Complexity:_ Medium.
+
+- [ ] **[P1] Saturating-cast helpers for size / duration arithmetic**
+  _Justification:_ Closes H2, H9, H10, M9, M12 — all are `uint64_t→size_t` or `double→int64_t` casts that lack explicit bounds checks.
+  _Approach:_ Add `safe_size_cast(uint64_t)` and `saturating_ms(double)` in a new `src/numeric_safety.hpp`. Grep `static_cast<size_t>(` and `static_cast<int64_t>(` along the request path; route each through the helper or document why not.
+  _Complexity:_ Low per site, medium in aggregate.
+
+- [ ] **[P1] Empty-collection guard helper for backend selection**
+  _Justification:_ Closes H6, M7, M8 — `live_backends[0]` and `% live_backends.size()` are reached after their empty checks via paths that don't re-check.
+  _Approach:_ Replace direct indexing in `router_service.cpp` with a `select_backend(live_backends, …) -> std::optional<Backend>` helper that owns the empty / single / hash / random cases.
+  _Complexity:_ Medium.
+
+- [ ] **[P1] Document and assert the shutdown lifetime contract**
+  _Justification:_ Closes H4, H5, M1, M14. The single invariant — gate awaited before destruction, workers joined before alien teardown, fire-and-forget futures tracked by the gate — currently lives in commit history rather than code.
+  _Approach:_ Add `~HttpController()` / `~TokenizerThreadPool()` asserts that the gate is closed and futures empty. Add a comment block in each describing the required teardown order. Capture `seastar::shared_ptr<HttpController>` (or equivalent) in long-lived lambdas instead of raw `[this]`.
+  _Complexity:_ Medium.
+
+### P1 — HIGH findings
+
+- [ ] **[P1] H1: Replace `*slot.units` with checked access**
+  _Location:_ `src/http_controller.cpp:1986`. Use `slot.units.value()` (or assert + `*`) so a `nullopt` produces an abort, not UB.
+  _Complexity:_ Trivial.
+
+- [ ] **[P1] H7: Saturate `total_weight` in weighted random selection**
+  _Location:_ `src/router_service.cpp:2144-2152`. Cap the accumulator and assert `> 0` before constructing `uniform_int_distribution`.
+  _Complexity:_ Trivial.
+
+- [ ] **[P1] H8: Verify ART `split_long_prefix` boundary read**
+  _Location:_ `src/radix_tree.hpp:1098-1121`. Audit flagged `prefix[MAX_PREFIX_LENGTH]` as one-past-the-buffer for exactly-sized prefixes. May already be mitigated by an extra-byte buffer — confirm before changing. If not, index `MAX_PREFIX_LENGTH - 1` or split out an explicit edge-byte field.
+  _Complexity:_ Low.
+
+- _H2, H3, H4, H5, H6, H9, H10 — covered by the four cross-cutting items above; track resolution there._
+
+### P2 — MED findings
+
+- [ ] **[P2] M2: Normalise the optional-units pattern**
+  _Location:_ `src/http_controller.cpp:1119`. Same `*opt` pattern as H1; not currently exploitable but a refactoring footgun.
+  _Complexity:_ Trivial.
+
+- [ ] **[P2] M3: Tighten `encode_cached_async` text ownership**
+  _Location:_ `src/tokenizer_service.cpp:243-312`. Either take `std::string&&` or document "must copy before any `co_await`" at the entry.
+  _Complexity:_ Trivial.
+
+- [ ] **[P2] M4: Catch `std::bad_alloc` inside `smp::submit_to` lambda**
+  _Location:_ `src/tokenizer_service.cpp:254-291`. Return `{{}, false}` from the lambda on alloc failure rather than letting the exception cross the dispatch boundary; or enforce a hard body-size cap upstream.
+  _Complexity:_ Low.
+
+- [ ] **[P2] M6: Surface RapidJSON nesting errors distinctly**
+  _Location:_ `src/request_rewriter.hpp:342`. Distinguish nesting-limit failures from generic parse errors in metrics / logs; consider lowering the implicit nesting cap.
+  _Complexity:_ Low.
+
+- [ ] **[P2] M10: Bound the fallback walker**
+  _Locations:_ `src/circuit_breaker.hpp:78-80`, `src/http_controller.cpp::get_fallback_backend` (~217-230). Verify the documented "up to 3 attempts" cap is enforced; combined with `failure_threshold = 0` configs, an unbounded walker risks a CPU loop on a dead cluster.
+  _Complexity:_ Low.
+
+- [ ] **[P2] M11: Buffer to first CRLF before HTTP status snoop**
+  _Location:_ `src/stream_parser.cpp:152-157`. A first chunk shorter than `"HTTP/1.1 200"` silently misses 2xx detection — circuit breaker miss, no TTFB, no route learning.
+  _Complexity:_ Low.
+
+- [ ] **[P2] M13: Centralise `bundle.is_valid` write/read**
+  _Location:_ `src/http_controller.cpp:2191-2200` (read), 11 write sites (e.g. 776, 831, 857, 912, 921, 933, 948). Either promote to `std::atomic<bool>` if any cross-coroutine read is possible, or funnel mark-invalid through a single helper to make the reasoning local.
+  _Complexity:_ Medium.
+
+- [ ] **[P2] M15: Audit non-EPIPE write-error path**
+  _Location:_ `src/http_controller.cpp:1021-1037`. Map the rethrow site to the enclosing coroutine's handler; confirm it can absorb arbitrary write exceptions without panicking.
+  _Complexity:_ Low.
+
+- _M1, M5, M7, M8, M9, M12, M14 — covered by the cross-cutting items above._
+
+### P3 — LOW findings (rolled up)
+
+- [ ] **[P3] Defensive cleanup — LOW findings from the audit**
+  _Coverage:_ L1-L12 from the audit doc — rate-limiter fail-open behaviour, manual-vs-RAII active-request decrement, header null-check defence, cache-iterator return shape, vocab-id sign assertion at config load, recursive subspan logic, histogram negative-duration guard, connection-pool TOCTOU defence.
+  _Justification:_ None are exploitable today; bundling avoids 12 trivial PRs.
+  _Approach:_ Single sweep PR. Skip any item whose mitigation would be more code than the latent risk.
+  _Complexity:_ Low overall.
+
+### Verification & follow-up
+
+- [ ] **[P2] Add libFuzzer harnesses for the audit's input boundaries**
+  _Justification:_ The most reachable crash candidates from the audit (H2, H8, H10, M6, M12) are driven by request-body or backend-response bytes. Targeted fuzzers on `RequestRewriter::extract_*`, `StreamParser::push`, and `RadixTree::insert/lookup` would shake these out without an integration env.
+  _Approach:_ One harness per entry point, seed corpus from existing unit-test fixtures.
+  _Complexity:_ Medium.
+
+- [ ] **[P3] Re-run the audit after fixes land**
+  _Justification:_ The audit was static-only. After the cross-cutting items land, a follow-up pass should confirm no findings regressed and check the slow paths (cross-shard route-learning retries, gossip-driven backend churn, persistence backpressure escalation) explicitly excluded from the first pass.
+  _Complexity:_ Low.
 
 ---
 
