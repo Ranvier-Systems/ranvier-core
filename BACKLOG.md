@@ -988,102 +988,121 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
 
 ## 18. Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)
 
-Code follow-ups from the request-lifecycle crash-risk assessment in [`docs/audits/request-lifecycle-crash-audit.md`](docs/audits/request-lifecycle-crash-audit.md). The audit was static-only (no build / sanitiser / fuzz run), so the first action on each item is to confirm the finding against current source — line numbers may have drifted. Each item should land as its own PR.
+Follow-ups from the request-lifecycle crash-risk assessment in [`docs/audits/request-lifecycle-crash-audit.md`](docs/audits/request-lifecycle-crash-audit.md). The audit was static-only and produced 25 HIGH+MED findings of mixed quality. A second triage pass re-read the source around each finding; this section reflects the triage verdicts, not the raw audit list.
 
-The audit also recommends four cross-cutting fixes that close several findings at once; those are listed first under "Cross-cutting" because doing them collapses many of the per-finding entries below.
+**Triage outcome:**
+- 8 CONFIRMED → fix tickets below
+- 10 MITIGATED → closed with a one-line evidence note (see audit doc)
+- 4 HYPOTHETICAL → defensive-only, rolled into a single sweep ticket
+- 3 INVESTIGATE-FURTHER → empirical follow-ups (sanitiser / fuzz)
 
-### Cross-cutting (do these first)
+Even some CONFIRMED items have only hypothetical reachability (operator-misconfiguration or "if a future caller…"). They are kept on the list because each fix is trivial; do not treat them as security findings.
+
+Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). Anything that survives a multi-hour fuzz run on its corresponding boundary should be moved from this section to "MITIGATED-BY-FUZZ" in the audit doc.
+
+### Cross-cutting (do these first — each closes several findings)
 
 - [ ] **[P1] Adopt a `with_timeout` helper on the request hot path**
-  _Justification:_ Closes audit findings H3 (reactor-blocking FFI fallback) and M5 (thread-pool future with no timeout); also makes M15 easier to reason about.
+  _Closes:_ H3 (reactor-blocking FFI fallback), M5 (thread-pool future with no timeout). Also tightens M15.
   _Approach:_ Single helper `co_await with_request_deadline(ctx, fut)` that maps `seastar::timed_out_error` to a structured request error. Apply to `encode_threaded_async`, `submit_async`, and the chunk-read site in `stream_backend_response`.
   _Complexity:_ Medium.
 
-- [ ] **[P1] Saturating-cast helpers for size / duration arithmetic**
-  _Justification:_ Closes H2, H9, H10, M9, M12 — all are `uint64_t→size_t` or `double→int64_t` casts that lack explicit bounds checks.
-  _Approach:_ Add `safe_size_cast(uint64_t)` and `saturating_ms(double)` in a new `src/numeric_safety.hpp`. Grep `static_cast<size_t>(` and `static_cast<int64_t>(` along the request path; route each through the helper or document why not.
-  _Complexity:_ Low per site, medium in aggregate.
-
-- [ ] **[P1] Empty-collection guard helper for backend selection**
-  _Justification:_ Closes H6, M7, M8 — `live_backends[0]` and `% live_backends.size()` are reached after their empty checks via paths that don't re-check.
-  _Approach:_ Replace direct indexing in `router_service.cpp` with a `select_backend(live_backends, …) -> std::optional<Backend>` helper that owns the empty / single / hash / random cases.
-  _Complexity:_ Medium.
-
 - [ ] **[P1] Document and assert the shutdown lifetime contract**
-  _Justification:_ Closes H4, H5, M1, M14. The single invariant — gate awaited before destruction, workers joined before alien teardown, fire-and-forget futures tracked by the gate — currently lives in commit history rather than code.
-  _Approach:_ Add `~HttpController()` / `~TokenizerThreadPool()` asserts that the gate is closed and futures empty. Add a comment block in each describing the required teardown order. Capture `seastar::shared_ptr<HttpController>` (or equivalent) in long-lived lambdas instead of raw `[this]`.
+  _Closes:_ H5 (alien instance captured by reference), M14 (`.then()` route-learning captures raw `[this]`).
+  _Note:_ Triage downgraded H4 (TokenizerThreadPool promise race) and M1 (streaming-lambda `[this]`) to MITIGATED — the gate-holder pattern already covers them. This ticket only needs to handle H5 and M14.
+  _Approach:_ Capture `seastar::shared_ptr<HttpController>` (or equivalent) in long-lived `.then()` chains instead of raw `[this]`. Either capture the alien by value (if the API allows) or assert join-before-alien-teardown ordering in `~TokenizerThreadPool()`. Add a comment block describing the required shutdown order.
   _Complexity:_ Medium.
 
-### P1 — HIGH findings
+### P1 — CONFIRMED HIGHs
 
 - [ ] **[P1] H1: Replace `*slot.units` with checked access**
-  _Location:_ `src/http_controller.cpp:1986`. Use `slot.units.value()` (or assert + `*`) so a `nullopt` produces an abort, not UB.
-  _Complexity:_ Trivial.
+  _Location:_ `src/http_controller.cpp:1986`. Triage notes the dereference is currently safe via the `rejected` guard at line 1969; risk is "future refactor" only. Fix is one line — use `slot.units.value()` or assert.
+  _Complexity:_ Trivial. _Reachability:_ Hypothetical (refactor footgun).
+
+- [ ] **[P1] H2: Validate Content-Length before `uint64_t→size_t` cast**
+  _Location:_ `src/http_controller.cpp:2742`. Compare parsed `uint64_t` against `max_request_body_bytes` *before* casting; reject (413) if larger.
+  _Complexity:_ Trivial. _Reachability:_ Network-input on 32-bit hosts; on 64-bit hosts the cast is lossless but explicit validation still desirable.
+
+- [ ] **[P1] H3: Wrap local-FFI tokenizer fallback in `with_timeout`**
+  _Location:_ `src/tokenizer_service.cpp:381` (called via `src/http_controller.cpp:1318`). Subsumed by the cross-cutting `with_timeout` ticket.
+  _Complexity:_ Low (once the helper exists).
+
+- [ ] **[P1] H5: Fix alien-instance capture lifetime**
+  _Location:_ `src/tokenizer_thread_pool.cpp:66`. Subsumed by the cross-cutting shutdown-contract ticket.
+  _Complexity:_ Medium.
 
 - [ ] **[P1] H7: Saturate `total_weight` in weighted random selection**
   _Location:_ `src/router_service.cpp:2144-2152`. Cap the accumulator and assert `> 0` before constructing `uniform_int_distribution`.
-  _Complexity:_ Trivial.
+  _Complexity:_ Trivial. _Reachability:_ Operator-misconfiguration only.
 
-- [ ] **[P1] H8: Verify ART `split_long_prefix` boundary read**
-  _Location:_ `src/radix_tree.hpp:1098-1121`. Audit flagged `prefix[MAX_PREFIX_LENGTH]` as one-past-the-buffer for exactly-sized prefixes. May already be mitigated by an extra-byte buffer — confirm before changing. If not, index `MAX_PREFIX_LENGTH - 1` or split out an explicit edge-byte field.
+- [ ] **[P1] H9: Cap exponential backoff before `double→int64_t` cast**
+  _Location:_ `src/http_controller.cpp:755-757`. Compute `next_ms` in `double`, clamp to `max_backoff_ms`, then cast.
+  _Complexity:_ Trivial. _Reachability:_ Confirmed via code shape; requires enough retries to wrap, which is operationally rare but not impossible.
+
+### P2 — CONFIRMED MEDs not subsumed by cross-cutting
+
+- [ ] **[P2] M5: Add timeout to `TokenizerThreadPool::submit_async` callers**
+  Subsumed by the cross-cutting `with_timeout` ticket.
   _Complexity:_ Low.
 
-- _H2, H3, H4, H5, H6, H9, H10 — covered by the four cross-cutting items above; track resolution there._
-
-### P2 — MED findings
-
-- [ ] **[P2] M2: Normalise the optional-units pattern**
-  _Location:_ `src/http_controller.cpp:1119`. Same `*opt` pattern as H1; not currently exploitable but a refactoring footgun.
-  _Complexity:_ Trivial.
-
-- [ ] **[P2] M3: Tighten `encode_cached_async` text ownership**
-  _Location:_ `src/tokenizer_service.cpp:243-312`. Either take `std::string&&` or document "must copy before any `co_await`" at the entry.
-  _Complexity:_ Trivial.
-
-- [ ] **[P2] M4: Catch `std::bad_alloc` inside `smp::submit_to` lambda**
-  _Location:_ `src/tokenizer_service.cpp:254-291`. Return `{{}, false}` from the lambda on alloc failure rather than letting the exception cross the dispatch boundary; or enforce a hard body-size cap upstream.
-  _Complexity:_ Low.
-
-- [ ] **[P2] M6: Surface RapidJSON nesting errors distinctly**
-  _Location:_ `src/request_rewriter.hpp:342`. Distinguish nesting-limit failures from generic parse errors in metrics / logs; consider lowering the implicit nesting cap.
-  _Complexity:_ Low.
-
-- [ ] **[P2] M10: Bound the fallback walker**
-  _Locations:_ `src/circuit_breaker.hpp:78-80`, `src/http_controller.cpp::get_fallback_backend` (~217-230). Verify the documented "up to 3 attempts" cap is enforced; combined with `failure_threshold = 0` configs, an unbounded walker risks a CPU loop on a dead cluster.
-  _Complexity:_ Low.
-
-- [ ] **[P2] M11: Buffer to first CRLF before HTTP status snoop**
-  _Location:_ `src/stream_parser.cpp:152-157`. A first chunk shorter than `"HTTP/1.1 200"` silently misses 2xx detection — circuit breaker miss, no TTFB, no route learning.
-  _Complexity:_ Low.
-
-- [ ] **[P2] M13: Centralise `bundle.is_valid` write/read**
-  _Location:_ `src/http_controller.cpp:2191-2200` (read), 11 write sites (e.g. 776, 831, 857, 912, 921, 933, 948). Either promote to `std::atomic<bool>` if any cross-coroutine read is possible, or funnel mark-invalid through a single helper to make the reasoning local.
+- [ ] **[P2] M14: Stop capturing raw `[this]` in fire-and-forget route-learning**
+  _Location:_ `src/http_controller.cpp:991-999`. Subsumed by the cross-cutting shutdown-contract ticket.
   _Complexity:_ Medium.
 
-- [ ] **[P2] M15: Audit non-EPIPE write-error path**
-  _Location:_ `src/http_controller.cpp:1021-1037`. Map the rethrow site to the enclosing coroutine's handler; confirm it can absorb arbitrary write exceptions without panicking.
+### P3 — Defensive only (HYPOTHETICAL findings, single sweep)
+
+- [ ] **[P3] Defensive sweep: M3, M6, M9, M11**
+  _Coverage:_
+  - **M3** (`tokenizer_service.cpp:243-312`) — document the "string_view must be copied before first co_await" invariant at the entry, or take `std::string&&`.
+  - **M6** (`request_rewriter.hpp:342`) — distinguish RapidJSON nesting-limit failures from generic parse errors in metrics.
+  - **M9** (`router_service.cpp:1145`) — `int64_t→int32_t` cast in jump-hash; only matters if num_buckets > 2^31, but document the assumption.
+  - **M11** (`stream_parser.cpp:152-157`) — buffer to first CRLF before HTTP status snoop. Not a crash; observability regression on split TCP segments.
+
+  _Justification:_ None are exploitable; bundling avoids four trivial PRs. Skip any item whose mitigation would be more code than the latent risk.
+  _Complexity:_ Low overall.
+
+### P2 — INVESTIGATE FURTHER (empirical, not fix tickets)
+
+- [ ] **[P2] M4 investigation: confirm `std::bad_alloc` propagation across `smp::submit_to`**
+  _Location:_ `src/tokenizer_service.cpp:254-291`.
+  _What's unclear:_ Whether a `std::bad_alloc` thrown inside the cross-shard lambda is repackaged as `broken_promise` or propagated cleanly to the outer `try/catch` at `http_controller.cpp:1340`.
+  _How to resolve:_ One unit test that forces an allocation failure (e.g. via a custom `std::pmr` allocator or `LD_PRELOAD` malloc shim) inside the submitted lambda; observe the exception type at the catch site.
+  _Decision rule:_ If the exception is repackaged, add a try/catch inside the lambda. If propagated cleanly, mark MITIGATED in the audit doc.
+  _Complexity:_ Medium.
+
+- [ ] **[P3] M7 investigation: cross-shard `get_live_backends` race during reconfiguration**
+  _Location:_ `src/router_service.cpp:529-540`.
+  _What's unclear:_ Whether `smp::invoke_on_all` reconfigurations can interleave with a per-shard lookup such that two sequential reads see inconsistent state.
+  _How to resolve:_ TSan run during a backend-churn integration test; or code-read of all `invoke_on_all` callers that mutate `backends` to confirm they hold the gate.
   _Complexity:_ Low.
 
-- _M1, M5, M7, M8, M9, M12, M14 — covered by the cross-cutting items above._
-
-### P3 — LOW findings (rolled up)
-
-- [ ] **[P3] Defensive cleanup — LOW findings from the audit**
-  _Coverage:_ L1-L12 from the audit doc — rate-limiter fail-open behaviour, manual-vs-RAII active-request decrement, header null-check defence, cache-iterator return shape, vocab-id sign assertion at config load, recursive subspan logic, histogram negative-duration guard, connection-pool TOCTOU defence.
-  _Justification:_ None are exploitable today; bundling avoids 12 trivial PRs.
-  _Approach:_ Single sweep PR. Skip any item whose mitigation would be more code than the latent risk.
-  _Complexity:_ Low overall.
+- [ ] **[P3] M10 investigation: hard cap on fallback walker**
+  _Location:_ `src/circuit_breaker.hpp:78-80`, `http_controller.cpp::get_fallback_backend` (~217-229).
+  _What's unclear:_ Triage found `failure_threshold` defaults to 5 and the loop is bounded by `get_all_backend_ids().size()` — likely already safe. Confirm the loop has an explicit max-iterations cap independent of the backend list size.
+  _How to resolve:_ One focused code read; if the cap exists, mark MITIGATED.
+  _Complexity:_ Trivial.
 
 ### Verification & follow-up
 
-- [ ] **[P2] Add libFuzzer harnesses for the audit's input boundaries**
-  _Justification:_ The most reachable crash candidates from the audit (H2, H8, H10, M6, M12) are driven by request-body or backend-response bytes. Targeted fuzzers on `RequestRewriter::extract_*`, `StreamParser::push`, and `RadixTree::insert/lookup` would shake these out without an integration env.
-  _Approach:_ One harness per entry point, seed corpus from existing unit-test fixtures.
-  _Complexity:_ Medium.
+- [x] **[P2] libFuzzer harnesses for the audit's input boundaries**
+  Landed alongside this triage at `tests/fuzz/` — one harness each for `RadixTree::insert/lookup`, `RequestRewriter::extract_*`, and `StreamParser::push`. Build with `-DRANVIER_BUILD_FUZZERS=ON` (clang only). See `tests/fuzz/README.md` for run instructions.
+  _Follow-up:_ run each harness for at least 2 hours on a developer box; report results in the audit doc as MITIGATED-BY-FUZZ or as new reproducer entries.
+
+- [ ] **[P2] Run unit tests + benchmarks under ASan/UBSan**
+  _Justification:_ Catches the integer-overflow / cast findings (H2, H9) and any heap UAF along the request path with no harness work.
+  _Approach:_ Add a `Dockerfile.sanitize` (or a flag in the existing test container) that builds with `-fsanitize=address,undefined`. Run the full unit-test suite and the smoke benchmarks. Triage any new failures separately from this audit.
+  _Complexity:_ Low (build config) + variable (triage of any failures found).
 
 - [ ] **[P3] Re-run the audit after fixes land**
-  _Justification:_ The audit was static-only. After the cross-cutting items land, a follow-up pass should confirm no findings regressed and check the slow paths (cross-shard route-learning retries, gossip-driven backend churn, persistence backpressure escalation) explicitly excluded from the first pass.
+  _Justification:_ The audit was static-only and excluded slow paths (cross-shard route-learning retries, gossip-driven backend churn, persistence backpressure escalation). A follow-up pass after the cross-cutting tickets land should re-grade the remaining items and extend coverage to the excluded paths.
   _Complexity:_ Low.
+
+### Closed by triage (no action — recorded for traceability)
+
+The following findings from the original audit were re-read against current source and judged MITIGATED. The audit doc carries the per-item evidence.
+
+- **HIGHs MITIGATED:** H4 (TokenizerThreadPool promise race — promises set before `_pending_jobs` clear), H6 (`live_backends[0]` — empty check is at the immediately preceding line), H8 (ART `prefix[MAX_PREFIX_LENGTH]` — buffer is over-allocated), H10 (`_chunk_bytes_needed + 2` — `max_chunk_size` cap upstream).
+- **MEDs MITIGATED:** M1 (streaming-lambda `[this]` — gate holder lifetime), M2 (optional-units pattern — guarded), M8 (modulo on live_backends — empty check at preceding line), M12 (Content-Length parse — comparator is safe for valid `size_t`), M13 (`bundle.is_valid` — single-coroutine access only), M15 (non-EPIPE rethrow — Seastar-handler-safe by design).
 
 ---
 

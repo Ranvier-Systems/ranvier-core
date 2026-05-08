@@ -6,6 +6,30 @@ assessment was produced without compiling or running the code; each finding
 should be confirmed against the live source (file:line refs may drift) and
 verified with a targeted test or sanitiser run before remediation.
 
+> **Triage addendum (2026-05-08).** A second pass re-read the source around
+> each HIGH and MED finding. Verdicts are summarised below; per-item
+> dispositions are tracked in [BACKLOG.md §18](../../BACKLOG.md#18-request-lifecycle-crash-risk-audit-follow-ups-2026-05-08).
+> The original findings are preserved verbatim for traceability.
+>
+> | Verdict | HIGHs | MEDs |
+> |---------|-------|------|
+> | CONFIRMED (fix) | H1, H2, H3, H5, H7, H9 | M5, M14 |
+> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M8, M12, M13, M15 |
+> | HYPOTHETICAL (defensive only) | — | M3, M6, M9, M11 |
+> | INVESTIGATE FURTHER | — | M4, M7, M10 |
+>
+> Two CONFIRMED items deserve a footnote: H1 and H7 are CONFIRMED by code
+> shape (the dereference / arithmetic exists as flagged), but reachability
+> in both cases is via "future caller refactor" or "operator
+> misconfiguration" rather than network input. They are kept on the fix
+> list because the cost of fixing each is trivial; do not treat them as
+> security findings.
+>
+> Empirical follow-up: libFuzzer harnesses for the high-attack-surface
+> boundaries land alongside this triage at `tests/fuzz/`. They cover
+> H8/H10/M6/M11/M12 — anything that converts to "no crash after N hours"
+> can be moved to MITIGATED with confidence.
+
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS
 contexts.

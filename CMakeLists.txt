@@ -1155,3 +1155,72 @@ foreach(_t ${_ranvier_all_targets})
     add_dependencies(unit_tests ${_t})
   endif()
 endforeach()
+
+# =============================================================================
+# Fuzz Harnesses (opt-in)
+# =============================================================================
+# libFuzzer-based harnesses for boundaries identified in the request-lifecycle
+# crash-risk audit. Disabled by default — they require clang and add
+# -fsanitize=fuzzer,address,undefined to the harness binaries only. See
+# tests/fuzz/README.md for usage.
+option(RANVIER_BUILD_FUZZERS "Build libFuzzer harnesses (requires clang)" OFF)
+
+if(RANVIER_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR
+            "RANVIER_BUILD_FUZZERS=ON requires clang/clang++; got "
+            "${CMAKE_CXX_COMPILER_ID}. Re-run cmake with "
+            "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++.")
+    endif()
+
+    set(_fuzz_flags -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+
+    # RadixTree fuzzer (pure C++, no Seastar)
+    add_executable(radix_tree_fuzz
+      tests/fuzz/radix_tree_fuzz.cpp
+      src/node_slab.cpp
+    )
+    target_include_directories(radix_tree_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(radix_tree_fuzz
+      PRIVATE
+      absl::inlined_vector
+    )
+    target_compile_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
+    target_link_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
+
+    # RequestRewriter fuzzer (pure C++, RapidJSON only)
+    add_executable(request_rewriter_fuzz
+      tests/fuzz/request_rewriter_fuzz.cpp
+    )
+    target_include_directories(request_rewriter_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(request_rewriter_fuzz
+      PRIVATE
+      rapidjson
+    )
+    target_compile_options(request_rewriter_fuzz PRIVATE ${_fuzz_flags})
+    target_link_options(request_rewriter_fuzz PRIVATE ${_fuzz_flags})
+
+    # StreamParser fuzzer (requires Seastar types)
+    if(Seastar_FOUND)
+        add_executable(stream_parser_fuzz
+          tests/fuzz/stream_parser_fuzz.cpp
+          src/stream_parser.cpp
+        )
+        target_include_directories(stream_parser_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(stream_parser_fuzz
+          PRIVATE
+          Seastar::seastar
+          absl::flat_hash_map
+        )
+        target_compile_options(stream_parser_fuzz PRIVATE ${_fuzz_flags})
+        target_link_options(stream_parser_fuzz PRIVATE ${_fuzz_flags})
+    else()
+        message(STATUS "Seastar not found — skipping stream_parser_fuzz")
+    endif()
+
+    add_custom_target(fuzz_harnesses
+      DEPENDS radix_tree_fuzz request_rewriter_fuzz)
+    if(Seastar_FOUND)
+        add_dependencies(fuzz_harnesses stream_parser_fuzz)
+    endif()
+endif()
