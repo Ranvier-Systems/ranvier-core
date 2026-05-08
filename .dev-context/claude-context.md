@@ -49,90 +49,133 @@ Before writing any code, verify:
 
 ```
 HTTP Request (:8080)
-  -> HttpController (sharded, one per core)
-  -> TokenizerService (BPE encoding with LRU cache)
+  -> HttpController (sharded, one per core; ingress concurrency cap)
+  -> RateLimiter (token-bucket; per-agent/IP)
+  -> AgentRegistry (User-Agent -> priority tier; pause/resume)
+  -> RequestScheduler (per-agent fair queue, CRITICAL/HIGH/NORMAL/LOW)
+  -> IntentClassifier (AUTOCOMPLETE / EDIT / CHAT)
+  -> ChatTemplate (llama3 / chatml / mistral / none) -> formatted prompt
+  -> TextValidator (UTF-8, null-byte, length)
+  -> TokenizerService
+       Layer 1: LRU cache (shard-local)
+       Layer 2: cross-shard P2C dispatch (ShardLoadBalancer)
+       Layer 3: TokenizerThreadPool (dedicated OS threads, 5-13ms FFI)
+  -> BoundaryDetector (per-message split for multi-depth prefix lookup)
+  -> RequestRewriter (inject prompt_token_ids into JSON body)
   -> RouterService
-     -> RadixTree (Adaptive Radix Tree - O(k) prefix lookup)
-     -> Fallback: consistent hash or weighted random
-  -> CircuitBreaker check
-  -> ConnectionPool -> GPU Backend
-  -> [Async] Learn route + persist + gossip broadcast
+       PREFIX: RadixTree (ART, O(k) lookup) -> consistent-hash fallback
+       HASH:   consistent hash on token prefix
+       RANDOM: uniform random (skips tokenization)
+  -> CircuitBreaker check (CLOSED / OPEN / HALF_OPEN)
+  -> ConnectionPool -> GPU Backend (vLLM / SGLang / TensorRT-LLM / Ollama / LM Studio)
+  -> StreamParser (SSE / chunked) -> client
+  -> [Async] Learn route -> AsyncPersistence (MPSC ring -> SQLite worker)
+                         -> GossipService (shard 0; ROUTE_ANNOUNCEMENT broadcast)
 ```
 
 ### Source Code Layout
 
 ```
 src/
-  main.cpp                    # Seastar reactor entry point
-  application.{hpp,cpp}       # Service lifecycle orchestration (CREATED->RUNNING->DRAINING->STOPPED)
+  main.cpp                    # Seastar reactor entry point (startup-only blocking I/O OK)
+  application.{hpp,cpp}       # Service lifecycle (CREATED -> STARTING -> RUNNING ->
+                              #                    DRAINING -> STOPPING -> STOPPED)
 
   # Routing Core
-  router_service.{hpp,cpp}    # Unified routing interface (prefix/hash/random modes)
-  radix_tree.hpp              # Adaptive Radix Tree (Node4/16/48/256, slab-allocated)
-  node_slab.{hpp,cpp}         # O(1) slab allocator for ART nodes
+  router_service.{hpp,cpp}    # Unified routing interface (PREFIX/HASH/RANDOM modes);
+                              #   route batching via pending buffer; gossip broadcast
+  radix_tree.hpp              # Adaptive Radix Tree (Node4/16/48/256, byte-keyed, LRU-bounded)
+  node_slab.{hpp,cpp}         # O(1) slab allocator for ART nodes (thread-local free-list)
 
   # HTTP Layer
-  http_controller.{hpp,cpp}   # Request handling, proxy, SSE streaming
-  connection_pool.hpp         # LRU + TTL connection management
-  circuit_breaker.hpp         # Backend health state machine (CLOSED/OPEN/HALF_OPEN)
-  rate_limiter.hpp            # Request throttling
-  stream_parser.{hpp,cpp}     # SSE stream parsing
-  request_rewriter.hpp        # Token ID injection into requests
+  http_controller.{hpp,cpp}   # Sharded request handler, proxy, SSE streaming, backpressure
+  connection_pool.hpp         # LRU + TTL connection management (templated on ClosePolicy)
+  circuit_breaker.hpp         # Per-backend state machine (CLOSED/OPEN/HALF_OPEN; templated Clock)
+  proxy_retry_policy.hpp      # Pure retry / backoff / fallback logic (no Seastar deps)
+  rate_limiter.hpp            # Seastar wrapper: cleanup timer + gate + Prometheus
+  rate_limiter_core.hpp       # Pure token-bucket algorithm (no Seastar deps)
+  request_scheduler.hpp       # Per-agent fair scheduling, priority tiers
+  stream_parser.{hpp,cpp}     # Zero-copy chunked + SSE parser
+  request_rewriter.hpp        # Inject prompt_token_ids into request body (vLLM schema)
+
+  # Request Processing / Text
+  intent_classifier.{hpp,cpp} # AUTOCOMPLETE (FIM) / EDIT / CHAT classification (pure)
+  agent_registry.{hpp,cpp}    # User-Agent -> priority tier; pause/resume; shard-local
+  chat_template.hpp           # Pre-compiled templates (llama3, chatml, mistral, none)
+  boundary_detector.hpp       # Marker-scan + proportional estimation for message boundaries
+  text_boundary_info.hpp      # Boundary metadata used for multi-depth prefix extraction
+  text_validator.hpp          # UTF-8 / null-byte / length validation (pre-tokenizer)
+  cache_event_parser.hpp      # POST /v1/cache/events JSON parser (eviction/load events)
 
   # Tokenization
-  tokenizer_service.{hpp,cpp} # HuggingFace BPE via Rust FFI (sharded, one per core)
-  tokenizer_thread_pool.{hpp,cpp} # Thread pool for FFI calls (5-13ms each)
+  tokenizer_service.{hpp,cpp} # 3-layer: LRU cache -> cross-shard P2C -> thread pool
+  tokenizer_thread_pool.{hpp,cpp} # Dedicated OS workers for FFI (5-13ms BPE calls)
 
-  # Clustering
-  gossip_service.{hpp,cpp}    # Cluster state sync coordinator (shard 0 only)
-  gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery, DNS discovery
+  # Clustering / Gossip
+  gossip_service.{hpp,cpp}    # Cluster state sync orchestrator (shard 0 only)
+  gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery (ACKs), DNS discovery;
+                              #   ROUTE_ANNOUNCEMENT, HEARTBEAT, ROUTE_ACK,
+                              #   NODE_STATE, CACHE_EVICTION (big-endian)
   gossip_transport.{hpp,cpp}  # UDP channel, DTLS encryption
   gossip_consensus.{hpp,cpp}  # Peer table, quorum, split-brain detection
-  crypto_offloader.{hpp,cpp}  # DTLS crypto on worker threads
-  dtls_context.{hpp,cpp}      # OpenSSL DTLS session management
+  crypto_offloader.{hpp,cpp}  # Adaptive DTLS crypto offload (symmetric on-shard,
+                              #   asymmetric to worker thread); stall tracking
+  dtls_context.{hpp,cpp}      # OpenSSL DTLS session management (mTLS support)
+  byte_order.hpp              # Endian helpers for wire format
 
   # Configuration
   config.hpp                  # Facade header (includes schema + loader)
   config_infra.hpp            # Infrastructure config structs (ServerConfig, PoolConfig, etc.)
   config_schema.hpp           # Ranvier-specific configs (RoutingConfig, AssetsConfig, RanvierConfig)
   config_loader.{hpp,cpp}     # YAML parsing + env var overrides
+  config_loader_async.{hpp,cpp} # Async config reload (no reactor stalls; SIGHUP path)
   sharded_config.hpp          # Lock-free per-shard config distribution
 
   # Persistence
   persistence.hpp             # Interface definition
   sqlite_persistence.{hpp,cpp} # SQLite WAL-mode backend
-  async_persistence.{hpp,cpp} # Fire-and-forget queue with batch writes
+  async_persistence.{hpp,cpp} # Fire-and-forget MPSC ring -> dedicated OS worker (alien::run_on)
+  mpsc_ring_buffer.hpp        # Lock-free bounded MPSC queue (Vyukov; power-of-two)
 
   # Infrastructure
-  health_service.{hpp,cpp}    # Backend liveness monitoring
-  k8s_discovery_service.{hpp,cpp} # Kubernetes EndpointSlice watching
-  metrics_helpers.hpp         # Reusable histogram/bucket infrastructure (MetricHistogram, BackendMetrics)
-  metrics_service.hpp         # Ranvier-specific Prometheus metrics (:9180)
-  tracing_service.{hpp,cpp}   # OpenTelemetry (optional, Zipkin exporter)
-  shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch
-  shard_load_metrics.hpp      # Per-shard load tracking
-  cross_shard_request.hpp     # Safe cross-shard pointer passing
+  backend_registry.hpp        # Abstract backend lifecycle interface (decouples discovery + health)
+  health_service.{hpp,cpp}    # Backend liveness loop + vLLM /metrics scrape; ACTIVE/DRAINING
+  k8s_discovery_service.{hpp,cpp} # K8s EndpointSlice watcher; ranvier.io/* annotations
+  local_discovery.{hpp,cpp}   # Probe local ports (Ollama 11434, vLLM 8080, LM Studio 1234, ...)
+  metrics_service.hpp         # Ranvier Prometheus metrics (:9180); thread-local counters/gauges
+  metrics_helpers.hpp         # Reusable histogram/bucket infra (MetricHistogram, BackendMetrics)
+  metrics_auth_handler.hpp    # Auth / access control for metrics endpoint
+  prometheus_parser.hpp       # Parse Prometheus text exposition (for vLLM scrape)
+  vllm_metrics.hpp            # Per-backend vLLM stats struct (running/queued, KV-cache %, tps)
+  tracing_service.{hpp,cpp}   # OpenTelemetry (optional WITH_TELEMETRY=ON; Zipkin/OTLP)
+  shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch (snapshot-cached)
+  shard_load_metrics.hpp      # Per-shard load tracking (active + queued requests)
+  cross_shard_request.hpp     # Safe foreign_ptr unwrap for cross-shard data
 
   # Utilities
-  types.hpp                   # Core type aliases (TokenId, BackendId)
-  logging.hpp                 # Structured logging
-  parse_utils.hpp             # Safe string-to-number conversion
-  text_validator.hpp          # Input validation
+  types.hpp                   # Core aliases (TokenId, BackendId), kYieldInterval
+  logging.hpp                 # Structured logging + request-ID generation
+  parse_utils.hpp             # Safe string-to-number, hex decoding
+
+  dashboard/                  # Embedded web UI assets
 
 tests/
-  unit/                       # 24+ Google Test files
+  unit/                       # Google Test (reactor-free where possible)
   integration/                # Python tests + Locust load testing
 
 deploy/helm/ranvier/          # Kubernetes Helm chart
 
+docs/internals/               # Authoritative deep-dives (see Documentation Map below)
 .dev-context/                 # Workflow prompts, audit findings, cheatsheet
 ```
 
 ### Key Types
 
 ```cpp
-using TokenId = int32_t;     // BPE token identifier
-using BackendId = int32_t;   // GPU pool identifier
+// src/types.hpp
+using TokenId   = int32_t;            // BPE token identifier
+using BackendId = int32_t;            // GPU pool identifier
+inline constexpr size_t kYieldInterval = 128;  // co_await maybe_yield() cadence
 
 struct RouteResult {
     std::optional<BackendId> backend_id;
@@ -141,9 +184,29 @@ struct RouteResult {
     std::string error_message;
 };
 
-enum class RoutingMode { PREFIX, HASH, RANDOM };
-enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
+// Routing / proxy
+enum class RoutingMode         { PREFIX, HASH, RANDOM };
+enum class CircuitState        { CLOSED, OPEN, HALF_OPEN };
+enum class ConnectionErrorType { NONE, BROKEN_PIPE, CONNECTION_RESET };
+
+// Request classification / scheduling
+enum class RequestIntent { AUTOCOMPLETE, CHAT, EDIT };
+enum class PriorityLevel { CRITICAL, HIGH, NORMAL, LOW };
+
+// Templates / crypto
+enum class ChatTemplateFormat { none, llama3, chatml, mistral };
+enum class CryptoOpType {
+    SYMMETRIC_ENCRYPT, SYMMETRIC_DECRYPT,
+    HANDSHAKE_INITIATE, HANDSHAKE_CONTINUE, UNKNOWN
+};
+
+// Application lifecycle (application.hpp)
+enum class ApplicationState {
+    CREATED, STARTING, RUNNING, DRAINING, STOPPING, STOPPED
+};
 ```
+
+Service start order: `TokenizerService` -> `RouterService` -> `HttpController` -> `HealthService` -> `AsyncPersistenceManager` -> `K8sDiscoveryService` -> `GossipService`. Shutdown reverses this.
 
 ## Critical Constraints for Coding
 
@@ -260,6 +323,21 @@ The full server binary (`ranvier_server`) requires Seastar installed on the syst
 - **API:** Admin on `:8080`, Data on `:8080`, Metrics on `:9180`.
 - **Persistence:** SQLite tracks backends and routes.
 - **Configuration:** YAML (default: `ranvier.yaml`) with env var overrides (e.g., `RANVIER_ROUTING_MAX_ROUTES=50000`). Hot-reload via SIGHUP (rate-limited to once per 10 seconds, atomic across all shards). See `ranvier.yaml.example`.
+
+### Authoritative deep-dives (`docs/internals/`)
+
+| File | Covers |
+|------|--------|
+| `radix-tree.md` | ART internals: byte-keyed Node4/16/48/256, slab allocator, path compression, LRU eviction. |
+| `prefix-affinity-routing.md` | Hybrid ART + consistent-hash fallback; backend KV-cache prerequisites (vLLM APC, SGLang RadixAttention); ~81% vs 49% cache hit. |
+| `tokenization.md` | 3-layer tokenization: LRU cache (80-90% hit) -> cross-shard P2C -> dedicated thread pool; FFI safety. |
+| `request-lifecycle.md` | End-to-end request path (ingress -> rate-limit -> tokenize -> boundary -> route -> circuit -> connect -> stream -> learn). Source of truth for tracing. |
+| `request-lifecycle-perf-analysis.md` | Perf mitigations: route batching (no per-request gossip), tokenization fallback, stale-connection retries, load-aware overrides. |
+| `shard-load-balancing.md` | P2C algorithm + snapshot cache; currently advisory (HTTP hot path not yet dispatching). |
+| `gossip-protocol.md` | Wire format, packet types (ROUTE_ANNOUNCEMENT / HEARTBEAT / ROUTE_ACK / NODE_STATE / CACHE_EVICTION), big-endian, ACK-based reliability, DTLS. |
+| `async-persistence.md` | Lock-free MPSC ring -> dedicated OS worker -> SQLite WAL; fire-and-forget API + backpressure; `process_batch` accumulator. |
+
+When changing behavior in any of these areas, update the corresponding doc in the same PR.
 
 ## CI/CD
 
