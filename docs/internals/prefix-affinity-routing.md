@@ -37,21 +37,39 @@ Request arrives with tokens
 └─────────────────────────────────────────┘
         │
    Found in ART?
-   ├─ YES → Route to learned backend (cache hit)
+   ├─ YES → preferred = learned backend (cache hit)
    │
    └─ NO ──┐
            ▼
 ┌─────────────────────────────────────────┐
 │  2. Hash Fallback (Deterministic)       │
-│     FNV-1a hash of first N tokens       │
-│     hash % num_backends = backend       │
+│     FNV-1a over block-aligned tokens →  │
+│     configured hash strategy (default:  │
+│     bounded-load + jump consistent hash)│
 └─────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────┐
-│  3. Learn Prefix (After Success)        │
-│     Store first N tokens → backend      │
-│     Future requests get ART hit         │
+│  3. Load-Aware Override (Optional)      │
+│     Divert to less-loaded backend if    │
+│     preferred is overloaded             │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│  4. Cost-Aware Override (Optional)      │
+│     Fast lane / budget redirect when    │
+│     cost-based routing is enabled       │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
+│  5. Learn Prefix (After Success)        │
+│     Store the originally-selected ART/  │
+│     hash backend (not the load/cost     │
+│     diversion target) so cache affinity │
+│     survives transient load spikes.     │
+│     Future requests get ART hit.        │
 └─────────────────────────────────────────┘
 ```
 
@@ -153,6 +171,8 @@ With multi-depth routing enabled:
 - A request continuing an existing conversation can match at any previous depth
 - Enables cache reuse for branching conversations and conversation continuations
 
+Multi-depth route storage is implemented by `RouterService::learn_route_global_multi()` in `router_service.cpp`, which inserts one ART entry per boundary. Per-message char offsets are pre-computed during JSON parsing (`message_char_ends` in `TextWithBoundaryInfo`) and translated to token boundaries by `boundary_detector.hpp` — either by re-tokenizing each formatted message or by proportional char-to-token estimation, depending on tokenizer availability.
+
 #### Enabling Multi-Depth Routing
 
 ```bash
@@ -171,7 +191,9 @@ Clients can specify multiple boundaries using the `prefix_boundaries` array:
 }
 ```
 
-This tells Ranvier to store routes at tokens 256, 306, and 406.
+This tells Ranvier to store routes at tokens 256, 306, and 406. The first boundary is also used as the hash-fallback prefix length so that hash routing matches the system-message depth.
+
+Client-provided `prefix_boundaries` is gated on **both** `accept_client_prefix_boundary` AND `enable_multi_depth_routing` — if either is disabled, the array is ignored and Ranvier falls back to single-boundary detection (`prefix_token_count` or automatic system-message detection).
 
 ### Prefix Boundary Configuration
 
@@ -188,24 +210,34 @@ This tells Ranvier to store routes at tokens 256, 306, and 406.
 |--------|-------------|
 | `prefix_boundary_used` | System message boundary detected and used |
 | `prefix_boundary_skipped` | Boundary skipped (no system messages, too short, etc.) |
-| `prefix_boundary_client` | Client-provided `prefix_token_count` was used |
-| `multi_depth_routes_stored` | Total routes stored via multi-depth learning |
+| `prefix_boundary_client` | Client-provided `prefix_token_count` or `prefix_boundaries` was used |
+| `router_multi_depth_routes_stored` | Total routes stored via multi-depth learning |
 
 ## Configuration
 
 ### Environment Variables
 
 ```bash
-# Enable prefix-affinity routing (default: true)
+# Legacy toggle: true=PREFIX mode, false=RANDOM mode
+# Superseded by RANVIER_ROUTING_MODE — kept for backward compatibility
 RANVIER_PREFIX_AFFINITY_ENABLED=true
 
 # Number of tokens to use as routing key (default: 128)
 RANVIER_PREFIX_TOKEN_LENGTH=128
 
-# Alternative: set routing mode directly
-# "prefix" enables prefix-affinity with ART, "hash" uses consistent hash only,
-# "random" uses weighted random distribution (no affinity)
+# Routing mode: "prefix" (ART + hash), "hash" (hash only, no learning),
+# or "random" (weighted random, no affinity). "round_robin" is accepted
+# as a legacy alias for "random".
 RANVIER_ROUTING_MODE=prefix
+
+# Hash strategy used by both PREFIX-mode fallback and HASH mode.
+# Values: "bounded_load" (default), "p2c", "jump", "modular"
+RANVIER_HASH_STRATEGY=bounded_load
+RANVIER_BOUNDED_LOAD_EPSILON=0.25   # capacity headroom for BOUNDED_LOAD
+RANVIER_P2C_LOAD_BIAS=2             # primary affinity bias for P2C
+
+# vLLM PagedAttention block alignment for the FNV-1a prefix hash (default: 16)
+RANVIER_BLOCK_ALIGNMENT=16
 
 # Prefix boundary detection (for multi-turn conversations)
 RANVIER_ENABLE_PREFIX_BOUNDARY=true
@@ -218,36 +250,48 @@ RANVIER_ENABLE_MULTI_DEPTH_ROUTING=false
 
 ```yaml
 routing:
-  prefix_affinity_enabled: true
+  routing_mode: prefix          # "prefix", "hash", or "random"
   prefix_token_length: 128
-  block_alignment: 16  # Align to vLLM's PagedAttention block size
+  block_alignment: 16           # Align to vLLM's PagedAttention block size
+  hash_strategy: bounded_load   # bounded_load | p2c | jump | modular
+  bounded_load_epsilon: 0.25
+  p2c_load_bias: 2
   enable_prefix_boundary: true  # Detect system message boundaries
   min_prefix_boundary_tokens: 4
-  accept_client_prefix_boundary: false  # Accept client-provided prefix_token_count
+  accept_client_prefix_boundary: false  # Accept prefix_token_count / prefix_boundaries
   enable_multi_depth_routing: false     # Store routes at multiple message depths
 ```
+
+`prefix_affinity_enabled: true|false` is also accepted as a legacy alias that maps to `routing_mode: prefix` or `routing_mode: random` respectively.
 
 ### Configuration Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `prefix_affinity_enabled` | `true` | Enable hybrid ART + hash routing |
-| `prefix_token_length` | `128` | Number of tokens to use as routing key |
-| `block_alignment` | `16` | Align prefix to vLLM block boundaries |
+| `routing_mode` | `prefix` | `prefix` (ART + hash), `hash` (hash-only), or `random` |
+| `prefix_token_length` | `128` | Number of tokens used as routing key when no boundary is available |
+| `block_alignment` | `16` | Align prefix to vLLM block boundaries before hashing |
+| `hash_strategy` | `bounded_load` | `bounded_load`, `p2c`, `jump`, or `modular` |
+| `bounded_load_epsilon` | `0.25` | Per-backend capacity headroom = `ceil(avg_load * (1 + ε))` |
+| `p2c_load_bias` | `2` | Switch to secondary only when `secondary + bias < primary` |
 | `enable_prefix_boundary` | `true` | Detect system message boundaries for multi-turn |
 | `min_prefix_boundary_tokens` | `4` | Minimum system message tokens to use as boundary |
-| `accept_client_prefix_boundary` | `false` | Accept client-provided `prefix_token_count` |
+| `accept_client_prefix_boundary` | `false` | Accept client-provided `prefix_token_count` / `prefix_boundaries` |
 | `enable_multi_depth_routing` | `false` | Store routes at multiple message depths |
 
 ## Implementation Details
 
 ### Key Files
 
-- `src/router_service.cpp` - `get_backend_for_prefix()` implements hybrid routing
-- `src/router_service.cpp` - `learn_route_global()` stores prefix (truncated to N tokens)
+- `src/router_service.cpp` - `route_request()` (top-level dispatch), `get_backend_for_prefix()` (hybrid ART+hash), `bounded_load_select()`, `p2c_select()`, `jump_consistent_hash()`, `apply_load_aware_selection()`
+- `src/router_service.cpp` - `learn_route_global()` (single boundary) and `learn_route_global_multi()` (multi-depth)
 - `src/radix_tree.hpp` - Adaptive Radix Tree with longest prefix match
-- `src/http_controller.cpp` - Routing decision and `X-Backend-ID` header
-- `src/config.hpp` - Configuration parsing
+- `src/parse_utils.hpp` - `hash_prefix()` (FNV-1a + block alignment) shared by router, header injection, and cache-event eviction
+- `src/http_controller.cpp` - Routing decision, prefix-boundary detection, `X-Backend-ID` header
+- `src/request_rewriter.hpp` - `extract_text_with_boundary_info()`, `extract_prefix_token_count()`, `extract_prefix_boundaries()`
+- `src/boundary_detector.hpp` - Translates char-level system-prefix boundary into token-level boundary
+- `src/config_schema.hpp` - `RoutingConfig` struct (the `config.hpp` header is a thin facade)
+- `src/config_loader.cpp` - YAML and environment-variable parsing
 
 ### System Message Boundary Detection
 
@@ -265,7 +309,22 @@ When a prefix boundary is available, Ranvier uses it (instead of `prefix_token_l
 
 ### Hash Function
 
-The hash fallback uses FNV-1a over the raw token bytes, with the token count first rounded down to the nearest `block_alignment` boundary (defaulting to 16, matching vLLM's PagedAttention block size). This alignment ensures that two prefixes differing only in trailing partial-block tokens hash identically. See `hash_prefix()` in `router_service.cpp` for the implementation.
+The hash fallback uses FNV-1a over the raw token bytes, with the token count first rounded down to the nearest `block_alignment` boundary (defaulting to 16, matching vLLM's PagedAttention block size). This alignment ensures that two prefixes differing only in trailing partial-block tokens hash identically. When the available token count is smaller than `block_alignment`, all available tokens are hashed (no truncation). See `hash_prefix()` in `parse_utils.hpp` for the implementation; the same helper is reused for the `X-Ranvier-Prefix-Hash` header and cache-event eviction lookups so that all three views agree byte-for-byte.
+
+### Hash Strategies
+
+The 64-bit FNV-1a hash is fed into one of four bucket-selection strategies, configurable via `hash_strategy` (env: `RANVIER_HASH_STRATEGY`). The strategy controls the **hash-fallback path** in `prefix` mode and the entire selection in `hash` mode.
+
+| Strategy | Behavior | Built-in load awareness |
+|----------|----------|-------------------------|
+| `bounded_load` (default) | Jump consistent hash + per-backend cap of `ceil(avg_load · (1 + ε))`. On overflow, sequentially probes adjacent buckets, then falls back to least-loaded. | Yes — supersedes the median-threshold override. |
+| `p2c` | Power-of-two-choices: hashes to a primary and a secondary (XORed with a per-request salt). Sticks to primary unless secondary's load is lower by at least `p2c_load_bias`. | Yes — supersedes the median-threshold override. |
+| `jump` | Plain Lamping/Veach jump consistent hash. Topology changes remap only ~1/n keys. | No — relies on the median-threshold override (Step 3). |
+| `modular` | `hash % num_backends`. **Benchmark only**: any topology change reshuffles all keys. | No — relies on the median-threshold override (Step 3). |
+
+`bounded_load_epsilon` (default `0.25`) and `p2c_load_bias` (default `2`) tune the corresponding strategies. All strategies honor the `load_aware_routing` toggle: when set to `false`, every strategy degrades to plain jump consistent hash with no diversion, giving operators a uniform escape hatch.
+
+Both `bounded_load` and `p2c` use **capacity-adjusted load** (active requests blended with cache headroom and GPU load) when `capacity_headroom_weight > 0` and headroom data is available, so backends near KV-cache exhaustion are deprioritized for large requests.
 
 ### X-Backend-ID Header
 
@@ -297,7 +356,14 @@ Content-Type: text/event-stream
 
 ## Load-Aware Routing
 
-When enabled (`load_aware_routing: true`), the router considers backend queue depth before routing to the prefix-preferred backend. This prevents hot spots when a single backend becomes overloaded with requests.
+When enabled (`load_aware_routing: true`, the default), the router considers backend queue depth before routing to the prefix-preferred backend. This prevents hot spots when a single backend becomes overloaded with requests.
+
+How load awareness is applied depends on the active `hash_strategy`:
+
+- **`bounded_load`** and **`p2c`** bake load awareness into selection itself (cap probing for bounded-load, secondary comparison for P2C). For ART hits, an additional check re-runs the strategy if the ART-selected backend exceeds the strategy's cap/bias.
+- **`jump`** and **`modular`** rely on a separate **median-threshold override** described below (`apply_load_aware_selection()`). It is also the only path that runs when `hash_strategy` is unset and the implicit default were `jump`.
+
+When `load_aware_routing: false`, all strategies skip diversion entirely.
 
 ### Problem
 
@@ -315,22 +381,26 @@ Request with prefix P1 → Backend 1 (prefix affinity)
 
 Load-aware routing checks the preferred backend's in-flight request count before routing. If the backend is overloaded and a significantly less-loaded alternative exists, the request is diverted to reduce tail latency.
 
-### Algorithm
+### Algorithm (median-threshold override)
 
-Uses a **relative threshold** based on the median load across all backends. This auto-adapts to any workload, model size, or cluster size — no per-model tuning needed.
+This is the algorithm used by the `jump` and `modular` strategies. It uses a **relative threshold** based on the median load across all backends, which auto-adapts to any workload, model size, or cluster size — no per-model tuning needed.
 
 ```
 1. Determine preferred backend (ART lookup or hash fallback)
-2. If preferred load is 0, route to preferred (fast path)
-3. Compute median load across all live backends (via nth_element, O(n))
-4. Compute threshold = median * load_imbalance_factor + load_imbalance_floor
-5. If preferred load > threshold:
+2. If load_aware_routing is disabled or fewer than 2 live backends, return preferred
+3. If preferred load is 0, route to preferred (fast path)
+4. Compute median composite load across all live backends (via nth_element, O(n))
+   composite = local_active_requests + gpu_load_score * gpu_load_weight
+5. Compute threshold = median * load_imbalance_factor + load_imbalance_floor
+6. If preferred load > threshold:
    - Find least-loaded backend among candidates
    - Route to least-loaded (accepting cache miss)
-6. Otherwise, route to preferred
+7. Otherwise, route to preferred
 ```
 
-See `apply_load_aware_selection()` in `router_service.cpp` for the implementation.
+See `apply_load_aware_selection()` in `router_service.cpp` for the implementation. The bounded-load and P2C strategies have their own integrated overrides — see `bounded_load_select()` and `p2c_select()` respectively.
+
+Regardless of which path produces the final backend, route learning (Step 5 of the high-level flow) uses the **originally selected** ART/hash backend, not the load-diversion target. This preserves long-term cache affinity across transient load spikes.
 
 ### Configuration
 
