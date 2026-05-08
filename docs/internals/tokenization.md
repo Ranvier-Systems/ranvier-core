@@ -73,11 +73,16 @@ The cache provides O(1) lookup for repeated texts, which is common for system me
 
 ```cpp
 struct TokenizationCacheConfig {
-    bool enabled = true;           // Enable/disable caching
-    size_t max_entries = 1000;     // Maximum cache entries (Rule #4)
-    size_t max_text_length = 8192; // Don't cache texts longer than this
+    bool enabled = true;            // Enable/disable caching
+    size_t max_entries = 1000;      // Maximum cache entries (Rule #4)
+    size_t max_text_length = 65536; // Don't cache texts longer than this
 };
 ```
+
+The 64 KB `max_text_length` is intentionally aligned with the thread-pool
+`max_text_length`. An older default of 8 KB caused boundary detection to skip
+caching for large system prefixes (2K–8K tokens), forcing a blocking FFI call
+on every request. Worst-case memory: 1000 entries × 64 KB ≈ 64 MB/shard.
 
 ### Expected Hit Rates
 
@@ -123,9 +128,19 @@ Currently uses simple round-robin to the next shard:
 ```cpp
 uint32_t select_tokenization_shard() const {
     uint32_t local = seastar::this_shard_id();
-    return (local + 1) % seastar::smp::count;
+    uint32_t shard_count = seastar::smp::count;
+    if (shard_count <= 1) {
+        return local;
+    }
+    return (local + 1) % shard_count;
 }
 ```
+
+Earlier versions of this file referenced "P2C" shard selection — that label
+survives in a few in-source comments but the implementation has always been
+plain round-robin. P2C-based selection via `ShardLoadBalancer` is wired up
+through `set_cross_shard_refs()` for future use, but `select_tokenization_shard()`
+ignores load and just rotates to the next shard.
 
 ## Layer 3: Thread Pool
 
@@ -151,30 +166,46 @@ Reactor Thread (shard N)           Worker Thread N
 
 ```cpp
 struct ThreadPoolTokenizationConfig {
-    bool enabled = false;          // Disabled by default (P3 priority)
-    size_t max_queue_size = 256;   // Bounded queue (Rule #4)
-    size_t min_text_length = 256;  // Skip for short texts
+    bool enabled = false;           // Struct default; application overrides to true
+    size_t max_queue_size = 256;    // Bounded queue (Rule #4)
+    size_t min_text_length = 64;    // Skip for short texts
     size_t max_text_length = 65536; // Skip for very long texts
 };
 ```
+
+> The `ThreadPoolTokenizationConfig` struct itself defaults `enabled` to
+> `false`, but the application's `AssetsConfig` (`tokenizer_thread_pool_enabled`)
+> defaults to **`true`**, so the thread pool is on by default in normal
+> deployments. Disable explicitly via env var or YAML if you need the old
+> behavior.
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RANVIER_TOKENIZER_THREAD_POOL` | `false` | Enable thread pool |
+| `RANVIER_TOKENIZER_THREAD_POOL_ENABLED` | `true` | Enable thread pool (`1`/`true`/`yes`) |
 | `RANVIER_TOKENIZER_THREAD_POOL_QUEUE_SIZE` | `256` | SPSC queue capacity |
-| `RANVIER_TOKENIZER_THREAD_POOL_MIN_TEXT` | `256` | Minimum text length |
+| `RANVIER_TOKENIZER_THREAD_POOL_MIN_TEXT` | `64` | Minimum text length |
 | `RANVIER_TOKENIZER_THREAD_POOL_MAX_TEXT` | `65536` | Maximum text length |
+| `RANVIER_TOKENIZATION_CACHE_ENABLED` | `true` | Enable LRU tokenization cache |
+| `RANVIER_TOKENIZATION_CACHE_SIZE` | `1000` | Maximum cache entries |
+| `RANVIER_TOKENIZATION_CACHE_MAX_TEXT` | `65536` | Skip cache for texts longer than this |
+| `RANVIER_TOKENIZER_LOCAL_FALLBACK_MAX_CONCURRENT` | `1` | Concurrent reactor-blocking tokenizations per shard |
 
 ### YAML Configuration
 
 ```yaml
 assets:
+  tokenization_cache_enabled: true
+  tokenization_cache_size: 1000
+  tokenization_cache_max_text: 65536
+
   tokenizer_thread_pool_enabled: true
   tokenizer_thread_pool_queue_size: 256
-  tokenizer_thread_pool_min_text: 256
+  tokenizer_thread_pool_min_text: 64
   tokenizer_thread_pool_max_text: 65536
+
+  tokenizer_local_fallback_max_concurrent: 1
 ```
 
 ### Key Components
@@ -228,20 +259,37 @@ stateDiagram-v2
 
 ### Prometheus Metrics
 
-#### Cache Metrics (TokenizerService)
+Metric registration is split across two services:
+
+- `MetricsService` (`ranvier_*`) — request-level counters recorded by the HTTP
+  controller on every tokenization, including cache hit/miss accounting.
+- `TokenizerService` (`ranvier_tokenizer_*`) — service-internal counters tied
+  directly to the local-fallback path.
+- `TokenizerThreadPool` (`ranvier_tokenizer_thread_pool_*`) — thread-pool
+  lifecycle and submission counters.
+
+#### Cache & Routing Counters (MetricsService)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `ranvier_tokenizer_cache_hits` | Counter | Cache hit count |
-| `ranvier_tokenizer_cache_misses` | Counter | Cache miss count |
-| `ranvier_tokenizer_cache_size` | Gauge | Current cache entries |
+| `ranvier_tokenization_cache_hits` | Counter | Cache hits recorded by the proxy hot path |
+| `ranvier_tokenization_cache_misses` | Counter | Cache misses recorded by the proxy hot path |
+| `ranvier_tokenization_cross_shard` | Counter | Cache misses dispatched to another shard |
+| `ranvier_tokenizer_errors` | Counter | Encode exceptions thrown during tokenization |
+| `ranvier_tokenization_skipped` | Counter | Requests routed without tokenization (random mode) |
 
-#### Cross-Shard Metrics (TokenizerService)
+> The shard-local cache size and per-shard hit/miss counters in
+> `TokenizationCache` are accessible programmatically (`cache_hits()`,
+> `cache_misses()`, `cache_size()`) but are **not** registered as Prometheus
+> metrics today. Operators should rely on the `ranvier_tokenization_cache_*`
+> counters above for cache-effectiveness dashboards.
+
+#### Local Fallback Metrics (TokenizerService)
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `ranvier_tokenizer_cross_shard_dispatches` | Counter | Cache misses sent to other shards |
-| `ranvier_tokenizer_local_fallbacks` | Counter | Tokenization done locally |
+| `ranvier_tokenizer_local_fallbacks` | Counter | Tokenizations completed on the reactor (blocking path) |
+| `ranvier_tokenizer_local_fallback_rejected` | Counter | Local fallback denied because the per-shard semaphore was already in use |
 
 #### Thread Pool Metrics (TokenizerThreadPool)
 
@@ -270,16 +318,20 @@ The primary + boundary split allows operators to identify whether tokenization t
 
 ```promql
 # Cache hit ratio
-sum(rate(ranvier_tokenizer_cache_hits[5m])) /
-(sum(rate(ranvier_tokenizer_cache_hits[5m])) + sum(rate(ranvier_tokenizer_cache_misses[5m])))
+sum(rate(ranvier_tokenization_cache_hits[5m])) /
+(sum(rate(ranvier_tokenization_cache_hits[5m])) + sum(rate(ranvier_tokenization_cache_misses[5m])))
 
-# Thread pool utilization
+# Thread pool utilization (fraction of cache misses that hit the worker pool)
 sum(rate(ranvier_tokenizer_thread_pool_jobs_submitted[5m])) /
-sum(rate(ranvier_tokenizer_cache_misses[5m]))
+sum(rate(ranvier_tokenization_cache_misses[5m]))
 
 # Queue full fallback rate
 sum(rate(ranvier_tokenizer_thread_pool_jobs_fallback[5m])) /
 sum(rate(ranvier_tokenizer_thread_pool_jobs_submitted[5m]))
+
+# Local-fallback rejection rate (semaphore already held)
+sum(rate(ranvier_tokenizer_local_fallback_rejected[5m])) /
+sum(rate(ranvier_tokenizer_local_fallbacks[5m]))
 
 # Boundary detection fraction of total tokenization time
 sum(rate(ranvier_router_boundary_detection_latency_seconds_sum[5m])) /
@@ -299,22 +351,22 @@ sum(rate(ranvier_router_primary_tokenization_latency_seconds_count[5m]))
 | Cross-shard | Target only | +1-10μs | Target shard reduced |
 | Local | Yes (5-13ms) | +5-13ms | All traffic affected |
 
-### When to Enable Thread Pool
+### Thread Pool Default
 
-Enable `tokenizer_thread_pool_enabled: true` when:
+The thread pool is **enabled by default** (`tokenizer_thread_pool_enabled = true`
+in `AssetsConfig`). Benchmarks showed ~60% P99 TTFT reduction and ~20%
+throughput improvement vs. the cross-shard-only path, which justified
+flipping the default. The legacy `false` default still lives on
+`ThreadPoolTokenizationConfig` itself, but `Application` always overlays the
+`AssetsConfig` value when constructing the sharded service.
 
-1. **Single-shard deployments**: Cross-shard dispatch provides no benefit
-2. **High cache miss rate**: Many unique texts reduce cache effectiveness
-3. **Latency-sensitive workloads**: Even target shard blocking is unacceptable
-4. **Benchmark shows stalls**: Use Prometheus metrics to identify reactor stalls
+### When to Disable
 
-### When to Keep Disabled (Default)
+Set `tokenizer_thread_pool_enabled: false` when:
 
-Keep disabled when:
-
-1. **High cache hit rate (>80%)**: Most requests served from cache
-2. **Multi-shard deployment**: Cross-shard dispatch already effective
-3. **Memory constrained**: Each shard's worker has its own tokenizer instance
+1. **Memory constrained**: Each shard's worker holds its own tokenizer instance
+2. **Diagnosing thread-pool issues**: Falls back to the cross-shard + local path
+3. **Single-shard deployment with very high cache hit rate**: Minimal benefit
 
 ## Tuning Guidelines
 
@@ -323,7 +375,7 @@ Keep disabled when:
 ```yaml
 # Maximize cache, skip thread pool overhead
 assets:
-  tokenizer_cache_max_entries: 5000
+  tokenization_cache_size: 5000
   tokenizer_thread_pool_enabled: false
 ```
 
@@ -334,7 +386,7 @@ assets:
 assets:
   tokenizer_thread_pool_enabled: true
   tokenizer_thread_pool_queue_size: 512
-  tokenizer_thread_pool_min_text: 128  # Lower threshold
+  tokenizer_thread_pool_min_text: 32   # Lower threshold for small prompts
 ```
 
 ### High Throughput
@@ -342,7 +394,7 @@ assets:
 ```yaml
 # Larger queue, aggressive caching
 assets:
-  tokenizer_cache_max_entries: 10000
+  tokenization_cache_size: 10000
   tokenizer_thread_pool_enabled: true
   tokenizer_thread_pool_queue_size: 1024
 ```
@@ -366,12 +418,21 @@ constexpr auto SPIN_ITERATIONS = 1000;
 constexpr auto SLEEP_DURATION = std::chrono::microseconds(100);
 
 while (!_shutdown.load(std::memory_order_acquire)) {
-    // Spin briefly for low latency
-    for (int i = 0; i < SPIN_ITERATIONS; ++i) {
-        if (_job_queue.pop(job)) { process_job(job); break; }
+    TokenizationJob job;
+    bool got_job = false;
+
+    // Spin briefly for low latency on bursty workloads
+    for (int i = 0; i < SPIN_ITERATIONS &&
+                    !_shutdown.load(std::memory_order_acquire); ++i) {
+        if (_job_queue.pop(job)) { got_job = true; break; }
     }
-    // Sleep if no job found
-    std::this_thread::sleep_for(SLEEP_DURATION);
+
+    if (!got_job) {
+        std::this_thread::sleep_for(SLEEP_DURATION);
+        continue;
+    }
+
+    process_job(job, alien_instance);
 }
 ```
 
@@ -401,17 +462,19 @@ Seastar replaces `malloc` globally with a per-shard allocator. Every allocation 
 
 The thread pool avoids both hazards by copying data at each thread boundary crossing:
 
-**Input: reactor → worker** (`tokenizer_thread_pool.cpp:148`)
+**Input: reactor → worker** (in `TokenizerWorker::process_job`, `src/tokenizer_thread_pool.cpp`)
 
 ```cpp
 // Reallocate the string on the worker thread so the reactor shard's
-// per-shard memory isn't held across the FFI call.
+// per-shard memory isn't held across the FFI call. Rust itself uses
+// jemalloc (patched at build time) and is allocator-safe, but keeping
+// the copy avoids pinning shard-local memory on a foreign thread.
 std::string local_text(job.text.data(), job.text.size());
 ```
 
 The job already contains an owned `std::string` copy (Rule #14), but that copy was allocated on the reactor's shard. Re-copying on the worker thread ensures the FFI call operates on worker-allocated memory, freeing the reactor's allocation for immediate reclaim.
 
-**Output: worker → reactor** (inside `alien::run_on()`, `tokenizer_thread_pool.cpp:171`)
+**Output: worker → reactor** (inside the `alien::run_on()` lambda)
 
 ```cpp
 // Copy tokens into shard-local memory. The captured vector was
@@ -419,9 +482,12 @@ The job already contains an owned `std::string` copy (Rule #14), but that copy w
 // keeps the hot path on the shard's own allocator and avoids
 // do_foreign_free overhead on the reactor.
 std::vector<int32_t> local_tokens(tokens.begin(), tokens.end());
+(*callback)(job_id, std::move(local_tokens), success);
 ```
 
 The result vector from `Encode()` was allocated on the worker thread. The `alien::run_on()` lambda captures it by move, then immediately copies it into a shard-local vector before passing to the completion callback. This ensures the reactor only ever owns shard-local memory.
+
+The same defense applies on the cross-shard path: in `encode_cached_async`, both the input string passed to `submit_to` and the result vector returned from the target shard are reallocated on the receiving shard before use.
 
 ### Rust-Side Allocator Isolation (jemalloc)
 
@@ -458,32 +524,39 @@ This gives Rust a completely independent jemalloc instance. All Rust-internal al
 
 ## Local Fallback Semaphore
 
-When both the thread pool and cross-shard dispatch are unavailable (queue full, text out of range, etc.), `encode_threaded_async()` falls through to Priority 4: local tokenization. This calls `tokenize_locally()`, which blocks the reactor for 5-13ms.
+When both the thread pool and cross-shard dispatch are unavailable (queue full, text out of range, etc.), `encode_threaded_async()` falls through to its last priority: local tokenization. This calls `tokenize_locally()`, which blocks the reactor for 5-13ms.
 
-Without concurrency control, multiple concurrent requests hitting Priority 4 on the same shard would compound the stall — each blocking call adds another 5-13ms during which the reactor cannot process events. On a busy shard, this can cascade into hundreds of milliseconds of reactor stall.
+> Numbering note: the in-source code labels this fall-through as **Priority
+> 3** because cache hits short-circuit before the priority chain begins (so
+> the chain is thread-pool → cross-shard → local). The earlier "Priority Order"
+> table in this doc treats the cache hit as Priority 1, making the same
+> fall-through Priority 4. Both numberings appear in the codebase and refer
+> to the same code path.
+
+Without concurrency control, multiple concurrent requests hitting the local fallback on the same shard would compound the stall — each blocking call adds another 5-13ms during which the reactor cannot process events. On a busy shard, this can cascade into hundreds of milliseconds of reactor stall.
 
 ### Semaphore Gating
 
-A `seastar::semaphore` limits concurrent local tokenizations per shard (`tokenizer_service.hpp:195-198`):
+A `seastar::semaphore` limits concurrent local tokenizations per shard (declared in `tokenizer_service.hpp`, configured via `configure_local_fallback()`):
 
 ```cpp
-// Configure the shard-local semaphore that gates Priority 4 (local fallback)
+// Configure the shard-local semaphore that gates Priority 3 (local fallback)
 // in encode_threaded_async(). Default is 1 concurrent local tokenization.
 // Setting to 0 effectively disables the local fallback entirely.
 void configure_local_fallback(size_t max_concurrent);
 ```
 
-The implementation uses `try_wait()` for non-blocking acquisition (`tokenizer_service.cpp:377-383`):
+`encode_threaded_async()` is a coroutine; the implementation uses `try_wait()` for non-blocking acquisition and a `seastar::defer` RAII guard to release on every exit path:
 
 ```cpp
-// Priority 4: Local tokenization (blocks reactor) — gated by semaphore
+// Priority 3: Local tokenization (blocks reactor) — gated by semaphore
 if (!_local_tokenize_sem.try_wait(1)) {
     ++_local_fallback_rejected;
-    return seastar::make_ready_future<TokenizationResult>(TokenizationResult{});
+    co_return TokenizationResult{};
 }
-// Scope guard: signal semaphore after tokenize_locally() returns (exception safety)
+// RAII guard: signal semaphore when scope exits (exception-safe, Rule #19)
 auto sem_guard = seastar::defer([this] { _local_tokenize_sem.signal(1); });
-return seastar::make_ready_future<TokenizationResult>(tokenize_locally(text));
+co_return tokenize_locally(text);
 ```
 
 If the semaphore is already exhausted, the request gets an empty `TokenizationResult` and the caller falls back to hash or random routing (no prefix-affinity, but no reactor stall either).
