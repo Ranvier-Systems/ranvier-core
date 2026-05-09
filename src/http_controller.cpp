@@ -5,6 +5,7 @@
 #include "logging.hpp"
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
+#include "request_timeout.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"
 #include "tracing_service.hpp"
@@ -869,7 +870,8 @@ future<> HttpController::stream_backend_response(
         temporary_buffer<char> chunk;
 
         try {
-            auto read_future = with_timeout(read_deadline, bundle->in.read());
+            auto read_future = with_request_timeout(
+                read_deadline, bundle->in.read(), "stream_chunk");
             chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
                 // Check for connection errors first
                 auto err_type = classify_connection_error(ep);
@@ -1315,7 +1317,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     //   2. Thread pool (if enabled): offloads FFI to worker thread
                     //   3. Cross-shard dispatch: P2C to least-loaded shard
                     //   4. Local fallback: blocks reactor (last resort)
-                    auto tok_result = co_await _tokenizer.local().encode_threaded_async(text_to_tokenize);
+                    //
+                    // Path 4 runs the Rust BPE call on the reactor; without a
+                    // hard ceiling a wedged tokenizer would block the entire
+                    // shard. Wrap with a deadline so the worst case is a
+                    // request-scoped timeout, not a permanent shard stall.
+                    constexpr auto kTokenizeTimeout = std::chrono::seconds(5);
+                    auto tok_result = co_await with_request_timeout(
+                        kTokenizeTimeout,
+                        _tokenizer.local().encode_threaded_async(text_to_tokenize),
+                        "tokenize");
                     tokens = std::move(tok_result.tokens);
 
                     // Set tracing attributes based on tokenization source
@@ -1339,6 +1350,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                             metrics().record_tokenization_cross_shard();
                         }
                     }
+                } catch (const request_timeout_error& e) {
+                    // Tokenizer exceeded its deadline (likely wedged FFI or
+                    // saturated thread pool) - fall back to round-robin so the
+                    // request can still make progress.
+                    log_proxy.warn("[{}] Tokenization timed out ({}), falling back to round-robin routing",
+                                   request_id, e.label());
+                    tokenize_span.set_error(std::string("tokenization_timeout: ") + e.label());
+                    metrics().record_tokenizer_error();
+                    tokens.clear();
                 } catch (const std::exception& e) {
                     // Tokenizer failed - log and continue without tokens (fall back to round-robin)
                     log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",

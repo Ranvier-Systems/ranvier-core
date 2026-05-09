@@ -1,6 +1,8 @@
 #include "tokenizer_service.hpp"
+#include "request_timeout.hpp"
 #include "shard_load_balancer.hpp"
 
+#include <optional>
 #include <stdexcept>
 
 #include <seastar/util/defer.hh>
@@ -340,24 +342,48 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
                 // Successfully submitted to thread pool
                 ++_thread_pool_dispatches;
 
-                // Convert ThreadPoolTokenizationResult to TokenizationResult
-                auto pool_result = co_await std::move(*future_opt);
-                TokenizationResult result;
-                result.tokens = std::move(pool_result.tokens);
-                result.cache_hit = pool_result.cache_hit;
-                result.cross_shard = false;  // Thread pool is shard-local
-                result.source_shard = local_shard;
-
-                // Cache locally for future lookups
-                std::string text_copy(text);
-                if (!result.tokens.empty()) {
-                    _cache.insert(text_copy, result.tokens);
+                // Bound the wait so a wedged worker can't strand the request
+                // forever (audit M5). On timeout, fall through to cross-shard
+                // / local just like the queue-full path.
+                constexpr auto kThreadPoolTokenizeTimeout =
+                    std::chrono::seconds(3);
+                std::optional<ThreadPoolTokenizationResult> pool_result_opt;
+                try {
+                    pool_result_opt = co_await with_request_timeout(
+                        kThreadPoolTokenizeTimeout,
+                        std::move(*future_opt),
+                        "tokenize_thread_pool");
+                } catch (const request_timeout_error&) {
+                    ++_thread_pool_fallbacks;
+                    log_tokenizer.warn("Thread pool tokenization timed out on "
+                                       "shard {} after {}s, falling through to "
+                                       "other priorities",
+                                       local_shard,
+                                       kThreadPoolTokenizeTimeout.count());
                 }
 
-                co_return result;
+                if (pool_result_opt) {
+                    // Convert ThreadPoolTokenizationResult to TokenizationResult
+                    auto& pool_result = *pool_result_opt;
+                    TokenizationResult result;
+                    result.tokens = std::move(pool_result.tokens);
+                    result.cache_hit = pool_result.cache_hit;
+                    result.cross_shard = false;  // Thread pool is shard-local
+                    result.source_shard = local_shard;
+
+                    // Cache locally for future lookups
+                    std::string text_copy(text);
+                    if (!result.tokens.empty()) {
+                        _cache.insert(text_copy, result.tokens);
+                    }
+
+                    co_return result;
+                }
+                // Timeout: fall through to cross-shard / local below.
+            } else {
+                // Queue full - fall through to other methods
+                ++_thread_pool_fallbacks;
             }
-            // Queue full - fall through to other methods
-            ++_thread_pool_fallbacks;
         }
     }
 
