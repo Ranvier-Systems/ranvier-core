@@ -60,9 +60,18 @@ void TokenizerWorker::start(seastar::alien::instance& alien_instance) {
     _shutdown.store(false, std::memory_order_release);
     _running.store(true, std::memory_order_release);
 
-    // Spawn worker thread
-    // IMPORTANT: We pass alien_instance by reference. The caller must ensure
-    // the alien instance outlives the worker thread (it's part of app_template).
+    // Spawn worker thread.
+    //
+    // SHUTDOWN-CONTRACT: alien_instance is captured by reference because
+    // seastar::alien::instance is a non-movable, non-reference-counted
+    // singleton owned by app_template. The worker thread calls
+    // alien::run_on(alien_instance, ...) on every completion (see
+    // process_job below), so a dangling reference here is undefined behavior.
+    //
+    // The caller MUST guarantee that stop() is called (which joins this
+    // thread) before app_template / the alien instance is torn down. See
+    // the class-level comment on TokenizerThreadPool, and the assertion in
+    // ~TokenizerThreadPool() that the worker has been stopped.
     _thread = std::make_unique<std::thread>([this, &alien_instance]() {
         worker_loop(alien_instance);
     });
@@ -203,6 +212,21 @@ void set_thread_pool_completion_callback(
 TokenizerThreadPool::TokenizerThreadPool(ThreadPoolTokenizationConfig config)
     : _config(config)
     , _shard_id(seastar::this_shard_id()) {
+}
+
+TokenizerThreadPool::~TokenizerThreadPool() {
+    // SHUTDOWN-CONTRACT enforcement: the worker thread captures the alien
+    // instance by reference; if it is still alive at destruction time, the
+    // caller skipped stop_worker() and the alien may be torn down before
+    // the thread exits. Force a stop with a loud warning so we don't UAF
+    // the alien from a foreign thread.
+    if (_worker) {
+        log_thread_pool.error("~TokenizerThreadPool on shard {}: stop_worker() "
+                              "was not called before destruction; forcing stop "
+                              "(see SHUTDOWN-CONTRACT in tokenizer_thread_pool.hpp)",
+                              _shard_id);
+        stop_worker();
+    }
 }
 
 seastar::future<> TokenizerThreadPool::stop() {

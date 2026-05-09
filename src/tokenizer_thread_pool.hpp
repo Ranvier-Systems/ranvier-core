@@ -198,10 +198,36 @@ private:
  *   }).then([this] {
  *       return _thread_pool.stop();
  *   });
+ *
+ * SHUTDOWN CONTRACT (cross-cutting; see
+ * audits/request-lifecycle-crash-audit.md "Lifetime contract for shutdown"):
+ *
+ *   The OS worker thread spawned by start_worker() captures
+ *   seastar::alien::instance BY REFERENCE because alien::instance is a
+ *   non-movable, non-reference-counted singleton owned by app_template. It
+ *   uses that reference on every completion (alien::run_on) and is therefore
+ *   a use-after-free hazard if the alien outlives it.
+ *
+ *   The caller MUST guarantee this ordering:
+ *
+ *     1. stop_worker() on every shard (joins the OS thread; blocks).
+ *     2. _thread_pool.stop() (sharded service teardown).
+ *     3. Return from app_template::run() (alien instance destroyed).
+ *
+ *   Application::stop() implements this order at application.cpp; see the
+ *   "Step 4a" block. ~TokenizerThreadPool asserts (warn-and-force-stop)
+ *   that step 1 happened. Companion invariants on HttpController's
+ *   _request_gate are documented at the top of class HttpController in
+ *   http_controller.hpp.
  */
 class TokenizerThreadPool {
 public:
     explicit TokenizerThreadPool(ThreadPoolTokenizationConfig config = {});
+
+    // SHUTDOWN-CONTRACT: stop_worker() MUST be called before destruction.
+    // Asserts (warn-and-force-stop in release) that the worker has been
+    // joined. See class comment for the alien-lifetime invariant.
+    ~TokenizerThreadPool();
 
     // Seastar sharded service requirement
     seastar::future<> stop();
