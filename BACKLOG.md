@@ -1092,8 +1092,16 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 ### Verification & follow-up
 
 - [x] **[P2] libFuzzer harnesses for the audit's input boundaries**
-  Landed alongside this triage at `tests/fuzz/` — one harness each for `RadixTree::insert/lookup`, `RequestRewriter::extract_*`, and `StreamParser::push`. Build with `-DRANVIER_BUILD_FUZZERS=ON` (clang only). See `tests/fuzz/README.md` for run instructions.
-  _Follow-up:_ run each harness for at least 2 hours on a developer box; report results in the audit doc as MITIGATED-BY-FUZZ or as new reproducer entries.
+  Landed at `tests/fuzz/` — one harness each for `RadixTree::insert/lookup`, `RequestRewriter::extract_*`, and `StreamParser::push`. Build with `-DRANVIER_BUILD_FUZZERS=ON` (clang only); the `Dockerfile.fuzz` image is the recommended environment. See `tests/fuzz/README.md`.
+  _30-min run results (2026-05-08):_
+  - `radix_tree_fuzz`: clean, 4,959,251 execs → MITIGATED-BY-FUZZ for H8, L9.
+  - `request_rewriter_fuzz`: first run crashed at ~564k execs (deeply-nested JSON → stack overflow). Surfaced as new ticket "M6 — UPGRADED-BY-FUZZ" above; fixed via `kParseIterativeFlag`. Post-fix run clean at 5,552,208 execs → MITIGATED-BY-FUZZ for M6, L5.
+  - `stream_parser_fuzz`: blocked by Seastar/libFuzzer allocator interaction (Hard Rule #15 — Seastar overrides global new/delete; libFuzzer never boots the reactor). Crashed in libFuzzer's internal cleanup, not in StreamParser. Not a Ranvier bug. See `tests/fuzz/README.md` for the exact diagnosis. H10, M11, M12 remain at static MITIGATED.
+
+- [ ] **[P3] Unblock Seastar-dependent fuzzing**
+  _Where:_ `tests/fuzz/stream_parser_fuzz.cpp` (and any future Seastar-touching harness).
+  _Approach:_ rebuild Seastar with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON` in a `Dockerfile.fuzz`-derived image. Trade-off: bypasses Seastar's per-shard allocator entirely, so any allocator-specific bug becomes invisible to the fuzzer; everything else (parsing, state machine, integer math) is correctly exercised. Worth the one-time ~30-min image build if H10/M11/M12 ever need to be promoted from static MITIGATED to MITIGATED-BY-FUZZ.
+  _Complexity:_ Medium (one-time Docker layer + Seastar build).
 
 - [ ] **[P2] Run unit tests + benchmarks under ASan/UBSan**
   _Justification:_ Catches the integer-overflow / cast findings (H2, H9) and any heap UAF along the request path with no harness work.

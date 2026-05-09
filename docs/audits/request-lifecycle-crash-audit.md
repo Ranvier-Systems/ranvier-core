@@ -42,6 +42,20 @@ verified with a targeted test or sanitiser run before remediation.
 > boundaries land alongside this triage at `tests/fuzz/`. They cover
 > H8/H10/M6/M11/M12 — anything that converts to "no crash after N hours"
 > can be moved to MITIGATED with confidence.
+>
+> **Fuzz run results (2026-05-08, 30 min × harness, libFuzzer + ASan + UBSan, clang 17 on aarch64):**
+>
+> | Harness | Status | Execs | Notes |
+> |---------|--------|-------|-------|
+> | `radix_tree_fuzz` | clean | 4,959,251 | Seeded corpus (430 inputs). 1,175 new units. Validates H8, L9. |
+> | `request_rewriter_fuzz` | clean (post-fix) | 5,552,208 | First long run crashed at ~564k execs (M6 upgrade); after fix, 30 min clean. 3,017 new units. Validates M6, L5. |
+> | `stream_parser_fuzz` | not validated | 1 | Crashed in libFuzzer cleanup before any real input ran, due to Seastar's global `operator new`/`delete` override (Hard Rule #15) requiring an uninitialised reactor. Not a `StreamParser` bug. See `tests/fuzz/README.md`. H10, M11, M12 stay at static MITIGATED. |
+>
+> Findings moved to **MITIGATED-BY-FUZZ** by these runs: H8, L9, M6 (post-fix), L5.
+>
+> Findings staying at static **MITIGATED** (no fuzz validation possible
+> until Seastar is rebuilt with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`):
+> H10, M11, M12.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS

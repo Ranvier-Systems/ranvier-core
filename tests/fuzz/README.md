@@ -140,3 +140,16 @@ bug. If you run the harness binaries directly (not via `make`), set
 - `stream_parser_fuzz` operates on a single `StreamParser` instance per
   input, splitting the input into pseudo-random chunks. It does not
   exercise the full HTTP-over-TCP path.
+- **`stream_parser_fuzz` does not currently run end-to-end** because of a
+  Seastar / libFuzzer allocator interaction. Seastar overrides global
+  `operator new`/`delete` to use its per-shard allocator (Hard Rule #15);
+  that allocator requires `seastar::smp::start()` to initialise per-shard
+  pools. libFuzzer's `main` never boots the Seastar reactor, so
+  allocations go through an uninitialised fast path that produces
+  pointers `libc::free` later rejects with `munmap_chunk: invalid
+  pointer`. The crash is in libFuzzer's cleanup of its own data
+  structures, not in `StreamParser`. The harness binary still builds and
+  the source is correct; fuzzing it would require Seastar to be rebuilt
+  with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`. Audit findings H10, M11,
+  M12 remain at their static-triage MITIGATED verdicts until that
+  unblock lands.
