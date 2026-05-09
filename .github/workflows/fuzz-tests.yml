@@ -1,0 +1,130 @@
+# Fuzz tests for Ranvier Core
+#
+# Runs the libFuzzer harnesses under tests/fuzz/ for a short
+# post-merge regression check. Each working harness gets 60 seconds of
+# fuzzer time. The corpus is cached across runs so coverage compounds —
+# the second run on a branch is meaningfully better than the first.
+#
+# Triggers:
+#   - After Docker Publish completes (post-merge to main).
+#   - Manual via workflow_dispatch.
+#
+# This workflow does NOT run on PRs. Fuzz is too noisy and corpus-
+# dependent to gate code review on; failures here flag regressions
+# after merge so they can be triaged from the run page.
+#
+# Excluded harness: stream_parser_fuzz. It links Seastar, whose global
+# operator new/delete override (Hard Rule #15) requires a running
+# reactor that libFuzzer's main never starts. The harness builds and
+# the source is correct; running it crashes in libFuzzer's own cleanup,
+# not in StreamParser. See tests/fuzz/README.md and BACKLOG §18
+# "Unblock Seastar-dependent fuzzing" for the unblock path.
+#
+# Architecture note: GitHub-hosted runners are x86_64. Local fuzz runs
+# (e.g. on Apple Silicon) are aarch64. Different ABIs surface different
+# bugs (alignment, integer-cast behaviour); a "passes locally, fails in
+# CI" finding is real signal, not a configuration issue.
+name: Fuzz Tests
+
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
+
+jobs:
+  fuzz-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the fuzz image from Dockerfile.fuzz (which layers clang,
+      # compiler-rt, llvm, lld onto the cached base image). Reuses GHA
+      # build cache so subsequent runs are layer-cache hits.
+      - name: Build fuzz image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.fuzz
+          load: true
+          tags: ranvier-fuzz:latest
+          cache-from: |
+            type=gha,scope=app-amd64
+            type=gha,scope=fuzz-tests
+          cache-to: type=gha,mode=max,scope=fuzz-tests
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+
+      # Restore the corpus from the most recent prior run. The primary
+      # key embeds run_id so it never hits (forces a save every run);
+      # restore-keys falls back to any earlier saved corpus on this OS.
+      # Net effect: every run restores the latest corpus and saves an
+      # updated one, so coverage accumulates across runs.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: tests/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-
+
+      - name: Run fuzz harnesses (60s each)
+        id: fuzz
+        run: |
+          mkdir -p fuzz-results
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            ranvier-fuzz:latest \
+            make fuzz-ci \
+            2>&1 | tee fuzz-results/fuzz-ci.log
+
+          FUZZ_EXIT=${PIPESTATUS[0]}
+          echo "fuzz_exit_code=$FUZZ_EXIT" >> $GITHUB_OUTPUT
+          exit $FUZZ_EXIT
+
+      # On crash, libFuzzer writes a `crash-<sha>` reproducer to cwd.
+      # Upload both the log and any reproducers so the failure can be
+      # triaged from the run page.
+      - name: Upload fuzz artifacts on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-artifacts
+          path: |
+            fuzz-results/fuzz-ci.log
+            crash-*
+            tests/fuzz/corpus/
+          retention-days: 30
+
+      - name: Upload fuzz log on success
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: fuzz-log
+          path: fuzz-results/fuzz-ci.log
+          retention-days: 7

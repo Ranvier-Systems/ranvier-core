@@ -108,6 +108,30 @@ A short smoke run (~5 min each) on every commit is enough to catch
 regressions; a longer run (overnight or on CI nightly) will exercise the
 deeper paths the audit was concerned about.
 
+## CI integration
+
+`make fuzz-ci` runs the post-merge regression check used by
+`.github/workflows/fuzz-tests.yml`: 60 seconds × the two working
+harnesses (`radix_tree_fuzz`, `request_rewriter_fuzz`). The workflow
+fires after Docker Publish completes and on `workflow_dispatch`; it
+does not run on PRs (fuzz is too noisy and corpus-dependent for the PR
+feedback loop).
+
+The workflow caches `tests/fuzz/corpus/` across runs via
+`actions/cache`, so coverage compounds — every run restores the latest
+corpus and saves an updated one. On failure the log, any `crash-*`
+reproducer, and the corpus snapshot are uploaded as artifacts.
+
+`stream_parser_fuzz` is **not** part of `fuzz-ci` (Seastar / libFuzzer
+allocator interaction; see *Caveats* below). When the unblock lands,
+add it back to the `fuzz-ci` target in the `Makefile`.
+
+For longer scheduled runs, override the per-harness time:
+
+```sh
+FUZZ_CI_TIME=600 make fuzz-ci   # 10 min × 2 harnesses
+```
+
 ## UBSan suppressions
 
 The Make targets pass `UBSAN_OPTIONS=suppressions=tests/fuzz/ubsan-suppressions.txt`.
