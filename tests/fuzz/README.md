@@ -108,6 +108,18 @@ A short smoke run (~5 min each) on every commit is enough to catch
 regressions; a longer run (overnight or on CI nightly) will exercise the
 deeper paths the audit was concerned about.
 
+## UBSan suppressions
+
+The Make targets pass `UBSAN_OPTIONS=suppressions=tests/fuzz/ubsan-suppressions.txt`.
+That file silences a single class of UBSan finding inside RapidJSON v1.1.0
+(`pointer-overflow` in `Stack::Reserve`, where `nullptr + n` is computed
+before the buffer is allocated). It is a known and harmless pattern in
+the vendored RapidJSON; suppressing it stops the fuzzer from drowning in
+RapidJSON-internal noise and keeps the signal focused on Ranvier code.
+Every other UBSan check remains active and will halt the run on a real
+bug. If you run the harness binaries directly (not via `make`), set
+`UBSAN_OPTIONS` yourself or expect transient false positives.
+
 ## What "passing" means
 
 - **Crash within minutes:** the audit was right about that boundary; treat

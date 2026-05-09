@@ -40,6 +40,11 @@ FUZZ_TIME ?= 1800
 FUZZ_MAX_LEN ?= 262144
 FUZZ_BUILD_DIR := build-fuzz
 
+# Pass our suppressions file in addition to the env defaults set by
+# Dockerfile.fuzz. Setting UBSAN_OPTIONS replaces (does not merge with)
+# any prior env value, so we re-list halt_on_error and print_stacktrace.
+FUZZ_UBSAN_OPTIONS := halt_on_error=1:print_stacktrace=1:suppressions=$(CURDIR)/tests/fuzz/ubsan-suppressions.txt
+
 fuzz-build:
 	@command -v clang >/dev/null 2>&1 || { \
 	    echo "error: clang not found on PATH."; \
@@ -69,7 +74,8 @@ fuzz-build:
 
 fuzz-run-radix-tree: fuzz-build
 	@mkdir -p tests/fuzz/corpus/radix_tree
-	@$(FUZZ_BUILD_DIR)/radix_tree_fuzz \
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/radix_tree_fuzz \
 	    tests/fuzz/corpus/radix_tree \
 	    -max_total_time=$(FUZZ_TIME) \
 	    -max_len=$(FUZZ_MAX_LEN) \
@@ -77,7 +83,8 @@ fuzz-run-radix-tree: fuzz-build
 
 fuzz-run-request-rewriter: fuzz-build
 	@mkdir -p tests/fuzz/corpus/request_rewriter
-	@$(FUZZ_BUILD_DIR)/request_rewriter_fuzz \
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/request_rewriter_fuzz \
 	    tests/fuzz/corpus/request_rewriter \
 	    -max_total_time=$(FUZZ_TIME) \
 	    -max_len=$(FUZZ_MAX_LEN) \
@@ -89,7 +96,8 @@ fuzz-run-stream-parser: fuzz-build
 	    exit 1; \
 	fi
 	@mkdir -p tests/fuzz/corpus/stream_parser
-	@$(FUZZ_BUILD_DIR)/stream_parser_fuzz \
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/stream_parser_fuzz \
 	    tests/fuzz/corpus/stream_parser \
 	    -max_total_time=$(FUZZ_TIME) \
 	    -max_len=$(FUZZ_MAX_LEN) \
