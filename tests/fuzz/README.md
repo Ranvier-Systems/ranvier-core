@@ -17,6 +17,30 @@ already mitigated).
 
 ## Building
 
+### Prerequisites
+
+libFuzzer is a clang feature (no GCC equivalent), so the harnesses
+require **clang and compiler-rt** in the build environment. The
+production builder image (`Dockerfile.production`) is GCC-only — install
+clang separately, or use a developer container.
+
+```sh
+# Fedora (matches Dockerfile.base)
+dnf install -y clang compiler-rt llvm
+
+# Debian / Ubuntu
+apt-get install -y clang llvm
+
+# Verify clang is on PATH before configuring CMake
+which clang clang++ && clang --version
+```
+
+If you see `is not a full path and was not found in the PATH` from CMake,
+clang isn't installed (or isn't on `PATH`); install it first or pass an
+absolute path via `-DCMAKE_C_COMPILER=/usr/bin/clang`.
+
+### Configure & build
+
 The fuzzers are opt-in. Configure with:
 
 ```sh
@@ -27,6 +51,10 @@ cmake -B build-fuzz \
   -DCMAKE_BUILD_TYPE=Debug
 cmake --build build-fuzz --target radix_tree_fuzz request_rewriter_fuzz stream_parser_fuzz
 ```
+
+(Drop `stream_parser_fuzz` from the target list if Seastar isn't found —
+CMake will print `Seastar not found — skipping stream_parser_fuzz` and
+only the two pure-C++ harnesses build.)
 
 `stream_parser_fuzz` only builds when Seastar is found by CMake; the other
 two are pure C++ and build without Seastar.
