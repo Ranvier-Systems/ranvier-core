@@ -272,6 +272,32 @@ struct HttpControllerConfig {
     bool should_learn_routes() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
 };
 
+// ============================================================================
+// SHUTDOWN CONTRACT (cross-cutting; see audits/request-lifecycle-crash-audit.md
+// "Lifetime contract for shutdown")
+// ----------------------------------------------------------------------------
+// Three invariants MUST hold for clean shutdown. They are enforced by
+// Application::stop() and by gate-holder discipline at request callsites:
+//
+//   (a) `_request_gate` is awaited (closed) before ~HttpController. Application
+//       calls _controller.stop(), which co_awaits _request_gate.close()
+//       (http_controller.cpp HttpController::stop), so all in-flight request
+//       coroutines complete before the controller is destroyed.
+//
+//   (b) TokenizerThreadPool workers are joined (stop_worker()) before the
+//       seastar::alien::instance owned by app_template goes away. Worker
+//       threads capture the alien by reference and call alien::run_on() on
+//       completion; see TokenizerThreadPool's class comment.
+//
+//   (c) Every fire-and-forget future spawned during a request MUST be
+//       tracked by `_request_gate`. The standard pattern is to capture
+//       `_request_gate.hold()` into the lambda (or .finally) so that
+//       _request_gate.close() blocks on the tail. Raw `[this]` capture in a
+//       discarded `.then()` is a use-after-free hazard — the surrounding
+//       coroutine's holder is released before the chain resolves. See the
+//       single-depth route-learning chain in stream_backend_response for an
+//       example.
+// ============================================================================
 class HttpController {
 public:
     // Takes sharded<TokenizerService> to access the local shard's tokenizer (thread-safe)

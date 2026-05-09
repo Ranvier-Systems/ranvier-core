@@ -1002,16 +1002,29 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 ### Cross-cutting (do these first — each closes several findings)
 
-- [ ] **[P1] Adopt a `with_timeout` helper on the request hot path**
-  _Closes:_ H3 (reactor-blocking FFI fallback), M5 (thread-pool future with no timeout). Also tightens M15.
-  _Approach:_ Single helper `co_await with_request_deadline(ctx, fut)` that maps `seastar::timed_out_error` to a structured request error. Apply to `encode_threaded_async`, `submit_async`, and the chunk-read site in `stream_backend_response`.
-  _Complexity:_ Medium.
+- [x] **[P1] Adopt a `with_timeout` helper on the request hot path** — Fixed 2026-05-09
+  _Closes:_ H3, M5; tightens M15.
+  _Fix:_ `with_request_timeout(deadline_or_duration, fut, label)` in
+  `src/request_timeout.hpp` translates `seastar::timed_out_error` into
+  a labeled `request_timeout_error`. Applied at the three call sites
+  in `http_controller.cpp` (tokenize, stream chunk-read) and
+  `tokenizer_service.cpp` (thread-pool future); on tokenize timeout
+  the request falls back to round-robin routing.
 
-- [ ] **[P1] Document and assert the shutdown lifetime contract**
-  _Closes:_ H5 (alien instance captured by reference), M14 (`.then()` route-learning captures raw `[this]`).
-  _Note:_ Triage downgraded H4 (TokenizerThreadPool promise race) and M1 (streaming-lambda `[this]`) to MITIGATED — the gate-holder pattern already covers them. This ticket only needs to handle H5 and M14.
-  _Approach:_ Capture `seastar::shared_ptr<HttpController>` (or equivalent) in long-lived `.then()` chains instead of raw `[this]`. Either capture the alien by value (if the API allows) or assert join-before-alien-teardown ordering in `~TokenizerThreadPool()`. Add a comment block describing the required shutdown order.
-  _Complexity:_ Medium.
+- [x] **[P1] Document and assert the shutdown lifetime contract** — Fixed 2026-05-09
+  _Closes:_ H5, M14. (Triage already MITIGATED H4 and M1 via the gate-holder pattern.)
+  _Fix:_ Single-depth route-learning `.then()` in
+  `http_controller.cpp:stream_backend_response` now captures
+  `_request_gate.hold()` alongside `this`, so `_request_gate.close()`
+  blocks on the fire-and-forget tail (the project-idiomatic equivalent
+  of `seastar::shared_ptr<HttpController>`). `seastar::alien::instance`
+  is a non-movable singleton, so by-value capture in `TokenizerWorker`
+  is not feasible; instead `~TokenizerThreadPool` asserts that
+  `stop_worker()` was called (warn-and-force-stop fallback) and the
+  capture site is documented as `SHUTDOWN-CONTRACT`. A canonical
+  invariant block lives at the top of `class HttpController`
+  (`http_controller.hpp`) and `class TokenizerThreadPool`
+  (`tokenizer_thread_pool.hpp`).
 
 ### P1 — CONFIRMED HIGHs
 
@@ -1027,9 +1040,7 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
   _Location:_ `src/tokenizer_service.cpp:381` (called via `src/http_controller.cpp:1318`). Subsumed by the cross-cutting `with_timeout` ticket.
   _Complexity:_ Low (once the helper exists).
 
-- [ ] **[P1] H5: Fix alien-instance capture lifetime**
-  _Location:_ `src/tokenizer_thread_pool.cpp:66`. Subsumed by the cross-cutting shutdown-contract ticket.
-  _Complexity:_ Medium.
+- [x] **[P1] H5: Fix alien-instance capture lifetime** — Fixed 2026-05-09 (subsumed by shutdown-contract ticket above).
 
 - [ ] **[P1] H7: Saturate `total_weight` in weighted random selection**
   _Location:_ `src/router_service.cpp:2144-2152`. Cap the accumulator and assert `> 0` before constructing `uniform_int_distribution`.
@@ -1045,9 +1056,7 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
   Subsumed by the cross-cutting `with_timeout` ticket.
   _Complexity:_ Low.
 
-- [ ] **[P2] M14: Stop capturing raw `[this]` in fire-and-forget route-learning**
-  _Location:_ `src/http_controller.cpp:991-999`. Subsumed by the cross-cutting shutdown-contract ticket.
-  _Complexity:_ Medium.
+- [x] **[P2] M14: Stop capturing raw `[this]` in fire-and-forget route-learning** — Fixed 2026-05-09 (subsumed by shutdown-contract ticket above).
 
 ### M6 — UPGRADED-BY-FUZZ, fixed (2026-05-08)
 

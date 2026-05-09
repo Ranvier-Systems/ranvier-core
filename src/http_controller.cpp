@@ -990,8 +990,15 @@ future<> HttpController::stream_backend_response(
                 } else {
                     // Single-depth routing: use prefix_boundary or default
                     // Skip persistence if route was deduplicated (§21.7)
+                    //
+                    // Lifetime: this `.then()` captures `this` to reach `_persistence`,
+                    // but the future is fire-and-forget — the surrounding coroutine's
+                    // gate::holder is released before the chain resolves. Capture an
+                    // extra gate::holder so `_request_gate.close()` blocks on this tail
+                    // and `this` stays valid. See shutdown contract on HttpController.
                     (void)_router.learn_route_global(ctx->tokens, learn_backend, ctx->request_id, ctx->prefix_boundary)
-                        .then([this, tokens = ctx->tokens, backend = learn_backend](bool is_new_route) {
+                        .then([this, tokens = ctx->tokens, backend = learn_backend,
+                               holder = _request_gate.hold()](bool is_new_route) {
                             if (is_new_route && _persistence) {
                                 _persistence->queue_save_route(tokens, backend);
                             }
