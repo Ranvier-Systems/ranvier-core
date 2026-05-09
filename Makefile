@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-clean
 
 # Default target
 all: build
@@ -25,6 +25,66 @@ build-debug:
 clean:
 	@echo "Cleaning build directory..."
 	@rm -rf build
+
+# -----------------------------------------------------------------------------
+# Fuzz harnesses (libFuzzer; requires clang — see Dockerfile.fuzz)
+# -----------------------------------------------------------------------------
+# These targets assume `clang` and `clang++` are on PATH. The ranvier-fuzz
+# image (Dockerfile.fuzz) provides them; the production builder does not.
+#
+# Typical workflow:
+#   make fuzz-build                 # configure + build all harnesses
+#   make fuzz-run-radix-tree        # run one harness for the default time
+#   FUZZ_TIME=600 make fuzz-run-request-rewriter   # 10-minute run
+FUZZ_TIME ?= 1800
+FUZZ_MAX_LEN ?= 262144
+FUZZ_BUILD_DIR := build-fuzz
+
+fuzz-build:
+	@command -v clang >/dev/null 2>&1 || { \
+	    echo "error: clang not found on PATH."; \
+	    echo "       Use the ranvier-fuzz image (Dockerfile.fuzz) or"; \
+	    echo "       install clang locally (Fedora: dnf install clang compiler-rt llvm)."; \
+	    exit 1; \
+	}
+	@echo "Configuring fuzz harnesses (clang + libFuzzer + ASan/UBSan)..."
+	@cmake -B $(FUZZ_BUILD_DIR) \
+	    -DRANVIER_BUILD_FUZZERS=ON \
+	    -DCMAKE_C_COMPILER=$$(command -v clang) \
+	    -DCMAKE_CXX_COMPILER=$$(command -v clang++) \
+	    -DCMAKE_BUILD_TYPE=Debug
+	@cmake --build $(FUZZ_BUILD_DIR) --target fuzz_harnesses -j$$(nproc)
+
+fuzz-run-radix-tree: fuzz-build
+	@mkdir -p tests/fuzz/corpus/radix_tree
+	@$(FUZZ_BUILD_DIR)/radix_tree_fuzz \
+	    tests/fuzz/corpus/radix_tree \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
+fuzz-run-request-rewriter: fuzz-build
+	@mkdir -p tests/fuzz/corpus/request_rewriter
+	@$(FUZZ_BUILD_DIR)/request_rewriter_fuzz \
+	    tests/fuzz/corpus/request_rewriter \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
+fuzz-run-stream-parser: fuzz-build
+	@if [ ! -x $(FUZZ_BUILD_DIR)/stream_parser_fuzz ]; then \
+	    echo "stream_parser_fuzz not built — Seastar likely not found at configure time."; \
+	    exit 1; \
+	fi
+	@mkdir -p tests/fuzz/corpus/stream_parser
+	@$(FUZZ_BUILD_DIR)/stream_parser_fuzz \
+	    tests/fuzz/corpus/stream_parser \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
+fuzz-clean:
+	@rm -rf $(FUZZ_BUILD_DIR)
 
 # Run all tests
 test: test-unit
@@ -743,6 +803,14 @@ help:
 	@echo "  make test-integration-full   - Run all integration tests (multi-node)"
 	@echo "  make test-integration-ci     - Run integration tests via pytest (JUnit XML output)"
 	@echo "  make test-validation         - Run validation suite unit tests"
+	@echo ""
+	@echo "Fuzz harnesses (require clang; see Dockerfile.fuzz):"
+	@echo "  make fuzz-build                    - Configure + build all libFuzzer harnesses"
+	@echo "  make fuzz-run-radix-tree           - Fuzz RadixTree::insert/lookup"
+	@echo "  make fuzz-run-request-rewriter     - Fuzz RequestRewriter::extract_*"
+	@echo "  make fuzz-run-stream-parser        - Fuzz StreamParser::push (needs Seastar)"
+	@echo "  make fuzz-clean                    - Remove the fuzz build directory"
+	@echo "  FUZZ_TIME=600 make fuzz-run-radix-tree  (override default 1800s run)"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"

@@ -21,27 +21,54 @@ already mitigated).
 
 libFuzzer is a clang feature (no GCC equivalent), so the harnesses
 require **clang and compiler-rt** in the build environment. The
-production builder image (`Dockerfile.production`) is GCC-only — install
-clang separately, or use a developer container.
+production builder image (`Dockerfile.base` / `Dockerfile.production`)
+is GCC-only.
+
+The recommended path is the dedicated [`Dockerfile.fuzz`](../../Dockerfile.fuzz)
+image, which extends `ranvier-base` with clang/LLVM/lld:
+
+```sh
+# Build (or pull) the base image first.
+docker build -f Dockerfile.base -t ranvier-base:latest .
+
+# Layer clang on top.
+docker build -f Dockerfile.fuzz -t ranvier-fuzz:latest .
+
+# Drop into a shell with the source tree mounted.
+docker run --rm -it -v "$PWD:/src" -w /src ranvier-fuzz:latest bash
+```
+
+If you'd rather install clang into your existing container:
 
 ```sh
 # Fedora (matches Dockerfile.base)
-dnf install -y clang compiler-rt llvm
+dnf install -y clang compiler-rt llvm lld
 
 # Debian / Ubuntu
-apt-get install -y clang llvm
+apt-get install -y clang llvm lld
 
-# Verify clang is on PATH before configuring CMake
+# Verify clang is on PATH before configuring CMake.
 which clang clang++ && clang --version
 ```
 
 If you see `is not a full path and was not found in the PATH` from CMake,
-clang isn't installed (or isn't on `PATH`); install it first or pass an
-absolute path via `-DCMAKE_C_COMPILER=/usr/bin/clang`.
+clang isn't installed (or isn't on `PATH`). The error appears at the
+`project()` call before any Ranvier-specific guard can fire — install
+clang first, or pass an absolute path via
+`-DCMAKE_C_COMPILER=/usr/bin/clang`.
 
 ### Configure & build
 
-The fuzzers are opt-in. Configure with:
+The fuzzers are opt-in. The simplest path is the Make targets:
+
+```sh
+make fuzz-build                # configure + build all harnesses
+make fuzz-run-radix-tree       # default 30-min run; FUZZ_TIME=600 overrides
+make fuzz-run-request-rewriter
+make fuzz-run-stream-parser
+```
+
+Or invoke cmake directly:
 
 ```sh
 cmake -B build-fuzz \
@@ -49,15 +76,12 @@ cmake -B build-fuzz \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-fuzz --target radix_tree_fuzz request_rewriter_fuzz stream_parser_fuzz
+cmake --build build-fuzz --target fuzz_harnesses
 ```
 
-(Drop `stream_parser_fuzz` from the target list if Seastar isn't found —
-CMake will print `Seastar not found — skipping stream_parser_fuzz` and
-only the two pure-C++ harnesses build.)
-
 `stream_parser_fuzz` only builds when Seastar is found by CMake; the other
-two are pure C++ and build without Seastar.
+two are pure C++ and build without Seastar. (CMake prints
+`Seastar not found — skipping stream_parser_fuzz` when that path is taken.)
 
 The harnesses link against `-fsanitize=fuzzer,address,undefined` by default
 when `RANVIER_BUILD_FUZZERS=ON` and the compiler is clang. ASan + UBSan are
@@ -66,14 +90,17 @@ input doesn't trigger an outright SIGSEGV.
 
 ## Running
 
+The Make targets handle the corpus directory and default flags for you;
+this section documents the equivalent direct invocations.
+
 ```sh
 # 30-minute fuzz run with a 256 KiB input cap
-./build-fuzz/tests/fuzz/radix_tree_fuzz \
+./build-fuzz/radix_tree_fuzz \
     -max_total_time=1800 -max_len=262144 -print_final_stats=1
 
-# Continue from a corpus directory
+# Continue from a corpus directory (preserves coverage between runs)
 mkdir -p tests/fuzz/corpus/radix_tree
-./build-fuzz/tests/fuzz/radix_tree_fuzz \
+./build-fuzz/radix_tree_fuzz \
     tests/fuzz/corpus/radix_tree -max_total_time=1800
 ```
 
