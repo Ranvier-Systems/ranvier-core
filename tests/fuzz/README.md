@@ -1,0 +1,179 @@
+# Fuzz Harnesses
+
+libFuzzer harnesses for boundaries identified in the
+[request-lifecycle crash-risk audit](../../docs/audits/request-lifecycle-crash-audit.md).
+
+These exist to convert the audit's static "could crash" findings into either
+"does crash" (real bug) or "ran clean for N hours" (audit was wrong /
+already mitigated).
+
+## Targets
+
+| Harness | Boundary | Audit findings exercised |
+|---------|----------|---------------------------|
+| `radix_tree_fuzz.cpp` | `RadixTree::insert` / `RadixTree::lookup` | H8 (split_long_prefix off-by-one), L9 (recursive subspan) |
+| `request_rewriter_fuzz.cpp` | `RequestRewriter::extract_*` (JSON body parsing) | M6 (RapidJSON nesting), M4 (large allocations), L5 (vocab ID validation) |
+| `stream_parser_fuzz.cpp` | `StreamParser::push` (chunked HTTP / SSE) | H10 (chunk trailer length), M11 (status snoop split), M12 (Content-Length cast) |
+
+## Building
+
+### Prerequisites
+
+libFuzzer is a clang feature (no GCC equivalent), so the harnesses
+require **clang and compiler-rt** in the build environment. The
+production builder image (`Dockerfile.base` / `Dockerfile.production`)
+is GCC-only.
+
+The recommended path is the dedicated [`Dockerfile.fuzz`](../../Dockerfile.fuzz)
+image, which extends `ranvier-base` with clang/LLVM/lld:
+
+```sh
+# Build (or pull) the base image first.
+docker build -f Dockerfile.base -t ranvier-base:latest .
+
+# Layer clang on top.
+docker build -f Dockerfile.fuzz -t ranvier-fuzz:latest .
+
+# Drop into a shell with the source tree mounted.
+docker run --rm -it -v "$PWD:/src" -w /src ranvier-fuzz:latest bash
+```
+
+If you'd rather install clang into your existing container:
+
+```sh
+# Fedora (matches Dockerfile.base)
+dnf install -y clang compiler-rt llvm lld
+
+# Debian / Ubuntu
+apt-get install -y clang llvm lld
+
+# Verify clang is on PATH before configuring CMake.
+which clang clang++ && clang --version
+```
+
+If you see `is not a full path and was not found in the PATH` from CMake,
+clang isn't installed (or isn't on `PATH`). The error appears at the
+`project()` call before any Ranvier-specific guard can fire — install
+clang first, or pass an absolute path via
+`-DCMAKE_C_COMPILER=/usr/bin/clang`.
+
+### Configure & build
+
+The fuzzers are opt-in. The simplest path is the Make targets:
+
+```sh
+make fuzz-build                # configure + build all harnesses
+make fuzz-run-radix-tree       # default 30-min run; FUZZ_TIME=600 overrides
+make fuzz-run-request-rewriter
+make fuzz-run-stream-parser
+```
+
+Or invoke cmake directly:
+
+```sh
+cmake -B build-fuzz \
+  -DRANVIER_BUILD_FUZZERS=ON \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-fuzz --target fuzz_harnesses
+```
+
+`stream_parser_fuzz` only builds when Seastar is found by CMake; the other
+two are pure C++ and build without Seastar. (CMake prints
+`Seastar not found — skipping stream_parser_fuzz` when that path is taken.)
+
+The harnesses link against `-fsanitize=fuzzer,address,undefined` by default
+when `RANVIER_BUILD_FUZZERS=ON` and the compiler is clang. ASan + UBSan are
+on so genuine crashes (OOB, UAF, signed overflow) get caught even when the
+input doesn't trigger an outright SIGSEGV.
+
+## Running
+
+The Make targets handle the corpus directory and default flags for you;
+this section documents the equivalent direct invocations.
+
+```sh
+# 30-minute fuzz run with a 256 KiB input cap
+./build-fuzz/radix_tree_fuzz \
+    -max_total_time=1800 -max_len=262144 -print_final_stats=1
+
+# Continue from a corpus directory (preserves coverage between runs)
+mkdir -p tests/fuzz/corpus/radix_tree
+./build-fuzz/radix_tree_fuzz \
+    tests/fuzz/corpus/radix_tree -max_total_time=1800
+```
+
+A short smoke run (~5 min each) on every commit is enough to catch
+regressions; a longer run (overnight or on CI nightly) will exercise the
+deeper paths the audit was concerned about.
+
+## CI integration
+
+`make fuzz-ci` runs the post-merge regression check used by
+`.github/workflows/fuzz-tests.yml`: 60 seconds × the two working
+harnesses (`radix_tree_fuzz`, `request_rewriter_fuzz`). The workflow
+fires after Docker Publish completes and on `workflow_dispatch`; it
+does not run on PRs (fuzz is too noisy and corpus-dependent for the PR
+feedback loop).
+
+The workflow caches `tests/fuzz/corpus/` across runs via
+`actions/cache`, so coverage compounds — every run restores the latest
+corpus and saves an updated one. On failure the log, any `crash-*`
+reproducer, and the corpus snapshot are uploaded as artifacts.
+
+`stream_parser_fuzz` is **not** part of `fuzz-ci` (Seastar / libFuzzer
+allocator interaction; see *Caveats* below). When the unblock lands,
+add it back to the `fuzz-ci` target in the `Makefile`.
+
+For longer scheduled runs, override the per-harness time:
+
+```sh
+FUZZ_CI_TIME=600 make fuzz-ci   # 10 min × 2 harnesses
+```
+
+## UBSan suppressions
+
+The Make targets pass `UBSAN_OPTIONS=suppressions=tests/fuzz/ubsan-suppressions.txt`.
+That file silences a single class of UBSan finding inside RapidJSON v1.1.0
+(`pointer-overflow` in `Stack::Reserve`, where `nullptr + n` is computed
+before the buffer is allocated). It is a known and harmless pattern in
+the vendored RapidJSON; suppressing it stops the fuzzer from drowning in
+RapidJSON-internal noise and keeps the signal focused on Ranvier code.
+Every other UBSan check remains active and will halt the run on a real
+bug. If you run the harness binaries directly (not via `make`), set
+`UBSAN_OPTIONS` yourself or expect transient false positives.
+
+## What "passing" means
+
+- **Crash within minutes:** the audit was right about that boundary; treat
+  the reproducer as a P0 fix.
+- **No crash after several hours of fuzzing on a corpus seeded from the
+  unit tests:** the audit's concern about that boundary is unfounded *for
+  inputs the harness can construct*. Update the audit doc to mark the
+  finding `MITIGATED-BY-FUZZ`.
+- **No crash but coverage is low:** the harness probably isn't reaching the
+  flagged code. Inspect `-print_pcs=1` output and either expand the harness
+  or downgrade the finding to "static-only, can't verify."
+
+## Caveats
+
+- These harnesses cover *static* boundaries. Cross-shard, threading, and
+  shutdown-ordering findings (H4, H5, M1, M14) are not fuzzable here — they
+  need `seastar-tsan` or a dedicated stress test.
+- `stream_parser_fuzz` operates on a single `StreamParser` instance per
+  input, splitting the input into pseudo-random chunks. It does not
+  exercise the full HTTP-over-TCP path.
+- **`stream_parser_fuzz` does not currently run end-to-end** because of a
+  Seastar / libFuzzer allocator interaction. Seastar overrides global
+  `operator new`/`delete` to use its per-shard allocator (Hard Rule #15);
+  that allocator requires `seastar::smp::start()` to initialise per-shard
+  pools. libFuzzer's `main` never boots the Seastar reactor, so
+  allocations go through an uninitialised fast path that produces
+  pointers `libc::free` later rejects with `munmap_chunk: invalid
+  pointer`. The crash is in libFuzzer's cleanup of its own data
+  structures, not in `StreamParser`. The harness binary still builds and
+  the source is correct; fuzzing it would require Seastar to be rebuilt
+  with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`. Audit findings H10, M11,
+  M12 remain at their static-triage MITIGATED verdicts until that
+  unblock lands.

@@ -28,6 +28,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 15. [Intelligence Layer Roadmap (2026-03-25)](#15-intelligence-layer-roadmap-2026-03-25)
 16. [KV-Cache Compression-Aware Routing (2026-04-05)](#16-kv-cache-compression-aware-routing-2026-04-05)
 17. [Hard Rules Audit Follow-ups (2026-05-05)](#17-hard-rules-audit-follow-ups-2026-05-05)
+18. [Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)](#18-request-lifecycle-crash-risk-audit-follow-ups-2026-05-08)
 
 ---
 
@@ -982,6 +983,141 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
 
 - [ ] **[P3] Add CI grep for `seastar::async(`**
   _Justification:_ The misuse was systemic enough that a lint will catch the next instance faster than another audit. Allowlist the legitimate sites once they're identified.
+
+---
+
+## 18. Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)
+
+Follow-ups from the request-lifecycle crash-risk assessment in [`docs/audits/request-lifecycle-crash-audit.md`](docs/audits/request-lifecycle-crash-audit.md). The audit was static-only and produced 25 HIGH+MED findings of mixed quality. A second triage pass re-read the source around each finding; this section reflects the triage verdicts, not the raw audit list.
+
+**Triage outcome:**
+- 8 CONFIRMED → fix tickets below
+- 10 MITIGATED → closed with a one-line evidence note (see audit doc)
+- 4 HYPOTHETICAL → defensive-only, rolled into a single sweep ticket
+- 3 INVESTIGATE-FURTHER → empirical follow-ups (sanitiser / fuzz)
+
+Even some CONFIRMED items have only hypothetical reachability (operator-misconfiguration or "if a future caller…"). They are kept on the list because each fix is trivial; do not treat them as security findings.
+
+Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). Anything that survives a multi-hour fuzz run on its corresponding boundary should be moved from this section to "MITIGATED-BY-FUZZ" in the audit doc.
+
+### Cross-cutting (do these first — each closes several findings)
+
+- [ ] **[P1] Adopt a `with_timeout` helper on the request hot path**
+  _Closes:_ H3 (reactor-blocking FFI fallback), M5 (thread-pool future with no timeout). Also tightens M15.
+  _Approach:_ Single helper `co_await with_request_deadline(ctx, fut)` that maps `seastar::timed_out_error` to a structured request error. Apply to `encode_threaded_async`, `submit_async`, and the chunk-read site in `stream_backend_response`.
+  _Complexity:_ Medium.
+
+- [ ] **[P1] Document and assert the shutdown lifetime contract**
+  _Closes:_ H5 (alien instance captured by reference), M14 (`.then()` route-learning captures raw `[this]`).
+  _Note:_ Triage downgraded H4 (TokenizerThreadPool promise race) and M1 (streaming-lambda `[this]`) to MITIGATED — the gate-holder pattern already covers them. This ticket only needs to handle H5 and M14.
+  _Approach:_ Capture `seastar::shared_ptr<HttpController>` (or equivalent) in long-lived `.then()` chains instead of raw `[this]`. Either capture the alien by value (if the API allows) or assert join-before-alien-teardown ordering in `~TokenizerThreadPool()`. Add a comment block describing the required shutdown order.
+  _Complexity:_ Medium.
+
+### P1 — CONFIRMED HIGHs
+
+- [ ] **[P1] H1: Replace `*slot.units` with checked access**
+  _Location:_ `src/http_controller.cpp:1986`. Triage notes the dereference is currently safe via the `rejected` guard at line 1969; risk is "future refactor" only. Fix is one line — use `slot.units.value()` or assert.
+  _Complexity:_ Trivial. _Reachability:_ Hypothetical (refactor footgun).
+
+- [ ] **[P1] H2: Validate Content-Length before `uint64_t→size_t` cast**
+  _Location:_ `src/http_controller.cpp:2742`. Compare parsed `uint64_t` against `max_request_body_bytes` *before* casting; reject (413) if larger.
+  _Complexity:_ Trivial. _Reachability:_ Network-input on 32-bit hosts; on 64-bit hosts the cast is lossless but explicit validation still desirable.
+
+- [ ] **[P1] H3: Wrap local-FFI tokenizer fallback in `with_timeout`**
+  _Location:_ `src/tokenizer_service.cpp:381` (called via `src/http_controller.cpp:1318`). Subsumed by the cross-cutting `with_timeout` ticket.
+  _Complexity:_ Low (once the helper exists).
+
+- [ ] **[P1] H5: Fix alien-instance capture lifetime**
+  _Location:_ `src/tokenizer_thread_pool.cpp:66`. Subsumed by the cross-cutting shutdown-contract ticket.
+  _Complexity:_ Medium.
+
+- [ ] **[P1] H7: Saturate `total_weight` in weighted random selection**
+  _Location:_ `src/router_service.cpp:2144-2152`. Cap the accumulator and assert `> 0` before constructing `uniform_int_distribution`.
+  _Complexity:_ Trivial. _Reachability:_ Operator-misconfiguration only.
+
+- [ ] **[P1] H9: Cap exponential backoff before `double→int64_t` cast**
+  _Location:_ `src/http_controller.cpp:755-757`. Compute `next_ms` in `double`, clamp to `max_backoff_ms`, then cast.
+  _Complexity:_ Trivial. _Reachability:_ Confirmed via code shape; requires enough retries to wrap, which is operationally rare but not impossible.
+
+### P2 — CONFIRMED MEDs not subsumed by cross-cutting
+
+- [ ] **[P2] M5: Add timeout to `TokenizerThreadPool::submit_async` callers**
+  Subsumed by the cross-cutting `with_timeout` ticket.
+  _Complexity:_ Low.
+
+- [ ] **[P2] M14: Stop capturing raw `[this]` in fire-and-forget route-learning**
+  _Location:_ `src/http_controller.cpp:991-999`. Subsumed by the cross-cutting shutdown-contract ticket.
+  _Complexity:_ Medium.
+
+### M6 — UPGRADED-BY-FUZZ, fixed (2026-05-08)
+
+- [x] **[P1] M6: RapidJSON stack overflow on deeply-nested JSON**
+  _Original verdict:_ HYPOTHETICAL (defensive only). _Actual:_ CONFIRMED via fuzz. The request-rewriter harness reproduced an ASan stack-overflow within ~10 minutes; the input was a deeply-nested JSON array that recursed through `ParseArray`/`ParseValue` ~250+ levels until the OS stack was exhausted. Reachable from request body — adversarial client could crash any shard.
+  _Fix:_ Passed `rapidjson::kParseIterativeFlag` to `Document::Parse(...)` at all nine call sites in `request_rewriter.hpp`. The iterative parser keeps state on the heap (in the existing `MemoryPoolAllocator`) and can't stack-overflow regardless of nesting; total memory remains bounded by `max_request_body_bytes` upstream. No policy / threshold to tune.
+  _Reproducer:_ `crash-9ebccad46252e559406b7dcff51ac746fb050996` (libFuzzer artifact).
+  _Lesson for future audits:_ static triage said "parser may fail and return `HasParseError()` — correctly handled at line 344"; that was wrong. RapidJSON's default flags (`kParseDefaultFlags == kParseNoFlags`) impose no depth limit on the recursive descent parser. Worth grepping any future review of JSON-handling code for missing iterative or depth-checked configurations.
+
+### P3 — Defensive only (HYPOTHETICAL findings, single sweep)
+
+- [ ] **[P3] Defensive sweep: M3, M9, M11**
+  _Coverage:_
+  - **M3** (`tokenizer_service.cpp:243-312`) — document the "string_view must be copied before first co_await" invariant at the entry, or take `std::string&&`.
+  - **M9** (`router_service.cpp:1145`) — `int64_t→int32_t` cast in jump-hash; only matters if num_buckets > 2^31, but document the assumption.
+  - **M11** (`stream_parser.cpp:152-157`) — buffer to first CRLF before HTTP status snoop. Not a crash; observability regression on split TCP segments.
+
+  _Justification:_ None are exploitable; bundling avoids three trivial PRs. Skip any item whose mitigation would be more code than the latent risk.
+  _Complexity:_ Low overall.
+
+### P2 — INVESTIGATE FURTHER (empirical, not fix tickets)
+
+- [ ] **[P2] M4 investigation: confirm `std::bad_alloc` propagation across `smp::submit_to`**
+  _Location:_ `src/tokenizer_service.cpp:254-291`.
+  _What's unclear:_ Whether a `std::bad_alloc` thrown inside the cross-shard lambda is repackaged as `broken_promise` or propagated cleanly to the outer `try/catch` at `http_controller.cpp:1340`.
+  _How to resolve:_ One unit test that forces an allocation failure (e.g. via a custom `std::pmr` allocator or `LD_PRELOAD` malloc shim) inside the submitted lambda; observe the exception type at the catch site.
+  _Decision rule:_ If the exception is repackaged, add a try/catch inside the lambda. If propagated cleanly, mark MITIGATED in the audit doc.
+  _Complexity:_ Medium.
+
+- [ ] **[P3] M7 investigation: cross-shard `get_live_backends` race during reconfiguration**
+  _Location:_ `src/router_service.cpp:529-540`.
+  _What's unclear:_ Whether `smp::invoke_on_all` reconfigurations can interleave with a per-shard lookup such that two sequential reads see inconsistent state.
+  _How to resolve:_ TSan run during a backend-churn integration test; or code-read of all `invoke_on_all` callers that mutate `backends` to confirm they hold the gate.
+  _Complexity:_ Low.
+
+- [ ] **[P3] M10 investigation: hard cap on fallback walker**
+  _Location:_ `src/circuit_breaker.hpp:78-80`, `http_controller.cpp::get_fallback_backend` (~217-229).
+  _What's unclear:_ Triage found `failure_threshold` defaults to 5 and the loop is bounded by `get_all_backend_ids().size()` — likely already safe. Confirm the loop has an explicit max-iterations cap independent of the backend list size.
+  _How to resolve:_ One focused code read; if the cap exists, mark MITIGATED.
+  _Complexity:_ Trivial.
+
+### Verification & follow-up
+
+- [x] **[P2] libFuzzer harnesses for the audit's input boundaries**
+  Landed at `tests/fuzz/` — one harness each for `RadixTree::insert/lookup`, `RequestRewriter::extract_*`, and `StreamParser::push`. Build with `-DRANVIER_BUILD_FUZZERS=ON` (clang only); the `Dockerfile.fuzz` image is the recommended environment. See `tests/fuzz/README.md`.
+  _30-min run results (2026-05-08):_
+  - `radix_tree_fuzz`: clean, 4,959,251 execs → MITIGATED-BY-FUZZ for H8, L9.
+  - `request_rewriter_fuzz`: first run crashed at ~564k execs (deeply-nested JSON → stack overflow). Surfaced as new ticket "M6 — UPGRADED-BY-FUZZ" above; fixed via `kParseIterativeFlag`. Post-fix run clean at 5,552,208 execs → MITIGATED-BY-FUZZ for M6, L5.
+  - `stream_parser_fuzz`: blocked by Seastar/libFuzzer allocator interaction (Hard Rule #15 — Seastar overrides global new/delete; libFuzzer never boots the reactor). Crashed in libFuzzer's internal cleanup, not in StreamParser. Not a Ranvier bug. See `tests/fuzz/README.md` for the exact diagnosis. H10, M11, M12 remain at static MITIGATED.
+
+- [ ] **[P3] Unblock Seastar-dependent fuzzing**
+  _Where:_ `tests/fuzz/stream_parser_fuzz.cpp` (and any future Seastar-touching harness).
+  _Approach:_ rebuild Seastar with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON` in a `Dockerfile.fuzz`-derived image. Trade-off: bypasses Seastar's per-shard allocator entirely, so any allocator-specific bug becomes invisible to the fuzzer; everything else (parsing, state machine, integer math) is correctly exercised. Worth the one-time ~30-min image build if H10/M11/M12 ever need to be promoted from static MITIGATED to MITIGATED-BY-FUZZ.
+  _Complexity:_ Medium (one-time Docker layer + Seastar build).
+
+- [ ] **[P2] Run unit tests + benchmarks under ASan/UBSan**
+  _Justification:_ Catches the integer-overflow / cast findings (H2, H9) and any heap UAF along the request path with no harness work.
+  _Approach:_ Add a `Dockerfile.sanitize` (or a flag in the existing test container) that builds with `-fsanitize=address,undefined`. Run the full unit-test suite and the smoke benchmarks. Triage any new failures separately from this audit.
+  _Complexity:_ Low (build config) + variable (triage of any failures found).
+
+- [ ] **[P3] Re-run the audit after fixes land**
+  _Justification:_ The audit was static-only and excluded slow paths (cross-shard route-learning retries, gossip-driven backend churn, persistence backpressure escalation). A follow-up pass after the cross-cutting tickets land should re-grade the remaining items and extend coverage to the excluded paths.
+  _Complexity:_ Low.
+
+### Closed by triage (no action — recorded for traceability)
+
+The following findings from the original audit were re-read against current source and judged MITIGATED. The audit doc carries the per-item evidence.
+
+- **HIGHs MITIGATED:** H4 (TokenizerThreadPool promise race — promises set before `_pending_jobs` clear), H6 (`live_backends[0]` — empty check is at the immediately preceding line), H8 (ART `prefix[MAX_PREFIX_LENGTH]` — buffer is over-allocated), H10 (`_chunk_bytes_needed + 2` — `max_chunk_size` cap upstream).
+- **MEDs MITIGATED:** M1 (streaming-lambda `[this]` — gate holder lifetime), M2 (optional-units pattern — guarded), M8 (modulo on live_backends — empty check at preceding line), M12 (Content-Length parse — comparator is safe for valid `size_t`), M13 (`bundle.is_valid` — single-coroutine access only), M15 (non-EPIPE rethrow — Seastar-handler-safe by design).
 
 ---
 

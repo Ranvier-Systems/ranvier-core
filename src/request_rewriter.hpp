@@ -246,7 +246,7 @@ inline RewriteResult RequestRewriter::rewrite(std::string_view body,
 
     // Parse the JSON document
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError()) {
         return RewriteResult{std::string(body), false, "JSON parse error"};
@@ -295,7 +295,7 @@ inline RewriteResult RequestRewriter::rewrite(std::string_view body,
 
 inline std::optional<std::string> RequestRewriter::extract_text(std::string_view body) {
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return std::nullopt;
@@ -339,7 +339,7 @@ RequestRewriter::extract_text_with_boundary_info(
         bool need_formatted_messages,
         const ChatTemplate& chat_template) {
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return std::nullopt;
@@ -495,7 +495,7 @@ RequestRewriter::extract_text_with_boundary_info(
 
 inline std::optional<std::string> RequestRewriter::extract_system_messages(std::string_view body) {
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return std::nullopt;
@@ -544,7 +544,7 @@ inline std::optional<size_t> RequestRewriter::extract_prefix_token_count(std::st
     }
 
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return std::nullopt;
@@ -591,7 +591,7 @@ inline std::vector<size_t> RequestRewriter::extract_prefix_boundaries(std::strin
     }
 
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return {};
@@ -645,7 +645,7 @@ inline std::optional<RequestRewriter::MessageBoundaries> RequestRewriter::extrac
     }
 
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return std::nullopt;
@@ -716,7 +716,7 @@ inline RequestRewriter::TokenExtractionResult RequestRewriter::extract_prompt_to
     result.valid = false;
 
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         result.error = "Invalid JSON";
@@ -797,7 +797,7 @@ inline std::string RequestRewriter::strip_prompt_token_ids(std::string_view body
 
     // Parse the JSON document
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
 
     if (doc.HasParseError() || !doc.IsObject()) {
         return std::string(body);

@@ -1,0 +1,56 @@
+# ---------------------------------------------------------
+# Ranvier Fuzz Builder Image
+# ---------------------------------------------------------
+# Layers clang + LLVM compiler-rt on top of Dockerfile.base so the
+# libFuzzer harnesses under tests/fuzz/ can be built and run.
+#
+# Why a separate image: libFuzzer is a clang-only feature and the
+# production base image is GCC-only. Adding clang to the base image
+# would inflate every production build with ~400 MB of toolchain.
+# This image is for the developer fuzz loop, not the production path.
+#
+# Build:
+#   # 1. Build (or pull) the base image first.
+#   docker build -f Dockerfile.base -t ranvier-base:latest .
+#
+#   # 2. Build the fuzz image on top.
+#   docker build -f Dockerfile.fuzz -t ranvier-fuzz:latest .
+#
+# Run:
+#   # Mount the source tree and drop into a shell.
+#   docker run --rm -it -v "$PWD:/src" -w /src ranvier-fuzz:latest bash
+#
+#   # Or build and run a single harness in one shot.
+#   docker run --rm -v "$PWD:/src" -w /src ranvier-fuzz:latest \
+#       make fuzz-build fuzz-run-radix-tree
+#
+# Override the base image (e.g. CI cache tag):
+#   docker build --build-arg BASE_IMAGE=registry/ranvier-base:abc123 \
+#                -f Dockerfile.fuzz -t ranvier-fuzz:latest .
+# ---------------------------------------------------------
+ARG BASE_IMAGE=ranvier-base:latest
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="Ranvier Fuzz Builder"
+LABEL org.opencontainers.image.description="ranvier-base + clang/LLVM for libFuzzer harnesses"
+
+# clang        — compiler driver
+# clang-tools-extra — clang-tidy etc. (cheap, useful when triaging crashes)
+# compiler-rt  — provides the libFuzzer + ASan + UBSan runtime libraries
+# llvm         — llvm-symbolizer, used by ASan to produce readable stacks
+# lld          — fast linker; libFuzzer builds with sanitizers benefit a lot
+RUN dnf install -y \
+        clang \
+        clang-tools-extra \
+        compiler-rt \
+        llvm \
+        lld \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Make ASan stack traces readable by default.
+ENV ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer
+ENV UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+ENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1
+
+WORKDIR /src

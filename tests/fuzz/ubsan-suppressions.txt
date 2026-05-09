@@ -1,0 +1,20 @@
+# UBSan suppressions for fuzz harnesses.
+#
+# UBSan flags certain technically-undefined-but-effectively-harmless
+# patterns in third-party code that we vendor. We suppress those so the
+# fuzzer doesn't drown in noise; every other UBSan check remains active
+# and will halt the run on a real Ranvier bug.
+#
+# Each line is `<check>:<source-or-symbol-pattern>`. See the LLVM docs
+# at https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#runtime-suppressions
+#
+# Format: pattern matches against the source filename of the failing
+# instruction. Globs are POSIX fnmatch(3).
+
+# RapidJSON v1.1.0 internal Stack::Reserve does `stack_ + n` when
+# `stack_ == nullptr`; pointer arithmetic on nullptr with non-zero
+# offset is UB even though the result is unused (a malloc immediately
+# follows). Reported and discussed upstream; not a real bug. Affects
+# every fuzz input that triggers any Stack::Push before the first
+# allocation.
+pointer-overflow:*rapidjson*
