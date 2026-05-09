@@ -2,8 +2,7 @@
 //
 // Static coverage of the request_timeout_error exception class exposed by
 // src/request_timeout.hpp. The templated with_request_timeout() helper itself
-// requires a running Seastar reactor and is exercised by the integration
-// harnesses at the three call sites it wraps (BACKLOG §18).
+// requires a running Seastar reactor and is exercised by integration tests.
 
 #include "request_timeout.hpp"
 

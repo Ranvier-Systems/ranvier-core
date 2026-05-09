@@ -343,8 +343,8 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
                 ++_thread_pool_dispatches;
 
                 // Bound the wait so a wedged worker can't strand the request
-                // forever (audit M5). On timeout, fall through to cross-shard
-                // / local just like the queue-full path.
+                // forever. On timeout, fall through to cross-shard / local
+                // just like the queue-full path.
                 constexpr auto kThreadPoolTokenizeTimeout =
                     std::chrono::seconds(3);
                 std::optional<ThreadPoolTokenizationResult> pool_result_opt;

@@ -2,9 +2,7 @@
 //
 // Wraps seastar::with_timeout with a domain-tagged exception type so callers
 // on the request hot path can identify which phase exceeded its deadline
-// (tokenize, thread-pool dispatch, backend chunk read, ...). Closes BACKLOG
-// §18 cross-cutting ticket: H3 (reactor-blocking FFI fallback), M5 (thread
-// pool future with no timeout), tightens M15 (chunk-read site).
+// (tokenize, thread-pool dispatch, backend chunk read, ...).
 
 #pragma once
 

@@ -846,8 +846,7 @@ if(Seastar_FOUND)
 
     # request_timeout helper Unit Tests (Requires Seastar types for
     # seastar::timed_out_error base class — the templated helper itself is
-    # exercised by the integration harnesses at the three call sites it wraps,
-    # see BACKLOG §18.)
+    # exercised by integration tests.)
     add_executable(request_timeout_test
       tests/unit/request_timeout_test.cpp
     )
