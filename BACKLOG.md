@@ -1049,16 +1049,23 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
   _Location:_ `src/http_controller.cpp:991-999`. Subsumed by the cross-cutting shutdown-contract ticket.
   _Complexity:_ Medium.
 
+### M6 — UPGRADED-BY-FUZZ, fixed (2026-05-08)
+
+- [x] **[P1] M6: RapidJSON stack overflow on deeply-nested JSON**
+  _Original verdict:_ HYPOTHETICAL (defensive only). _Actual:_ CONFIRMED via fuzz. The request-rewriter harness reproduced an ASan stack-overflow within ~10 minutes; the input was a deeply-nested JSON array that recursed through `ParseArray`/`ParseValue` ~250+ levels until the OS stack was exhausted. Reachable from request body — adversarial client could crash any shard.
+  _Fix:_ Passed `rapidjson::kParseIterativeFlag` to `Document::Parse(...)` at all nine call sites in `request_rewriter.hpp`. The iterative parser keeps state on the heap (in the existing `MemoryPoolAllocator`) and can't stack-overflow regardless of nesting; total memory remains bounded by `max_request_body_bytes` upstream. No policy / threshold to tune.
+  _Reproducer:_ `crash-9ebccad46252e559406b7dcff51ac746fb050996` (libFuzzer artifact).
+  _Lesson for future audits:_ static triage said "parser may fail and return `HasParseError()` — correctly handled at line 344"; that was wrong. RapidJSON's default flags (`kParseDefaultFlags == kParseNoFlags`) impose no depth limit on the recursive descent parser. Worth grepping any future review of JSON-handling code for missing iterative or depth-checked configurations.
+
 ### P3 — Defensive only (HYPOTHETICAL findings, single sweep)
 
-- [ ] **[P3] Defensive sweep: M3, M6, M9, M11**
+- [ ] **[P3] Defensive sweep: M3, M9, M11**
   _Coverage:_
   - **M3** (`tokenizer_service.cpp:243-312`) — document the "string_view must be copied before first co_await" invariant at the entry, or take `std::string&&`.
-  - **M6** (`request_rewriter.hpp:342`) — distinguish RapidJSON nesting-limit failures from generic parse errors in metrics.
   - **M9** (`router_service.cpp:1145`) — `int64_t→int32_t` cast in jump-hash; only matters if num_buckets > 2^31, but document the assumption.
   - **M11** (`stream_parser.cpp:152-157`) — buffer to first CRLF before HTTP status snoop. Not a crash; observability regression on split TCP segments.
 
-  _Justification:_ None are exploitable; bundling avoids four trivial PRs. Skip any item whose mitigation would be more code than the latent risk.
+  _Justification:_ None are exploitable; bundling avoids three trivial PRs. Skip any item whose mitigation would be more code than the latent risk.
   _Complexity:_ Low overall.
 
 ### P2 — INVESTIGATE FURTHER (empirical, not fix tickets)

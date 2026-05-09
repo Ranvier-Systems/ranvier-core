@@ -15,8 +15,21 @@ verified with a targeted test or sanitiser run before remediation.
 > |---------|-------|------|
 > | CONFIRMED (fix) | H1, H2, H3, H5, H7, H9 | M5, M14 |
 > | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M8, M12, M13, M15 |
-> | HYPOTHETICAL (defensive only) | — | M3, M6, M9, M11 |
+> | HYPOTHETICAL (defensive only) | — | M3, M9, M11 |
 > | INVESTIGATE FURTHER | — | M4, M7, M10 |
+> | UPGRADED-BY-FUZZ (fixed) | — | M6 |
+>
+> **Fuzz update (2026-05-08):** the request-rewriter harness in
+> `tests/fuzz/` triggered a stack overflow on adversarial deeply-nested
+> JSON within ~10 minutes, contradicting the original triage of M6 as
+> HYPOTHETICAL. RapidJSON's default recursive parser has no depth limit;
+> Ranvier called it directly at nine sites in `request_rewriter.hpp`. M6
+> is upgraded to CONFIRMED and fixed by passing `kParseIterativeFlag` to
+> `Document::Parse(...)` at every call site (commit landed alongside this
+> note). The iterative parser keeps state on the heap, can't
+> stack-overflow regardless of nesting, and is bounded by the existing
+> `max_request_body_bytes` cap. Reproducer artifact:
+> `crash-9ebccad46252e559406b7dcff51ac746fb050996`.
 >
 > Two CONFIRMED items deserve a footnote: H1 and H7 are CONFIRMED by code
 > shape (the dereference / arithmetic exists as flagged), but reachability
