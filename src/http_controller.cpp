@@ -752,10 +752,14 @@ future<ConnectionBundle> HttpController::establish_backend_connection(ProxyConte
             // Wait with exponential backoff before retry
             co_await seastar::sleep(ctx->current_backoff);
 
-            // Increase backoff for next attempt (with cap)
-            auto next_backoff = std::chrono::milliseconds(
-                static_cast<int64_t>(ctx->current_backoff.count() * ctx->retry_config.backoff_multiplier));
-            ctx->current_backoff = std::min(next_backoff, ctx->retry_config.max_backoff);
+            // Increase backoff for next attempt (with cap).
+            // Compute in double and clamp to max_backoff before casting to int64_t,
+            // since a raw double->int64_t cast on overflow is UB (audit H9, Hard Rule #11).
+            const double next_ms = std::min(
+                static_cast<double>(ctx->current_backoff.count()) *
+                    ctx->retry_config.backoff_multiplier,
+                static_cast<double>(ctx->retry_config.max_backoff.count()));
+            ctx->current_backoff = std::chrono::milliseconds(static_cast<int64_t>(next_ms));
         } else {
             log_proxy.warn("[{}] Connection failed after {} retries and {} fallbacks",
                 ctx->request_id, ctx->retry_config.max_retries + 1, ctx->fallback_attempts);
@@ -2010,7 +2014,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // BackendRequestGuard destructor decrements active_requests; CostBudgetGuard destructor releases cost budget.
     // Use SSE content type for streaming requests, JSON for non-streaming (e.g. Ollama non-stream)
     auto response_content_type = ctx->client_expects_streaming ? "text/event-stream" : "json";
-    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(slot.units.value()), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
@@ -2766,6 +2770,16 @@ size_t HttpController::get_request_body_size(const seastar::http::request& req) 
         uint64_t cl_value = 0;
         auto [ptr, ec] = std::from_chars(cl_str.data(), cl_str.data() + cl_str.size(), cl_value);
         if (ec == std::errc{} && ptr == cl_str.data() + cl_str.size()) {
+            // Validate against limits BEFORE the size_t cast so a Content-Length
+            // larger than size_t (32-bit hosts) cannot silently truncate past the
+            // body-size check (audit H2). On 64-bit hosts both branches are no-ops.
+            if (_config.max_request_body_bytes > 0 &&
+                cl_value > _config.max_request_body_bytes) {
+                return std::numeric_limits<size_t>::max();
+            }
+            if (cl_value > std::numeric_limits<size_t>::max()) {
+                return std::numeric_limits<size_t>::max();
+            }
             return static_cast<size_t>(cl_value);
         }
     }

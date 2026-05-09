@@ -1028,27 +1028,17 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 ### P1 — CONFIRMED HIGHs
 
-- [ ] **[P1] H1: Replace `*slot.units` with checked access**
-  _Location:_ `src/http_controller.cpp:1986`. Triage notes the dereference is currently safe via the `rejected` guard at line 1969; risk is "future refactor" only. Fix is one line — use `slot.units.value()` or assert.
-  _Complexity:_ Trivial. _Reachability:_ Hypothetical (refactor footgun).
+- [x] **[P1] H1: Replace `*slot.units` with checked access** — Fixed 2026-05-09 (P1 trivial sweep).
 
-- [ ] **[P1] H2: Validate Content-Length before `uint64_t→size_t` cast**
-  _Location:_ `src/http_controller.cpp:2742`. Compare parsed `uint64_t` against `max_request_body_bytes` *before* casting; reject (413) if larger.
-  _Complexity:_ Trivial. _Reachability:_ Network-input on 32-bit hosts; on 64-bit hosts the cast is lossless but explicit validation still desirable.
+- [x] **[P1] H2: Validate Content-Length before `uint64_t→size_t` cast** — Fixed 2026-05-09 (P1 trivial sweep).
 
-- [ ] **[P1] H3: Wrap local-FFI tokenizer fallback in `with_timeout`**
-  _Location:_ `src/tokenizer_service.cpp:381` (called via `src/http_controller.cpp:1318`). Subsumed by the cross-cutting `with_timeout` ticket.
-  _Complexity:_ Low (once the helper exists).
+- [x] **[P1] H3: Wrap local-FFI tokenizer fallback in `with_timeout`** — Fixed 2026-05-09 (subsumed by `with_timeout` ticket above).
 
 - [x] **[P1] H5: Fix alien-instance capture lifetime** — Fixed 2026-05-09 (subsumed by shutdown-contract ticket above).
 
-- [ ] **[P1] H7: Saturate `total_weight` in weighted random selection**
-  _Location:_ `src/router_service.cpp:2144-2152`. Cap the accumulator and assert `> 0` before constructing `uniform_int_distribution`.
-  _Complexity:_ Trivial. _Reachability:_ Operator-misconfiguration only.
+- [x] **[P1] H7: Saturate `total_weight` in weighted random selection** — Fixed 2026-05-09 (P1 trivial sweep).
 
-- [ ] **[P1] H9: Cap exponential backoff before `double→int64_t` cast**
-  _Location:_ `src/http_controller.cpp:755-757`. Compute `next_ms` in `double`, clamp to `max_backoff_ms`, then cast.
-  _Complexity:_ Trivial. _Reachability:_ Confirmed via code shape; requires enough retries to wrap, which is operationally rare but not impossible.
+- [x] **[P1] H9: Cap exponential backoff before `double→int64_t` cast** — Fixed 2026-05-09 (P1 trivial sweep).
 
 ### P2 — CONFIRMED MEDs not subsumed by cross-cutting
 
