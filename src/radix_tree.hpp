@@ -431,6 +431,17 @@ public:
     // =============================================================================
     // Tree Dump/Serialization for Admin API
     // =============================================================================
+    //
+    // The DumpNode struct below contains a `vector<pair<uint8_t, DumpNode>>`,
+    // a self-referential type. C++17 explicitly allows incomplete types in
+    // std::vector, but Clang + libstdc++ instantiates vector's destructor
+    // more eagerly than GCC + libstdc++ does and rejects this. The fuzz
+    // build (clang) compiles with -DRANVIER_FUZZING to skip the dump
+    // machinery — the harnesses only exercise insert/lookup, never dump().
+    // The proper fix (vector<pair<uint8_t, unique_ptr<DumpNode>>>) is
+    // tracked as a follow-up; until then, production builds (GCC) are
+    // unaffected.
+#ifndef RANVIER_FUZZING
 
     // Represents a node in the serialized tree structure.
     //
@@ -536,6 +547,8 @@ private:
 
         return result;
     }
+
+#endif  // RANVIER_FUZZING
 
 public:
 

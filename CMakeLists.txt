@@ -1185,6 +1185,10 @@ if(RANVIER_BUILD_FUZZERS)
       PRIVATE
       absl::inlined_vector
     )
+    # Skip the DumpNode machinery (self-referential vector that Clang +
+    # libstdc++ rejects but GCC + libstdc++ accepts). The fuzz harness only
+    # exercises insert/lookup, never dump.
+    target_compile_definitions(radix_tree_fuzz PRIVATE RANVIER_FUZZING)
     target_compile_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
     target_link_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
 
