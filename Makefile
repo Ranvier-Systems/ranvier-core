@@ -47,6 +47,18 @@ fuzz-build:
 	    echo "       install clang locally (Fedora: dnf install clang compiler-rt llvm)."; \
 	    exit 1; \
 	}
+	@# A stale cache from a previous configure (different source path —
+	@# common when the same checkout is mounted into different containers,
+	@# e.g. devcontainer at /workspaces vs ad-hoc bind mount at /src) makes
+	@# cmake abort with "source ... does not match the source used to
+	@# generate cache". Detect and wipe rather than failing.
+	@if [ -f $(FUZZ_BUILD_DIR)/CMakeCache.txt ]; then \
+	    cached_src=$$(grep -E '^CMAKE_HOME_DIRECTORY:' $(FUZZ_BUILD_DIR)/CMakeCache.txt | cut -d= -f2); \
+	    if [ "$$cached_src" != "$$(pwd)" ]; then \
+	        echo "Stale fuzz build cache (cached source $$cached_src != $$(pwd)); wiping $(FUZZ_BUILD_DIR)."; \
+	        rm -rf $(FUZZ_BUILD_DIR); \
+	    fi; \
+	fi
 	@echo "Configuring fuzz harnesses (clang + libFuzzer + ASan/UBSan)..."
 	@cmake -B $(FUZZ_BUILD_DIR) \
 	    -DRANVIER_BUILD_FUZZERS=ON \
