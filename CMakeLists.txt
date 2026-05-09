@@ -844,6 +844,20 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(sharded_config_test)
 
+    # request_timeout helper Unit Tests (Requires Seastar types for
+    # seastar::timed_out_error base class — the templated helper itself is
+    # exercised by integration tests.)
+    add_executable(request_timeout_test
+      tests/unit/request_timeout_test.cpp
+    )
+    target_include_directories(request_timeout_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(request_timeout_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest_main
+    )
+    gtest_discover_tests(request_timeout_test)
+
     # CryptoOffloader Unit Tests (Requires Seastar types)
     # Tests adaptive crypto offloading decision logic and configuration
     add_executable(crypto_offloader_test
