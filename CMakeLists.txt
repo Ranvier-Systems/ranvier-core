@@ -1195,7 +1195,7 @@ if(RANVIER_BUILD_FUZZERS)
     target_include_directories(request_rewriter_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(request_rewriter_fuzz
       PRIVATE
-      rapidjson
+      rapidjson_interface
     )
     target_compile_options(request_rewriter_fuzz PRIVATE ${_fuzz_flags})
     target_link_options(request_rewriter_fuzz PRIVATE ${_fuzz_flags})
