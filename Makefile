@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-clean
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-all fuzz-clean
 
 # Default target
 all: build
@@ -102,6 +102,8 @@ fuzz-run-stream-parser: fuzz-build
 	    -max_total_time=$(FUZZ_TIME) \
 	    -max_len=$(FUZZ_MAX_LEN) \
 	    -print_final_stats=1
+
+fuzz-run-all: fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser
 
 fuzz-clean:
 	@rm -rf $(FUZZ_BUILD_DIR)
@@ -829,6 +831,7 @@ help:
 	@echo "  make fuzz-run-radix-tree           - Fuzz RadixTree::insert/lookup"
 	@echo "  make fuzz-run-request-rewriter     - Fuzz RequestRewriter::extract_*"
 	@echo "  make fuzz-run-stream-parser        - Fuzz StreamParser::push (needs Seastar)"
+	@echo "  make fuzz-run-all                  - Run all three harnesses sequentially"
 	@echo "  make fuzz-clean                    - Remove the fuzz build directory"
 	@echo "  FUZZ_TIME=600 make fuzz-run-radix-tree  (override default 1800s run)"
 	@echo ""
