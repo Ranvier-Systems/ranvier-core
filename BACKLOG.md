@@ -1066,11 +1066,7 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 - [x] **[P2] M4 investigation: confirm `std::bad_alloc` propagation across `smp::submit_to`** — Mitigated 2026-05-10 — diagnostic test at `tests/unit/cross_shard_exception_propagation_test.cpp` throws `std::bad_alloc` inside a `seastar::smp::submit_to` lambda and observes it at the initiating shard with demangled typeid `std::bad_alloc` (propagated cleanly, not repackaged), so the existing `catch (const std::exception&)` around `encode_threaded_async` at `http_controller.cpp:1340` already covers it; see audit-doc closure addendum near the top of `docs/audits/request-lifecycle-crash-audit.md`.
 
-- [ ] **[P3] M7 investigation: cross-shard `get_live_backends` race during reconfiguration**
-  _Location:_ `src/router_service.cpp:529-540`.
-  _What's unclear:_ Whether `smp::invoke_on_all` reconfigurations can interleave with a per-shard lookup such that two sequential reads see inconsistent state.
-  _How to resolve:_ TSan run during a backend-churn integration test; or code-read of all `invoke_on_all` callers that mutate `backends` to confirm they hold the gate.
-  _Complexity:_ Low.
+- [x] **[P3] M7 investigation: cross-shard `get_live_backends` race during reconfiguration** — Mitigated 2026-05-10 — code-read confirms the reader (`ShardLocalState::get_live_backends`, `src/router_service.cpp:529-540`) is synchronous (no `co_await`) and every cross-shard writer that mutates `backends` / `backend_ids` / `dead_backends` / `is_draining` (`register_backend_global`, `unregister_backend_global`, `report_backend_health`, `drain_backend_global`, `handle_node_state_change`) dispatches via `seastar::smp::submit_to`, so the writer runs as its own reactor task on the target shard and cannot interleave with the reader's snapshot loop; see audit-doc closure addendum near the top of `docs/audits/request-lifecycle-crash-audit.md`.
 
 - [x] **[P3] M10 investigation: hard cap on fallback walker** — Mitigated 2026-05-10 — verified structural cap at `http_controller.cpp:218-231`: the loop iterates a value-copy of `get_all_backend_ids()` (snapshot taken at call time) and returns on first allowed backend, so the walker is bounded by the local copy size and cannot loop independently of the registry.
 
