@@ -2141,12 +2141,25 @@ std::optional<BackendId> RouterService::get_random_backend() {
         return std::nullopt;  // No live backends with weight > 0
     }
 
+    // Saturate the accumulator: pathological/operator-misconfigured weights
+    // must not wrap uint64_t and feed `dist(0, -1)` (audit H7, Hard Rule #11).
+    constexpr uint64_t kMaxTotalWeight = std::numeric_limits<uint64_t>::max() / 2;
     uint64_t total_weight = 0;
     for (const auto& [id, info] : live_infos) {
         if (info->priority == min_priority && info->weight > 0) {
-            total_weight += info->weight;
+            total_weight = (total_weight > kMaxTotalWeight - info->weight)
+                ? kMaxTotalWeight
+                : total_weight + info->weight;
         }
     }
+    // Invariant: min_priority was set from a weight>0 backend in the same
+    // live_infos snapshot, so total_weight > 0 here. Defend against future
+    // refactors breaking that invariant in release builds where the assert
+    // below is compiled out — never feed uniform_int_distribution(0, -1).
+    if (total_weight == 0) {
+        return std::nullopt;
+    }
+    assert(total_weight > 0);
 
     // Pass 2: weighted random selection over the highest-priority candidates
     std::uniform_int_distribution<uint64_t> dist(0, total_weight - 1);
