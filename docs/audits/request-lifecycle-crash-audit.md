@@ -161,6 +161,184 @@ verified with a targeted test or sanitiser run before remediation.
 > then drops to 0" shape that originally fed H6 cannot occur because
 > the reader's empty-check and indexing both run against the same
 > local snapshot. M7 → MITIGATED.
+>
+> **Re-run (2026-05-10).** Static re-read of all CONFIRMED and
+> MITIGATED items now that the fix tickets in BACKLOG §18 have
+> shipped, plus extension to the three slow paths the original audit
+> excluded (cross-shard route-learning retries, gossip-driven backend
+> churn, persistence backpressure). Verdict: every CONFIRMED fix
+> matches the recommended shape at the cited site, no MITIGATED item
+> downgrades, and the slow-path sweep surfaces one HIGH and one MED
+> in a single root cause (RapidJSON recursive parser on
+> non-request-path JSON inputs), plus two LOWs.
+>
+> *Shipped CONFIRMED fixes verified against current source:*
+>
+> - **H1** — `src/http_controller.cpp:2017` —
+>   `semaphore_units = std::move(slot.units.value())` replaces the
+>   raw `*slot.units` dereference; `std::optional::value()` throws
+>   on empty, giving a clean abort. Commit
+>   [`13e355b`](../../commit/13e355b). MITIGATED-BY-FIX.
+> - **H2** — `src/http_controller.cpp:2777-2780` —
+>   `get_request_body_size()` compares the parsed `uint64_t` against
+>   `SIZE_MAX` and `max_request_body_bytes` *before* the cast, so an
+>   adversarial `Content-Length` overflows into the upstream 413
+>   path rather than truncating into a small `size_t`. Commit
+>   [`13e355b`](../../commit/13e355b). MITIGATED-BY-FIX.
+> - **H3** — `src/http_controller.cpp:1332-1336` — the FFI fallback
+>   `encode_threaded_async()` is wrapped in
+>   `with_request_timeout(kTokenizeTimeout, ..., "tokenize")`
+>   from `src/request_timeout.hpp`; on timeout the controller falls
+>   back to round-robin routing rather than blocking the reactor.
+>   Commit [`f3ed20e`](../../commit/f3ed20e). MITIGATED-BY-FIX.
+> - **H5** — `src/tokenizer_thread_pool.cpp:65-74` documents the
+>   alien-by-reference capture site as `SHUTDOWN-CONTRACT`;
+>   `~TokenizerThreadPool` (lines 217-230) asserts `stop_worker()`
+>   was called and warns + force-stops on violation. The shutdown
+>   contract is now structurally enforced rather than implicit.
+>   Commit [`e75ff52`](../../commit/e75ff52). MITIGATED-BY-FIX.
+> - **H7** — `src/router_service.cpp:2151-2168` saturates
+>   `total_weight` at `UINT64_MAX/2` during accumulation and asserts
+>   `> 0` before constructing the distribution; on zero it returns
+>   `std::nullopt` and the caller falls back. Commit
+>   [`13e355b`](../../commit/13e355b). MITIGATED-BY-FIX.
+> - **H9** — `src/http_controller.cpp:758-762` computes the next
+>   backoff in `double` and clamps to `max_backoff.count()` *before*
+>   the `int64_t` cast, so no doubling can wrap negative regardless
+>   of multiplier or current backoff. Commit
+>   [`13e355b`](../../commit/13e355b). MITIGATED-BY-FIX.
+> - **M5** — `src/tokenizer_service.cpp:361-364` —
+>   `submit_async()` is wrapped in
+>   `with_request_timeout(kThreadPoolTokenizeTimeout, ..., "tokenize_thread_pool")`;
+>   a wedged worker now surfaces as a labeled timeout instead of a
+>   pending future. Commit [`f3ed20e`](../../commit/f3ed20e).
+>   MITIGATED-BY-FIX.
+> - **M14** — `src/http_controller.cpp:1003-1009` — the route-learning
+>   `.then()` lambda captures `holder = _request_gate.hold()`
+>   alongside `this`, so `_request_gate.close()` blocks on the
+>   fire-and-forget tail and the controller cannot be torn down
+>   under the callback. Commit [`e75ff52`](../../commit/e75ff52).
+>   MITIGATED-BY-FIX.
+>
+> *MITIGATED items re-read against current source.* Line numbers
+> have drifted by a handful of lines but every cited mitigation
+> structure is still in place: H4 (promises set inside
+> `_pending_jobs` before `stop()` clears the map), H6
+> (`get_backend_for_prefix` / `get_backend_by_hash` consume a
+> value-copy snapshot synchronously, empty-check and indexing both
+> against the snapshot), H8 (ART `prefix` is an
+> `absl::InlinedVector<uint8_t,32>`, the index is bounds-checked),
+> H10 (`max_chunk_size` cap rejects oversized chunks at
+> `stream_parser.cpp:308` before `_chunk_bytes_needed` is set),
+> M1/M13 (gate-holder + single-coroutine bundle access), M2 (the
+> `try_get_units` optional is guarded immediately above the
+> dereference), M3 (block comment at `tokenizer_service.cpp:213`
+> still pins the no-`co_await`-before-copy invariant), M4 (outer
+> `catch (const std::exception&)` at
+> `http_controller.cpp:1373` still wraps the cross-shard call), M7
+> (reader still synchronous, all writers still go via
+> `smp::submit_to`), M8 (empty-check immediately precedes the
+> modulo), M9 (cast-safety comment present at
+> `router_service.cpp:1136-1141` citing
+> `MAX_KNOWN_BACKENDS = 64` at `local_discovery.hpp:81`), M11
+> (`\r\n\r\n` guard at `stream_parser.cpp:141` still gates the
+> snoop), M12 (`size_t` parse + capped accumulator size), M15
+> (rethrow handler at `http_controller.cpp:2060-2067` still
+> catches). No downgrades.
+>
+> *Slow-path extension — three areas the original audit excluded:*
+>
+> - **Cross-shard route-learning retries**
+>   (`router_service.cpp::flush_route_batch`,
+>   `start_batch_flush_timer`). Clean. The timer callback
+>   (`router_service.cpp:2904-2912`) atomically moves
+>   `_pending_remote_routes` out at line 2957 before broadcasting,
+>   so a failed broadcast cannot retry the same batch on the next
+>   tick; the gate-holder + `do_with(std::move(holder), ...)`
+>   pattern at line 2972 keeps the holder alive across the
+>   `parallel_for_each`; foreign_ptr handles the cross-shard
+>   ownership transfer per Hard Rule #14. Backpressure cap
+>   (`MAX_BUFFER_SIZE`) is enforced at the buffer side. No new
+>   findings.
+> - **Gossip-driven backend churn**
+>   (`gossip_service.cpp`, `local_discovery.cpp`,
+>   `router_service.cpp::handle_node_state_change`). The registry
+>   writers are the same set re-verified for M7; gossip itself does
+>   not write the registry directly, it routes through
+>   `RouterService::handle_node_state_change`'s `submit_to` path.
+>   Two narrow finds: the JSON parsers in the discovery layer (S2)
+>   and the monotonic backend-id counter (S4 LOW).
+> - **Persistence backpressure escalation**
+>   (`async_persistence.cpp`, `sqlite_persistence.cpp`). The MPSC
+>   reservation pattern at `async_persistence.cpp:287-305` is
+>   conservative — producers `fetch_add` first then push, and only
+>   `fetch_sub` on push failure or drain — so `_queue_size` is an
+>   upper bound on actual ring depth, never an under-count. The
+>   worker drains on shutdown
+>   (`async_persistence.cpp:354-358`) and signals back via
+>   `alien::run_on`. One operational gap (S3 LOW) on disk-full
+>   error classification. No crash-class findings.
+>
+> | New finding | Severity | Where | Root cause |
+> |-------------|----------|-------|------------|
+> | S1 | HIGH | `src/cache_event_parser.hpp:64` | Default-recursive RapidJSON on `POST /v1/cache/events` body |
+> | S2 | MED | `src/local_discovery.cpp:214`, `src/k8s_discovery_service.cpp:687,973,1094` | Default-recursive RapidJSON on backend `/v1/models` and K8s API responses |
+> | S3 | LOW | `src/sqlite_persistence.cpp:362-367` | `save_routes_batch()` returns plain `bool`; disk-full not distinguished from transient errors |
+> | S4 | LOW | `src/local_discovery.cpp:328`, `src/local_discovery.hpp:86` | `_next_backend_id` is `int32_t` starting at 10000; signed overflow is UB after 2^31 increments |
+>
+> S1 and S2 share the M6 root cause that the original audit
+> handled only on the request-rewriter path: RapidJSON's default
+> flags use a recursive descent parser with no depth limit, and
+> the M6 fix (`kParseIterativeFlag`) was applied only to the nine
+> sites in `request_rewriter.hpp`. The non-request-path JSON
+> consumers were not swept. S1 is HIGH because
+> `POST /v1/cache/events` is a network-reachable endpoint with
+> *optional* auth (`_config.cache_events.auth_token` empty by
+> default), so an unauthenticated client can crash a shard with a
+> deeply-nested array. S2 is MED because the inputs come from
+> a localhost backend's HTTP response or the Kubernetes API
+> server — both nominally trusted, but a compromised backend or
+> a malicious watch-stream injector can still reach the parser.
+> Fix shape mirrors M6: pass `rapidjson::kParseIterativeFlag` to
+> `Document::Parse(...)` at every cited site. New fix tickets
+> opened in BACKLOG §18 for S1 (P1) and S2 (P2). S3 and S4 go in
+> the closure table below.
+>
+> Two of the original sub-agent's slow-path candidates were
+> dismissed during spot-check and are recorded here for
+> traceability: the "timer callback retries the same batch on
+> failure" shape doesn't apply (the batch is moved out at
+> `router_service.cpp:2957` before the broadcast, so a failed
+> broadcast loses *that* batch but doesn't re-retry it), and the
+> "queue-size underflow" shape on `async_persistence.cpp:311,320`
+> doesn't apply (the producer-first reservation makes the counter
+> an upper bound, not a signed accumulator).
+>
+> *Closure table additions (LOWs from the slow-path sweep):*
+>
+> - **S3** (`src/sqlite_persistence.cpp:362-367`,
+>   `save_routes_batch`) — on `sqlite3_step()` failure the function
+>   rolls back the transaction and returns `false`; the caller
+>   logs a generic warning. SQLite distinguishes transient
+>   contention (e.g. `SQLITE_BUSY`) from permanent failures
+>   (`SQLITE_FULL`, `SQLITE_IOERR_*`) but Ranvier collapses both
+>   into "save failed". Not a crash — route writes are best-effort
+>   for a learnt cache, and the rollback keeps the table
+>   consistent — but a disk-full event drops all subsequent
+>   batches silently. Defensive fix: branch on the rc and emit
+>   distinct metrics / log severity for permanent vs. transient
+>   errors. LOW.
+> - **S4** (`src/local_discovery.cpp:328`,
+>   `src/local_discovery.hpp:86`) — `_next_backend_id` is
+>   `int32_t` (alias `BackendId`) starting at 10000 and
+>   monotonically incremented per discovered backend. With
+>   `MAX_KNOWN_BACKENDS = 64` capping concurrent membership and
+>   the counter never reset, signed-int overflow at 2^31 is UB
+>   but requires ~2.1B backend churns over the process lifetime.
+>   Realistically unreachable; recorded as LOW for completeness.
+>   Defensive fix: switch to `uint32_t` (still wraps, but
+>   well-defined and observable), or detect approach to the cap
+>   and refuse new IDs.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS
