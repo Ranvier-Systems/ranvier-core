@@ -1193,6 +1193,49 @@ foreach(_t ${_ranvier_all_targets})
 endforeach()
 
 # =============================================================================
+# Sanitizer Build (opt-in)
+# =============================================================================
+# Builds the unit-test executables with ASan + UBSan for the empirical sweep
+# requested in BACKLOG §18 — catches the integer-overflow / cast findings
+# (H2, H9) and any heap UAF along the request path with no harness work.
+# Disabled by default: sanitisers slow tests several-fold and require clang
+# to pick up the matching compiler-rt runtime that Dockerfile.sanitize ships.
+#
+# Each *_test target compiles its production source files in-tree (see e.g.
+# radix_tree_test pulling in src/node_slab.cpp), so applying the flags to
+# the test target is sufficient to instrument every translation unit the
+# test exercises — there is no shared library that would otherwise escape.
+option(RANVIER_BUILD_SANITIZED "Build unit tests with ASan + UBSan (requires clang)" OFF)
+
+if(RANVIER_BUILD_SANITIZED)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR
+            "RANVIER_BUILD_SANITIZED=ON requires clang/clang++; got "
+            "${CMAKE_CXX_COMPILER_ID}. Re-run cmake with "
+            "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++.")
+    endif()
+
+    # halt_on_error is set via UBSAN_OPTIONS at run time (see the sanitize-*
+    # Make targets); -fno-sanitize-recover makes UBSan abort on the first
+    # finding even when the env var is missed.
+    set(_san_flags
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+        -fno-sanitize-recover=undefined)
+
+    # _ranvier_all_targets was captured above for the unit_tests aggregate
+    # and lists every directly-defined target at that point — including all
+    # *_test executables. Fuzz harnesses are added later and are excluded
+    # by construction (they bring their own -fsanitize=fuzzer,address,undefined).
+    foreach(_t ${_ranvier_all_targets})
+        if(_t MATCHES "_test$")
+            target_compile_options(${_t} PRIVATE ${_san_flags})
+            target_link_options(${_t} PRIVATE ${_san_flags})
+        endif()
+    endforeach()
+endif()
+
+# =============================================================================
 # Fuzz Harnesses (opt-in)
 # =============================================================================
 # libFuzzer-based harnesses for boundaries identified in the request-lifecycle

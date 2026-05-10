@@ -1,0 +1,115 @@
+# Sanitizer tests for Ranvier Core
+#
+# Builds the unit-test suite with -fsanitize=address,undefined inside the
+# ranvier-sanitize image (Dockerfile.sanitize) and runs ctest. The intent
+# is the empirical sweep called for in BACKLOG §18 — pick up the
+# integer-overflow / cast shapes (H2, H9) and any heap UAF on the request
+# path that the static audit could not confirm or refute.
+#
+# Triggers:
+#   - After Docker Publish completes (post-merge to main, same shape as
+#     unit-tests.yml and fuzz-tests.yml).
+#   - Manual via workflow_dispatch.
+#
+# This workflow does NOT run on PRs and is NOT a merge gate. The first
+# few sanitised runs are expected to surface noise — third-party library
+# quirks, latent UB in vendored code, and any genuine findings — that
+# need triaging into separate tickets per BACKLOG §18 closure plan
+# rather than blocking unrelated PRs. `continue-on-error: true` reflects
+# that: the run uploads its log and exits success-coded so the workflow
+# remains visible without gating the rest of CI. Flip to `false` once
+# the initial findings are triaged and the suite is clean.
+#
+# Architecture note: GitHub-hosted runners are x86_64; local runs (e.g.
+# Apple Silicon) are aarch64. ASan/UBSan can surface different bugs on
+# different ABIs (alignment, integer-cast behaviour); a "passes locally,
+# fails in CI" finding is real signal, not a configuration issue.
+name: Sanitizer Tests
+
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
+
+jobs:
+  sanitizer-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the sanitizer image from Dockerfile.sanitize (clang +
+      # compiler-rt + llvm + lld layered on the cached base image).
+      # Reuses GHA build cache so subsequent runs are layer-cache hits.
+      - name: Build sanitizer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.sanitize
+          load: true
+          tags: ranvier-sanitize:latest
+          cache-from: |
+            type=gha,scope=app-amd64
+            type=gha,scope=sanitizer-tests
+          cache-to: type=gha,mode=max,scope=sanitizer-tests
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+
+      - name: Run unit tests under ASan/UBSan
+        id: sanitize
+        continue-on-error: true
+        run: |
+          mkdir -p sanitize-results
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            ranvier-sanitize:latest \
+            make sanitize-test \
+            2>&1 | tee sanitize-results/sanitize.log
+
+          SAN_EXIT=${PIPESTATUS[0]}
+          echo "sanitize_exit_code=$SAN_EXIT" >> $GITHUB_OUTPUT
+
+      - name: Upload sanitizer log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sanitizer-results
+          path: sanitize-results/sanitize.log
+          retention-days: 30
+
+      # Surface the result without failing the workflow. Once the initial
+      # batch of findings is triaged, drop continue-on-error above and
+      # delete this annotation step so a regression fails the job.
+      - name: Annotate sanitizer outcome
+        if: always()
+        run: |
+          if [ "${{ steps.sanitize.outputs.sanitize_exit_code }}" = "0" ]; then
+            echo "::notice::Sanitizer run passed."
+          else
+            echo "::warning::Sanitizer run reported findings (exit ${{ steps.sanitize.outputs.sanitize_exit_code }}). See uploaded log; triage per BACKLOG §18."
+          fi

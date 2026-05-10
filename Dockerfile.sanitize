@@ -1,0 +1,60 @@
+# ---------------------------------------------------------
+# Ranvier Sanitizer Builder Image
+# ---------------------------------------------------------
+# Layers clang + LLVM compiler-rt on top of Dockerfile.base so the unit
+# tests can be built with -fsanitize=address,undefined for the empirical
+# ASan/UBSan sweep called for in BACKLOG §18.
+#
+# Why a separate image (mirrors Dockerfile.fuzz):
+#   - The production base image is GCC-only; clang is required for the
+#     compiler-rt runtime that backs ASan/UBSan and matches the toolchain
+#     used by the fuzz image.
+#   - Adding clang to every production builder would inflate releases by
+#     ~400 MB. The sanitizer build is a developer / post-merge CI loop,
+#     not a release path.
+#
+# Build:
+#   # 1. Build (or pull) the base image first.
+#   docker build -f Dockerfile.base -t ranvier-base:latest .
+#
+#   # 2. Build the sanitizer image on top.
+#   docker build -f Dockerfile.sanitize -t ranvier-sanitize:latest .
+#
+# Run:
+#   # Build sanitised tests and run ctest.
+#   docker run --rm -v "$PWD:/src" -w /src ranvier-sanitize:latest \
+#       make sanitize-test
+#
+# Override the base image (e.g. CI cache tag):
+#   docker build --build-arg BASE_IMAGE=registry/ranvier-base:abc123 \
+#                -f Dockerfile.sanitize -t ranvier-sanitize:latest .
+# ---------------------------------------------------------
+ARG BASE_IMAGE=ranvier-base:latest
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="Ranvier Sanitizer Builder"
+LABEL org.opencontainers.image.description="ranvier-base + clang/LLVM for ASan + UBSan unit-test runs"
+
+# clang        — compiler driver
+# clang-tools-extra — clang-tidy etc. (cheap, useful when triaging findings)
+# compiler-rt  — provides the ASan + UBSan runtime libraries
+# llvm         — llvm-symbolizer, used by ASan/UBSan to produce readable stacks
+# lld          — fast linker, recommended for sanitised builds
+RUN dnf install -y \
+        clang \
+        clang-tools-extra \
+        compiler-rt \
+        llvm \
+        lld \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Make stack traces readable and force the run to halt on the first finding
+# rather than racing past it. detect_leaks=0 because Seastar's per-shard
+# allocator + LSan have not been validated together; LSan can be enabled
+# in a separate ticket once that interaction is checked.
+ENV ASAN_SYMBOLIZER_PATH=/usr/bin/llvm-symbolizer
+ENV UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+ENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1
+
+WORKDIR /src

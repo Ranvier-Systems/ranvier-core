@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-all fuzz-ci fuzz-clean
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
 
 # Default target
 all: build
@@ -119,6 +119,59 @@ fuzz-ci:
 
 fuzz-clean:
 	@rm -rf $(FUZZ_BUILD_DIR)
+
+# -----------------------------------------------------------------------------
+# Sanitizer build (ASan + UBSan; requires clang — see Dockerfile.sanitize)
+# -----------------------------------------------------------------------------
+# Builds the unit tests with -fsanitize=address,undefined and runs ctest.
+# The ranvier-sanitize image (Dockerfile.sanitize) provides clang + the
+# compiler-rt runtime; the production builder does not.
+#
+# Typical workflow (inside the ranvier-sanitize container):
+#   make sanitize-build             # configure + build all *_test targets
+#   make sanitize-test              # build + run ctest under ASan/UBSan
+SANITIZE_BUILD_DIR := build-sanitize
+
+# Reuse the fuzz UBSan suppressions: the only listed entry is RapidJSON's
+# pointer-overflow on Stack::Reserve, which is library-level noise that
+# also fires from unit tests that parse JSON. Setting UBSAN_OPTIONS
+# replaces (does not merge with) the env defaults set by Dockerfile.sanitize,
+# so the halt_on_error and print_stacktrace flags are re-listed here.
+SANITIZE_UBSAN_OPTIONS := halt_on_error=1:print_stacktrace=1:suppressions=$(CURDIR)/tests/fuzz/ubsan-suppressions.txt
+
+sanitize-build:
+	@command -v clang >/dev/null 2>&1 || { \
+	    echo "error: clang not found on PATH."; \
+	    echo "       Use the ranvier-sanitize image (Dockerfile.sanitize) or"; \
+	    echo "       install clang locally (Fedora: dnf install clang compiler-rt llvm)."; \
+	    exit 1; \
+	}
+	@# Same stale-cache guard as the fuzz target — protects against the
+	@# CMAKE_HOME_DIRECTORY mismatch that occurs when the same checkout is
+	@# bind-mounted into different containers (e.g. /workspaces vs /src).
+	@if [ -f $(SANITIZE_BUILD_DIR)/CMakeCache.txt ]; then \
+	    cached_src=$$(grep -E '^CMAKE_HOME_DIRECTORY:' $(SANITIZE_BUILD_DIR)/CMakeCache.txt | cut -d= -f2); \
+	    if [ "$$cached_src" != "$$(pwd)" ]; then \
+	        echo "Stale sanitize build cache (cached source $$cached_src != $$(pwd)); wiping $(SANITIZE_BUILD_DIR)."; \
+	        rm -rf $(SANITIZE_BUILD_DIR); \
+	    fi; \
+	fi
+	@echo "Configuring unit tests (clang + ASan/UBSan)..."
+	@cmake -B $(SANITIZE_BUILD_DIR) \
+	    -DRANVIER_BUILD_SANITIZED=ON \
+	    -DCMAKE_C_COMPILER=$$(command -v clang) \
+	    -DCMAKE_CXX_COMPILER=$$(command -v clang++) \
+	    -DCMAKE_BUILD_TYPE=Debug
+	@cmake --build $(SANITIZE_BUILD_DIR) --target unit_tests -j$$(nproc)
+
+sanitize-test: sanitize-build
+	@echo "Running unit tests under ASan/UBSan..."
+	@cd $(SANITIZE_BUILD_DIR) && \
+	    UBSAN_OPTIONS="$(SANITIZE_UBSAN_OPTIONS)" \
+	    ctest --output-on-failure
+
+sanitize-clean:
+	@rm -rf $(SANITIZE_BUILD_DIR)
 
 # Run all tests
 test: test-unit
