@@ -465,7 +465,11 @@ private:
 
     // Extract request body size from Content-Length header or actual content.
     // Returns 0 if Content-Length is missing/unparseable and content is empty.
-    static size_t get_request_body_size(const seastar::http::request& req);
+    // max_request_body_bytes is the configured limit (0 = unlimited); a parsed
+    // Content-Length above the limit or above SIZE_MAX returns SIZE_MAX so the
+    // caller's body-size check fires (audit H2).
+    static size_t get_request_body_size(const seastar::http::request& req,
+                                        size_t max_request_body_bytes);
 
     // Select target shard for request processing using P2C algorithm
     // Returns local shard if load balancing disabled or not beneficial

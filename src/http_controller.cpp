@@ -1166,7 +1166,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
     // Request body size limit check — before any body processing to prevent memory exhaustion (§4.4)
     if (_config.max_request_body_bytes > 0) {
-        size_t body_size = get_request_body_size(*req);
+        size_t body_size = get_request_body_size(*req, _config.max_request_body_bytes);
         if (body_size > _config.max_request_body_bytes) {
             ++_requests_rejected_body_size;
             metrics().record_body_size_rejection();
@@ -2762,7 +2762,8 @@ bool HttpController::is_persistence_backpressured() const {
     return fill_ratio >= _config.backpressure.persistence_queue_threshold;
 }
 
-size_t HttpController::get_request_body_size(const seastar::http::request& req) {
+size_t HttpController::get_request_body_size(const seastar::http::request& req,
+                                             size_t max_request_body_bytes) {
     auto content_length_it = req._headers.find("Content-Length");
     if (content_length_it != req._headers.end()) {
         // Content-Length header present — parse with from_chars (Rule #10)
@@ -2774,8 +2775,7 @@ size_t HttpController::get_request_body_size(const seastar::http::request& req) 
             // larger than size_t (32-bit hosts) cannot silently truncate past the
             // body-size check (audit H2). On 64-bit hosts the size_t guard is a no-op.
             if (cl_value > std::numeric_limits<size_t>::max() ||
-                (_config.max_request_body_bytes > 0 &&
-                 cl_value > _config.max_request_body_bytes)) {
+                (max_request_body_bytes > 0 && cl_value > max_request_body_bytes)) {
                 return std::numeric_limits<size_t>::max();
             }
             return static_cast<size_t>(cl_value);
