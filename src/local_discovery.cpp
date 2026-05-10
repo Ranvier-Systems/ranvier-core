@@ -211,7 +211,7 @@ DiscoveredBackend LocalDiscoveryService::parse_models_response(
 
     // Parse JSON with RapidJSON
     rapidjson::Document doc;
-    doc.Parse(body.c_str(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.c_str(), body.size());
 
     if (!doc.HasParseError() && doc.IsObject() && doc.HasMember("data") && doc["data"].IsArray()) {
         const auto& data = doc["data"];

@@ -61,7 +61,7 @@ inline CacheEventParseResult parse_cache_events(
     }
 
     rapidjson::Document doc;
-    doc.Parse(body.data(), body.size());
+    doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size());
     if (doc.HasParseError() || !doc.IsObject()) {
         result.error = "Invalid JSON";
         return result;

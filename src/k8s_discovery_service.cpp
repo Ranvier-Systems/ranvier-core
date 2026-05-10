@@ -684,7 +684,7 @@ seastar::future<> K8sDiscoveryService::sync_endpoints() {
     std::string response = co_await k8s_get(path);
 
     rapidjson::Document doc;
-    if (doc.Parse(response.c_str()).HasParseError()) {
+    if (doc.Parse<rapidjson::kParseIterativeFlag>(response.c_str()).HasParseError()) {
         log_k8s.error("Failed to parse sync response: {}", rapidjson::GetParseError_En(doc.GetParseError()));
         co_return;
     }
@@ -971,7 +971,7 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
             if (line.empty()) co_return true;
 
             rapidjson::Document event;
-            if (event.Parse(line.c_str()).HasParseError()) co_return true;
+            if (event.Parse<rapidjson::kParseIterativeFlag>(line.c_str()).HasParseError()) co_return true;
 
             // Handle direct Status objects (e.g., HTTP error response body)
             if (event.HasMember("kind") && event["kind"].IsString() &&
@@ -1091,7 +1091,7 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slices(const std::s
     std::vector<K8sEndpoint> all_endpoints;
     rapidjson::Document doc;
 
-    if (doc.Parse(json.c_str()).HasParseError()) {
+    if (doc.Parse<rapidjson::kParseIterativeFlag>(json.c_str()).HasParseError()) {
         log_k8s.error("JSON parse error: {} at offset {}",
                       rapidjson::GetParseError_En(doc.GetParseError()),
                       doc.GetErrorOffset());
