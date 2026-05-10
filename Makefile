@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-seastar fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
 
 # Default target
 all: build
@@ -103,14 +103,28 @@ fuzz-run-stream-parser: fuzz-build
 	    -max_len=$(FUZZ_MAX_LEN) \
 	    -print_final_stats=1
 
+# Same harness as fuzz-run-stream-parser, but intended to be invoked
+# from inside the ranvier-fuzz-seastar image (Dockerfile.fuzz-seastar)
+# whose /usr/local Seastar install was rebuilt with
+# -DSeastar_USE_DEFAULT_ALLOCATOR=ON. The default-allocator Seastar lets
+# libFuzzer's main run without booting seastar::smp::start; the per-shard
+# allocator otherwise hands out pointers that libc::free rejects in
+# libFuzzer's own cleanup (see tests/fuzz/README.md "Caveats" for the
+# full diagnosis). Kept as a separate target so the CI job and the
+# README pointer can name the unblock path explicitly without callers
+# wondering which image fuzz-run-stream-parser belongs in.
+fuzz-run-stream-parser-seastar: fuzz-run-stream-parser
+
 fuzz-run-all: fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser
 
 # Short fuzz pass for CI post-merge regression checks. Defaults to 60s
 # per harness; override with FUZZ_CI_TIME for longer scheduled runs.
 # Deliberately excludes fuzz-run-stream-parser — that harness is blocked
-# by a Seastar / libFuzzer allocator interaction (see tests/fuzz/README.md
-# and BACKLOG §18 "Unblock Seastar-dependent fuzzing"). Add it back once
-# Seastar is rebuilt with -DSeastar_USE_DEFAULT_ALLOCATOR=ON.
+# by a Seastar / libFuzzer allocator interaction in the default fuzz image
+# (see tests/fuzz/README.md "Caveats" and BACKLOG §18 "Unblock
+# Seastar-dependent fuzzing"). The unblock image (Dockerfile.fuzz-seastar)
+# and `fuzz-run-stream-parser-seastar` target exist for it; the dedicated
+# CI job in .github/workflows/fuzz-tests.yml runs that path separately.
 FUZZ_CI_TIME ?= 60
 
 fuzz-ci:
@@ -896,6 +910,9 @@ help:
 	@echo "  make fuzz-run-radix-tree           - Fuzz RadixTree::insert/lookup"
 	@echo "  make fuzz-run-request-rewriter     - Fuzz RequestRewriter::extract_*"
 	@echo "  make fuzz-run-stream-parser        - Fuzz StreamParser::push (needs Seastar)"
+	@echo "  make fuzz-run-stream-parser-seastar - Same harness, expects the ranvier-fuzz-seastar image"
+	@echo "                                       (Dockerfile.fuzz-seastar; Seastar rebuilt with"
+	@echo "                                       -DSeastar_USE_DEFAULT_ALLOCATOR=ON to unblock libFuzzer)"
 	@echo "  make fuzz-run-all                  - Run all three harnesses sequentially"
 	@echo "  make fuzz-ci                       - Short post-merge run (60s × 2 harnesses, no stream-parser)"
 	@echo "  make fuzz-clean                    - Remove the fuzz build directory"
