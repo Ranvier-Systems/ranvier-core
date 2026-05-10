@@ -1089,9 +1089,27 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
   _Approach:_ Add a `Dockerfile.sanitize` (or a flag in the existing test container) that builds with `-fsanitize=address,undefined`. Run the full unit-test suite and the smoke benchmarks. Triage any new failures separately from this audit.
   _Complexity:_ Low (build config) + variable (triage of any failures found).
 
-- [ ] **[P3] Re-run the audit after fixes land**
-  _Justification:_ The audit was static-only and excluded slow paths (cross-shard route-learning retries, gossip-driven backend churn, persistence backpressure escalation). A follow-up pass after the cross-cutting tickets land should re-grade the remaining items and extend coverage to the excluded paths.
-  _Complexity:_ Low.
+- [x] **[P3] Re-run the audit after fixes land** — Completed 2026-05-10 — all 8 CONFIRMED fixes verified MITIGATED-BY-FIX against current source, no MITIGATED-item downgrades, slow-path sweep added 1 HIGH + 1 MED + 2 LOW under a single root cause (RapidJSON recursive parser missed by the M6 sweep on non-request-path JSON). See "Re-run (2026-05-10)" addendum near the top of `docs/audits/request-lifecycle-crash-audit.md`. New fix tickets opened below; LOWs in the closure addendum.
+
+### P1 — Slow-path findings from the 2026-05-10 audit re-run
+
+- [ ] **[P1] S1: Apply `kParseIterativeFlag` to cache-event JSON parser**
+  _Where:_ `src/cache_event_parser.hpp:64` — `doc.Parse(body.data(), body.size())`.
+  _Risk:_ `POST /v1/cache/events` accepts a JSON body parsed via RapidJSON's default recursive descent parser. A deeply-nested array exhausts the OS stack and crashes the shard. Auth on this endpoint is *optional* (`_config.cache_events.auth_token` empty by default), so an unauthenticated network client can trigger the crash. Same root cause as M6 but on a slow-path that the original audit excluded.
+  _Fix:_ `doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size())` — one-line change matching the M6 fix shape in `request_rewriter.hpp`.
+  _Complexity:_ Trivial.
+
+### P2 — Slow-path findings from the 2026-05-10 audit re-run
+
+- [ ] **[P2] S2: Apply `kParseIterativeFlag` to discovery-layer JSON parsers**
+  _Where:_
+  - `src/local_discovery.cpp:214` — backend `/v1/models` response.
+  - `src/k8s_discovery_service.cpp:687` — EndpointSlice list response.
+  - `src/k8s_discovery_service.cpp:973` — EndpointSlice watch event.
+  - `src/k8s_discovery_service.cpp:1094` — generic K8s JSON helper.
+  _Risk:_ Each site parses a network-sourced JSON response with the default recursive parser. Inputs come from a localhost backend or the Kubernetes API server (both nominally trusted), but a compromised backend or a malicious watch-stream injector can crash a shard with a deeply-nested payload. Body sizes are capped (e.g. `MAX_RESPONSE_SIZE = 65536` in `local_discovery.cpp:132`) but a 64KB array of `[[[…]]]` still recurses ~30K levels.
+  _Fix:_ Add `<rapidjson::kParseIterativeFlag>` to every cited `Parse(...)` call. Identical pattern to the M6 fix.
+  _Complexity:_ Trivial.
 
 ### Closed by triage (no action — recorded for traceability)
 
@@ -1099,6 +1117,9 @@ The following findings from the original audit were re-read against current sour
 
 - **HIGHs MITIGATED:** H4 (TokenizerThreadPool promise race — promises set before `_pending_jobs` clear), H6 (`live_backends[0]` — empty check is at the immediately preceding line), H8 (ART `prefix[MAX_PREFIX_LENGTH]` — buffer is over-allocated), H10 (`_chunk_bytes_needed + 2` — `max_chunk_size` cap upstream).
 - **MEDs MITIGATED:** M1 (streaming-lambda `[this]` — gate holder lifetime), M2 (optional-units pattern — guarded), M8 (modulo on live_backends — empty check at preceding line), M12 (Content-Length parse — comparator is safe for valid `size_t`), M13 (`bundle.is_valid` — single-coroutine access only), M15 (non-EPIPE rethrow — Seastar-handler-safe by design).
+- **LOWs from 2026-05-10 audit re-run (defensive only, no action required):**
+  - **S3** (`src/sqlite_persistence.cpp:362-367`) — `save_routes_batch()` returns plain `bool` for any `sqlite3_step()` failure; `SQLITE_FULL` / `SQLITE_IOERR_*` cannot be distinguished from transient `SQLITE_BUSY`. Not a crash (rollback keeps the table consistent and route writes are best-effort) but disk-full silently drops every subsequent batch. Defensive fix would branch on the rc and emit distinct metrics. LOW.
+  - **S4** (`src/local_discovery.cpp:328`, `src/local_discovery.hpp:86`) — `_next_backend_id` is `int32_t` (alias `BackendId`) starting at 10000 and incremented per discovered backend. Signed-int overflow at 2^31 is UB but requires ~2.1B churns over the process lifetime; the `MAX_KNOWN_BACKENDS = 64` cap bounds concurrent membership but not the monotonic counter. Realistically unreachable; recorded for completeness. LOW.
 
 ---
 
