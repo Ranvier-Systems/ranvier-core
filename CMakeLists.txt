@@ -1155,6 +1155,29 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(tokenizer_thread_pool_concurrency_test)
+
+    # M4 Cross-Shard `std::bad_alloc` Propagation Diagnostic
+    # Backlog §18 / docs/audits/request-lifecycle-crash-audit.md M4. Boots a
+    # 2-shard Seastar reactor, throws std::bad_alloc inside a lambda passed
+    # to seastar::smp::submit_to (matching the tokenizer call site at
+    # src/tokenizer_service.cpp:256), and prints which catch branch the
+    # outer site (src/http_controller.cpp:1373) observes. Diagnostic-only:
+    # the test always passes once preconditions hold; the printed line
+    # drives the audit's decision rule.
+    #
+    # Unlike the other Seastar-linked tests in this directory this one
+    # actually starts the reactor, so it provides its own main() and does
+    # NOT link GTest::gtest_main.
+    add_executable(m4_cross_shard_bad_alloc_test
+      tests/unit/m4_cross_shard_bad_alloc_test.cpp
+    )
+    target_include_directories(m4_cross_shard_bad_alloc_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(m4_cross_shard_bad_alloc_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest
+    )
+    gtest_discover_tests(m4_cross_shard_bad_alloc_test)
 endif()
 
 # Aggregate target that depends on every *_test executable. Lets CI build only
