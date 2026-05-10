@@ -339,6 +339,25 @@ verified with a targeted test or sanitiser run before remediation.
 >   Defensive fix: switch to `uint32_t` (still wraps, but
 >   well-defined and observable), or detect approach to the cap
 >   and refuse new IDs.
+>
+> **Re-run closure (2026-05-10).** S1 and S2 shipped together as a
+> single five-site sweep applying `rapidjson::kParseIterativeFlag`
+> to every non-request-path `Document::Parse(...)` call:
+> `src/cache_event_parser.hpp:64` (S1, `POST /v1/cache/events`
+> body), `src/local_discovery.cpp:214` (backend `/v1/models`
+> response), `src/k8s_discovery_service.cpp:687` (EndpointSlice
+> list response), `src/k8s_discovery_service.cpp:974`
+> (EndpointSlice watch event — line drifted by one from the
+> ticket), `src/k8s_discovery_service.cpp:1094` (generic K8s JSON
+> helper). The iterative parser keeps recursion state on the heap
+> (RapidJSON's `MemoryPoolAllocator`), bounded by the existing
+> upstream body-size caps (e.g. `MAX_RESPONSE_SIZE = 65536` in
+> `local_discovery.cpp:132`), so adversarial nesting depth can no
+> longer stack-overflow regardless of body size. With the
+> request-rewriter sweep (M6, 2026-05-08) plus this slow-path
+> sweep, every `Document::Parse(...)` call site in `src/` now
+> uses `kParseIterativeFlag`. S1 → MITIGATED-BY-FIX,
+> S2 → MITIGATED-BY-FIX.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS

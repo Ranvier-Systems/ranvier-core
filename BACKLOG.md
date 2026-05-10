@@ -1093,23 +1093,11 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 ### P1 — Slow-path findings from the 2026-05-10 audit re-run
 
-- [ ] **[P1] S1: Apply `kParseIterativeFlag` to cache-event JSON parser**
-  _Where:_ `src/cache_event_parser.hpp:64` — `doc.Parse(body.data(), body.size())`.
-  _Risk:_ `POST /v1/cache/events` accepts a JSON body parsed via RapidJSON's default recursive descent parser. A deeply-nested array exhausts the OS stack and crashes the shard. Auth on this endpoint is *optional* (`_config.cache_events.auth_token` empty by default), so an unauthenticated network client can trigger the crash. Same root cause as M6 but on a slow-path that the original audit excluded.
-  _Fix:_ `doc.Parse<rapidjson::kParseIterativeFlag>(body.data(), body.size())` — one-line change matching the M6 fix shape in `request_rewriter.hpp`.
-  _Complexity:_ Trivial.
+- [x] **[P1] S1: Apply `kParseIterativeFlag` to cache-event JSON parser** — Fixed 2026-05-10. `src/cache_event_parser.hpp:64` now passes `<rapidjson::kParseIterativeFlag>` to `Document::Parse(...)`, matching the M6 pattern. The iterative parser keeps state on the heap (its `MemoryPoolAllocator`), bounded by the existing request-body cap, so a deeply-nested `POST /v1/cache/events` body can no longer stack-overflow regardless of auth state.
 
 ### P2 — Slow-path findings from the 2026-05-10 audit re-run
 
-- [ ] **[P2] S2: Apply `kParseIterativeFlag` to discovery-layer JSON parsers**
-  _Where:_
-  - `src/local_discovery.cpp:214` — backend `/v1/models` response.
-  - `src/k8s_discovery_service.cpp:687` — EndpointSlice list response.
-  - `src/k8s_discovery_service.cpp:973` — EndpointSlice watch event.
-  - `src/k8s_discovery_service.cpp:1094` — generic K8s JSON helper.
-  _Risk:_ Each site parses a network-sourced JSON response with the default recursive parser. Inputs come from a localhost backend or the Kubernetes API server (both nominally trusted), but a compromised backend or a malicious watch-stream injector can crash a shard with a deeply-nested payload. Body sizes are capped (e.g. `MAX_RESPONSE_SIZE = 65536` in `local_discovery.cpp:132`) but a 64KB array of `[[[…]]]` still recurses ~30K levels.
-  _Fix:_ Add `<rapidjson::kParseIterativeFlag>` to every cited `Parse(...)` call. Identical pattern to the M6 fix.
-  _Complexity:_ Trivial.
+- [x] **[P2] S2: Apply `kParseIterativeFlag` to discovery-layer JSON parsers** — Fixed 2026-05-10. All four cited sites now pass `<rapidjson::kParseIterativeFlag>`: `src/local_discovery.cpp:214` (backend `/v1/models`), `src/k8s_discovery_service.cpp:687` (EndpointSlice list), `src/k8s_discovery_service.cpp:974` (EndpointSlice watch event — line drifted by one), `src/k8s_discovery_service.cpp:1094` (generic K8s JSON helper). Same one-line fix shape as S1 and M6.
 
 ### Closed by triage (no action — recorded for traceability)
 
