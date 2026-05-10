@@ -14,9 +14,9 @@ verified with a targeted test or sanitiser run before remediation.
 > | Verdict | HIGHs | MEDs |
 > |---------|-------|------|
 > | CONFIRMED (fix) | H1, H2, H3, H5, H7, H9 | M5, M14 |
-> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M8, M10, M12, M13, M15 |
+> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M4, M8, M10, M12, M13, M15 |
 > | HYPOTHETICAL (defensive only) | — | M3, M9, M11 |
-> | INVESTIGATE FURTHER | — | M4, M7 |
+> | INVESTIGATE FURTHER | — | M7 |
 > | UPGRADED-BY-FUZZ (fixed) | — | M6 |
 >
 > **Fuzz update (2026-05-08):** the request-rewriter harness in
@@ -65,6 +65,21 @@ verified with a targeted test or sanitiser run before remediation.
 > taken at call time and cannot loop independently of the registry —
 > the original "recommend dead backends in a loop" risk does not match
 > the actual control flow. M10 → MITIGATED.
+>
+> **Investigation closure (2026-05-10):** M4 (`std::bad_alloc`
+> propagation across `smp::submit_to`) resolved empirically by the
+> diagnostic test at
+> `tests/unit/cross_shard_exception_propagation_test.cpp`, which boots a
+> 2-shard reactor and throws `std::bad_alloc` inside a lambda submitted
+> via `seastar::smp::submit_to` (matching the cross-shard call shape in
+> `TokenizerService::encode_cached_async`). The initiating shard's outer
+> catch observed the exception with demangled typeid `std::bad_alloc`
+> and `e.what() == "std::bad_alloc"` — propagated cleanly, not
+> repackaged as `broken_promise` or any other type. The existing
+> outer `catch (const std::exception&)` around `encode_threaded_async`
+> in `HttpController::handle_proxy` (`src/http_controller.cpp:1340`)
+> therefore catches `bad_alloc` correctly, so no in-lambda try/catch is
+> required. M4 → MITIGATED.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS
