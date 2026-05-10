@@ -14,9 +14,9 @@ verified with a targeted test or sanitiser run before remediation.
 > | Verdict | HIGHs | MEDs |
 > |---------|-------|------|
 > | CONFIRMED (fix) | H1, H2, H3, H5, H7, H9 | M5, M14 |
-> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M3, M4, M8, M9, M10, M11, M12, M13, M15 |
+> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M3, M4, M7, M8, M9, M10, M11, M12, M13, M15 |
 > | HYPOTHETICAL (defensive only) | — | — |
-> | INVESTIGATE FURTHER | — | M7 |
+> | INVESTIGATE FURTHER | — | — |
 > | UPGRADED-BY-FUZZ (fixed) | — | M6 |
 >
 > **Fuzz update (2026-05-08):** the request-rewriter harness in
@@ -114,6 +114,53 @@ verified with a targeted test or sanitiser run before remediation.
 > in `HttpController::handle_proxy` (`src/http_controller.cpp:1340`)
 > therefore catches `bad_alloc` correctly, so no in-lambda try/catch is
 > required. M4 → MITIGATED.
+>
+> **Investigation closure (2026-05-10):** M7 (cross-shard
+> `get_live_backends` race during reconfiguration) resolved by code
+> re-read of all writers to the registry fields the reader touches.
+> The reader (`ShardLocalState::get_live_backends`,
+> `src/router_service.cpp:529-540`) is a synchronous member function
+> with no `co_await` — it iterates `backend_ids`, then for each id
+> probes `dead_backends.contains(id)`, `backends.find(id)`, and
+> `it->second.is_draining`. Because Seastar's per-shard reactor runs
+> one task to completion before scheduling the next, no other task on
+> the same shard can interleave between those reads. Every production
+> writer that mutates the same fields reaches the shard via
+> `seastar::smp::parallel_for_each(... smp::submit_to(shard_id, ...))`,
+> so the writer body executes as its own reactor task on the target
+> shard and cannot preempt the synchronous reader:
+>
+> - `RouterService::register_backend_global`
+>   (`src/router_service.cpp:3553-3586`) — `submit_to` lambda writes
+>   `state.backends[id]` and conditionally `state.backend_ids.push_back(id)`.
+> - `RouterService::unregister_backend_global`
+>   (`src/router_service.cpp:3588-3616`) — `submit_to` lambda writes
+>   `state.backends.erase`, `state.backend_ids.erase`, and
+>   `state.dead_backends.erase`.
+> - `RouterService::report_backend_health` broadcast
+>   (`src/router_service.cpp:3712-3723`) — `submit_to` lambda writes
+>   `state.dead_backends.insert/erase`.
+> - `RouterService::drain_backend_global`
+>   (`src/router_service.cpp:3764-3775`) — `submit_to` lambda writes
+>   `it->second.is_draining = true` and `drain_start_time`.
+> - `RouterService::handle_node_state_change`
+>   (`src/router_service.cpp:3896-3926`) — `submit_to` lambda toggles
+>   `it->second.is_draining` for both `DRAINING` and `ACTIVE`
+>   transitions.
+>
+> The remaining direct mutators of these fields
+> (`ShardLocalState::reset` at `src/router_service.cpp:478-513`, plus
+> the `*_for_testing` helpers at `src/router_service.cpp:4135-4189`)
+> are unit-test scaffolding only; they are not invoked from the
+> request path or any cross-shard broadcast. Call sites of the reader
+> (`get_backend_for_prefix` at `src/router_service.cpp:2220` and
+> `get_backend_by_hash` at `src/router_service.cpp:2559`) consume the
+> returned `std::vector<BackendId>` value-copy synchronously — once
+> `get_live_backends()` returns, downstream indexing operates on a
+> private copy that no writer can mutate. The "count observed > 0
+> then drops to 0" shape that originally fed H6 cannot occur because
+> the reader's empty-check and indexing both run against the same
+> local snapshot. M7 → MITIGATED.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS
