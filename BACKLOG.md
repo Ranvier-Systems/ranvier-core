@@ -1067,12 +1067,7 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 ### P2 — INVESTIGATE FURTHER (empirical, not fix tickets)
 
-- [ ] **[P2] M4 investigation: confirm `std::bad_alloc` propagation across `smp::submit_to`**
-  _Location:_ `src/tokenizer_service.cpp:254-291`.
-  _What's unclear:_ Whether a `std::bad_alloc` thrown inside the cross-shard lambda is repackaged as `broken_promise` or propagated cleanly to the outer `try/catch` at `http_controller.cpp:1340`.
-  _How to resolve:_ One unit test that forces an allocation failure (e.g. via a custom `std::pmr` allocator or `LD_PRELOAD` malloc shim) inside the submitted lambda; observe the exception type at the catch site.
-  _Decision rule:_ If the exception is repackaged, add a try/catch inside the lambda. If propagated cleanly, mark MITIGATED in the audit doc.
-  _Complexity:_ Medium.
+- [x] **[P2] M4 investigation: confirm `std::bad_alloc` propagation across `smp::submit_to`** — Mitigated 2026-05-10 — diagnostic test at `tests/unit/cross_shard_exception_propagation_test.cpp` throws `std::bad_alloc` inside a `seastar::smp::submit_to` lambda and observes it at the initiating shard with demangled typeid `std::bad_alloc` (propagated cleanly, not repackaged), so the existing `catch (const std::exception&)` around `encode_threaded_async` at `http_controller.cpp:1340` already covers it; see audit-doc closure addendum near the top of `docs/audits/request-lifecycle-crash-audit.md`.
 
 - [ ] **[P3] M7 investigation: cross-shard `get_live_backends` race during reconfiguration**
   _Location:_ `src/router_service.cpp:529-540`.
