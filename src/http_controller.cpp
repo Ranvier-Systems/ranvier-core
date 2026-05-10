@@ -2772,12 +2772,10 @@ size_t HttpController::get_request_body_size(const seastar::http::request& req) 
         if (ec == std::errc{} && ptr == cl_str.data() + cl_str.size()) {
             // Validate against limits BEFORE the size_t cast so a Content-Length
             // larger than size_t (32-bit hosts) cannot silently truncate past the
-            // body-size check (audit H2). On 64-bit hosts both branches are no-ops.
-            if (_config.max_request_body_bytes > 0 &&
-                cl_value > _config.max_request_body_bytes) {
-                return std::numeric_limits<size_t>::max();
-            }
-            if (cl_value > std::numeric_limits<size_t>::max()) {
+            // body-size check (audit H2). On 64-bit hosts the size_t guard is a no-op.
+            if (cl_value > std::numeric_limits<size_t>::max() ||
+                (_config.max_request_body_bytes > 0 &&
+                 cl_value > _config.max_request_body_bytes)) {
                 return std::numeric_limits<size_t>::max();
             }
             return static_cast<size_t>(cl_value);
