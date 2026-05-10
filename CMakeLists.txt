@@ -1156,28 +1156,27 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(tokenizer_thread_pool_concurrency_test)
 
-    # M4 Cross-Shard `std::bad_alloc` Propagation Diagnostic
-    # Backlog §18 / docs/audits/request-lifecycle-crash-audit.md M4. Boots a
-    # 2-shard Seastar reactor, throws std::bad_alloc inside a lambda passed
-    # to seastar::smp::submit_to (matching the tokenizer call site at
-    # src/tokenizer_service.cpp:256), and prints which catch branch the
-    # outer site (src/http_controller.cpp:1373) observes. Diagnostic-only:
-    # the test always passes once preconditions hold; the printed line
-    # drives the audit's decision rule.
+    # Seastar Contract Test: Cross-Shard Exception Propagation
+    # Boots a 2-shard reactor, throws std::bad_alloc inside a lambda passed
+    # to seastar::smp::submit_to, and prints whether the initiating shard
+    # observes the exception in its original type (caught as bad_alloc) or
+    # repackaged into a different std::exception subclass (e.g.
+    # seastar::broken_promise). The test always passes once the reactor
+    # preconditions hold; the printed "[result] …" line is the artefact.
     #
     # Unlike the other Seastar-linked tests in this directory this one
     # actually starts the reactor, so it provides its own main() and does
     # NOT link GTest::gtest_main.
-    add_executable(m4_cross_shard_bad_alloc_test
-      tests/unit/m4_cross_shard_bad_alloc_test.cpp
+    add_executable(cross_shard_exception_propagation_test
+      tests/unit/cross_shard_exception_propagation_test.cpp
     )
-    target_include_directories(m4_cross_shard_bad_alloc_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(m4_cross_shard_bad_alloc_test
+    target_include_directories(cross_shard_exception_propagation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(cross_shard_exception_propagation_test
       PRIVATE
       Seastar::seastar
       GTest::gtest
     )
-    gtest_discover_tests(m4_cross_shard_bad_alloc_test)
+    gtest_discover_tests(cross_shard_exception_propagation_test)
 endif()
 
 # Aggregate target that depends on every *_test executable. Lets CI build only
