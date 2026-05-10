@@ -1056,14 +1056,11 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 ### P3 — Defensive only (HYPOTHETICAL findings, single sweep)
 
-- [ ] **[P3] Defensive sweep: M3, M9, M11**
+- [x] **[P3] Defensive sweep: M3, M9, M11** — Mitigated 2026-05-10 — single bundled pass: M3 pinned via block comment at `tokenizer_service.cpp:213` (signature change to `std::string&&` rejected as more code than the latent risk); M9 documented via cast-safety comment at `router_service.cpp:1135` citing the `MAX_KNOWN_BACKENDS = 64` cap in `local_discovery.hpp:81`; M11 confirmed already mitigated by the `\r\n\r\n` guard at `stream_parser.cpp:141` (no code change). See audit-doc closure addendum near the top of `docs/audits/request-lifecycle-crash-audit.md`.
   _Coverage:_
-  - **M3** (`tokenizer_service.cpp:243-312`) — document the "string_view must be copied before first co_await" invariant at the entry, or take `std::string&&`.
-  - **M9** (`router_service.cpp:1145`) — `int64_t→int32_t` cast in jump-hash; only matters if num_buckets > 2^31, but document the assumption.
-  - **M11** (`stream_parser.cpp:152-157`) — buffer to first CRLF before HTTP status snoop. Not a crash; observability regression on split TCP segments.
-
-  _Justification:_ None are exploitable; bundling avoids three trivial PRs. Skip any item whose mitigation would be more code than the latent risk.
-  _Complexity:_ Low overall.
+  - **M3** (`tokenizer_service.cpp:243-312`) — invariant pinned in code as a block comment at the top of `encode_cached_async`; no `co_await` may precede the `text_copy` / `text_for_cache` materialisations.
+  - **M9** (`router_service.cpp:1145`) — cast-safety comment cites the upstream backend-count cap; cast is provably lossless under existing caps, no runtime check.
+  - **M11** (`stream_parser.cpp:152-157`) — re-read confirms `parse_headers` returns "need more data" until the full `\r\n\r\n` terminator is buffered, so the status line cannot be split when the snoop runs. Already mitigated; recorded as MITIGATED.
 
 ### P2 — INVESTIGATE FURTHER (empirical, not fix tickets)
 
