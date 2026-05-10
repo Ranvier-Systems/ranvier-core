@@ -1,36 +1,39 @@
-// Ranvier Core - M4 Cross-Shard `std::bad_alloc` Propagation Diagnostic
+// Ranvier Core - Seastar Contract Test: Cross-Shard Exception Propagation
 //
-// Backlog §18 / docs/audits/request-lifecycle-crash-audit.md M4
-// (Phase 2: Tokenization). The audit could not decide statically whether a
-// `std::bad_alloc` thrown inside the lambda passed to `seastar::smp::submit_to`
-// at `src/tokenizer_service.cpp:256` is propagated cleanly to the outer
-// `try/catch` at `src/http_controller.cpp:1373` or repacked into a different
-// exception type (e.g. `seastar::broken_promise`) by the cross-shard
-// future-marshalling machinery.
+// Characterises what exception type the initiating shard observes when a
+// lambda passed to `seastar::smp::submit_to` throws `std::bad_alloc` on the
+// target shard. The two outcomes the test distinguishes are:
 //
-// This test reproduces the cross-shard call shape with a lambda returning the
-// same `std::pair<std::vector<int32_t>, bool>` type, makes that lambda throw
-// `std::bad_alloc` directly (the simplest seam — a real OOM is not required
-// to characterise Seastar's exception transport), and prints which catch
-// branch at the outer site fires. The assertion always passes once the
-// reactor preconditions hold; the diagnostic line is the artefact the
-// developer needs to drive the audit's decision rule:
+//   * "propagated cleanly as bad_alloc" — typed `catch (const std::bad_alloc&)`
+//     fires at the outer site. Any production handler that catches
+//     `std::bad_alloc` (or its `std::exception` base) gets the original type.
+//   * "repackaged as <type>"            — Seastar's cross-shard
+//     future-marshalling has substituted a different exception (e.g.
+//     `seastar::broken_promise`). A handler that only matches `std::bad_alloc`
+//     by name will silently miss the OOM.
 //
-//   * "PROPAGATED CLEANLY as bad_alloc" → mark M4 MITIGATED in the audit doc
-//     and flip the BACKLOG entry, mirroring the M10 closure addendum.
-//   * "REPACKAGED as <type>"            → add a `try/catch` inside the
-//     submitted lambda that returns `{{}, false}`, per the audit's fix.
+// The test always passes once the reactor preconditions hold; the printed
+// "[result] …" line is the artefact callers consume.
+//
+// Originally added under the request-lifecycle crash audit (finding M4) to
+// resolve a question that could not be settled by code-reading: whether the
+// outer `try/catch` around `TokenizerService::encode_cached_async` (in
+// `HttpController::handle_proxy`'s tokenisation block) sees `std::bad_alloc`
+// in its original type when the cross-shard tokenizer lambda allocates and
+// fails. The test is kept as a long-lived contract check on Seastar — if
+// future Seastar versions change exception transport, this is where we'll
+// see it first.
 //
 // Departure from convention: every other Seastar-linked unit test in this
 // directory keeps the reactor unbooted (see the header comment in
-// `tokenizer_service_test.cpp`). This test cannot — `smp::submit_to` is
-// the unit under observation and only exists once the reactor is up with
+// `tokenizer_service_test.cpp`). This test cannot — `smp::submit_to` is the
+// unit under observation and only exists once the reactor is up with
 // `smp::count >= 2`. The reactor is therefore booted from `main()` via
 // `seastar::app_template::run` with a fixed minimal argv (`--smp 2`,
 // `--memory 256M`, `--overprovisioned`); the gtest body then asserts on
 // observations captured into static globals.
 //
-// Run: `./m4_cross_shard_bad_alloc_test` (no extra flags required).
+// Run: `./cross_shard_exception_propagation_test` (no extra flags required).
 //      The diagnostic line is printed to stdout by the test body.
 
 #include <gtest/gtest.h>
@@ -105,11 +108,9 @@ seastar::future<> run_experiment() {
     const unsigned target_shard =
         (seastar::this_shard_id() + 1) % seastar::smp::count;
 
-    // Mirrors `src/tokenizer_service.cpp:256` — same return type as the
-    // tokenizer cross-shard lambda. The body throws `std::bad_alloc` before
-    // any in-lambda try/catch can intercept it, which is the exact M4
-    // failure mode (the audit notes the lambda has no `try/catch` around
-    // its allocations at lines 264, 280, 290).
+    // Mirrors the cross-shard call shape used by
+    // `TokenizerService::encode_cached_async` — same return type, same
+    // single-throw failure mode (no in-lambda try/catch around the throw).
     auto fut = seastar::smp::submit_to(
         target_shard,
         []() -> std::pair<std::vector<int32_t>, bool> {
@@ -122,13 +123,14 @@ seastar::future<> run_experiment() {
             // Use `failed()` + `get_exception()` rather than `get()`/`get0()`
             // so the test compiles against any reasonably recent Seastar.
             //
-            // The rethrow-and-catch shape below mirrors
-            // `src/http_controller.cpp:1373-1387`, with one addition: an
-            // explicit `catch(const std::bad_alloc&)` ahead of the generic
-            // `std::exception` branch so we can distinguish "propagated
-            // cleanly" from "repackaged as another std::exception subclass"
-            // (e.g. `seastar::broken_promise`, which the production handler
-            // would still catch but for the wrong reason — masking the OOM).
+            // The rethrow-and-catch shape mirrors the production tokenisation
+            // outer catch in `HttpController::handle_proxy`, with one
+            // addition: an explicit `catch(const std::bad_alloc&)` ahead of
+            // the generic `std::exception` branch so we can distinguish
+            // "propagated cleanly" from "repackaged as another std::exception
+            // subclass" (e.g. `seastar::broken_promise`, which the production
+            // handler would still catch but for the wrong reason — masking
+            // the OOM).
             if (!f.failed()) {
                 f.ignore_ready_future();
                 return;
@@ -158,7 +160,7 @@ seastar::future<> run_experiment() {
 
 }  // namespace
 
-TEST(M4CrossShardBadAlloc, OuterCatchExceptionTypeDiagnostic) {
+TEST(CrossShardSubmitTo, BadAllocSurfaceType) {
     ASSERT_TRUE(g_obs.reactor_started.load(std::memory_order_acquire))
         << "Seastar reactor never started — main() did not invoke app.run()";
     ASSERT_TRUE(g_obs.reactor_had_two_shards.load(std::memory_order_acquire))
@@ -169,37 +171,31 @@ TEST(M4CrossShardBadAlloc, OuterCatchExceptionTypeDiagnostic) {
         << "Outer catch saw no exception at all — submit_to silently swallowed the throw";
 
     // Diagnostic — the test passes once the preconditions hold; the printed
-    // line is the artefact the developer feeds into the M4 decision rule.
+    // line is the artefact callers consume.
     if (g_obs.caught_as_bad_alloc) {
         std::cout
-            << "\n[M4 result] PROPAGATED CLEANLY as bad_alloc"
+            << "\n[result] propagated cleanly as bad_alloc"
             << "\n  typeid (mangled)   : " << g_obs.typeid_mangled
             << "\n  typeid (demangled) : " << g_obs.typeid_demangled
             << "\n  what()             : " << g_obs.what_message
-            << "\n  decision rule      : mark M4 MITIGATED in the audit doc"
-               " (mirror the M10 'Investigation closure (2026-05-10)' addendum)"
             << "\n";
-        SUCCEED() << "PROPAGATED CLEANLY as bad_alloc";
+        SUCCEED() << "propagated cleanly as bad_alloc";
     } else if (g_obs.caught_as_std_exception_only) {
         std::cout
-            << "\n[M4 result] REPACKAGED as " << g_obs.typeid_demangled
+            << "\n[result] repackaged as " << g_obs.typeid_demangled
             << " (still std::exception, but no longer std::bad_alloc)"
             << "\n  typeid (mangled)   : " << g_obs.typeid_mangled
             << "\n  typeid (demangled) : " << g_obs.typeid_demangled
             << "\n  what()             : " << g_obs.what_message
-            << "\n  decision rule      : add try/catch inside the submitted"
-               " lambda (return {{}, false}), per the M4 audit fix"
             << "\n";
-        SUCCEED() << "REPACKAGED as " << g_obs.typeid_demangled;
+        SUCCEED() << "repackaged as " << g_obs.typeid_demangled;
     } else {
         std::cout
-            << "\n[M4 result] REPACKAGED as non-std type"
+            << "\n[result] repackaged as non-std type"
             << "\n  typeid (mangled)   : " << g_obs.typeid_mangled
             << "\n  typeid (demangled) : " << g_obs.typeid_demangled
-            << "\n  decision rule      : add try/catch inside the submitted"
-               " lambda (return {{}, false}), per the M4 audit fix"
             << "\n";
-        SUCCEED() << "REPACKAGED as non-std type (" << g_obs.typeid_mangled << ")";
+        SUCCEED() << "repackaged as non-std type (" << g_obs.typeid_mangled << ")";
     }
 }
 
@@ -223,10 +219,10 @@ int main(int argc, char** argv) {
     // `--lock-memory 0` relax the CPU-pinning and mlock requirements that
     // otherwise need root in containers.
     seastar::app_template::seastar_options opts;
-    opts.name = "m4_cross_shard_bad_alloc_diag";
+    opts.name = "cross_shard_exception_propagation";
     seastar::app_template app(std::move(opts));
 
-    char arg0[]            = "m4_cross_shard_bad_alloc_test";
+    char arg0[]            = "cross_shard_exception_propagation_test";
     char arg_smp_flag[]    = "--smp";
     char arg_smp_val[]     = "2";
     char arg_mem_flag[]    = "--memory";
