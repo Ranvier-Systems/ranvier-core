@@ -535,3 +535,23 @@ TEST_F(ParseCacheEventsTest, MultipleMixedEvents) {
     EXPECT_EQ(result.events[1].event_type, "loaded");
     EXPECT_EQ(result.events[2].backend_id, 7);
 }
+
+// Regression for BACKLOG §18 S1 (audit re-run, 2026-05-10): the cache-event
+// parser at `cache_event_parser.hpp:64` must pass `kParseIterativeFlag` so a
+// deeply-nested body cannot stack-overflow RapidJSON's recursive descent.
+// `POST /v1/cache/events` accepts unauthenticated bodies by default, so this
+// is the network-reachable equivalent of the M6 fuzz finding on
+// `request_rewriter.hpp`. If a future refactor drops the template flag,
+// this test SIGSEGVs (gtest reports it as a crash, not a clean failure) —
+// that's the intended alarm.
+TEST_F(ParseCacheEventsTest, DeeplyNestedBodyDoesNotStackOverflow) {
+    constexpr size_t kDepth = 50'000;
+    std::string body;
+    body.reserve(kDepth * 2);
+    body.append(kDepth, '[');
+    body.append(kDepth, ']');
+
+    auto result = parse_cache_events(body, MAX_EVENTS, MAX_AGE_MS, NOW_MS);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.error, "Invalid JSON");
+}
