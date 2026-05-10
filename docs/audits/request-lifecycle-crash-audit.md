@@ -14,8 +14,8 @@ verified with a targeted test or sanitiser run before remediation.
 > | Verdict | HIGHs | MEDs |
 > |---------|-------|------|
 > | CONFIRMED (fix) | H1, H2, H3, H5, H7, H9 | M5, M14 |
-> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M4, M8, M10, M12, M13, M15 |
-> | HYPOTHETICAL (defensive only) | — | M3, M9, M11 |
+> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M3, M4, M8, M9, M10, M11, M12, M13, M15 |
+> | HYPOTHETICAL (defensive only) | — | — |
 > | INVESTIGATE FURTHER | — | M7 |
 > | UPGRADED-BY-FUZZ (fixed) | — | M6 |
 >
@@ -65,6 +65,40 @@ verified with a targeted test or sanitiser run before remediation.
 > taken at call time and cannot loop independently of the registry —
 > the original "recommend dead backends in a loop" risk does not match
 > the actual control flow. M10 → MITIGATED.
+>
+> **Investigation closure (2026-05-10):** P3 defensive sweep — M3, M9,
+> M11 resolved as a single bundle (per BACKLOG §18 "skip if mitigation
+> is more code than the latent risk").
+>
+> - **M3** (cross-shard `string_view` lifetime,
+>   `src/tokenizer_service.cpp:213`) — pinned the invariant in code as a
+>   block comment at the top of `TokenizerService::encode_cached_async`:
+>   the caller's backing buffer must remain live until the synchronous
+>   prelude copies into `text_copy` (cross-shard branch) and
+>   `text_for_cache` (post-await), and no `co_await` may be inserted
+>   before either copy. Signature change to `std::string&&` was
+>   considered and rejected: the only call site
+>   (`tokenizer_service.cpp:393`) forwards a `string_view` parameter of
+>   its own coroutine and would have to be changed in lockstep, costing
+>   more than the comment. M3 → MITIGATED.
+> - **M9** (jump-hash `int64_t→int32_t` cast,
+>   `src/router_service.cpp:1135`) — added a one-line cast-safety
+>   comment citing `LocalDiscovery::MAX_KNOWN_BACKENDS` (= 64,
+>   `local_discovery.hpp:81`), the hard upstream cap that bounds
+>   `num_buckets` six orders of magnitude below the 2^31 ceiling. All
+>   eight call sites pass `live_backends.size()` (or a local `n`
+>   derived from it), and `live_backends` originates in the discovery
+>   layer that enforces the cap, so the cast is provably lossless and
+>   no runtime check / debug assert is warranted. M9 → MITIGATED.
+> - **M11** (HTTP status snoop split-segment risk,
+>   `src/stream_parser.cpp:152`) — re-read confirms this was already
+>   mitigated by the `header_end = view.find("\r\n\r\n")` guard at
+>   `parse_headers` (`stream_parser.cpp:141`): the function returns
+>   0 / "need more data" when the four-byte header terminator is not
+>   yet in the buffer, so by the time line 152 runs the *full* headers
+>   (including the status line) are already accumulated. The "first
+>   TCP segment splits inside `HTTP/1.1 20…`" shape cannot reach the
+>   snoop. No code change. M11 → MITIGATED.
 >
 > **Investigation closure (2026-05-10):** M4 (`std::bad_alloc`
 > propagation across `smp::submit_to`) resolved empirically by the

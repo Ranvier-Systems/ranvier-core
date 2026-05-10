@@ -211,7 +211,16 @@ uint32_t TokenizerService::select_tokenization_shard() const {
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
-    // Rule 22: coroutine converts any pre-future throw into a failed future
+    // Rule 22: coroutine converts any pre-future throw into a failed future.
+    //
+    // LIFETIME INVARIANT (audit M3): `text` is a non-owning view; the caller's
+    // backing buffer must remain valid until the synchronous prelude has copied
+    // it into an owned string. In particular, do NOT insert any `co_await`
+    // before the `std::string text_copy(text)` below (cross-shard branch) or
+    // the `std::string text_for_cache(text)` after the cross-shard await — both
+    // currently re-materialise the bytes from the view while the caller's
+    // buffer is still live. Refactors that move the first suspension earlier
+    // must take `std::string&&` / copy first instead.
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: check local cache first (no async overhead for hits)

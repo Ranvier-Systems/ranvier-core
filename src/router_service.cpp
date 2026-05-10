@@ -1132,6 +1132,13 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
 // Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
 // removing a bucket remaps only ~1/n keys.  This preserves KV-cache affinity
 // during backend topology changes, unlike modular hashing which reshuffles all.
+//
+// Cast safety (audit M9): the final `static_cast<int32_t>(b)` is lossless
+// because `b < num_buckets` on exit and `num_buckets` is a non-negative count
+// of live backends — capped at `LocalDiscovery::MAX_KNOWN_BACKENDS` (= 64,
+// `local_discovery.hpp:81`) by the discovery layer that feeds every caller.
+// The 2^31 ceiling on the cast is therefore six orders of magnitude above the
+// hard upstream cap; no runtime check is required here.
 inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
     int64_t b = -1, j = 0;
     while (j < num_buckets) {
