@@ -1042,9 +1042,7 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
 
 ### P2 — CONFIRMED MEDs not subsumed by cross-cutting
 
-- [ ] **[P2] M5: Add timeout to `TokenizerThreadPool::submit_async` callers**
-  Subsumed by the cross-cutting `with_timeout` ticket.
-  _Complexity:_ Low.
+- [x] **[P2] M5: Add timeout to `TokenizerThreadPool::submit_async` callers** — Fixed 2026-05-09 (subsumed by `with_timeout` ticket above).
 
 - [x] **[P2] M14: Stop capturing raw `[this]` in fire-and-forget route-learning** — Fixed 2026-05-09 (subsumed by shutdown-contract ticket above).
 
@@ -1082,11 +1080,7 @@ Empirical companion: libFuzzer harnesses live at [`tests/fuzz/`](tests/fuzz/). A
   _How to resolve:_ TSan run during a backend-churn integration test; or code-read of all `invoke_on_all` callers that mutate `backends` to confirm they hold the gate.
   _Complexity:_ Low.
 
-- [ ] **[P3] M10 investigation: hard cap on fallback walker**
-  _Location:_ `src/circuit_breaker.hpp:78-80`, `http_controller.cpp::get_fallback_backend` (~217-229).
-  _What's unclear:_ Triage found `failure_threshold` defaults to 5 and the loop is bounded by `get_all_backend_ids().size()` — likely already safe. Confirm the loop has an explicit max-iterations cap independent of the backend list size.
-  _How to resolve:_ One focused code read; if the cap exists, mark MITIGATED.
-  _Complexity:_ Trivial.
+- [x] **[P3] M10 investigation: hard cap on fallback walker** — Mitigated 2026-05-10 — verified structural cap at `http_controller.cpp:218-231`: the loop iterates a value-copy of `get_all_backend_ids()` (snapshot taken at call time) and returns on first allowed backend, so the walker is bounded by the local copy size and cannot loop independently of the registry.
 
 ### Verification & follow-up
 

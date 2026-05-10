@@ -14,9 +14,9 @@ verified with a targeted test or sanitiser run before remediation.
 > | Verdict | HIGHs | MEDs |
 > |---------|-------|------|
 > | CONFIRMED (fix) | H1, H2, H3, H5, H7, H9 | M5, M14 |
-> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M8, M12, M13, M15 |
+> | MITIGATED (close) | H4, H6, H8, H10 | M1, M2, M8, M10, M12, M13, M15 |
 > | HYPOTHETICAL (defensive only) | — | M3, M9, M11 |
-> | INVESTIGATE FURTHER | — | M4, M7, M10 |
+> | INVESTIGATE FURTHER | — | M4, M7 |
 > | UPGRADED-BY-FUZZ (fixed) | — | M6 |
 >
 > **Fuzz update (2026-05-08):** the request-rewriter harness in
@@ -56,6 +56,15 @@ verified with a targeted test or sanitiser run before remediation.
 > Findings staying at static **MITIGATED** (no fuzz validation possible
 > until Seastar is rebuilt with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`):
 > H10, M11, M12.
+>
+> **Investigation closure (2026-05-10):** M10 (fallback walker hard cap)
+> resolved by code re-read. `HttpController::get_fallback_backend`
+> (`src/http_controller.cpp:218-231`) iterates a value-copy returned from
+> `_router.get_all_backend_ids()` and returns on the first allowed
+> backend, so the walker is structurally bounded by the snapshot size
+> taken at call time and cannot loop independently of the registry —
+> the original "recommend dead backends in a loop" risk does not match
+> the actual control flow. M10 → MITIGATED.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS
