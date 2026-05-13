@@ -123,8 +123,13 @@ corpus and saves an updated one. On failure the log, any `crash-*`
 reproducer, and the corpus snapshot are uploaded as artifacts.
 
 `stream_parser_fuzz` is **not** part of `fuzz-ci` (Seastar / libFuzzer
-allocator interaction; see *Caveats* below). When the unblock lands,
-add it back to the `fuzz-ci` target in the `Makefile`.
+allocator interaction; see *Caveats* below). It is run separately by
+the `stream-parser-fuzz-default-alloc` job in
+`.github/workflows/fuzz-tests.yml` against the shared default-allocator
+base (`Dockerfile.base.default-alloc`, layered under `Dockerfile.fuzz`
+via its `BASE_IMAGE` build-arg) and is gated to `workflow_dispatch`
+until the first multi-hour run is observed clean — see *Unblocking
+`stream_parser_fuzz`* below.
 
 For longer scheduled runs, override the per-harness time:
 
@@ -164,16 +169,59 @@ bug. If you run the harness binaries directly (not via `make`), set
 - `stream_parser_fuzz` operates on a single `StreamParser` instance per
   input, splitting the input into pseudo-random chunks. It does not
   exercise the full HTTP-over-TCP path.
-- **`stream_parser_fuzz` does not currently run end-to-end** because of a
-  Seastar / libFuzzer allocator interaction. Seastar overrides global
-  `operator new`/`delete` to use its per-shard allocator (Hard Rule #15);
-  that allocator requires `seastar::smp::start()` to initialise per-shard
-  pools. libFuzzer's `main` never boots the Seastar reactor, so
-  allocations go through an uninitialised fast path that produces
-  pointers `libc::free` later rejects with `munmap_chunk: invalid
-  pointer`. The crash is in libFuzzer's cleanup of its own data
-  structures, not in `StreamParser`. The harness binary still builds and
-  the source is correct; fuzzing it would require Seastar to be rebuilt
-  with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`. Audit findings H10, M11,
-  M12 remain at their static-triage MITIGATED verdicts until that
-  unblock lands.
+- **`stream_parser_fuzz` does not run end-to-end inside the default
+  `ranvier-fuzz` image** because of a Seastar / libFuzzer allocator
+  interaction. Seastar overrides global `operator new`/`delete` to use
+  its per-shard allocator (Hard Rule #15); that allocator requires
+  `seastar::smp::start()` to initialise per-shard pools. libFuzzer's
+  `main` never boots the Seastar reactor, so allocations go through an
+  uninitialised fast path that produces pointers `libc::free` later
+  rejects with `munmap_chunk: invalid pointer`. The crash is in
+  libFuzzer's cleanup of its own data structures, not in `StreamParser`.
+  The harness binary still builds and the source is correct.
+
+## Unblocking `stream_parser_fuzz`
+
+The diagnosis above identifies the per-shard allocator as the only
+blocker. The fix is to rebuild Seastar with
+`-DSeastar_USE_DEFAULT_ALLOCATOR=ON`, which routes `operator new`/
+`delete` back to libc malloc — libFuzzer's runtime understands those
+pointers, and the harness no longer crashes during libFuzzer cleanup.
+
+The artefacts that wire this up:
+
+- **`Dockerfile.base.default-alloc`** is the shared default-allocator
+  base. It derives `FROM ranvier-base` and reinstalls `/usr/local` with
+  Seastar rebuilt `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`. The image is
+  **unsuitable for production builds or perf measurement**: it bypasses
+  Seastar's per-shard memory hierarchy, so allocator-specific bugs
+  (cross-shard free, foreign_malloc bookkeeping, Hard Rule #15
+  interactions) become invisible and any latency/throughput number you
+  read off it is meaningless against production. Parsing, state-machine,
+  chunk-trailer, integer-math, and exception-propagation bugs are still
+  correctly exercised — that's the entire scope. The same image also
+  unblocks the §18 P2 ASan/UBSan sanitizer-tests workflow, whose
+  `gtest_discover_tests` step otherwise crashes in `libhwloc.so.15`
+  during static construction of Seastar-linked test binaries; see
+  `Dockerfile.sanitize`'s header for that consumer recipe.
+- **`Dockerfile.fuzz`** is layered on top of the default-allocator base
+  via its existing `BASE_IMAGE` build-arg — no fuzz-specific Dockerfile
+  exists for this path. See the header in `Dockerfile.fuzz` for the
+  exact `docker build` invocation.
+- **`make fuzz-run-stream-parser-default-alloc`** runs the harness;
+  intended to be invoked from inside the resulting
+  `ranvier-fuzz-default-alloc` container. The underlying
+  `fuzz-run-stream-parser` target keys off the `SEASTAR_DEFAULT_ALLOCATOR`
+  env var (set by `Dockerfile.base.default-alloc`) and prints the
+  blocked-by-allocator diagnostic when invoked against the production
+  base, so old muscle memory still works.
+- **`.github/workflows/fuzz-tests.yml`** has a
+  `stream-parser-fuzz-default-alloc` job gated to `workflow_dispatch`.
+  The first runs are manual so the developer can eyeball the output
+  before promoting H10/M11/M12 to MITIGATED-BY-FUZZ. Once a multi-hour
+  run is clean the trigger flips to the post-Docker-Publish
+  `workflow_run` shape used by the main `fuzz-tests` job.
+
+Until a multi-hour run is observed clean, audit findings H10, M11, M12
+remain at their static-triage MITIGATED verdicts. See BACKLOG §18
+"Unblock Seastar-dependent fuzzing" for the closure checklist.

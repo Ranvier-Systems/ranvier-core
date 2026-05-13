@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
 
 # Default target
 all: build
@@ -95,6 +95,35 @@ fuzz-run-stream-parser: fuzz-build
 	    echo "stream_parser_fuzz not built — Seastar likely not found at configure time."; \
 	    exit 1; \
 	fi
+	@# Detect the default-allocator base image (Dockerfile.base.default-alloc
+	@# sets SEASTAR_DEFAULT_ALLOCATOR=1). Outside that image, libFuzzer's
+	@# main runs against Seastar's per-shard allocator without a reactor,
+	@# crashes in libFuzzer cleanup with `munmap_chunk: invalid pointer`,
+	@# and produces no useful signal. Print the unblock recipe rather than
+	@# letting the harness crash silently for users who haven't read
+	@# tests/fuzz/README.md "Unblocking `stream_parser_fuzz`".
+	@if [ -z "$$SEASTAR_DEFAULT_ALLOCATOR" ]; then \
+	    echo "error: fuzz-run-stream-parser is blocked on the production base image."; \
+	    echo ""; \
+	    echo "       Seastar's per-shard allocator (Hard Rule #15) needs a running"; \
+	    echo "       reactor; libFuzzer's main never boots seastar::smp::start, so"; \
+	    echo "       allocations come from an uninitialised fast path and libFuzzer"; \
+	    echo "       crashes in its own cleanup ('munmap_chunk: invalid pointer')."; \
+	    echo "       The unblock image rebuilds Seastar with"; \
+	    echo "       -DSeastar_USE_DEFAULT_ALLOCATOR=ON — see"; \
+	    echo "       Dockerfile.base.default-alloc and tests/fuzz/README.md"; \
+	    echo "       'Unblocking stream_parser_fuzz'."; \
+	    echo ""; \
+	    echo "       Recipe:"; \
+	    echo "         docker build -f Dockerfile.base.default-alloc \\"; \
+	    echo "                      -t ranvier-base-default-alloc:latest ."; \
+	    echo "         docker build --build-arg BASE_IMAGE=ranvier-base-default-alloc:latest \\"; \
+	    echo "                      -f Dockerfile.fuzz -t ranvier-fuzz-default-alloc:latest ."; \
+	    echo "         docker run --rm -v \"\$$PWD:/src\" -w /src \\"; \
+	    echo "                    ranvier-fuzz-default-alloc:latest \\"; \
+	    echo "                    make fuzz-run-stream-parser-default-alloc"; \
+	    exit 1; \
+	fi
 	@mkdir -p tests/fuzz/corpus/stream_parser
 	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
 	    $(FUZZ_BUILD_DIR)/stream_parser_fuzz \
@@ -103,14 +132,27 @@ fuzz-run-stream-parser: fuzz-build
 	    -max_len=$(FUZZ_MAX_LEN) \
 	    -print_final_stats=1
 
+# Alias for fuzz-run-stream-parser. Kept as a separate target so the CI
+# job and the README pointer can name the unblock path explicitly —
+# callers reading the workflow / docs don't have to guess which image
+# fuzz-run-stream-parser belongs in. The detection in
+# fuzz-run-stream-parser itself is what actually enforces that the
+# Seastar default-allocator base is in use (Dockerfile.base.default-alloc
+# sets SEASTAR_DEFAULT_ALLOCATOR=1).
+fuzz-run-stream-parser-default-alloc: fuzz-run-stream-parser
+
 fuzz-run-all: fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser
 
 # Short fuzz pass for CI post-merge regression checks. Defaults to 60s
 # per harness; override with FUZZ_CI_TIME for longer scheduled runs.
 # Deliberately excludes fuzz-run-stream-parser — that harness is blocked
-# by a Seastar / libFuzzer allocator interaction (see tests/fuzz/README.md
-# and BACKLOG §18 "Unblock Seastar-dependent fuzzing"). Add it back once
-# Seastar is rebuilt with -DSeastar_USE_DEFAULT_ALLOCATOR=ON.
+# by a Seastar / libFuzzer allocator interaction in the default fuzz image
+# (see tests/fuzz/README.md "Caveats" and BACKLOG §18 "Unblock
+# Seastar-dependent fuzzing"). The unblock image
+# (Dockerfile.base.default-alloc layered under Dockerfile.fuzz) and the
+# `fuzz-run-stream-parser-default-alloc` target exist for it; the
+# dedicated CI job in .github/workflows/fuzz-tests.yml runs that path
+# separately.
 FUZZ_CI_TIME ?= 60
 
 fuzz-ci:
@@ -895,7 +937,11 @@ help:
 	@echo "  make fuzz-build                    - Configure + build all libFuzzer harnesses"
 	@echo "  make fuzz-run-radix-tree           - Fuzz RadixTree::insert/lookup"
 	@echo "  make fuzz-run-request-rewriter     - Fuzz RequestRewriter::extract_*"
-	@echo "  make fuzz-run-stream-parser        - Fuzz StreamParser::push (needs Seastar)"
+	@echo "  make fuzz-run-stream-parser              - Fuzz StreamParser::push (needs the default-alloc base)"
+	@echo "  make fuzz-run-stream-parser-default-alloc - Alias; same harness, names the unblock path explicitly"
+	@echo "                                              (build Dockerfile.base.default-alloc + Dockerfile.fuzz on top;"
+	@echo "                                              Seastar is rebuilt with -DSeastar_USE_DEFAULT_ALLOCATOR=ON to"
+	@echo "                                              unblock libFuzzer — see tests/fuzz/README.md)"
 	@echo "  make fuzz-run-all                  - Run all three harnesses sequentially"
 	@echo "  make fuzz-ci                       - Short post-merge run (60s × 2 harnesses, no stream-parser)"
 	@echo "  make fuzz-clean                    - Remove the fuzz build directory"

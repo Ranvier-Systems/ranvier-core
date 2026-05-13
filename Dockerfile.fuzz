@@ -27,6 +27,18 @@
 # Override the base image (e.g. CI cache tag):
 #   docker build --build-arg BASE_IMAGE=registry/ranvier-base:abc123 \
 #                -f Dockerfile.fuzz -t ranvier-fuzz:latest .
+#
+# Stack on the Seastar default-allocator base (unblocks
+# `stream_parser_fuzz` — libFuzzer's main never boots `smp::start`, so
+# Seastar's per-shard allocator hands out pointers `libc::free` rejects
+# in libFuzzer cleanup; the default-allocator base routes new/delete
+# back to libc malloc). See Dockerfile.base.default-alloc and
+# tests/fuzz/README.md "Unblocking `stream_parser_fuzz`" for the full
+# diagnosis and trade-offs. **Not for production builds.**
+#   docker build -f Dockerfile.base.default-alloc \
+#                -t ranvier-base-default-alloc:latest .
+#   docker build --build-arg BASE_IMAGE=ranvier-base-default-alloc:latest \
+#                -f Dockerfile.fuzz -t ranvier-fuzz-default-alloc:latest .
 # ---------------------------------------------------------
 ARG BASE_IMAGE=ranvier-base:latest
 FROM ${BASE_IMAGE}

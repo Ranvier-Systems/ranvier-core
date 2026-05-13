@@ -28,6 +28,20 @@
 # Override the base image (e.g. CI cache tag):
 #   docker build --build-arg BASE_IMAGE=registry/ranvier-base:abc123 \
 #                -f Dockerfile.sanitize -t ranvier-sanitize:latest .
+#
+# Stack on the Seastar default-allocator base (REQUIRED for the unit
+# tests that link Seastar — at build time CTest's gtest_discover_tests
+# runs each binary with `--gtest_list_tests`, which constructs the
+# Seastar globals without a running reactor; the per-shard allocator
+# crashes in `libhwloc.so.15` before the test list returns. The
+# default-allocator base routes new/delete back to libc malloc, so
+# discovery completes and the suite can run under ASan/UBSan). See
+# Dockerfile.base.default-alloc and BACKLOG §18 for the full diagnosis
+# and trade-offs. **Not for production builds.**
+#   docker build -f Dockerfile.base.default-alloc \
+#                -t ranvier-base-default-alloc:latest .
+#   docker build --build-arg BASE_IMAGE=ranvier-base-default-alloc:latest \
+#                -f Dockerfile.sanitize -t ranvier-sanitize-default-alloc:latest .
 # ---------------------------------------------------------
 ARG BASE_IMAGE=ranvier-base:latest
 FROM ${BASE_IMAGE}
