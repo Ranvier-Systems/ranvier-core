@@ -1,0 +1,122 @@
+# ---------------------------------------------------------
+# Ranvier Base Builder Image — Seastar Default-Allocator Variant
+# ---------------------------------------------------------
+# Derives FROM `ranvier-base` and reinstalls Seastar in `/usr/local`
+# with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`. Downstream images
+# (`Dockerfile.fuzz`, `Dockerfile.sanitize`) consume this via their
+# existing `BASE_IMAGE` build-arg — see "Build" below.
+#
+# WHY THIS IMAGE EXISTS
+# Seastar overrides global `operator new`/`delete` with its per-shard
+# allocator (Hard Rule #15). That allocator requires
+# `seastar::smp::start()` to initialise per-shard pools. Two test
+# workloads invoke the binary WITHOUT a running reactor:
+#
+#   1. libFuzzer (`tests/fuzz/stream_parser_fuzz`) — `LLVMFuzzerInitialize`
+#      runs in libFuzzer's `main`, which never boots `smp::start`.
+#      Allocations go through an uninitialised fast path, producing
+#      pointers `libc::free` rejects in libFuzzer's own cleanup
+#      (`munmap_chunk: invalid pointer`). See `tests/fuzz/README.md`
+#      "Caveats" for the full diagnosis.
+#
+#   2. CTest's `gtest_discover_tests` — at *build time*, CMake runs each
+#      test binary with `--gtest_list_tests` to enumerate cases. The
+#      Seastar-linked unit tests (e.g. `cross_shard_exception_propagation_test`)
+#      hit the same uninitialised-allocator fast path during static
+#      construction and crash in `libhwloc.so.15` before the test list
+#      can be returned. This blocks the entire §18 P2 ASan/UBSan sweep.
+#
+# Rebuilding Seastar with the default allocator routes `operator new`/
+# `delete` back to libc malloc — both libFuzzer's runtime and ASan/UBSan
+# understand those pointers, and the test binaries no longer crash in
+# discovery / cleanup.
+#
+# **NOT FOR PRODUCTION / PERF MEASUREMENT.**
+#   - Bypasses Seastar's per-shard memory hierarchy entirely.
+#   - Allocator-specific bugs (cross-shard free, foreign_malloc
+#     bookkeeping, Hard Rule #15 interactions) become INVISIBLE here.
+#   - NUMA-aware allocation, cross-reactor balance, and the shared-nothing
+#     contract are all neutralised. Anything you measure here for latency
+#     or throughput is meaningless against the production binary.
+#   - Parsing, state-machine, integer-math, chunk-trailer / SSE boundary,
+#     and exception-propagation bugs ARE correctly exercised — that is
+#     the entire scope of this image.
+#
+# Build:
+#   # 1. Build (or pull) the production base image first.
+#   docker build -f Dockerfile.base                -t ranvier-base:latest                .
+#
+#   # 2. Build this default-allocator base on top. Adds ~30 min on the
+#   #    first build (Seastar rebuild); subsequent builds are layer-cache
+#   #    hits.
+#   docker build -f Dockerfile.base.default-alloc  -t ranvier-base-default-alloc:latest  .
+#
+#   # 3a. Build the fuzz image on top of the default-allocator base.
+#   docker build --build-arg BASE_IMAGE=ranvier-base-default-alloc:latest \
+#                -f Dockerfile.fuzz -t ranvier-fuzz-default-alloc:latest .
+#
+#   # 3b. Or build the sanitize image on top.
+#   docker build --build-arg BASE_IMAGE=ranvier-base-default-alloc:latest \
+#                -f Dockerfile.sanitize -t ranvier-sanitize-default-alloc:latest .
+#
+# Run:
+#   # Fuzz the StreamParser harness (the original blocked workload).
+#   docker run --rm -v "$PWD:/src" -w /src ranvier-fuzz-default-alloc:latest \
+#       make fuzz-run-stream-parser-default-alloc
+#
+#   # Or run the sanitised unit-test suite (unblocks the §18 P2 ticket's
+#   # gtest_discover_tests crash).
+#   docker run --rm -v "$PWD:/src" -w /src ranvier-sanitize-default-alloc:latest \
+#       make sanitize-test
+#
+# Override the parent base (e.g. CI cache tag):
+#   docker build --build-arg BASE_IMAGE=registry/ranvier-base:abc123 \
+#                -f Dockerfile.base.default-alloc -t ranvier-base-default-alloc:latest .
+# ---------------------------------------------------------
+ARG BASE_IMAGE=ranvier-base:latest
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="Ranvier Base Builder (Seastar default allocator)"
+LABEL org.opencontainers.image.description="ranvier-base with Seastar rebuilt -DSeastar_USE_DEFAULT_ALLOCATOR=ON for libFuzzer + ASan/UBSan compatibility — NOT FOR PRODUCTION"
+
+# Reinstall Seastar over /usr/local with the default allocator. Mirrors
+# Dockerfile.base's Seastar layer exactly except for the trailing
+# `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`: configure.py uses
+# argparse.parse_known_args() and forwards unrecognised `-D...` flags to
+# the CMake invocation, which is how the option reaches Seastar's
+# CMakeLists. The artefact layout under /usr/local/lib/cmake/Seastar is
+# unchanged, so the project's `find_package(Seastar QUIET)` still picks
+# it up without any source-side conditionals.
+#
+# Toolchain inherits from the parent ranvier-base (GCC). Downstream
+# fuzz/sanitize images install clang on top; clang-built harnesses link
+# cleanly against a GCC-built Seastar (the toolchain ABI is stable
+# enough on Fedora 39 for this), and keeping GCC here means the layer
+# matches the production base's compiler choice for everything except
+# the allocator switch.
+WORKDIR /tmp
+RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
+    cd seastar && \
+    ./install-dependencies.sh && \
+    dnf clean all && \
+    ./configure.py \
+        --mode=release \
+        --prefix=/usr/local \
+        --c++-standard=20 \
+        --without-tests \
+        --without-apps \
+        --without-demos \
+        -DSeastar_USE_DEFAULT_ALLOCATOR=ON && \
+    ninja -j$(nproc) -C build/release install && \
+    cd /tmp && \
+    rm -rf seastar && \
+    rm -rf /var/cache/dnf /root/.cache /tmp/*
+
+# Marker env var so Make targets (and any future test scaffolding) can
+# detect at runtime that they're inside a default-allocator image and
+# skip / enable behaviour accordingly. The fuzz-run-stream-parser
+# Make target keys off this to print a blocked-by-allocator diagnostic
+# when invoked against the production base.
+ENV SEASTAR_DEFAULT_ALLOCATOR=1
+
+WORKDIR /src

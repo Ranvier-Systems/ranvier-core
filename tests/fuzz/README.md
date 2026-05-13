@@ -124,10 +124,12 @@ reproducer, and the corpus snapshot are uploaded as artifacts.
 
 `stream_parser_fuzz` is **not** part of `fuzz-ci` (Seastar / libFuzzer
 allocator interaction; see *Caveats* below). It is run separately by
-the `stream-parser-fuzz-seastar` job in `.github/workflows/fuzz-tests.yml`
-against the unblock image (`Dockerfile.fuzz-seastar`) and is gated to
-`workflow_dispatch` until the first multi-hour run is observed clean —
-see *Unblocking `stream_parser_fuzz`* below.
+the `stream-parser-fuzz-default-alloc` job in
+`.github/workflows/fuzz-tests.yml` against the shared default-allocator
+base (`Dockerfile.base.default-alloc`, layered under `Dockerfile.fuzz`
+via its `BASE_IMAGE` build-arg) and is gated to `workflow_dispatch`
+until the first multi-hour run is observed clean — see *Unblocking
+`stream_parser_fuzz`* below.
 
 For longer scheduled runs, override the per-harness time:
 
@@ -188,21 +190,37 @@ pointers, and the harness no longer crashes during libFuzzer cleanup.
 
 The artefacts that wire this up:
 
-- **`Dockerfile.fuzz-seastar`** layers a Seastar rebuild on top of
-  `ranvier-fuzz:latest`, reinstalling `/usr/local` with the
-  default-allocator build. The image is **fuzz-only and unsuitable for
-  production builds**: allocator-specific bugs (cross-shard free,
-  foreign_malloc bookkeeping) become invisible. Parsing, state-machine,
-  chunk-trailer, and integer-math bugs in `StreamParser` are still
-  correctly exercised — that's the entire scope.
-- **`make fuzz-run-stream-parser-seastar`** runs the harness; intended
-  to be invoked from inside the `ranvier-fuzz-seastar` container.
+- **`Dockerfile.base.default-alloc`** is the shared default-allocator
+  base. It derives `FROM ranvier-base` and reinstalls `/usr/local` with
+  Seastar rebuilt `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`. The image is
+  **unsuitable for production builds or perf measurement**: it bypasses
+  Seastar's per-shard memory hierarchy, so allocator-specific bugs
+  (cross-shard free, foreign_malloc bookkeeping, Hard Rule #15
+  interactions) become invisible and any latency/throughput number you
+  read off it is meaningless against production. Parsing, state-machine,
+  chunk-trailer, integer-math, and exception-propagation bugs are still
+  correctly exercised — that's the entire scope. The same image also
+  unblocks the §18 P2 ASan/UBSan sanitizer-tests workflow, whose
+  `gtest_discover_tests` step otherwise crashes in `libhwloc.so.15`
+  during static construction of Seastar-linked test binaries; see
+  `Dockerfile.sanitize`'s header for that consumer recipe.
+- **`Dockerfile.fuzz`** is layered on top of the default-allocator base
+  via its existing `BASE_IMAGE` build-arg — no fuzz-specific Dockerfile
+  exists for this path. See the header in `Dockerfile.fuzz` for the
+  exact `docker build` invocation.
+- **`make fuzz-run-stream-parser-default-alloc`** runs the harness;
+  intended to be invoked from inside the resulting
+  `ranvier-fuzz-default-alloc` container. The underlying
+  `fuzz-run-stream-parser` target keys off the `SEASTAR_DEFAULT_ALLOCATOR`
+  env var (set by `Dockerfile.base.default-alloc`) and prints the
+  blocked-by-allocator diagnostic when invoked against the production
+  base, so old muscle memory still works.
 - **`.github/workflows/fuzz-tests.yml`** has a
-  `stream-parser-fuzz-seastar` job gated to `workflow_dispatch`. The
-  first runs are manual so the developer can eyeball the output before
-  promoting H10/M11/M12 to MITIGATED-BY-FUZZ. Once a multi-hour run is
-  clean the trigger flips to the post-Docker-Publish `workflow_run`
-  shape used by the main `fuzz-tests` job.
+  `stream-parser-fuzz-default-alloc` job gated to `workflow_dispatch`.
+  The first runs are manual so the developer can eyeball the output
+  before promoting H10/M11/M12 to MITIGATED-BY-FUZZ. Once a multi-hour
+  run is clean the trigger flips to the post-Docker-Publish
+  `workflow_run` shape used by the main `fuzz-tests` job.
 
 Until a multi-hour run is observed clean, audit findings H10, M11, M12
 remain at their static-triage MITIGATED verdicts. See BACKLOG §18
