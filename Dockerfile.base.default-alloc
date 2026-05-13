@@ -81,12 +81,17 @@ LABEL org.opencontainers.image.description="ranvier-base with Seastar rebuilt -D
 
 # Reinstall Seastar over /usr/local with the default allocator. Mirrors
 # Dockerfile.base's Seastar layer exactly except for the trailing
-# `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`: configure.py uses
-# argparse.parse_known_args() and forwards unrecognised `-D...` flags to
-# the CMake invocation, which is how the option reaches Seastar's
-# CMakeLists. The artefact layout under /usr/local/lib/cmake/Seastar is
-# unchanged, so the project's `find_package(Seastar QUIET)` still picks
-# it up without any source-side conditionals.
+# `cmake -B build/release -DSeastar_USE_DEFAULT_ALLOCATOR=ON` step:
+# Seastar's configure.py uses strict argparse, with no passthrough for
+# arbitrary `-D` CMake flags and no built-in `--default-allocator`
+# option (verified against scylladb/seastar/configure.py on master,
+# 2026-05-13). We therefore let configure.py produce the normal
+# `build/release/` ninja dir and then re-cmake that dir to flip the
+# Seastar_USE_DEFAULT_ALLOCATOR cache variable before `ninja install`
+# materialises the libraries. The artefact layout under
+# /usr/local/lib/cmake/Seastar is unchanged, so the project's
+# `find_package(Seastar QUIET)` still picks it up without any
+# source-side conditionals.
 #
 # Toolchain inherits from the parent ranvier-base (GCC). Downstream
 # fuzz/sanitize images install clang on top; clang-built harnesses link
@@ -105,8 +110,8 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
         --c++-standard=20 \
         --without-tests \
         --without-apps \
-        --without-demos \
-        -DSeastar_USE_DEFAULT_ALLOCATOR=ON && \
+        --without-demos && \
+    cmake -B build/release -DSeastar_USE_DEFAULT_ALLOCATOR=ON && \
     ninja -j$(nproc) -C build/release install && \
     cd /tmp && \
     rm -rf seastar && \
