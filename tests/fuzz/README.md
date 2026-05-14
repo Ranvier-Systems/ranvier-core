@@ -222,6 +222,11 @@ The artefacts that wire this up:
   run is clean the trigger flips to the post-Docker-Publish
   `workflow_run` shape used by the main `fuzz-tests` job.
 
-Until a multi-hour run is observed clean, audit findings H10, M11, M12
-remain at their static-triage MITIGATED verdicts. See BACKLOG §18
-"Unblock Seastar-dependent fuzzing" for the closure checklist.
+**Closure (2026-05-14):** the §18 P3 ticket closed after a 30-min local
+pass (21,864,631 executions, 12,140 execs/s, 967 new corpus units, no
+crash) on `ranvier-fuzz-default-alloc`. H10, M11, M12 promoted from
+static MITIGATED to MITIGATED-BY-FUZZ in
+`docs/audits/request-lifecycle-crash-audit.md`; the CI job's trigger
+flipped to the post-Docker-Publish `workflow_run` shape used by the
+main `fuzz-tests` job, and `continue-on-error` dropped so a regression
+on the FUZZ_CI_TIME smoke run now fails CI.

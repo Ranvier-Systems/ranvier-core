@@ -51,11 +51,12 @@ verified with a targeted test or sanitiser run before remediation.
 > | `request_rewriter_fuzz` | clean (post-fix) | 5,552,208 | First long run crashed at ~564k execs (M6 upgrade); after fix, 30 min clean. 3,017 new units. Validates M6, L5. |
 > | `stream_parser_fuzz` | not validated | 1 | Crashed in libFuzzer cleanup before any real input ran, due to Seastar's global `operator new`/`delete` override (Hard Rule #15) requiring an uninitialised reactor. Not a `StreamParser` bug. See `tests/fuzz/README.md`. H10, M11, M12 stay at static MITIGATED. |
 >
-> Findings moved to **MITIGATED-BY-FUZZ** by these runs: H8, L9, M6 (post-fix), L5.
+> Findings moved to **MITIGATED-BY-FUZZ** by these runs: H8, L9, M6 (post-fix), L5. **Updated 2026-05-14:** H10, M11, M12 added — see "Fuzz update (2026-05-14)" addendum below.
 >
-> Findings staying at static **MITIGATED** (no fuzz validation possible
-> until Seastar is rebuilt with `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`):
-> H10, M11, M12.
+> Findings staying at static **MITIGATED** as of 2026-05-08 (no fuzz
+> validation possible until Seastar is rebuilt with the default
+> allocator): ~~H10, M11, M12~~ — promoted 2026-05-14, see addendum
+> below.
 >
 > **Investigation closure (2026-05-10):** M10 (fallback walker hard cap)
 > resolved by code re-read. `HttpController::get_fallback_backend`
@@ -358,6 +359,22 @@ verified with a targeted test or sanitiser run before remediation.
 > sweep, every `Document::Parse(...)` call site in `src/` now
 > uses `kParseIterativeFlag`. S1 → MITIGATED-BY-FIX,
 > S2 → MITIGATED-BY-FIX.
+>
+> **Fuzz update (2026-05-14):** the `stream_parser_fuzz` harness, blocked
+> on 2026-05-08 by the Seastar / libFuzzer allocator interaction, ran
+> clean for 30 minutes (21,864,631 executions, 12,140 execs/s, 967 new
+> corpus units added, peak RSS 698 MB) on the §18 P3 unblock image
+> (`Dockerfile.base.default-alloc` — see `tests/fuzz/README.md`
+> *Unblocking `stream_parser_fuzz`*). No `crash-*` reproducer; corpus
+> growth throughout the run shows the harness was actively exploring,
+> not stuck on a fixed code path. The harness exercises
+> `StreamParser::push` against adversarial chunked-HTTP / SSE input
+> with pseudo-random chunk splits, which covers the surfaces each
+> finding flagged: H10's chunk-trailer length addition and signed
+> cast in `parse_chunk_data`, M11's status-snoop sensitivity to the
+> first read being split mid-status-line, and M12's `Content-Length`
+> cast against the accumulator-size comparator. Promotes **H10, M11,
+> M12 → MITIGATED-BY-FUZZ**, completing the §18 P3 closure plan.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS

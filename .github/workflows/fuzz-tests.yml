@@ -145,19 +145,22 @@ jobs:
   # under Dockerfile.fuzz via its BASE_IMAGE build-arg). The same base
   # image also unblocks the §18 P2 sanitizer-tests workflow; switching
   # that workflow over lands separately when the P2 ticket's "still
-  # pending" follow-up runs (this commit only wires the fuzz consumer).
+  # pending" follow-up runs.
   #
-  # Gated to workflow_dispatch only for now: the first run is manual so
-  # the developer can eyeball the output before promoting H10/M11/M12 to
-  # MITIGATED-BY-FUZZ. Once a multi-hour run is observed clean, flip the
-  # trigger to mirror the main fuzz-tests job (workflow_run after
-  # "Docker Publish") and drop this gate. Mirrors the non-gating posture
-  # of sanitizer-tests.yml — this is intentionally a separate job (not
-  # workflow) so the corpus cache and image-build wiring stay co-located
-  # with the existing fuzz CI.
+  # Trigger matches the main fuzz-tests job (post-Docker-Publish
+  # workflow_run + manual dispatch) as of the §18 P3 closure on
+  # 2026-05-14: a 30-min local run (21.8M execs, 12K/s, 967 new corpus
+  # units, no crash) promoted H10/M11/M12 to MITIGATED-BY-FUZZ in the
+  # request-lifecycle audit, so the harness is now a regression gate
+  # alongside radix_tree_fuzz and request_rewriter_fuzz. continue-on-error
+  # dropped at the same time. The job is intentionally a separate job
+  # (not workflow) from the main fuzz-tests job so the default-allocator
+  # image build wiring stays co-located with the rest of the fuzz CI.
   # ---------------------------------------------------------------------
   stream-parser-fuzz-default-alloc:
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     # Generous: the first Seastar rebuild in the default-alloc base is
     # ~30 min; on cache hits the job is bounded by FUZZ_CI_TIME (default
@@ -236,16 +239,12 @@ jobs:
           restore-keys: |
             fuzz-corpus-stream-parser-${{ runner.os }}-
 
-      # Non-gating: the first runs of this harness are expected to
-      # surface either a genuine StreamParser finding (which becomes its
-      # own ticket per BACKLOG §18 closure plan) or noise from the
-      # default-allocator Seastar path. Either way, we don't want this
-      # job to block unrelated PRs while triage happens. Flip
-      # continue-on-error to false once the harness is observed clean
-      # under the post-Docker-Publish trigger.
+      # Gating as of 2026-05-14: the 30-min local pass that promoted
+      # H10/M11/M12 to MITIGATED-BY-FUZZ established the baseline, so a
+      # crash on the FUZZ_CI_TIME smoke run is a regression that should
+      # fail the job.
       - name: Build harness and fuzz inside default-allocator fuzz image
         id: fuzz_default_alloc
-        continue-on-error: true
         run: |
           mkdir -p fuzz-results
           docker run --rm \
@@ -258,6 +257,7 @@ jobs:
 
           FUZZ_EXIT=${PIPESTATUS[0]}
           echo "fuzz_exit_code=$FUZZ_EXIT" >> $GITHUB_OUTPUT
+          exit $FUZZ_EXIT
 
       - name: Upload stream_parser fuzz artifacts
         uses: actions/upload-artifact@v4
