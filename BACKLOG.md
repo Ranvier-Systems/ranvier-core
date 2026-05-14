@@ -991,6 +991,13 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
 - [ ] **[P3] Add CI grep for `seastar::async(`**
   _Justification:_ The misuse was systemic enough that a lint will catch the next instance faster than another audit. Allowlist the legitimate sites once they're identified.
 
+- [ ] **[P3] Bound concurrency on gossip broadcast async path**
+  _Location:_ `src/gossip_transport.cpp:208-261` — the `seastar::async` batch branch is gated only by `_gossip_task_gate`, which guards shutdown ordering, not holder count.
+  _Justification:_ Per-request callers (`broadcast_cache_eviction` via `http_controller.cpp:3704`, `broadcast_route` via the route-announcement path) can in principle stack arbitrarily many `seastar::thread` instances (128 kB stack each, virtual). Unlike `CryptoOffloader::max_queue_depth` at `crypto_offloader.hpp:94`, there is no explicit cap or inline fallback. Currently self-limits because the encrypt+send block is short, but the bound is implicit.
+  _Approach:_ Wrap the branch in `with_semaphore(_broadcast_sem, 1, ...)` with a small cap (4-8), or mirror the CryptoOffloader inline-fallback pattern at `crypto_offloader.hpp:284-310`.
+  _Complexity:_ Low.
+  _Cross-ref:_ In-code TODO at `src/gossip_transport.cpp:208`.
+
 ---
 
 ## 18. Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)
