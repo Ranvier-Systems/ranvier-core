@@ -80,18 +80,45 @@ LABEL org.opencontainers.image.title="Ranvier Base Builder (Seastar default allo
 LABEL org.opencontainers.image.description="ranvier-base with Seastar rebuilt -DSeastar_USE_DEFAULT_ALLOCATOR=ON for libFuzzer + ASan/UBSan compatibility — NOT FOR PRODUCTION"
 
 # Reinstall Seastar over /usr/local with the default allocator. Mirrors
-# Dockerfile.base's Seastar layer exactly except for the trailing
-# `cmake -B build/release -DSeastar_USE_DEFAULT_ALLOCATOR=ON` step:
-# Seastar's configure.py uses strict argparse, with no passthrough for
-# arbitrary `-D` CMake flags and no built-in `--default-allocator`
-# option (verified against scylladb/seastar/configure.py on master,
-# 2026-05-13). We therefore let configure.py produce the normal
-# `build/release/` ninja dir and then re-cmake that dir to flip the
-# Seastar_USE_DEFAULT_ALLOCATOR cache variable before `ninja install`
-# materialises the libraries. The artefact layout under
-# /usr/local/lib/cmake/Seastar is unchanged, so the project's
-# `find_package(Seastar QUIET)` still picks it up without any
-# source-side conditionals.
+# Dockerfile.base's Seastar layer except for one sed patch on Seastar's
+# CMakeLists before configure.
+#
+# WHY THE SED PATCH (and not a CMake option / configure.py flag):
+#   - Seastar exposes no `Seastar_USE_DEFAULT_ALLOCATOR` cache variable
+#     (verified against scylladb/seastar@master, 2026-05-13). The actual
+#     compile-time macro that gates `operator new`/`delete` in
+#     src/core/memory.cc is `SEASTAR_DEFAULT_ALLOCATOR`, applied as a
+#     `target_compile_definitions(seastar PUBLIC ...)` only when
+#     CMAKE_BUILD_TYPE is in the list `Debug;Sanitize;Fuzz`. Release
+#     builds (RelWithDebInfo) don't get it, and configure.py has no
+#     passthrough for arbitrary `-D` flags either.
+#   - We can't use `--mode=fuzz` (the obvious upstream-designed path):
+#     Seastar's Fuzz build type also wires `find_package(Sanitizers
+#     COMPONENTS fuzzer)` and links libseastar against
+#     `Sanitizers::fuzzer`, which is clang-only and embeds libFuzzer's
+#     `main()` — colliding with our harness's own libFuzzer main at
+#     link time.
+#   - We can't use `--mode=sanitize`: would instrument libseastar with
+#     ASan/UBSan everywhere, dropping fuzz throughput by ~5–10× for no
+#     gain (our harness already instruments its own code).
+#   - We can't inject `-DSEASTAR_DEFAULT_ALLOCATOR` via CXXFLAGS alone:
+#     that defines the macro for Seastar's own compilation, but doesn't
+#     populate the installed Seastar CMake config's
+#     INTERFACE_COMPILE_DEFINITIONS, so downstream `find_package(Seastar)`
+#     consumers (the Ranvier project, the fuzz harness) compile their
+#     own translation units without the macro — risking ODR violations
+#     against libseastar's compiled-in choice if any public Seastar
+#     header gates inlines or layouts on the macro.
+#
+# The surgical patch below adds `RelWithDebInfo` to the IN_LIST so the
+# existing PUBLIC propagation mechanism fires for our release build. We
+# get SEASTAR_DEFAULT_ALLOCATOR (the goal) plus SEASTAR_DEBUG (extra
+# runtime asserts in libseastar — minor overhead, occasionally catches
+# bugs during fuzzing) and SEASTAR_SHUFFLE_TASK_QUEUE (irrelevant; no
+# reactor running). Downstream consumers inherit the macro through
+# Seastar's installed CMake package, so `find_package(Seastar QUIET)`
+# in Ranvier's build picks it up automatically — no source-side
+# conditionals on this end either.
 #
 # Toolchain inherits from the parent ranvier-base (GCC). Downstream
 # fuzz/sanitize images install clang on top; clang-built harnesses link
@@ -104,6 +131,7 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
     cd seastar && \
     ./install-dependencies.sh && \
     dnf clean all && \
+    sed -i 's/IN_LIST:$<CONFIG>,Debug;Sanitize;Fuzz>/IN_LIST:$<CONFIG>,Debug;Sanitize;Fuzz;RelWithDebInfo>/g' CMakeLists.txt && \
     ./configure.py \
         --mode=release \
         --prefix=/usr/local \
@@ -111,7 +139,6 @@ RUN git clone --depth 1 https://github.com/scylladb/seastar.git && \
         --without-tests \
         --without-apps \
         --without-demos && \
-    cmake -B build/release -DSeastar_USE_DEFAULT_ALLOCATOR=ON && \
     ninja -j$(nproc) -C build/release install && \
     cd /tmp && \
     rm -rf seastar && \
