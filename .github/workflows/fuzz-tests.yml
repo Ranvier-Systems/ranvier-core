@@ -171,8 +171,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Driver=docker (not the default docker-container driver) so the
+      # two chained buildx builds below share the runner's local docker
+      # image store — the fuzz build's `FROM ranvier-base-default-alloc`
+      # has to resolve against the base image we just built one step
+      # earlier, and docker-container driver buildx instances can't see
+      # the local daemon's images (they'd default to docker.io lookup).
+      # Trade-off: the docker driver does not support `cache-to: type=gha`,
+      # so the ~30-min Seastar rebuild in Dockerfile.base.default-alloc
+      # is paid in full on every workflow_dispatch. Acceptable for a
+      # manual, bounded job; the proper fix is to publish
+      # ranvier-base-default-alloc to GHCR alongside ranvier-base so this
+      # job collapses to a single-stage build (same shape as the main
+      # fuzz-tests job above) — filed as a §18 P3 sub-bullet.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -182,8 +197,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Build the shared default-allocator base on top of the cached
-      # ranvier-base. The Seastar rebuild dominates first-build time
-      # (~30 min); subsequent runs hit the GHA layer cache.
+      # ranvier-base. ~30 min on first run; no inter-dispatch caching
+      # because of the docker-driver trade-off documented above.
       - name: Build default-allocator base image
         uses: docker/build-push-action@v6
         with:
@@ -191,17 +206,15 @@ jobs:
           file: ./Dockerfile.base.default-alloc
           load: true
           tags: ranvier-base-default-alloc:latest
-          cache-from: |
-            type=gha,scope=app-amd64
-            type=gha,scope=base-default-alloc
-          cache-to: type=gha,mode=max,scope=base-default-alloc
           build-args: |
             BASE_IMAGE=${{ env.BASE_IMAGE }}
 
       # Layer the fuzz toolchain (clang + compiler-rt + llvm + lld) on
       # top of the default-allocator base. Re-uses Dockerfile.fuzz
       # unchanged; the BASE_IMAGE build-arg is the only delta from the
-      # main fuzz-tests job.
+      # main fuzz-tests job. Resolves the FROM against the local docker
+      # daemon (loaded by the previous step) because of the docker
+      # driver — see "Set up Docker Buildx" above.
       - name: Build fuzz image on default-allocator base
         uses: docker/build-push-action@v6
         with:
@@ -209,10 +222,6 @@ jobs:
           file: ./Dockerfile.fuzz
           load: true
           tags: ranvier-fuzz-default-alloc:latest
-          cache-from: |
-            type=gha,scope=fuzz-tests
-            type=gha,scope=fuzz-tests-default-alloc
-          cache-to: type=gha,mode=max,scope=fuzz-tests-default-alloc
           build-args: |
             BASE_IMAGE=ranvier-base-default-alloc:latest
 
