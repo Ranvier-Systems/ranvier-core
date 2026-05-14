@@ -205,7 +205,12 @@ seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_a
         co_return;
     }
 
-    // For high fan-out broadcasts, use seastar::async to batch the crypto work
+    // For high fan-out broadcasts, use seastar::async to batch the crypto work.
+    //
+    // TODO(stack-cost): this seastar::async branch is not concurrency-bounded —
+    // _gossip_task_gate guards shutdown, not holder count. See BACKLOG.md §17
+    // "Bound concurrency on gossip broadcast async path" (P3) for the planned
+    // fix (with_semaphore or inline-fallback mirroring crypto_offloader.hpp).
     if (peers.size() > CRYPTO_OFFLOAD_PEER_THRESHOLD) {
         ++_crypto_batch_broadcasts;
         ++_crypto_ops_offloaded;
