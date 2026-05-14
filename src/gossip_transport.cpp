@@ -205,7 +205,17 @@ seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_a
         co_return;
     }
 
-    // For high fan-out broadcasts, use seastar::async to batch the crypto work
+    // For high fan-out broadcasts, use seastar::async to batch the crypto work.
+    //
+    // TODO(stack-cost): this seastar::async branch is not concurrency-bounded.
+    // Callers include per-request paths (cache eviction, route announcement)
+    // and _gossip_task_gate only guards shutdown, not holder count. At high
+    // request rates this can stack arbitrarily many seastar::thread instances
+    // (128 kB stack each, virtual). Practically self-limits today because the
+    // encrypt+send block is short, but unlike CryptoOffloader::max_queue_depth
+    // there is no explicit cap. Consider wrapping in with_semaphore (cap ~4-8)
+    // or adding an inline-fallback path mirroring crypto_offloader.hpp:284-310
+    // if production traffic ever shows it piling up.
     if (peers.size() > CRYPTO_OFFLOAD_PEER_THRESHOLD) {
         ++_crypto_batch_broadcasts;
         ++_crypto_ops_offloaded;
