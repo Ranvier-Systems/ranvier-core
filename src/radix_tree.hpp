@@ -435,12 +435,21 @@ public:
     // The DumpNode struct below contains a `vector<pair<uint8_t, DumpNode>>`,
     // a self-referential type. C++17 explicitly allows incomplete types in
     // std::vector, but Clang + libstdc++ instantiates vector's destructor
-    // more eagerly than GCC + libstdc++ does and rejects this. The fuzz
-    // build (clang) compiles with -DRANVIER_FUZZING to skip the dump
-    // machinery — the harnesses only exercise insert/lookup, never dump().
-    // The proper fix (vector<pair<uint8_t, unique_ptr<DumpNode>>>) is
-    // tracked as a follow-up; until then, production builds (GCC) are
-    // unaffected.
+    // more eagerly than GCC + libstdc++ does: the first call site for
+    // `dump_node()` forces synthesis of DumpNode's implicit destructor
+    // before the struct's closing brace, which transitively asks
+    // libstdc++'s `is_destructible` trait to inspect an incomplete
+    // DumpNode (via `pair<uint8_t, DumpNode>`'s implicit-default
+    // constructibility check). To defer that chain past the closing
+    // brace we user-declare `~DumpNode()` here and define it out-of-line
+    // as `= default` after RadixTree's body — at that point DumpNode is
+    // complete, the trait succeeds, and the vector's destructor
+    // instantiates cleanly on both clang+libstdc++ and gcc+libstdc++.
+    // The user-declared destructor does not disqualify aggregate
+    // initialisation in C++20, so existing aggregate-init call sites
+    // (e.g. `DumpNode{"empty", {}, std::nullopt, "LOCAL", 0, {}}`)
+    // continue to compile unchanged. The `#ifndef RANVIER_FUZZING`
+    // guard remains because the fuzz harnesses don't exercise dump().
 #ifndef RANVIER_FUZZING
 
     // Represents a node in the serialized tree structure.
@@ -458,6 +467,10 @@ public:
         std::string origin;                  // "LOCAL" or "REMOTE"
         int64_t last_accessed_ms;            // Milliseconds since epoch
         std::vector<std::pair<uint8_t, DumpNode>> children;  // Edge key is a raw byte
+
+        // User-declared destructor; defined `= default` out-of-line below
+        // RadixTree's closing brace. See comment block above for why.
+        ~DumpNode();
     };
 
     // Dump the entire tree structure for inspection
@@ -1969,5 +1982,13 @@ private:
         return n48_ptr;
     }
 };
+
+// Out-of-line destructor for RadixTree::DumpNode. At this point DumpNode
+// is a complete type, so libstdc++'s `is_destructible` trait evaluation
+// for `std::vector<std::pair<uint8_t, DumpNode>>::~vector` succeeds on
+// clang+libstdc++. See the comment block above the DumpNode definition.
+#ifndef RANVIER_FUZZING
+inline RadixTree::DumpNode::~DumpNode() = default;
+#endif
 
 } // namespace ranvier
