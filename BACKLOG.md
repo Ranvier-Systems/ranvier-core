@@ -29,6 +29,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 16. [KV-Cache Compression-Aware Routing (2026-04-05)](#16-kv-cache-compression-aware-routing-2026-04-05)
 17. [Hard Rules Audit Follow-ups (2026-05-05)](#17-hard-rules-audit-follow-ups-2026-05-05)
 18. [Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)](#18-request-lifecycle-crash-risk-audit-follow-ups-2026-05-08)
+19. [Heterogeneous Backend Support (2026-05-16)](#19-heterogeneous-backend-support-2026-05-16)
 
 ---
 
@@ -1132,6 +1133,74 @@ The following findings from the original audit were re-read against current sour
 - **LOWs from 2026-05-10 audit re-run (defensive only, no action required):**
   - **S3** (`src/sqlite_persistence.cpp:362-367`) — `save_routes_batch()` returns plain `bool` for any `sqlite3_step()` failure; `SQLITE_FULL` / `SQLITE_IOERR_*` cannot be distinguished from transient `SQLITE_BUSY`. Not a crash (rollback keeps the table consistent and route writes are best-effort) but disk-full silently drops every subsequent batch. Defensive fix would branch on the rc and emit distinct metrics. LOW.
   - **S4** (`src/local_discovery.cpp:328`, `src/local_discovery.hpp:86`) — `_next_backend_id` is `int32_t` (alias `BackendId`) starting at 10000 and incremented per discovered backend. Signed-int overflow at 2^31 is UB but requires ~2.1B churns over the process lifetime; the `MAX_KNOWN_BACKENDS = 64` cap bounds concurrent membership but not the monotonic counter. Realistically unreachable; recorded for completeness. LOW.
+
+---
+
+## 19. Heterogeneous Backend Support (2026-05-16)
+
+> **Context.** Today every Ranvier-supported backend (vLLM, SGLang, TensorRT-LLM, Ollama, LM Studio) is a GPU-based engine with a KV cache that benefits from prefix-affinity routing. Non-GPU inference providers — most prominently **Cerebras** (wafer-scale, model in 44 GB on-chip SRAM, no GPU KV-cache thrashing problem) — are OpenAI-compatible endpoints where prefix routing earns nothing but the rest of Ranvier's L7 plumbing (rate limiting, agent priorities, circuit breaking, fair scheduling) still applies. Enabling Ranvier as the unified control plane over a **mixed GPU + non-GPU fleet** is the strongest strategic angle; the code investigation on 2026-05-16 confirmed the existing `BackendInfo` struct already grew this way for `supports_token_ids` and `compression_ratio`, so the delta is mechanical.
+>
+> **Status.** Speculative — no design partner yet. Tracked here so the scoping work isn't lost. Do not start implementation without a customer commitment or a strategic decision to ship as a forward-looking capability.
+>
+> **Reference design notes.** Routing-mode (`PREFIX`/`HASH`/`RANDOM`) stays a cluster-wide setting; backend type is a per-backend property. The two are orthogonal — a heterogeneous fleet runs `PREFIX` globally and uses a per-backend predicate to suppress route learning on backends where prefix affinity is a no-op. Total estimated scope is **3–5 days** for a working hybrid setup with cheap-path metrics; the original scoping pass landed at 1.5–2 weeks before the predicate-only design reduced Phase 2 from ~3 days to ~half a day.
+
+### 19.1 Backend type tag
+
+- [ ] **[P3] Add `BackendType` enum threaded through the backend lifecycle**
+  _Context:_ Per-backend type is needed to gate type-specific behaviour (route learning, metrics scraping, request-body rewriting). The `BackendInfo` struct (`src/router_service.cpp:75,94`) is already a flat aggregate that grew this way for `supports_token_ids` (`backend_registry.hpp:35`) and `compression_ratio` (`router_service.hpp:340`); the addition follows that established pattern.
+  _Approach:_ Add `enum class BackendType { VLLM, SGLANG, TRT_LLM, OLLAMA, LM_STUDIO, CEREBRAS, OPENAI_COMPATIBLE }` to `src/types.hpp`. Thread one new field through the established 6 sites: (1) `BackendInfo` struct + constructor at `src/router_service.cpp:75,94`, (2) `BackendRegistry::register_backend_global()` at `src/backend_registry.hpp:33`, (3) `RouterService::register_backend_global()` override + impl at `src/router_service.hpp:337-340` and `src/router_service.cpp:3553-3585` (extend the `do_with` shared-vars dance), (4) `BackendState` admin DTO at `src/router_service.hpp:375-386`, (5) `register_backend_for_testing()` at `src/router_service.hpp:569-572`, (6) admin POST handler + JSON response at `src/http_controller.cpp:2343-2515,3039`. Add accessor `BackendType backend_type(BackendId)` mirroring `backend_supports_token_ids()` at `src/router_service.cpp:2117`. All existing callers default to `VLLM` for backward compatibility. Auto-set `supports_token_ids = false` for `CEREBRAS`/`OPENAI_COMPATIBLE` so the existing `strip_prompt_token_ids()` path activates without per-deployment config.
+  _Location:_ `src/types.hpp`, `src/backend_registry.hpp`, `src/router_service.{hpp,cpp}`, `src/http_controller.cpp`
+  _Complexity:_ Low (1–2 days; mechanical, follows existing pattern)
+
+- [ ] **[P3] SQLite schema migration for `backend_type` column**
+  _Context:_ Persisted backends are replayed on startup via `application.cpp:483`. Adding the type column requires a forward-compatible migration so existing rows default to `vllm`.
+  _Approach:_ `ALTER TABLE backends ADD COLUMN backend_type TEXT NOT NULL DEFAULT 'vllm'` in `src/sqlite_persistence.cpp`. Update the row-to-`BackendRecord` mapping and the insert path to round-trip the new column. Tag the migration with a schema version bump if the persistence layer tracks one.
+  _Location:_ `src/sqlite_persistence.cpp`, `src/application.cpp:483`
+  _Complexity:_ Low
+  _Dependencies:_ 19.1 (enum must exist first)
+
+### 19.2 Route-learning gate predicate
+
+- [ ] **[P3] Suppress ART route learning on non-cacheable backend types**
+  _Context:_ The investigation on 2026-05-16 collapsed what was originally framed as "per-backend routing-mode override" into a single predicate at the learning sites. The lookup path stays untouched — if a route exists, use it. We just don't create new ART entries pointing at backends where prefix affinity earns nothing (Cerebras keeps the whole model in SRAM; there is no GPU KV cache to optimize for).
+  _Approach:_ Add `bool should_cache_routes_for(BackendId) const` to `RouterService`, returning `false` when the backend's type is in the no-cache set (initially just `CEREBRAS`; extend as more backend types are added). Gate at two call sites: (1) local proxy-success learning at `src/http_controller.cpp:981` — combine with the existing `_config.should_learn_routes()` check, (2) gossip-received route ingress at `src/router_service.cpp:1372` — skip the `learn_route_remote()` call when the local backend is non-cacheable. Hash fallback and ART lookup both remain unchanged: if hash converges a prefix to a Cerebras backend, that's a correct routing decision; if an existing ART entry happens to point at one, accept it.
+  _Location:_ `src/router_service.{hpp,cpp}`, `src/http_controller.cpp:981`, `src/router_service.cpp:1372`
+  _Complexity:_ Low (~half a day; ~10 LOC predicate + 2 call-site gates)
+  _Dependencies:_ 19.1
+
+### 19.3 Metrics opt-out for non-vLLM backends
+
+- [ ] **[P3] Skip vLLM `/metrics` scrape for non-vLLM backend types**
+  _Context:_ `src/vllm_metrics.hpp` is tightly coupled to vLLM's Prometheus exposition format. Cerebras has no equivalent endpoint. Two paths exist: (a) cheap — opt non-vLLM backends out of the scrape entirely and let `get_backend_load_score()` return `0.0` (the existing optimistic default at `src/router_service.hpp:419-422`), losing load-aware routing on those backends; (b) right — abstract `VLLMMetrics` into a `BackendMetrics` interface with a Cerebras adapter. Cerebras's whole pitch is no queueing, so load signals matter less; the cheap path is appropriate for v1.
+  _Approach:_ In the `HealthService` scrape loop, check `backend_type(id)` before issuing the `/metrics` GET. Skip non-vLLM types. The existing `get_backend_load_score()` default of `0.0` already handles the missing-data case correctly. Document the loss of load-aware routing on these backends. Defer the `BackendMetrics` abstraction until a customer asks for it.
+  _Location:_ `src/health_service.cpp`, `src/vllm_metrics.hpp`
+  _Complexity:_ Low (~half a day)
+  _Dependencies:_ 19.1
+
+### 19.4 Static-config Cerebras backends
+
+- [ ] **[P3] YAML schema for remote-API backends (Cerebras and OpenAI-compatible)**
+  _Context:_ Cerebras is a remote API endpoint, not a local port or a K8s service. The existing discovery paths (`src/local_discovery.cpp:330` for port scans, `src/k8s_discovery_service.cpp` for cluster) don't fit. Static YAML config is the fastest way to register a remote backend with API key + base URL.
+  _Approach:_ Extend the backends YAML schema to accept a `type:` field (default `vllm`) plus an optional `api_key_env:` for secret reference. The startup registration path at `src/application.cpp:546` already calls `register_backend_global()`; thread the new `type` argument through (depends on 19.1). For API-key auth: inject the `Authorization: Bearer` header at the proxy step in `src/http_controller.cpp` for backends with a key configured. Treat the API key as the credential boundary — do not log it.
+  _Location:_ `src/config_loader.cpp`, `src/config_schema.hpp`, `src/application.cpp:546`, `src/http_controller.cpp`
+  _Complexity:_ Low (~1 day)
+  _Dependencies:_ 19.1
+
+- [ ] **[P3] K8s annotation for backend type (follow-up)**
+  _Context:_ Operator-friendly alternative to YAML config. The K8s discovery path already reads `ranvier.io/*` annotations on EndpointSlices.
+  _Approach:_ Recognize `ranvier.io/backend-type: cerebras` and `ranvier.io/api-key-secret-ref: <secret-name>` in `src/k8s_discovery_service.cpp`. Resolve the secret via the existing K8s client. Falls back to `vllm` when absent.
+  _Location:_ `src/k8s_discovery_service.cpp`
+  _Complexity:_ Low (~1 day)
+  _Dependencies:_ 19.1, 19.4 (reuse the auth-header injection from 19.4)
+
+### 19.5 Documentation
+
+- [ ] **[P3] Document hybrid-fleet operating model**
+  _Context:_ The marketing/positioning story for hybrid fleets is the actual deliverable — the engineering changes are small. Without docs that clearly state "prefix-affinity routing is a no-op on Cerebras backends; we still give you rate limiting / circuit breaking / fair scheduling," operators will set up the wrong expectations.
+  _Approach:_ Add a section to `docs/internals/prefix-affinity-routing.md` describing which backend types benefit from ART learning and which don't. Add a top-level "Hybrid fleets" page (or section) walking through a representative GPU + Cerebras config. Note explicitly that benchmarks should not credit Ranvier with the "48% faster TTFT" headline on non-cacheable backends.
+  _Location:_ `docs/internals/prefix-affinity-routing.md`, new doc page
+  _Complexity:_ Low
+  _Dependencies:_ 19.1, 19.2, 19.4
 
 ---
 
