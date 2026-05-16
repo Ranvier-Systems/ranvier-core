@@ -23,14 +23,3 @@
 # every fuzz input that triggers any Stack::Push before the first
 # allocation.
 pointer-overflow:*rapidjson*
-
-# Abseil raw_hash_set (the SwissTable backing absl::flat_hash_map et al)
-# constructs end() iterators by reading `*generation_ptr` even when
-# `generation_ptr` is null — which it is for unallocated control byte
-# arrays (e.g. .find() on a freshly constructed empty map). The loaded
-# value is never used because end iterators are only compared for
-# equality. Surfaced by §18 P2 sanitised suite on
-# `TokenizationCacheTextLengthTest.LongTextIsNotCached` via
-# `tokenizer_service.cpp:25`. Not present in newer Abseil; our pinned
-# version (lts_20230802) predates the fix.
-null:*raw_hash_set*
