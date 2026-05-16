@@ -24,6 +24,29 @@
 # Apple Silicon) are aarch64. ASan/UBSan can surface different bugs on
 # different ABIs (alignment, integer-cast behaviour); a "passes locally,
 # fails in CI" finding is real signal, not a configuration issue.
+#
+# Default-allocator base image: the first empirical run of this workflow
+# crashed inside CTest's `gtest_discover_tests` on
+# `cross_shard_exception_propagation_test` with `munmap_chunk(): invalid
+# pointer` deep in `libhwloc.so.15` — same Seastar-allocator / no-reactor
+# root cause as `stream_parser_fuzz` (Seastar's per-shard allocator
+# overrides global `new`/`delete`, the test binary is invoked at build
+# time under `--gtest_list_tests` without a running reactor, allocator
+# misbehaves). The §18 P3 closure ships the unblock as a shared
+# `Dockerfile.base.default-alloc` that rebuilds Seastar with the
+# `SEASTAR_DEFAULT_ALLOCATOR` macro propagated through the upstream
+# `PUBLIC` compile definitions. This workflow therefore chains two
+# buildx steps — base, then sanitize `FROM ranvier-base-default-alloc` —
+# mirroring the `stream-parser-fuzz-default-alloc` job in
+# `fuzz-tests.yml`. `driver: docker` is required so the second step can
+# resolve the locally-loaded base image; the trade-off is that the
+# docker driver does not support `cache-to: type=gha`, so the ~30-min
+# Seastar rebuild in the default-alloc base is paid in full on every
+# dispatch. Acceptable for a non-gating, manual/post-publish workflow.
+# When `ranvier-base-default-alloc` is published to GHCR alongside
+# `ranvier-base` (§18 P3 "Still pending" follow-up — same spinoff that
+# would benefit the `stream-parser-fuzz-default-alloc` job), this
+# workflow collapses back to a single-stage build with full GHA caching.
 name: Sanitizer Tests
 
 on:
@@ -43,7 +66,11 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Generous: the first Seastar rebuild in the default-alloc base is
+    # ~30 min (no cross-dispatch caching under the docker driver — see
+    # the top-of-file note); on subsequent layer-cache hits the job is
+    # bounded by the sanitised unit-test run.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: read
@@ -52,8 +79,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Driver=docker (not the default docker-container driver) so the
+      # two chained buildx builds below share the runner's local docker
+      # image store — the sanitize build's `FROM ranvier-base-default-alloc`
+      # has to resolve against the base image we just built one step
+      # earlier, and docker-container driver buildx instances can't see
+      # the local daemon's images (they'd default to docker.io lookup).
+      # Trade-off: the docker driver does not support `cache-to: type=gha`,
+      # so the Seastar rebuild in Dockerfile.base.default-alloc is paid in
+      # full on every dispatch. Mirrors the `stream-parser-fuzz-default-alloc`
+      # job in `fuzz-tests.yml`; the proper fix is the §18 P3 GHCR-publish
+      # spinoff, which would let both jobs pull the pre-built base.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -62,22 +102,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the sanitizer image from Dockerfile.sanitize (clang +
-      # compiler-rt + llvm + lld layered on the cached base image).
-      # Reuses GHA build cache so subsequent runs are layer-cache hits.
-      - name: Build sanitizer image
+      # Build the shared default-allocator base on top of the cached
+      # ranvier-base. ~30 min on first run; no inter-dispatch caching
+      # because of the docker-driver trade-off documented above.
+      - name: Build default-allocator base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.base.default-alloc
+          load: true
+          tags: ranvier-base-default-alloc:latest
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+
+      # Layer the sanitizer toolchain (clang + compiler-rt + llvm + lld)
+      # on top of the default-allocator base. Re-uses Dockerfile.sanitize
+      # unchanged; the BASE_IMAGE build-arg is the only delta from the
+      # original single-stage shape. Resolves the FROM against the local
+      # docker daemon (loaded by the previous step) because of the docker
+      # driver — see "Set up Docker Buildx" above. No cache-from/cache-to
+      # here: the docker driver does not support `type=gha`.
+      - name: Build sanitizer image on default-allocator base
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.sanitize
           load: true
           tags: ranvier-sanitize:latest
-          cache-from: |
-            type=gha,scope=app-amd64
-            type=gha,scope=sanitizer-tests
-          cache-to: type=gha,mode=max,scope=sanitizer-tests
           build-args: |
-            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            BASE_IMAGE=ranvier-base-default-alloc:latest
 
       - name: Run unit tests under ASan/UBSan
         id: sanitize
