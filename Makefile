@@ -208,9 +208,14 @@ sanitize-build:
 
 sanitize-test: sanitize-build
 	@echo "Running unit tests under ASan/UBSan..."
+	# --timeout 60: any individual test that runs >60s under the
+	# sanitiser is treated as a fail rather than left to hang the
+	# whole suite. Sanitised tests carry ~2-5x overhead, so this is
+	# generous for unit tests (which target sub-second runtimes
+	# unsanitised) while still catching deadlocks under ASan/UBSan.
 	@cd $(SANITIZE_BUILD_DIR) && \
 	    UBSAN_OPTIONS="$(SANITIZE_UBSAN_OPTIONS)" \
-	    ctest --output-on-failure
+	    ctest --output-on-failure --timeout 60
 
 sanitize-clean:
 	@rm -rf $(SANITIZE_BUILD_DIR)
