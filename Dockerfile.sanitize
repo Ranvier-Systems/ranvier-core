@@ -63,6 +63,67 @@ RUN dnf install -y \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
+# Rebuild Abseil from the matching LTS tag with ASan + UBSan instrumentation,
+# installed under /usr/local so CMake's find_package(absl) discovers it ahead
+# of the GCC-built distro shared library at /usr/lib64.
+#
+# WHY THIS LAYER EXISTS
+# Abseil's raw_hash_set.h auto-defines ABSL_SWISSTABLE_ENABLE_GENERATIONS
+# whenever it detects ASan (lts_20230802 header lines 105-118). Under that
+# macro the CommonFieldsGenerationInfoEnabled path is selected; it initialises
+# generation_ from EmptyGeneration() (defined in raw_hash_set.cc) and
+# dereferences *generation_ on every operator[] / try_emplace / iterator
+# construct. EmptyGeneration() returns a pointer into a static array when its
+# OWN translation unit was compiled with the macro defined, and nullptr
+# otherwise. The Fedora abseil-cpp-devel package ships a library built
+# WITHOUT ASan, so its EmptyGeneration() takes the nullptr branch — and the
+# test binaries' ASan-compiled headers dereference that nullptr on the first
+# flat_hash_map touch. 326 of 2322 cases crashed under this single ABI
+# mismatch in the 2026-05-16 first-end-to-end sanitised run; see BACKLOG §18
+# P2 F2 for the full investigation, line-cited evidence chain, and trade-off
+# discussion (FetchContent alternative explicitly rejected as more invasive).
+#
+# Rebuilding Abseil with the same -fsanitize=address,undefined flags as the
+# consuming test code keeps the header / library views of the macro aligned
+# and restores the iterator-invalidation detection that the Enabled path is
+# designed to provide — that detection is the whole reason ASan auto-enables
+# generations in the first place.
+#
+# Pin ABSEIL_TAG to 20230802.0 (matching what Fedora 39 ships) to keep this
+# a pure instrumentation rebuild: no version drift, only the build flags
+# change. CMake's find_package(absl) prefers /usr/local over /usr in its
+# default CONFIG search order, and the test binaries pick up an absolute
+# RPATH to /usr/local/lib64 at link time, so the distro Abseil under
+# /usr/lib64 is shadowed at both compile and runtime without needing
+# dnf-removal (which would cascade-uninstall unrelated Fedora packages).
+#
+# Toolchain note: build with clang (matches the test binaries' compiler) so
+# the compiler-rt runtime versions agree. clang-built libabsl linked into
+# clang-built tests is the supported configuration; the GCC distro build of
+# libseastar in the parent image is unaffected because nothing here touches
+# /usr/lib64 or Seastar.
+ARG ABSEIL_TAG=20230802.0
+RUN cd /tmp \
+    && git clone --depth 1 --branch ${ABSEIL_TAG} \
+        https://github.com/abseil/abseil-cpp.git abseil-cpp \
+    && cmake -S abseil-cpp -B abseil-cpp/build -G Ninja \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_CXX_STANDARD=20 \
+        -DBUILD_SHARED_LIBS=ON \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DABSL_BUILD_TESTING=OFF \
+        -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+        -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+    && cmake --build abseil-cpp/build -j"$(nproc)" \
+    && cmake --install abseil-cpp/build \
+    && rm -rf /tmp/abseil-cpp \
+    && ldconfig
+
 # Make stack traces readable and force the run to halt on the first finding
 # rather than racing past it. detect_leaks=0 because Seastar's per-shard
 # allocator + LSan have not been validated together; LSan can be enabled
