@@ -7,26 +7,31 @@
 # path that the static audit could not confirm or refute.
 #
 # Triggers:
-#   - Manual via workflow_dispatch only.
+#   - After Docker Publish completes (post-merge to main, same shape as
+#     unit-tests.yml and fuzz-tests.yml).
+#   - Manual via workflow_dispatch (for ad-hoc investigation against any
+#     branch).
 #
-# This workflow does NOT run on PRs, does NOT run post-merge, and is NOT
-# a merge gate. The first few sanitised runs are expected to surface
-# noise — third-party library quirks, latent UB in vendored code, and
-# any genuine findings — that need triaging into separate tickets per
-# BACKLOG §18 closure plan rather than blocking unrelated PRs.
-# `continue-on-error: true` reflects that: the run uploads its log and
-# exits success-coded so the workflow remains visible without gating
-# the rest of CI.
+# This workflow does NOT run on PRs (each dispatch costs up to ~60 min of
+# `ubuntu-latest` runner time — see the cost note below — which is too
+# much for per-PR CI), but IS a post-merge gate: `continue-on-error: false`
+# on the sanitised ctest step means a regression in any of the 2322
+# sanitised unit tests fails the job and surfaces against the commit
+# that introduced it.
 #
-# Why manual-only (BACKLOG §18 P2 follow-up 7): each dispatch costs up
-# to ~60 min of `ubuntu-latest` runner time (the ~30-min Seastar rebuild
-# in the default-alloc base is paid in full every dispatch — see the
-# build-architecture note below), and the job is currently non-gating
-# while §18 P2 triage flushes out vendored-library UBSan noise commit
-# by commit. Automatic post-merge dispatch would burn quota without
-# adding merge-gating value. Once the suite is observed clean,
-# `continue-on-error` flips to `false` AND the `workflow_run` post-merge
-# trigger is restored as a regression-catcher.
+# Gating-posture history (BACKLOG §18 P2): the workflow was non-gating
+# (`continue-on-error: true`, `workflow_dispatch`-only) through follow-ups
+# 1–8 while the initial sanitised findings were triaged into sub-tickets
+# F1 (PersistenceTest empty-span memcpy → fixed in #492), F2 (Abseil
+# raw_hash_set ASan ABI mismatch → fixed in #493 by rebuilding Abseil
+# under sanitisers in `Dockerfile.sanitize`) and F3 (RateLimiter wall-clock
+# refill flake → fixed in #495 by switching the test to TestClock). F3
+# was the last residual; the suite was observed clean on 2026-05-16
+# (2322/2322 pass, 44.16 sec wall-clock) on the F3 branch dispatch, and
+# gating is restored in this commit. Each dispatch still costs ~60 min
+# due to the ~30-min Seastar rebuild in the default-alloc base — the §18
+# P3 GHCR-publish spinoff would collapse this to a pull-and-test job
+# and drop the per-dispatch cost to a few minutes.
 #
 # Architecture note: GitHub-hosted runners are x86_64; local runs (e.g.
 # Apple Silicon) are aarch64. ASan/UBSan can surface different bugs on
@@ -58,7 +63,25 @@
 name: Sanitizer Tests
 
 on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
   workflow_dispatch:
+
+# A fast burst of merges to main produces one Docker Publish run per merge
+# and therefore one sanitizer-tests run per merge. At ~15 min cache-warm
+# (~60 min worst-case on a base-image rebuild), that adds up. Cancel any
+# in-progress run on the same ref when a newer one queues: the latest
+# commit's sanitiser includes every prior commit's changes anyway, so a
+# pass on the latest covers everything up to it, and a fail localises to
+# the most recent merge batch. Trade-off: if commit A regresses and commit
+# B lands before A's sanitiser finishes, A's run is cancelled and the
+# regression first surfaces against B — bisection scope is the A→B
+# interval. Standard cancel-in-progress posture for shared-branch CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -66,6 +89,9 @@ env:
 
 jobs:
   sanitizer-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     # Generous: the first Seastar rebuild in the default-alloc base is
     # ~30 min (no cross-dispatch caching under the docker driver — see
@@ -134,8 +160,6 @@ jobs:
             BASE_IMAGE=ranvier-base-default-alloc:latest
 
       - name: Run unit tests under ASan/UBSan
-        id: sanitize
-        continue-on-error: true
         run: |
           mkdir -p sanitize-results
           docker run --rm \
@@ -145,9 +169,6 @@ jobs:
             make sanitize-test \
             2>&1 | tee sanitize-results/sanitize.log
 
-          SAN_EXIT=${PIPESTATUS[0]}
-          echo "sanitize_exit_code=$SAN_EXIT" >> $GITHUB_OUTPUT
-
       - name: Upload sanitizer log
         uses: actions/upload-artifact@v4
         if: always()
@@ -155,15 +176,3 @@ jobs:
           name: sanitizer-results
           path: sanitize-results/sanitize.log
           retention-days: 30
-
-      # Surface the result without failing the workflow. Once the initial
-      # batch of findings is triaged, drop continue-on-error above and
-      # delete this annotation step so a regression fails the job.
-      - name: Annotate sanitizer outcome
-        if: always()
-        run: |
-          if [ "${{ steps.sanitize.outputs.sanitize_exit_code }}" = "0" ]; then
-            echo "::notice::Sanitizer run passed."
-          else
-            echo "::warning::Sanitizer run reported findings (exit ${{ steps.sanitize.outputs.sanitize_exit_code }}). See uploaded log; triage per BACKLOG §18."
-          fi
