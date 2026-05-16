@@ -1215,25 +1215,30 @@ if(RANVIER_BUILD_SANITIZED)
             "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++.")
     endif()
 
-    # halt_on_error is set via UBSAN_OPTIONS at run time (see the sanitize-*
-    # Make targets); -fno-sanitize-recover makes UBSan abort on the first
-    # finding even when the env var is missed.
+    # UBSan policy: vendored libraries (RapidJSON, Abseil, ...) contain
+    # several UBSan-noisy idioms that aren't real bugs but that the
+    # compiler can't distinguish from a genuine finding. We rely on
+    # runtime suppressions in `tests/fuzz/ubsan-suppressions.txt` to
+    # filter the noise, and on `halt_on_error=1` in `UBSAN_OPTIONS`
+    # (set by `make sanitize-test` and the `sanitizer-tests.yml` job)
+    # to abort on every unsuppressed finding.
     #
-    # Exception: -fsanitize-recover=pointer-overflow re-enables the
-    # recoverable handler for pointer-overflow only, so the runtime
-    # suppression in tests/fuzz/ubsan-suppressions.txt
-    # (`pointer-overflow:*rapidjson*`) actually fires. Without this,
-    # libclang_rt emits the `__ubsan_handle_pointer_overflow_abort`
-    # variant which unconditionally aborts and never consults the
-    # suppression list — every JSON-parsing unit test would abort on
-    # RapidJSON's Stack::Reserve nullptr-plus-zero pattern before any
-    # real finding could surface. Every other UBSan check still aborts
-    # on first hit.
+    # We intentionally do NOT pass `-fno-sanitize-recover=undefined`:
+    # that flag makes the compiler emit `__ubsan_handle_*_abort`
+    # variants which unconditionally `abort()` without consulting the
+    # runtime suppression list, so any vendored-library noise becomes
+    # un-suppressible and masks the real findings underneath. With the
+    # recoverable handlers, suppressions fire as intended and
+    # `halt_on_error=1` provides the abort-on-first-real-finding
+    # behaviour that the no-recover flag was meant to belt-and-suspender.
+    # Trade-off: running a sanitised test binary directly without
+    # `UBSAN_OPTIONS=halt_on_error=1` will print but not abort on real
+    # findings — every supported entry point (`make sanitize-test`,
+    # `sanitizer-tests.yml`) sets the env var, so this only bites
+    # ad-hoc invocations of the raw binary.
     set(_san_flags
         -fsanitize=address,undefined
-        -fno-omit-frame-pointer
-        -fno-sanitize-recover=undefined
-        -fsanitize-recover=pointer-overflow)
+        -fno-omit-frame-pointer)
 
     # _ranvier_all_targets was captured above for the unit_tests aggregate
     # and lists every directly-defined target at that point — including all

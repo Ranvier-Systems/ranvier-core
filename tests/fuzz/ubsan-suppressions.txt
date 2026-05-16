@@ -1,9 +1,14 @@
-# UBSan suppressions for fuzz harnesses.
+# UBSan suppressions for the fuzz harnesses and the §18 P2 sanitised
+# unit-test suite (Makefile target `sanitize-test`).
 #
 # UBSan flags certain technically-undefined-but-effectively-harmless
 # patterns in third-party code that we vendor. We suppress those so the
-# fuzzer doesn't drown in noise; every other UBSan check remains active
-# and will halt the run on a real Ranvier bug.
+# suite doesn't drown in noise; every other UBSan check remains active
+# and will halt the run on a real Ranvier bug via `halt_on_error=1` in
+# `UBSAN_OPTIONS` (set by both `make fuzz-*` and `make sanitize-test`).
+# See `CMakeLists.txt`'s `_san_flags` block for why we deliberately do
+# *not* pass `-fno-sanitize-recover=undefined` — that flag would defeat
+# this suppression file by emitting the `_abort` handler variants.
 #
 # Each line is `<check>:<source-or-symbol-pattern>`. See the LLVM docs
 # at https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#runtime-suppressions
@@ -18,3 +23,14 @@
 # every fuzz input that triggers any Stack::Push before the first
 # allocation.
 pointer-overflow:*rapidjson*
+
+# Abseil raw_hash_set (the SwissTable backing absl::flat_hash_map et al)
+# constructs end() iterators by reading `*generation_ptr` even when
+# `generation_ptr` is null — which it is for unallocated control byte
+# arrays (e.g. .find() on a freshly constructed empty map). The loaded
+# value is never used because end iterators are only compared for
+# equality. Surfaced by §18 P2 sanitised suite on
+# `TokenizationCacheTextLengthTest.LongTextIsNotCached` via
+# `tokenizer_service.cpp:25`. Not present in newer Abseil; our pinned
+# version (lts_20230802) predates the fix.
+null:*raw_hash_set*
