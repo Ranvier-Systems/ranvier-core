@@ -184,6 +184,12 @@ std::vector<BackendRecord> SqlitePersistence::load_backends() {
 }
 
 std::vector<uint8_t> SqlitePersistence::serialize_tokens(std::span<const TokenId> tokens) {
+    // memcpy is declared nonnull on both args, so a zero-size call with
+    // tokens.data() == nullptr (the spec-mandated value for an empty span)
+    // is UB even though the operation is a no-op.
+    if (tokens.empty()) {
+        return {};
+    }
     std::vector<uint8_t> blob(tokens.size() * sizeof(TokenId));
     std::memcpy(blob.data(), tokens.data(), blob.size());
     return blob;
