@@ -1218,10 +1218,22 @@ if(RANVIER_BUILD_SANITIZED)
     # halt_on_error is set via UBSAN_OPTIONS at run time (see the sanitize-*
     # Make targets); -fno-sanitize-recover makes UBSan abort on the first
     # finding even when the env var is missed.
+    #
+    # Exception: -fsanitize-recover=pointer-overflow re-enables the
+    # recoverable handler for pointer-overflow only, so the runtime
+    # suppression in tests/fuzz/ubsan-suppressions.txt
+    # (`pointer-overflow:*rapidjson*`) actually fires. Without this,
+    # libclang_rt emits the `__ubsan_handle_pointer_overflow_abort`
+    # variant which unconditionally aborts and never consults the
+    # suppression list — every JSON-parsing unit test would abort on
+    # RapidJSON's Stack::Reserve nullptr-plus-zero pattern before any
+    # real finding could surface. Every other UBSan check still aborts
+    # on first hit.
     set(_san_flags
         -fsanitize=address,undefined
         -fno-omit-frame-pointer
-        -fno-sanitize-recover=undefined)
+        -fno-sanitize-recover=undefined
+        -fsanitize-recover=pointer-overflow)
 
     # _ranvier_all_targets was captured above for the unit_tests aggregate
     # and lists every directly-defined target at that point — including all
