@@ -432,23 +432,36 @@ public:
     // Tree Dump/Serialization for Admin API
     // =============================================================================
     //
-    // The DumpNode struct below contains a `vector<pair<uint8_t, DumpNode>>`,
-    // a self-referential type. C++17 explicitly allows incomplete types in
-    // std::vector, but Clang + libstdc++ instantiates vector's destructor
-    // more eagerly than GCC + libstdc++ does: the first call site for
-    // `dump_node()` forces synthesis of DumpNode's implicit destructor
-    // before the struct's closing brace, which transitively asks
-    // libstdc++'s `is_destructible` trait to inspect an incomplete
-    // DumpNode (via `pair<uint8_t, DumpNode>`'s implicit-default
-    // constructibility check). To defer that chain past the closing
-    // brace we user-declare `~DumpNode()` here and define it out-of-line
-    // as `= default` after RadixTree's body — at that point DumpNode is
-    // complete, the trait succeeds, and the vector's destructor
-    // instantiates cleanly on both clang+libstdc++ and gcc+libstdc++.
-    // The user-declared destructor does not disqualify aggregate
-    // initialisation in C++20, so existing aggregate-init call sites
-    // (e.g. `DumpNode{"empty", {}, std::nullopt, "LOCAL", 0, {}}`)
-    // continue to compile unchanged. The `#ifndef RANVIER_FUZZING`
+    // The DumpNode struct below is a self-referential type. C++17 explicitly
+    // allows incomplete types in `std::vector`, but clang + libstdc++
+    // instantiates vector's special members more eagerly than gcc + libstdc++
+    // does. With the natural shape `vector<pair<uint8_t, DumpNode>>`, two
+    // separate trait chains misfire on clang:
+    //   (1) the first `dump_node()` call site forces synthesis of DumpNode's
+    //       implicit destructor before the struct's closing brace, which
+    //       transitively asks libstdc++'s vector-destructor machinery for
+    //       `is_destructible<pair<uint8_t, DumpNode>>` on an incomplete
+    //       DumpNode;
+    //   (2) `optional<DumpNode>` construction inside `dump_with_prefix` then
+    //       instantiates DumpNode's implicit copy ctor, which fans into
+    //       vector's copy-ctor `__uninitialized_copy` → `_Destroy` trait
+    //       chain on the same incomplete pair.
+    // A user-declared destructor defers chain (1) past the closing brace but
+    // doesn't help chain (2). The canonical fix for both is to break the
+    // recursion through an indirection: `vector<pair<uint8_t,
+    // unique_ptr<DumpNode>>>`. The vector now contains pointers (sizeof
+    // known regardless of DumpNode's completeness), unique_ptr<DumpNode> is
+    // move-only so DumpNode's implicit copy ctor is *deleted* (never
+    // instantiated → chain (2) doesn't fire), and the vector's destructor
+    // chain bottoms out at unique_ptr's destructor which sees DumpNode
+    // complete at synthesis time (the closing brace). gcc + libstdc++
+    // continues to accept the change unchanged because nothing about the
+    // semantic shape moved — only the storage indirection.
+    //
+    // Cost: one heap allocation per child node when populating a dump
+    // (admin / cold path). Consumers iterate children via `child.second->...`
+    // or `*child.second`; aggregate-init call sites pass an empty children
+    // list as `{}` and are unaffected. The `#ifndef RANVIER_FUZZING`
     // guard remains because the fuzz harnesses don't exercise dump().
 #ifndef RANVIER_FUZZING
 
@@ -466,11 +479,10 @@ public:
         std::optional<BackendId> backend;    // Leaf value (if any)
         std::string origin;                  // "LOCAL" or "REMOTE"
         int64_t last_accessed_ms;            // Milliseconds since epoch
-        std::vector<std::pair<uint8_t, DumpNode>> children;  // Edge key is a raw byte
-
-        // User-declared destructor; defined `= default` out-of-line below
-        // RadixTree's closing brace. See comment block above for why.
-        ~DumpNode();
+        // Edge key is a raw byte; child stored via unique_ptr to break the
+        // recursion through vector's value-type trait machinery (see comment
+        // block above). Move-only by construction.
+        std::vector<std::pair<uint8_t, std::unique_ptr<DumpNode>>> children;
     };
 
     // Dump the entire tree structure for inspection
@@ -554,8 +566,11 @@ private:
             node->last_accessed.time_since_epoch()).count();
 
         // Collect children (edge keys are bytes in the byte-level tree).
+        // The child DumpNode is heap-allocated to break the recursion
+        // through vector's value-type trait machinery — see the comment
+        // block above the DumpNode struct definition.
         visit_children(node, [this, &result](uint8_t key, Node* child) {
-            result.children.emplace_back(key, dump_node(child));
+            result.children.emplace_back(key, std::make_unique<DumpNode>(dump_node(child)));
         });
 
         return result;
@@ -1982,13 +1997,5 @@ private:
         return n48_ptr;
     }
 };
-
-// Out-of-line destructor for RadixTree::DumpNode. At this point DumpNode
-// is a complete type, so libstdc++'s `is_destructible` trait evaluation
-// for `std::vector<std::pair<uint8_t, DumpNode>>::~vector` succeeds on
-// clang+libstdc++. See the comment block above the DumpNode definition.
-#ifndef RANVIER_FUZZING
-inline RadixTree::DumpNode::~DumpNode() = default;
-#endif
 
 } // namespace ranvier
