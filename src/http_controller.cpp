@@ -2864,7 +2864,7 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0) ss << ",\n";
             ss << inner_indent << "  {\"edge\": " << static_cast<unsigned>(node.children[i].first) << ", \"node\": ";
-            ss << dump_node_to_json(node.children[i].second, indent_level + 2, remaining_depth - 1);
+            ss << dump_node_to_json(*node.children[i].second, indent_level + 2, remaining_depth - 1);
             ss << "}";
         }
         ss << "\n" << inner_indent;

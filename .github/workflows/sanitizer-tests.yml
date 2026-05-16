@@ -7,18 +7,26 @@
 # path that the static audit could not confirm or refute.
 #
 # Triggers:
-#   - After Docker Publish completes (post-merge to main, same shape as
-#     unit-tests.yml and fuzz-tests.yml).
-#   - Manual via workflow_dispatch.
+#   - Manual via workflow_dispatch only.
 #
-# This workflow does NOT run on PRs and is NOT a merge gate. The first
-# few sanitised runs are expected to surface noise — third-party library
-# quirks, latent UB in vendored code, and any genuine findings — that
-# need triaging into separate tickets per BACKLOG §18 closure plan
-# rather than blocking unrelated PRs. `continue-on-error: true` reflects
-# that: the run uploads its log and exits success-coded so the workflow
-# remains visible without gating the rest of CI. Flip to `false` once
-# the initial findings are triaged and the suite is clean.
+# This workflow does NOT run on PRs, does NOT run post-merge, and is NOT
+# a merge gate. The first few sanitised runs are expected to surface
+# noise — third-party library quirks, latent UB in vendored code, and
+# any genuine findings — that need triaging into separate tickets per
+# BACKLOG §18 closure plan rather than blocking unrelated PRs.
+# `continue-on-error: true` reflects that: the run uploads its log and
+# exits success-coded so the workflow remains visible without gating
+# the rest of CI.
+#
+# Why manual-only (BACKLOG §18 P2 follow-up 7): each dispatch costs up
+# to ~60 min of `ubuntu-latest` runner time (the ~30-min Seastar rebuild
+# in the default-alloc base is paid in full every dispatch — see the
+# build-architecture note below), and the job is currently non-gating
+# while §18 P2 triage flushes out vendored-library UBSan noise commit
+# by commit. Automatic post-merge dispatch would burn quota without
+# adding merge-gating value. Once the suite is observed clean,
+# `continue-on-error` flips to `false` AND the `workflow_run` post-merge
+# trigger is restored as a regression-catcher.
 #
 # Architecture note: GitHub-hosted runners are x86_64; local runs (e.g.
 # Apple Silicon) are aarch64. ASan/UBSan can surface different bugs on
@@ -50,10 +58,6 @@
 name: Sanitizer Tests
 
 on:
-  workflow_run:
-    workflows: ["Docker Publish"]
-    types:
-      - completed
   workflow_dispatch:
 
 env:
@@ -62,9 +66,6 @@ env:
 
 jobs:
   sanitizer-tests:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     # Generous: the first Seastar rebuild in the default-alloc base is
     # ~30 min (no cross-dispatch caching under the docker driver — see
