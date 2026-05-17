@@ -1023,6 +1023,7 @@ if(Seastar_FOUND)
       tests/unit/tokenization_cache_test.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenization_cache_test
@@ -1057,6 +1058,7 @@ if(Seastar_FOUND)
       tests/unit/tokenizer_service_test.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_service_test
@@ -1129,6 +1131,7 @@ if(Seastar_FOUND)
       tests/unit/async_persistence_concurrency_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_concurrency_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src
@@ -1150,6 +1153,7 @@ if(Seastar_FOUND)
     add_executable(tokenizer_thread_pool_concurrency_test
       tests/unit/tokenizer_thread_pool_concurrency_test.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_concurrency_test
