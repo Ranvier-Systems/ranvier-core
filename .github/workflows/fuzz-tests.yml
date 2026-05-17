@@ -24,11 +24,12 @@
 # top via its BASE_IMAGE build-arg. See the
 # `fuzz-run-stream-parser-default-alloc` Make target and the
 # `stream-parser-fuzz-default-alloc` job below. Full diagnosis lives in
-# tests/fuzz/README.md "Caveats"; the unblock plan and remaining work
-# live in BACKLOG §18 "Unblock Seastar-dependent fuzzing". The same
-# base image also unblocks the §18 P2 ASan/UBSan sanitizer-tests
-# workflow (gtest_discover_tests crash); that switch lands separately
-# when the P2 ticket's "still pending" follow-up runs.
+# tests/fuzz/README.md "Caveats"; the remaining work (a multi-hour
+# fuzz pass to promote H10/M11/M12 to MITIGATED-BY-FUZZ) lives in
+# BACKLOG §18 P3 "Unblock Seastar-dependent fuzzing". The same base
+# image is consumed by the §18 P2 sanitizer-tests workflow; both
+# consumers pull it pre-built from GHCR per the §18 P3 GHCR-publish
+# spinoff (see `docker-base.yml`'s `build-base-default-alloc` job).
 #
 # Architecture note: GitHub-hosted runners are x86_64. Local fuzz runs
 # (e.g. on Apple Silicon) are aarch64. Different ABIs surface different
@@ -46,6 +47,11 @@ on:
 env:
   REGISTRY: ghcr.io
   BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
+  # Used by the stream-parser-fuzz-default-alloc job below; built and
+  # published by docker-base.yml's build-base-default-alloc job (§18 P3
+  # GHCR-publish spinoff). See that job and Dockerfile.base.default-alloc
+  # for the allocator rationale.
+  DEFAULT_ALLOC_BASE: ghcr.io/ranvier-systems/ranvier-base-default-alloc:latest
 
 jobs:
   fuzz-tests:
@@ -142,27 +148,28 @@ jobs:
   # ---------------------------------------------------------------------
   # stream_parser_fuzz, run inside a fuzz image stacked on the shared
   # Seastar default-allocator base (Dockerfile.base.default-alloc, layered
-  # under Dockerfile.fuzz via its BASE_IMAGE build-arg). The same base
-  # image also unblocks the §18 P2 sanitizer-tests workflow; switching
-  # that workflow over lands separately when the P2 ticket's "still
-  # pending" follow-up runs (this commit only wires the fuzz consumer).
+  # under Dockerfile.fuzz via its BASE_IMAGE build-arg). The default-alloc
+  # base is published to GHCR by docker-base.yml's
+  # build-base-default-alloc job (§18 P3 GHCR-publish spinoff); this job
+  # pulls the pre-built base and builds Dockerfile.fuzz on top in a
+  # single buildx step with full type=gha layer caching. Same shape as
+  # the §18 P2 sanitizer-tests workflow.
   #
   # Gated to workflow_dispatch only for now: the first run is manual so
   # the developer can eyeball the output before promoting H10/M11/M12 to
   # MITIGATED-BY-FUZZ. Once a multi-hour run is observed clean, flip the
   # trigger to mirror the main fuzz-tests job (workflow_run after
-  # "Docker Publish") and drop this gate. Mirrors the non-gating posture
-  # of sanitizer-tests.yml — this is intentionally a separate job (not
-  # workflow) so the corpus cache and image-build wiring stay co-located
-  # with the existing fuzz CI.
+  # "Docker Publish") and drop this gate. Intentionally a separate job
+  # (not workflow) so the corpus cache and image-build wiring stay
+  # co-located with the existing fuzz CI.
   # ---------------------------------------------------------------------
   stream-parser-fuzz-default-alloc:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # Generous: the first Seastar rebuild in the default-alloc base is
-    # ~30 min; on cache hits the job is bounded by FUZZ_CI_TIME (default
-    # 60s) plus link time.
-    timeout-minutes: 60
+    # Default-alloc base pulled pre-built from GHCR (~1-2 min), fuzz
+    # toolchain layered on top (~3-5 min cold, near-instant cache-warm);
+    # FUZZ_CI_TIME default 60s plus link time.
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
@@ -171,23 +178,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Driver=docker (not the default docker-container driver) so the
-      # two chained buildx builds below share the runner's local docker
-      # image store — the fuzz build's `FROM ranvier-base-default-alloc`
-      # has to resolve against the base image we just built one step
-      # earlier, and docker-container driver buildx instances can't see
-      # the local daemon's images (they'd default to docker.io lookup).
-      # Trade-off: the docker driver does not support `cache-to: type=gha`,
-      # so the ~30-min Seastar rebuild in Dockerfile.base.default-alloc
-      # is paid in full on every workflow_dispatch. Acceptable for a
-      # manual, bounded job; the proper fix is to publish
-      # ranvier-base-default-alloc to GHCR alongside ranvier-base so this
-      # job collapses to a single-stage build (same shape as the main
-      # fuzz-tests job above) — filed as a §18 P3 sub-bullet.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -196,34 +188,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the shared default-allocator base on top of the cached
-      # ranvier-base. ~30 min on first run; no inter-dispatch caching
-      # because of the docker-driver trade-off documented above.
-      - name: Build default-allocator base image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.base.default-alloc
-          load: true
-          tags: ranvier-base-default-alloc:latest
-          build-args: |
-            BASE_IMAGE=${{ env.BASE_IMAGE }}
-
-      # Layer the fuzz toolchain (clang + compiler-rt + llvm + lld) on
-      # top of the default-allocator base. Re-uses Dockerfile.fuzz
-      # unchanged; the BASE_IMAGE build-arg is the only delta from the
-      # main fuzz-tests job. Resolves the FROM against the local docker
-      # daemon (loaded by the previous step) because of the docker
-      # driver — see "Set up Docker Buildx" above.
-      - name: Build fuzz image on default-allocator base
+      # Single-stage build: layer the fuzz toolchain (clang + compiler-rt
+      # + llvm + lld) on top of the pre-published
+      # ranvier-base-default-alloc image from GHCR. The base itself is
+      # built by docker-base.yml's build-base-default-alloc job on every
+      # push to main (path-filtered to Dockerfile.base.default-alloc /
+      # Dockerfile.base / CMakeLists.txt / vcpkg.json), so this job never
+      # pays the ~30-min Seastar rebuild itself.
+      - name: Build fuzz image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.fuzz
           load: true
           tags: ranvier-fuzz-default-alloc:latest
+          cache-from: |
+            type=gha,scope=fuzz-tests-default-alloc
+          cache-to: type=gha,mode=max,scope=fuzz-tests-default-alloc
           build-args: |
-            BASE_IMAGE=ranvier-base-default-alloc:latest
+            BASE_IMAGE=${{ env.DEFAULT_ALLOC_BASE }}
 
       # Restore the stream_parser corpus separately from the main
       # fuzz-tests job — the harness has its own subdirectory and we
