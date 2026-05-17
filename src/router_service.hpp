@@ -399,6 +399,17 @@ public:
     // into the learning/scrape paths.
     BackendType backend_type(BackendId id) const;
 
+    // Whether ART route learning is worthwhile for this backend. Returns
+    // false when the backend's type is in the no-cache set (e.g. Cerebras
+    // keeps the whole model in on-chip SRAM, so prefix affinity earns
+    // nothing). Gates the learning sites only; the lookup path is
+    // unaffected — if a route already points at a non-cacheable backend
+    // we still honor it. Safe default for not-found is true: backend
+    // registration propagates across shards asynchronously, so a gossip
+    // route may legitimately arrive before this shard sees the backend;
+    // defaulting to false would silently drop those.
+    bool should_cache_routes_for(BackendId id) const;
+
     // Get tree dump for admin inspection (local shard only)
     RadixTree::DumpNode get_tree_dump() const;
 

@@ -523,6 +523,52 @@ TEST_F(RouterServiceTest, BackendTypeToStringRoundTrip) {
     }
 }
 
+// =============================================================================
+// should_cache_routes_for() — Route-Learning Gate Predicate
+// =============================================================================
+
+TEST_F(RouterServiceTest, ShouldCacheRoutesTrueForCacheableTypes) {
+    BackendId next_id = 1;
+    for (auto t : {BackendType::VLLM, BackendType::SGLANG, BackendType::TRT_LLM,
+                   BackendType::OLLAMA, BackendType::LM_STUDIO,
+                   BackendType::OPENAI_COMPATIBLE}) {
+        RouterService::register_backend_for_testing(next_id, make_addr("10.0.0.1", 8080),
+                                                     100, 0, false, 1.0, t);
+        EXPECT_TRUE(router_->should_cache_routes_for(next_id))
+            << "type=" << backend_type_to_string(t);
+        RouterService::unregister_backend_for_testing(next_id);
+        ++next_id;
+    }
+}
+
+TEST_F(RouterServiceTest, ShouldCacheRoutesFalseForCerebras) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    EXPECT_FALSE(router_->should_cache_routes_for(1));
+}
+
+TEST_F(RouterServiceTest, ShouldCacheRoutesTrueForMissingBackend) {
+    // Safe default: missing backend means downstream learn_route_global
+    // will reject the call; we don't pre-empt that with a silent skip.
+    EXPECT_TRUE(router_->should_cache_routes_for(999));
+}
+
+TEST_F(RouterServiceTest, LookupHonorsExistingCerebrasRoute) {
+    // The gate suppresses *new* ART learning on Cerebras backends; it
+    // does not retroactively delete or hide existing entries. If an
+    // entry already exists (e.g. inserted via the admin POST route,
+    // which is intentionally ungated as an operator command), lookup
+    // still returns it.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->lookup(tokens);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 1);
+}
+
 TEST_F(RouterServiceTest, UnregisterClearsDeadStatus) {
     RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
     RouterService::mark_backend_dead_for_testing(1);

@@ -1049,12 +1049,13 @@ audit doc.
 
 ### 19.2 Route-learning gate predicate
 
-- [ ] **[P3] Suppress ART route learning on non-cacheable backend types**
+- [x] **[P3] Suppress ART route learning on non-cacheable backend types**
   _Context:_ The investigation on 2026-05-16 collapsed what was originally framed as "per-backend routing-mode override" into a single predicate at the learning sites. The lookup path stays untouched — if a route exists, use it. We just don't create new ART entries pointing at backends where prefix affinity earns nothing (Cerebras keeps the whole model in SRAM; there is no GPU KV cache to optimize for).
   _Approach:_ Add `bool should_cache_routes_for(BackendId) const` to `RouterService`, returning `false` when the backend's type is in the no-cache set (initially just `CEREBRAS`; extend as more backend types are added). Gate at two call sites: (1) local proxy-success learning at `src/http_controller.cpp:981` — combine with the existing `_config.should_learn_routes()` check, (2) gossip-received route ingress at `src/router_service.cpp:1372` — skip the `learn_route_remote()` call when the local backend is non-cacheable. Hash fallback and ART lookup both remain unchanged: if hash converges a prefix to a Cerebras backend, that's a correct routing decision; if an existing ART entry happens to point at one, accept it.
   _Location:_ `src/router_service.{hpp,cpp}`, `src/http_controller.cpp:981`, `src/router_service.cpp:1372`
   _Complexity:_ Low (~half a day; ~10 LOC predicate + 2 call-site gates)
   _Dependencies:_ 19.1
+  _Completed 2026-05-17 (a421a55):_ `should_cache_routes_for(BackendId)` added to `RouterService` next to `backend_type()`. No-cache set is exactly `{CEREBRAS}` for v1; `OPENAI_COMPATIBLE` deliberately stays cacheable until §19.4 lets operators opt out per-deployment. Gated at both call sites: outer `if` in `stream_backend_response` (single- and multi-depth share the same branch) and the gossip `set_route_learn_callback` lambda (skip returns `make_ready_future<>()`, no throw). Lookup path untouched — pre-existing ART entries pointing at Cerebras backends still resolve. Safe default for not-found is `true` (let `learn_route_global()` produce the canonical error downstream). Unit tests cover the predicate truth table across all seven `BackendType` values, the missing-backend default, and lookup of an existing Cerebras route.
 
 ### 19.3 Metrics opt-out for non-vLLM backends
 

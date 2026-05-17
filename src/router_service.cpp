@@ -1374,8 +1374,15 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                            "Set self_backend_id to this node's backend ID for proper cluster drain.");
         }
 
-        // Set up callback to handle incoming route announcements
+        // Set up callback to handle incoming route announcements.
+        // Drop routes targeting non-cacheable backends: a peer may broadcast
+        // routes pointing at e.g. a Cerebras node in its cluster, but our
+        // local ART would never produce a useful cache hit from such an
+        // entry.
         _gossip->set_route_learn_callback([this](std::vector<TokenId> tokens, BackendId backend) {
+            if (!should_cache_routes_for(backend)) {
+                return seastar::make_ready_future<>();
+            }
             return learn_route_remote(std::move(tokens), backend);
         });
 
@@ -2142,6 +2149,23 @@ BackendType RouterService::backend_type(BackendId id) const {
     // Backend not found — VLLM is the historical default and matches the
     // assumption baked into existing learning/scrape paths.
     return BackendType::VLLM;
+}
+
+bool RouterService::should_cache_routes_for(BackendId id) const {
+    // Safe default true: backend registration propagates across shards
+    // asynchronously, so a gossip-delivered route may arrive on a shard
+    // that hasn't yet seen the backend. Defaulting to false here would
+    // silently drop those.
+    if (!g_shard_state) return true;
+    auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it == state.backends.end()) return true;
+    // No-cache set: types where prefix affinity has no GPU KV cache to
+    // optimize for. OPENAI_COMPATIBLE is intentionally NOT here — it's a
+    // catch-all that includes self-hosted shims (e.g. SGLang behind an
+    // OpenAI-compatible API) which do have a cache; a per-deployment
+    // opt-out is the right tool for that, not a type-level rule.
+    return it->second.type != BackendType::CEREBRAS;
 }
 
 std::optional<BackendId> RouterService::get_random_backend() {
