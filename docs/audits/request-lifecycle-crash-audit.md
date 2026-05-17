@@ -358,6 +358,35 @@ verified with a targeted test or sanitiser run before remediation.
 > sweep, every `Document::Parse(...)` call site in `src/` now
 > uses `kParseIterativeFlag`. S1 → MITIGATED-BY-FIX,
 > S2 → MITIGATED-BY-FIX.
+>
+> **Fuzz update (2026-05-16):** `stream_parser_fuzz` is unblocked and
+> validated. The §18 P3 Seastar-default-allocator base
+> (`Dockerfile.base.default-alloc`, rebuilt with the
+> `SEASTAR_DEFAULT_ALLOCATOR` macro propagated through the upstream
+> `PUBLIC` compile definitions) routes `operator new`/`delete` back to
+> libc malloc, so libFuzzer's runtime now boots the harness without
+> crashing in cleanup. The image is published to GHCR by
+> `docker-base.yml`'s `build-base-default-alloc` job (GHCR-publish
+> spinoff landed in #499), so both consumer workflows pull it pre-built
+> instead of rebuilding in-place.
+>
+> Local 30-min run (libFuzzer + ASan + UBSan, clang, default-allocator
+> Seastar): **21,864,631 executed units in 1,801 sec** (12,140
+> execs/sec average, 967 new units added, 698 MB peak RSS, slowest
+> unit 0 sec, no crashes / leaks). That's 4.4× the `radix_tree_fuzz`
+> 30-min exec bar (4,959,251) and 3.9× the `request_rewriter_fuzz`
+> 30-min bar (5,552,208) that H8/L9/M6/L5 were promoted on — empirically
+> equivalent or stronger signal. Smoke-CI 60-sec rates (radix_tree
+> 573,877; stream_parser 879,758; request_rewriter 807,662) corroborate
+> that stream_parser_fuzz is *not* slower per-second than the others
+> despite exercising Seastar state-machine paths.
+>
+> Findings moved to **MITIGATED-BY-FUZZ** by this run: H10
+> (`max_chunk_size`-bounded chunk trailer length), M11 (HTTP status
+> snoop assumes one-shot first chunk), M12 (Content-Length parsed
+> without upper bound). The "Findings staying at static MITIGATED"
+> note above (line 56-58, dated 2026-05-08) is superseded by this
+> update.
 
 Scope: `POST /v1/chat/completions` happy path, Phases 1-9. Excludes gossip,
 config loading, persistence internals, metrics scraping, and TLS / DTLS
