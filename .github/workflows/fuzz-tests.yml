@@ -24,12 +24,10 @@
 # top via its BASE_IMAGE build-arg. See the
 # `fuzz-run-stream-parser-default-alloc` Make target and the
 # `stream-parser-fuzz-default-alloc` job below. Full diagnosis lives in
-# tests/fuzz/README.md "Caveats"; the remaining work (a multi-hour
-# fuzz pass to promote H10/M11/M12 to MITIGATED-BY-FUZZ) lives in
-# BACKLOG §18 P3 "Unblock Seastar-dependent fuzzing". The same base
-# image is consumed by the §18 P2 sanitizer-tests workflow; both
-# consumers pull it pre-built from GHCR per the §18 P3 GHCR-publish
-# spinoff (see `docker-base.yml`'s `build-base-default-alloc` job).
+# tests/fuzz/README.md "Caveats". The same base image is consumed by
+# the §18 P2 sanitizer-tests workflow; both consumers pull it pre-built
+# from GHCR per the §18 P3 GHCR-publish spinoff (see `docker-base.yml`'s
+# `build-base-default-alloc` job).
 #
 # Architecture note: GitHub-hosted runners are x86_64. Local fuzz runs
 # (e.g. on Apple Silicon) are aarch64. Different ABIs surface different
@@ -155,16 +153,19 @@ jobs:
   # single buildx step with full type=gha layer caching. Same shape as
   # the §18 P2 sanitizer-tests workflow.
   #
-  # Gated to workflow_dispatch only for now: the first run is manual so
-  # the developer can eyeball the output before promoting H10/M11/M12 to
-  # MITIGATED-BY-FUZZ. Once a multi-hour run is observed clean, flip the
-  # trigger to mirror the main fuzz-tests job (workflow_run after
-  # "Docker Publish") and drop this gate. Intentionally a separate job
-  # (not workflow) so the corpus cache and image-build wiring stay
+  # Triggers and gating mirror the main fuzz-tests job above:
+  # workflow_run after "Docker Publish" plus manual workflow_dispatch,
+  # with the same `if:` guard requiring successful upstream Docker
+  # Publish. continue-on-error: false on the fuzz step means a real
+  # finding or regression fails the job and surfaces against the
+  # commit that introduced it. Intentionally a separate job (not
+  # workflow) so the corpus cache and image-build wiring stay
   # co-located with the existing fuzz CI.
   # ---------------------------------------------------------------------
   stream-parser-fuzz-default-alloc:
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     # Default-alloc base pulled pre-built from GHCR (~1-2 min), fuzz
     # toolchain layered on top (~3-5 min cold, near-instant cache-warm);
@@ -255,16 +256,7 @@ jobs:
           restore-keys: |
             fuzz-corpus-stream-parser-${{ runner.os }}-
 
-      # Non-gating: the first runs of this harness are expected to
-      # surface either a genuine StreamParser finding (which becomes its
-      # own ticket per BACKLOG §18 closure plan) or noise from the
-      # default-allocator Seastar path. Either way, we don't want this
-      # job to block unrelated PRs while triage happens. Flip
-      # continue-on-error to false once the harness is observed clean
-      # under the post-Docker-Publish trigger.
       - name: Build harness and fuzz inside default-allocator fuzz image
-        id: fuzz_default_alloc
-        continue-on-error: true
         run: |
           mkdir -p fuzz-results
           docker run --rm \
@@ -275,8 +267,7 @@ jobs:
             make fuzz-run-stream-parser-default-alloc \
             2>&1 | tee fuzz-results/fuzz-stream-parser-default-alloc.log
 
-          FUZZ_EXIT=${PIPESTATUS[0]}
-          echo "fuzz_exit_code=$FUZZ_EXIT" >> $GITHUB_OUTPUT
+          exit ${PIPESTATUS[0]}
 
       - name: Upload stream_parser fuzz artifacts
         uses: actions/upload-artifact@v4
@@ -288,12 +279,3 @@ jobs:
             crash-*
             tests/fuzz/corpus/stream_parser
           retention-days: 30
-
-      - name: Annotate stream_parser fuzz outcome
-        if: always()
-        run: |
-          if [ "${{ steps.fuzz_default_alloc.outputs.fuzz_exit_code }}" = "0" ]; then
-            echo "::notice::stream_parser_fuzz (Seastar default allocator) passed."
-          else
-            echo "::warning::stream_parser_fuzz (Seastar default allocator) reported a finding (exit ${{ steps.fuzz_default_alloc.outputs.fuzz_exit_code }}). See uploaded log + crash reproducers; file per BACKLOG §18."
-          fi
