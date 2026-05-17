@@ -9,6 +9,7 @@
 #include "metrics_service.hpp"
 #include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
+#include "worker_affinity.hpp"
 
 #include <cstdio>
 #include <csignal>
@@ -613,6 +614,13 @@ seastar::future<> Application::startup() {
         return _sharded_config.start(ShardedConfig(_config)).then([this] {
             _sharded_config_started = true;
             log_main.info("Sharded config initialized on {} cores", seastar::smp::count);
+        }).then([] {
+            // 1b. Compute the non-reactor cpuset by surveying reactor
+            // affinities. Used later when spawning the persistence worker
+            // and the per-shard tokenizer workers to keep them off reactor
+            // cores. The process-wide allowed cpuset was snapshotted in
+            // main() before Seastar started.
+            return worker_affinity::initialize_non_reactor_cpuset();
         }).then([this] {
             // 2. Initialize tokenizer (async with DMA file I/O) - failure is fatal
             return init_tokenizer();

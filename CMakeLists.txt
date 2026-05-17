@@ -282,6 +282,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/tokenizer_thread_pool.cpp
       src/sqlite_persistence.cpp
       src/tracing_service.cpp
+      src/worker_affinity.cpp
     )
     add_dependencies(ranvier_server dashboard_resource)
 
@@ -942,6 +943,7 @@ if(Seastar_FOUND)
       tests/unit/async_persistence_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src
@@ -984,6 +986,7 @@ if(Seastar_FOUND)
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
       src/tracing_service.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(application_test PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -1020,6 +1023,7 @@ if(Seastar_FOUND)
       tests/unit/tokenization_cache_test.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenization_cache_test
@@ -1036,6 +1040,7 @@ if(Seastar_FOUND)
     add_executable(tokenizer_thread_pool_test
       tests/unit/tokenizer_thread_pool_test.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_thread_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_test
@@ -1053,6 +1058,7 @@ if(Seastar_FOUND)
       tests/unit/tokenizer_service_test.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_service_test
@@ -1125,6 +1131,7 @@ if(Seastar_FOUND)
       tests/unit/async_persistence_concurrency_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_concurrency_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src
@@ -1146,6 +1153,7 @@ if(Seastar_FOUND)
     add_executable(tokenizer_thread_pool_concurrency_test
       tests/unit/tokenizer_thread_pool_concurrency_test.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_concurrency_test
@@ -1177,6 +1185,28 @@ if(Seastar_FOUND)
       GTest::gtest
     )
     gtest_discover_tests(cross_shard_exception_propagation_test)
+
+    # Worker Affinity End-to-End Test
+    # Boots a 2-shard reactor, runs the full snapshot → init → pin
+    # pipeline, then reads pthread_getaffinity_np back on a real worker
+    # thread to verify the kernel honoured the pin. Asserts the success-
+    # path invariant (worker landed on a single non-reactor CPU) on hosts
+    # with at least one non-reactor core; gracefully skips that assertion
+    # on tight-fit CI runners (M=0 fallback path).
+    #
+    # Like cross_shard_exception_propagation_test this provides its own
+    # main() and does NOT link GTest::gtest_main.
+    add_executable(worker_affinity_test
+      tests/unit/worker_affinity_test.cpp
+      src/worker_affinity.cpp
+    )
+    target_include_directories(worker_affinity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(worker_affinity_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest
+    )
+    gtest_discover_tests(worker_affinity_test)
 endif()
 
 # Aggregate target that depends on every *_test executable. Lets CI build only

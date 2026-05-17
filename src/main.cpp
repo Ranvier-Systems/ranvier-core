@@ -11,6 +11,7 @@
 
 #include "application.hpp"
 #include "config.hpp"
+#include "worker_affinity.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -394,6 +395,12 @@ For more information, see: https://github.com/ranvier-systems/ranvier-core
 }
 
 int main(int argc, char** argv) {
+    // Snapshot the process-wide CPU affinity before Seastar pins the reactor
+    // threads. Used later by worker_affinity::pin_worker_to_non_reactor_core
+    // to place foreign std::thread workers off the reactor cores. Must run
+    // before app_template::run().
+    ranvier::worker_affinity::snapshot_process_cpuset();
+
     // Check for --help BEFORE loading config (avoids config errors blocking help)
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
