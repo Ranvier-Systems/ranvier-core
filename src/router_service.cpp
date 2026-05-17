@@ -3696,12 +3696,20 @@ std::vector<BackendId> RouterService::get_all_backend_ids() const {
 // parallel_for_each shape but keeps the key out of the persistence/admin/K8s
 // paths — the side-map is the credential boundary. Keys are NEVER logged.
 seastar::future<> RouterService::set_backend_api_key_global(BackendId id, std::string api_key) {
+    // Rule #14: std::string owns heap storage. Capturing it into the
+    // submit_to closure by value would copy-construct on the calling shard
+    // and then free on the target shard when the map entry is later
+    // destroyed — cross-shard free via do_foreign_free. Use foreign_ptr
+    // for the cross-shard hop and reallocate locally on each target shard,
+    // matching the pattern at the load-snapshot broadcast above.
     return seastar::do_with(std::move(api_key),
         [id](std::string& shared_key) {
             return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
                 [id, &shared_key](unsigned shard_id) {
+                    auto clone = std::make_unique<std::string>(shared_key);
+                    auto foreign = seastar::make_foreign(std::move(clone));
                     return seastar::smp::submit_to(shard_id,
-                        [id, key = shared_key]() mutable {
+                        [id, foreign = std::move(foreign)]() mutable {
                             if (!g_shard_state) return seastar::make_ready_future<>();
                             auto& state = shard_state();
                             // Rule #4: bound the side-map. The cap matches
@@ -3713,7 +3721,9 @@ seastar::future<> RouterService::set_backend_api_key_global(BackendId id, std::s
                                                 ShardLocalState::MAX_API_KEYS, id);
                                 return seastar::make_ready_future<>();
                             }
-                            state.backend_api_keys[id] = std::move(key);
+                            // Reallocate locally so the map entry's heap
+                            // storage lives on this shard (Rule #14).
+                            state.backend_api_keys[id] = std::string(foreign->data(), foreign->size());
                             return seastar::make_ready_future<>();
                         });
                 });

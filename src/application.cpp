@@ -595,7 +595,12 @@ seastar::future<> Application::register_static_backends() {
 
             co_await _router->register_backend_global(
                 sb.id, addr, sb.weight, sb.priority,
-                /*supports_token_ids=*/true,  // auto-downgraded inside for non-VLLM
+                // CEREBRAS / OPENAI_COMPATIBLE are auto-downgraded to false
+                // inside register_backend_global. Other non-vLLM types
+                // (OLLAMA, LM_STUDIO) inherit the codebase-wide default and
+                // would pass through — but those are typically registered
+                // via local-discovery, not static config.
+                /*supports_token_ids=*/true,
                 sb.compression_ratio, sb.type);
 
             if (!api_key.empty()) {

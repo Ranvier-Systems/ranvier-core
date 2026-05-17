@@ -510,9 +510,9 @@ telemetry:
 #
 # `type` accepts: vllm (default), sglang, trt_llm, ollama, lm_studio,
 # cerebras, openai_compatible. Non-vLLM types skip prefix-affinity
-# learning (§19.2) and the vLLM /metrics scrape (§19.3); under
-# load_aware_routing they appear as zero-load (see operator info log
-# emitted at registration time).
+# learning and the vLLM /metrics scrape; under load_aware_routing they
+# appear as zero-load (see the operator info log emitted at
+# registration time).
 #
 # Maximum 64 entries (Rule #4). Hand-curate this list; auto-discovered
 # fleets belong under k8s_discovery: or local_mode:.
