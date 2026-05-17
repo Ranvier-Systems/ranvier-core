@@ -14,9 +14,11 @@
 #     - .dev-context/claude-context.md Hard Rule #12
 #     - BACKLOG.md §17 (P0 audit that prompted this lint)
 #
-# Documentation mentions (lines starting with `*` for doxygen, lines
-# starting with `//`, or where `seastar::async(` only appears inside
-# a `//` comment) are ignored automatically — no marker needed.
+# Documentation mentions are ignored automatically — no marker needed.
+# The classifier strips C-style comments (`//`-to-EOL, `/* ... */`,
+# trailing `/* ...`) and leading doxygen-continuation `*`, then re-checks
+# whether `seastar::async(` still appears. Comment-only mentions drop
+# out; real call sites survive and require a marker.
 #
 # Usage:
 #   ./scripts/lint-seastar-async.sh             # scan src/ and tests/
@@ -47,7 +49,13 @@ cd "$repo_root"
 # also scanned. The scan paths are small, so the speed difference is
 # negligible. Restrict to C/C++ source extensions to skip generated
 # binaries, dashboard HTML, and the like.
-raw_matches=$(grep -rnE \
+#
+# `-H` forces grep to prefix every match line with the filename, even
+# when the user passes a single file argument (in that case, grep
+# defaults to LINE:CONTENT without the FILE: prefix, which would break
+# the `IFS=: read -r file line content` parser below — `seastar::`
+# contains its own colons).
+raw_matches=$(grep -rnHE \
     --include='*.cpp' --include='*.hpp' --include='*.h' --include='*.cc' \
     'seastar::async[[:space:]]*\(' \
     "${SCAN_PATHS[@]}" 2>/dev/null || true)
@@ -60,28 +68,44 @@ fi
 # Walk each match. We classify each line as one of:
 #   - documentation: comment-only mention, ignored.
 #   - allowed: real call site with a rule12-allow: marker on this or
-#     the preceding line.
+#     the preceding contiguous comment lines.
 #   - violation: real call site with no marker.
+#
+# Classifier runs two passes per line:
+#   1. Whole-line comment? (leading `//` or `*` doxygen continuation)
+#      -> doc.
+#   2. Otherwise, strip `// ...` trailing and `/* ... */` inline block
+#      comments from the line and re-check for `seastar::async(`.
+#      If absent, the mention was inside a comment -> doc. If still
+#      present, it's a real call site and we look for the marker.
+#
+# Not bulletproof: won't track an open `/*` across lines, and won't
+# preserve `//` inside a string literal. Adequate for this codebase —
+# the lint is a guardrail, not an adversarial parser.
 violations=()
 allowed_count=0
 doc_count=0
 
 while IFS=: read -r file line content; do
-    # Skip pure-comment lines (doxygen continuation `*` or single-line `//`)
-    # by looking at the first non-whitespace character.
     leading=$(printf '%s\n' "$content" | sed -E 's/^[[:space:]]*//')
-    first_char="${leading:0:1}"
-    if [[ "$first_char" == "*" || "$first_char" == "/" ]]; then
-        if [[ "${leading:0:2}" == "//" || "$first_char" == "*" ]]; then
+
+    # Pass 1: whole-line comments. Doxygen continuation (`*` at line
+    # start) and `//`-prefixed lines are documentation no matter what
+    # they contain.
+    case "$leading" in
+        '*'*|'//'*)
             doc_count=$((doc_count + 1))
             continue
-        fi
-    fi
+            ;;
+    esac
 
-    # Strip everything from `//` to end-of-line, then re-check whether
-    # the line still contains `seastar::async(`. Catches inline-comment
-    # mentions like `enum { ASYNC, /* uses seastar::async() */ };`.
-    code_only=$(printf '%s\n' "$content" | sed -E 's@//.*$@@')
+    # Pass 2: strip inline comments and re-check. Catches mentions like
+    # `auto x = foo(); /* uses seastar::async() */` and trailing
+    # `// ... seastar::async() ...` on otherwise-real code lines that
+    # don't actually call seastar::async themselves.
+    code_only=$(printf '%s\n' "$content" | sed -E \
+        -e 's@/\*[^*]*\*+([^/*][^*]*\*+)*/@@g' \
+        -e 's@//.*$@@')
     if ! printf '%s\n' "$code_only" | grep -qE 'seastar::async[[:space:]]*\('; then
         doc_count=$((doc_count + 1))
         continue
@@ -91,22 +115,28 @@ while IFS=: read -r file line content; do
     # block of comment lines immediately above it. Walking up through
     # comment lines (rather than checking only line-1) lets the marker
     # live in a multi-line `//` comment block that explains the rationale,
-    # which is the natural shape for non-trivial justifications.
+    # which is the natural shape for non-trivial justifications. A blank
+    # line breaks the walk — markers must be directly adjacent to the call.
     if printf '%s\n' "$content" | grep -q 'rule12-allow:'; then
         allowed_count=$((allowed_count + 1))
         continue
     fi
+    # Note: O(walk_distance) `sed -n Np FILE` reads per call site. Fine
+    # for this codebase; if call-site count grows past ~hundreds, slurp
+    # the file once into an array instead.
     found_marker=0
     walk_line=$((line - 1))
     while [[ $walk_line -ge 1 ]]; do
         walk_content=$(sed -n "${walk_line}p" "$file")
         walk_trimmed=$(printf '%s\n' "$walk_content" | sed -E 's/^[[:space:]]*//')
-        walk_first="${walk_trimmed:0:1}"
-        walk_first2="${walk_trimmed:0:2}"
-        # Stop walking once we hit a non-comment line.
-        if [[ "$walk_first" != "*" && "$walk_first2" != "//" ]]; then
+        # Stop walking once we hit a non-comment line (including blanks).
+        if [[ -z "$walk_trimmed" ]]; then
             break
         fi
+        case "$walk_trimmed" in
+            '*'*|'//'*) ;;  # comment continuation; keep walking
+            *) break ;;     # code line; stop
+        esac
         if printf '%s\n' "$walk_content" | grep -q 'rule12-allow:'; then
             found_marker=1
             break
