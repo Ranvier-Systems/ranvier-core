@@ -12,6 +12,7 @@
 //   5. Draining mode with timeout
 
 #include "router_service.hpp"
+#include "backend_registry.hpp"
 #include "config.hpp"
 #include "radix_tree.hpp"
 #include "node_slab.hpp"
@@ -451,6 +452,31 @@ TEST_F(RouterServiceTest, BackendTypeRoundTripsThroughRegistration) {
     EXPECT_EQ(router_->backend_type(1), BackendType::SGLANG);
     EXPECT_EQ(router_->backend_type(2), BackendType::OLLAMA);
     EXPECT_EQ(router_->backend_type(3), BackendType::CEREBRAS);
+}
+
+TEST_F(RouterServiceTest, BackendTypeRoundTripsThroughAbstractRegistry) {
+    // §19.3: BackendRegistry exposes backend_type() so HealthService can
+    // proactively skip non-vLLM backends without depending on RouterService
+    // directly. Verify that calls through the abstract interface dispatch to
+    // the concrete override — if RouterService::backend_type() loses its
+    // `override` keyword, this test catches the silent fallback to the
+    // BackendRegistry inline default (which would always return VLLM).
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0, BackendType::VLLM);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, false, 1.0, BackendType::OLLAMA);
+
+    BackendRegistry* registry = router_.get();
+    EXPECT_EQ(registry->backend_type(1), BackendType::VLLM);
+    EXPECT_EQ(registry->backend_type(2), BackendType::CEREBRAS);
+    EXPECT_EQ(registry->backend_type(3), BackendType::OLLAMA);
+
+    // Unknown backend: matches RouterService's conservative default. The
+    // HealthService scrape predicate relies on this so a race between gossip
+    // and local registration doesn't silently mute a real vLLM backend.
+    EXPECT_EQ(registry->backend_type(999), BackendType::VLLM);
 }
 
 TEST_F(RouterServiceTest, BackendStatesIncludeType) {
