@@ -282,6 +282,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/tokenizer_thread_pool.cpp
       src/sqlite_persistence.cpp
       src/tracing_service.cpp
+      src/worker_affinity.cpp
     )
     add_dependencies(ranvier_server dashboard_resource)
 
@@ -942,6 +943,7 @@ if(Seastar_FOUND)
       tests/unit/async_persistence_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src
@@ -984,6 +986,7 @@ if(Seastar_FOUND)
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
       src/tracing_service.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(application_test PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -1036,6 +1039,7 @@ if(Seastar_FOUND)
     add_executable(tokenizer_thread_pool_test
       tests/unit/tokenizer_thread_pool_test.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_thread_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_test

@@ -1,4 +1,5 @@
 #include "tokenizer_thread_pool.hpp"
+#include "worker_affinity.hpp"
 
 #include <chrono>
 
@@ -75,6 +76,14 @@ void TokenizerWorker::start(seastar::alien::instance& alien_instance) {
     _thread = std::make_unique<std::thread>([this, &alien_instance]() {
         worker_loop(alien_instance);
     });
+
+    // Pin the worker off the reactor cores. Per-shard placement is
+    // round-robin across the non-reactor cpuset (helper does the modulo).
+    // Best-effort: failure (empty non-reactor cpuset, non-Linux, syscall
+    // error) is logged inside the helper and the worker simply continues
+    // with inherited affinity.
+    worker_affinity::pin_worker_to_non_reactor_core(
+        _thread->native_handle(), _shard_id, "tokenizer");
 
     log_thread_pool.info("TokenizerWorker started for shard {}", _shard_id);
 }

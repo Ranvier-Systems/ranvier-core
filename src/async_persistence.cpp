@@ -1,4 +1,5 @@
 #include "async_persistence.hpp"
+#include "worker_affinity.hpp"
 #include <seastar/core/alien.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/smp.hh>
@@ -149,6 +150,14 @@ seastar::future<> AsyncPersistenceManager::start(seastar::alien::instance& alien
     _worker_thread = std::make_unique<std::thread>([this]() {
         worker_loop();
     });
+
+    // Pin the worker off the reactor cores. Best-effort: failure (empty
+    // non-reactor cpuset, non-Linux, syscall error) is logged inside the
+    // helper and the worker simply continues with inherited affinity.
+    // Single-worker caller, so worker_index=0 picks the first non-reactor
+    // core deterministically.
+    worker_affinity::pin_worker_to_non_reactor_core(
+        _worker_thread->native_handle(), /*worker_index=*/0, "persistence");
 
     if (_config.enable_stats_logging) {
         _stats_timer.set_callback([this] { log_stats(); });
