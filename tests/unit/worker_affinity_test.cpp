@@ -280,10 +280,18 @@ int main(int argc, char** argv) {
 
     ranvier::worker_affinity::snapshot_process_cpuset();
 
-    // Boot the reactor. Match the argv shape from
-    // cross_shard_exception_propagation_test (--smp 2 for a meaningful
-    // multi-shard survey; --overprovisioned + --lock-memory 0 keep the
-    // test runnable in containers).
+    // Boot the reactor. --smp 2 for a meaningful multi-shard survey;
+    // --memory 256M keeps the per-shard budget low enough for CI
+    // containers; --lock-memory 0 relaxes the mlock requirement.
+    //
+    // Unlike cross_shard_exception_propagation_test we deliberately do NOT
+    // pass --overprovisioned: that flag causes Seastar to hand each
+    // reactor the full process cpuset rather than pinning to a single CPU,
+    // which collapses the helper's reactor union to the entire cpuset and
+    // leaves the non-reactor cpuset empty (M=0) — the success-path
+    // assertion would always skip. Dropping it requires the test runner
+    // to permit per-thread CPU affinity, which is the default on Linux
+    // outside of heavily-restricted cgroup configs.
     seastar::app_template::seastar_options opts;
     opts.name = "worker_affinity_test";
     seastar::app_template app(std::move(opts));
@@ -295,13 +303,11 @@ int main(int argc, char** argv) {
     char arg_mem_val[]   = "256M";
     char arg_lock_flag[] = "--lock-memory";
     char arg_lock_val[]  = "0";
-    char arg_overprov[]  = "--overprovisioned";
     char* app_argv[] = {
         arg0,
         arg_smp_flag,  arg_smp_val,
         arg_mem_flag,  arg_mem_val,
         arg_lock_flag, arg_lock_val,
-        arg_overprov,
         nullptr,
     };
     int app_argc = static_cast<int>(sizeof(app_argv) / sizeof(app_argv[0])) - 1;
