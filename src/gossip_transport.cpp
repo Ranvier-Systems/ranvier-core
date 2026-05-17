@@ -228,6 +228,11 @@ seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_a
         ++_crypto_batch_broadcasts;
         ++_crypto_ops_offloaded;
 
+        // rule12-allow: bounded by _broadcast_sem above (cap
+        // BROADCAST_CONCURRENCY_CAP); uses seastar::thread::yield() inside
+        // the send loop for reactor fairness. Replacing with a coroutine +
+        // co_await maybe_yield() would drop the 128 kB stack entirely; flagged
+        // in BACKLOG §17 P3 resolution as a follow-up architectural refactor.
         co_await seastar::async([this,
                                plaintext_copy = std::vector<uint8_t>(data),
                                peers_copy = std::vector<seastar::socket_address>(peers)]() {

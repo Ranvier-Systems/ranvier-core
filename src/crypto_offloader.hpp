@@ -323,7 +323,11 @@ seastar::future<std::invoke_result_t<Func>> CryptoOffloader::execute_offloaded(
     auto* stalls_avoided_ptr = &_stalls_avoided;
     auto* queue_depth_ptr = &_queue_depth;
 
-    // Use seastar::async to run the operation in a Seastar thread context
+    // Use seastar::async to run the operation in a Seastar thread context.
+    // rule12-allow: this IS the codebase's offload primitive. The seastar::thread
+    // frame lets the caller's `func` use `.get()` on Seastar futures inline.
+    // Concurrency is bounded by _config.max_queue_depth (queue check above);
+    // higher-level callers fall back to inline execution on cap-hit.
     return seastar::async([func = std::forward<Func>(func),
                           start_time, stall_threshold, stalls_avoided_ptr]() mutable -> ResultType {
         if constexpr (std::is_void_v<ResultType>) {
