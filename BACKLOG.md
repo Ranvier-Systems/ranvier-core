@@ -981,10 +981,10 @@ The codebase wraps blocking SQLite and `std::ifstream` calls in `seastar::async(
 
 ### P2 — Cleanup
 
-- [ ] **[P2] Drop unnecessary `do_with` in coroutine broadcasts (Rule #20)**
-  _Locations:_ `src/router_service.cpp:3494` (`broadcast_gpu_load`), `src/router_service.cpp:3517` (`broadcast_cache_headroom`).
+- [x] **[P2] Drop unnecessary `do_with` in coroutine broadcasts (Rule #20)**
+  _Locations:_ `src/router_service.cpp` — `RouterService::broadcast_gpu_load` (was line 3494, now 3533) and `RouterService::broadcast_cache_headroom` (was line 3517, now 3556). Line numbers drifted between when this entry was filed and when it was actioned; the symbol-name locations were authoritative.
   _Justification:_ Both are already inside a coroutine; the coroutine frame already keeps `shared` alive across the awaited `invoke_on_all`. The current `do_with` adds no safety, just noise. Per the corrected Rule #20, coroutines are the preferred pattern.
-  _Approach:_ Replace `co_await seastar::do_with(std::move(shared), [](auto& shared) { return invoke_on_all(...); })` with the inner call directly using the local.
+  _Resolution:_ Replaced `co_await seastar::do_with(std::move(shared), [](auto& shared) { return seastar::smp::invoke_on_all([&shared] { ... }); });` with `co_await seastar::smp::invoke_on_all([&shared] { ... });` in both functions. `shared` (a `seastar::foreign_ptr<std::unique_ptr<absl::flat_hash_map<...>>>`) stays as a local in the coroutine frame; the inner lambda captures it by reference and is invoked-and-awaited on every shard via `invoke_on_all`, so the reference target outlives the call by construction. No move into `do_with`'s internal storage, no extra heap indirection, no second lambda layer. The preceding 4-line comment that explicitly justified the `do_with` ("makes the lifetime guarantee visible and resilient to future refactoring") was the textbook case of Rule #20's defensive over-engineering and was replaced with a one-line `// Rule #20:` reminder. The companion `broadcast_load_snapshot` site at line 3438 uses `return seastar::do_with(...)` from a non-coroutine future-returning function, so `do_with` *is* still needed there (Rule #20's correction applies only inside coroutines) — deliberately not touched. The `#include <seastar/core/do_with.hh>` at line 13 is still needed because seven other call sites in this file remain (1896, 2991, 3201, 3259, 3438, 3588, 3884 — all either non-coroutine returns or `do_with`-around-`seastar::async` patterns out of scope here).
   _Complexity:_ Trivial.
 
 ### Optional follow-up

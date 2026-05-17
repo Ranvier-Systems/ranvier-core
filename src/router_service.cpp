@@ -3526,23 +3526,18 @@ seastar::future<> RouterService::broadcast_gpu_load(
     auto shared = seastar::make_foreign(
         std::make_unique<absl::flat_hash_map<BackendId, double>>(std::move(scores)));
 
-    // Use do_with to anchor the foreign_ptr lifetime explicitly, matching
-    // the pattern in broadcast_load_snapshot(). While co_await keeps the
-    // coroutine frame alive, do_with makes the lifetime guarantee visible
-    // and resilient to future refactoring.
-    co_await seastar::do_with(std::move(shared),
-        [](auto& shared) {
-            return seastar::smp::invoke_on_all(
-                [&shared] {
-                    if (!g_shard_state) return;
-                    auto& cache = g_shard_state->gpu_load_cache;
-                    cache.scores.clear();
-                    for (const auto& [id, score] : *shared) {
-                        if (cache.scores.size() >= ShardLocalState::GpuLoadCache::MAX_ENTRIES) break;
-                        cache.scores[id] = score;
-                    }
-                    cache.updated_at = std::chrono::steady_clock::now();
-                });
+    // Rule #20: inside a coroutine, the frame keeps `shared` alive across the
+    // co_await -- no do_with anchor needed.
+    co_await seastar::smp::invoke_on_all(
+        [&shared] {
+            if (!g_shard_state) return;
+            auto& cache = g_shard_state->gpu_load_cache;
+            cache.scores.clear();
+            for (const auto& [id, score] : *shared) {
+                if (cache.scores.size() >= ShardLocalState::GpuLoadCache::MAX_ENTRIES) break;
+                cache.scores[id] = score;
+            }
+            cache.updated_at = std::chrono::steady_clock::now();
         });
 }
 
@@ -3551,21 +3546,17 @@ seastar::future<> RouterService::broadcast_cache_headroom(
     auto shared = seastar::make_foreign(
         std::make_unique<absl::flat_hash_map<BackendId, double>>(std::move(pressure_map)));
 
-    // Same pattern as broadcast_gpu_load(): foreign_ptr anchored via do_with,
-    // then invoke_on_all distributes to every shard's local cache.
-    co_await seastar::do_with(std::move(shared),
-        [](auto& shared) {
-            return seastar::smp::invoke_on_all(
-                [&shared] {
-                    if (!g_shard_state) return;
-                    auto& cache = g_shard_state->cache_headroom_cache;
-                    cache.pressure.clear();
-                    for (const auto& [id, p] : *shared) {
-                        if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) break;
-                        cache.pressure[id] = p;
-                    }
-                    cache.updated_at = std::chrono::steady_clock::now();
-                });
+    // Rule #20: see broadcast_gpu_load() above.
+    co_await seastar::smp::invoke_on_all(
+        [&shared] {
+            if (!g_shard_state) return;
+            auto& cache = g_shard_state->cache_headroom_cache;
+            cache.pressure.clear();
+            for (const auto& [id, p] : *shared) {
+                if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) break;
+                cache.pressure[id] = p;
+            }
+            cache.updated_at = std::chrono::steady_clock::now();
         });
 }
 
