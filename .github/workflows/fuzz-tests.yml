@@ -188,6 +188,42 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Fail fast with a helpful message if the default-alloc base hasn't
+      # been published yet. Same shape and rationale as sanitizer-tests.yml
+      # — mirrors the bootstrap-window safety net so a missing base
+      # surfaces as a clear "go dispatch docker-base.yml" message instead
+      # of a cryptic docker-driver error.
+      - name: Check default-alloc base image exists
+        run: |
+          echo "Checking if default-alloc base image exists: ${{ env.DEFAULT_ALLOC_BASE }}"
+          if docker manifest inspect ${{ env.DEFAULT_ALLOC_BASE }} > /dev/null 2>&1; then
+            echo "✓ Default-alloc base image found: ${{ env.DEFAULT_ALLOC_BASE }}"
+          else
+            echo "::error::Default-alloc base image not found: ${{ env.DEFAULT_ALLOC_BASE }}"
+            echo ""
+            echo "=========================================="
+            echo "ERROR: Default-alloc base image does not exist in GHCR"
+            echo "=========================================="
+            echo ""
+            echo "stream_parser_fuzz requires a pre-built default-allocator base"
+            echo "image (Seastar rebuilt with SEASTAR_DEFAULT_ALLOCATOR — see"
+            echo "Dockerfile.base.default-alloc header and BACKLOG §18 P3 for the"
+            echo "allocator rationale). This image is published by docker-base.yml's"
+            echo "build-base-default-alloc job."
+            echo ""
+            echo "To fix this, run the 'Docker Base Image' workflow manually:"
+            echo ""
+            echo "  1. Go to: https://github.com/${{ github.repository }}/actions/workflows/docker-base.yml"
+            echo "  2. Click 'Run workflow'"
+            echo "  3. Wait for build-base-default-alloc to complete (~30 min on first run)"
+            echo "  4. Re-run this workflow"
+            echo ""
+            echo "Or use GitHub CLI:"
+            echo "  gh workflow run docker-base.yml --ref main"
+            echo ""
+            exit 1
+          fi
+
       # Single-stage build: layer the fuzz toolchain (clang + compiler-rt
       # + llvm + lld) on top of the pre-published
       # ranvier-base-default-alloc image from GHCR. The base itself is
