@@ -12,6 +12,17 @@ on:
       - main
     tags:
       - 'v*'
+    # Skip docs-only pushes. Because unit/integration/fuzz/sanitizer/benchmark
+    # workflows all cascade off this one via workflow_run, skipping the publish
+    # skips the entire downstream CI chain. Tag pushes ignore paths-ignore by
+    # GitHub design, so releases still publish.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'assets/**'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
 
 env:
   REGISTRY: ghcr.io
