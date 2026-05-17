@@ -724,7 +724,12 @@ seastar::future<> GossipProtocol::refresh_peers() {
             // must stay inside the lambda -- max_concurrent_for_each aborts
             // the batch on the first escaping exception. Shared mutation of
             // discovered_addresses is safe under shard-0-only cooperative
-            // scheduling; see commit message for the full argument.
+            // scheduling; see commit message for the full argument. Concurrent
+            // get_host_by_name on one _dns_resolver is safe by construction:
+            // Seastar's impl holds one c-ares channel (which natively supports
+            // multiple in-flight queries) and allocates a per-query promise on
+            // the heap, with no shared mutable state -- but the contract is
+            // not documented in dns.hh, so re-check on Seastar upgrade.
             co_await seastar::max_concurrent_for_each(
                 srv_records, MAX_CONCURRENT_DNS_RESOLUTIONS,
                 [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
