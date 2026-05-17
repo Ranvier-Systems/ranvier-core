@@ -712,28 +712,19 @@ seastar::future<> GossipProtocol::refresh_peers() {
     try {
         std::vector<seastar::socket_address> discovered_addresses;
 
-        if (_config.discovery_type == DiscoveryType::SRV) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        if (_config.discovery_type == DiscoveryType::SRV) {
             auto srv_records = co_await _dns_resolver.get_srv_records(
                 seastar::net::dns_resolver::srv_proto::udp,
                 "_gossip",
                 _config.discovery_dns_name);
-#pragma GCC diagnostic pop
 
-            // Rule #2: resolve SRV targets in parallel with bounded concurrency.
-            // The batch handles reactor fairness via its own scheduling, so no
-            // explicit maybe_yield is required. discovered_addresses is mutated
-            // from inside the lambda; this is safe because refresh_peers() runs
-            // shard-0-only (line above) and Seastar coroutines on a single shard
-            // only interleave at co_await suspension points -- emplace_back
-            // executes between awaits without preemption. Same precedent as
-            // local_discovery.cpp:82's results.push_back. The per-target
-            // try/catch is kept inside the lambda so one bad SRV target logs
-            // and lets siblings complete (max_concurrent_for_each would
-            // otherwise abort the batch on the first exception).
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            // Rule #2: bounded-concurrency fan-out. The per-target try/catch
+            // must stay inside the lambda -- max_concurrent_for_each aborts
+            // the batch on the first escaping exception. Shared mutation of
+            // discovered_addresses is safe under shard-0-only cooperative
+            // scheduling; see commit message for the full argument.
             co_await seastar::max_concurrent_for_each(
                 srv_records, MAX_CONCURRENT_DNS_RESOLUTIONS,
                 [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
@@ -747,18 +738,15 @@ seastar::future<> GossipProtocol::refresh_peers() {
                         log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                     }
                 });
-#pragma GCC diagnostic pop
         } else if (_config.discovery_type == DiscoveryType::A) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
-#pragma GCC diagnostic pop
 
             for (const auto& addr : host_entry.addr_list) {
                 discovered_addresses.emplace_back(addr, _config.gossip_port);
                 log_gossip_protocol().debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
             }
         }
+#pragma GCC diagnostic pop
 
         if (discovered_addresses.empty()) {
             log_gossip_protocol().debug("DNS discovery returned no addresses");
