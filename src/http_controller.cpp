@@ -978,7 +978,8 @@ future<> HttpController::stream_backend_response(
             // the ART converges on the consistent-hash assignment rather than
             // transient load/cost diversions; 0 means skip learning entirely.
             if (ctx->learn_target_backend != 0 &&
-                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length) {
+                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length &&
+                _router.should_cache_routes_for(ctx->learn_target_backend)) {
                 BackendId learn_backend = ctx->learn_target_backend;
                 // Route learning is best-effort; don't fail the request if it fails
                 if (!ctx->prefix_boundaries.empty() && _config.enable_multi_depth_routing) {
