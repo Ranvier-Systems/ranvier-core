@@ -139,7 +139,11 @@ void GossipService::register_metrics() {
             seastar::metrics::description("Total number of packets decrypted with DTLS")),
         seastar::metrics::make_counter("cluster_dtls_lockdown_drops",
             [this] { return _transport->dtls_lockdown_drops(); },
-            seastar::metrics::description("Total packets dropped due to mTLS lockdown"))
+            seastar::metrics::description("Total packets dropped due to mTLS lockdown")),
+        seastar::metrics::make_counter("cluster_crypto_broadcasts_waited",
+            [this] { return _transport->crypto_broadcasts_waited(); },
+            seastar::metrics::description("Large-fanout DTLS broadcasts that waited on the in-flight cap "
+                                          "(seastar::thread stack reservation backpressure)"))
     });
 
 #ifdef RANVIER_DEBUG_METRICS
