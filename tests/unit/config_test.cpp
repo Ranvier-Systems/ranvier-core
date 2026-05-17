@@ -2466,6 +2466,179 @@ TEST_F(ConfigTest, MaxTtlMultiplierAboveMaxFails) {
     EXPECT_NE(error->find("max_ttl_multiplier"), std::string::npos);
 }
 
+// =============================================================================
+// Static-config backends YAML schema
+// =============================================================================
+
+TEST_F(ConfigTest, StaticBackendsAbsentByDefault) {
+    auto config = RanvierConfig::load_from_string("");
+    EXPECT_TRUE(config.backends.entries.empty());
+}
+
+TEST_F(ConfigTest, StaticBackendsParseFullEntry) {
+    const std::string yaml = R"(
+backends:
+  - id: 101
+    host: api.cerebras.ai
+    port: 443
+    type: cerebras
+    weight: 200
+    priority: 0
+    compression_ratio: 6.0
+    api_key_env: CEREBRAS_API_KEY
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.backends.entries.size(), 1u);
+    const auto& e = config.backends.entries[0];
+    EXPECT_EQ(e.id, 101);
+    EXPECT_EQ(e.host, "api.cerebras.ai");
+    EXPECT_EQ(e.port, 443);
+    EXPECT_EQ(e.type, BackendType::CEREBRAS);
+    EXPECT_EQ(e.weight, 200u);
+    EXPECT_EQ(e.priority, 0u);
+    EXPECT_DOUBLE_EQ(e.compression_ratio, 6.0);
+    EXPECT_EQ(e.api_key_env, "CEREBRAS_API_KEY");
+}
+
+TEST_F(ConfigTest, StaticBackendsMinimalEntryUsesDefaults) {
+    // Minimum required fields: id and host. Everything else should fall back
+    // to schema defaults so a vLLM backend on a trusted network can be
+    // declared with two lines.
+    const std::string yaml = R"(
+backends:
+  - id: 1
+    host: 10.0.0.1
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.backends.entries.size(), 1u);
+    const auto& e = config.backends.entries[0];
+    EXPECT_EQ(e.id, 1);
+    EXPECT_EQ(e.host, "10.0.0.1");
+    EXPECT_EQ(e.port, 443);                       // HTTPS default
+    EXPECT_EQ(e.type, BackendType::VLLM);
+    EXPECT_EQ(e.weight, 100u);
+    EXPECT_EQ(e.priority, 0u);
+    EXPECT_DOUBLE_EQ(e.compression_ratio, 1.0);
+    EXPECT_TRUE(e.api_key_env.empty());
+}
+
+TEST_F(ConfigTest, StaticBackendsParseMultipleEntries) {
+    const std::string yaml = R"(
+backends:
+  - id: 1
+    host: 10.0.0.1
+    port: 8080
+    type: vllm
+  - id: 2
+    host: api.cerebras.ai
+    port: 443
+    type: cerebras
+    api_key_env: CEREBRAS_API_KEY
+  - id: 3
+    host: 10.0.0.3
+    port: 11434
+    type: ollama
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.backends.entries.size(), 3u);
+    EXPECT_EQ(config.backends.entries[0].type, BackendType::VLLM);
+    EXPECT_EQ(config.backends.entries[1].type, BackendType::CEREBRAS);
+    EXPECT_EQ(config.backends.entries[2].type, BackendType::OLLAMA);
+}
+
+TEST_F(ConfigTest, StaticBackendsRejectsUnknownType) {
+    const std::string yaml = R"(
+backends:
+  - id: 1
+    host: 10.0.0.1
+    type: tabby_llm
+)";
+    EXPECT_THROW(RanvierConfig::load_from_string(yaml), std::runtime_error);
+}
+
+TEST_F(ConfigTest, StaticBackendsRejectsMissingRequiredField) {
+    // Missing 'host'
+    const std::string yaml = R"(
+backends:
+  - id: 1
+    port: 8080
+)";
+    EXPECT_THROW(RanvierConfig::load_from_string(yaml), std::runtime_error);
+}
+
+TEST_F(ConfigTest, StaticBackendsRejectsNonSequence) {
+    const std::string yaml = R"(
+backends:
+  id: 1
+  host: 10.0.0.1
+)";
+    EXPECT_THROW(RanvierConfig::load_from_string(yaml), std::runtime_error);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendIdZero) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 0;
+    sb.host = "10.0.0.1";
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("backends"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendDuplicateIds) {
+    RanvierConfig config;
+    StaticBackendConfig a;
+    a.id = 1; a.host = "10.0.0.1";
+    StaticBackendConfig b;
+    b.id = 1; b.host = "10.0.0.2";
+    config.backends.entries.push_back(a);
+    config.backends.entries.push_back(b);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("duplicate"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendEmptyHost) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "";
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("host"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendInvalidPort) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.port = 0;
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("port"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendZeroWeight) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.weight = 0;
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("weight"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendCompressionBelowOne) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.compression_ratio = 0.5;
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("compression_ratio"), std::string::npos);
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

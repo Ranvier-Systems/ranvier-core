@@ -343,6 +343,22 @@ public:
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id) override;
 
+    // Per-backend API key store. Side-map separate from BackendInfo so the
+    // credential boundary stays in one named place and
+    // the abstract BackendRegistry interface doesn't gain a credential
+    // parameter that K8s / admin / persistence paths must ignore.
+    //
+    // `set_backend_api_key_global` broadcasts the key to every shard
+    // (mirroring register_backend_global's parallel_for_each shape) and
+    // is intended to be called once at startup right after the backend
+    // is registered. `get_backend_api_key` is synchronous and shard-
+    // local — http_controller calls it on the request path to decide
+    // whether to inject `Authorization: Bearer <key>`.
+    //
+    // Keys live in memory only — never written to SQLite, never logged.
+    seastar::future<> set_backend_api_key_global(BackendId id, std::string api_key);
+    std::string get_backend_api_key(BackendId id) const;
+
     // Start draining a backend (stops new requests, allows existing cache hits)
     // After backend_drain_timeout, the backend will be fully removed
     seastar::future<> drain_backend_global(BackendId id);
@@ -589,6 +605,11 @@ public:
                                               bool supports_token_ids = true,
                                               double compression_ratio = 1.0,
                                               BackendType type = BackendType::VLLM);
+
+    // Write a key directly into the shard-local api_key side-map.
+    // Bypasses set_backend_api_key_global's parallel_for_each broadcast so
+    // get_backend_api_key can be unit-tested without a running reactor.
+    static void set_backend_api_key_for_testing(BackendId id, std::string api_key);
 
     // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
     static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);

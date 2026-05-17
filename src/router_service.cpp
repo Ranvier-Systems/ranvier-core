@@ -133,6 +133,14 @@ struct ShardLocalState {
     std::vector<BackendId> backend_ids;
     absl::flat_hash_set<BackendId> dead_backends;  // Circuit breaker blacklist
 
+    // Per-backend API key store. Kept separate from BackendInfo so the
+    // credential boundary lives in one named place
+    // and persistence/admin/discovery paths don't have to thread a
+    // credential parameter through. Bounded by MAX_API_KEYS to match
+    // HealthService's MAX_TRACKED_BACKENDS posture (Rule #4).
+    static constexpr size_t MAX_API_KEYS = 256;
+    absl::flat_hash_map<BackendId, std::string> backend_api_keys;
+
     // ========================================================================
     // Statistics Counters
     // ========================================================================
@@ -3663,6 +3671,10 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
             // Also remove from dead backends set if present
             state.dead_backends.erase(id);
 
+            // Clean up the API key side-map. Keeps the credential boundary
+            // tight — a re-registered ID never inherits a stale key.
+            state.backend_api_keys.erase(id);
+
             // Clean up circuit breaker entry (Rule #4: bounded container cleanup)
             if (state.circuit_cleanup_callback) {
                 state.circuit_cleanup_callback(id);
@@ -3678,6 +3690,52 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
 std::vector<BackendId> RouterService::get_all_backend_ids() const {
     if (!g_shard_state) return {};
     return shard_state().backend_ids;
+}
+
+// Broadcast the API key to every shard. Mirrors register_backend_global's
+// parallel_for_each shape but keeps the key out of the persistence/admin/K8s
+// paths — the side-map is the credential boundary. Keys are NEVER logged.
+seastar::future<> RouterService::set_backend_api_key_global(BackendId id, std::string api_key) {
+    // Rule #14: std::string owns heap storage. Capturing it into the
+    // submit_to closure by value would copy-construct on the calling shard
+    // and then free on the target shard when the map entry is later
+    // destroyed — cross-shard free via do_foreign_free. Use foreign_ptr
+    // for the cross-shard hop and reallocate locally on each target shard,
+    // matching the pattern at the load-snapshot broadcast above.
+    return seastar::do_with(std::move(api_key),
+        [id](std::string& shared_key) {
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+                [id, &shared_key](unsigned shard_id) {
+                    auto clone = std::make_unique<std::string>(shared_key);
+                    auto foreign = seastar::make_foreign(std::move(clone));
+                    return seastar::smp::submit_to(shard_id,
+                        [id, foreign = std::move(foreign)]() mutable {
+                            if (!g_shard_state) return seastar::make_ready_future<>();
+                            auto& state = shard_state();
+                            // Rule #4: bound the side-map. The cap matches
+                            // HealthService's MAX_TRACKED_BACKENDS; existing
+                            // entries can always be overwritten.
+                            if (state.backend_api_keys.size() >= ShardLocalState::MAX_API_KEYS
+                                && !state.backend_api_keys.contains(id)) {
+                                log_router.warn("API key store full ({} entries), dropping key for backend {}",
+                                                ShardLocalState::MAX_API_KEYS, id);
+                                return seastar::make_ready_future<>();
+                            }
+                            // Reallocate locally so the map entry's heap
+                            // storage lives on this shard (Rule #14).
+                            state.backend_api_keys[id] = std::string(foreign->data(), foreign->size());
+                            return seastar::make_ready_future<>();
+                        });
+                });
+        });
+}
+
+std::string RouterService::get_backend_api_key(BackendId id) const {
+    if (!g_shard_state) return {};
+    const auto& state = shard_state();
+    auto it = state.backend_api_keys.find(id);
+    if (it != state.backend_api_keys.end()) return it->second;
+    return {};
 }
 
 std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {
@@ -4256,6 +4314,14 @@ void RouterService::unregister_backend_for_testing(BackendId id) {
         state.backend_ids.erase(it);
     }
     state.dead_backends.erase(id);
+    // Keep the for_testing helper symmetric with the production unregister
+    // path, which clears the api-key side-map.
+    state.backend_api_keys.erase(id);
+}
+
+void RouterService::set_backend_api_key_for_testing(BackendId id, std::string api_key) {
+    if (!g_shard_state) return;
+    g_shard_state->backend_api_keys[id] = std::move(api_key);
 }
 
 size_t RouterService::get_route_count_for_testing() {

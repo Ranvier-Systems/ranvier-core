@@ -26,6 +26,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/http/function_handlers.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
@@ -535,6 +536,93 @@ seastar::future<> Application::load_persisted_state() {
     }
 }
 
+// Register backends declared in the YAML `backends:` array. Runs after
+// load_persisted_state so static config wins on ID collision (the
+// SQLite row is overwritten by register_backend_global's broadcast). Address
+// resolution and env-var lookup happen here — post-reactor, pre-traffic, on
+// shard 0. The resolved API key is pushed to RouterService's per-shard
+// side-map and never written anywhere on disk.
+seastar::future<> Application::register_static_backends() {
+    if (_config.backends.entries.empty()) {
+        co_return;
+    }
+    log_main.info("Registering {} static-config backend(s) from YAML",
+                  _config.backends.entries.size());
+    size_t failed = 0;
+    for (const auto& sb : _config.backends.entries) {
+        try {
+            // Resolve host -> socket_address. Try direct IP first (cheap),
+            // fall back to DNS for hostnames (Cerebras-shaped). Mirrors the
+            // POST /admin/backends path at http_controller.cpp:2453.
+            seastar::socket_address addr;
+            bool needs_dns = false;
+            try {
+                seastar::net::inet_address parsed{sb.host};
+                addr = seastar::socket_address(parsed, sb.port);
+            } catch (const std::exception&) {
+                needs_dns = true;
+            }
+            if (needs_dns) {
+                auto deadline = seastar::lowres_clock::now()
+                    + std::chrono::seconds(_config.server.dns_resolution_timeout_seconds);
+                auto hostent = co_await seastar::with_timeout(
+                    deadline, seastar::net::dns::get_host_by_name(sb.host));
+                if (hostent.addr_list.empty()) {
+                    log_main.warn("Static backend {}: DNS returned no addresses for '{}' — skipping",
+                                  sb.id, sb.host);
+                    ++failed;
+                    continue;
+                }
+                addr = seastar::socket_address(hostent.addr_list[0], sb.port);
+            }
+
+            // Resolve the API key before registering — if the env var is
+            // required but missing, refuse to register so we don't end up
+            // with a backend that 401s on every request. Empty api_key_env
+            // means "no auth header", which is correct for vLLM-class
+            // backends on a trusted network.
+            std::string api_key;
+            if (!sb.api_key_env.empty()) {
+                const char* val = std::getenv(sb.api_key_env.c_str());
+                if (val == nullptr || *val == '\0') {
+                    log_main.warn("Static backend {} ({}): api_key_env='{}' is unset or empty — skipping registration",
+                                  sb.id, backend_type_to_string(sb.type), sb.api_key_env);
+                    ++failed;
+                    continue;
+                }
+                api_key.assign(val);
+            }
+
+            co_await _router->register_backend_global(
+                sb.id, addr, sb.weight, sb.priority,
+                // CEREBRAS / OPENAI_COMPATIBLE are auto-downgraded to false
+                // inside register_backend_global. Other non-vLLM types
+                // (OLLAMA, LM_STUDIO) inherit the codebase-wide default and
+                // would pass through — but those are typically registered
+                // via local-discovery, not static config.
+                /*supports_token_ids=*/true,
+                sb.compression_ratio, sb.type);
+
+            if (!api_key.empty()) {
+                co_await _router->set_backend_api_key_global(sb.id, std::move(api_key));
+            }
+
+            // Log without the key. api_key_env name is fine — it's not the secret.
+            log_main.info("Static backend {} ({}) -> {} (weight={}, priority={}, api_key_env={})",
+                          sb.id, backend_type_to_string(sb.type),
+                          addr, sb.weight, sb.priority,
+                          sb.api_key_env.empty() ? "<none>" : sb.api_key_env.c_str());
+        } catch (const std::exception& e) {
+            ++failed;
+            log_main.warn("Failed to register static backend {}: {}", sb.id, e.what());
+        }
+    }
+    if (failed > 0) {
+        log_main.warn("Static backend registration: {} of {} failed",
+                      failed, _config.backends.entries.size());
+    }
+}
+
 void Application::init_health_checker() {
     _health_checker = std::make_unique<HealthService>(*_router, build_health_config());
     _health_checker->start();
@@ -803,6 +891,12 @@ seastar::future<> Application::startup() {
                 return seastar::make_ready_future<>();
             }
             return load_persisted_state();
+        }).then([this] {
+            // 14b. Register static-config backends from YAML.
+            // Runs after persistence replay so YAML wins on ID collision,
+            // and before discovery services start so static entries are
+            // visible to the first wave of requests.
+            return register_static_backends();
         }).then([this] {
             // 15. Start K8s discovery service if enabled
             if (_k8s_discovery && _k8s_discovery->is_enabled()) {
