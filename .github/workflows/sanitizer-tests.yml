@@ -114,6 +114,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Fail fast with a helpful message if the default-alloc base hasn't
+      # been published yet. This avoids the cryptic 5-min docker-driver
+      # error chain when the base is missing — most commonly during the
+      # bootstrap window after a Docker Publish run completes before
+      # docker-base.yml's build-base-default-alloc job has finished (the
+      # two run in parallel on any push to main that touches the
+      # docker-base.yml path filter; Docker Publish reuses the cached
+      # ranvier-base and finishes first). Mirrors the check-base-image
+      # job in docker-publish.yml.
+      - name: Check default-alloc base image exists
+        run: |
+          echo "Checking if default-alloc base image exists: ${{ env.DEFAULT_ALLOC_BASE }}"
+          if docker manifest inspect ${{ env.DEFAULT_ALLOC_BASE }} > /dev/null 2>&1; then
+            echo "✓ Default-alloc base image found: ${{ env.DEFAULT_ALLOC_BASE }}"
+          else
+            echo "::error::Default-alloc base image not found: ${{ env.DEFAULT_ALLOC_BASE }}"
+            echo ""
+            echo "=========================================="
+            echo "ERROR: Default-alloc base image does not exist in GHCR"
+            echo "=========================================="
+            echo ""
+            echo "The sanitised suite requires a pre-built default-allocator base"
+            echo "image (Seastar rebuilt with SEASTAR_DEFAULT_ALLOCATOR). This image"
+            echo "is published by docker-base.yml's build-base-default-alloc job."
+            echo ""
+            echo "Most likely cause: this dispatch raced docker-base.yml on a push"
+            echo "to main that touched the docker-base.yml path filter. The default-"
+            echo "alloc job runs after the multi-arch ranvier-base merge, which can"
+            echo "take longer than the Docker Publish run that triggers this workflow."
+            echo ""
+            echo "To fix this, run the 'Docker Base Image' workflow manually:"
+            echo ""
+            echo "  1. Go to: https://github.com/${{ github.repository }}/actions/workflows/docker-base.yml"
+            echo "  2. Click 'Run workflow'"
+            echo "  3. Wait for build-base-default-alloc to complete (~30 min on first run)"
+            echo "  4. Re-run this workflow"
+            echo ""
+            echo "Or use GitHub CLI:"
+            echo "  gh workflow run docker-base.yml --ref main"
+            echo ""
+            exit 1
+          fi
+
       # Single-stage build: layer the sanitizer toolchain (clang +
       # compiler-rt + llvm + lld) on top of the pre-published
       # ranvier-base-default-alloc image from GHCR. The base itself is
