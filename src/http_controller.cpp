@@ -795,8 +795,8 @@ future<bool> HttpController::send_backend_request(ProxyContext* ctx, ConnectionB
         "Content-Length: " + to_sstring(ctx->forwarded_body.size()) + "\r\n"
         "X-Request-ID: " + safe_request_id + "\r\n";
 
-    // §19.4: forward the configured API key as `Authorization: Bearer <key>`
-    // when the chosen backend has one. Sanitized to strip CR/LF so a malformed
+    // Forward the configured API key as `Authorization: Bearer <key>` when
+    // the chosen backend has one. Sanitized to strip CR/LF so a malformed
     // env-var value can't inject additional headers. The key itself is never
     // logged — only its presence/absence is observable via metrics.
     auto api_key = _router.get_backend_api_key(ctx->current_backend);

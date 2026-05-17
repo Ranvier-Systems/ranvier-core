@@ -3091,7 +3091,7 @@ TEST_F(OriginalSelectedTest, JumpHashNoDivertOriginalMatches) {
 }
 
 // =============================================================================
-// API Key Side-Map (BACKLOG §19.4)
+// API Key Side-Map
 // =============================================================================
 // HealthService-style: the broadcast path uses parallel_for_each across shards
 // and needs a reactor, so we exercise the synchronous getters via the testing

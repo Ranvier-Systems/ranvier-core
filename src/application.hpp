@@ -228,8 +228,8 @@ private:
     // Load persisted state (backends and routes) from SQLite
     seastar::future<> load_persisted_state();
 
-    // Register static-config backends from YAML (BACKLOG §19.4). Runs
-    // after load_persisted_state so static config wins on ID collision.
+    // Register static-config backends from YAML. Runs after
+    // load_persisted_state so static config wins on ID collision.
     // Resolves api_key_env -> env var value here (post-reactor but
     // pre-traffic) and pushes the value to RouterService's side-map.
     seastar::future<> register_static_backends();

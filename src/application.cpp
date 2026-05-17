@@ -536,8 +536,8 @@ seastar::future<> Application::load_persisted_state() {
     }
 }
 
-// BACKLOG §19.4: register backends declared in the YAML `backends:` array.
-// Runs after load_persisted_state so static config wins on ID collision (the
+// Register backends declared in the YAML `backends:` array. Runs after
+// load_persisted_state so static config wins on ID collision (the
 // SQLite row is overwritten by register_backend_global's broadcast). Address
 // resolution and env-var lookup happen here — post-reactor, pre-traffic, on
 // shard 0. The resolved API key is pushed to RouterService's per-shard
@@ -887,7 +887,7 @@ seastar::future<> Application::startup() {
             }
             return load_persisted_state();
         }).then([this] {
-            // 14b. Register static-config backends from YAML (§19.4).
+            // 14b. Register static-config backends from YAML.
             // Runs after persistence replay so YAML wins on ID collision,
             // and before discovery services start so static entries are
             // visible to the first wave of requests.

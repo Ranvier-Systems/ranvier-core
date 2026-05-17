@@ -492,7 +492,7 @@ telemetry:
   #   View traces at: http://localhost:16686
 
 # =============================================================================
-# Static-Config Backends (BACKLOG §19.4)
+# Static-Config Backends
 # =============================================================================
 #
 # Top-level `backends:` array for backends that don't fit the K8s /

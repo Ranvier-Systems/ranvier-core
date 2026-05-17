@@ -2467,7 +2467,7 @@ TEST_F(ConfigTest, MaxTtlMultiplierAboveMaxFails) {
 }
 
 // =============================================================================
-// Static-config backends YAML schema (BACKLOG §19.4)
+// Static-config backends YAML schema
 // =============================================================================
 
 TEST_F(ConfigTest, StaticBackendsAbsentByDefault) {

@@ -474,7 +474,7 @@ struct CacheEventsConfig {
     bool inject_prefix_hash_header = true;         // Add X-Ranvier-Prefix-Hash to proxied requests
 };
 
-// Static-config backend declaration (BACKLOG §19.4).
+// Static-config backend declaration.
 //
 // For backends that don't fit the K8s / local-discovery / admin-API
 // model — chiefly Cerebras and other OpenAI-compatible remote APIs that

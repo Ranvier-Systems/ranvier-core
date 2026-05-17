@@ -133,8 +133,8 @@ struct ShardLocalState {
     std::vector<BackendId> backend_ids;
     absl::flat_hash_set<BackendId> dead_backends;  // Circuit breaker blacklist
 
-    // Per-backend API key store (BACKLOG §19.4). Kept separate from
-    // BackendInfo so the credential boundary lives in one named place
+    // Per-backend API key store. Kept separate from BackendInfo so the
+    // credential boundary lives in one named place
     // and persistence/admin/discovery paths don't have to thread a
     // credential parameter through. Bounded by MAX_API_KEYS to match
     // HealthService's MAX_TRACKED_BACKENDS posture (Rule #4).
@@ -3671,8 +3671,8 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
             // Also remove from dead backends set if present
             state.dead_backends.erase(id);
 
-            // §19.4: clean up the API key side-map. Keeps the credential
-            // boundary tight — a re-registered ID never inherits a stale key.
+            // Clean up the API key side-map. Keeps the credential boundary
+            // tight — a re-registered ID never inherits a stale key.
             state.backend_api_keys.erase(id);
 
             // Clean up circuit breaker entry (Rule #4: bounded container cleanup)
@@ -3692,7 +3692,7 @@ std::vector<BackendId> RouterService::get_all_backend_ids() const {
     return shard_state().backend_ids;
 }
 
-// §19.4: broadcast the API key to every shard. Mirrors register_backend_global's
+// Broadcast the API key to every shard. Mirrors register_backend_global's
 // parallel_for_each shape but keeps the key out of the persistence/admin/K8s
 // paths — the side-map is the credential boundary. Keys are NEVER logged.
 seastar::future<> RouterService::set_backend_api_key_global(BackendId id, std::string api_key) {
@@ -4304,8 +4304,8 @@ void RouterService::unregister_backend_for_testing(BackendId id) {
         state.backend_ids.erase(it);
     }
     state.dead_backends.erase(id);
-    // §19.4: keep the for_testing helper symmetric with the production
-    // unregister path, which clears the api-key side-map.
+    // Keep the for_testing helper symmetric with the production unregister
+    // path, which clears the api-key side-map.
     state.backend_api_keys.erase(id);
 }
 

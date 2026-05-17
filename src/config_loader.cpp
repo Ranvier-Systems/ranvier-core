@@ -1560,8 +1560,8 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (db["enable_cors"]) config.dashboard.enable_cors = db["enable_cors"].as<bool>();
         }
 
-        // Static backend declarations (BACKLOG §19.4). Top-level `backends:`
-        // array; parsed verbatim into config.backends.entries. Env-var
+        // Static backend declarations. Top-level `backends:` array; parsed
+        // verbatim into config.backends.entries. Env-var
         // resolution and address resolution happen later, in
         // application.cpp at startup (post-reactor) — we hold only the env
         // var *name* in the config, not the resolved secret.
@@ -1881,8 +1881,8 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         return "local_mode.discovery_ports exceeds maximum of 64 entries (Rule #4)";
     }
 
-    // Validate static backend declarations (BACKLOG §19.4). Caught at
-    // config load time so an operator typo doesn't get past startup.
+    // Validate static backend declarations. Caught at config load time so
+    // an operator typo doesn't get past startup.
     if (config.backends.entries.size() > StaticBackendsConfig::MAX_STATIC_BACKENDS) {
         return "backends exceeds maximum of 64 entries (Rule #4)";
     }
