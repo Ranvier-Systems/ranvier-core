@@ -20,7 +20,7 @@
 
 #include <yaml-cpp/yaml.h>
 
-#include <absl/container/flat_hash_set.h>
+#include <unordered_set>
 
 namespace ranvier {
 
@@ -1887,7 +1887,7 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         return "backends exceeds maximum of 64 entries (Rule #4)";
     }
     {
-        absl::flat_hash_set<BackendId> seen_ids;
+        std::unordered_set<BackendId> seen_ids;
         seen_ids.reserve(config.backends.entries.size());
         for (const auto& sb : config.backends.entries) {
             if (sb.id <= 0) {
