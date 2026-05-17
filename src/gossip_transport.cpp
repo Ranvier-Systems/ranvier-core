@@ -10,6 +10,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/net/inet_address.hh>
@@ -205,13 +206,25 @@ seastar::future<> GossipTransport::broadcast(const std::vector<seastar::socket_a
         co_return;
     }
 
-    // For high fan-out broadcasts, use seastar::async to batch the crypto work.
-    //
-    // TODO(stack-cost): this seastar::async branch is not concurrency-bounded —
-    // _gossip_task_gate guards shutdown, not holder count. See BACKLOG.md §17
-    // "Bound concurrency on gossip broadcast async path" (P3) for the planned
-    // fix (with_semaphore or inline-fallback mirroring crypto_offloader.hpp).
+    // For high fan-out broadcasts, use seastar::async to batch the crypto
+    // work. Concurrency is bounded by _broadcast_sem (cap
+    // BROADCAST_CONCURRENCY_CAP, see gossip_transport.hpp) so that
+    // per-request callers cannot stack arbitrarily many 128 kB
+    // seastar::thread stacks under sustained load. Excess concurrent
+    // callers wait via co_await get_units — broadcasts are background
+    // work so bounded await latency is acceptable.
     if (peers.size() > CRYPTO_OFFLOAD_PEER_THRESHOLD) {
+        // try_get_units first so we can count backpressure activations
+        // separately from the happy path. If the fast path fails, the
+        // counter increments before we suspend on get_units. RAII units
+        // are released automatically when `units` leaves scope below,
+        // after the seastar::async future completes (Rule #19).
+        auto units = seastar::try_get_units(_broadcast_sem, 1);
+        if (!units) {
+            ++_crypto_broadcasts_waited;
+            units = co_await seastar::get_units(_broadcast_sem, 1);
+        }
+
         ++_crypto_batch_broadcasts;
         ++_crypto_ops_offloaded;
 
