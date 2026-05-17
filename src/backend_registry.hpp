@@ -46,6 +46,14 @@ public:
     // Not pure-virtual — default implementation returns 0.0 so existing
     // implementations don't break.
     virtual double get_backend_load_score(BackendId /*id*/) const { return 0.0; }
+
+    // Engine class for the given backend. Used by HealthService to skip the
+    // vLLM-shaped /metrics scrape on non-vLLM backends (proactive suppression).
+    // Default returns BackendType::VLLM — matches the historical assumption
+    // baked into the learning/scrape paths and keeps test mocks compiling.
+    virtual BackendType backend_type(BackendId /*id*/) const {
+        return BackendType::VLLM;
+    }
 };
 
 }  // namespace ranvier
