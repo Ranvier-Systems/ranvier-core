@@ -1060,12 +1060,13 @@ audit doc.
 
 ### 19.3 Metrics opt-out for non-vLLM backends
 
-- [ ] **[P3] Skip vLLM `/metrics` scrape for non-vLLM backend types**
+- [x] **[P3] Skip vLLM `/metrics` scrape for non-vLLM backend types**
   _Context:_ `src/vllm_metrics.hpp` is tightly coupled to vLLM's Prometheus exposition format. Cerebras has no equivalent endpoint. Two paths exist: (a) cheap — opt non-vLLM backends out of the scrape entirely and let `get_backend_load_score()` return `0.0` (the existing optimistic default at `src/router_service.hpp:419-422`), losing load-aware routing on those backends; (b) right — abstract `VLLMMetrics` into a `BackendMetrics` interface with a Cerebras adapter. Cerebras's whole pitch is no queueing, so load signals matter less; the cheap path is appropriate for v1.
   _Approach:_ In the `HealthService` scrape loop, check `backend_type(id)` before issuing the `/metrics` GET. Skip non-vLLM types. The existing `get_backend_load_score()` default of `0.0` already handles the missing-data case correctly. Document the loss of load-aware routing on these backends. Defer the `BackendMetrics` abstraction until a customer asks for it.
   _Location:_ `src/health_service.cpp`, `src/vllm_metrics.hpp`
   _Complexity:_ Low (~half a day)
   _Dependencies:_ 19.1
+  _Completed 2026-05-17 (a774153):_ `BackendRegistry` gained a `virtual backend_type(BackendId)` with an inline `VLLM` default, symmetric with how `get_backend_load_score` is exposed; `RouterService::backend_type()` is now an `override`. `HealthService::scrape_one_backend` checks `_registry.backend_type(id) != BackendType::VLLM` before `is_scrape_suppressed(id)` so the connect/timeout cost is skipped from cycle 1 (proactive) instead of after `SCRAPE_FAILURE_SUPPRESSION_THRESHOLD` failures (adaptive). Reused the existing `health_vllm_scrapes_suppressed` counter — description broadened to "proactive (type-based) or adaptive (failure-based)". One-line `info` log at `register_backend_global` when a non-VLLM backend is added under `load_aware_routing=true`, flagging that the router will treat the backend as zero-load (the BACKLOG-accepted footgun). Per the entry, deferred the `BackendMetrics` abstraction — "not vLLM = skip" is the honest predicate until a customer asks for richer per-type metrics. Unit test (`router_service_test.cpp::BackendTypeRoundTripsThroughAbstractRegistry`) calls `backend_type()` through a `BackendRegistry*` to lock in the `override` — a missing keyword would silently fall through to the inline `VLLM` default and never reach the registered type. `HealthService::scrape_one_backend` itself has no reactor-free unit-test seam (mirrors §19.2's HTTP-controller-gate posture); covered end-to-end by integration tests.
 
 ### 19.4 Static-config Cerebras backends
 

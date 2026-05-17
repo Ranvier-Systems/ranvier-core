@@ -3600,6 +3600,18 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
         supports_token_ids = false;
     }
 
+    // Operator warning: non-vLLM backends have no /metrics scrape, so
+    // get_backend_load_score() always returns 0.0 for them. Under
+    // load_aware_routing they look idle and attract more traffic — fine
+    // for Cerebras (no queueing) but a footgun worth flagging once at
+    // registration time. Rule #17: not per-scrape, no log flood.
+    if (type != BackendType::VLLM && g_shard_state
+            && g_shard_state->config.load_aware_routing) {
+        log_router.info("Backend {} ({}): metrics scraping disabled; "
+                        "load-aware routing will treat this backend as zero-load",
+                        id, backend_type_to_string(type));
+    }
+
     return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio, type,
         [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
              uint32_t& shared_priority, bool& shared_supports_token_ids,

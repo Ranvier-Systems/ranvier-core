@@ -397,7 +397,7 @@ public:
     // Engine class for the given backend. Returns BackendType::VLLM if the
     // backend is not registered — matches the historical assumption baked
     // into the learning/scrape paths.
-    BackendType backend_type(BackendId id) const;
+    BackendType backend_type(BackendId id) const override;
 
     // Whether ART route learning is worthwhile for this backend. Returns
     // false when the backend's type is in the no-cache set (e.g. Cerebras
