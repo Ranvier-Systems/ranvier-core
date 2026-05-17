@@ -3089,3 +3089,48 @@ TEST_F(OriginalSelectedTest, JumpHashNoDivertOriginalMatches) {
     EXPECT_EQ(second.backend_id.value(), first.backend_id.value());
     EXPECT_EQ(second.original_selected, second.backend_id.value());
 }
+
+// =============================================================================
+// API Key Side-Map (BACKLOG §19.4)
+// =============================================================================
+// HealthService-style: the broadcast path uses parallel_for_each across shards
+// and needs a reactor, so we exercise the synchronous getters via the testing
+// helper that writes directly into shard-local state.
+
+TEST_F(RouterServiceTest, ApiKeyMissingReturnsEmpty) {
+    EXPECT_TRUE(router_->get_backend_api_key(42).empty());
+}
+
+TEST_F(RouterServiceTest, ApiKeyRoundTrips) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::set_backend_api_key_for_testing(1, "sk-test-cerebras-key");
+    EXPECT_EQ(router_->get_backend_api_key(1), "sk-test-cerebras-key");
+}
+
+TEST_F(RouterServiceTest, ApiKeyClearedOnUnregister) {
+    // The credential boundary closes when the backend is unregistered —
+    // a re-registered ID must not inherit the previous tenant's key.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::set_backend_api_key_for_testing(1, "sk-tenant-a");
+    EXPECT_EQ(router_->get_backend_api_key(1), "sk-tenant-a");
+
+    RouterService::unregister_backend_for_testing(1);
+    EXPECT_TRUE(router_->get_backend_api_key(1).empty());
+
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.2", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    EXPECT_TRUE(router_->get_backend_api_key(1).empty())
+        << "Re-registered backend should start without a key";
+}
+
+TEST_F(RouterServiceTest, ApiKeyPerBackendIndependent) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::set_backend_api_key_for_testing(2, "sk-only-on-2");
+
+    EXPECT_TRUE(router_->get_backend_api_key(1).empty());
+    EXPECT_EQ(router_->get_backend_api_key(2), "sk-only-on-2");
+}

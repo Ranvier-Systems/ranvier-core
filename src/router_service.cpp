@@ -4304,6 +4304,14 @@ void RouterService::unregister_backend_for_testing(BackendId id) {
         state.backend_ids.erase(it);
     }
     state.dead_backends.erase(id);
+    // §19.4: keep the for_testing helper symmetric with the production
+    // unregister path, which clears the api-key side-map.
+    state.backend_api_keys.erase(id);
+}
+
+void RouterService::set_backend_api_key_for_testing(BackendId id, std::string api_key) {
+    if (!g_shard_state) return;
+    g_shard_state->backend_api_keys[id] = std::move(api_key);
 }
 
 size_t RouterService::get_route_count_for_testing() {

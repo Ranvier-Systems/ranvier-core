@@ -606,6 +606,11 @@ public:
                                               double compression_ratio = 1.0,
                                               BackendType type = BackendType::VLLM);
 
+    // §19.4: write a key directly into the shard-local api_key side-map.
+    // Bypasses set_backend_api_key_global's parallel_for_each broadcast so
+    // get_backend_api_key can be unit-tested without a running reactor.
+    static void set_backend_api_key_for_testing(BackendId id, std::string api_key);
+
     // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
     static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);
 
