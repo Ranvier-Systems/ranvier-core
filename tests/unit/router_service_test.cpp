@@ -524,7 +524,7 @@ TEST_F(RouterServiceTest, BackendTypeToStringRoundTrip) {
 }
 
 // =============================================================================
-// should_cache_routes_for() — Route-Learning Gate Predicate (BACKLOG §19.2)
+// should_cache_routes_for() — Route-Learning Gate Predicate
 // =============================================================================
 
 TEST_F(RouterServiceTest, ShouldCacheRoutesTrueForCacheableTypes) {
@@ -554,10 +554,11 @@ TEST_F(RouterServiceTest, ShouldCacheRoutesTrueForMissingBackend) {
 }
 
 TEST_F(RouterServiceTest, LookupHonorsExistingCerebrasRoute) {
-    // The gate suppresses *new* ART learning on Cerebras backends; it does
-    // not retroactively delete or hide existing entries. If an entry exists
-    // (e.g. from before a backend was reclassified, or inserted by admin),
-    // lookup still returns it.
+    // The gate suppresses *new* ART learning on Cerebras backends; it
+    // does not retroactively delete or hide existing entries. If an
+    // entry already exists (e.g. inserted via the admin POST route,
+    // which is intentionally ungated as an operator command), lookup
+    // still returns it.
     RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
                                                  100, 0, false, 1.0, BackendType::CEREBRAS);
     std::vector<int32_t> tokens = {10, 20, 30, 40, 50};

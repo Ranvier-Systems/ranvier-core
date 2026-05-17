@@ -404,9 +404,10 @@ public:
     // keeps the whole model in on-chip SRAM, so prefix affinity earns
     // nothing). Gates the learning sites only; the lookup path is
     // unaffected — if a route already points at a non-cacheable backend
-    // we still honor it. Safe default for not-found is true: a missing
-    // backend will be rejected downstream by learn_route_global anyway,
-    // and we shouldn't pre-empt that with a silent skip here.
+    // we still honor it. Safe default for not-found is true: backend
+    // registration propagates across shards asynchronously, so a gossip
+    // route may legitimately arrive before this shard sees the backend;
+    // defaulting to false would silently drop those.
     bool should_cache_routes_for(BackendId id) const;
 
     // Get tree dump for admin inspection (local shard only)
