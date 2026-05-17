@@ -30,6 +30,10 @@ struct BackendRecord {
     uint16_t port;
     uint32_t weight = 100;    // Relative weight for load balancing (default 100)
     uint32_t priority = 0;    // Priority group (0 = highest, higher = lower priority)
+    // Persisted backend_type column. Stored as the raw string from SQLite —
+    // the service layer (application.cpp replay) calls parse_backend_type()
+    // and decides what to do with unknown values (Rule #7).
+    std::string backend_type = "vllm";
 };
 
 struct RouteRecord {
@@ -60,7 +64,8 @@ public:
 
     // Backend operations
     virtual bool save_backend(BackendId id, const std::string& ip, uint16_t port,
-                              uint32_t weight = 100, uint32_t priority = 0) = 0;
+                              uint32_t weight = 100, uint32_t priority = 0,
+                              const std::string& backend_type = "vllm") = 0;
     virtual bool remove_backend(BackendId id) = 0;
     virtual std::vector<BackendRecord> load_backends() = 0;
 

@@ -470,8 +470,8 @@ seastar::future<> Application::load_persisted_state() {
                   routes.size(), skipped, invalid_backend_count);
 
     for (const auto& rec : backends) {
-        log_main.info("  - Backend {} -> {}:{} (weight={}, priority={})",
-            rec.id, rec.ip, rec.port, rec.weight, rec.priority);
+        log_main.info("  - Backend {} -> {}:{} (weight={}, priority={}, type={})",
+            rec.id, rec.ip, rec.port, rec.weight, rec.priority, rec.backend_type);
     }
 
     // Step 3: Restore backends first, then routes
@@ -480,7 +480,19 @@ seastar::future<> Application::load_persisted_state() {
         for (const auto& rec : backends) {
             try {
                 seastar::socket_address addr(seastar::ipv4_addr(rec.ip, rec.port));
-                co_await _router->register_backend_global(rec.id, addr, rec.weight, rec.priority);
+                // Service-layer validation (Rule #7): persistence returned the
+                // raw string; we parse here and warn on unknown values, falling
+                // back to VLLM so a corrupt or future-version row doesn't fail
+                // the whole replay. supports_token_ids/compression_ratio aren't
+                // persisted yet — defaults match the historical replay path.
+                auto type_opt = parse_backend_type(rec.backend_type);
+                if (!type_opt) {
+                    log_main.warn("Backend {}: unknown persisted backend_type '{}' - defaulting to vllm",
+                                  rec.id, rec.backend_type);
+                }
+                BackendType type = type_opt.value_or(BackendType::VLLM);
+                co_await _router->register_backend_global(rec.id, addr, rec.weight, rec.priority,
+                    /*supports_token_ids=*/true, /*compression_ratio=*/1.0, type);
             } catch (...) {
                 failed_backends++;
                 try {

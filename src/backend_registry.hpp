@@ -33,7 +33,8 @@ public:
         register_backend_global(BackendId id, seastar::socket_address addr,
                                 uint32_t weight = 100, uint32_t priority = 0,
                                 bool supports_token_ids = true,
-                                double compression_ratio = 1.0) = 0;
+                                double compression_ratio = 1.0,
+                                BackendType type = BackendType::VLLM) = 0;
 
     virtual seastar::future<>
         unregister_backend_global(BackendId id) = 0;
