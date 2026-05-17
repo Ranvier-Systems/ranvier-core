@@ -164,6 +164,10 @@ seastar::future<> run_experiment() {
     g_obs.worker_pinned_cpu = first_set_bit(after);
 
     stop.store(true, std::memory_order_release);
+    // worker.join() blocks the reactor thread until the spawned thread
+    // exits. The worker checks `stop` every ~2ms, so the join returns
+    // promptly. This would be a Rule #12 violation in production code,
+    // but this is a dedicated test reactor that only runs this experiment.
     worker.join();
     co_return;
 }

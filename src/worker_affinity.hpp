@@ -53,9 +53,15 @@ void snapshot_process_cpuset();
 
 // Survey reactor-thread affinities across all shards and cache the
 // non-reactor cpuset. MUST be called from a reactor thread once during
-// startup, before any worker thread is spawned. Safe to call multiple times
-// — only the first triggers the survey; subsequent calls return a ready
-// future.
+// startup, before any worker thread is spawned. Idempotent across
+// completed calls: an already-resolved init returns a ready future.
+//
+// CONTRACT: this is initialisation, not synchronisation. Concurrent
+// re-entry before the first call resolves is a logic error — both
+// callers will race past the "already done" check and double-populate
+// the internal state. Production callers chain a single init in the
+// startup .then(), so this is not exercised; documented here for
+// future maintainers.
 seastar::future<> initialize_non_reactor_cpuset();
 
 // Pin the given OS thread to one of the non-reactor cores using round-robin
