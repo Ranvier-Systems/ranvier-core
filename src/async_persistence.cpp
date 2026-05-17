@@ -241,10 +241,11 @@ void AsyncPersistenceManager::queue_save_route(std::span<const TokenId> tokens,
 
 void AsyncPersistenceManager::queue_save_backend(BackendId id, const std::string& ip,
                                                   uint16_t port, uint32_t weight,
-                                                  uint32_t priority) {
+                                                  uint32_t priority,
+                                                  const std::string& backend_type) {
     if (_stopping.load(std::memory_order_relaxed) || !is_open()) return;
 
-    SaveBackendOp op{id, ip, port, weight, priority};
+    SaveBackendOp op{id, ip, port, weight, priority, backend_type};
     try_enqueue(std::move(op));
 }
 
@@ -431,7 +432,7 @@ void AsyncPersistenceManager::execute(SaveRouteOp& op, RouteAccumulator& routes)
 void AsyncPersistenceManager::execute(const SaveBackendOp& op, RouteAccumulator& routes) {
     routes.flush();  // Flush routes first to maintain ordering
 
-    if (_store->save_backend(op.id, op.ip, op.port, op.weight, op.priority)) {
+    if (_store->save_backend(op.id, op.ip, op.port, op.weight, op.priority, op.backend_type)) {
         _ops_processed++;
     } else {
         log_async_persist.warn("Failed to save backend {} to persistence", op.id);

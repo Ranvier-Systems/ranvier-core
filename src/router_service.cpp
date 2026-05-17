@@ -88,15 +88,22 @@ struct BackendInfo {
     // Set via per-backend config or admin API. Technology-agnostic.
     double compression_ratio = 1.0;
 
+    // Per-backend engine class. Default VLLM preserves existing behaviour
+    // for all callers that haven't been threaded through with the type.
+    // See BACKLOG §19 for the heterogeneous-fleet design.
+    BackendType type = BackendType::VLLM;
+
     BackendInfo() = default;
 
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
-                bool supports_token_ids_ = true, double compression_ratio_ = 1.0)
+                bool supports_token_ids_ = true, double compression_ratio_ = 1.0,
+                BackendType type_ = BackendType::VLLM)
         : addr(std::move(addr_))
         , weight(weight_)
         , priority(priority_)
         , supports_token_ids(supports_token_ids_)
-        , compression_ratio(compression_ratio_) {}
+        , compression_ratio(compression_ratio_)
+        , type(type_) {}
 };
 
 // ============================================================================
@@ -2125,6 +2132,18 @@ bool RouterService::backend_supports_token_ids(BackendId id) const {
     return false;
 }
 
+BackendType RouterService::backend_type(BackendId id) const {
+    if (!g_shard_state) return BackendType::VLLM;
+    auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it != state.backends.end()) {
+        return it->second.type;
+    }
+    // Backend not found — VLLM is the historical default and matches the
+    // assumption baked into existing learning/scrape paths.
+    return BackendType::VLLM;
+}
+
 std::optional<BackendId> RouterService::get_random_backend() {
     if (!g_shard_state) return std::nullopt;
     auto& state = shard_state();
@@ -3553,22 +3572,36 @@ seastar::future<> RouterService::broadcast_cache_headroom(
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
                                                           uint32_t weight, uint32_t priority,
                                                           bool supports_token_ids,
-                                                          double compression_ratio) {
-    return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio,
+                                                          double compression_ratio,
+                                                          BackendType type) {
+    // Non-GPU backend classes don't speak vLLM's prompt_token_ids field;
+    // forwarding it produces 400 rejections. Auto-downgrade so operators
+    // don't have to set both flags consistently — type is the source of truth.
+    if ((type == BackendType::CEREBRAS || type == BackendType::OPENAI_COMPATIBLE)
+            && supports_token_ids) {
+        log_router.info("Backend {}: type={} forces supports_token_ids=false "
+                        "(prompt_token_ids is a vLLM-specific field)",
+                        id, backend_type_to_string(type));
+        supports_token_ids = false;
+    }
+
+    return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio, type,
         [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
              uint32_t& shared_priority, bool& shared_supports_token_ids,
-             double& shared_compression_ratio) {
+             double& shared_compression_ratio, BackendType& shared_type) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
-             &shared_compression_ratio] (unsigned shard_id) {
+             &shared_compression_ratio, &shared_type] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
                                                        weight = shared_weight,
                                                        priority = shared_priority,
                                                        supports_token_ids = shared_supports_token_ids,
-                                                       compression_ratio = shared_compression_ratio] {
+                                                       compression_ratio = shared_compression_ratio,
+                                                       type = shared_type] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
-                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids, compression_ratio};
+                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
+                                                  compression_ratio, type};
 
                 // Update vector (check for duplicates)
                 bool exists = false;
@@ -3657,6 +3690,7 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         bs.is_dead = shard.dead_backends.contains(id);
         bs.supports_token_ids = info.supports_token_ids;
         bs.compression_ratio = info.compression_ratio;
+        bs.type = info.type;
 
         if (info.is_draining) {
             // Convert steady_clock to wall-clock time:
@@ -4135,10 +4169,18 @@ void RouterService::set_circuit_cleanup_callback(CircuitCleanupCallback callback
 void RouterService::register_backend_for_testing(BackendId id, seastar::socket_address addr,
                                                    uint32_t weight, uint32_t priority,
                                                    bool supports_token_ids,
-                                                   double compression_ratio) {
+                                                   double compression_ratio,
+                                                   BackendType type) {
     if (!g_shard_state) return;
     auto& state = *g_shard_state;
-    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids, compression_ratio};
+    // Mirror register_backend_global()'s auto-downgrade so tests see the
+    // same invariant: non-vLLM types never carry supports_token_ids=true.
+    if ((type == BackendType::CEREBRAS || type == BackendType::OPENAI_COMPATIBLE)
+            && supports_token_ids) {
+        supports_token_ids = false;
+    }
+    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
+                                      compression_ratio, type};
 
     bool exists = false;
     for (auto existing : state.backend_ids) {

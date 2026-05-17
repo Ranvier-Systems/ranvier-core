@@ -337,7 +337,8 @@ public:
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr,
                                                uint32_t weight = 100, uint32_t priority = 0,
                                                bool supports_token_ids = true,
-                                               double compression_ratio = 1.0) override;
+                                               double compression_ratio = 1.0,
+                                               BackendType type = BackendType::VLLM) override;
 
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id) override;
@@ -382,6 +383,7 @@ public:
         bool is_dead;
         bool supports_token_ids;  // Whether backend supports vLLM prompt_token_ids
         double compression_ratio;  // KV-cache compression ratio (>= 1.0, 1.0 = no compression)
+        BackendType type;  // Engine class (VLLM, SGLANG, CEREBRAS, ...)
         int64_t drain_start_ms;  // 0 if not draining
     };
 
@@ -391,6 +393,11 @@ public:
     // Check if a backend supports vLLM's prompt_token_ids field.
     // Returns false if backend not found (safe default: don't inject unknown fields).
     bool backend_supports_token_ids(BackendId id) const;
+
+    // Engine class for the given backend. Returns BackendType::VLLM if the
+    // backend is not registered — matches the historical assumption baked
+    // into the learning/scrape paths.
+    BackendType backend_type(BackendId id) const;
 
     // Get tree dump for admin inspection (local shard only)
     RadixTree::DumpNode get_tree_dump() const;
@@ -569,7 +576,8 @@ public:
     static void register_backend_for_testing(BackendId id, seastar::socket_address addr,
                                               uint32_t weight = 100, uint32_t priority = 0,
                                               bool supports_token_ids = true,
-                                              double compression_ratio = 1.0);
+                                              double compression_ratio = 1.0,
+                                              BackendType type = BackendType::VLLM);
 
     // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
     static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);
