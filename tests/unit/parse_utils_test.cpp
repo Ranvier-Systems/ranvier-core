@@ -555,3 +555,102 @@ TEST_F(ParseCacheEventsTest, DeeplyNestedBodyDoesNotStackOverflow) {
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(result.error, "Invalid JSON");
 }
+
+// =============================================================================
+// base64_decode (used by K8s Secret resolution)
+// =============================================================================
+
+TEST(Base64Decode, EmptyInput) {
+    auto r = ranvier::base64_decode("");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_TRUE(r->empty());
+}
+
+TEST(Base64Decode, SimpleAscii) {
+    // "Hello" -> SGVsbG8=
+    auto r = ranvier::base64_decode("SGVsbG8=");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "Hello");
+}
+
+TEST(Base64Decode, NoPaddingNeeded) {
+    // "foobar" (6 bytes, no padding) -> Zm9vYmFy
+    auto r = ranvier::base64_decode("Zm9vYmFy");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "foobar");
+}
+
+TEST(Base64Decode, OnePadByte) {
+    // "foo" (3 bytes? no, 3 bytes = no pad. "fo" = 2 bytes = "Zm8=" one pad)
+    auto r = ranvier::base64_decode("Zm8=");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "fo");
+}
+
+TEST(Base64Decode, TwoPadBytes) {
+    // "f" (1 byte) -> "Zg=="
+    auto r = ranvier::base64_decode("Zg==");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "f");
+}
+
+TEST(Base64Decode, RealisticApiKey) {
+    // "sk-prodaccount-12345" -> base64
+    auto r = ranvier::base64_decode("c2stcHJvZGFjY291bnQtMTIzNDU=");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, "sk-prodaccount-12345");
+}
+
+TEST(Base64Decode, RejectsWrongLength) {
+    // Length must be a multiple of 4 (input "Zm9v" is OK as a sanity baseline).
+    EXPECT_TRUE(ranvier::base64_decode("Zm9v").has_value());
+    EXPECT_FALSE(ranvier::base64_decode("Zm9").has_value());
+    EXPECT_FALSE(ranvier::base64_decode("Zm").has_value());
+    EXPECT_FALSE(ranvier::base64_decode("Z").has_value());
+    EXPECT_FALSE(ranvier::base64_decode("Zm9vYg").has_value());
+}
+
+TEST(Base64Decode, RejectsInvalidCharacters) {
+    // '$' is not in the base64 alphabet
+    EXPECT_FALSE(ranvier::base64_decode("Zm$vYmFy").has_value());
+    // Null byte
+    std::string with_null = "Zm";
+    with_null.push_back('\0');
+    with_null.push_back('v');
+    EXPECT_FALSE(ranvier::base64_decode(with_null).has_value());
+}
+
+TEST(Base64Decode, RejectsUrlSafeAlphabet) {
+    // URL-safe base64 uses '-' and '_' instead of '+' and '/'. K8s never
+    // produces these, so we reject them rather than silently decoding.
+    EXPECT_FALSE(ranvier::base64_decode("Zm9-YmFy").has_value());
+    EXPECT_FALSE(ranvier::base64_decode("Zm9_YmFy").has_value());
+}
+
+TEST(Base64Decode, RejectsWhitespace) {
+    // K8s API responses don't wrap base64; whitespace inside is malformed.
+    EXPECT_FALSE(ranvier::base64_decode("Zm9v YmFy").has_value());
+    EXPECT_FALSE(ranvier::base64_decode("Zm9vYmFy\n").has_value());
+}
+
+TEST(Base64Decode, RejectsPaddingInMiddle) {
+    // Padding may only appear at the end of the input.
+    EXPECT_FALSE(ranvier::base64_decode("Zm==Zm9v").has_value());
+}
+
+TEST(Base64Decode, RejectsBadPaddingPattern) {
+    // The pattern "X=X=" (data, pad, data, pad) is invalid — if the third
+    // character is padding, the fourth must be too.
+    EXPECT_FALSE(ranvier::base64_decode("Zm=v").has_value());
+}
+
+TEST(Base64Decode, BinaryRoundTrip) {
+    // Decoded output may contain arbitrary bytes including nulls.
+    auto r = ranvier::base64_decode("AAEC/w==");  // 0x00, 0x01, 0x02, 0xFF
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 4u);
+    EXPECT_EQ(static_cast<unsigned char>((*r)[0]), 0x00);
+    EXPECT_EQ(static_cast<unsigned char>((*r)[1]), 0x01);
+    EXPECT_EQ(static_cast<unsigned char>((*r)[2]), 0x02);
+    EXPECT_EQ(static_cast<unsigned char>((*r)[3]), 0xFF);
+}

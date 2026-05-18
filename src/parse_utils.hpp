@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -334,6 +335,69 @@ inline std::optional<std::string_view> extract_bearer_token(std::string_view aut
         return auth_header_value.substr(BEARER_PREFIX.size());
     }
     return std::nullopt;
+}
+
+// =============================================================================
+// Base64 Decoding
+// =============================================================================
+
+/**
+ * Decode a standard base64 string (RFC 4648). Used to unwrap K8s Secret
+ * `data` fields, which are always base64-encoded UTF-8 strings.
+ *
+ * Accepts canonical base64 with `=` padding. Rejects URL-safe base64
+ * (`-` and `_`) and whitespace inside the input — K8s never produces those.
+ *
+ * Returns std::nullopt for any malformed input (bad characters, wrong
+ * length). On success returns the decoded bytes; the result may contain
+ * arbitrary bytes including nulls (caller decides whether to treat as text).
+ *
+ * @param input Base64-encoded string (no leading/trailing whitespace)
+ * @return Decoded bytes, or std::nullopt if input is malformed
+ */
+inline std::optional<std::string> base64_decode(std::string_view input) {
+    if (input.size() % 4 != 0) return std::nullopt;
+
+    // Lookup table: ASCII -> 6-bit value, or 0xFF for invalid characters.
+    // Built once at static-init time. '=' (padding) maps to 0xFE so we can
+    // distinguish it from invalid characters.
+    static constexpr auto table = [] {
+        std::array<uint8_t, 256> t{};
+        for (auto& v : t) v = 0xFF;
+        for (uint8_t i = 0; i < 26; ++i) {
+            t['A' + i] = i;
+            t['a' + i] = 26 + i;
+        }
+        for (uint8_t i = 0; i < 10; ++i) t['0' + i] = 52 + i;
+        t['+'] = 62;
+        t['/'] = 63;
+        t['='] = 0xFE;
+        return t;
+    }();
+
+    std::string out;
+    out.reserve((input.size() / 4) * 3);
+
+    for (size_t i = 0; i < input.size(); i += 4) {
+        uint8_t a = table[static_cast<uint8_t>(input[i])];
+        uint8_t b = table[static_cast<uint8_t>(input[i + 1])];
+        uint8_t c = table[static_cast<uint8_t>(input[i + 2])];
+        uint8_t d = table[static_cast<uint8_t>(input[i + 3])];
+
+        // First two chars must be data, never padding.
+        if (a == 0xFF || a == 0xFE || b == 0xFF || b == 0xFE) return std::nullopt;
+        if (c == 0xFF || d == 0xFF) return std::nullopt;
+        // Padding is only allowed at the end (last quartet).
+        bool last = (i + 4 == input.size());
+        if (!last && (c == 0xFE || d == 0xFE)) return std::nullopt;
+        // If c is padding, d must also be padding (= pattern: XX==).
+        if (c == 0xFE && d != 0xFE) return std::nullopt;
+
+        out.push_back(static_cast<char>((a << 2) | (b >> 4)));
+        if (c != 0xFE) out.push_back(static_cast<char>(((b & 0x0F) << 4) | (c >> 2)));
+        if (d != 0xFE) out.push_back(static_cast<char>(((c & 0x03) << 6) | d));
+    }
+    return out;
 }
 
 } // namespace ranvier

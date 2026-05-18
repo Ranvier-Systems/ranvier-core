@@ -6,8 +6,13 @@
 // - Maps Kubernetes annotations to Ranvier's weight/priority settings
 //
 // Annotations:
-//   ranvier.io/weight: "200"   - Backend weight (default: 100)
-//   ranvier.io/priority: "1"   - Priority group (default: 0, lower = higher priority)
+//   ranvier.io/weight: "200"                    - Backend weight (default: 100)
+//   ranvier.io/priority: "1"                    - Priority group (default: 0)
+//   ranvier.io/backend-type: "cerebras"         - BackendType tag (default: vllm)
+//   ranvier.io/api-key-secret-ref: "my-secret"  - Name of a K8s Secret in the
+//                                                  same namespace whose `api-key`
+//                                                  field holds the credential
+//                                                  forwarded as Authorization: Bearer.
 
 #pragma once
 
@@ -44,6 +49,14 @@ inline seastar::logger log_k8s("ranvier.k8s");
 // Annotation keys for weight and priority
 constexpr const char* K8S_ANNOTATION_WEIGHT = "ranvier.io/weight";
 constexpr const char* K8S_ANNOTATION_PRIORITY = "ranvier.io/priority";
+// Annotation keys for heterogeneous-backend support (see BACKLOG §19).
+constexpr const char* K8S_ANNOTATION_BACKEND_TYPE = "ranvier.io/backend-type";
+constexpr const char* K8S_ANNOTATION_API_KEY_SECRET_REF = "ranvier.io/api-key-secret-ref";
+
+// Conventional Secret data-map field that holds the API key. Operators run
+//   kubectl create secret generic my-key --from-literal=api-key=sk-...
+// to provision a credential consumable via api-key-secret-ref.
+constexpr const char* K8S_SECRET_API_KEY_FIELD = "api-key";
 
 // Default values
 constexpr uint32_t K8S_DEFAULT_WEIGHT = 100;
@@ -75,6 +88,14 @@ struct K8sEndpoint {
     bool ready;                           // Ready for traffic
     uint32_t weight = K8S_DEFAULT_WEIGHT;
     uint32_t priority = K8S_DEFAULT_PRIORITY;
+    // Heterogeneous-backend metadata. Default `VLLM` matches the historical
+    // assumption baked into the rest of the codebase.
+    BackendType type = BackendType::VLLM;
+    // Name of a K8s Secret whose `api-key` field holds the credential.
+    // Empty string means "no auth header" — correct for vLLM on a cluster-
+    // internal network. The Secret value is resolved at endpoint-discovery
+    // time and never stored on this struct (only the reference is).
+    std::string api_key_secret_ref;
 
     // Generate a stable BackendId from the endpoint
     // Uses FNV-1a 64-bit hash for quality distribution, truncated to 31 bits (positive int32_t).
@@ -86,9 +107,11 @@ struct K8sEndpoint {
     }
 };
 
-// Callback types for router integration
+// Callback types for router integration. `type` and `api_key` were added for
+// heterogeneous-fleet support — callers that don't care can pass VLLM/"".
 using BackendRegisterCallback = std::function<seastar::future<>(
-    BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority)>;
+    BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
+    BackendType type, std::string api_key)>;
 using BackendDrainCallback = std::function<seastar::future<>(BackendId id)>;
 
 // K8sDiscoveryService: Watches Kubernetes for GPU backend endpoints
@@ -208,6 +231,12 @@ private:
     seastar::future<> handle_endpoint_removed(std::string uid);
     seastar::future<> handle_endpoint_modified(K8sEndpoint endpoint);
 
+    // Resolve the endpoint's api-key Secret (if any) and invoke the
+    // register callback. Logs and returns without registering if the
+    // Secret can't be resolved. Centralises the secret-fetch + register
+    // dance shared between handle_endpoint_added and handle_endpoint_modified.
+    seastar::future<> register_with_secret(const K8sEndpoint& endpoint, BackendId backend_id);
+
     // Reconcile current state with discovered endpoints
     seastar::future<> reconcile(std::vector<K8sEndpoint> discovered);
 
@@ -215,6 +244,13 @@ private:
     seastar::future<std::string> k8s_get(std::string path);
     seastar::future<> k8s_watch(std::string path,
                                 std::function<seastar::future<bool>(const std::string&)> on_event);
+
+    // Fetch the `api-key` field from a namespace-local Secret. Returns the
+    // decoded value, or std::nullopt on any failure (404, RBAC denied,
+    // malformed JSON, missing/empty `api-key` field, base64 decode error).
+    // Used at endpoint-discovery time to resolve `ranvier.io/api-key-secret-ref`.
+    // The returned string is never logged.
+    seastar::future<std::optional<std::string>> fetch_secret_api_key(std::string secret_name);
 
     // Build full URL for K8s API endpoint
     std::string build_url(const std::string& path) const;

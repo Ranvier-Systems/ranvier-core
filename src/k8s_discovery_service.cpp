@@ -671,6 +671,66 @@ seastar::future<std::string> K8sDiscoveryService::k8s_get(std::string path) {
     }
 }
 
+seastar::future<std::optional<std::string>>
+K8sDiscoveryService::fetch_secret_api_key(std::string secret_name) {
+    // GET /api/v1/namespaces/{ns}/secrets/{name} — same auth path as the
+    // EndpointSlice watcher. We deliberately never log the resolved value;
+    // log statements here mention only the secret NAME, which is benign
+    // (it's also visible in the EndpointSlice annotation).
+    std::string path = "/api/v1/namespaces/" + _config.namespace_name
+                     + "/secrets/" + secret_name;
+    std::string body;
+    try {
+        body = co_await k8s_get(path);
+    } catch (const std::exception& e) {
+        log_k8s.warn("Secret '{}': K8s API fetch failed: {}", secret_name, e.what());
+        co_return std::nullopt;
+    }
+
+    // Parse the Secret JSON. K8s shape:
+    //   { "kind": "Secret", "data": { "api-key": "<base64>" }, ... }
+    rapidjson::Document doc;
+    doc.Parse(body.data(), body.size());
+    if (doc.HasParseError() || !doc.IsObject()) {
+        log_k8s.warn("Secret '{}': response JSON is malformed", secret_name);
+        co_return std::nullopt;
+    }
+    // K8s returns a Status object with kind="Status" on RBAC denial / 404.
+    if (doc.HasMember("kind") && doc["kind"].IsString()
+            && std::string_view(doc["kind"].GetString()) == "Status") {
+        const char* msg = doc.HasMember("message") && doc["message"].IsString()
+                              ? doc["message"].GetString() : "unknown";
+        log_k8s.warn("Secret '{}': K8s API returned Status (likely 404 or RBAC denied): {}",
+                     secret_name, msg);
+        co_return std::nullopt;
+    }
+    if (!doc.HasMember("data") || !doc["data"].IsObject()) {
+        log_k8s.warn("Secret '{}': response has no 'data' object", secret_name);
+        co_return std::nullopt;
+    }
+    const auto& data = doc["data"];
+    if (!data.HasMember(K8S_SECRET_API_KEY_FIELD)
+            || !data[K8S_SECRET_API_KEY_FIELD].IsString()) {
+        log_k8s.warn("Secret '{}': missing or non-string '{}' field "
+                     "(operators must create the secret with --from-literal=api-key=...)",
+                     secret_name, K8S_SECRET_API_KEY_FIELD);
+        co_return std::nullopt;
+    }
+    const char* encoded = data[K8S_SECRET_API_KEY_FIELD].GetString();
+    auto decoded = base64_decode(std::string_view(encoded));
+    if (!decoded) {
+        log_k8s.warn("Secret '{}': '{}' field is not valid base64",
+                     secret_name, K8S_SECRET_API_KEY_FIELD);
+        co_return std::nullopt;
+    }
+    if (decoded->empty()) {
+        log_k8s.warn("Secret '{}': '{}' field decodes to empty value",
+                     secret_name, K8S_SECRET_API_KEY_FIELD);
+        co_return std::nullopt;
+    }
+    co_return std::optional<std::string>(std::move(*decoded));
+}
+
 seastar::future<> K8sDiscoveryService::sync_endpoints() {
     if (!_running) {
         co_return;
@@ -838,27 +898,57 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_added(K8sEndpoint endpoin
     }
     _backend_id_to_uid[backend_id] = endpoint.uid;
 
-    log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, ready={}, backend_id={})",
+    log_k8s.info("K8s endpoint added: {} ({}:{}, weight={}, priority={}, type={}, "
+                 "secret_ref={}, ready={}, backend_id={})",
                  endpoint.uid, endpoint.address, endpoint.port,
-                 endpoint.weight, endpoint.priority, endpoint.ready, backend_id);
+                 endpoint.weight, endpoint.priority,
+                 backend_type_to_string(endpoint.type),
+                 endpoint.api_key_secret_ref.empty() ? "<none>"
+                                                    : endpoint.api_key_secret_ref.c_str(),
+                 endpoint.ready, backend_id);
 
     _endpoints[endpoint.uid] = endpoint;
     ++_endpoints_added;
 
     // Only register ready endpoints
     if (endpoint.ready && _register_callback) {
-        try {
-            seastar::net::inet_address inet_addr(endpoint.address);
-            seastar::socket_address addr(inet_addr, endpoint.port);
-
-            co_await _register_callback(backend_id, addr,
-                                         endpoint.weight, endpoint.priority);
-        } catch (const std::exception& e) {
-            log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
-        }
+        co_await register_with_secret(endpoint, backend_id);
     }
 
     co_return;
+}
+
+seastar::future<> K8sDiscoveryService::register_with_secret(
+        const K8sEndpoint& endpoint, BackendId backend_id) {
+    // Resolve the credential before registering. Same posture as the
+    // static-config YAML path: if the secret-ref is set but unresolvable,
+    // skip registration with a warn rather than register a backend that
+    // 401s on every request. Empty ref means "no auth" (correct for vLLM
+    // on a trusted cluster network).
+    std::string api_key;
+    if (!endpoint.api_key_secret_ref.empty()) {
+        auto resolved = co_await fetch_secret_api_key(endpoint.api_key_secret_ref);
+        if (!resolved) {
+            log_k8s.warn("Backend {} ({}): Secret '{}' could not be resolved — "
+                         "skipping registration. Check that the Secret exists, has an "
+                         "'api-key' field, and that the ServiceAccount has 'get' on "
+                         "secrets in this namespace.",
+                         endpoint.uid, backend_type_to_string(endpoint.type),
+                         endpoint.api_key_secret_ref);
+            co_return;
+        }
+        api_key = std::move(*resolved);
+    }
+    try {
+        seastar::net::inet_address inet_addr(endpoint.address);
+        seastar::socket_address addr(inet_addr, endpoint.port);
+
+        co_await _register_callback(backend_id, addr,
+                                     endpoint.weight, endpoint.priority,
+                                     endpoint.type, std::move(api_key));
+    } catch (const std::exception& e) {
+        log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
+    }
 }
 
 seastar::future<> K8sDiscoveryService::handle_endpoint_removed(std::string uid) {
@@ -908,17 +998,12 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(K8sEndpoint endp
     _endpoints[endpoint.uid] = endpoint;
 
     if (endpoint.ready && !was_ready) {
-        // Became ready - register
+        // Became ready - register (re-resolves the Secret if a ref is set;
+        // this is also the rotation path — change the Secret value and bounce
+        // the pod's readiness to pick up the new credential without restarting
+        // Ranvier).
         if (_register_callback) {
-            try {
-                seastar::net::inet_address inet_addr(endpoint.address);
-                seastar::socket_address addr(inet_addr, endpoint.port);
-
-                co_await _register_callback(backend_id, addr,
-                                             endpoint.weight, endpoint.priority);
-            } catch (const std::exception& e) {
-                log_k8s.error("Failed to register backend for {}: {}", endpoint.uid, e.what());
-            }
+            co_await register_with_secret(endpoint, backend_id);
         }
     } else if (!endpoint.ready && was_ready) {
         // Became not ready - drain
@@ -930,17 +1015,12 @@ seastar::future<> K8sDiscoveryService::handle_endpoint_modified(K8sEndpoint endp
             }
         }
     } else if (endpoint.ready) {
-        // Still ready but weight/priority changed - re-register
+        // Still ready but weight/priority/type/secret-ref changed — re-register.
+        // Re-resolves the Secret on every modify so an operator can rotate the
+        // credential by `kubectl edit secret` followed by a touch-annotation
+        // on the EndpointSlice.
         if (_register_callback) {
-            try {
-                seastar::net::inet_address inet_addr(endpoint.address);
-                seastar::socket_address addr(inet_addr, endpoint.port);
-
-                co_await _register_callback(backend_id, addr,
-                                             endpoint.weight, endpoint.priority);
-            } catch (const std::exception& e) {
-                log_k8s.error("Failed to update backend for {}: {}", endpoint.uid, e.what());
-            }
+            co_await register_with_secret(endpoint, backend_id);
         }
     }
 
@@ -1114,8 +1194,10 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
 
     uint32_t base_weight = K8S_DEFAULT_WEIGHT;
     uint32_t base_priority = K8S_DEFAULT_PRIORITY;
+    BackendType base_type = BackendType::VLLM;
+    std::string base_secret_ref;
 
-    // 1. Extract Annotations (Weight/Priority)
+    // 1. Extract Annotations (Weight/Priority/Type/SecretRef)
     if (doc.HasMember("metadata") && doc["metadata"].IsObject()) {
         const auto& meta = doc["metadata"];
         if (meta.HasMember("annotations") && meta["annotations"].IsObject()) {
@@ -1151,6 +1233,24 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
                     log_k8s.warn("Invalid '{}' annotation value '{}' - using default {}",
                                  K8S_ANNOTATION_PRIORITY, priority_str, base_priority);
                 }
+            }
+            // Heterogeneous-backend annotations. Parsed here so the values
+            // propagate to every endpoint in this EndpointSlice.
+            if (ann.HasMember(K8S_ANNOTATION_BACKEND_TYPE)
+                    && ann[K8S_ANNOTATION_BACKEND_TYPE].IsString()) {
+                const char* type_str = ann[K8S_ANNOTATION_BACKEND_TYPE].GetString();
+                auto type_opt = parse_backend_type(std::string_view(type_str));
+                if (type_opt) {
+                    base_type = *type_opt;
+                } else {
+                    log_k8s.warn("Annotation '{}' has unknown value '{}' - defaulting to vllm "
+                                 "(valid: vllm, sglang, trt_llm, ollama, lm_studio, cerebras, openai_compatible)",
+                                 K8S_ANNOTATION_BACKEND_TYPE, type_str);
+                }
+            }
+            if (ann.HasMember(K8S_ANNOTATION_API_KEY_SECRET_REF)
+                    && ann[K8S_ANNOTATION_API_KEY_SECRET_REF].IsString()) {
+                base_secret_ref = ann[K8S_ANNOTATION_API_KEY_SECRET_REF].GetString();
             }
         }
     }
@@ -1194,6 +1294,8 @@ std::vector<K8sEndpoint> K8sDiscoveryService::parse_endpoint_slice(const rapidjs
                         endpoint.ready = ready;
                         endpoint.weight = base_weight;
                         endpoint.priority = base_priority;
+                        endpoint.type = base_type;
+                        endpoint.api_key_secret_ref = base_secret_ref;
                         endpoints.push_back(std::move(endpoint));
                     }
                 }
