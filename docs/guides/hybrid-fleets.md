@@ -1,6 +1,8 @@
 # Hybrid Fleets
 
-This guide walks operators through running Ranvier in front of a mixed fleet: some backends are GPU-based (vLLM, SGLang, TensorRT-LLM) with KV caches that benefit from prefix-affinity routing, and some are remote-API backends (Cerebras, OpenAI-compatible) that don't. Ranvier handles both in the same configuration — the same admin API, the same metrics, the same circuit breakers — but applies the prefix-affinity optimisations only where they earn anything.
+This guide walks operators through running Ranvier in front of a mixed fleet: some backends are self-hosted instances Ranvier can address directly (vLLM, SGLang, TensorRT-LLM) and benefit from prefix-affinity routing, and some are managed-API endpoints (Cerebras, OpenAI-compatible) where every request goes to a single URL that the provider's own scheduler load-balances internally. Ranvier handles both in the same configuration — the same admin API, the same metrics, the same circuit breakers — but applies prefix-affinity routing only to the backends whose physical instances it can actually pin requests to.
+
+A common misconception worth dispelling upfront: managed-API backends like Cerebras *do* have KV caches (every autoregressive transformer does; on Cerebras the cache lives in on-wafer SRAM rather than GPU HBM). The reason prefix-affinity earns nothing on them isn't the absence of a cache — it's that the endpoint is opaque, so Ranvier can't influence which physical instance handles a given request. Cache locality, where possible, is the provider's internal concern.
 
 ## When you want this
 
@@ -8,14 +10,14 @@ This guide walks operators through running Ranvier in front of a mixed fleet: so
 - You have a heterogeneous fleet split by priority tier: GPU for interactive traffic, remote API for batch or low-priority traffic.
 - You want a single ingress with one admin API, one Prometheus endpoint, one rate-limiter, one routing layer — regardless of how requests are ultimately served.
 
-## What a "non-cacheable" backend means here
+## What an opaque-endpoint backend means here
 
-[`prefix-affinity-routing.md`](../internals/prefix-affinity-routing.md#backend-type-applicability) has the full truth table. Practically, two things are different about a non-cacheable backend in a Ranvier fleet:
+[`prefix-affinity-routing.md`](../internals/prefix-affinity-routing.md#backend-type-applicability) has the full truth table. Practically, two things are different about a managed-API backend in a Ranvier fleet:
 
-1. **No route is learned for it.** When Ranvier proxies a request to a backend with no KV cache, it skips the post-success "remember that prefix P went to backend B" step. Cache-hit-rate counters and TTFT-improvement numbers don't accrue against this traffic.
-2. **No `/metrics` is scraped from it.** Ranvier's vLLM-shaped Prometheus scrape is skipped. The backend's load score stays at `0.0`, so it looks idle to the load-aware router and tends to attract more traffic. Usually fine — non-cacheable backends are typically remote APIs whose pitch is "no queueing" — but it's worth understanding.
+1. **No route is learned for it.** When Ranvier proxies a request to a backend the provider load-balances internally, it skips the post-success "remember that prefix P went to backend B" step. An ART entry pointing at `api.cerebras.ai` would just mean "send this prefix to the same opaque URL we already send everything to" — which earns nothing. Cache-hit-rate counters and TTFT-improvement numbers don't accrue against this traffic, but the provider's internal scheduler may still be doing cache reuse on its side — it's just not observable to us.
+2. **No `/metrics` is scraped from it.** Ranvier's vLLM-shaped Prometheus scrape is skipped (the schema is vLLM-specific). The backend's load score stays at `0.0`, so it looks idle to the load-aware router and tends to attract more traffic. Usually acceptable — managed-API providers absorb the implied skew via their own internal scheduling and capacity — but worth understanding.
 
-Everything else — rate limiting per agent, circuit breaking per backend, fair scheduling across priority tiers, request retries, agent-priority overrides, API-key forwarding — works identically across both classes.
+Everything else — rate limiting per agent, circuit breaking per backend, fair scheduling across priority tiers, request retries, agent-priority overrides, API-key forwarding — works identically across both classes. This is the strategic value: one control plane, one set of operational concerns, regardless of which physical backend ultimately runs the inference.
 
 ## A working configuration
 
@@ -44,8 +46,11 @@ backends:
     type: vllm
     weight: 100
 
-  # Overflow / burst capacity. Cerebras has no KV cache and no Prometheus
-  # endpoint — ART learning and metrics scraping both stay off.
+  # Overflow / burst capacity. Cerebras is a managed-API endpoint —
+  # ART learning is off (every request hits the same opaque URL,
+  # so prefix-affinity earns nothing here even though Cerebras's
+  # internal scheduler still does cache reuse) and the vLLM-shaped
+  # /metrics scrape is off (different exposition format).
   # Lower weight nudges hash routing to land here less often.
   - id: 101
     host: api.cerebras.ai
@@ -87,7 +92,7 @@ Backends without `api_key_env` register normally and receive no auth header — 
 
 ## Performance expectations
 
-Ranvier's headline benchmark numbers (e.g. README's "44% faster TTFT" on Llama-3.1-70B, the "~49% → 81%" cache-hit rate in [`prefix-affinity-routing.md`](../internals/prefix-affinity-routing.md)) measure the prefix-affinity routing benefit on **cacheable** backends. They do not credit Ranvier for anything happening on a Cerebras / OpenAI-compatible backend in a hybrid fleet — the latency on that traffic is dominated by the remote service, not by Ranvier's routing layer.
+Ranvier's headline benchmark numbers (e.g. README's "44% faster TTFT" on Llama-3.1-70B, the "~49% → 81%" cache-hit rate in [`prefix-affinity-routing.md`](../internals/prefix-affinity-routing.md)) measure what prefix-affinity routing earns when Ranvier can actually steer requests to specific physical backends. They do not credit Ranvier for anything happening on a managed-API backend in a hybrid fleet, because Ranvier doesn't choose which Cerebras (or OpenAI, or other managed) instance handles a request — the provider's internal scheduler does, and any cache reuse there is invisible to us. Reporting the prefix-affinity headline for traffic that landed on a managed backend would be miscredited.
 
 When measuring a hybrid fleet:
 
@@ -95,7 +100,7 @@ When measuring a hybrid fleet:
 - Use the `X-Backend-ID` response header to attribute each request to a specific backend in your post-processing.
 - The `router_cache_hits` and `router_cache_misses` counters are per-shard and per-backend; aggregate them with the `backend` label intact for per-class breakdowns.
 
-A reasonable summary for an external audience: *"Ranvier gives you ~50% → ~80% cache hit rate on your vLLM fleet; the Cerebras endpoint behind the same ingress benefits from rate-limiting, circuit-breaking, and fair scheduling but not from prefix-affinity routing — by design."*
+A reasonable summary for an external audience: *"Ranvier delivers ~50% → ~80% cache hit rate on the self-hosted GPU pool, where it controls per-instance routing. The Cerebras endpoint behind the same ingress shares the rate-limiting, circuit-breaking, agent priorities, observability, and unified control plane, but not the prefix-affinity benefit — that requires per-instance addressability, which a managed API doesn't expose."*
 
 ## Observability for hybrid fleets
 
@@ -145,7 +150,7 @@ A Pod restart (rolling deployment, readiness flip) also re-triggers the registra
 
 ## What doesn't work yet
 
-- **Per-deployment ART-learning opt-out.** Today, ART learning is a type-level decision (`cerebras` opts out, everything else opts in). If you have an OpenAI-compatible shim that doesn't cache, you can't yet flag it as "no-cache" without modifying the type — this is on the roadmap.
+- **Per-deployment ART-learning opt-out.** Today, ART learning is a type-level decision (`cerebras` opts out, everything else opts in). If you front a managed OpenAI-compatible API where Ranvier can't influence per-instance routing, you currently can't tag it as "no-learn" without classifying it as `cerebras`. A per-deployment opt-out flag is on the roadmap.
 - **Multiple credentials per backend.** Each backend can have one `api_key_env` / `api-key-secret-ref`; we don't support rotating two keys for blue/green or signing requests with two headers.
 - **Live key reload for static-YAML backends.** Changing the env var after Ranvier is running has no effect on backends registered via the `backends:` YAML block. Restart to pick up new credentials. K8s-discovered backends *do* support rotation via the annotation-touch pattern above.
 - **Custom Secret field names.** The `api-key-secret-ref` annotation always reads the conventional `api-key` field from the Secret. If you need to point at a different field in an existing multi-field Secret, that's a future enhancement.
