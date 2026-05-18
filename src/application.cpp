@@ -602,6 +602,16 @@ seastar::future<> Application::register_static_backends() {
                 api_key.assign(val);
             }
 
+            // Install the key first, then register the backend. HTTP isn't
+            // listening yet at startup, so the race-window concern that
+            // motivates this ordering in the K8s discovery path doesn't
+            // apply here — but keeping the order consistent across both
+            // call sites makes the "key-before-backend" invariant easy to
+            // reason about.
+            if (!api_key.empty()) {
+                co_await _router->set_backend_api_key_global(sb.id, std::move(api_key));
+            }
+
             co_await _router->register_backend_global(
                 sb.id, addr, sb.weight, sb.priority,
                 // CEREBRAS / OPENAI_COMPATIBLE are auto-downgraded to false
@@ -611,10 +621,6 @@ seastar::future<> Application::register_static_backends() {
                 // via local-discovery, not static config.
                 /*supports_token_ids=*/true,
                 sb.compression_ratio, sb.type);
-
-            if (!api_key.empty()) {
-                co_await _router->set_backend_api_key_global(sb.id, std::move(api_key));
-            }
 
             // Log without the key. api_key_env name is fine — it's not the secret.
             log_main.info("Static backend {} ({}) -> {} (weight={}, priority={}, api_key_env={})",
@@ -654,15 +660,23 @@ void Application::init_k8s_discovery() {
     // come from EndpointSlice annotations (ranvier.io/backend-type and
     // ranvier.io/api-key-secret-ref); both default to vLLM / empty for the
     // historical homogeneous-fleet case.
+    //
+    // Ordering: set the key BEFORE registering the backend. Each call is a
+    // parallel_for_each broadcast that resolves only when every shard has
+    // applied the change. By installing the key first, no shard sees the
+    // backend in `state.backends` without also having the key in the side-
+    // map — which would otherwise produce 401s on the first few requests
+    // landing in the microseconds between the two broadcasts (HTTP is
+    // listening when K8s discovery fires events, so this window is real).
     _k8s_discovery->set_register_callback(
         [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
                BackendType type, std::string api_key) -> seastar::future<> {
-            co_await _router->register_backend_global(id, addr, weight, priority,
-                                                       /*supports_token_ids=*/true,
-                                                       /*compression_ratio=*/1.0, type);
             if (!api_key.empty()) {
                 co_await _router->set_backend_api_key_global(id, std::move(api_key));
             }
+            co_await _router->register_backend_global(id, addr, weight, priority,
+                                                       /*supports_token_ids=*/true,
+                                                       /*compression_ratio=*/1.0, type);
         });
     _k8s_discovery->set_drain_callback(
         [this](BackendId id) {
