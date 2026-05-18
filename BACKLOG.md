@@ -913,12 +913,13 @@ audit doc.
 
 ### 19.5 Documentation
 
-- [ ] **[P3] Document hybrid-fleet operating model**
+- [x] **[P3] Document hybrid-fleet operating model**
   _Context:_ The marketing/positioning story for hybrid fleets is the actual deliverable — the engineering changes are small. Without docs that clearly state "prefix-affinity routing is a no-op on Cerebras backends; we still give you rate limiting / circuit breaking / fair scheduling," operators will set up the wrong expectations.
   _Approach:_ Add a section to `docs/internals/prefix-affinity-routing.md` describing which backend types benefit from ART learning and which don't. Add a top-level "Hybrid fleets" page (or section) walking through a representative GPU + Cerebras config. Note explicitly that benchmarks should not credit Ranvier with the "48% faster TTFT" headline on non-cacheable backends.
   _Location:_ `docs/internals/prefix-affinity-routing.md`, new doc page
   _Complexity:_ Low
   _Dependencies:_ 19.1, 19.2, 19.4
+  _Completed 2026-05-17 (12ff1ae):_ Added a "Backend Type Applicability" subsection to `docs/internals/prefix-affinity-routing.md` that tabulates each `BackendType` against three independent gates (ART learning via `should_cache_routes_for`, vLLM `/metrics` scrape, `prompt_token_ids` forwarding) and points to the enforcement sites in the codebase. Caveated the benchmark-results block immediately below so non-cacheable backends in hybrid fleets don't accidentally take credit for the cache-hit / TTFT headlines. Created `docs/guides/hybrid-fleets.md` as the operator-facing top-level page: covers when to use a hybrid fleet, a working ranvier.yaml stanza (vLLM cluster + Cerebras overflow with `api_key_env`), the credential-handling rules (env-resolved at startup, never logged, never persisted, restart-to-rotate), the one-line `info` log emitted at registration time for non-VLLM-under-load-aware-routing, expectations on the zero-load assumption, a Prometheus metrics table for hybrid-fleet observability (including the correct claim that `router_cache_hits` is shard-aggregate, NOT per-backend labeled — use `X-Backend-ID` for per-backend attribution), and a "what doesn't work yet" section listing per-deployment ART-learning opt-out, multi-credential per backend, live key reload, and the absence of a first-class `api_key_secret_ref` field (which §19.4 follow-up "K8s annotation for backend type" would deliver). Cross-references wired in both directions; `ranvier.yaml.example` and `.dev-context/claude-context.md` docs map updated to point at the new material.
 
 ---
 
