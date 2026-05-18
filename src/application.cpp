@@ -567,13 +567,13 @@ seastar::future<> Application::register_static_backends() {
                     + std::chrono::seconds(_config.server.dns_resolution_timeout_seconds);
                 auto hostent = co_await seastar::with_timeout(
                     deadline, seastar::net::dns::get_host_by_name(sb.host));
-                if (hostent.addr_list.empty()) {
+                if (hostent.addr_entries.empty()) {
                     log_main.warn("Static backend {}: DNS returned no addresses for '{}' — skipping",
                                   sb.id, sb.host);
                     ++failed;
                     continue;
                 }
-                addr = seastar::socket_address(hostent.addr_list[0], sb.port);
+                addr = seastar::socket_address(hostent.addr_entries[0], sb.port);
             }
 
             // Resolve the API key before registering — if the env var is
