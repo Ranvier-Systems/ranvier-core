@@ -108,12 +108,47 @@ A reasonable summary for an external audience: *"Ranvier gives you ~50% → ~80%
 | `ranvier_backend_active_requests` | Per-backend gauge | In-flight count per backend. Non-cacheable backends still report inflight load here — only the *load score* (derived from the vLLM `/metrics` scrape) is zero. |
 | `X-Backend-ID` response header | Per-request | Which backend served the request. The single most useful field for per-backend post-hoc attribution. |
 
+## K8s-native equivalent
+
+If you're discovering your fleet via Kubernetes EndpointSlices (the `k8s_discovery` path) rather than static YAML, you don't need a `backends:` block at all. Tag the EndpointSlice with two annotations and Ranvier picks up both the type and the credential:
+
+```yaml
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: cerebras-overflow
+  annotations:
+    ranvier.io/backend-type: cerebras
+    ranvier.io/api-key-secret-ref: cerebras-prod-key
+    ranvier.io/weight: "50"
+    ranvier.io/priority: "1"
+  ...
+```
+
+Provision the Secret with the conventional `api-key` field:
+
+```bash
+kubectl create secret generic cerebras-prod-key \
+  --from-literal=api-key="$CEREBRAS_API_KEY"
+```
+
+When Ranvier processes the EndpointSlice, it fetches the Secret via the K8s API, decodes the `api-key` field, and pushes it to the same per-shard side-map the static-YAML path writes to. The auth-header injection at the proxy hot path is identical regardless of how the key arrived.
+
+**RBAC requirement.** The default Helm chart now grants `secrets: [get]` (no `list`/`watch`) to the discovery Role. If you provision RBAC yourself, add this rule to the existing Role; if no backend in your fleet uses the annotation, the rule can be omitted (Ranvier will start fine, but those backends will be skipped with a warn).
+
+**Credential rotation.** There's no Secret watcher — Ranvier reads the Secret once per backend registration. To rotate a key without restarting:
+1. `kubectl edit secret <name>` to update the `api-key` field.
+2. Touch any annotation on the EndpointSlice (e.g. `kubectl annotate endpointslice <name> ranvier.io/rotate="$(date +%s)" --overwrite`) to force a `MODIFIED` event.
+3. Ranvier's `handle_endpoint_modified` re-fetches the Secret and pushes the new value to the side-map.
+
+A Pod restart (rolling deployment, readiness flip) also re-triggers the registration path. Both work; choose whichever fits your existing rotation tooling.
+
 ## What doesn't work yet
 
 - **Per-deployment ART-learning opt-out.** Today, ART learning is a type-level decision (`cerebras` opts out, everything else opts in). If you have an OpenAI-compatible shim that doesn't cache, you can't yet flag it as "no-cache" without modifying the type — this is on the roadmap.
-- **Multiple credentials per backend.** Each backend can have one `api_key_env`; we don't support rotating two keys for blue/green or signing requests with two headers.
-- **Live key reload.** Changing the env var after Ranvier is running has no effect. Restart to pick up new credentials.
-- **K8s Secret references.** `api_key_env` resolves to a process environment variable. K8s Secret-backed env vars work transparently (the kubelet does the substitution before Ranvier starts), but there's no first-class `api_key_secret_ref` schema field — yet.
+- **Multiple credentials per backend.** Each backend can have one `api_key_env` / `api-key-secret-ref`; we don't support rotating two keys for blue/green or signing requests with two headers.
+- **Live key reload for static-YAML backends.** Changing the env var after Ranvier is running has no effect on backends registered via the `backends:` YAML block. Restart to pick up new credentials. K8s-discovered backends *do* support rotation via the annotation-touch pattern above.
+- **Custom Secret field names.** The `api-key-secret-ref` annotation always reads the conventional `api-key` field from the Secret. If you need to point at a different field in an existing multi-field Secret, that's a future enhancement.
 
 ## See also
 
