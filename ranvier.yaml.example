@@ -501,6 +501,10 @@ telemetry:
 # register at every startup, after persistence replay (static config
 # wins on ID collision) and before discovery services start.
 #
+# Operator walkthrough: see docs/guides/hybrid-fleets.md for the full
+# story on running GPU and remote-API backends behind the same ingress,
+# including which Ranvier features apply per backend type.
+#
 # Required fields per entry: `id` (>0) and `host`. Everything else has
 # defaults. The optional `api_key_env` names an environment variable
 # whose value Ranvier forwards as `Authorization: Bearer <value>` on
