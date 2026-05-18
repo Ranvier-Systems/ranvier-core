@@ -567,13 +567,22 @@ seastar::future<> Application::register_static_backends() {
                     + std::chrono::seconds(_config.server.dns_resolution_timeout_seconds);
                 auto hostent = co_await seastar::with_timeout(
                     deadline, seastar::net::dns::get_host_by_name(sb.host));
-                if (hostent.addr_entries.empty()) {
+                // seastar::net::hostent::addr_list is deprecated in favour of
+                // addr_entries (which exposes address_entry structs instead of
+                // raw inet_address). The mirror call at
+                // http_controller.cpp:2491 suppresses the same warning the
+                // same way; uniform pragma keeps both call-sites trivially
+                // diffable until the codebase migrates to the new API.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                if (hostent.addr_list.empty()) {
                     log_main.warn("Static backend {}: DNS returned no addresses for '{}' — skipping",
                                   sb.id, sb.host);
                     ++failed;
                     continue;
                 }
-                addr = seastar::socket_address(hostent.addr_entries[0], sb.port);
+                addr = seastar::socket_address(hostent.addr_list[0], sb.port);
+#pragma GCC diagnostic pop
             }
 
             // Resolve the API key before registering — if the env var is
