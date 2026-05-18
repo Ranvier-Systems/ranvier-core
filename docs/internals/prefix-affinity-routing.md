@@ -23,8 +23,8 @@ Ranvier's `BackendType` enum (`src/types.hpp`) tags each registered backend. The
 | `trt_llm` | ✓ | ✗ | ✓ | KV cache reuse is the backend-side cache. |
 | `ollama` | ✓ | ✗ | ✗ | Has a KV cache; prefix affinity helps. No Prometheus endpoint. Does not accept `prompt_token_ids` — strip it at registration time. |
 | `lm_studio` | ✓ | ✗ | ✗ | Same shape as Ollama. |
-| `cerebras` | ✗ | ✗ | ✗ | Wafer-scale inference holds the whole model in on-chip SRAM with no per-request KV state to optimize for, so prefix affinity earns nothing. Auto-downgraded to `supports_token_ids=false` at registration. |
-| `openai_compatible` | ✓ | ✗ | ✗ | Catch-all for self-hosted shims (e.g. SGLang behind an OpenAI-compatible API). ART learning stays on because most shims wrap a backend with a real cache; opt out per-deployment if yours doesn't. Auto-downgraded to `supports_token_ids=false`. |
+| `cerebras` | ✗ | ✗ | ✗ | Cerebras has a KV cache like every autoregressive transformer; on the WSE it lives in on-wafer SRAM (~44 GB, ~21 PB/s) rather than GPU HBM. The reason ART learning is off isn't the absence of a cache — it's that requests go to a single managed-API URL (`api.cerebras.ai`) whose internal scheduler chooses which physical instance handles each request. Ranvier can't pin a prefix to a specific wafer, so an ART entry pointing at this backend means "send prefix P to the same opaque load balancer we already send everything to" — i.e. it earns nothing. Cache reuse, where possible, is handled inside Cerebras's own scheduler. Auto-downgraded to `supports_token_ids=false` at registration. |
+| `openai_compatible` | ✓ | ✗ | ✗ | Catch-all for self-hosted shims (e.g. SGLang behind an OpenAI-compatible API) where Ranvier IS the entity choosing which instance to hit. ART learning stays on for that reason; opt out per-deployment if your shim is an opaque managed API rather than a self-hosted instance. Auto-downgraded to `supports_token_ids=false`. |
 
 The truth table above is enforced in three places:
 
@@ -32,7 +32,7 @@ The truth table above is enforced in three places:
 - `HealthService::scrape_one_backend()` (`src/health_service.cpp`) gates the `/metrics` scrape.
 - `RouterService::register_backend_global()` (`src/router_service.cpp`) auto-downgrades `supports_token_ids` for `cerebras` and `openai_compatible`.
 
-For non-vLLM backends, `get_backend_load_score()` always returns `0.0` (no scrape signal). Under `load_aware_routing: true` this makes them look idle and attract more traffic — usually fine for backends whose pitch is no queueing (Cerebras), worth knowing for others. Ranvier emits a one-line `info` log at registration time for each non-VLLM backend under load-aware routing so this is visible to operators. See [Hybrid Fleets](../guides/hybrid-fleets.md) for the operator-facing walkthrough.
+For non-vLLM backends, `get_backend_load_score()` always returns `0.0` (no scrape signal). Under `load_aware_routing: true` this makes them look idle and attract more traffic — usually acceptable for managed-API backends where the provider absorbs the implied skew, worth knowing for self-hosted backends that don't expose vLLM-shaped metrics. Ranvier emits a one-line `info` log at registration time for each non-VLLM backend under load-aware routing so this is visible to operators. See [Hybrid Fleets](../guides/hybrid-fleets.md) for the operator-facing walkthrough.
 
 ## Overview
 
@@ -45,7 +45,7 @@ When multiple requests share a common prefix (e.g., the same system prompt), rou
 | Cache Hit Rate | ~49% | **81%** |
 | Routing Overhead | - | 0.15ms |
 
-These numbers assume backends that actually cache (the first five rows of the table above). Cerebras-class backends in a hybrid fleet do not contribute to either the cache-hit or the TTFT-improvement headline; their throughput is dominated by the backend's own performance characteristics, not by Ranvier's routing.
+These numbers measure what Ranvier's ART layer accomplishes when it can actually steer requests — i.e. when backends are individually addressable. Managed-API backends in a hybrid fleet (the `cerebras` row above) don't contribute to either the cache-hit or the TTFT-improvement headline: not because the backend has no cache, but because Ranvier can't influence which physical instance handles each request, so cache locality is the provider's concern, not ours.
 
 ## How It Works
 

@@ -513,10 +513,15 @@ telemetry:
 # in a broken state. Keys are never logged and never written to SQLite.
 #
 # `type` accepts: vllm (default), sglang, trt_llm, ollama, lm_studio,
-# cerebras, openai_compatible. Non-vLLM types skip prefix-affinity
-# learning and the vLLM /metrics scrape; under load_aware_routing they
-# appear as zero-load (see the operator info log emitted at
-# registration time).
+# cerebras, openai_compatible. Only the `cerebras` type opts out of
+# prefix-affinity ART learning — managed APIs route internally so
+# Ranvier can't pin a prefix to a specific instance. All other
+# non-vLLM types still learn routes (their backends have a KV cache
+# AND Ranvier controls per-instance routing). Only `vllm` is scraped
+# for /metrics; the other types are skipped because the Prometheus
+# exposition format is vLLM-specific. Under load_aware_routing, every
+# non-vllm backend appears as zero-load (see the operator info log
+# emitted at registration time).
 #
 # Maximum 64 entries (Rule #4). Hand-curate this list; auto-discovered
 # fleets belong under k8s_discovery: or local_mode:.

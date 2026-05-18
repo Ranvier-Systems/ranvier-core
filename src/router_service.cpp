@@ -2168,11 +2168,22 @@ bool RouterService::should_cache_routes_for(BackendId id) const {
     auto& state = shard_state();
     auto it = state.backends.find(id);
     if (it == state.backends.end()) return true;
-    // No-cache set: types where prefix affinity has no GPU KV cache to
-    // optimize for. OPENAI_COMPATIBLE is intentionally NOT here — it's a
-    // catch-all that includes self-hosted shims (e.g. SGLang behind an
-    // OpenAI-compatible API) which do have a cache; a per-deployment
-    // opt-out is the right tool for that, not a type-level rule.
+    // No-cache set: types where Ranvier can't usefully drive prefix
+    // affinity. The reason is routing opacity, not the absence of a
+    // backend cache — Cerebras and similar managed-API endpoints DO
+    // have a KV cache (every autoregressive transformer does; on
+    // Cerebras it lives in on-wafer SRAM, not GPU HBM), but the
+    // provider's own scheduler load-balances requests across instances
+    // we can't see or pin to. ART entries pointing at this BackendId
+    // would mean "send prefix P to api.cerebras.ai" — which we already
+    // do for every request to that backend regardless of ART state.
+    //
+    // OPENAI_COMPATIBLE is intentionally NOT here: it's a catch-all
+    // covering self-hosted shims (e.g. SGLang behind an OpenAI-
+    // compatible API) where Ranvier IS the one choosing which
+    // instance to hit, so affinity earns the usual benefit. A per-
+    // deployment opt-out is the right tool for the rare shim that
+    // doesn't cache, not a type-level rule.
     return it->second.type != BackendType::CEREBRAS;
 }
 
@@ -3610,9 +3621,12 @@ seastar::future<> RouterService::register_backend_global(BackendId id, seastar::
 
     // Operator warning: non-vLLM backends have no /metrics scrape, so
     // get_backend_load_score() always returns 0.0 for them. Under
-    // load_aware_routing they look idle and attract more traffic — fine
-    // for Cerebras (no queueing) but a footgun worth flagging once at
-    // registration time. Rule #17: not per-scrape, no log flood.
+    // load_aware_routing they look idle and attract more traffic.
+    // Usually acceptable for managed-API backends (Cerebras and
+    // similar) where the provider handles queueing internally and is
+    // sized to absorb the implied traffic skew — but it is a footgun
+    // worth surfacing once at registration time. Rule #17: not per-
+    // scrape, no log flood.
     if (type != BackendType::VLLM && g_shard_state
             && g_shard_state->config.load_aware_routing) {
         log_router.info("Backend {} ({}): metrics scraping disabled; "
