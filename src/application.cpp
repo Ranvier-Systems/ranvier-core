@@ -641,10 +641,19 @@ void Application::init_k8s_discovery() {
 
     _k8s_discovery = std::make_unique<K8sDiscoveryService>(build_k8s_config());
 
-    // Connect K8s discovery to router via callbacks
+    // Connect K8s discovery to router via callbacks. `type` and `api_key`
+    // come from EndpointSlice annotations (ranvier.io/backend-type and
+    // ranvier.io/api-key-secret-ref); both default to vLLM / empty for the
+    // historical homogeneous-fleet case.
     _k8s_discovery->set_register_callback(
-        [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority) {
-            return _router->register_backend_global(id, addr, weight, priority);
+        [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
+               BackendType type, std::string api_key) -> seastar::future<> {
+            co_await _router->register_backend_global(id, addr, weight, priority,
+                                                       /*supports_token_ids=*/true,
+                                                       /*compression_ratio=*/1.0, type);
+            if (!api_key.empty()) {
+                co_await _router->set_backend_api_key_global(id, std::move(api_key));
+            }
         });
     _k8s_discovery->set_drain_callback(
         [this](BackendId id) {
