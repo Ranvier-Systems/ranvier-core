@@ -329,7 +329,7 @@ The full server binary (`ranvier_server`) requires Seastar installed on the syst
 | File | Covers |
 |------|--------|
 | `radix-tree.md` | ART internals: byte-keyed Node4/16/48/256, slab allocator, path compression, LRU eviction. |
-| `prefix-affinity-routing.md` | Hybrid ART + consistent-hash fallback; backend KV-cache prerequisites (vLLM APC, SGLang RadixAttention); ~81% vs 49% cache hit. |
+| `prefix-affinity-routing.md` | Hybrid ART + consistent-hash fallback; backend KV-cache prerequisites (vLLM APC, SGLang RadixAttention); per-`BackendType` applicability (which types learn / scrape / forward token IDs); ~81% vs 49% cache hit. |
 | `tokenization.md` | 3-layer tokenization: LRU cache (80-90% hit) -> cross-shard P2C -> dedicated thread pool; FFI safety. |
 | `request-lifecycle.md` | End-to-end request path (ingress -> rate-limit -> tokenize -> boundary -> route -> circuit -> connect -> stream -> learn). Source of truth for tracing. |
 | `request-lifecycle-perf-analysis.md` | Perf mitigations: route batching (no per-request gossip), tokenization fallback, stale-connection retries, load-aware overrides. |

@@ -12,6 +12,28 @@ Prefix-affinity routing requires that backends have **prefix caching enabled**. 
 | **SGLang** | RadixAttention is enabled by default |
 | **TensorRT-LLM** | KV cache reuse is enabled by default |
 
+## Backend Type Applicability
+
+Ranvier's `BackendType` enum (`src/types.hpp`) tags each registered backend. The type drives three independent gates: whether routes are learned into the ART, whether the vLLM-shaped `/metrics` endpoint is scraped, and whether `prompt_token_ids` is forwarded in the request body. The headline benefits in this document apply to types that pass the first gate; the rest stay live in the fleet for traffic-management value (rate limiting, circuit breaking, fair scheduling, auth header injection) but do **not** earn the cache-hit numbers below.
+
+| `BackendType` | ART learning | vLLM `/metrics` scrape | `prompt_token_ids` forwarded | Notes |
+|---|---|---|---|---|
+| `vllm` | ✓ | ✓ | ✓ | The canonical path. Everything in this document applies. |
+| `sglang` | ✓ | ✗ | ✓ | RadixAttention is the backend-side cache. Metrics scrape skipped — SGLang's `/metrics` schema differs from vLLM's. |
+| `trt_llm` | ✓ | ✗ | ✓ | KV cache reuse is the backend-side cache. |
+| `ollama` | ✓ | ✗ | ✗ | Has a KV cache; prefix affinity helps. No Prometheus endpoint. Does not accept `prompt_token_ids` — strip it at registration time. |
+| `lm_studio` | ✓ | ✗ | ✗ | Same shape as Ollama. |
+| `cerebras` | ✗ | ✗ | ✗ | Wafer-scale inference holds the whole model in on-chip SRAM with no per-request KV state to optimize for, so prefix affinity earns nothing. Auto-downgraded to `supports_token_ids=false` at registration. |
+| `openai_compatible` | ✓ | ✗ | ✗ | Catch-all for self-hosted shims (e.g. SGLang behind an OpenAI-compatible API). ART learning stays on because most shims wrap a backend with a real cache; opt out per-deployment if yours doesn't. Auto-downgraded to `supports_token_ids=false`. |
+
+The truth table above is enforced in three places:
+
+- `RouterService::should_cache_routes_for()` (`src/router_service.cpp`) gates the ART-learn sites.
+- `HealthService::scrape_one_backend()` (`src/health_service.cpp`) gates the `/metrics` scrape.
+- `RouterService::register_backend_global()` (`src/router_service.cpp`) auto-downgrades `supports_token_ids` for `cerebras` and `openai_compatible`.
+
+For non-vLLM backends, `get_backend_load_score()` always returns `0.0` (no scrape signal). Under `load_aware_routing: true` this makes them look idle and attract more traffic — usually fine for backends whose pitch is no queueing (Cerebras), worth knowing for others. Ranvier emits a one-line `info` log at registration time for each non-VLLM backend under load-aware routing so this is visible to operators. See [Hybrid Fleets](../guides/hybrid-fleets.md) for the operator-facing walkthrough.
+
 ## Overview
 
 When multiple requests share a common prefix (e.g., the same system prompt), routing them to the same backend allows that backend's KV cache to serve subsequent requests faster. Without prefix-affinity, requests are distributed randomly, resulting in ~50% cache hit rate with 2 backends.
@@ -22,6 +44,8 @@ When multiple requests share a common prefix (e.g., the same system prompt), rou
 |--------|----------------|-----------------|
 | Cache Hit Rate | ~49% | **81%** |
 | Routing Overhead | - | 0.15ms |
+
+These numbers assume backends that actually cache (the first five rows of the table above). Cerebras-class backends in a hybrid fleet do not contribute to either the cache-hit or the TTFT-improvement headline; their throughput is dominated by the backend's own performance characteristics, not by Ranvier's routing.
 
 ## How It Works
 
