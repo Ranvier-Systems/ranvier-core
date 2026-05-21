@@ -344,17 +344,13 @@ The section heading and anchor (`#6-integration-tests-end-to-end-validation`) ar
 ---
 
 ## 7. Strategic Assessment (2026-01-31)
-### 8.6 Action Items (Tracking)
 
-- [ ] **[P3] Track config.hpp complexity - split when >2000 LOC**
-  _Description:_ Monitor `config.hpp` (currently 1,510 LOC). When exceeding 2000 LOC, split into `config_schema.hpp` (type definitions) and `config_loader.cpp` (YAML parsing logic).
-  _Rationale:_ Prevent config.hpp from becoming the next "sprawling module". Current growth trajectory suggests split needed within 2-3 feature additions.
-  _Files:_ `src/config.hpp` → `src/config_schema.hpp` (new), `src/config_loader.cpp` (new)
-  _Complexity:_ Medium
-  _Trigger:_ >2000 LOC or >50 config fields
+**Status: CLOSED (2026-05-21).** Both tracking items resolved.
 
----
+- §6 (integration test coverage) — closed 2026-05-17, see [`docs/audits/integration-tests-2026-01-31.md`](docs/audits/integration-tests-2026-01-31.md).
+- The lone §8.6 action item (track `config.hpp` complexity, split at >2000 LOC) was preempted by an actual split: `src/config.hpp` is now a 19-line facade re-exporting `config_schema.hpp` (572 LOC, structs) and `config_loader.{hpp,cpp}` (1941 LOC, YAML parsing), with `config_infra.hpp` (450 LOC) additionally separating infrastructure from product config. The >2000 LOC trigger on the monolithic header can never fire.
 
+The section heading and anchor (`#7-strategic-assessment-2026-01-31`) are preserved as a stable pointer for the table of contents and the §6 closure narrative.
 
 ---
 
