@@ -242,6 +242,8 @@ struct K8sEndpoint {
     bool ready;
     uint32_t weight = K8S_DEFAULT_WEIGHT;
     uint32_t priority = K8S_DEFAULT_PRIORITY;
+    BackendType type = BackendType::VLLM;
+    std::string api_key_secret_ref;
 
     // FNV-1a 64-bit hash, truncated to 31 bits for positive BackendId.
     // Mirrors the production implementation in k8s_discovery_service.cpp.
@@ -404,6 +406,8 @@ protected:
         auto metadata = k8s_json::get_object(json, "metadata");
         uint32_t default_weight = K8S_DEFAULT_WEIGHT;
         uint32_t default_priority = K8S_DEFAULT_PRIORITY;
+        BackendType default_type = BackendType::VLLM;
+        std::string default_secret_ref;
 
         if (metadata) {
             auto annotations = k8s_json::get_object(*metadata, "annotations");
@@ -452,6 +456,21 @@ protected:
                     } catch (const std::exception&) {
                         // Keep default_priority on parse failure (logging in real impl)
                     }
+                }
+
+                // Mirror the production parser's handling of the new annotations.
+                auto type_str = k8s_json::get_string(*annotations, "ranvier.io/backend-type");
+                if (type_str) {
+                    auto parsed = parse_backend_type(*type_str);
+                    if (parsed) {
+                        default_type = *parsed;
+                    }
+                    // Unknown type falls back to VLLM (matches the production warn-and-default behavior)
+                }
+                auto secret_ref = k8s_json::get_string(*annotations,
+                                                       "ranvier.io/api-key-secret-ref");
+                if (secret_ref) {
+                    default_secret_ref = *secret_ref;
                 }
             }
         }
@@ -507,6 +526,8 @@ protected:
                 endpoint.ready = ready;
                 endpoint.weight = default_weight;
                 endpoint.priority = default_priority;
+                endpoint.type = default_type;
+                endpoint.api_key_secret_ref = default_secret_ref;
 
                 endpoints.push_back(std::move(endpoint));
             }
@@ -820,6 +841,109 @@ TEST_F(K8sEndpointSliceTest, ParseEmptyEndpoints) {
 
     auto endpoints = parse_endpoint_slice(json);
     EXPECT_TRUE(endpoints.empty());
+}
+
+// =============================================================================
+// Backend Type & Secret-Ref Annotations
+// =============================================================================
+
+TEST_F(K8sEndpointSliceTest, ParseBackendTypeAnnotation) {
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/backend-type": "cerebras"}},
+        "ports": [{"port": 443}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].type, BackendType::CEREBRAS);
+    EXPECT_TRUE(endpoints[0].api_key_secret_ref.empty());
+}
+
+TEST_F(K8sEndpointSliceTest, ParseSecretRefAnnotation) {
+    std::string json = R"({
+        "metadata": {"annotations": {
+            "ranvier.io/backend-type": "openai_compatible",
+            "ranvier.io/api-key-secret-ref": "my-cerebras-key"
+        }},
+        "ports": [{"port": 443}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].type, BackendType::OPENAI_COMPATIBLE);
+    EXPECT_EQ(endpoints[0].api_key_secret_ref, "my-cerebras-key");
+}
+
+TEST_F(K8sEndpointSliceTest, ParseUnknownBackendTypeFallsBackToVllm) {
+    // Operator typo or future type we don't recognise yet — defaults to VLLM
+    // and the request continues. Matches the production warn-and-default
+    // posture; no exception.
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/backend-type": "tabby_llm"}},
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].type, BackendType::VLLM);
+}
+
+TEST_F(K8sEndpointSliceTest, ParseAbsentAnnotationsDefaultsToVllmAndNoSecret) {
+    // Backwards-compatible: existing GPU fleets that don't set the new
+    // annotations get VLLM + no auth header, exactly as before.
+    std::string json = R"({
+        "metadata": {"annotations": {"ranvier.io/weight": "100"}},
+        "ports": [{"port": 8080}],
+        "endpoints": [{
+            "addresses": ["10.0.0.1"],
+            "conditions": {"ready": true},
+            "targetRef": {"uid": "pod-uid-1"}
+        }]
+    })";
+    auto endpoints = parse_endpoint_slice(json);
+    ASSERT_EQ(endpoints.size(), 1u);
+    EXPECT_EQ(endpoints[0].type, BackendType::VLLM);
+    EXPECT_TRUE(endpoints[0].api_key_secret_ref.empty());
+}
+
+TEST_F(K8sEndpointSliceTest, AllBackendTypesParseCorrectly) {
+    // Truth-table test across every BackendType the schema accepts.
+    struct Case { const char* annotation; BackendType expected; };
+    Case cases[] = {
+        {"vllm",              BackendType::VLLM},
+        {"sglang",            BackendType::SGLANG},
+        {"trt_llm",           BackendType::TRT_LLM},
+        {"ollama",            BackendType::OLLAMA},
+        {"lm_studio",         BackendType::LM_STUDIO},
+        {"cerebras",          BackendType::CEREBRAS},
+        {"openai_compatible", BackendType::OPENAI_COMPATIBLE},
+    };
+    for (const auto& c : cases) {
+        std::string json = std::string(R"({
+            "metadata": {"annotations": {"ranvier.io/backend-type": ")") + c.annotation + R"("}},
+            "ports": [{"port": 8080}],
+            "endpoints": [{
+                "addresses": ["10.0.0.1"],
+                "conditions": {"ready": true},
+                "targetRef": {"uid": "pod-uid-1"}
+            }]
+        })";
+        auto endpoints = parse_endpoint_slice(json);
+        ASSERT_EQ(endpoints.size(), 1u) << "annotation: " << c.annotation;
+        EXPECT_EQ(endpoints[0].type, c.expected) << "annotation: " << c.annotation;
+    }
 }
 
 // =============================================================================

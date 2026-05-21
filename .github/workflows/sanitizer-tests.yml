@@ -1,0 +1,195 @@
+# Sanitizer tests for Ranvier Core
+#
+# Builds the unit-test suite with -fsanitize=address,undefined inside the
+# ranvier-sanitize image (Dockerfile.sanitize) and runs ctest. The intent
+# is the empirical sweep called for in BACKLOG §18 — pick up the
+# integer-overflow / cast shapes (H2, H9) and any heap UAF on the request
+# path that the static audit could not confirm or refute.
+#
+# Triggers:
+#   - After Docker Publish completes (post-merge to main, same shape as
+#     unit-tests.yml and fuzz-tests.yml).
+#   - Manual via workflow_dispatch (for ad-hoc investigation against any
+#     branch).
+#
+# This workflow does NOT run on PRs (each dispatch costs up to ~60 min of
+# `ubuntu-latest` runner time — see the cost note below — which is too
+# much for per-PR CI), but IS a post-merge gate: `continue-on-error: false`
+# on the sanitised ctest step means a regression in any of the 2322
+# sanitised unit tests fails the job and surfaces against the commit
+# that introduced it.
+#
+# Gating-posture history (BACKLOG §18 P2): the workflow was non-gating
+# (`continue-on-error: true`, `workflow_dispatch`-only) through follow-ups
+# 1–8 while the initial sanitised findings were triaged into sub-tickets
+# F1 (PersistenceTest empty-span memcpy → fixed in #492), F2 (Abseil
+# raw_hash_set ASan ABI mismatch → fixed in #493 by rebuilding Abseil
+# under sanitisers in `Dockerfile.sanitize`) and F3 (RateLimiter wall-clock
+# refill flake → fixed in #495 by switching the test to TestClock). F3
+# was the last residual; the suite was observed clean on 2026-05-16
+# (2322/2322 pass, 44.16 sec wall-clock) on the F3 branch dispatch, and
+# gating is restored in this commit. Each dispatch still costs ~60 min
+# due to the ~30-min Seastar rebuild in the default-alloc base — the §18
+# P3 GHCR-publish spinoff would collapse this to a pull-and-test job
+# and drop the per-dispatch cost to a few minutes.
+#
+# Architecture note: GitHub-hosted runners are x86_64; local runs (e.g.
+# Apple Silicon) are aarch64. ASan/UBSan can surface different bugs on
+# different ABIs (alignment, integer-cast behaviour); a "passes locally,
+# fails in CI" finding is real signal, not a configuration issue.
+#
+# Default-allocator base image: the first empirical run of this workflow
+# crashed inside CTest's `gtest_discover_tests` on
+# `cross_shard_exception_propagation_test` with `munmap_chunk(): invalid
+# pointer` deep in `libhwloc.so.15` — same Seastar-allocator / no-reactor
+# root cause as `stream_parser_fuzz` (Seastar's per-shard allocator
+# overrides global `new`/`delete`, the test binary is invoked at build
+# time under `--gtest_list_tests` without a running reactor, allocator
+# misbehaves). The §18 P3 closure shipped the unblock as a shared
+# `Dockerfile.base.default-alloc` that rebuilds Seastar with the
+# `SEASTAR_DEFAULT_ALLOCATOR` macro propagated through the upstream
+# `PUBLIC` compile definitions. The default-alloc base is published to
+# GHCR alongside `ranvier-base` by `docker-base.yml`'s
+# `build-base-default-alloc` job (see §18 P3 GHCR-publish spinoff). This
+# workflow therefore pulls the pre-built default-alloc base from GHCR
+# and builds `Dockerfile.sanitize` on top in a single buildx step with
+# full `type=gha` layer caching. The ~30-min Seastar rebuild is now
+# paid once per push to main (when `Dockerfile.base.default-alloc` /
+# `Dockerfile.base` / `CMakeLists.txt` / `vcpkg.json` change) inside
+# the publish workflow, not once per consumer dispatch.
+name: Sanitizer Tests
+
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
+  workflow_dispatch:
+
+# A fast burst of merges to main produces one Docker Publish run per merge
+# and therefore one sanitizer-tests run per merge. At ~5-10 min total
+# (default-alloc base pulled pre-built from GHCR per the §18 P3 spinoff;
+# sanitizer-toolchain layer cache-warm in the steady state), that's still
+# worth dropping redundant work. Cancel any in-progress run on the same
+# ref when a newer one queues: the latest commit's sanitiser includes
+# every prior commit's changes anyway, so a pass on the latest covers
+# everything up to it, and a fail localises to the most recent merge
+# batch. Trade-off: if commit A regresses and commit B lands before A's
+# sanitiser finishes, A's run is cancelled and the regression first
+# surfaces against B — bisection scope is the A→B interval. Standard
+# cancel-in-progress posture for shared-branch CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  DEFAULT_ALLOC_BASE: ghcr.io/ranvier-systems/ranvier-base-default-alloc:latest
+
+jobs:
+  sanitizer-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # Default-alloc base is pulled pre-built from GHCR (~1-2 min), then
+    # the sanitizer-toolchain layer builds on top (~3-5 min cold, near-
+    # instant on layer-cache hit). Test run is ~45 sec at the F3 baseline.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Fail fast with a helpful message if the default-alloc base hasn't
+      # been published yet. This avoids the cryptic 5-min docker-driver
+      # error chain when the base is missing — most commonly during the
+      # bootstrap window after a Docker Publish run completes before
+      # docker-base.yml's build-base-default-alloc job has finished (the
+      # two run in parallel on any push to main that touches the
+      # docker-base.yml path filter; Docker Publish reuses the cached
+      # ranvier-base and finishes first). Mirrors the check-base-image
+      # job in docker-publish.yml.
+      - name: Check default-alloc base image exists
+        run: |
+          echo "Checking if default-alloc base image exists: ${{ env.DEFAULT_ALLOC_BASE }}"
+          if docker manifest inspect ${{ env.DEFAULT_ALLOC_BASE }} > /dev/null 2>&1; then
+            echo "✓ Default-alloc base image found: ${{ env.DEFAULT_ALLOC_BASE }}"
+          else
+            echo "::error::Default-alloc base image not found: ${{ env.DEFAULT_ALLOC_BASE }}"
+            echo ""
+            echo "=========================================="
+            echo "ERROR: Default-alloc base image does not exist in GHCR"
+            echo "=========================================="
+            echo ""
+            echo "The sanitised suite requires a pre-built default-allocator base"
+            echo "image (Seastar rebuilt with SEASTAR_DEFAULT_ALLOCATOR). This image"
+            echo "is published by docker-base.yml's build-base-default-alloc job."
+            echo ""
+            echo "Most likely cause: this dispatch raced docker-base.yml on a push"
+            echo "to main that touched the docker-base.yml path filter. The default-"
+            echo "alloc job runs after the multi-arch ranvier-base merge, which can"
+            echo "take longer than the Docker Publish run that triggers this workflow."
+            echo ""
+            echo "To fix this, run the 'Docker Base Image' workflow manually:"
+            echo ""
+            echo "  1. Go to: https://github.com/${{ github.repository }}/actions/workflows/docker-base.yml"
+            echo "  2. Click 'Run workflow'"
+            echo "  3. Wait for build-base-default-alloc to complete (~30 min on first run)"
+            echo "  4. Re-run this workflow"
+            echo ""
+            echo "Or use GitHub CLI:"
+            echo "  gh workflow run docker-base.yml --ref main"
+            echo ""
+            exit 1
+          fi
+
+      # Single-stage build: layer the sanitizer toolchain (clang +
+      # compiler-rt + llvm + lld) on top of the pre-published
+      # ranvier-base-default-alloc image from GHCR. The base itself is
+      # built by `docker-base.yml`'s `build-base-default-alloc` job on
+      # every push to main (path-filtered to Dockerfile.base.default-alloc
+      # / Dockerfile.base / CMakeLists.txt / vcpkg.json), so this job
+      # never pays the ~30-min Seastar rebuild itself.
+      - name: Build sanitizer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.sanitize
+          load: true
+          tags: ranvier-sanitize:latest
+          cache-from: type=gha,scope=sanitizer-tests-amd64
+          cache-to: type=gha,mode=max,scope=sanitizer-tests-amd64
+          build-args: |
+            BASE_IMAGE=${{ env.DEFAULT_ALLOC_BASE }}
+
+      - name: Run unit tests under ASan/UBSan
+        run: |
+          mkdir -p sanitize-results
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            ranvier-sanitize:latest \
+            make sanitize-test \
+            2>&1 | tee sanitize-results/sanitize.log
+
+      - name: Upload sanitizer log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sanitizer-results
+          path: sanitize-results/sanitize.log
+          retention-days: 30

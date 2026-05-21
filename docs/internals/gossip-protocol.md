@@ -19,6 +19,8 @@ Ranvier uses a custom UDP-based gossip protocol to propagate route announcements
 | `ROUTE_ANNOUNCEMENT` | `0x01` | New route learned (tokens → backend mapping) |
 | `HEARTBEAT` | `0x02` | Keep-alive for peer liveness detection |
 | `ROUTE_ACK` | `0x03` | Acknowledgment for route announcement |
+| `NODE_STATE` | `0x04` | Backend lifecycle change (e.g. `ACTIVE` → `DRAINING`) |
+| `CACHE_EVICTION` | `0x05` | Cluster-wide cache eviction notification |
 
 ## Wire Formats
 
@@ -90,6 +92,61 @@ All multi-byte integers are encoded **big-endian**.
 | Version | 1 | 1 byte | Protocol version (`0x02`) |
 
 **Packet size**: 2 bytes (fixed)
+
+### Node State
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |    Version    |     State     |  Backend ID   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Backend ID (cont)       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| Type | 0 | 1 byte | `0x04` (NODE_STATE) |
+| Version | 1 | 1 byte | Protocol version (`0x02`) |
+| State | 2 | 1 byte | `0x00` (ACTIVE) or `0x01` (DRAINING) |
+| Backend ID | 3 | 4 bytes | Backend whose state is changing |
+
+**Packet size**: 7 bytes (fixed)
+
+Broadcast on `SIGTERM` so peers can drop the draining backend out of the
+routing pool before in-flight requests complete.
+
+### Cache Eviction
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |    Version    |       Sequence Number         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Sequence (cont)           |          Backend ID           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Backend ID (cont)       |          Prefix Hash          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       Prefix Hash (cont)                      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Prefix Hash (cont)        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| Type | 0 | 1 byte | `0x05` (CACHE_EVICTION) |
+| Version | 1 | 1 byte | Protocol version (`0x02`) |
+| Sequence Number | 2 | 4 bytes | Per-peer monotonic sequence (currently unused for retry, reserved) |
+| Backend ID | 6 | 4 bytes | Backend whose cache slot was evicted |
+| Prefix Hash | 10 | 8 bytes | 64-bit hash identifying the evicted prefix |
+
+**Packet size**: 18 bytes (fixed)
+
+Sent by `HttpController` when a local KV-cache eviction is observed and
+`cache_events.propagate_via_gossip` is enabled.
 
 ## DTLS Encryption
 
@@ -326,12 +383,23 @@ The sliding window provides protection against **replay attacks** where an attac
 **Critical Behavior:** The sliding window **persists across resync events**. When the gossip service enters resync mode (e.g., during network partition recovery), the sequence number windows are **NOT cleared**. This ensures attackers cannot exploit the resync to replay old captured packets.
 
 ```cpp
-void start_resync() {
-    // SECURITY: DO NOT clear _received_seq_windows!
+// GossipService::start_resync() coordinates two modules:
+void GossipService::start_resync() {
+    _consensus->start_resync();      // sets the _resyncing flag only
+    _protocol->clear_pending_acks(); // clears outbound retry queue
+}
+
+// GossipConsensus::start_resync():
+void GossipConsensus::start_resync() {
+    _resyncing.store(true, std::memory_order_relaxed);
+    // SECURITY: DO NOT clear sequence windows here.
     // Clearing would allow replay attacks after network recovery.
-    _pending_acks.clear();  // Only clear pending outbound acks
 }
 ```
+
+The replay-protection windows live in `GossipProtocol`
+(`_received_seq_windows` / `_received_seq_sets`) and are only cleared
+per-peer when a peer is removed from the peer table.
 
 **Window Sizing:** The window should be large enough to cover:
 - Maximum expected in-flight messages during normal operation
@@ -552,6 +620,7 @@ cluster:
   quorum_threshold: 0.5                   # Fraction for quorum (0.5 = majority)
   reject_routes_on_quorum_loss: true      # Reject writes when degraded
   fail_open_on_quorum_loss: false         # true = random routing during split-brain
+  accept_gossip_on_quorum_loss: false     # true = apply incoming gossip while degraded (stale > none)
   quorum_warning_threshold: 1             # Warn when margin <= this (0 disables)
   quorum_check_window_seconds: 30         # Window for recently-seen check
 
@@ -577,6 +646,7 @@ RANVIER_CLUSTER_QUORUM_ENABLED=true
 RANVIER_CLUSTER_QUORUM_THRESHOLD=0.5
 RANVIER_CLUSTER_REJECT_ROUTES_ON_QUORUM_LOSS=true
 RANVIER_CLUSTER_FAIL_OPEN_ON_QUORUM_LOSS=false
+RANVIER_CLUSTER_ACCEPT_GOSSIP_ON_QUORUM_LOSS=false
 RANVIER_CLUSTER_QUORUM_WARNING_THRESHOLD=1
 RANVIER_CLUSTER_QUORUM_CHECK_WINDOW=30
 
@@ -587,6 +657,10 @@ RANVIER_CLUSTER_MTLS_ENABLED=false
 ## Metrics
 
 All metrics are exposed via Prometheus on port 9180.
+
+A subset of debugging-oriented metrics are gated behind the
+`RANVIER_DEBUG_METRICS` build flag. They add scrape overhead and are intended
+for development; they are marked **(debug-only)** in the tables below.
 
 ### Packet Counters
 
@@ -606,9 +680,18 @@ All metrics are exposed via Prometheus on port 9180.
 | `ranvier_cluster_retries_sent` | Counter | Retry transmissions |
 | `ranvier_cluster_duplicates_suppressed` | Counter | Duplicate announcements filtered |
 | `ranvier_cluster_max_retries_exceeded` | Counter | Announcements dropped after max retries |
-| `ranvier_cluster_dedup_peers_overflow` | Counter | Times dedup peer limit (10000) was reached |
-| `ranvier_cluster_pending_acks_overflow` | Counter | Times pending ACKs limit (1000) was reached |
+| `ranvier_cluster_dedup_peers_overflow` | Counter | Times dedup peer limit (10000) was reached **(debug-only)** |
+| `ranvier_cluster_pending_acks_overflow` | Counter | Times pending ACKs limit (1000) was reached **(debug-only)** |
 | `ranvier_cluster_pending_acks_count` | Gauge | Current number of pending ACKs awaiting response |
+
+### Node State and Cache Eviction
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ranvier_cluster_node_state_sent` | Counter | NODE_STATE packets broadcast (e.g. DRAINING on shutdown) |
+| `ranvier_cluster_node_state_received` | Counter | NODE_STATE packets received from peers |
+| `ranvier_gossip_cache_evictions_sent_total` | Counter | CACHE_EVICTION packets broadcast |
+| `ranvier_gossip_cache_evictions_received_total` | Counter | CACHE_EVICTION packets received from peers |
 
 ### Peer Health
 
@@ -639,16 +722,21 @@ All metrics are exposed via Prometheus on port 9180.
 | `ranvier_cluster_dtls_handshakes_failed` | Counter | DTLS handshakes that failed |
 | `ranvier_cluster_dtls_packets_encrypted` | Counter | Packets encrypted with DTLS |
 | `ranvier_cluster_dtls_packets_decrypted` | Counter | Packets decrypted with DTLS |
-| `ranvier_cluster_dtls_cert_reloads` | Counter | Certificate hot-reloads performed |
+| `ranvier_cluster_dtls_cert_reloads` | Counter | Certificate hot-reloads performed **(debug-only)** |
 | `ranvier_cluster_dtls_lockdown_drops` | Counter | Packets dropped due to mTLS lockdown |
+| `ranvier_cluster_dtls_sessions_rejected` | Counter | DTLS sessions rejected because the per-peer session limit was hit **(debug-only)** |
 
 ### Crypto Performance
 
+All metrics in this section are gated behind `RANVIER_DEBUG_METRICS`.
+
 | Metric | Type | Description |
 |--------|------|-------------|
-| `ranvier_cluster_crypto_stall_warnings` | Counter | Crypto ops exceeding 100μs stall threshold |
-| `ranvier_cluster_crypto_ops_offloaded` | Counter | Crypto ops offloaded to background thread |
-| `ranvier_cluster_crypto_batch_broadcasts` | Counter | Broadcasts using batch mode (>10 peers) |
+| `ranvier_cluster_crypto_stall_warnings` | Counter | Crypto ops exceeding the stall threshold (`CRYPTO_STALL_WARNING_US` = 100μs in transport) **(debug-only)** |
+| `ranvier_cluster_crypto_ops_offloaded` | Counter | Crypto ops offloaded to a Seastar thread context **(debug-only)** |
+| `ranvier_cluster_crypto_batch_broadcasts` | Counter | Broadcasts using batch mode (>10 peers) **(debug-only)** |
+| `ranvier_cluster_crypto_stalls_avoided` | Counter | Offloaded ops that exceeded the stall threshold (i.e. would have stalled the reactor inline) **(debug-only)** |
+| `ranvier_cluster_crypto_handshakes_offloaded` | Counter | DTLS handshake ops offloaded **(debug-only)** |
 
 ## Debugging
 
@@ -670,9 +758,18 @@ All metrics are exposed via Prometheus on port 9180.
 
 ### Log Levels
 
+The gossip stack is split across four loggers, one per module:
+
+| Logger | Source |
+|--------|--------|
+| `ranvier.gossip` | `GossipService` orchestrator |
+| `ranvier.gossip.consensus` | `GossipConsensus` (peer table, quorum) |
+| `ranvier.gossip.protocol` | `GossipProtocol` (packets, retries, DNS discovery) |
+| `ranvier.gossip.transport` | `GossipTransport` (UDP, DTLS, crypto offload) |
+
 ```bash
-# Enable trace logging for gossip
-SEASTAR_LOGGER_LEVELS="ranvier.gossip=trace"
+# Enable trace logging for the entire gossip stack
+SEASTAR_LOGGER_LEVELS="ranvier.gossip=trace,ranvier.gossip.consensus=trace,ranvier.gossip.protocol=trace,ranvier.gossip.transport=trace"
 ```
 
 **Trace logs** include:
@@ -727,8 +824,9 @@ When receiving high volumes of remote route announcements, immediately broadcast
 
 | Trigger | Condition |
 |---------|-----------|
-| Timer | Every 10ms by default (configurable via `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS` env var, 1-1000ms) |
-| Buffer full | When buffer reaches 100 routes (configurable via `RouteBatchConfig::MAX_BATCH_SIZE`) |
+| Timer | Every 20ms by default (`RouteBatchConfig::DEFAULT_FLUSH_INTERVAL`, configurable via `RANVIER_ROUTE_BATCH_FLUSH_INTERVAL_MS` env var, 1-1000ms) |
+| Buffer full | When buffer reaches `RouteBatchConfig::MAX_BATCH_SIZE` (100) routes |
+| Buffer overflow | If gossip flooding pushes the buffer past `RouteBatchConfig::MAX_BUFFER_SIZE` (10000), the oldest `OVERFLOW_DROP_COUNT` (1000) entries are dropped to bound memory |
 
 **Batch Broadcast Flow**:
 1. `learn_route_remote()` pushes route to `_pending_remote_routes` buffer
@@ -756,15 +854,22 @@ Total overhead: ~6KB per peer (negligible for typical 3-node clusters)
 
 ## Source Files
 
+The gossip implementation is split into a thin orchestrator
+(`GossipService`) and three modules: consensus, transport, and protocol.
+
 | File | Purpose |
 |------|---------|
-| `src/gossip_service.hpp` | Packet structs, GossipService class, QuorumState enum |
-| `src/gossip_service.cpp` | UDP send/receive, reliability logic, quorum tracking, DTLS crypto |
-| `src/router_service.hpp` | PendingRemoteRoute, RouteBatchConfig, batch buffer |
-| `src/router_service.cpp` | Route batching implementation (learn_route_remote, flush_route_batch) |
-| `src/dtls_context.hpp` | DtlsContext and DtlsSession classes |
-| `src/dtls_context.cpp` | OpenSSL-based DTLS implementation |
-| `src/config.hpp` | ClusterConfig with reliability, quorum, and TLS settings |
+| `src/gossip_service.hpp` / `.cpp` | Thin orchestrator that wires the three modules together and registers Prometheus metrics |
+| `src/gossip_consensus.hpp` / `.cpp` | Peer table, liveness, `QuorumState`, split-brain detection, route-prune callbacks |
+| `src/gossip_transport.hpp` / `.cpp` | UDP channel, DTLS encryption/handshakes, certificate hot-reload, mTLS lockdown |
+| `src/gossip_protocol.hpp` / `.cpp` | Packet structs (`RouteAnnouncementPacket`, `RouteAckPacket`, `NodeStatePacket`, `CacheEvictionPacket`), reliable delivery, dedup window, DNS discovery, heartbeat |
+| `src/crypto_offloader.hpp` / `.cpp` | `CryptoOffloader` adaptive offloading via `seastar::async` |
+| `src/dtls_context.hpp` / `.cpp` | `DtlsContext` and `DtlsSession` classes (OpenSSL-based DTLS) |
+| `src/router_service.hpp` / `.cpp` | `PendingRemoteRoute`, `RouteBatchConfig`, `learn_route_remote`, `flush_route_batch` |
+| `src/config_infra.hpp` | `ClusterConfig`, `GossipTlsConfig`, `DiscoveryType` |
 | `tests/unit/quorum_test.cpp` | Unit tests for quorum calculation and state transitions |
 | `tests/unit/gossip_protocol_test.cpp` | Wire format tests and crypto offload threshold tests |
+| `tests/unit/gossip_cache_eviction_test.cpp` | Unit tests for `CACHE_EVICTION` packet round-trip and propagation |
+| `tests/unit/gossip_transport_ownership_test.cpp` | Unit tests for transport lifecycle and DTLS session ownership |
+| `tests/unit/crypto_offloader_test.cpp` | Unit tests for `CryptoOffloader` decision logic |
 | `tests/unit/route_batching_test.cpp` | Unit tests for route batching behavior |

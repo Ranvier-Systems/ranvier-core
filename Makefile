@@ -4,7 +4,7 @@
 # Use bash for PIPESTATUS support in benchmark targets
 SHELL := /bin/bash
 
-.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help
+.PHONY: all build clean test test-unit test-integration test-integration-fast test-integration-full test-integration-ci integration-up integration-down integration-logs bench benchmark benchmark-up benchmark-down benchmark-real benchmark-real-local benchmark-single-gpu benchmark-comparison benchmark-real-up benchmark-real-down helm-lint helm-template helm-dry-run help fuzz-build fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser fuzz-run-stream-parser-default-alloc fuzz-run-all fuzz-ci fuzz-clean sanitize-build sanitize-test sanitize-clean
 
 # Default target
 all: build
@@ -25,6 +25,200 @@ build-debug:
 clean:
 	@echo "Cleaning build directory..."
 	@rm -rf build
+
+# -----------------------------------------------------------------------------
+# Fuzz harnesses (libFuzzer; requires clang — see Dockerfile.fuzz)
+# -----------------------------------------------------------------------------
+# These targets assume `clang` and `clang++` are on PATH. The ranvier-fuzz
+# image (Dockerfile.fuzz) provides them; the production builder does not.
+#
+# Typical workflow:
+#   make fuzz-build                 # configure + build all harnesses
+#   make fuzz-run-radix-tree        # run one harness for the default time
+#   FUZZ_TIME=600 make fuzz-run-request-rewriter   # 10-minute run
+FUZZ_TIME ?= 1800
+FUZZ_MAX_LEN ?= 262144
+FUZZ_BUILD_DIR := build-fuzz
+
+# Pass our suppressions file in addition to the env defaults set by
+# Dockerfile.fuzz. Setting UBSAN_OPTIONS replaces (does not merge with)
+# any prior env value, so we re-list halt_on_error and print_stacktrace.
+FUZZ_UBSAN_OPTIONS := halt_on_error=1:print_stacktrace=1:suppressions=$(CURDIR)/tests/fuzz/ubsan-suppressions.txt
+
+fuzz-build:
+	@command -v clang >/dev/null 2>&1 || { \
+	    echo "error: clang not found on PATH."; \
+	    echo "       Use the ranvier-fuzz image (Dockerfile.fuzz) or"; \
+	    echo "       install clang locally (Fedora: dnf install clang compiler-rt llvm)."; \
+	    exit 1; \
+	}
+	@# A stale cache from a previous configure (different source path —
+	@# common when the same checkout is mounted into different containers,
+	@# e.g. devcontainer at /workspaces vs ad-hoc bind mount at /src) makes
+	@# cmake abort with "source ... does not match the source used to
+	@# generate cache". Detect and wipe rather than failing.
+	@if [ -f $(FUZZ_BUILD_DIR)/CMakeCache.txt ]; then \
+	    cached_src=$$(grep -E '^CMAKE_HOME_DIRECTORY:' $(FUZZ_BUILD_DIR)/CMakeCache.txt | cut -d= -f2); \
+	    if [ "$$cached_src" != "$$(pwd)" ]; then \
+	        echo "Stale fuzz build cache (cached source $$cached_src != $$(pwd)); wiping $(FUZZ_BUILD_DIR)."; \
+	        rm -rf $(FUZZ_BUILD_DIR); \
+	    fi; \
+	fi
+	@echo "Configuring fuzz harnesses (clang + libFuzzer + ASan/UBSan)..."
+	@cmake -B $(FUZZ_BUILD_DIR) \
+	    -DRANVIER_BUILD_FUZZERS=ON \
+	    -DCMAKE_C_COMPILER=$$(command -v clang) \
+	    -DCMAKE_CXX_COMPILER=$$(command -v clang++) \
+	    -DCMAKE_BUILD_TYPE=Debug
+	@cmake --build $(FUZZ_BUILD_DIR) --target fuzz_harnesses -j$$(nproc)
+
+fuzz-run-radix-tree: fuzz-build
+	@mkdir -p tests/fuzz/corpus/radix_tree
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/radix_tree_fuzz \
+	    tests/fuzz/corpus/radix_tree \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
+fuzz-run-request-rewriter: fuzz-build
+	@mkdir -p tests/fuzz/corpus/request_rewriter
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/request_rewriter_fuzz \
+	    tests/fuzz/corpus/request_rewriter \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
+fuzz-run-stream-parser: fuzz-build
+	@if [ ! -x $(FUZZ_BUILD_DIR)/stream_parser_fuzz ]; then \
+	    echo "stream_parser_fuzz not built — Seastar likely not found at configure time."; \
+	    exit 1; \
+	fi
+	@# Detect the default-allocator base image (Dockerfile.base.default-alloc
+	@# sets SEASTAR_DEFAULT_ALLOCATOR=1). Outside that image, libFuzzer's
+	@# main runs against Seastar's per-shard allocator without a reactor,
+	@# crashes in libFuzzer cleanup with `munmap_chunk: invalid pointer`,
+	@# and produces no useful signal. Print the unblock recipe rather than
+	@# letting the harness crash silently for users who haven't read
+	@# tests/fuzz/README.md "Unblocking `stream_parser_fuzz`".
+	@if [ -z "$$SEASTAR_DEFAULT_ALLOCATOR" ]; then \
+	    echo "error: fuzz-run-stream-parser is blocked on the production base image."; \
+	    echo ""; \
+	    echo "       Seastar's per-shard allocator (Hard Rule #15) needs a running"; \
+	    echo "       reactor; libFuzzer's main never boots seastar::smp::start, so"; \
+	    echo "       allocations come from an uninitialised fast path and libFuzzer"; \
+	    echo "       crashes in its own cleanup ('munmap_chunk: invalid pointer')."; \
+	    echo "       The unblock image rebuilds Seastar with"; \
+	    echo "       -DSeastar_USE_DEFAULT_ALLOCATOR=ON — see"; \
+	    echo "       Dockerfile.base.default-alloc and tests/fuzz/README.md"; \
+	    echo "       'Unblocking stream_parser_fuzz'."; \
+	    echo ""; \
+	    echo "       Recipe:"; \
+	    echo "         docker build -f Dockerfile.base.default-alloc \\"; \
+	    echo "                      -t ranvier-base-default-alloc:latest ."; \
+	    echo "         docker build --build-arg BASE_IMAGE=ranvier-base-default-alloc:latest \\"; \
+	    echo "                      -f Dockerfile.fuzz -t ranvier-fuzz-default-alloc:latest ."; \
+	    echo "         docker run --rm -v \"\$$PWD:/src\" -w /src \\"; \
+	    echo "                    ranvier-fuzz-default-alloc:latest \\"; \
+	    echo "                    make fuzz-run-stream-parser-default-alloc"; \
+	    exit 1; \
+	fi
+	@mkdir -p tests/fuzz/corpus/stream_parser
+	@UBSAN_OPTIONS="$(FUZZ_UBSAN_OPTIONS)" \
+	    $(FUZZ_BUILD_DIR)/stream_parser_fuzz \
+	    tests/fuzz/corpus/stream_parser \
+	    -max_total_time=$(FUZZ_TIME) \
+	    -max_len=$(FUZZ_MAX_LEN) \
+	    -print_final_stats=1
+
+# Alias for fuzz-run-stream-parser. Kept as a separate target so the CI
+# job and the README pointer can name the unblock path explicitly —
+# callers reading the workflow / docs don't have to guess which image
+# fuzz-run-stream-parser belongs in. The detection in
+# fuzz-run-stream-parser itself is what actually enforces that the
+# Seastar default-allocator base is in use (Dockerfile.base.default-alloc
+# sets SEASTAR_DEFAULT_ALLOCATOR=1).
+fuzz-run-stream-parser-default-alloc: fuzz-run-stream-parser
+
+fuzz-run-all: fuzz-run-radix-tree fuzz-run-request-rewriter fuzz-run-stream-parser
+
+# Short fuzz pass for CI post-merge regression checks. Defaults to 60s
+# per harness; override with FUZZ_CI_TIME for longer scheduled runs.
+# Deliberately excludes fuzz-run-stream-parser — that harness is blocked
+# by a Seastar / libFuzzer allocator interaction in the default fuzz image
+# (see tests/fuzz/README.md "Caveats" and BACKLOG §18 "Unblock
+# Seastar-dependent fuzzing"). The unblock image
+# (Dockerfile.base.default-alloc layered under Dockerfile.fuzz) and the
+# `fuzz-run-stream-parser-default-alloc` target exist for it; the
+# dedicated CI job in .github/workflows/fuzz-tests.yml runs that path
+# separately.
+FUZZ_CI_TIME ?= 60
+
+fuzz-ci:
+	@$(MAKE) fuzz-run-radix-tree FUZZ_TIME=$(FUZZ_CI_TIME)
+	@$(MAKE) fuzz-run-request-rewriter FUZZ_TIME=$(FUZZ_CI_TIME)
+
+fuzz-clean:
+	@rm -rf $(FUZZ_BUILD_DIR)
+
+# -----------------------------------------------------------------------------
+# Sanitizer build (ASan + UBSan; requires clang — see Dockerfile.sanitize)
+# -----------------------------------------------------------------------------
+# Builds the unit tests with -fsanitize=address,undefined and runs ctest.
+# The ranvier-sanitize image (Dockerfile.sanitize) provides clang + the
+# compiler-rt runtime; the production builder does not.
+#
+# Typical workflow (inside the ranvier-sanitize container):
+#   make sanitize-build             # configure + build all *_test targets
+#   make sanitize-test              # build + run ctest under ASan/UBSan
+SANITIZE_BUILD_DIR := build-sanitize
+
+# Reuse the fuzz UBSan suppressions: the only listed entry is RapidJSON's
+# pointer-overflow on Stack::Reserve, which is library-level noise that
+# also fires from unit tests that parse JSON. Setting UBSAN_OPTIONS
+# replaces (does not merge with) the env defaults set by Dockerfile.sanitize,
+# so the halt_on_error and print_stacktrace flags are re-listed here.
+SANITIZE_UBSAN_OPTIONS := halt_on_error=1:print_stacktrace=1:suppressions=$(CURDIR)/tests/fuzz/ubsan-suppressions.txt
+
+sanitize-build:
+	@command -v clang >/dev/null 2>&1 || { \
+	    echo "error: clang not found on PATH."; \
+	    echo "       Use the ranvier-sanitize image (Dockerfile.sanitize) or"; \
+	    echo "       install clang locally (Fedora: dnf install clang compiler-rt llvm)."; \
+	    exit 1; \
+	}
+	@# Same stale-cache guard as the fuzz target — protects against the
+	@# CMAKE_HOME_DIRECTORY mismatch that occurs when the same checkout is
+	@# bind-mounted into different containers (e.g. /workspaces vs /src).
+	@if [ -f $(SANITIZE_BUILD_DIR)/CMakeCache.txt ]; then \
+	    cached_src=$$(grep -E '^CMAKE_HOME_DIRECTORY:' $(SANITIZE_BUILD_DIR)/CMakeCache.txt | cut -d= -f2); \
+	    if [ "$$cached_src" != "$$(pwd)" ]; then \
+	        echo "Stale sanitize build cache (cached source $$cached_src != $$(pwd)); wiping $(SANITIZE_BUILD_DIR)."; \
+	        rm -rf $(SANITIZE_BUILD_DIR); \
+	    fi; \
+	fi
+	@echo "Configuring unit tests (clang + ASan/UBSan)..."
+	@cmake -B $(SANITIZE_BUILD_DIR) \
+	    -DRANVIER_BUILD_SANITIZED=ON \
+	    -DCMAKE_C_COMPILER=$$(command -v clang) \
+	    -DCMAKE_CXX_COMPILER=$$(command -v clang++) \
+	    -DCMAKE_BUILD_TYPE=Debug
+	@cmake --build $(SANITIZE_BUILD_DIR) --target unit_tests -j$$(nproc)
+
+sanitize-test: sanitize-build
+	@echo "Running unit tests under ASan/UBSan..."
+	# --timeout 60: any individual test that runs >60s under the
+	# sanitiser is treated as a fail rather than left to hang the
+	# whole suite. Sanitised tests carry ~2-5x overhead, so this is
+	# generous for unit tests (which target sub-second runtimes
+	# unsanitised) while still catching deadlocks under ASan/UBSan.
+	@cd $(SANITIZE_BUILD_DIR) && \
+	    UBSAN_OPTIONS="$(SANITIZE_UBSAN_OPTIONS)" \
+	    ctest --output-on-failure --timeout 60
+
+sanitize-clean:
+	@rm -rf $(SANITIZE_BUILD_DIR)
 
 # Run all tests
 test: test-unit
@@ -743,6 +937,20 @@ help:
 	@echo "  make test-integration-full   - Run all integration tests (multi-node)"
 	@echo "  make test-integration-ci     - Run integration tests via pytest (JUnit XML output)"
 	@echo "  make test-validation         - Run validation suite unit tests"
+	@echo ""
+	@echo "Fuzz harnesses (require clang; see Dockerfile.fuzz):"
+	@echo "  make fuzz-build                    - Configure + build all libFuzzer harnesses"
+	@echo "  make fuzz-run-radix-tree           - Fuzz RadixTree::insert/lookup"
+	@echo "  make fuzz-run-request-rewriter     - Fuzz RequestRewriter::extract_*"
+	@echo "  make fuzz-run-stream-parser              - Fuzz StreamParser::push (needs the default-alloc base)"
+	@echo "  make fuzz-run-stream-parser-default-alloc - Alias; same harness, names the unblock path explicitly"
+	@echo "                                              (build Dockerfile.base.default-alloc + Dockerfile.fuzz on top;"
+	@echo "                                              Seastar is rebuilt with -DSeastar_USE_DEFAULT_ALLOCATOR=ON to"
+	@echo "                                              unblock libFuzzer — see tests/fuzz/README.md)"
+	@echo "  make fuzz-run-all                  - Run all three harnesses sequentially"
+	@echo "  make fuzz-ci                       - Short post-merge run (60s × 2 harnesses, no stream-parser)"
+	@echo "  make fuzz-clean                    - Remove the fuzz build directory"
+	@echo "  FUZZ_TIME=600 make fuzz-run-radix-tree  (override default 1800s run)"
 	@echo ""
 	@echo "Production Readiness Validation:"
 	@echo "  make validate       - Run full validation suite (all 4 tests)"

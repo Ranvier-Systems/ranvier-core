@@ -10,6 +10,7 @@
 #pragma once
 
 #include "config_infra.hpp"
+#include "types.hpp"
 
 namespace ranvier {
 
@@ -473,6 +474,39 @@ struct CacheEventsConfig {
     bool inject_prefix_hash_header = true;         // Add X-Ranvier-Prefix-Hash to proxied requests
 };
 
+// Static-config backend declaration.
+//
+// For backends that don't fit the K8s / local-discovery / admin-API
+// model — chiefly Cerebras and other OpenAI-compatible remote APIs that
+// need an API key. Entries are registered at startup after persistence
+// replay (so static config wins on ID collision) and are NOT round-
+// tripped through SQLite: env-var-only credential resolution keeps
+// plain-text secrets out of the database. Hand-edit the YAML to add /
+// remove static backends.
+struct StaticBackendConfig {
+    BackendId id = 0;                              // Stable identifier
+    std::string host;                              // IP or hostname (resolved at startup)
+    uint16_t port = 443;                           // Defaults to HTTPS (Cerebras-shaped)
+    uint32_t weight = 100;
+    uint32_t priority = 0;
+    double compression_ratio = 1.0;
+    BackendType type = BackendType::VLLM;
+    // Optional name of an environment variable whose value Ranvier
+    // forwards as `Authorization: Bearer <value>` on every proxied
+    // request to this backend. Treated as a credential boundary —
+    // never logged, never persisted. The env-var name itself (not the
+    // value) is what lives in this struct.
+    std::string api_key_env;
+};
+
+struct StaticBackendsConfig {
+    // Rule #4: cap the YAML list. 64 is well above the realistic
+    // ceiling for hand-curated static backends; auto-discovered fleets
+    // use the K8s / local-discovery paths instead.
+    static constexpr size_t MAX_STATIC_BACKENDS = 64;
+    std::vector<StaticBackendConfig> entries;
+};
+
 // =============================================================================
 // Per-API-Key Attribution Configuration
 // =============================================================================
@@ -540,9 +574,17 @@ struct RanvierConfig {
     DashboardConfig dashboard;
     CacheEventsConfig cache_events;
     AttributionConfig attribution;
+    StaticBackendsConfig backends;
 
-    // Load configuration from YAML file (blocking - use only before reactor starts)
+    // Load configuration from YAML file (blocking - use only before reactor starts).
+    // For the on-reactor hot-reload path, see `load_config_async()` declared in
+    // config_loader_async.hpp; both paths share `load_from_string()` below.
     static RanvierConfig load(const std::string& config_path);
+
+    // Parse a YAML config from an in-memory string.
+    // Used by both the sync `load()` path and the async DMA-read path.
+    // Throws std::runtime_error on malformed YAML; applies env overrides on success.
+    static RanvierConfig load_from_string(const std::string& yaml_text);
 
     // Load with defaults (no file)
     static RanvierConfig defaults();

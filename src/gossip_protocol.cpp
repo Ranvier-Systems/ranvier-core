@@ -13,12 +13,19 @@
 #include <boost/range/irange.hpp>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
+
+// Bound the fan-out of per-SRV-target DNS A-record lookups in refresh_peers().
+// SRV record sets can reach 500+ entries; serial resolution scales as N x RTT,
+// while this cap collapses wall-clock latency to ~ceil(N/16) x RTT without
+// flooding the resolver.
+constexpr size_t MAX_CONCURRENT_DNS_RESOLUTIONS = 16;
 
 //------------------------------------------------------------------------------
 // Packet Serialization
@@ -705,28 +712,37 @@ seastar::future<> GossipProtocol::refresh_peers() {
     try {
         std::vector<seastar::socket_address> discovered_addresses;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
         if (_config.discovery_type == DiscoveryType::SRV) {
             auto srv_records = co_await _dns_resolver.get_srv_records(
                 seastar::net::dns_resolver::srv_proto::udp,
                 "_gossip",
                 _config.discovery_dns_name);
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-            for (const auto& srv : srv_records) {
-                try {
-                    auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
-                    for (const auto& addr : host_entry.addr_list) {
-                        discovered_addresses.emplace_back(addr, srv.port);
-                        log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+            // Rule #2: bounded-concurrency fan-out. The per-target try/catch
+            // must stay inside the lambda -- max_concurrent_for_each aborts
+            // the batch on the first escaping exception. Shared mutation of
+            // discovered_addresses is safe under shard-0-only cooperative
+            // scheduling; see commit message for the full argument. Concurrent
+            // get_host_by_name on one _dns_resolver is safe by construction:
+            // Seastar's impl holds one c-ares channel (which natively supports
+            // multiple in-flight queries) and allocates a per-query promise on
+            // the heap, with no shared mutable state -- but the contract is
+            // not documented in dns.hh, so re-check on Seastar upgrade.
+            co_await seastar::max_concurrent_for_each(
+                srv_records, MAX_CONCURRENT_DNS_RESOLUTIONS,
+                [this, &discovered_addresses](const auto& srv) -> seastar::future<> {
+                    try {
+                        auto host_entry = co_await _dns_resolver.get_host_by_name(srv.target);
+                        for (const auto& addr : host_entry.addr_list) {
+                            discovered_addresses.emplace_back(addr, srv.port);
+                            log_gossip_protocol().debug("DNS SRV discovered peer: {}:{}", addr, srv.port);
+                        }
+                    } catch (const std::exception& e) {
+                        log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
                     }
-                } catch (const std::exception& e) {
-                    log_gossip_protocol().warn("Failed to resolve SRV target {}: {}", srv.target, e.what());
-                }
-                // Rule #17: Yield between DNS resolutions to avoid reactor stall
-                // when SRV record count is large (unbounded, could reach 500+)
-                co_await seastar::coroutine::maybe_yield();
-            }
+                });
         } else if (_config.discovery_type == DiscoveryType::A) {
             auto host_entry = co_await _dns_resolver.get_host_by_name(_config.discovery_dns_name);
 
@@ -734,8 +750,8 @@ seastar::future<> GossipProtocol::refresh_peers() {
                 discovered_addresses.emplace_back(addr, _config.gossip_port);
                 log_gossip_protocol().debug("DNS A discovered peer: {}:{}", addr, _config.gossip_port);
             }
-#pragma GCC diagnostic pop
         }
+#pragma GCC diagnostic pop
 
         if (discovered_addresses.empty()) {
             log_gossip_protocol().debug("DNS discovery returned no addresses");

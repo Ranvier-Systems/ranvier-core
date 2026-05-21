@@ -5,6 +5,7 @@
 #include "logging.hpp"
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
+#include "request_timeout.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"
 #include "tracing_service.hpp"
@@ -838,10 +839,14 @@ future<ConnectionBundle> HttpController::establish_backend_connection(ProxyConte
             // Wait with exponential backoff before retry
             co_await seastar::sleep(ctx->current_backoff);
 
-            // Increase backoff for next attempt (with cap)
-            auto next_backoff = std::chrono::milliseconds(
-                static_cast<int64_t>(ctx->current_backoff.count() * ctx->retry_config.backoff_multiplier));
-            ctx->current_backoff = std::min(next_backoff, ctx->retry_config.max_backoff);
+            // Increase backoff for next attempt (with cap).
+            // Compute in double and clamp to max_backoff before casting to int64_t,
+            // since a raw double->int64_t cast on overflow is UB (audit H9, Hard Rule #11).
+            const double next_ms = std::min(
+                static_cast<double>(ctx->current_backoff.count()) *
+                    ctx->retry_config.backoff_multiplier,
+                static_cast<double>(ctx->retry_config.max_backoff.count()));
+            ctx->current_backoff = std::chrono::milliseconds(static_cast<int64_t>(next_ms));
         } else {
             log_proxy.warn("[{}] Connection failed after {} retries and {} fallbacks",
                 ctx->request_id, ctx->retry_config.max_retries + 1, ctx->fallback_attempts);
@@ -876,6 +881,16 @@ future<bool> HttpController::send_backend_request(ProxyContext* ctx, ConnectionB
         "Content-Type: application/json\r\n"
         "Content-Length: " + to_sstring(ctx->forwarded_body.size()) + "\r\n"
         "X-Request-ID: " + safe_request_id + "\r\n";
+
+    // Forward the configured API key as `Authorization: Bearer <key>` when
+    // the chosen backend has one. Sanitized to strip CR/LF so a malformed
+    // env-var value can't inject additional headers. The key itself is never
+    // logged — only its presence/absence is observable via metrics.
+    auto api_key = _router.get_backend_api_key(ctx->current_backend);
+    if (!api_key.empty()) {
+        http_headers += "Authorization: Bearer "
+                      + sstring(sanitize_header_value(api_key)) + "\r\n";
+    }
 
     // Add traceparent header if tracing is enabled (sanitize to prevent injection)
     if (!ctx->backend_traceparent.empty()) {
@@ -956,7 +971,8 @@ future<> HttpController::stream_backend_response(
         temporary_buffer<char> chunk;
 
         try {
-            auto read_future = with_timeout(read_deadline, bundle->in.read());
+            auto read_future = with_request_timeout(
+                read_deadline, bundle->in.read(), "stream_chunk");
             chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
                 // Check for connection errors first
                 auto err_type = classify_connection_error(ep);
@@ -1059,7 +1075,8 @@ future<> HttpController::stream_backend_response(
             // the ART converges on the consistent-hash assignment rather than
             // transient load/cost diversions; 0 means skip learning entirely.
             if (ctx->learn_target_backend != 0 &&
-                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length) {
+                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length &&
+                _router.should_cache_routes_for(ctx->learn_target_backend)) {
                 BackendId learn_backend = ctx->learn_target_backend;
                 // Route learning is best-effort; don't fail the request if it fails
                 if (!ctx->prefix_boundaries.empty() && _config.enable_multi_depth_routing) {
@@ -1075,8 +1092,15 @@ future<> HttpController::stream_backend_response(
                 } else {
                     // Single-depth routing: use prefix_boundary or default
                     // Skip persistence if route was deduplicated (§21.7)
+                    //
+                    // Lifetime: this `.then()` captures `this` to reach `_persistence`,
+                    // but the future is fire-and-forget — the surrounding coroutine's
+                    // gate::holder is released before the chain resolves. Capture an
+                    // extra gate::holder so `_request_gate.close()` blocks on this tail
+                    // and `this` stays valid. See shutdown contract on HttpController.
                     (void)_router.learn_route_global(ctx->tokens, learn_backend, ctx->request_id, ctx->prefix_boundary)
-                        .then([this, tokens = ctx->tokens, backend = learn_backend](bool is_new_route) {
+                        .then([this, tokens = ctx->tokens, backend = learn_backend,
+                               holder = _request_gate.hold()](bool is_new_route) {
                             if (is_new_route && _persistence) {
                                 _persistence->queue_save_route(tokens, backend);
                             }
@@ -1249,7 +1273,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
     // Request body size limit check — before any body processing to prevent memory exhaustion (§4.4)
     if (_config.max_request_body_bytes > 0) {
-        size_t body_size = get_request_body_size(*req);
+        size_t body_size = get_request_body_size(*req, _config.max_request_body_bytes);
         if (body_size > _config.max_request_body_bytes) {
             ++_requests_rejected_body_size;
             metrics().record_body_size_rejection();
@@ -1411,7 +1435,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     //   2. Thread pool (if enabled): offloads FFI to worker thread
                     //   3. Cross-shard dispatch: P2C to least-loaded shard
                     //   4. Local fallback: blocks reactor (last resort)
-                    auto tok_result = co_await _tokenizer.local().encode_threaded_async(text_to_tokenize);
+                    //
+                    // Path 4 runs the Rust BPE call on the reactor; without a
+                    // hard ceiling a wedged tokenizer would block the entire
+                    // shard. Wrap with a deadline so the worst case is a
+                    // request-scoped timeout, not a permanent shard stall.
+                    constexpr auto kTokenizeTimeout = std::chrono::seconds(5);
+                    auto tok_result = co_await with_request_timeout(
+                        kTokenizeTimeout,
+                        _tokenizer.local().encode_threaded_async(text_to_tokenize),
+                        "tokenize");
                     tokens = std::move(tok_result.tokens);
 
                     // Set tracing attributes based on tokenization source
@@ -1435,6 +1468,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                             metrics().record_tokenization_cross_shard();
                         }
                     }
+                } catch (const request_timeout_error& e) {
+                    // Tokenizer exceeded its deadline (likely wedged FFI or
+                    // saturated thread pool) - fall back to round-robin so the
+                    // request can still make progress.
+                    log_proxy.warn("[{}] Tokenization timed out ({}), falling back to round-robin routing",
+                                   request_id, e.label());
+                    tokenize_span.set_error(std::string("tokenization_timeout: ") + e.label());
+                    metrics().record_tokenizer_error();
+                    tokens.clear();
                 } catch (const std::exception& e) {
                     // Tokenizer failed - log and continue without tokens (fall back to round-robin)
                     log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
@@ -2081,7 +2123,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // BackendRequestGuard destructor decrements active_requests; CostBudgetGuard destructor releases cost budget.
     // Use SSE content type for streaming requests, JSON for non-streaming (e.g. Ollama non-stream)
     auto response_content_type = ctx->client_expects_streaming ? "text/event-stream" : "json";
-    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(slot.units.value()), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
@@ -2450,7 +2492,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
 }
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true
+    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true&type=vllm
     // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
@@ -2459,6 +2501,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     sstring priority_str = req->get_query_param("priority");
     sstring supports_token_ids_str = req->get_query_param("supports_token_ids");
     sstring compression_ratio_str = req->get_query_param("compression_ratio");
+    sstring type_str = req->get_query_param("type");
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
@@ -2538,6 +2581,21 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         compression_ratio = *cr_opt;
     }
 
+    // type: backend engine class (vllm, sglang, trt_llm, ollama, lm_studio,
+    // cerebras, openai_compatible). Default vllm for backward compatibility.
+    // Invalid values are rejected (400), mirroring the supports_token_ids path.
+    BackendType backend_type = BackendType::VLLM;
+    if (!type_str.empty()) {
+        auto type_opt = parse_backend_type(std::string_view(type_str));
+        if (!type_opt) {
+            log_control.warn("POST /admin/backends: invalid type '{}'", type_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid type: must be one of vllm, sglang, trt_llm, ollama, lm_studio, cerebras, openai_compatible\"}");
+            co_return std::move(rep);
+        }
+        backend_type = *type_opt;
+    }
+
     // Resolve address: supports both direct IP addresses and hostnames
     socket_address addr;
     std::string resolved_ip;
@@ -2604,10 +2662,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     // Queue backend for async persistence (fire-and-forget, non-blocking)
     // Store the resolved IP, not the hostname, for persistence
     if (_persistence) {
-        _persistence->queue_save_backend(id, resolved_ip, port, weight, priority);
+        _persistence->queue_save_backend(id, resolved_ip, port, weight, priority,
+            std::string(backend_type_to_string(backend_type)));
     }
 
-    co_await _router.register_backend_global(id, addr, weight, priority, supports_token_ids, compression_ratio);
+    co_await _router.register_backend_global(id, addr, weight, priority,
+        supports_token_ids, compression_ratio, backend_type);
 
     // Notify HealthService of compression ratio for compression-aware load scoring.
     // HealthService state lives on shard 0 — must submit_to(0) to avoid cross-shard
@@ -2618,12 +2678,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         });
     }
 
-    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={})",
-        id, ip_str, port, weight, priority, supports_token_ids, compression_ratio);
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={}, type={})",
+        id, ip_str, port, weight, priority, supports_token_ids, compression_ratio,
+        backend_type_to_string(backend_type));
     rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
         ", \"priority\": " + std::to_string(priority) +
         ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") +
-        ", \"compression_ratio\": " + std::to_string(compression_ratio) + "}");
+        ", \"compression_ratio\": " + std::to_string(compression_ratio) +
+        ", \"type\": \"" + std::string(backend_type_to_string(backend_type)) + "\"}");
     co_return std::move(rep);
 }
 
@@ -2872,7 +2934,8 @@ bool HttpController::is_persistence_backpressured() const {
     return fill_ratio >= _config.backpressure.persistence_queue_threshold;
 }
 
-size_t HttpController::get_request_body_size(const seastar::http::request& req) {
+size_t HttpController::get_request_body_size(const seastar::http::request& req,
+                                             size_t max_request_body_bytes) {
     auto content_length_it = req._headers.find("Content-Length");
     if (content_length_it != req._headers.end()) {
         // Content-Length header present — parse with from_chars (Rule #10)
@@ -2880,6 +2943,13 @@ size_t HttpController::get_request_body_size(const seastar::http::request& req) 
         uint64_t cl_value = 0;
         auto [ptr, ec] = std::from_chars(cl_str.data(), cl_str.data() + cl_str.size(), cl_value);
         if (ec == std::errc{} && ptr == cl_str.data() + cl_str.size()) {
+            // Validate against limits BEFORE the size_t cast so a Content-Length
+            // larger than size_t (32-bit hosts) cannot silently truncate past the
+            // body-size check (audit H2). On 64-bit hosts the size_t guard is a no-op.
+            if (cl_value > std::numeric_limits<size_t>::max() ||
+                (max_request_body_bytes > 0 && cl_value > max_request_body_bytes)) {
+                return std::numeric_limits<size_t>::max();
+            }
             return static_cast<size_t>(cl_value);
         }
     }
@@ -2966,7 +3036,7 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0) ss << ",\n";
             ss << inner_indent << "  {\"edge\": " << static_cast<unsigned>(node.children[i].first) << ", \"node\": ";
-            ss << dump_node_to_json(node.children[i].second, indent_level + 2, remaining_depth - 1);
+            ss << dump_node_to_json(*node.children[i].second, indent_level + 2, remaining_depth - 1);
             ss << "}";
         }
         ss << "\n" << inner_indent;
@@ -3139,7 +3209,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
         oss << "      \"is_draining\": " << (b.is_draining ? "true" : "false") << ",\n";
         oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false") << ",\n";
         oss << "      \"supports_token_ids\": " << (b.supports_token_ids ? "true" : "false") << ",\n";
-        oss << "      \"compression_ratio\": " << b.compression_ratio;
+        oss << "      \"compression_ratio\": " << b.compression_ratio << ",\n";
+        oss << "      \"type\": \"" << backend_type_to_string(b.type) << "\"";
         if (b.drain_start_ms > 0) {
             oss << ",\n      \"drain_start_ms\": " << b.drain_start_ms << "\n";
         } else {

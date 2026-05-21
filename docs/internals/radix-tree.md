@@ -108,7 +108,7 @@ Each 2MB chunk is divided into fixed-size slots. Each slot contains an 8-byte `S
 | Node48 | 448 bytes | 4,681 |
 | Node256 | 3,200 bytes | 655 |
 
-Node256 slots are larger than a naive calculation (256 × 8 = 2,048 bytes) because they include an additional `std::array<TokenId, 256>` for hash collision handling (see [Node256](#node256-direct-access-with-collision-handling)).
+Node256 slots are larger than a naive calculation (256 × 8 = 2,048 bytes) because each slot also holds the common `Node` header (LRU pointers, `InlinedVector` prefix, leaf metadata, vtable pointer) plus alignment padding. See [Node256](#node256-direct-mapped-array) for the structure.
 
 ---
 
@@ -134,18 +134,18 @@ stateDiagram-v2
 
 ### Common Node Header
 
-All node types inherit from `Node` (see `radix_tree.hpp:103-120`). The base struct carries:
+All node types inherit from `Node` (defined in `radix_tree.hpp`). The base struct carries:
 
 | Field | Type | Purpose |
 |-------|------|---------|
 | `type` | `NodeType` | Discriminator for polymorphic dispatch |
-| `prefix` | `absl::InlinedVector<TokenId, 8>` | Path compression (inline for ≤8 tokens, heap beyond) |
+| `prefix` | `absl::InlinedVector<uint8_t, 32>` | Byte-level path compression (inline for ≤32 bytes ≈ 8 tokens, heap beyond) |
 | `leaf_value` | `std::optional<BackendId>` | Route destination if this node is terminal |
 | `origin` | `RouteOrigin` | `LOCAL` (default) or `REMOTE` — controls eviction priority |
 | `last_accessed` | `steady_clock::time_point` | Timestamp for TTL expiration |
 | `lru_prev` / `lru_next` | `Node*` | Intrusive doubly-linked LRU list pointers |
 
-The `prefix` field uses Abseil's `InlinedVector` rather than `std::vector` to avoid heap allocation for short prefixes (≤8 tokens), which covers the majority of nodes after path compression splits.
+The tree operates on raw bytes (big-endian `TokenId` encoding), so `prefix` is a byte vector, not a `TokenId` vector. The `InlinedVector` inline capacity of 32 bytes equals 8 logical tokens — enough to avoid heap allocation for the majority of nodes after path compression splits.
 
 ### Node Types
 
@@ -179,18 +179,18 @@ This is the textbook ART representation and it's only possible because the tree 
 
 ### Growth and Shrinking
 
-**Growth** occurs during insertion when a node reaches capacity. The `grow_nodeX_to_nodeY()` functions (e.g., `radix_tree.hpp:920-960`) allocate a new, larger node via the slab, then call `transfer_node_metadata()` to move the prefix, leaf value, origin, timestamps, *and* LRU list position to the new node. Existing children are moved via `std::move()` — zero-copy ownership transfer. The old node is automatically returned to the slab when its `NodePtr` goes out of scope.
+**Growth** occurs during insertion when a node reaches capacity. The `grow_to_node16()`, `grow_to_node48()`, and `grow_to_node256()` helpers allocate a new, larger node via the slab, then call `transfer_node_metadata()` to move the prefix, leaf value, origin, timestamps, *and* LRU list position to the new node. Existing children are moved via `std::move()` — zero-copy ownership transfer. The old node is automatically returned to the slab when its `NodePtr` goes out of scope.
 
-**Shrinking** occurs during compaction. Unlike growth (which is always one step up), shrinking can skip intermediate types: a Node256 with ≤4 children shrinks directly to Node4, not through Node48 and Node16. See [Tree Compaction](#tree-compaction-memory-reclamation) and `radix_tree.hpp:1757-1793`.
+**Shrinking** occurs during compaction. Unlike growth (which is always one step up), shrinking can skip intermediate types: a Node256 with ≤4 children shrinks directly to Node4, not through Node48 and Node16. See [Tree Compaction](#tree-compaction-memory-reclamation) and the `shrink_node()` helper in `radix_tree.hpp`.
 
 ### Memory Efficiency
 
 | Node Type | Slab Slot | Keys Storage | Children Storage | Capacity |
 |-----------|-----------|--------------|------------------|----------|
-| Node4 | 192 B | 16 B (4 × 4B) | 32 B (4 × 8B) | 1-4 |
-| Node16 | 192 B | 64 B (16 × 4B) | 128 B (16 × 8B) | 5-16 |
-| Node48 | 448 B | 192 B keys + 256 B index | 384 B (48 × 8B) | 17-48 |
-| Node256 | 3,200 B | 1,024 B (256 × 4B) | 2,048 B (256 × 8B) | 49-256 |
+| Node4 | 192 B | 4 B (4 × 1B) | 32 B (4 × 8B) | 1-4 |
+| Node16 | 192 B | 16 B (16 × 1B) | 128 B (16 × 8B) | 5-16 |
+| Node48 | 448 B | 48 B keys + 256 B index | 384 B (48 × 8B) | 17-48 |
+| Node256 | 3,200 B | none (slot index *is* the key) | 2,048 B (256 × 8B) | 49-256 |
 
 Sparse trees (common in LLM routing) use primarily Node4/Node16. Dense branching automatically upgrades to indexed/direct access.
 
@@ -206,7 +206,7 @@ Without compression, a 1,000-token system prompt creates 1,000 nodes — 1,000 p
 
 ### How It Works
 
-Each node's `prefix` field stores a sequence of tokens that don't branch. Prefixes are only split when a new route diverges ("lazy expansion"). The `split_node()` function (`radix_tree.hpp:1090-1120`) handles this:
+Each node's `prefix` field stores a sequence of bytes that don't branch. Prefixes are only split when a new route diverges ("lazy expansion"). The `split_node()` function in `radix_tree.hpp` handles this:
 
 1. **Determine split point** — where the new route diverges from the existing prefix
 2. **Create a child node** for the suffix, sized to hold all existing children (not always Node4 — a node with 30 children creates Node48)
@@ -228,7 +228,7 @@ graph TB
 
 ### Maximum Prefix Length Invariant
 
-Node prefixes are bounded by `MAX_PREFIX_LENGTH = 256` (defined at `radix_tree.hpp:97`) to prevent unbounded memory growth in a single `InlinedVector` (Hard Rule #4). When `insert()` or `split_node()` would produce a prefix exceeding 256 tokens, `split_long_prefix()` chains the excess into a linked sequence of Node4 nodes, each holding up to 256 tokens. This is transparent to callers.
+Node prefixes are bounded by `MAX_PREFIX_LENGTH = 1024` bytes (defined in `radix_tree.hpp`), which corresponds to 256 logical tokens at 4 bytes per `TokenId`. The bound prevents unbounded memory growth in a single `InlinedVector` (Hard Rule #4). When `insert()` or `split_node()` would produce a prefix exceeding this bound, `split_long_prefix()` chains the excess into a linked sequence of nodes, each holding up to 1024 bytes of prefix. This is transparent to callers.
 
 ### Cache Efficiency Gains
 
@@ -241,7 +241,7 @@ Node prefixes are bounded by `MAX_PREFIX_LENGTH = 256` (defined at `radix_tree.h
 
 ### Lookup with Path Compression
 
-The `lookup_recursive()` function (`radix_tree.hpp:1468-1527`) uses iterative traversal (not actual recursion) for hot-path performance. Key design decisions:
+The `lookup_recursive()` function in `radix_tree.hpp` uses iterative traversal (the name is a holdover from the original recursive implementation) for hot-path performance. Key design decisions:
 
 - **Best-match semantics:** Returns the deepest matching leaf, not just exact matches. A lookup for tokens `[A,B,C,D,E]` returns the leaf at `[A,B,C]` if no deeper match exists.
 - **Early return on mismatch:** When the prefix comparison fails partway, the function immediately returns the best match found so far.
@@ -254,9 +254,9 @@ The `lookup_recursive()` function (`radix_tree.hpp:1468-1527`) uses iterative tr
 
 > **Status:** Planned optimization for Node16 lookups
 
-Node16 currently uses linear scan through the keys vector. The memory layout is designed to be SIMD-friendly: 16 × 4-byte `TokenId` keys fit in two AVX2 registers (256 bits each) or four SSE4.2 registers (128 bits each).
+Node16 currently uses linear scan through the keys vector. The byte-keyed layout is naturally SIMD-friendly: 16 × 1-byte keys fit in a single 128-bit SSE register (`_mm_cmpeq_epi8` + `_mm_movemask_epi8`) or AVX2 register lane.
 
-The planned optimization would broadcast the search key to all SIMD lanes and compare all 16 keys in 2 instructions, reducing average lookup from ~12 cycles to ~4 cycles.
+The planned optimization would broadcast the search byte to all SIMD lanes and compare all 16 keys in 2 instructions, reducing average lookup from ~12 cycles to ~4 cycles.
 
 ### Expected Performance Gains
 
@@ -268,9 +268,9 @@ The planned optimization would broadcast the search key to all SIMD lanes and co
 
 ### Implementation Considerations
 
-1. **Alignment:** Keys vector must be 32-byte aligned for optimal AVX2 performance (likely requires `alignas(32)` or switching to `std::array`)
-2. **Runtime detection:** Needs `__builtin_cpu_supports("avx2")` with graceful fallback to SSE4.2 or scalar path
-3. **Build integration:** Requires `-mavx2 -msse4.2` compiler flags
+1. **Alignment:** The keys vector must be 16-byte aligned for unaligned-load avoidance (likely requires `alignas(16)` or switching to `std::array<uint8_t, 16>`)
+2. **Runtime detection:** Needs `__builtin_cpu_supports("sse4.2")` (and `"avx2"` if extended) with graceful fallback to scalar path
+3. **Build integration:** Requires `-msse4.2` compiler flags (`-mavx2` for the wider variant)
 
 ---
 
@@ -396,7 +396,7 @@ flowchart TB
     MORE -->|No| ROOT[Check if this node should shrink]
 ```
 
-**Shrinking skips intermediate types:** A Node256 with 3 children shrinks directly to Node4, not through Node48 → Node16 → Node4. This is handled by `shrink_node()` at `radix_tree.hpp:1757-1793`.
+**Shrinking skips intermediate types:** A Node256 with 3 children shrinks directly to Node4, not through Node48 → Node16 → Node4. This is handled by `shrink_node()` in `radix_tree.hpp`.
 
 ### Performance
 

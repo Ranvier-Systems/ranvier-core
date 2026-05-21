@@ -12,6 +12,7 @@
 //   5. Draining mode with timeout
 
 #include "router_service.hpp"
+#include "backend_registry.hpp"
 #include "config.hpp"
 #include "radix_tree.hpp"
 #include "node_slab.hpp"
@@ -425,6 +426,173 @@ TEST_F(RouterServiceTest, CompressionRatioSurvivesReregister) {
                                                  100, 0, true, 3.0);
     states = router_->get_all_backend_states();
     EXPECT_DOUBLE_EQ(states[0].compression_ratio, 3.0);
+}
+
+// =============================================================================
+// BackendType Tests (BACKLOG §19.1)
+// =============================================================================
+
+TEST_F(RouterServiceTest, BackendTypeDefaultsToVllm) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    EXPECT_EQ(router_->backend_type(1), BackendType::VLLM);
+}
+
+TEST_F(RouterServiceTest, BackendTypeNonexistentReturnsVllm) {
+    EXPECT_EQ(router_->backend_type(999), BackendType::VLLM);
+}
+
+TEST_F(RouterServiceTest, BackendTypeRoundTripsThroughRegistration) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0, BackendType::SGLANG);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, false, 1.0, BackendType::OLLAMA);
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+
+    EXPECT_EQ(router_->backend_type(1), BackendType::SGLANG);
+    EXPECT_EQ(router_->backend_type(2), BackendType::OLLAMA);
+    EXPECT_EQ(router_->backend_type(3), BackendType::CEREBRAS);
+}
+
+TEST_F(RouterServiceTest, BackendTypeRoundTripsThroughAbstractRegistry) {
+    // §19.3: BackendRegistry exposes backend_type() so HealthService can
+    // proactively skip non-vLLM backends without depending on RouterService
+    // directly. Verify that calls through the abstract interface dispatch to
+    // the concrete override — if RouterService::backend_type() loses its
+    // `override` keyword, this test catches the silent fallback to the
+    // BackendRegistry inline default (which would always return VLLM).
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0, BackendType::VLLM);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::register_backend_for_testing(3, make_addr("10.0.0.3", 8080),
+                                                 100, 0, false, 1.0, BackendType::OLLAMA);
+
+    BackendRegistry* registry = router_.get();
+    EXPECT_EQ(registry->backend_type(1), BackendType::VLLM);
+    EXPECT_EQ(registry->backend_type(2), BackendType::CEREBRAS);
+    EXPECT_EQ(registry->backend_type(3), BackendType::OLLAMA);
+
+    // Unknown backend: matches RouterService's conservative default. The
+    // HealthService scrape predicate relies on this so a race between gossip
+    // and local registration doesn't silently mute a real vLLM backend.
+    EXPECT_EQ(registry->backend_type(999), BackendType::VLLM);
+}
+
+TEST_F(RouterServiceTest, BackendStatesIncludeType) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, true, 1.0, BackendType::VLLM);
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+
+    auto states = router_->get_all_backend_states();
+    ASSERT_EQ(states.size(), 2u);
+    for (const auto& s : states) {
+        if (s.id == 1) {
+            EXPECT_EQ(s.type, BackendType::VLLM);
+        } else if (s.id == 2) {
+            EXPECT_EQ(s.type, BackendType::CEREBRAS);
+        }
+    }
+}
+
+TEST_F(RouterServiceTest, CerebrasForcesSupportsTokenIdsFalse) {
+    // Auto-downgrade: even when caller passes supports_token_ids=true,
+    // CEREBRAS overrides it to false so the existing strip_prompt_token_ids
+    // path activates without per-deployment config.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, /*supports_token_ids=*/true,
+                                                 1.0, BackendType::CEREBRAS);
+    EXPECT_EQ(router_->backend_type(1), BackendType::CEREBRAS);
+    EXPECT_FALSE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, OpenAiCompatibleForcesSupportsTokenIdsFalse) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, /*supports_token_ids=*/true,
+                                                 1.0, BackendType::OPENAI_COMPATIBLE);
+    EXPECT_FALSE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, VllmRespectsExplicitSupportsTokenIdsFalse) {
+    // The auto-downgrade only fires for CEREBRAS / OPENAI_COMPATIBLE. For
+    // VLLM-class types, explicit false should pass through untouched.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, /*supports_token_ids=*/false,
+                                                 1.0, BackendType::VLLM);
+    EXPECT_FALSE(router_->backend_supports_token_ids(1));
+}
+
+TEST_F(RouterServiceTest, ParseBackendTypeKnownStrings) {
+    EXPECT_EQ(parse_backend_type("vllm"), BackendType::VLLM);
+    EXPECT_EQ(parse_backend_type("sglang"), BackendType::SGLANG);
+    EXPECT_EQ(parse_backend_type("trt_llm"), BackendType::TRT_LLM);
+    EXPECT_EQ(parse_backend_type("ollama"), BackendType::OLLAMA);
+    EXPECT_EQ(parse_backend_type("lm_studio"), BackendType::LM_STUDIO);
+    EXPECT_EQ(parse_backend_type("cerebras"), BackendType::CEREBRAS);
+    EXPECT_EQ(parse_backend_type("openai_compatible"), BackendType::OPENAI_COMPATIBLE);
+}
+
+TEST_F(RouterServiceTest, ParseBackendTypeUnknownReturnsNullopt) {
+    EXPECT_FALSE(parse_backend_type("").has_value());
+    EXPECT_FALSE(parse_backend_type("VLLM").has_value());  // case-sensitive
+    EXPECT_FALSE(parse_backend_type("bogus").has_value());
+}
+
+TEST_F(RouterServiceTest, BackendTypeToStringRoundTrip) {
+    for (auto t : {BackendType::VLLM, BackendType::SGLANG, BackendType::TRT_LLM,
+                   BackendType::OLLAMA, BackendType::LM_STUDIO,
+                   BackendType::CEREBRAS, BackendType::OPENAI_COMPATIBLE}) {
+        auto round_tripped = parse_backend_type(backend_type_to_string(t));
+        ASSERT_TRUE(round_tripped.has_value());
+        EXPECT_EQ(*round_tripped, t);
+    }
+}
+
+// =============================================================================
+// should_cache_routes_for() — Route-Learning Gate Predicate
+// =============================================================================
+
+TEST_F(RouterServiceTest, ShouldCacheRoutesTrueForCacheableTypes) {
+    BackendId next_id = 1;
+    for (auto t : {BackendType::VLLM, BackendType::SGLANG, BackendType::TRT_LLM,
+                   BackendType::OLLAMA, BackendType::LM_STUDIO,
+                   BackendType::OPENAI_COMPATIBLE}) {
+        RouterService::register_backend_for_testing(next_id, make_addr("10.0.0.1", 8080),
+                                                     100, 0, false, 1.0, t);
+        EXPECT_TRUE(router_->should_cache_routes_for(next_id))
+            << "type=" << backend_type_to_string(t);
+        RouterService::unregister_backend_for_testing(next_id);
+        ++next_id;
+    }
+}
+
+TEST_F(RouterServiceTest, ShouldCacheRoutesFalseForCerebras) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    EXPECT_FALSE(router_->should_cache_routes_for(1));
+}
+
+TEST_F(RouterServiceTest, ShouldCacheRoutesTrueForMissingBackend) {
+    // Safe default: missing backend means downstream learn_route_global
+    // will reject the call; we don't pre-empt that with a silent skip.
+    EXPECT_TRUE(router_->should_cache_routes_for(999));
+}
+
+TEST_F(RouterServiceTest, LookupHonorsExistingCerebrasRoute) {
+    // The gate suppresses *new* ART learning on Cerebras backends; it
+    // does not retroactively delete or hide existing entries. If an
+    // entry already exists (e.g. inserted via the admin POST route,
+    // which is intentionally ungated as an operator command), lookup
+    // still returns it.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    std::vector<int32_t> tokens = {10, 20, 30, 40, 50};
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->lookup(tokens);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result.value(), 1);
 }
 
 TEST_F(RouterServiceTest, UnregisterClearsDeadStatus) {
@@ -2920,4 +3088,49 @@ TEST_F(OriginalSelectedTest, JumpHashNoDivertOriginalMatches) {
     ASSERT_TRUE(second.backend_id.has_value());
     EXPECT_EQ(second.backend_id.value(), first.backend_id.value());
     EXPECT_EQ(second.original_selected, second.backend_id.value());
+}
+
+// =============================================================================
+// API Key Side-Map
+// =============================================================================
+// HealthService-style: the broadcast path uses parallel_for_each across shards
+// and needs a reactor, so we exercise the synchronous getters via the testing
+// helper that writes directly into shard-local state.
+
+TEST_F(RouterServiceTest, ApiKeyMissingReturnsEmpty) {
+    EXPECT_TRUE(router_->get_backend_api_key(42).empty());
+}
+
+TEST_F(RouterServiceTest, ApiKeyRoundTrips) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::set_backend_api_key_for_testing(1, "sk-test-cerebras-key");
+    EXPECT_EQ(router_->get_backend_api_key(1), "sk-test-cerebras-key");
+}
+
+TEST_F(RouterServiceTest, ApiKeyClearedOnUnregister) {
+    // The credential boundary closes when the backend is unregistered —
+    // a re-registered ID must not inherit the previous tenant's key.
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::set_backend_api_key_for_testing(1, "sk-tenant-a");
+    EXPECT_EQ(router_->get_backend_api_key(1), "sk-tenant-a");
+
+    RouterService::unregister_backend_for_testing(1);
+    EXPECT_TRUE(router_->get_backend_api_key(1).empty());
+
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.2", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    EXPECT_TRUE(router_->get_backend_api_key(1).empty())
+        << "Re-registered backend should start without a key";
+}
+
+TEST_F(RouterServiceTest, ApiKeyPerBackendIndependent) {
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    RouterService::register_backend_for_testing(2, make_addr("10.0.0.2", 443),
+                                                 100, 0, false, 1.0, BackendType::CEREBRAS);
+    RouterService::set_backend_api_key_for_testing(2, "sk-only-on-2");
+
+    EXPECT_TRUE(router_->get_backend_api_key(1).empty());
+    EXPECT_EQ(router_->get_backend_api_key(2), "sk-only-on-2");
 }

@@ -263,6 +263,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/application.cpp
       src/async_persistence.cpp
       src/config_loader.cpp
+      src/config_loader_async.cpp
       src/crypto_offloader.cpp
       src/dtls_context.cpp
       src/gossip_consensus.cpp
@@ -281,6 +282,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/tokenizer_thread_pool.cpp
       src/sqlite_persistence.cpp
       src/tracing_service.cpp
+      src/worker_affinity.cpp
     )
     add_dependencies(ranvier_server dashboard_resource)
 
@@ -843,6 +845,20 @@ if(Seastar_FOUND)
     )
     gtest_discover_tests(sharded_config_test)
 
+    # request_timeout helper Unit Tests (Requires Seastar types for
+    # seastar::timed_out_error base class — the templated helper itself is
+    # exercised by integration tests.)
+    add_executable(request_timeout_test
+      tests/unit/request_timeout_test.cpp
+    )
+    target_include_directories(request_timeout_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(request_timeout_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest_main
+    )
+    gtest_discover_tests(request_timeout_test)
+
     # CryptoOffloader Unit Tests (Requires Seastar types)
     # Tests adaptive crypto offloading decision logic and configuration
     add_executable(crypto_offloader_test
@@ -927,6 +943,7 @@ if(Seastar_FOUND)
       tests/unit/async_persistence_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src
@@ -949,6 +966,7 @@ if(Seastar_FOUND)
       src/agent_registry.cpp
       src/application.cpp
       src/config_loader.cpp
+      src/config_loader_async.cpp
       src/crypto_offloader.cpp
       src/gossip_consensus.cpp
       src/gossip_protocol.cpp
@@ -968,6 +986,7 @@ if(Seastar_FOUND)
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
       src/tracing_service.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(application_test PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -1004,6 +1023,7 @@ if(Seastar_FOUND)
       tests/unit/tokenization_cache_test.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenization_cache_test
@@ -1020,6 +1040,7 @@ if(Seastar_FOUND)
     add_executable(tokenizer_thread_pool_test
       tests/unit/tokenizer_thread_pool_test.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_thread_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_test
@@ -1037,6 +1058,7 @@ if(Seastar_FOUND)
       tests/unit/tokenizer_service_test.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_service_test
@@ -1109,6 +1131,7 @@ if(Seastar_FOUND)
       tests/unit/async_persistence_concurrency_test.cpp
       src/async_persistence.cpp
       src/sqlite_persistence.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_concurrency_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src
@@ -1130,6 +1153,7 @@ if(Seastar_FOUND)
     add_executable(tokenizer_thread_pool_concurrency_test
       tests/unit/tokenizer_thread_pool_concurrency_test.cpp
       src/tokenizer_thread_pool.cpp
+      src/worker_affinity.cpp
     )
     target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_concurrency_test
@@ -1139,6 +1163,50 @@ if(Seastar_FOUND)
       GTest::gtest_main
     )
     gtest_discover_tests(tokenizer_thread_pool_concurrency_test)
+
+    # Seastar Contract Test: Cross-Shard Exception Propagation
+    # Boots a 2-shard reactor, throws std::bad_alloc inside a lambda passed
+    # to seastar::smp::submit_to, and prints whether the initiating shard
+    # observes the exception in its original type (caught as bad_alloc) or
+    # repackaged into a different std::exception subclass (e.g.
+    # seastar::broken_promise). The test always passes once the reactor
+    # preconditions hold; the printed "[result] …" line is the artefact.
+    #
+    # Unlike the other Seastar-linked tests in this directory this one
+    # actually starts the reactor, so it provides its own main() and does
+    # NOT link GTest::gtest_main.
+    add_executable(cross_shard_exception_propagation_test
+      tests/unit/cross_shard_exception_propagation_test.cpp
+    )
+    target_include_directories(cross_shard_exception_propagation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(cross_shard_exception_propagation_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest
+    )
+    gtest_discover_tests(cross_shard_exception_propagation_test)
+
+    # Worker Affinity End-to-End Test
+    # Boots a 2-shard reactor, runs the full snapshot → init → pin
+    # pipeline, then reads pthread_getaffinity_np back on a real worker
+    # thread to verify the kernel honoured the pin. Asserts the success-
+    # path invariant (worker landed on a single non-reactor CPU) on hosts
+    # with at least one non-reactor core; gracefully skips that assertion
+    # on tight-fit CI runners (M=0 fallback path).
+    #
+    # Like cross_shard_exception_propagation_test this provides its own
+    # main() and does NOT link GTest::gtest_main.
+    add_executable(worker_affinity_test
+      tests/unit/worker_affinity_test.cpp
+      src/worker_affinity.cpp
+    )
+    target_include_directories(worker_affinity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(worker_affinity_test
+      PRIVATE
+      Seastar::seastar
+      GTest::gtest
+    )
+    gtest_discover_tests(worker_affinity_test)
 endif()
 
 # Aggregate target that depends on every *_test executable. Lets CI build only
@@ -1153,3 +1221,136 @@ foreach(_t ${_ranvier_all_targets})
     add_dependencies(unit_tests ${_t})
   endif()
 endforeach()
+
+# =============================================================================
+# Sanitizer Build (opt-in)
+# =============================================================================
+# Builds the unit-test executables with ASan + UBSan for the empirical sweep
+# requested in BACKLOG §18 — catches the integer-overflow / cast findings
+# (H2, H9) and any heap UAF along the request path with no harness work.
+# Disabled by default: sanitisers slow tests several-fold and require clang
+# to pick up the matching compiler-rt runtime that Dockerfile.sanitize ships.
+#
+# Each *_test target compiles its production source files in-tree (see e.g.
+# radix_tree_test pulling in src/node_slab.cpp), so applying the flags to
+# the test target is sufficient to instrument every translation unit the
+# test exercises — there is no shared library that would otherwise escape.
+option(RANVIER_BUILD_SANITIZED "Build unit tests with ASan + UBSan (requires clang)" OFF)
+
+if(RANVIER_BUILD_SANITIZED)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR
+            "RANVIER_BUILD_SANITIZED=ON requires clang/clang++; got "
+            "${CMAKE_CXX_COMPILER_ID}. Re-run cmake with "
+            "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++.")
+    endif()
+
+    # UBSan policy: vendored libraries (RapidJSON, Abseil, ...) contain
+    # several UBSan-noisy idioms that aren't real bugs but that the
+    # compiler can't distinguish from a genuine finding. We rely on
+    # runtime suppressions in `tests/fuzz/ubsan-suppressions.txt` to
+    # filter the noise, and on `halt_on_error=1` in `UBSAN_OPTIONS`
+    # (set by `make sanitize-test` and the `sanitizer-tests.yml` job)
+    # to abort on every unsuppressed finding.
+    #
+    # We intentionally do NOT pass `-fno-sanitize-recover=undefined`:
+    # that flag makes the compiler emit `__ubsan_handle_*_abort`
+    # variants which unconditionally `abort()` without consulting the
+    # runtime suppression list, so any vendored-library noise becomes
+    # un-suppressible and masks the real findings underneath. With the
+    # recoverable handlers, suppressions fire as intended and
+    # `halt_on_error=1` provides the abort-on-first-real-finding
+    # behaviour that the no-recover flag was meant to belt-and-suspender.
+    # Trade-off: running a sanitised test binary directly without
+    # `UBSAN_OPTIONS=halt_on_error=1` will print but not abort on real
+    # findings — every supported entry point (`make sanitize-test`,
+    # `sanitizer-tests.yml`) sets the env var, so this only bites
+    # ad-hoc invocations of the raw binary.
+    set(_san_flags
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer)
+
+    # _ranvier_all_targets was captured above for the unit_tests aggregate
+    # and lists every directly-defined target at that point — including all
+    # *_test executables. Fuzz harnesses are added later and are excluded
+    # by construction (they bring their own -fsanitize=fuzzer,address,undefined).
+    foreach(_t ${_ranvier_all_targets})
+        if(_t MATCHES "_test$")
+            target_compile_options(${_t} PRIVATE ${_san_flags})
+            target_link_options(${_t} PRIVATE ${_san_flags})
+        endif()
+    endforeach()
+endif()
+
+# =============================================================================
+# Fuzz Harnesses (opt-in)
+# =============================================================================
+# libFuzzer-based harnesses for boundaries identified in the request-lifecycle
+# crash-risk audit. Disabled by default — they require clang and add
+# -fsanitize=fuzzer,address,undefined to the harness binaries only. See
+# tests/fuzz/README.md for usage.
+option(RANVIER_BUILD_FUZZERS "Build libFuzzer harnesses (requires clang)" OFF)
+
+if(RANVIER_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR
+            "RANVIER_BUILD_FUZZERS=ON requires clang/clang++; got "
+            "${CMAKE_CXX_COMPILER_ID}. Re-run cmake with "
+            "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++.")
+    endif()
+
+    set(_fuzz_flags -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+
+    # RadixTree fuzzer (pure C++, no Seastar)
+    add_executable(radix_tree_fuzz
+      tests/fuzz/radix_tree_fuzz.cpp
+      src/node_slab.cpp
+    )
+    target_include_directories(radix_tree_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(radix_tree_fuzz
+      PRIVATE
+      absl::inlined_vector
+    )
+    # Skip the DumpNode machinery (self-referential vector that Clang +
+    # libstdc++ rejects but GCC + libstdc++ accepts). The fuzz harness only
+    # exercises insert/lookup, never dump.
+    target_compile_definitions(radix_tree_fuzz PRIVATE RANVIER_FUZZING)
+    target_compile_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
+    target_link_options(radix_tree_fuzz PRIVATE ${_fuzz_flags})
+
+    # RequestRewriter fuzzer (pure C++, RapidJSON only)
+    add_executable(request_rewriter_fuzz
+      tests/fuzz/request_rewriter_fuzz.cpp
+    )
+    target_include_directories(request_rewriter_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(request_rewriter_fuzz
+      PRIVATE
+      rapidjson_interface
+    )
+    target_compile_options(request_rewriter_fuzz PRIVATE ${_fuzz_flags})
+    target_link_options(request_rewriter_fuzz PRIVATE ${_fuzz_flags})
+
+    # StreamParser fuzzer (requires Seastar types)
+    if(Seastar_FOUND)
+        add_executable(stream_parser_fuzz
+          tests/fuzz/stream_parser_fuzz.cpp
+          src/stream_parser.cpp
+        )
+        target_include_directories(stream_parser_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(stream_parser_fuzz
+          PRIVATE
+          Seastar::seastar
+          absl::flat_hash_map
+        )
+        target_compile_options(stream_parser_fuzz PRIVATE ${_fuzz_flags})
+        target_link_options(stream_parser_fuzz PRIVATE ${_fuzz_flags})
+    else()
+        message(STATUS "Seastar not found — skipping stream_parser_fuzz")
+    endif()
+
+    add_custom_target(fuzz_harnesses
+      DEPENDS radix_tree_fuzz request_rewriter_fuzz)
+    if(Seastar_FOUND)
+        add_dependencies(fuzz_harnesses stream_parser_fuzz)
+    endif()
+endif()

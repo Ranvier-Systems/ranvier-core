@@ -1,0 +1,281 @@
+# Fuzz tests for Ranvier Core
+#
+# Runs the libFuzzer harnesses under tests/fuzz/ for a short
+# post-merge regression check. Each working harness gets 60 seconds of
+# fuzzer time. The corpus is cached across runs so coverage compounds —
+# the second run on a branch is meaningfully better than the first.
+#
+# Triggers:
+#   - After Docker Publish completes (post-merge to main).
+#   - Manual via workflow_dispatch.
+#
+# This workflow does NOT run on PRs. Fuzz is too noisy and corpus-
+# dependent to gate code review on; failures here flag regressions
+# after merge so they can be triaged from the run page.
+#
+# Excluded from the main `fuzz-tests` job: stream_parser_fuzz. It links
+# Seastar, whose global operator new/delete override (Hard Rule #15)
+# requires a running reactor that libFuzzer's main never starts. The
+# harness builds and the source is correct; running it inside the
+# default ranvier-fuzz image crashes in libFuzzer's own cleanup, not in
+# StreamParser. The unblock is the shared default-allocator base image
+# (Dockerfile.base.default-alloc) that rebuilds Seastar with
+# `-DSeastar_USE_DEFAULT_ALLOCATOR=ON`; Dockerfile.fuzz is stacked on
+# top via its BASE_IMAGE build-arg. See the
+# `fuzz-run-stream-parser-default-alloc` Make target and the
+# `stream-parser-fuzz-default-alloc` job below. Full diagnosis lives in
+# tests/fuzz/README.md "Caveats". The same base image is consumed by
+# the §18 P2 sanitizer-tests workflow; both consumers pull it pre-built
+# from GHCR per the §18 P3 GHCR-publish spinoff (see `docker-base.yml`'s
+# `build-base-default-alloc` job).
+#
+# Architecture note: GitHub-hosted runners are x86_64. Local fuzz runs
+# (e.g. on Apple Silicon) are aarch64. Different ABIs surface different
+# bugs (alignment, integer-cast behaviour); a "passes locally, fails in
+# CI" finding is real signal, not a configuration issue.
+name: Fuzz Tests
+
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types:
+      - completed
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE: ghcr.io/ranvier-systems/ranvier-base:latest
+  # Used by the stream-parser-fuzz-default-alloc job below; built and
+  # published by docker-base.yml's build-base-default-alloc job (§18 P3
+  # GHCR-publish spinoff). See that job and Dockerfile.base.default-alloc
+  # for the allocator rationale.
+  DEFAULT_ALLOC_BASE: ghcr.io/ranvier-systems/ranvier-base-default-alloc:latest
+
+jobs:
+  fuzz-tests:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the fuzz image from Dockerfile.fuzz (which layers clang,
+      # compiler-rt, llvm, lld onto the cached base image). Reuses GHA
+      # build cache so subsequent runs are layer-cache hits.
+      - name: Build fuzz image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.fuzz
+          load: true
+          tags: ranvier-fuzz:latest
+          cache-from: |
+            type=gha,scope=app-amd64
+            type=gha,scope=fuzz-tests
+          cache-to: type=gha,mode=max,scope=fuzz-tests
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+
+      # Restore the corpus from the most recent prior run. The primary
+      # key embeds run_id so it never hits (forces a save every run);
+      # restore-keys falls back to any earlier saved corpus on this OS.
+      # Net effect: every run restores the latest corpus and saves an
+      # updated one, so coverage accumulates across runs.
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: tests/fuzz/corpus
+          key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-
+
+      - name: Run fuzz harnesses (60s each)
+        id: fuzz
+        run: |
+          mkdir -p fuzz-results
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            ranvier-fuzz:latest \
+            make fuzz-ci \
+            2>&1 | tee fuzz-results/fuzz-ci.log
+
+          FUZZ_EXIT=${PIPESTATUS[0]}
+          echo "fuzz_exit_code=$FUZZ_EXIT" >> $GITHUB_OUTPUT
+          exit $FUZZ_EXIT
+
+      # On crash, libFuzzer writes a `crash-<sha>` reproducer to cwd.
+      # Upload both the log and any reproducers so the failure can be
+      # triaged from the run page.
+      - name: Upload fuzz artifacts on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash-artifacts
+          path: |
+            fuzz-results/fuzz-ci.log
+            crash-*
+            tests/fuzz/corpus/
+          retention-days: 30
+
+      - name: Upload fuzz log on success
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: fuzz-log
+          path: fuzz-results/fuzz-ci.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # stream_parser_fuzz, run inside a fuzz image stacked on the shared
+  # Seastar default-allocator base (Dockerfile.base.default-alloc, layered
+  # under Dockerfile.fuzz via its BASE_IMAGE build-arg). The default-alloc
+  # base is published to GHCR by docker-base.yml's
+  # build-base-default-alloc job (§18 P3 GHCR-publish spinoff); this job
+  # pulls the pre-built base and builds Dockerfile.fuzz on top in a
+  # single buildx step with full type=gha layer caching. Same shape as
+  # the §18 P2 sanitizer-tests workflow.
+  #
+  # Triggers and gating mirror the main fuzz-tests job above:
+  # workflow_run after "Docker Publish" plus manual workflow_dispatch,
+  # with the same `if:` guard requiring successful upstream Docker
+  # Publish. continue-on-error: false on the fuzz step means a real
+  # finding or regression fails the job and surfaces against the
+  # commit that introduced it. Intentionally a separate job (not
+  # workflow) so the corpus cache and image-build wiring stay
+  # co-located with the existing fuzz CI.
+  # ---------------------------------------------------------------------
+  stream-parser-fuzz-default-alloc:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # Default-alloc base pulled pre-built from GHCR (~1-2 min), fuzz
+    # toolchain layered on top (~3-5 min cold, near-instant cache-warm);
+    # FUZZ_CI_TIME default 60s plus link time.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Fail fast with a helpful message if the default-alloc base hasn't
+      # been published yet. Same shape and rationale as sanitizer-tests.yml
+      # — mirrors the bootstrap-window safety net so a missing base
+      # surfaces as a clear "go dispatch docker-base.yml" message instead
+      # of a cryptic docker-driver error.
+      - name: Check default-alloc base image exists
+        run: |
+          echo "Checking if default-alloc base image exists: ${{ env.DEFAULT_ALLOC_BASE }}"
+          if docker manifest inspect ${{ env.DEFAULT_ALLOC_BASE }} > /dev/null 2>&1; then
+            echo "✓ Default-alloc base image found: ${{ env.DEFAULT_ALLOC_BASE }}"
+          else
+            echo "::error::Default-alloc base image not found: ${{ env.DEFAULT_ALLOC_BASE }}"
+            echo ""
+            echo "=========================================="
+            echo "ERROR: Default-alloc base image does not exist in GHCR"
+            echo "=========================================="
+            echo ""
+            echo "stream_parser_fuzz requires a pre-built default-allocator base"
+            echo "image (Seastar rebuilt with SEASTAR_DEFAULT_ALLOCATOR — see"
+            echo "Dockerfile.base.default-alloc header and BACKLOG §18 P3 for the"
+            echo "allocator rationale). This image is published by docker-base.yml's"
+            echo "build-base-default-alloc job."
+            echo ""
+            echo "To fix this, run the 'Docker Base Image' workflow manually:"
+            echo ""
+            echo "  1. Go to: https://github.com/${{ github.repository }}/actions/workflows/docker-base.yml"
+            echo "  2. Click 'Run workflow'"
+            echo "  3. Wait for build-base-default-alloc to complete (~30 min on first run)"
+            echo "  4. Re-run this workflow"
+            echo ""
+            echo "Or use GitHub CLI:"
+            echo "  gh workflow run docker-base.yml --ref main"
+            echo ""
+            exit 1
+          fi
+
+      # Single-stage build: layer the fuzz toolchain (clang + compiler-rt
+      # + llvm + lld) on top of the pre-published
+      # ranvier-base-default-alloc image from GHCR. The base itself is
+      # built by docker-base.yml's build-base-default-alloc job on every
+      # push to main (path-filtered to Dockerfile.base.default-alloc /
+      # Dockerfile.base / CMakeLists.txt / vcpkg.json), so this job never
+      # pays the ~30-min Seastar rebuild itself.
+      - name: Build fuzz image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.fuzz
+          load: true
+          tags: ranvier-fuzz-default-alloc:latest
+          cache-from: |
+            type=gha,scope=fuzz-tests-default-alloc
+          cache-to: type=gha,mode=max,scope=fuzz-tests-default-alloc
+          build-args: |
+            BASE_IMAGE=${{ env.DEFAULT_ALLOC_BASE }}
+
+      # Restore the stream_parser corpus separately from the main
+      # fuzz-tests job — the harness has its own subdirectory and we
+      # don't want a regression in one to clobber the other's coverage.
+      - name: Restore stream_parser corpus
+        uses: actions/cache@v4
+        with:
+          path: tests/fuzz/corpus/stream_parser
+          key: fuzz-corpus-stream-parser-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-stream-parser-${{ runner.os }}-
+
+      - name: Build harness and fuzz inside default-allocator fuzz image
+        run: |
+          mkdir -p fuzz-results
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            -e FUZZ_TIME=${FUZZ_CI_TIME:-60} \
+            ranvier-fuzz-default-alloc:latest \
+            make fuzz-run-stream-parser-default-alloc \
+            2>&1 | tee fuzz-results/fuzz-stream-parser-default-alloc.log
+
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload stream_parser fuzz artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stream-parser-fuzz-default-alloc
+          path: |
+            fuzz-results/fuzz-stream-parser-default-alloc.log
+            crash-*
+            tests/fuzz/corpus/stream_parser
+          retention-days: 30

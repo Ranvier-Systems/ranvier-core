@@ -62,6 +62,7 @@ except ImportError:
     print("Error: 'requests' library is required. Install with: pip install requests")
     sys.exit(1)
 
+import conftest
 from conftest import (
     ClusterTestCase,
     DOCKER_HOST,

@@ -1,6 +1,7 @@
 // Ranvier Core - Application Bootstrap and Lifecycle Implementation
 
 #include "application.hpp"
+#include "config_loader_async.hpp"
 #include "dashboard_resource.hpp"
 #include "gossip_service.hpp"
 #include "logging.hpp"
@@ -8,6 +9,7 @@
 #include "metrics_service.hpp"
 #include "shard_load_metrics.hpp"
 #include "tracing_service.hpp"
+#include "worker_affinity.hpp"
 
 #include <cstdio>
 #include <csignal>
@@ -24,6 +26,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/http/function_handlers.hh>
+#include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 
 namespace ranvier {
@@ -423,8 +426,9 @@ seastar::future<> Application::init_persistence() {
         log_main.warn("Persistence WAL checkpoint failed - continuing anyway");
     }
 
-    // Start async persistence manager (arms flush timer)
-    co_await _async_persistence->start();
+    // Start async persistence manager (spawns SQLite worker thread + stats timer).
+    // The alien instance is owned by app_template and outlives the manager.
+    co_await _async_persistence->start(*seastar::alien::internal::default_instance);
 
     // Distribute async persistence manager to all HttpController shards
     co_await _controller.invoke_on_all([this](HttpController& c) {
@@ -476,8 +480,8 @@ seastar::future<> Application::load_persisted_state() {
                   routes.size(), skipped, invalid_backend_count);
 
     for (const auto& rec : backends) {
-        log_main.info("  - Backend {} -> {}:{} (weight={}, priority={})",
-            rec.id, rec.ip, rec.port, rec.weight, rec.priority);
+        log_main.info("  - Backend {} -> {}:{} (weight={}, priority={}, type={})",
+            rec.id, rec.ip, rec.port, rec.weight, rec.priority, rec.backend_type);
     }
 
     // Step 3: Restore backends first, then routes
@@ -486,7 +490,19 @@ seastar::future<> Application::load_persisted_state() {
         for (const auto& rec : backends) {
             try {
                 seastar::socket_address addr(seastar::ipv4_addr(rec.ip, rec.port));
-                co_await _router->register_backend_global(rec.id, addr, rec.weight, rec.priority);
+                // Service-layer validation (Rule #7): persistence returned the
+                // raw string; we parse here and warn on unknown values, falling
+                // back to VLLM so a corrupt or future-version row doesn't fail
+                // the whole replay. supports_token_ids/compression_ratio aren't
+                // persisted yet — defaults match the historical replay path.
+                auto type_opt = parse_backend_type(rec.backend_type);
+                if (!type_opt) {
+                    log_main.warn("Backend {}: unknown persisted backend_type '{}' - defaulting to vllm",
+                                  rec.id, rec.backend_type);
+                }
+                BackendType type = type_opt.value_or(BackendType::VLLM);
+                co_await _router->register_backend_global(rec.id, addr, rec.weight, rec.priority,
+                    /*supports_token_ids=*/true, /*compression_ratio=*/1.0, type);
             } catch (...) {
                 failed_backends++;
                 try {
@@ -528,6 +544,108 @@ seastar::future<> Application::load_persisted_state() {
     }
 }
 
+// Register backends declared in the YAML `backends:` array. Runs after
+// load_persisted_state so static config wins on ID collision (the
+// SQLite row is overwritten by register_backend_global's broadcast). Address
+// resolution and env-var lookup happen here — post-reactor, pre-traffic, on
+// shard 0. The resolved API key is pushed to RouterService's per-shard
+// side-map and never written anywhere on disk.
+seastar::future<> Application::register_static_backends() {
+    if (_config.backends.entries.empty()) {
+        co_return;
+    }
+    log_main.info("Registering {} static-config backend(s) from YAML",
+                  _config.backends.entries.size());
+    size_t failed = 0;
+    for (const auto& sb : _config.backends.entries) {
+        try {
+            // Resolve host -> socket_address. Try direct IP first (cheap),
+            // fall back to DNS for hostnames (Cerebras-shaped). Mirrors the
+            // POST /admin/backends path at http_controller.cpp:2453.
+            seastar::socket_address addr;
+            bool needs_dns = false;
+            try {
+                seastar::net::inet_address parsed{sb.host};
+                addr = seastar::socket_address(parsed, sb.port);
+            } catch (const std::exception&) {
+                needs_dns = true;
+            }
+            if (needs_dns) {
+                auto deadline = seastar::lowres_clock::now()
+                    + std::chrono::seconds(_config.server.dns_resolution_timeout_seconds);
+                auto hostent = co_await seastar::with_timeout(
+                    deadline, seastar::net::dns::get_host_by_name(sb.host));
+                // seastar::net::hostent::addr_list is deprecated in favour of
+                // addr_entries (which exposes address_entry structs instead of
+                // raw inet_address). The mirror call at
+                // http_controller.cpp:2491 suppresses the same warning the
+                // same way; uniform pragma keeps both call-sites trivially
+                // diffable until the codebase migrates to the new API.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                if (hostent.addr_list.empty()) {
+                    log_main.warn("Static backend {}: DNS returned no addresses for '{}' — skipping",
+                                  sb.id, sb.host);
+                    ++failed;
+                    continue;
+                }
+                addr = seastar::socket_address(hostent.addr_list[0], sb.port);
+#pragma GCC diagnostic pop
+            }
+
+            // Resolve the API key before registering — if the env var is
+            // required but missing, refuse to register so we don't end up
+            // with a backend that 401s on every request. Empty api_key_env
+            // means "no auth header", which is correct for vLLM-class
+            // backends on a trusted network.
+            std::string api_key;
+            if (!sb.api_key_env.empty()) {
+                const char* val = std::getenv(sb.api_key_env.c_str());
+                if (val == nullptr || *val == '\0') {
+                    log_main.warn("Static backend {} ({}): api_key_env='{}' is unset or empty — skipping registration",
+                                  sb.id, backend_type_to_string(sb.type), sb.api_key_env);
+                    ++failed;
+                    continue;
+                }
+                api_key.assign(val);
+            }
+
+            // Install the key first, then register the backend. HTTP isn't
+            // listening yet at startup, so the race-window concern that
+            // motivates this ordering in the K8s discovery path doesn't
+            // apply here — but keeping the order consistent across both
+            // call sites makes the "key-before-backend" invariant easy to
+            // reason about.
+            if (!api_key.empty()) {
+                co_await _router->set_backend_api_key_global(sb.id, std::move(api_key));
+            }
+
+            co_await _router->register_backend_global(
+                sb.id, addr, sb.weight, sb.priority,
+                // CEREBRAS / OPENAI_COMPATIBLE are auto-downgraded to false
+                // inside register_backend_global. Other non-vLLM types
+                // (OLLAMA, LM_STUDIO) inherit the codebase-wide default and
+                // would pass through — but those are typically registered
+                // via local-discovery, not static config.
+                /*supports_token_ids=*/true,
+                sb.compression_ratio, sb.type);
+
+            // Log without the key. api_key_env name is fine — it's not the secret.
+            log_main.info("Static backend {} ({}) -> {} (weight={}, priority={}, api_key_env={})",
+                          sb.id, backend_type_to_string(sb.type),
+                          addr, sb.weight, sb.priority,
+                          sb.api_key_env.empty() ? "<none>" : sb.api_key_env.c_str());
+        } catch (const std::exception& e) {
+            ++failed;
+            log_main.warn("Failed to register static backend {}: {}", sb.id, e.what());
+        }
+    }
+    if (failed > 0) {
+        log_main.warn("Static backend registration: {} of {} failed",
+                      failed, _config.backends.entries.size());
+    }
+}
+
 void Application::init_health_checker() {
     _health_checker = std::make_unique<HealthService>(*_router, build_health_config());
     _health_checker->start();
@@ -546,10 +664,27 @@ void Application::init_k8s_discovery() {
 
     _k8s_discovery = std::make_unique<K8sDiscoveryService>(build_k8s_config());
 
-    // Connect K8s discovery to router via callbacks
+    // Connect K8s discovery to router via callbacks. `type` and `api_key`
+    // come from EndpointSlice annotations (ranvier.io/backend-type and
+    // ranvier.io/api-key-secret-ref); both default to vLLM / empty for the
+    // historical homogeneous-fleet case.
+    //
+    // Ordering: set the key BEFORE registering the backend. Each call is a
+    // parallel_for_each broadcast that resolves only when every shard has
+    // applied the change. By installing the key first, no shard sees the
+    // backend in `state.backends` without also having the key in the side-
+    // map — which would otherwise produce 401s on the first few requests
+    // landing in the microseconds between the two broadcasts (HTTP is
+    // listening when K8s discovery fires events, so this window is real).
     _k8s_discovery->set_register_callback(
-        [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority) {
-            return _router->register_backend_global(id, addr, weight, priority);
+        [this](BackendId id, seastar::socket_address addr, uint32_t weight, uint32_t priority,
+               BackendType type, std::string api_key) -> seastar::future<> {
+            if (!api_key.empty()) {
+                co_await _router->set_backend_api_key_global(id, std::move(api_key));
+            }
+            co_await _router->register_backend_global(id, addr, weight, priority,
+                                                       /*supports_token_ids=*/true,
+                                                       /*compression_ratio=*/1.0, type);
         });
     _k8s_discovery->set_drain_callback(
         [this](BackendId id) {
@@ -607,6 +742,13 @@ seastar::future<> Application::startup() {
         return _sharded_config.start(ShardedConfig(_config)).then([this] {
             _sharded_config_started = true;
             log_main.info("Sharded config initialized on {} cores", seastar::smp::count);
+        }).then([] {
+            // 1b. Compute the non-reactor cpuset by surveying reactor
+            // affinities. Used later when spawning the persistence worker
+            // and the per-shard tokenizer workers to keep them off reactor
+            // cores. The process-wide allowed cpuset was snapshotted in
+            // main() before Seastar started.
+            return worker_affinity::initialize_non_reactor_cpuset();
         }).then([this] {
             // 2. Initialize tokenizer (async with DMA file I/O) - failure is fatal
             return init_tokenizer();
@@ -797,6 +939,12 @@ seastar::future<> Application::startup() {
                 return seastar::make_ready_future<>();
             }
             return load_persisted_state();
+        }).then([this] {
+            // 14b. Register static-config backends from YAML.
+            // Runs after persistence replay so YAML wins on ID collision,
+            // and before discovery services start so static entries are
+            // visible to the first wave of requests.
+            return register_static_backends();
         }).then([this] {
             // 15. Start K8s discovery service if enabled
             if (_k8s_discovery && _k8s_discovery->is_enabled()) {
@@ -1341,6 +1489,50 @@ seastar::future<> Application::stop_services() {
                 log_main.debug("  Shard load balancer stopped");
             });
         })
+        .then([] {
+            // -------------------------------------------------------------------------
+            // Step 4a2: Tear down per-shard ShardLoadMetrics while the reactor is
+            // still up. The thread_local unique_ptr would otherwise destruct at
+            // thread-exit, after Seastar has stopped — safe today because
+            // ~ShardLoadMetrics is trivial, but a latent shutdown-order trap if
+            // the type ever gains reactor-touching state (Rule #13). Runs after
+            // every consumer (HttpController, ShardLoadBalancer) is stopped.
+            // -------------------------------------------------------------------------
+            return seastar::smp::invoke_on_all([] {
+                cleanup_shard_load_metrics();
+            }).then([] {
+                log_main.debug("  Shard load metrics cleaned up on all shards");
+            });
+        })
+        .then([] {
+            // -------------------------------------------------------------------------
+            // Step 4a3: Tear down per-shard MetricsService. Deregisters every
+            // Prometheus lambda capturing `this` (Rule #6) and frees the raw
+            // thread_local g_metrics pointer that would otherwise leak at process
+            // exit. Sibling of step 4a2 — kept as a separate invoke_on_all so a
+            // future async signature on stop_metrics() does not reshape the
+            // lambda. Ordering preconditions:
+            //   (a) every caller of metrics() must be quiescent. The full caller
+            //       set (http_controller, router_service, stream_parser, plus
+            //       the circuit-cleanup callback registered against
+            //       HttpController) is driven by HttpController, which stopped
+            //       in step 4. Tokenizer/persistence/sharded_config do not
+            //       touch metrics(), so later steps are safe.
+            //   (b) no Prometheus scrape may be in flight. The metrics HTTP
+            //       server was stopped in step 3 (stop_servers()); Seastar's
+            //       http_server::stop() drains in-flight connections before
+            //       returning, so handlers cannot still be reading metrics
+            //       state by the time we reach this step.
+            // stop_metrics() self-guards on g_metrics != nullptr, so shards
+            // that never lazy-initialised (or where the metrics HTTP server
+            // was disabled) are no-ops.
+            // -------------------------------------------------------------------------
+            return seastar::smp::invoke_on_all([] {
+                stop_metrics();
+            }).then([] {
+                log_main.debug("  Metrics service stopped on all shards");
+            });
+        })
         .then([this] {
             // -------------------------------------------------------------------------
             // Step 4b: Stop sharded tokenizer service
@@ -1445,12 +1637,13 @@ seastar::future<> Application::reload_config() {
 
     log_main.info("Reloading configuration from {}", _config_path);
 
-    // Load configuration asynchronously to avoid blocking the reactor.
-    // seastar::async() offloads the blocking std::ifstream I/O to the thread pool.
-    // This is the ONLY safe way to reload config after the Seastar reactor starts.
-    return seastar::async([path = _config_path] {
-        return RanvierConfig::load(path);
-    }).then([this, now](RanvierConfig new_config) {
+    // Read the YAML file via Seastar DMA and parse on the calling shard.
+    // The previous seastar::async() wrapper here was a Rule #12 violation:
+    // seastar::async runs in a seastar::thread that executes on the reactor,
+    // so the std::ifstream inside still stalled this shard for the duration
+    // of the read. load_config_async() uses open_file_dma + dma_read_bulk,
+    // which is reactor-safe (Rule #12, corrected 2026-05-05).
+    return load_config_async(_config_path).then([this, now](RanvierConfig new_config) {
         // Validate the new configuration
         auto validation_error = RanvierConfig::validate(new_config);
         if (validation_error) {
