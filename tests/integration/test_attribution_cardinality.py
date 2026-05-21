@@ -125,6 +125,17 @@ class AttributionCardinalityTest(ClusterTestCase):
         # The integration cluster has no configured api_keys, so the only
         # labels observed are sentinels (3 < 256). Overflow must not fire.
         for name, endpoints in NODES.items():
+            # First confirm the counter is actually registered — otherwise
+            # sum_metric_by_substring returns 0.0 for "not registered" AND
+            # "registered at zero" indistinguishably, and the test would
+            # pass by coincidence when init_api_key_attribution() never ran.
+            self.assertTrue(
+                metric_is_registered(
+                    endpoints["metrics"], "api_key_label_overflow_total"
+                ),
+                f"{name}: api_key_label_overflow_total not registered — "
+                "init_api_key_attribution() may not have been called.",
+            )
             value = sum_metric_by_substring(
                 endpoints["metrics"], "api_key_label_overflow_total"
             )
