@@ -123,7 +123,10 @@ jobs:
               tests/integration/test_graceful_shutdown.py \
               tests/integration/test_negative_paths.py \
               tests/integration/test_load_aware_routing.py \
-              tests/integration/test_intelligence_layer.py"
+              tests/integration/test_intelligence_layer.py \
+              tests/integration/test_metrics.py \
+              tests/integration/test_persistence_recovery.py \
+              tests/integration/test_attribution_cardinality.py"
             echo "Running all integration tests"
           fi
 
