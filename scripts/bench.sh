@@ -1510,6 +1510,13 @@ run_benchmark() {
     log_info "Locust --run-time: ${LOCUST_RUN_TIME_SECS}s (from DURATION=$DURATION)" >&2
     BENCHMARK_START_TS=$(date +%s)
 
+    # Capture GPU clocks/throttle state at start of run for environmental-drift
+    # auditing between runs. See .dev-context/investigation-289-routing-regression.md.
+    if command -v nvidia-smi &> /dev/null; then
+        nvidia-smi --query-gpu=index,clocks.sm,clocks.mem,clocks_throttle_reasons.active \
+                   --format=csv > "$REPORT_DIR/nvidia_smi_start.csv" 2>/dev/null || true
+    fi
+
     # Start memory sampler (captures docker stats every 30s)
     MEM_LOG="$REPORT_DIR/memory_stats.csv"
     echo "# Memory stats for benchmark: $LABEL" > "$MEM_LOG"
@@ -1572,6 +1579,25 @@ run_benchmark() {
         docker stats --no-stream --format '{{.Name}},{{.MemUsage}}' 2>/dev/null | grep ranvier >> "$MEM_LOG" || true
         log_info "Memory stats saved to: $MEM_LOG" >&2
         unset MEM_SAMPLER_PID  # Clear so cleanup doesn't try again
+    fi
+
+    # End-of-run nvidia-smi snapshot (paired with start snapshot above).
+    if command -v nvidia-smi &> /dev/null; then
+        nvidia-smi --query-gpu=index,clocks.sm,clocks.mem,clocks_throttle_reasons.active \
+                   --format=csv > "$REPORT_DIR/nvidia_smi_end.csv" 2>/dev/null || true
+    fi
+
+    # Scrape Prometheus /metrics so the parser can surface
+    # routing_load_aware_fallbacks_total and per-backend distribution. The
+    # parser reads $REPORT_DIR/prometheus_metrics.txt as a sibling of
+    # benchmark.log. Best-effort: missing file just leaves the counters blank.
+    if command -v curl &> /dev/null; then
+        for node in ranvier-1 ranvier-2 ranvier-3; do
+            if docker exec "$node" curl -sf http://localhost:9180/metrics \
+                    > "$REPORT_DIR/prometheus_metrics.txt" 2>/dev/null; then
+                break
+            fi
+        done
     fi
 
     log_ok "Results saved to: $REPORT_DIR/" >&2

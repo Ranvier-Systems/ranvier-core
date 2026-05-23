@@ -8,8 +8,8 @@ Prefix-aware routing vs round-robin baseline, all models at default config (pref
 
 | Model | Users | Duration | P99 TTFT | Throughput | Cache Hits | Key Takeaway |
 |-------|-------|----------|----------|------------|------------|--------------|
-| **13B** | 30 | 30m | **-80% to -85%** | **+13% to +22%** | 97% | Queue-bound — routing rescues tail latency |
-| **13B** | 20 | 10m | **-67% to -79%** | +4% to +14% | 81-98% | Consistent wins, some run-to-run variance |
+| **13B** | 30 | 30m | **-80% to -85%** *(see note)* | **+13% to +22%** | 97% | Queue-bound — routing rescues tail latency |
+| **13B** | 20 | 10m | **-67% to -79%** *(see note)* | +4% to +14% | 81-98% | Consistent wins, some run-to-run variance |
 | **13B** | 10 | 10m | **-60% to -79%** | +12% to +15% | 83-97% | Wins even at low concurrency |
 | **8B** | 20-30 | 10-30m | flat | flat | 68-98% | Routing-neutral (model too fast to benefit) |
 | **70B** | 16 | 30m | flat | flat | 98% | Compute-bound; benefit is per-request (44% XLarge) |
@@ -19,6 +19,15 @@ Instance 8 (Mar 5, commit 08e5a93, batched route learning), and Instance 9 (Apr 
 commit 16f3454, boundary detection + routing fixes). All on 8xA100 40GB, vLLM v0.15.1.
 0% incomplete rate on all runs. See [detailed results](#detailed-results-by-instance) for
 per-instance breakdowns.*
+
+> **Note (May 22, 2026 — `5079f9f` reproduction):** 13B at 20u/30u with the default
+> `load_aware_routing=true` + `load_imbalance_factor=2.0` thresholds did **not** reproduce the
+> 20u/30u headline numbers above. 30u/30m showed P99 TTFT **+44%** vs round-robin (Cache Miss P99
+> **+69%**). 20u/30m showed 6.0% incomplete requests on prefix-aware (vs 0 on round-robin) — the
+> -57% headline excludes incompletes from the P99 calculation. The 10u/30m result remained healthy.
+> See [kv-cache-prefix-routing-benchmark.md § Known Issue](kv-cache-prefix-routing-benchmark.md#known-issue-13b30u-prefix-aware-miss-tail-with-default-load-aware-thresholds)
+> and [investigation #289](../../.dev-context/investigation-289-routing-regression.md). Tracking
+> in [investigation-may22-affinity-thrashing-reproduction](../../.dev-context/investigation-may22-affinity-thrashing-reproduction.md).
 
 **Key wins:**
 - **7-8x more cache hits** — 97-98% cache hit rate vs 11-13% round-robin baseline
@@ -97,6 +106,13 @@ Routing overhead dropped to 0.3-0.7ms. Boundary detection dropped from 5-7ms to 
 
 **Headline result (13B, 30u, 30m):** P99 -58.8%, throughput +23.1%, cache hit P99 -68.0%,
 XLarge hit P99 -87.0%. Every aggregate TTFT metric improved. Validation flipped FAILED → PASSED.
+
+> **Reproducibility note (May 22, 2026):** A 30u/30m repeat on commit `5079f9f` did **not**
+> reproduce these numbers — P99 TTFT was **+44%** vs round-robin, with the miss tail blown out
+> (Cache Miss P99 +69%, Large Miss P99 +123%, XLarge Miss P99 +62%). The Instance 9 result above
+> is preserved for historical context, but the headline should not be quoted as current
+> steady-state until the affinity-thrashing root cause is resolved. See
+> [Known Issue](kv-cache-prefix-routing-benchmark.md#known-issue-13b30u-prefix-aware-miss-tail-with-default-load-aware-thresholds).
 
 *Note: Lambda Labs instances were near full capacity during this period, which may have
 increased run-to-run variance from noisy neighbors. Earlier instances (Feb 2026) ran on
