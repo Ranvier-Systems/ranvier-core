@@ -259,41 +259,44 @@ test-integration-full:
 	fi
 	@echo "Starting integration tests..."
 	@echo ""
-	@echo "=== Test Suite 1/12: Cluster Behavior ==="
+	@echo "=== Test Suite 1/13: Cluster Behavior ==="
 	@python3 tests/integration/test_cluster.py
 	@echo ""
-	@echo "=== Test Suite 2/12: Prefix Routing ==="
+	@echo "=== Test Suite 2/13: Prefix Routing ==="
 	@python3 tests/integration/test_prefix_routing.py
 	@echo ""
-	@echo "=== Test Suite 3/12: Graceful Shutdown ==="
+	@echo "=== Test Suite 3/13: Graceful Shutdown ==="
 	@python3 tests/integration/test_graceful_shutdown.py
 	@echo ""
-	@echo "=== Test Suite 4/12: Negative Paths ==="
+	@echo "=== Test Suite 4/13: Negative Paths ==="
 	@python3 tests/integration/test_negative_paths.py
 	@echo ""
-	@echo "=== Test Suite 5/12: Load-Aware Routing ==="
+	@echo "=== Test Suite 5/13: Load-Aware Routing ==="
 	@python3 tests/integration/test_load_aware_routing.py
 	@echo ""
-	@echo "=== Test Suite 6/12: Intelligence Layer ==="
+	@echo "=== Test Suite 6/13: Intelligence Layer ==="
 	@python3 -m pytest tests/integration/test_intelligence_layer.py -v -s
 	@echo ""
-	@echo "=== Test Suite 7/12: HTTP Pipeline ==="
+	@echo "=== Test Suite 7/13: HTTP Pipeline ==="
 	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 	@echo ""
-	@echo "=== Test Suite 8/12: Streaming ==="
+	@echo "=== Test Suite 8/13: Streaming ==="
 	@python3 -m pytest tests/integration/test_streaming.py -v -s
 	@echo ""
-	@echo "=== Test Suite 9/12: Metrics ==="
+	@echo "=== Test Suite 9/13: Metrics ==="
 	@python3 -m pytest tests/integration/test_metrics.py -v -s
 	@echo ""
-	@echo "=== Test Suite 10/12: Persistence Recovery ==="
+	@echo "=== Test Suite 10/13: Persistence Recovery ==="
 	@python3 tests/integration/test_persistence_recovery.py
 	@echo ""
-	@echo "=== Test Suite 11/12: Health & Circuit Breaker ==="
+	@echo "=== Test Suite 11/13: Health & Circuit Breaker ==="
 	@python3 tests/integration/test_health_circuit_breaker.py
 	@echo ""
-	@echo "=== Test Suite 12/12: Config Loading ==="
+	@echo "=== Test Suite 12/13: Config Loading ==="
 	@python3 tests/integration/test_config_loading.py
+	@echo ""
+	@echo "=== Test Suite 13/13: Attribution Cardinality ==="
+	@python3 tests/integration/test_attribution_cardinality.py
 
 # Run only the single-node-capable integration suites (fast path).
 # The speed win comes from skipping the slow multi-node suites
@@ -308,7 +311,7 @@ test-integration-fast:
 	@echo "Running Single-Node Integration Tests"
 	@echo "======================================"
 	@echo ""
-	@echo "Suites: test_http_pipeline, test_streaming, test_metrics, test_config_loading"
+	@echo "Suites: test_http_pipeline, test_streaming, test_metrics, test_config_loading, test_attribution_cardinality"
 	@echo "(skipping multi-node suites: cluster, prefix_routing,"
 	@echo " load_aware_routing, negative_paths, graceful_shutdown,"
 	@echo " intelligence_layer)"
@@ -327,17 +330,20 @@ test-integration-fast:
 		pip3 install --user pytest || pip install --user pytest; \
 	fi
 	@echo ""
-	@echo "=== Test Suite 1/4: HTTP Pipeline ==="
+	@echo "=== Test Suite 1/5: HTTP Pipeline ==="
 	@python3 -m pytest tests/integration/test_http_pipeline.py -v -s
 	@echo ""
-	@echo "=== Test Suite 2/4: Streaming ==="
+	@echo "=== Test Suite 2/5: Streaming ==="
 	@python3 -m pytest tests/integration/test_streaming.py -v -s
 	@echo ""
-	@echo "=== Test Suite 3/4: Metrics ==="
+	@echo "=== Test Suite 3/5: Metrics ==="
 	@python3 -m pytest tests/integration/test_metrics.py -v -s
 	@echo ""
-	@echo "=== Test Suite 4/4: Config Loading ==="
+	@echo "=== Test Suite 4/5: Config Loading ==="
 	@python3 -m pytest tests/integration/test_config_loading.py -v -s
+	@echo ""
+	@echo "=== Test Suite 5/5: Attribution Cardinality ==="
+	@python3 -m pytest tests/integration/test_attribution_cardinality.py -v -s
 
 # Run integration tests via pytest (single command, JUnit XML output for CI)
 # pytest discovers both unittest.TestCase and native pytest tests automatically
@@ -376,6 +382,7 @@ test-integration-ci:
 		tests/integration/test_persistence_recovery.py \
 		tests/integration/test_health_circuit_breaker.py \
 		tests/integration/test_config_loading.py \
+		tests/integration/test_attribution_cardinality.py \
 		-v -s --tb=short --junitxml=integration-results.xml
 
 # Helper to detect docker compose command

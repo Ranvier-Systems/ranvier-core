@@ -780,6 +780,23 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_DASHBOARD_CORS")) {
         dashboard.enable_cors = (*v == "1" || *v == "true" || *v == "yes");
     }
+
+    // Attribution overrides
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_MAX_LABEL_CARDINALITY")) {
+        attribution.max_label_cardinality = *v;
+    }
+    if (auto v = get_env("RANVIER_ATTRIBUTION_PERSISTENCE_ENABLED")) {
+        attribution.persistence_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_MAX_REQUEST_ROWS")) {
+        attribution.max_request_rows = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_WINDOW_HOURS")) {
+        attribution.admin_query_max_window_hours = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_ROWS")) {
+        attribution.admin_query_max_rows = *v;
+    }
 }
 
 // =============================================================================
@@ -1560,6 +1577,26 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (db["enable_cors"]) config.dashboard.enable_cors = db["enable_cors"].as<bool>();
         }
 
+        // Attribution section (per-API-key observability)
+        if (yaml["attribution"]) {
+            YAML::Node at = yaml["attribution"];
+            if (at["max_label_cardinality"]) {
+                config.attribution.max_label_cardinality = at["max_label_cardinality"].as<uint32_t>();
+            }
+            if (at["persistence_enabled"]) {
+                config.attribution.persistence_enabled = at["persistence_enabled"].as<bool>();
+            }
+            if (at["max_request_rows"]) {
+                config.attribution.max_request_rows = at["max_request_rows"].as<uint32_t>();
+            }
+            if (at["admin_query_max_window_hours"]) {
+                config.attribution.admin_query_max_window_hours = at["admin_query_max_window_hours"].as<uint32_t>();
+            }
+            if (at["admin_query_max_rows"]) {
+                config.attribution.admin_query_max_rows = at["admin_query_max_rows"].as<uint32_t>();
+            }
+        }
+
         // Static backend declarations. Top-level `backends:` array; parsed
         // verbatim into config.backends.entries. Env-var
         // resolution and address resolution happen later, in
@@ -1933,6 +1970,22 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.cache_events.max_event_age_seconds == 0) {
         return "cache_events.max_event_age_seconds must be positive";
+    }
+
+    // Validate attribution settings
+    if (config.attribution.max_label_cardinality < 4) {
+        // Must leave room for the three sentinels (_unauthenticated, _invalid,
+        // _overflow) plus at least one real key.
+        return "attribution.max_label_cardinality must be at least 4";
+    }
+    if (config.attribution.max_request_rows == 0) {
+        return "attribution.max_request_rows must be positive";
+    }
+    if (config.attribution.admin_query_max_window_hours == 0) {
+        return "attribution.admin_query_max_window_hours must be positive";
+    }
+    if (config.attribution.admin_query_max_rows == 0) {
+        return "attribution.admin_query_max_rows must be positive";
     }
 
     return std::nullopt;  // Valid
