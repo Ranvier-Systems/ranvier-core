@@ -397,7 +397,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
                 std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
                 [](auto /*req*/, auto rep) {
                     add_cors_headers(*rep);
-                    rep->set_status(seastar::http::reply::status_type{204});
+                    rep->set_status(seastar::http::reply::status_type::no_content);
                     rep->done();
                     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
                 });
@@ -1279,6 +1279,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             metrics().record_body_size_rejection();
             log_proxy.warn("[{}] Request rejected - body size {} exceeds limit {}",
                            request_id, body_size, _config.max_request_body_bytes);
+            // 413 Payload Too Large. Kept as a numeric cast rather than a
+            // named enum value: the Seastar enumerator was renamed across
+            // versions (request_entity_too_large -> payload_too_large), so the
+            // numeric form is the version-portable choice here.
             rep->set_status(static_cast<seastar::http::reply::status_type>(413));
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"Request body too large\", \"max_bytes\": " +
@@ -3613,14 +3617,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
@@ -3661,26 +3665,26 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_pause_agent
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
 
     if (!info->allow_pause) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_pause_not_allowed"})");
         co_return std::move(rep);
     }
 
     if (info->paused) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_already_paused"})");
         co_return std::move(rep);
     }
@@ -3702,20 +3706,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
 
     if (!info->paused) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_not_paused"})");
         co_return std::move(rep);
     }
@@ -3909,7 +3913,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         if (!authorized) {
             metrics().record_cache_event_auth_failure();
             RouterService::record_cache_event_auth_failure();
-            rep->set_status(seastar::http::reply::status_type{401});
+            rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->write_body("json", sstring("{\"error\": \"Unauthorized\"}"));
             co_return std::move(rep);
         }
@@ -3936,7 +3940,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         if (!parsed.error.empty()) {
             log_proxy.warn("Cache event parse error: {}", parsed.error);
         }
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", sstring("{\"error\": \"" + parsed.error + "\"}"));
         co_return std::move(rep);
     }
