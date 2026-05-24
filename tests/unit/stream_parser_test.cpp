@@ -52,6 +52,7 @@ TEST_F(StreamParserTest, ParsesSimpleChunkedResponse) {
     auto result = parser.push(make_buffer(response));
 
     EXPECT_TRUE(result.header_snoop_success);
+    EXPECT_EQ(result.backend_status_code, 200);
     EXPECT_EQ(result.data, "hello");
     EXPECT_TRUE(result.done);
     EXPECT_FALSE(result.has_error);
@@ -68,7 +69,60 @@ TEST_F(StreamParserTest, DetectsNon200Status) {
     auto result = parser.push(make_buffer(response));
 
     EXPECT_FALSE(result.header_snoop_success);  // Not 200 OK
+    EXPECT_EQ(result.backend_status_code, 500); // but the real code is captured
     EXPECT_TRUE(result.done);
+}
+
+// Numeric status-code parsing (per-API-key attribution depends on the real
+// backend status, not just the 200/non-200 bool).
+
+TEST_F(StreamParserTest, ParsesBackendStatusCode429) {
+    std::string response =
+        "HTTP/1.1 429 Too Many Requests\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    auto result = parser.push(make_buffer(response));
+    EXPECT_FALSE(result.header_snoop_success);
+    EXPECT_EQ(result.backend_status_code, 429);
+}
+
+TEST_F(StreamParserTest, ParsesHttp10StatusCode) {
+    std::string response =
+        "HTTP/1.0 503 Service Unavailable\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    auto result = parser.push(make_buffer(response));
+    EXPECT_EQ(result.backend_status_code, 503);
+}
+
+TEST_F(StreamParserTest, Non200TwoHundredFamilyStatusCodes) {
+    // 201/204 are success-family but NOT 200, so header_snoop_success stays
+    // false (preserving circuit-breaker/route-learning behaviour) while the
+    // numeric code is still captured accurately.
+    {
+        StreamParser p;
+        auto r = p.push(make_buffer("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"));
+        EXPECT_FALSE(r.header_snoop_success);
+        EXPECT_EQ(r.backend_status_code, 201);
+    }
+    {
+        StreamParser p;
+        auto r = p.push(make_buffer("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"));
+        EXPECT_FALSE(r.header_snoop_success);
+        EXPECT_EQ(r.backend_status_code, 204);
+    }
+}
+
+TEST_F(StreamParserTest, StatusCodeNotConfusedByHeaderValue) {
+    // A "200" appearing in a header value must not be mistaken for the status.
+    std::string response =
+        "HTTP/1.1 404 Not Found\r\n"
+        "X-Upstream-Latency-Ms: 200\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    auto result = parser.push(make_buffer(response));
+    EXPECT_FALSE(result.header_snoop_success);
+    EXPECT_EQ(result.backend_status_code, 404);
 }
 
 TEST_F(StreamParserTest, HandlesMultipleChunks) {

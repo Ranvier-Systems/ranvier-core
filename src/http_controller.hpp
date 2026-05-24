@@ -123,6 +123,12 @@ struct ProxyContext {
     RetrySettings retry_config;
     bool fallback_enabled;
 
+    // Backend HTTP status code parsed from the upstream response status line
+    // (e.g. 200, 429, 500). 0 until the backend's headers are seen — remains
+    // 0 if the request fails before any response (timeout, connection failure).
+    // Used for per-API-key attribution (request_attribution.status_code).
+    int backend_status_code = 0;
+
     // State flags
     bool shard_metrics_active = false;
     bool timed_out = false;

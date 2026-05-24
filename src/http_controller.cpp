@@ -1051,6 +1051,15 @@ future<> HttpController::stream_backend_response(
             bundle->is_valid = false;
         }
 
+        // Capture the backend's real status code the first time the status
+        // line is parsed (non-zero means headers were seen this push). Used
+        // for per-API-key attribution — see the LogRequestOp enqueue in
+        // handle_proxy. Captured for ALL responses, not just 200, so backend
+        // errors (429/500/etc.) are recorded accurately.
+        if (res.backend_status_code != 0 && ctx->backend_status_code == 0) {
+            ctx->backend_status_code = res.backend_status_code;
+        }
+
         // Snooping Logic - record success and learn route
         if (res.header_snoop_success) {
             // Backend responded successfully - record for circuit breaker
@@ -2257,6 +2266,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     ctx->timed_out = false;
                     ctx->stream_closed = false;
                     ctx->chunks_received = 0;
+                    ctx->backend_status_code = 0;  // re-parsed from the retry response
                     ctx->connect_start = std::chrono::steady_clock::now();
 
                     // Re-send the HTTP request on fresh connection
@@ -2347,16 +2357,26 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             if (ctx->current_backend != 0) {
                 op.backend_id = ctx->current_backend;
             }
-            // Status code derived from the outcome flags. We don't track HTTP
-            // status explicitly on the proxy path; this is a best-effort
-            // mapping for downstream reporting.
+            // Status code: prefer the backend's real HTTP status (parsed from
+            // the upstream status line) so backend errors (429/500/etc.) are
+            // recorded accurately. Proxy-level failures that happen before any
+            // backend response (timeout, connection failure, mid-stream client
+            // disconnect) never see a backend status, so fall back to a
+            // synthesized proxy-outcome code. Client disconnect is checked
+            // first because it can occur after a successful backend response
+            // began streaming, and operators want to distinguish it.
             if (ctx->client_disconnected) {
                 op.status_code = 499;  // Nginx convention
             } else if (ctx->timed_out) {
                 op.status_code = 504;
             } else if (ctx->connection_error || ctx->connection_failed) {
                 op.status_code = 502;
+            } else if (ctx->backend_status_code != 0) {
+                op.status_code = ctx->backend_status_code;
             } else {
+                // No backend status and no proxy-level failure flag — e.g. an
+                // empty response that didn't trip stale-retry. Default to 200
+                // (consistent with the success branch in phase 4).
                 op.status_code = 200;
             }
             op.latency_ms = static_cast<int32_t>(
