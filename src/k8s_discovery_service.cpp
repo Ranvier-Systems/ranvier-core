@@ -36,6 +36,12 @@ namespace ranvier {
 // Maximum concurrent endpoint operations to prevent overwhelming backends
 constexpr size_t K8S_MAX_CONCURRENT_ENDPOINT_OPS = 16;
 
+// HTTP 410 Gone — sent by the K8s watch API when the supplied resourceVersion
+// has expired and a full re-list is required. A plain int (not a Seastar
+// reply status_type) because it is compared against a code parsed from the
+// upstream API response, not a status we send.
+constexpr int kHttpStatusGone = 410;
+
 // Note: parse_port() is now provided by parse_utils.hpp using std::from_chars
 
 // Parse the numeric HTTP status code from a response header block.
@@ -1063,7 +1069,7 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
                 std::string message = (event.HasMember("message") && event["message"].IsString())
                     ? event["message"].GetString() : "Unknown error";
 
-                if (status_code == 410) {
+                if (status_code == kHttpStatusGone) {
                     log_k8s.warn("Watch received 410 Gone (resource version expired): {} - "
                                  "clearing resource version and re-syncing", message);
                     ++_watch_410_gone;
@@ -1094,7 +1100,7 @@ seastar::future<> K8sDiscoveryService::watch_endpoints() {
                     }
                 }
 
-                if (status_code == 410) {
+                if (status_code == kHttpStatusGone) {
                     log_k8s.warn("Watch received 410 Gone event (resource version expired): {} - "
                                  "clearing resource version and re-syncing", message);
                     ++_watch_410_gone;
