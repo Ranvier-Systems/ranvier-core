@@ -12,6 +12,16 @@
 
 namespace ranvier {
 
+// HTTP status-code constants for status-line parsing. The codebase has no
+// shared HTTP-status header, and Seastar's status_type enum (used elsewhere
+// only for set_status) has no notion of the valid-range bounds, so these are
+// defined locally.
+namespace {
+constexpr int kHttpStatusOk = 200;        // 200 OK — drives header_snoop_success
+constexpr int kMinValidHttpStatus = 100;  // lowest well-formed HTTP status
+constexpr int kMaxValidHttpStatus = 599;  // highest well-formed HTTP status
+}  // namespace
+
 StreamParser::Result StreamParser::push(seastar::temporary_buffer<char> chunk) {
     Result res;
 
@@ -167,8 +177,9 @@ ssize_t StreamParser::parse_headers(Result& res) {
             auto first = rest.data();
             auto last = rest.data() + rest.size();
             auto [ptr, ec] = std::from_chars(first, last, code);
-            // Accept only a well-formed 3-digit code in the 100-599 range.
-            if (ec == std::errc{} && ptr != first && code >= 100 && code <= 599) {
+            // Accept only a well-formed status code in the valid HTTP range.
+            if (ec == std::errc{} && ptr != first &&
+                code >= kMinValidHttpStatus && code <= kMaxValidHttpStatus) {
                 res.backend_status_code = code;
             }
         }
@@ -176,7 +187,7 @@ ssize_t StreamParser::parse_headers(Result& res) {
 
     // header_snoop_success preserves the prior semantics: true iff the backend
     // returned 200 OK (drives circuit-breaker success + route learning).
-    res.header_snoop_success = (res.backend_status_code == 200);
+    res.header_snoop_success = (res.backend_status_code == kHttpStatusOk);
 
     // Determine transfer encoding: chunked vs Content-Length.
     // Ollama (and some other backends) send non-chunked responses with Content-Length.
