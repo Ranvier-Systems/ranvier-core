@@ -490,3 +490,91 @@ telemetry:
   #     jaegertracing/all-in-one:latest
   #   Then set: enabled: true, otlp_endpoint: "http://localhost:9411"
   #   View traces at: http://localhost:16686
+
+# =============================================================================
+# =============================================================================
+# Per-API-Key Attribution Configuration
+# =============================================================================
+# Per-API-key attribution for observability (Prometheus labels) and historical
+# reporting (SQLite rows). Parse-only: requests without a valid key still serve;
+# they attribute to the "_unauthenticated" sentinel. See
+# docs/architecture/per-api-key-attribution.md.
+attribution:
+  # Max distinct api_key label values per shard before new keys collapse to the
+  # "_overflow" sentinel. Bounds Prometheus active-series count.
+  # (RANVIER_ATTRIBUTION_MAX_LABEL_CARDINALITY)
+  max_label_cardinality: 256
+
+  # Gate the request_attribution SQLite table and per-request enqueue.
+  # When false, no per-request rows are persisted; metric labels are still recorded.
+  # (RANVIER_ATTRIBUTION_PERSISTENCE_ENABLED)
+  persistence_enabled: true
+
+  # Row-count cap on the request_attribution table. Oldest rows pruned by id.
+  # (RANVIER_ATTRIBUTION_MAX_REQUEST_ROWS)
+  max_request_rows: 1000000
+
+  # Bound on the GET /admin/keys/usage query window.
+  # (RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_WINDOW_HOURS)
+  admin_query_max_window_hours: 168  # 7 days
+
+  # Bound on rows materialised for a single /admin/keys/usage query (in-memory
+  # percentile computation budget).
+  # (RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_ROWS)
+  admin_query_max_rows: 100000
+
+# =============================================================================
+# Static-Config Backends
+# =============================================================================
+#
+# Top-level `backends:` array for backends that don't fit the K8s /
+# local-discovery / admin-API model — chiefly Cerebras and other
+# OpenAI-compatible remote APIs that need an API key. Entries here
+# register at every startup, after persistence replay (static config
+# wins on ID collision) and before discovery services start.
+#
+# Operator walkthrough: see docs/guides/hybrid-fleets.md for the full
+# story on running GPU and remote-API backends behind the same ingress,
+# including which Ranvier features apply per backend type.
+#
+# Required fields per entry: `id` (>0) and `host`. Everything else has
+# defaults. The optional `api_key_env` names an environment variable
+# whose value Ranvier forwards as `Authorization: Bearer <value>` on
+# proxied requests. Resolved at startup — missing or empty value
+# causes the entry to be skipped with a warning rather than registered
+# in a broken state. Keys are never logged and never written to SQLite.
+#
+# `type` accepts: vllm (default), sglang, trt_llm, ollama, lm_studio,
+# cerebras, openai_compatible. Only the `cerebras` type opts out of
+# prefix-affinity ART learning — managed APIs route internally so
+# Ranvier can't pin a prefix to a specific instance. All other
+# non-vLLM types still learn routes (their backends have a KV cache
+# AND Ranvier controls per-instance routing). Only `vllm` is scraped
+# for /metrics; the other types are skipped because the Prometheus
+# exposition format is vLLM-specific. Under load_aware_routing, every
+# non-vllm backend appears as zero-load (see the operator info log
+# emitted at registration time).
+#
+# Maximum 64 entries (Rule #4). Hand-curate this list; auto-discovered
+# fleets belong under k8s_discovery: or local_mode:.
+#
+# backends:
+#   - id: 101
+#     host: api.cerebras.ai
+#     port: 443
+#     type: cerebras
+#     api_key_env: CEREBRAS_API_KEY
+#
+#   - id: 102
+#     host: 10.0.0.42
+#     port: 8080
+#     type: vllm
+#     weight: 200
+#     priority: 0
+#     compression_ratio: 6.0
+#
+#   - id: 103
+#     host: api.openai.com
+#     port: 443
+#     type: openai_compatible
+#     api_key_env: OPENAI_API_KEY

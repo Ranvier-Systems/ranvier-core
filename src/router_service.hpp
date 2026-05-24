@@ -337,10 +337,27 @@ public:
     seastar::future<> register_backend_global(BackendId id, seastar::socket_address addr,
                                                uint32_t weight = 100, uint32_t priority = 0,
                                                bool supports_token_ids = true,
-                                               double compression_ratio = 1.0) override;
+                                               double compression_ratio = 1.0,
+                                               BackendType type = BackendType::VLLM) override;
 
     // Remove a backend from all shards
     seastar::future<> unregister_backend_global(BackendId id) override;
+
+    // Per-backend API key store. Side-map separate from BackendInfo so the
+    // credential boundary stays in one named place and
+    // the abstract BackendRegistry interface doesn't gain a credential
+    // parameter that K8s / admin / persistence paths must ignore.
+    //
+    // `set_backend_api_key_global` broadcasts the key to every shard
+    // (mirroring register_backend_global's parallel_for_each shape) and
+    // is intended to be called once at startup right after the backend
+    // is registered. `get_backend_api_key` is synchronous and shard-
+    // local — http_controller calls it on the request path to decide
+    // whether to inject `Authorization: Bearer <key>`.
+    //
+    // Keys live in memory only — never written to SQLite, never logged.
+    seastar::future<> set_backend_api_key_global(BackendId id, std::string api_key);
+    std::string get_backend_api_key(BackendId id) const;
 
     // Start draining a backend (stops new requests, allows existing cache hits)
     // After backend_drain_timeout, the backend will be fully removed
@@ -382,6 +399,7 @@ public:
         bool is_dead;
         bool supports_token_ids;  // Whether backend supports vLLM prompt_token_ids
         double compression_ratio;  // KV-cache compression ratio (>= 1.0, 1.0 = no compression)
+        BackendType type;  // Engine class (VLLM, SGLANG, CEREBRAS, ...)
         int64_t drain_start_ms;  // 0 if not draining
     };
 
@@ -391,6 +409,22 @@ public:
     // Check if a backend supports vLLM's prompt_token_ids field.
     // Returns false if backend not found (safe default: don't inject unknown fields).
     bool backend_supports_token_ids(BackendId id) const;
+
+    // Engine class for the given backend. Returns BackendType::VLLM if the
+    // backend is not registered — matches the historical assumption baked
+    // into the learning/scrape paths.
+    BackendType backend_type(BackendId id) const override;
+
+    // Whether ART route learning is worthwhile for this backend. Returns
+    // false when the backend's type is in the no-cache set (e.g. Cerebras
+    // keeps the whole model in on-chip SRAM, so prefix affinity earns
+    // nothing). Gates the learning sites only; the lookup path is
+    // unaffected — if a route already points at a non-cacheable backend
+    // we still honor it. Safe default for not-found is true: backend
+    // registration propagates across shards asynchronously, so a gossip
+    // route may legitimately arrive before this shard sees the backend;
+    // defaulting to false would silently drop those.
+    bool should_cache_routes_for(BackendId id) const;
 
     // Get tree dump for admin inspection (local shard only)
     RadixTree::DumpNode get_tree_dump() const;
@@ -569,7 +603,13 @@ public:
     static void register_backend_for_testing(BackendId id, seastar::socket_address addr,
                                               uint32_t weight = 100, uint32_t priority = 0,
                                               bool supports_token_ids = true,
-                                              double compression_ratio = 1.0);
+                                              double compression_ratio = 1.0,
+                                              BackendType type = BackendType::VLLM);
+
+    // Write a key directly into the shard-local api_key side-map.
+    // Bypasses set_backend_api_key_global's parallel_for_each broadcast so
+    // get_backend_api_key can be unit-tested without a running reactor.
+    static void set_backend_api_key_for_testing(BackendId id, std::string api_key);
 
     // Insert a route directly into the shard-local RadixTree (bypasses async broadcast).
     static void insert_route_for_testing(const std::vector<int32_t>& tokens, BackendId backend);

@@ -12,12 +12,18 @@ on:
         description: 'Reason for rebuild (e.g., Seastar update, toolchain upgrade)'
         required: false
         default: 'Manual rebuild'
-  # Auto-trigger when Dockerfile.base or dependencies change
+  # Auto-trigger when Dockerfile.base or dependencies change.
+  # Dockerfile.base.default-alloc is included so the build-base-default-alloc
+  # job below rebuilds when the default-alloc layer's recipe changes (e.g.
+  # SEASTAR_DEFAULT_ALLOCATOR sed patch tweaks). On a default-alloc-only
+  # change, the build-base + merge jobs are layer-cache hits and fast; only
+  # the default-alloc layer actually rebuilds.
   push:
     branches:
       - main
     paths:
       - 'Dockerfile.base'
+      - 'Dockerfile.base.default-alloc'
       - 'CMakeLists.txt'
       - 'vcpkg.json'
       - '.github/workflows/docker-base.yml'
@@ -187,3 +193,106 @@ jobs:
           echo "  --build-arg BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \\" >> $GITHUB_STEP_SUMMARY
           echo "  -t ranvier:latest ." >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------
+  # Default-allocator base image (Seastar rebuilt with SEASTAR_DEFAULT_ALLOCATOR)
+  # ---------------------------------------------------------------------
+  # Builds Dockerfile.base.default-alloc on top of the freshly-published
+  # ranvier-base:latest and pushes to ranvier-base-default-alloc:latest.
+  # See Dockerfile.base.default-alloc's header for the full rationale
+  # (Seastar's per-shard allocator vs libFuzzer/CTest discovery without a
+  # running reactor) and BACKLOG §18 P3 for the build-config history.
+  #
+  # Single-arch (amd64): the only consumers today are sanitizer-tests.yml
+  # and the stream-parser-fuzz-default-alloc job in fuzz-tests.yml, both
+  # of which run on ubuntu-latest (amd64). The default-alloc image is
+  # explicitly NOT FOR PRODUCTION (header documents the trade-off) so the
+  # arm64 local-dev case the parent image's multi-arch manifest serves
+  # doesn't apply here. Single-stage push direct to :latest (no
+  # push-by-digest + merge dance) keeps the job shape simple.
+  #
+  # Cost: ~30 min on a true rebuild (Seastar reinstall in /usr/local),
+  # near-instant on a layer-cache hit when neither the parent base nor
+  # Dockerfile.base.default-alloc actually changed. Paid once per push to
+  # main (gated by the same path filter as build-base); replaces the
+  # ~30-min in-job rebuild that sanitizer-tests.yml and
+  # stream-parser-fuzz-default-alloc each used to pay every dispatch.
+  build-base-default-alloc:
+    needs: [merge]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DEFAULT_ALLOC_IMAGE_NAME: ranvier-systems/ranvier-base-default-alloc
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.DEFAULT_ALLOC_IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value={{date 'YYYYMMDD'}}
+
+      - name: Build and Push default-allocator base
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.base.default-alloc
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=base-default-alloc-amd64
+          cache-to: type=gha,mode=max,scope=base-default-alloc-amd64
+          build-args: |
+            BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Generate Summary
+        run: |
+          echo "## Default-Allocator Base Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.REGISTRY }}/${{ env.DEFAULT_ALLOC_IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Parent base:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\` (rebuilt with SEASTAR_DEFAULT_ALLOCATOR)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Platforms" >> $GITHUB_STEP_SUMMARY
+          echo "- \`linux/amd64\` (consumers are CI-only and amd64-only)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Tags" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Consumers" >> $GITHUB_STEP_SUMMARY
+          echo "- \`sanitizer-tests.yml\` (BACKLOG §18 P2)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`fuzz-tests.yml\` \`stream-parser-fuzz-default-alloc\` job (BACKLOG §18 P3)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**NOT FOR PRODUCTION** — see Dockerfile.base.default-alloc header for the allocator trade-off." >> $GITHUB_STEP_SUMMARY

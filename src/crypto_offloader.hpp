@@ -89,8 +89,14 @@ struct CryptoOffloaderConfig {
     // If predicted latency exceeds this, operation is offloaded
     uint64_t offload_latency_threshold_us = 100;
 
-    // Maximum number of in-flight async operations
-    // New operations are run inline when this limit is reached
+    // Maximum number of in-flight async operations. New operations are run
+    // inline when this limit is reached.
+    //
+    // Each in-flight op holds a seastar::thread with a 128 kB stack (virtual
+    // address space reserved up front; RSS grows on demand). At 1024 the
+    // reservation is ~128 MB of address space, which is fine on 64-bit. The
+    // real driver for this bound is queueing latency and reactor fairness,
+    // not memory; raise with care if you also raise stall_threshold_us.
     size_t max_queue_depth = 1024;
 
     // Enable/disable adaptive offloading
@@ -317,7 +323,11 @@ seastar::future<std::invoke_result_t<Func>> CryptoOffloader::execute_offloaded(
     auto* stalls_avoided_ptr = &_stalls_avoided;
     auto* queue_depth_ptr = &_queue_depth;
 
-    // Use seastar::async to run the operation in a Seastar thread context
+    // Use seastar::async to run the operation in a Seastar thread context.
+    // rule12-allow: this IS the codebase's offload primitive. The seastar::thread
+    // frame lets the caller's `func` use `.get()` on Seastar futures inline.
+    // Concurrency is bounded by _config.max_queue_depth (queue check above);
+    // higher-level callers fall back to inline execution on cap-hit.
     return seastar::async([func = std::forward<Func>(func),
                           start_time, stall_threshold, stalls_avoided_ptr]() mutable -> ResultType {
         if constexpr (std::is_void_v<ResultType>) {

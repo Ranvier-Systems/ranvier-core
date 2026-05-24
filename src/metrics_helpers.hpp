@@ -160,4 +160,43 @@ struct BackendMetrics {
         , first_byte_latency(backend_latency_buckets()) {}
 };
 
+// =============================================================================
+// ApiKeyMetrics — Per-API-Key Counter / Histogram Storage
+// =============================================================================
+// Per-shard slot for the api_key label table. One ApiKeyMetrics per distinct
+// observed (or pre-registered) label, plus three sentinels (_unauthenticated,
+// _invalid, _overflow). Bounded by AttributionConfig::max_label_cardinality.
+//
+// All fields are shard-local plain integers / doubles (Hard Rule #1 — no
+// atomics, no mutexes; metrics scrape reads the values lock-free). Stored
+// behind unique_ptr in the owning map so lambda captures of &slot stay valid
+// across rehashes.
+struct ApiKeyMetrics {
+    std::string label;  // sanitised label value used as Prometheus label
+
+    // Counters (Memo §6.1)
+    uint64_t requests_total = 0;
+    uint64_t requests_success = 0;
+    uint64_t requests_failed = 0;
+    uint64_t requests_timeout = 0;
+    uint64_t requests_rate_limited = 0;
+
+    // Aggregate sums for tokens/cost (counters; histograms not currently
+    // present in the codebase). Prometheus operators can derive rate / sum
+    // queries off these.
+    uint64_t input_tokens_sum = 0;
+    uint64_t output_tokens_sum = 0;
+    double   cost_units_sum = 0.0;
+
+    // Histograms (Memo §6.1)
+    MetricHistogram request_duration;       // ranvier_http_request_duration_seconds
+    MetricHistogram router_total_latency;   // ranvier_router_request_total_latency_seconds
+
+    bool registered = false;
+
+    ApiKeyMetrics()
+        : request_duration(latency_buckets())
+        , router_total_latency(total_request_latency_buckets()) {}
+};
+
 }  // namespace ranvier

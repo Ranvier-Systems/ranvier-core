@@ -45,7 +45,7 @@ void HealthService::start() {
         sm::make_counter("health_vllm_scrapes_failed", _vllm_scrapes_failed,
             sm::description("Failed vLLM metrics scrapes (includes non-vLLM backends)")),
         sm::make_counter("health_vllm_scrapes_suppressed", _vllm_scrapes_suppressed,
-            sm::description("vLLM scrapes skipped due to adaptive suppression (non-vLLM backends)")),
+            sm::description("vLLM scrapes skipped — proactive (type-based) or adaptive (failure-based)")),
         sm::make_counter("health_vllm_overflow_drops", _metrics_overflow_drops,
             sm::description("vLLM metrics dropped due to MAX_TRACKED_BACKENDS limit")),
         sm::make_gauge("health_vllm_scrape_duration_avg_seconds",
@@ -239,7 +239,17 @@ future<> HealthService::scrape_all_vllm_metrics(
 }
 
 future<> HealthService::scrape_one_backend(BackendId id, socket_address addr) {
-    // Adaptive suppression: skip backends that consistently fail (non-vLLM)
+    // Proactive suppression: backend type tells us the scrape is pointless
+    // (e.g. Cerebras exposes no Prometheus /metrics endpoint). Skips the
+    // connect/timeout cost that adaptive suppression incurs for the first
+    // SCRAPE_FAILURE_SUPPRESSION_THRESHOLD cycles. O(1) and independent of
+    // failure history, so it runs before is_scrape_suppressed().
+    if (_registry.backend_type(id) != BackendType::VLLM) {
+        ++_vllm_scrapes_suppressed;
+        co_return;
+    }
+    // Adaptive suppression: skip backends that consistently fail (non-vLLM
+    // that slipped past the type check, or vLLM that's persistently broken).
     if (is_scrape_suppressed(id)) {
         ++_vllm_scrapes_suppressed;
         co_return;

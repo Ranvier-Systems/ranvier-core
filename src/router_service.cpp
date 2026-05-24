@@ -88,15 +88,22 @@ struct BackendInfo {
     // Set via per-backend config or admin API. Technology-agnostic.
     double compression_ratio = 1.0;
 
+    // Per-backend engine class. Default VLLM preserves existing behaviour
+    // for all callers that haven't been threaded through with the type.
+    // See BACKLOG §19 for the heterogeneous-fleet design.
+    BackendType type = BackendType::VLLM;
+
     BackendInfo() = default;
 
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
-                bool supports_token_ids_ = true, double compression_ratio_ = 1.0)
+                bool supports_token_ids_ = true, double compression_ratio_ = 1.0,
+                BackendType type_ = BackendType::VLLM)
         : addr(std::move(addr_))
         , weight(weight_)
         , priority(priority_)
         , supports_token_ids(supports_token_ids_)
-        , compression_ratio(compression_ratio_) {}
+        , compression_ratio(compression_ratio_)
+        , type(type_) {}
 };
 
 // ============================================================================
@@ -125,6 +132,14 @@ struct ShardLocalState {
     absl::flat_hash_map<BackendId, BackendInfo> backends;
     std::vector<BackendId> backend_ids;
     absl::flat_hash_set<BackendId> dead_backends;  // Circuit breaker blacklist
+
+    // Per-backend API key store. Kept separate from BackendInfo so the
+    // credential boundary lives in one named place
+    // and persistence/admin/discovery paths don't have to thread a
+    // credential parameter through. Bounded by MAX_API_KEYS to match
+    // HealthService's MAX_TRACKED_BACKENDS posture (Rule #4).
+    static constexpr size_t MAX_API_KEYS = 256;
+    absl::flat_hash_map<BackendId, std::string> backend_api_keys;
 
     // ========================================================================
     // Statistics Counters
@@ -1132,6 +1147,13 @@ static void apply_route_batch_to_local_tree(const std::vector<PendingRemoteRoute
 // Maps a 64-bit key to a bucket in [0, num_buckets) such that adding or
 // removing a bucket remaps only ~1/n keys.  This preserves KV-cache affinity
 // during backend topology changes, unlike modular hashing which reshuffles all.
+//
+// Cast safety (audit M9): the final `static_cast<int32_t>(b)` is lossless
+// because `b < num_buckets` on exit and `num_buckets` is a non-negative count
+// of live backends — capped at `LocalDiscovery::MAX_KNOWN_BACKENDS` (= 64,
+// `local_discovery.hpp:81`) by the discovery layer that feeds every caller.
+// The 2^31 ceiling on the cast is therefore six orders of magnitude above the
+// hard upstream cap; no runtime check is required here.
 inline int32_t jump_consistent_hash(uint64_t key, int32_t num_buckets) {
     int64_t b = -1, j = 0;
     while (j < num_buckets) {
@@ -1360,8 +1382,15 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                            "Set self_backend_id to this node's backend ID for proper cluster drain.");
         }
 
-        // Set up callback to handle incoming route announcements
+        // Set up callback to handle incoming route announcements.
+        // Drop routes targeting non-cacheable backends: a peer may broadcast
+        // routes pointing at e.g. a Cerebras node in its cluster, but our
+        // local ART would never produce a useful cache hit from such an
+        // entry.
         _gossip->set_route_learn_callback([this](std::vector<TokenId> tokens, BackendId backend) {
+            if (!should_cache_routes_for(backend)) {
+                return seastar::make_ready_future<>();
+            }
             return learn_route_remote(std::move(tokens), backend);
         });
 
@@ -2118,6 +2147,46 @@ bool RouterService::backend_supports_token_ids(BackendId id) const {
     return false;
 }
 
+BackendType RouterService::backend_type(BackendId id) const {
+    if (!g_shard_state) return BackendType::VLLM;
+    auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it != state.backends.end()) {
+        return it->second.type;
+    }
+    // Backend not found — VLLM is the historical default and matches the
+    // assumption baked into existing learning/scrape paths.
+    return BackendType::VLLM;
+}
+
+bool RouterService::should_cache_routes_for(BackendId id) const {
+    // Safe default true: backend registration propagates across shards
+    // asynchronously, so a gossip-delivered route may arrive on a shard
+    // that hasn't yet seen the backend. Defaulting to false here would
+    // silently drop those.
+    if (!g_shard_state) return true;
+    auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it == state.backends.end()) return true;
+    // No-cache set: types where Ranvier can't usefully drive prefix
+    // affinity. The reason is routing opacity, not the absence of a
+    // backend cache — Cerebras and similar managed-API endpoints DO
+    // have a KV cache (every autoregressive transformer does; on
+    // Cerebras it lives in on-wafer SRAM, not GPU HBM), but the
+    // provider's own scheduler load-balances requests across instances
+    // we can't see or pin to. ART entries pointing at this BackendId
+    // would mean "send prefix P to api.cerebras.ai" — which we already
+    // do for every request to that backend regardless of ART state.
+    //
+    // OPENAI_COMPATIBLE is intentionally NOT here: it's a catch-all
+    // covering self-hosted shims (e.g. SGLang behind an OpenAI-
+    // compatible API) where Ranvier IS the one choosing which
+    // instance to hit, so affinity earns the usual benefit. A per-
+    // deployment opt-out is the right tool for the rare shim that
+    // doesn't cache, not a type-level rule.
+    return it->second.type != BackendType::CEREBRAS;
+}
+
 std::optional<BackendId> RouterService::get_random_backend() {
     if (!g_shard_state) return std::nullopt;
     auto& state = shard_state();
@@ -2141,12 +2210,25 @@ std::optional<BackendId> RouterService::get_random_backend() {
         return std::nullopt;  // No live backends with weight > 0
     }
 
+    // Saturate the accumulator: pathological/operator-misconfigured weights
+    // must not wrap uint64_t and feed `dist(0, -1)` (audit H7, Hard Rule #11).
+    constexpr uint64_t kMaxTotalWeight = std::numeric_limits<uint64_t>::max() / 2;
     uint64_t total_weight = 0;
     for (const auto& [id, info] : live_infos) {
         if (info->priority == min_priority && info->weight > 0) {
-            total_weight += info->weight;
+            total_weight = (total_weight > kMaxTotalWeight - info->weight)
+                ? kMaxTotalWeight
+                : total_weight + info->weight;
         }
     }
+    // Invariant: min_priority was set from a weight>0 backend in the same
+    // live_infos snapshot, so total_weight > 0 here. Defend against future
+    // refactors breaking that invariant in release builds where the assert
+    // below is compiled out — never feed uniform_int_distribution(0, -1).
+    if (total_weight == 0) {
+        return std::nullopt;
+    }
+    assert(total_weight > 0);
 
     // Pass 2: weighted random selection over the highest-priority candidates
     std::uniform_int_distribution<uint64_t> dist(0, total_weight - 1);
@@ -3487,23 +3569,18 @@ seastar::future<> RouterService::broadcast_gpu_load(
     auto shared = seastar::make_foreign(
         std::make_unique<absl::flat_hash_map<BackendId, double>>(std::move(scores)));
 
-    // Use do_with to anchor the foreign_ptr lifetime explicitly, matching
-    // the pattern in broadcast_load_snapshot(). While co_await keeps the
-    // coroutine frame alive, do_with makes the lifetime guarantee visible
-    // and resilient to future refactoring.
-    co_await seastar::do_with(std::move(shared),
-        [](auto& shared) {
-            return seastar::smp::invoke_on_all(
-                [&shared] {
-                    if (!g_shard_state) return;
-                    auto& cache = g_shard_state->gpu_load_cache;
-                    cache.scores.clear();
-                    for (const auto& [id, score] : *shared) {
-                        if (cache.scores.size() >= ShardLocalState::GpuLoadCache::MAX_ENTRIES) break;
-                        cache.scores[id] = score;
-                    }
-                    cache.updated_at = std::chrono::steady_clock::now();
-                });
+    // Rule #20: inside a coroutine, the frame keeps `shared` alive across the
+    // co_await -- no do_with anchor needed.
+    co_await seastar::smp::invoke_on_all(
+        [&shared] {
+            if (!g_shard_state) return;
+            auto& cache = g_shard_state->gpu_load_cache;
+            cache.scores.clear();
+            for (const auto& [id, score] : *shared) {
+                if (cache.scores.size() >= ShardLocalState::GpuLoadCache::MAX_ENTRIES) break;
+                cache.scores[id] = score;
+            }
+            cache.updated_at = std::chrono::steady_clock::now();
         });
 }
 
@@ -3512,43 +3589,68 @@ seastar::future<> RouterService::broadcast_cache_headroom(
     auto shared = seastar::make_foreign(
         std::make_unique<absl::flat_hash_map<BackendId, double>>(std::move(pressure_map)));
 
-    // Same pattern as broadcast_gpu_load(): foreign_ptr anchored via do_with,
-    // then invoke_on_all distributes to every shard's local cache.
-    co_await seastar::do_with(std::move(shared),
-        [](auto& shared) {
-            return seastar::smp::invoke_on_all(
-                [&shared] {
-                    if (!g_shard_state) return;
-                    auto& cache = g_shard_state->cache_headroom_cache;
-                    cache.pressure.clear();
-                    for (const auto& [id, p] : *shared) {
-                        if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) break;
-                        cache.pressure[id] = p;
-                    }
-                    cache.updated_at = std::chrono::steady_clock::now();
-                });
+    // Rule #20: see broadcast_gpu_load() above.
+    co_await seastar::smp::invoke_on_all(
+        [&shared] {
+            if (!g_shard_state) return;
+            auto& cache = g_shard_state->cache_headroom_cache;
+            cache.pressure.clear();
+            for (const auto& [id, p] : *shared) {
+                if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) break;
+                cache.pressure[id] = p;
+            }
+            cache.updated_at = std::chrono::steady_clock::now();
         });
 }
 
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
                                                           uint32_t weight, uint32_t priority,
                                                           bool supports_token_ids,
-                                                          double compression_ratio) {
-    return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio,
+                                                          double compression_ratio,
+                                                          BackendType type) {
+    // Non-GPU backend classes don't speak vLLM's prompt_token_ids field;
+    // forwarding it produces 400 rejections. Auto-downgrade so operators
+    // don't have to set both flags consistently — type is the source of truth.
+    if ((type == BackendType::CEREBRAS || type == BackendType::OPENAI_COMPATIBLE)
+            && supports_token_ids) {
+        log_router.info("Backend {}: type={} forces supports_token_ids=false "
+                        "(prompt_token_ids is a vLLM-specific field)",
+                        id, backend_type_to_string(type));
+        supports_token_ids = false;
+    }
+
+    // Operator warning: non-vLLM backends have no /metrics scrape, so
+    // get_backend_load_score() always returns 0.0 for them. Under
+    // load_aware_routing they look idle and attract more traffic.
+    // Usually acceptable for managed-API backends (Cerebras and
+    // similar) where the provider handles queueing internally and is
+    // sized to absorb the implied traffic skew — but it is a footgun
+    // worth surfacing once at registration time. Rule #17: not per-
+    // scrape, no log flood.
+    if (type != BackendType::VLLM && g_shard_state
+            && g_shard_state->config.load_aware_routing) {
+        log_router.info("Backend {} ({}): metrics scraping disabled; "
+                        "load-aware routing will treat this backend as zero-load",
+                        id, backend_type_to_string(type));
+    }
+
+    return seastar::do_with(addr, weight, priority, supports_token_ids, compression_ratio, type,
         [id](seastar::socket_address& shared_addr, uint32_t& shared_weight,
              uint32_t& shared_priority, bool& shared_supports_token_ids,
-             double& shared_compression_ratio) {
+             double& shared_compression_ratio, BackendType& shared_type) {
         return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
             [id, &shared_addr, &shared_weight, &shared_priority, &shared_supports_token_ids,
-             &shared_compression_ratio] (unsigned shard_id) {
+             &shared_compression_ratio, &shared_type] (unsigned shard_id) {
             return seastar::smp::submit_to(shard_id, [id, addr = shared_addr,
                                                        weight = shared_weight,
                                                        priority = shared_priority,
                                                        supports_token_ids = shared_supports_token_ids,
-                                                       compression_ratio = shared_compression_ratio] {
+                                                       compression_ratio = shared_compression_ratio,
+                                                       type = shared_type] {
                 if (!g_shard_state) return seastar::make_ready_future<>();
                 auto& state = shard_state();
-                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids, compression_ratio};
+                state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
+                                                  compression_ratio, type};
 
                 // Update vector (check for duplicates)
                 bool exists = false;
@@ -3583,6 +3685,10 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
             // Also remove from dead backends set if present
             state.dead_backends.erase(id);
 
+            // Clean up the API key side-map. Keeps the credential boundary
+            // tight — a re-registered ID never inherits a stale key.
+            state.backend_api_keys.erase(id);
+
             // Clean up circuit breaker entry (Rule #4: bounded container cleanup)
             if (state.circuit_cleanup_callback) {
                 state.circuit_cleanup_callback(id);
@@ -3598,6 +3704,52 @@ seastar::future<> RouterService::unregister_backend_global(BackendId id) {
 std::vector<BackendId> RouterService::get_all_backend_ids() const {
     if (!g_shard_state) return {};
     return shard_state().backend_ids;
+}
+
+// Broadcast the API key to every shard. Mirrors register_backend_global's
+// parallel_for_each shape but keeps the key out of the persistence/admin/K8s
+// paths — the side-map is the credential boundary. Keys are NEVER logged.
+seastar::future<> RouterService::set_backend_api_key_global(BackendId id, std::string api_key) {
+    // Rule #14: std::string owns heap storage. Capturing it into the
+    // submit_to closure by value would copy-construct on the calling shard
+    // and then free on the target shard when the map entry is later
+    // destroyed — cross-shard free via do_foreign_free. Use foreign_ptr
+    // for the cross-shard hop and reallocate locally on each target shard,
+    // matching the pattern at the load-snapshot broadcast above.
+    return seastar::do_with(std::move(api_key),
+        [id](std::string& shared_key) {
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+                [id, &shared_key](unsigned shard_id) {
+                    auto clone = std::make_unique<std::string>(shared_key);
+                    auto foreign = seastar::make_foreign(std::move(clone));
+                    return seastar::smp::submit_to(shard_id,
+                        [id, foreign = std::move(foreign)]() mutable {
+                            if (!g_shard_state) return seastar::make_ready_future<>();
+                            auto& state = shard_state();
+                            // Rule #4: bound the side-map. The cap matches
+                            // HealthService's MAX_TRACKED_BACKENDS; existing
+                            // entries can always be overwritten.
+                            if (state.backend_api_keys.size() >= ShardLocalState::MAX_API_KEYS
+                                && !state.backend_api_keys.contains(id)) {
+                                log_router.warn("API key store full ({} entries), dropping key for backend {}",
+                                                ShardLocalState::MAX_API_KEYS, id);
+                                return seastar::make_ready_future<>();
+                            }
+                            // Reallocate locally so the map entry's heap
+                            // storage lives on this shard (Rule #14).
+                            state.backend_api_keys[id] = std::string(foreign->data(), foreign->size());
+                            return seastar::make_ready_future<>();
+                        });
+                });
+        });
+}
+
+std::string RouterService::get_backend_api_key(BackendId id) const {
+    if (!g_shard_state) return {};
+    const auto& state = shard_state();
+    auto it = state.backend_api_keys.find(id);
+    if (it != state.backend_api_keys.end()) return it->second;
+    return {};
 }
 
 std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {
@@ -3637,6 +3789,7 @@ std::vector<RouterService::BackendState> RouterService::get_all_backend_states()
         bs.is_dead = shard.dead_backends.contains(id);
         bs.supports_token_ids = info.supports_token_ids;
         bs.compression_ratio = info.compression_ratio;
+        bs.type = info.type;
 
         if (info.is_draining) {
             // Convert steady_clock to wall-clock time:
@@ -4115,10 +4268,18 @@ void RouterService::set_circuit_cleanup_callback(CircuitCleanupCallback callback
 void RouterService::register_backend_for_testing(BackendId id, seastar::socket_address addr,
                                                    uint32_t weight, uint32_t priority,
                                                    bool supports_token_ids,
-                                                   double compression_ratio) {
+                                                   double compression_ratio,
+                                                   BackendType type) {
     if (!g_shard_state) return;
     auto& state = *g_shard_state;
-    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids, compression_ratio};
+    // Mirror register_backend_global()'s auto-downgrade so tests see the
+    // same invariant: non-vLLM types never carry supports_token_ids=true.
+    if ((type == BackendType::CEREBRAS || type == BackendType::OPENAI_COMPATIBLE)
+            && supports_token_ids) {
+        supports_token_ids = false;
+    }
+    state.backends[id] = BackendInfo{addr, weight, priority, supports_token_ids,
+                                      compression_ratio, type};
 
     bool exists = false;
     for (auto existing : state.backend_ids) {
@@ -4167,6 +4328,14 @@ void RouterService::unregister_backend_for_testing(BackendId id) {
         state.backend_ids.erase(it);
     }
     state.dead_backends.erase(id);
+    // Keep the for_testing helper symmetric with the production unregister
+    // path, which clears the api-key side-map.
+    state.backend_api_keys.erase(id);
+}
+
+void RouterService::set_backend_api_key_for_testing(BackendId id, std::string api_key) {
+    if (!g_shard_state) return;
+    g_shard_state->backend_api_keys[id] = std::move(api_key);
 }
 
 size_t RouterService::get_route_count_for_testing() {

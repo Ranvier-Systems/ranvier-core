@@ -139,6 +139,15 @@ class BenchmarkResults:
     avg_response_time_ms: Optional[float] = None
     requests_per_sec: float = 0.0
 
+    # Prometheus routing counters (scraped at end-of-run from prometheus_metrics.txt
+    # in the report dir). load_aware_fallbacks_total is the single counter that
+    # distinguishes affinity-thrashing from other routing regressions; see
+    # .dev-context/investigation-289-routing-regression.md.
+    load_aware_fallbacks_total: Optional[int] = None
+    # Per-backend in-flight request gauge — printed as a sorted list so prefix-
+    # concentration hot-spotting shows up directly in the comparison output.
+    backend_active_requests: Optional[Dict[str, float]] = None
+
     # Validation
     sync_errors: int = 0
     validation_passed: bool = False
@@ -149,8 +158,21 @@ class BenchmarkResults:
         return asdict(self)
 
     def to_csv_row(self) -> Dict[str, Any]:
-        """Convert to CSV-friendly dictionary."""
-        return {k: (v if v is not None else "") for k, v in asdict(self).items()}
+        """Convert to CSV-friendly dictionary.
+
+        Nested dict fields (e.g. backend_active_requests) are serialized as
+        compact JSON so a single CSV row can survive a round trip without
+        flattening the per-backend keys into columns.
+        """
+        row = {}
+        for k, v in asdict(self).items():
+            if v is None:
+                row[k] = ""
+            elif isinstance(v, dict):
+                row[k] = json.dumps(v, sort_keys=True)
+            else:
+                row[k] = v
+        return row
 
 
 # =============================================================================
@@ -511,6 +533,85 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
     return results
 
 
+# Prometheus counter / gauge names verified against src/metrics_service.hpp:
+#   - "routing_load_aware_fallbacks_total" : counter (metrics_service.hpp:123)
+#   - "backend_active_requests"            : per-backend gauge labelled by backend_id
+#                                            (metrics_service.hpp:999, label backend_id=...)
+# Both are exposed in the "ranvier" metric group; Prometheus serializes the group
+# name as a prefix, so the exposition lines look like
+#   ranvier_routing_load_aware_fallbacks_total 1234
+#   ranvier_backend_active_requests{backend_id="3"} 5
+#
+# A per-backend `requests_routed_total` counter does NOT currently exist; the
+# closest signal is `ranvier_backend_active_requests` (instantaneous in-flight
+# count) and the per-backend latency histogram count
+# (`ranvier_backend_latency_seconds_count{backend_id=...}`), which we scrape as
+# a cheap approximation of "requests dispatched per backend." Mark these as
+# verified-via-source if the user asks.
+_PROM_FALLBACK_RE = re.compile(
+    r"^ranvier_routing_load_aware_fallbacks_total\s+([0-9.eE+-]+)"
+)
+_PROM_BACKEND_ACTIVE_RE = re.compile(
+    r'^ranvier_backend_active_requests\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
+)
+_PROM_BACKEND_HIST_COUNT_RE = re.compile(
+    r'^ranvier_backend_latency_seconds_count\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
+)
+
+
+def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
+    """Scrape routing counters from a Prometheus text exposition dump.
+
+    Expected file: the body of an HTTP GET against the Ranvier /metrics endpoint
+    captured at end-of-run. See bench.sh for the curl invocation. Missing file
+    is non-fatal — returns an empty dict and the caller leaves the fields as
+    None so the comparison output makes the absence visible.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        with open(prom_path, "r") as f:
+            content = f.read()
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        return out
+
+    fallbacks = None
+    active: Dict[str, float] = {}
+    routed_total: Dict[str, float] = {}
+    for line in content.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _PROM_FALLBACK_RE.match(line)
+        if m:
+            try:
+                fallbacks = int(float(m.group(1)))
+            except ValueError:
+                pass
+            continue
+        m = _PROM_BACKEND_ACTIVE_RE.match(line)
+        if m:
+            try:
+                active[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+            continue
+        m = _PROM_BACKEND_HIST_COUNT_RE.match(line)
+        if m:
+            try:
+                routed_total[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+            continue
+
+    if fallbacks is not None:
+        out["load_aware_fallbacks_total"] = fallbacks
+    if active:
+        out["backend_active_requests"] = active
+    if routed_total:
+        # Returned alongside to enrich the per-backend distribution block.
+        out["backend_routed_total"] = routed_total
+    return out
+
+
 def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> BenchmarkResults:
     """Parse a benchmark log file and return structured results."""
     with open(filepath, "r") as f:
@@ -683,6 +784,22 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         if mode_match:
             results.benchmark_mode = mode_match.group(1)
 
+    # Prometheus dump (optional; sibling file in report dir). Missing dump is
+    # fine — the comparison output will show "N/A" and the load_aware_fallbacks
+    # row will be absent, which is itself a signal to the operator that the
+    # counter wasn't captured.
+    prom_path = Path(filepath).parent / "prometheus_metrics.txt"
+    prom = parse_prometheus_dump(str(prom_path))
+    if "load_aware_fallbacks_total" in prom:
+        results.load_aware_fallbacks_total = prom["load_aware_fallbacks_total"]
+    # Prefer per-backend histogram counts (cumulative dispatched requests) if
+    # available; fall back to the active-requests gauge (instantaneous in-flight)
+    # otherwise. Either is usable for spotting hot-spotting.
+    if "backend_routed_total" in prom:
+        results.backend_active_requests = prom["backend_routed_total"]
+    elif "backend_active_requests" in prom:
+        results.backend_active_requests = prom["backend_active_requests"]
+
     # Sync errors
     sync_match = re.search(r"(\d+) new sync errors", content)
     if sync_match:
@@ -713,10 +830,19 @@ def load_csv_results(filepath: str) -> BenchmarkResults:
 
     results = BenchmarkResults(source_file=filepath)
 
+    # Dict fields are serialized as JSON in to_csv_row(); recover them here.
+    DICT_FIELDS = {"backend_active_requests"}
+
     # Map CSV fields to dataclass
     for key in asdict(results).keys():
         if key in data and data[key]:
             val = data[key]
+            if key in DICT_FIELDS:
+                try:
+                    setattr(results, key, json.loads(val))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                continue
             current = getattr(results, key)
             if isinstance(current, bool):
                 setattr(results, key, val.lower() == "true")
@@ -961,6 +1087,11 @@ def format_change(
     return f"{sign}{diff:.2f} ({sign}{pct:.1f}%) {indicator}"
 
 
+def _max_incomplete_rate(*runs: BenchmarkResults) -> float:
+    """Return the larger of the two incomplete-rate values for honest P99 captioning."""
+    return max((r.incomplete_rate_pct or 0.0) for r in runs)
+
+
 def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     """Compare two benchmark results and return formatted comparison."""
     lines = []
@@ -969,6 +1100,28 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     lines.append("=" * 80)
     lines.append(f"Baseline (Round-Robin): {baseline.source_file}")
     lines.append(f"New (Prefix-Aware):     {new.source_file}")
+    lines.append("")
+
+    # VALIDATION + INCOMPLETE-RATE BANNER (top of report).
+    # Surfacing this above the metrics blocks is intentional: a green P99
+    # alongside a non-zero timeout rate is the exact metric-blindness pattern
+    # that hid the May 22 2026 13B/20u regression. See
+    # .dev-context/investigation-may22-affinity-thrashing-reproduction.md.
+    lines.append("-" * 80)
+    lines.append("RUN STATUS (read this first)")
+    lines.append("-" * 80)
+    val_b = "PASSED" if baseline.validation_passed else "FAILED"
+    val_n = "PASSED" if new.validation_passed else "FAILED"
+    lines.append(f"  Validation:   {val_b} -> {val_n}")
+    inc_b = baseline.incomplete_rate_pct or 0.0
+    inc_n = new.incomplete_rate_pct or 0.0
+    inc_warn = ""
+    if max(inc_b, inc_n) > 0.0:
+        inc_warn = "   *** TIMEOUTS PRESENT — P99 figures below EXCLUDE incompletes ***"
+    lines.append(
+        f"  Incompletes:  baseline {baseline.incomplete_requests} ({inc_b:.1f}%)  "
+        f"new {new.incomplete_requests} ({inc_n:.1f}%){inc_warn}"
+    )
     lines.append("")
 
     # KEY METRICS - Cache hit rate is the most important comparison
@@ -1154,6 +1307,17 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     lines.append("OVERALL TTFT (All Request Sizes)")
     lines.append("-" * 80)
     lines.append("  (Aggregate may be misleading - see per-bucket for real impact)")
+    max_inc = _max_incomplete_rate(baseline, new)
+    if max_inc > 0.0:
+        # Per-side captioning so the reader can't miss it. Locust excludes
+        # incomplete (timed-out) requests from its TTFT percentile inputs, so
+        # any P99 here is conditional on the run completing — comparing a
+        # "fast" run with high timeouts to a "slow" run with none is comparing
+        # different request populations.
+        lines.append(
+            f"  *** P99 TTFT (excl. timeouts: baseline {(baseline.incomplete_rate_pct or 0.0):.2f}%, "
+            f"new {(new.incomplete_rate_pct or 0.0):.2f}%) ***"
+        )
     lines.append("")
 
     ttft_metrics = [
@@ -1237,11 +1401,73 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
             change_str = format_change(baseline_val, new_val, lower_is_better)
             lines.append(f"{name:<30} {baseline_str:>12} {new_str:>12} {change_str:>30}")
 
+    # ROUTING COUNTERS (Prometheus) — affinity-thrashing fingerprint.
+    # See .dev-context/investigation-289-routing-regression.md: the
+    # load_aware_fallbacks_total counter is the single signal that
+    # distinguishes affinity-thrashing from other regressions.
+    has_routing_counters = (
+        baseline.load_aware_fallbacks_total is not None
+        or new.load_aware_fallbacks_total is not None
+        or baseline.backend_active_requests
+        or new.backend_active_requests
+    )
+    if has_routing_counters:
+        lines.append("")
+        lines.append("-" * 80)
+        lines.append("ROUTING COUNTERS (from Prometheus /metrics dump)")
+        lines.append("-" * 80)
+
+        def _fmt_count(v):
+            return "N/A" if v is None else str(int(v))
+
+        # Load-aware fallback counter (cumulative since process start). High
+        # values relative to total_requests indicate the load-aware logic is
+        # firing constantly — investigation #289's "30u" or "flapping" failure
+        # mode depending on which side the spike is on.
+        b_fb = baseline.load_aware_fallbacks_total
+        n_fb = new.load_aware_fallbacks_total
+        b_fb_pct = (b_fb / baseline.total_requests * 100.0) if (b_fb and baseline.total_requests) else None
+        n_fb_pct = (n_fb / new.total_requests * 100.0) if (n_fb and new.total_requests) else None
+        b_fb_str = f"{_fmt_count(b_fb)}" + (f" ({b_fb_pct:.1f}%)" if b_fb_pct is not None else "")
+        n_fb_str = f"{_fmt_count(n_fb)}" + (f" ({n_fb_pct:.1f}%)" if n_fb_pct is not None else "")
+        lines.append(f"  load_aware_fallbacks_total:  baseline={b_fb_str}  new={n_fb_str}")
+        lines.append("  (percent = fallbacks / total_requests; high % suggests affinity thrashing)")
+
+        # Per-backend request distribution. Print as sorted list with min/max
+        # and a Gini coefficient — hot-spotting from prefix concentration
+        # shows up as a high Gini (>0.3 is suspicious on a uniform workload).
+        def _gini(vals):
+            n = len(vals)
+            if n == 0:
+                return None
+            s = sum(vals)
+            if s == 0:
+                return 0.0
+            srt = sorted(vals)
+            cum = sum((i + 1) * v for i, v in enumerate(srt))
+            return (2.0 * cum) / (n * s) - (n + 1.0) / n
+
+        def _render_dist(label, dist):
+            if not dist:
+                lines.append(f"  {label}: (no per-backend data)")
+                return
+            try:
+                pairs = sorted(dist.items(), key=lambda kv: int(kv[0]))
+            except ValueError:
+                pairs = sorted(dist.items())
+            vals = [v for _, v in pairs]
+            mn, mx = min(vals), max(vals)
+            g = _gini(vals)
+            list_str = ", ".join(f"b{k}={int(v) if v == int(v) else v:.1f}" for k, v in pairs)
+            g_str = f"{g:.3f}" if g is not None else "N/A"
+            lines.append(f"  {label}: min={mn:.0f} max={mx:.0f} gini={g_str}")
+            lines.append(f"    [{list_str}]")
+
+        _render_dist("baseline backend dist", baseline.backend_active_requests or {})
+        _render_dist("new      backend dist", new.backend_active_requests or {})
+
     lines.append("")
     lines.append("-" * 80)
-
-    # Validation status
-    lines.append(f"Validation: {'PASSED' if baseline.validation_passed else 'FAILED'} -> {'PASSED' if new.validation_passed else 'FAILED'}")
 
     # Summary
     lines.append("")

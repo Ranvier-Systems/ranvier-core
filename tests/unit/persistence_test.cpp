@@ -105,6 +105,62 @@ TEST_F(PersistenceTest, RemoveBackend) {
 }
 
 // =============================================================================
+// backend_type Round-Trip (BACKLOG §19.1)
+// =============================================================================
+
+TEST_F(PersistenceTest, BackendTypeDefaultsToVllmWhenOmitted) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+    // Caller omitted backend_type → default "vllm" applies (default arg).
+    EXPECT_TRUE(store_->save_backend(1, "192.168.1.100", 11434, 100, 0));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1u);
+    EXPECT_EQ(backends[0].backend_type, "vllm");
+}
+
+TEST_F(PersistenceTest, BackendTypeRoundTripCerebras) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+    EXPECT_TRUE(store_->save_backend(1, "api.cerebras.ai", 443, 100, 0, "cerebras"));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1u);
+    EXPECT_EQ(backends[0].id, 1);
+    EXPECT_EQ(backends[0].ip, "api.cerebras.ai");
+    EXPECT_EQ(backends[0].port, 443);
+    EXPECT_EQ(backends[0].backend_type, "cerebras");
+}
+
+TEST_F(PersistenceTest, BackendTypeSurvivesReopen) {
+    // Verify the ADD COLUMN migration + serialization round-trips across a
+    // close/reopen cycle (simulates a process restart).
+    ASSERT_TRUE(store_->open(test_db_path_));
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8080, 100, 0, "sglang"));
+    EXPECT_TRUE(store_->save_backend(2, "10.0.0.2", 8080, 100, 0, "openai_compatible"));
+    store_->close();
+
+    auto store2 = create_persistence_store();
+    ASSERT_TRUE(store2->open(test_db_path_));
+    auto backends = store2->load_backends();
+    ASSERT_EQ(backends.size(), 2u);
+    for (const auto& b : backends) {
+        if (b.id == 1) EXPECT_EQ(b.backend_type, "sglang");
+        else if (b.id == 2) EXPECT_EQ(b.backend_type, "openai_compatible");
+    }
+    store2->close();
+}
+
+TEST_F(PersistenceTest, BackendTypeUpdateOnInsertOrReplace) {
+    ASSERT_TRUE(store_->open(test_db_path_));
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8080, 100, 0, "vllm"));
+    // INSERT OR REPLACE must update backend_type along with other fields.
+    EXPECT_TRUE(store_->save_backend(1, "10.0.0.1", 8080, 100, 0, "cerebras"));
+
+    auto backends = store_->load_backends();
+    ASSERT_EQ(backends.size(), 1u);
+    EXPECT_EQ(backends[0].backend_type, "cerebras");
+}
+
+// =============================================================================
 // Route Tests
 // =============================================================================
 

@@ -49,90 +49,133 @@ Before writing any code, verify:
 
 ```
 HTTP Request (:8080)
-  -> HttpController (sharded, one per core)
-  -> TokenizerService (BPE encoding with LRU cache)
+  -> HttpController (sharded, one per core; ingress concurrency cap)
+  -> RateLimiter (token-bucket; per-agent/IP)
+  -> AgentRegistry (User-Agent -> priority tier; pause/resume)
+  -> RequestScheduler (per-agent fair queue, CRITICAL/HIGH/NORMAL/LOW)
+  -> IntentClassifier (AUTOCOMPLETE / EDIT / CHAT)
+  -> ChatTemplate (llama3 / chatml / mistral / none) -> formatted prompt
+  -> TextValidator (UTF-8, null-byte, length)
+  -> TokenizerService
+       Layer 1: LRU cache (shard-local)
+       Layer 2: cross-shard P2C dispatch (ShardLoadBalancer)
+       Layer 3: TokenizerThreadPool (dedicated OS threads, 5-13ms FFI)
+  -> BoundaryDetector (per-message split for multi-depth prefix lookup)
+  -> RequestRewriter (inject prompt_token_ids into JSON body)
   -> RouterService
-     -> RadixTree (Adaptive Radix Tree - O(k) prefix lookup)
-     -> Fallback: consistent hash or weighted random
-  -> CircuitBreaker check
-  -> ConnectionPool -> GPU Backend
-  -> [Async] Learn route + persist + gossip broadcast
+       PREFIX: RadixTree (ART, O(k) lookup) -> consistent-hash fallback
+       HASH:   consistent hash on token prefix
+       RANDOM: uniform random (skips tokenization)
+  -> CircuitBreaker check (CLOSED / OPEN / HALF_OPEN)
+  -> ConnectionPool -> GPU Backend (vLLM / SGLang / TensorRT-LLM / Ollama / LM Studio)
+  -> StreamParser (SSE / chunked) -> client
+  -> [Async] Learn route -> AsyncPersistence (MPSC ring -> SQLite worker)
+                         -> GossipService (shard 0; ROUTE_ANNOUNCEMENT broadcast)
 ```
 
 ### Source Code Layout
 
 ```
 src/
-  main.cpp                    # Seastar reactor entry point
-  application.{hpp,cpp}       # Service lifecycle orchestration (CREATED->RUNNING->DRAINING->STOPPED)
+  main.cpp                    # Seastar reactor entry point (startup-only blocking I/O OK)
+  application.{hpp,cpp}       # Service lifecycle (CREATED -> STARTING -> RUNNING ->
+                              #                    DRAINING -> STOPPING -> STOPPED)
 
   # Routing Core
-  router_service.{hpp,cpp}    # Unified routing interface (prefix/hash/random modes)
-  radix_tree.hpp              # Adaptive Radix Tree (Node4/16/48/256, slab-allocated)
-  node_slab.{hpp,cpp}         # O(1) slab allocator for ART nodes
+  router_service.{hpp,cpp}    # Unified routing interface (PREFIX/HASH/RANDOM modes);
+                              #   route batching via pending buffer; gossip broadcast
+  radix_tree.hpp              # Adaptive Radix Tree (Node4/16/48/256, byte-keyed, LRU-bounded)
+  node_slab.{hpp,cpp}         # O(1) slab allocator for ART nodes (thread-local free-list)
 
   # HTTP Layer
-  http_controller.{hpp,cpp}   # Request handling, proxy, SSE streaming
-  connection_pool.hpp         # LRU + TTL connection management
-  circuit_breaker.hpp         # Backend health state machine (CLOSED/OPEN/HALF_OPEN)
-  rate_limiter.hpp            # Request throttling
-  stream_parser.{hpp,cpp}     # SSE stream parsing
-  request_rewriter.hpp        # Token ID injection into requests
+  http_controller.{hpp,cpp}   # Sharded request handler, proxy, SSE streaming, backpressure
+  connection_pool.hpp         # LRU + TTL connection management (templated on ClosePolicy)
+  circuit_breaker.hpp         # Per-backend state machine (CLOSED/OPEN/HALF_OPEN; templated Clock)
+  proxy_retry_policy.hpp      # Pure retry / backoff / fallback logic (no Seastar deps)
+  rate_limiter.hpp            # Seastar wrapper: cleanup timer + gate + Prometheus
+  rate_limiter_core.hpp       # Pure token-bucket algorithm (no Seastar deps)
+  request_scheduler.hpp       # Per-agent fair scheduling, priority tiers
+  stream_parser.{hpp,cpp}     # Zero-copy chunked + SSE parser
+  request_rewriter.hpp        # Inject prompt_token_ids into request body (vLLM schema)
+
+  # Request Processing / Text
+  intent_classifier.{hpp,cpp} # AUTOCOMPLETE (FIM) / EDIT / CHAT classification (pure)
+  agent_registry.{hpp,cpp}    # User-Agent -> priority tier; pause/resume; shard-local
+  chat_template.hpp           # Pre-compiled templates (llama3, chatml, mistral, none)
+  boundary_detector.hpp       # Marker-scan + proportional estimation for message boundaries
+  text_boundary_info.hpp      # Boundary metadata used for multi-depth prefix extraction
+  text_validator.hpp          # UTF-8 / null-byte / length validation (pre-tokenizer)
+  cache_event_parser.hpp      # POST /v1/cache/events JSON parser (eviction/load events)
 
   # Tokenization
-  tokenizer_service.{hpp,cpp} # HuggingFace BPE via Rust FFI (sharded, one per core)
-  tokenizer_thread_pool.{hpp,cpp} # Thread pool for FFI calls (5-13ms each)
+  tokenizer_service.{hpp,cpp} # 3-layer: LRU cache -> cross-shard P2C -> thread pool
+  tokenizer_thread_pool.{hpp,cpp} # Dedicated OS workers for FFI (5-13ms BPE calls)
 
-  # Clustering
-  gossip_service.{hpp,cpp}    # Cluster state sync coordinator (shard 0 only)
-  gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery, DNS discovery
+  # Clustering / Gossip
+  gossip_service.{hpp,cpp}    # Cluster state sync orchestrator (shard 0 only)
+  gossip_protocol.{hpp,cpp}   # Wire format, reliable delivery (ACKs), DNS discovery;
+                              #   ROUTE_ANNOUNCEMENT, HEARTBEAT, ROUTE_ACK,
+                              #   NODE_STATE, CACHE_EVICTION (big-endian)
   gossip_transport.{hpp,cpp}  # UDP channel, DTLS encryption
   gossip_consensus.{hpp,cpp}  # Peer table, quorum, split-brain detection
-  crypto_offloader.{hpp,cpp}  # DTLS crypto on worker threads
-  dtls_context.{hpp,cpp}      # OpenSSL DTLS session management
+  crypto_offloader.{hpp,cpp}  # Adaptive DTLS crypto offload (symmetric on-shard,
+                              #   asymmetric to worker thread); stall tracking
+  dtls_context.{hpp,cpp}      # OpenSSL DTLS session management (mTLS support)
+  byte_order.hpp              # Endian helpers for wire format
 
   # Configuration
   config.hpp                  # Facade header (includes schema + loader)
   config_infra.hpp            # Infrastructure config structs (ServerConfig, PoolConfig, etc.)
   config_schema.hpp           # Ranvier-specific configs (RoutingConfig, AssetsConfig, RanvierConfig)
   config_loader.{hpp,cpp}     # YAML parsing + env var overrides
+  config_loader_async.{hpp,cpp} # Async config reload (no reactor stalls; SIGHUP path)
   sharded_config.hpp          # Lock-free per-shard config distribution
 
   # Persistence
   persistence.hpp             # Interface definition
   sqlite_persistence.{hpp,cpp} # SQLite WAL-mode backend
-  async_persistence.{hpp,cpp} # Fire-and-forget queue with batch writes
+  async_persistence.{hpp,cpp} # Fire-and-forget MPSC ring -> dedicated OS worker (alien::run_on)
+  mpsc_ring_buffer.hpp        # Lock-free bounded MPSC queue (Vyukov; power-of-two)
 
   # Infrastructure
-  health_service.{hpp,cpp}    # Backend liveness monitoring
-  k8s_discovery_service.{hpp,cpp} # Kubernetes EndpointSlice watching
-  metrics_helpers.hpp         # Reusable histogram/bucket infrastructure (MetricHistogram, BackendMetrics)
-  metrics_service.hpp         # Ranvier-specific Prometheus metrics (:9180)
-  tracing_service.{hpp,cpp}   # OpenTelemetry (optional, Zipkin exporter)
-  shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch
-  shard_load_metrics.hpp      # Per-shard load tracking
-  cross_shard_request.hpp     # Safe cross-shard pointer passing
+  backend_registry.hpp        # Abstract backend lifecycle interface (decouples discovery + health)
+  health_service.{hpp,cpp}    # Backend liveness loop + vLLM /metrics scrape; ACTIVE/DRAINING
+  k8s_discovery_service.{hpp,cpp} # K8s EndpointSlice watcher; ranvier.io/* annotations
+  local_discovery.{hpp,cpp}   # Probe local ports (Ollama 11434, vLLM 8080, LM Studio 1234, ...)
+  metrics_service.hpp         # Ranvier Prometheus metrics (:9180); thread-local counters/gauges
+  metrics_helpers.hpp         # Reusable histogram/bucket infra (MetricHistogram, BackendMetrics)
+  metrics_auth_handler.hpp    # Auth / access control for metrics endpoint
+  prometheus_parser.hpp       # Parse Prometheus text exposition (for vLLM scrape)
+  vllm_metrics.hpp            # Per-backend vLLM stats struct (running/queued, KV-cache %, tps)
+  tracing_service.{hpp,cpp}   # OpenTelemetry (optional WITH_TELEMETRY=ON; Zipkin/OTLP)
+  shard_load_balancer.hpp     # Power-of-Two-Choices cross-shard dispatch (snapshot-cached)
+  shard_load_metrics.hpp      # Per-shard load tracking (active + queued requests)
+  cross_shard_request.hpp     # Safe foreign_ptr unwrap for cross-shard data
 
   # Utilities
-  types.hpp                   # Core type aliases (TokenId, BackendId)
-  logging.hpp                 # Structured logging
-  parse_utils.hpp             # Safe string-to-number conversion
-  text_validator.hpp          # Input validation
+  types.hpp                   # Core aliases (TokenId, BackendId), kYieldInterval
+  logging.hpp                 # Structured logging + request-ID generation
+  parse_utils.hpp             # Safe string-to-number, hex decoding
+
+  dashboard/                  # Embedded web UI assets
 
 tests/
-  unit/                       # 24+ Google Test files
+  unit/                       # Google Test (reactor-free where possible)
   integration/                # Python tests + Locust load testing
 
 deploy/helm/ranvier/          # Kubernetes Helm chart
 
+docs/internals/               # Authoritative deep-dives (see Documentation Map below)
 .dev-context/                 # Workflow prompts, audit findings, cheatsheet
 ```
 
 ### Key Types
 
 ```cpp
-using TokenId = int32_t;     // BPE token identifier
-using BackendId = int32_t;   // GPU pool identifier
+// src/types.hpp
+using TokenId   = int32_t;            // BPE token identifier
+using BackendId = int32_t;            // GPU pool identifier
+inline constexpr size_t kYieldInterval = 128;  // co_await maybe_yield() cadence
 
 struct RouteResult {
     std::optional<BackendId> backend_id;
@@ -141,9 +184,29 @@ struct RouteResult {
     std::string error_message;
 };
 
-enum class RoutingMode { PREFIX, HASH, RANDOM };
-enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
+// Routing / proxy
+enum class RoutingMode         { PREFIX, HASH, RANDOM };
+enum class CircuitState        { CLOSED, OPEN, HALF_OPEN };
+enum class ConnectionErrorType { NONE, BROKEN_PIPE, CONNECTION_RESET };
+
+// Request classification / scheduling
+enum class RequestIntent { AUTOCOMPLETE, CHAT, EDIT };
+enum class PriorityLevel { CRITICAL, HIGH, NORMAL, LOW };
+
+// Templates / crypto
+enum class ChatTemplateFormat { none, llama3, chatml, mistral };
+enum class CryptoOpType {
+    SYMMETRIC_ENCRYPT, SYMMETRIC_DECRYPT,
+    HANDSHAKE_INITIATE, HANDSHAKE_CONTINUE, UNKNOWN
+};
+
+// Application lifecycle (application.hpp)
+enum class ApplicationState {
+    CREATED, STARTING, RUNNING, DRAINING, STOPPING, STOPPED
+};
 ```
+
+Service start order: `TokenizerService` -> `RouterService` -> `HttpController` -> `HealthService` -> `AsyncPersistenceManager` -> `K8sDiscoveryService` -> `GossipService`. Shutdown reverses this.
 
 ## Critical Constraints for Coding
 
@@ -261,6 +324,21 @@ The full server binary (`ranvier_server`) requires Seastar installed on the syst
 - **Persistence:** SQLite tracks backends and routes.
 - **Configuration:** YAML (default: `ranvier.yaml`) with env var overrides (e.g., `RANVIER_ROUTING_MAX_ROUTES=50000`). Hot-reload via SIGHUP (rate-limited to once per 10 seconds, atomic across all shards). See `ranvier.yaml.example`.
 
+### Authoritative deep-dives (`docs/internals/`)
+
+| File | Covers |
+|------|--------|
+| `radix-tree.md` | ART internals: byte-keyed Node4/16/48/256, slab allocator, path compression, LRU eviction. |
+| `prefix-affinity-routing.md` | Hybrid ART + consistent-hash fallback; backend KV-cache prerequisites (vLLM APC, SGLang RadixAttention); per-`BackendType` applicability (which types learn / scrape / forward token IDs); ~81% vs 49% cache hit. |
+| `tokenization.md` | 3-layer tokenization: LRU cache (80-90% hit) -> cross-shard P2C -> dedicated thread pool; FFI safety. |
+| `request-lifecycle.md` | End-to-end request path (ingress -> rate-limit -> tokenize -> boundary -> route -> circuit -> connect -> stream -> learn). Source of truth for tracing. |
+| `request-lifecycle-perf-analysis.md` | Perf mitigations: route batching (no per-request gossip), tokenization fallback, stale-connection retries, load-aware overrides. |
+| `shard-load-balancing.md` | P2C algorithm + snapshot cache; currently advisory (HTTP hot path not yet dispatching). |
+| `gossip-protocol.md` | Wire format, packet types (ROUTE_ANNOUNCEMENT / HEARTBEAT / ROUTE_ACK / NODE_STATE / CACHE_EVICTION), big-endian, ACK-based reliability, DTLS. |
+| `async-persistence.md` | Lock-free MPSC ring -> dedicated OS worker -> SQLite WAL; fire-and-forget API + backpressure; `process_batch` accumulator. |
+
+When changing behavior in any of these areas, update the corresponding doc in the same PR.
+
 ## CI/CD
 
 GitHub Actions workflows in `.github/workflows/`:
@@ -335,11 +413,13 @@ For additional Seastar pitfalls not yet elevated to Hard Rules, see `.dev-contex
 
 **THE PATTERN:** Writing `for (auto& item : items) { co_await process(item); }` to iterate over a collection of async operations.
 
-**THE CONSEQUENCE:** O(n) latency instead of O(1). If processing 100 K8s endpoints takes 10ms each, the loop takes 1000ms--blocking the reactor for the entire second. Seastar's event loop cannot multiplex; it waits for each await.
+**THE CONSEQUENCE:** O(n) latency for *this request* instead of O(1). If processing 100 K8s endpoints takes 10ms each, the request takes 1000ms end-to-end. The reactor itself is **not** stalled — each `co_await` suspends the fiber and the shard happily serves other requests in the meantime. The bug is per-request tail latency (and timeouts further down the chain), not throughput collapse.
 
-**THE LESSON:** *Hard Rule: Replace sequential awaits with `seastar::parallel_for_each` or `max_concurrent_for_each`.* Batch concurrent operations with a semaphore (e.g., 16 in-flight) to bound parallelism without serializing.
+**THE LESSON:** *Hard Rule: Replace sequential awaits with `seastar::parallel_for_each` or `max_concurrent_for_each`.* Batch concurrent operations with a semaphore (e.g., 16 in-flight) to bound parallelism without serializing. Only keep serial ordering when each iteration genuinely depends on the previous result.
 
 **PROMPT GUARD:** "Never co_await inside a loop over external resources; use parallel_for_each with a concurrency limit."
+
+*Corrected 2026-05-05: previous wording said the loop "blocks the reactor" and that "Seastar's event loop cannot multiplex." That was wrong — the reactor multiplexes across fibers; only this fiber's progress is serialized. The real symptom is per-request latency.*
 
 ---
 
@@ -453,25 +533,37 @@ For additional Seastar pitfalls not yet elevated to Hard Rules, see `.dev-contex
 
 #### 12. The Blocking-ifstream-in-Coroutine Anti-Pattern
 
-**THE PATTERN:** Using `std::ifstream` or `std::ofstream` inside a coroutine or Seastar method: `std::ifstream file(path); buffer << file.rdbuf();`
+**THE PATTERN:** Using `std::ifstream`, `std::ofstream`, raw `::read`/`::write` on fds, blocking SQL drivers, synchronous `getaddrinfo`/curl, or any other blocking syscall on the reactor thread. Also includes the common false-fix: wrapping the blocking call in `seastar::async(...)` or `seastar::thread(...)` and assuming that "offloads to a thread pool."
 
-**THE CONSEQUENCE:** `std::ifstream` performs blocking I/O. In Seastar, this stalls the reactor thread--stopping all network I/O, timer callbacks, and request processing on that shard. A 10ms disk read becomes 10ms of zero throughput.
+**THE CONSEQUENCE:** Blocking I/O on the reactor thread stalls every fiber on that shard — network I/O, timer callbacks, request processing. A 10ms disk read becomes 10ms of zero throughput. **Critically: `seastar::async`/`seastar::thread` do NOT fix this.** A `seastar::thread` is a stackful coroutine that runs *on the reactor*; the blocking call still blocks the reactor exactly as if it had been called directly. The wrapper only helps if the work being wrapped is itself non-blocking (e.g., uses `.get()` on Seastar futures).
 
-**THE LESSON:** *Hard Rule: Use Seastar file I/O APIs.* Use `seastar::open_file_dma()` + `seastar::make_file_input_stream()` for async file reads. For small files during startup only, document the blocking nature explicitly.
+**THE LESSON:** *Hard Rule: Use Seastar file I/O APIs for files. For genuinely blocking C libraries (SQLite, blocking DNS, etc.), run them on a dedicated OS thread and signal back via `seastar::alien::run_on()`.*
 
-**PROMPT GUARD:** "Never use std::ifstream/ofstream in Seastar code--use seastar::open_file_dma and seastar::make_file_input_stream for async file I/O."
+- Files: `seastar::open_file_dma()` + `seastar::make_file_input_stream()`.
+- Blocking C libraries: dedicated `std::thread` worker pulling from an MPSC queue, results posted back to the originating shard with `seastar::alien::run_on`. See `src/tokenizer_thread_pool.cpp` for the canonical implementation.
+- Startup-only blocking I/O (before the reactor starts) is fine — `main.cpp` dry-run and initial config load qualify. Document it explicitly.
+
+**PROMPT GUARD:** "Never use std::ifstream/ofstream/blocking syscalls in Seastar code. `seastar::async` does NOT offload blocking work to a thread pool — it runs on the reactor. For files use seastar::open_file_dma; for blocking libraries use a dedicated OS thread + seastar::alien."
+
+*Corrected 2026-05-05: previous wording only addressed file I/O and offered no guidance for blocking C libraries. The codebase's `async_persistence` and config-reload paths wrapped blocking SQLite/ifstream in `seastar::async` under the false assumption that it offloads to a thread pool — see BACKLOG follow-ups.*
 
 ---
 
 #### 13. The Thread-Local-Raw-New Anti-Pattern
 
-**THE PATTERN:** Using `thread_local T* g_ptr = nullptr;` with `g_ptr = new T();` for per-shard state.
+**THE PATTERN:** Using `thread_local T* g_ptr = nullptr;` with `g_ptr = new T();` for per-shard state, with no `delete`.
 
-**THE CONSEQUENCE:** No corresponding `delete` call exists. Thread-local variables aren't destroyed by unique_ptr RAII. Memory leaks accumulate over the process lifetime. Tools like valgrind report leaks at exit.
+**THE CONSEQUENCE:** Memory leaks at process exit. But the more dangerous variant is the **subtle false fix**: switching to `thread_local std::unique_ptr<T>` only solves the problem if `T`'s destructor is trivial. The unique_ptr is destroyed at *thread-exit time*, which on Seastar shards happens **after** the reactor has already torn down. Any destructor that touches reactor primitives (metric registrations, gates, foreign_ptrs, futures) will run against a dead reactor — typically manifests as use-after-free or hangs at shutdown rather than a clean leak report.
 
-**THE LESSON:** *Hard Rule: Use `thread_local std::unique_ptr<T>` or add explicit destroy function.* Alternatively, use Seastar's `seastar::sharded<T>` service pattern which handles per-shard lifecycle correctly.
+**THE LESSON:** *Hard Rule: Per-shard state needs an explicit destroy function called during the shard's `stop()`, BEFORE the reactor tears down.* Acceptable patterns:
 
-**PROMPT GUARD:** "Never use raw 'new' with thread_local pointers--use unique_ptr or add an explicit destroy/cleanup function called during shutdown."
+1. **Preferred:** `seastar::sharded<T>` — handles lifecycle ordering correctly.
+2. Raw `thread_local T*` paired with an explicit `destroy_X()` invoked from the service's `stop()` (and verify it's actually wired up — `cleanup_*` functions that exist but are never called are worse than none).
+3. `thread_local std::unique_ptr<T>` is acceptable **only** when `~T()` is trivial / pure-memory and touches no reactor state. Even then, prefer (1) or (2) for clarity.
+
+**PROMPT GUARD:** "thread_local std::unique_ptr is NOT a fix on its own — its destructor runs after reactor teardown. Every per-shard thread_local needs an explicit destroy hook called from stop(), or use seastar::sharded<T>."
+
+*Corrected 2026-05-05: previous wording recommended `thread_local std::unique_ptr<T>` as an equally-good alternative to an explicit destroy hook. That's only true for trivially-destructible state. For anything touching reactor primitives, the unique_ptr destruction happens too late.*
 
 ---
 
@@ -792,7 +884,11 @@ return seastar::do_with(std::move(text), [](auto& text) {
 
 **THE CONSEQUENCE:** `do_with` allocates the object on the heap and passes a reference to the lambda. If the lambda parameter isn't a reference (`auto` without `&`), C++ creates a copy that is destroyed when the lambda returns--before the future resolves. This is a use-after-free that the compiler will **not** warn about. Symptoms include intermittent crashes under load, often in completely unrelated code due to heap corruption.
 
-**THE LESSON:** *Hard Rule: Always use `auto&` or explicit `Type&` in `do_with` lambda parameters. Prefer coroutines over `do_with` for new code*--coroutines manage stack variable lifetimes naturally.
+**THE LESSON:** *Hard Rule: In new code, prefer C++20 coroutines and let the coroutine frame own the variable — `do_with` is rarely needed.* When `do_with` is unavoidable (e.g., pre-coroutine code paths, or anchoring a `foreign_ptr` for an `invoke_on_all` chain that doesn't return a future to the caller), always use `auto&` or explicit `Type&` in the lambda parameters.
+
+Two structural defenses that prevent this bug entirely:
+1. **Coroutines:** `co_await slow_op(buffer)` keeps `buffer` on the coroutine frame for the full duration. No do_with, no missing-reference bug possible.
+2. **Move-only types:** if the captured object is move-only (no copy ctor), the buggy `[](auto obj){...}` form fails to compile. Marking heavy types `noncopyable` (e.g., `std::unique_ptr<T>`, types with deleted copy) turns this from a silent runtime use-after-free into a compile error.
 
 ```cpp
 // CORRECT: reference parameter
@@ -806,7 +902,9 @@ seastar::future<> handle(Buffer buffer) {
 }
 ```
 
-**PROMPT GUARD:** "Always use auto& (with &) in do_with lambda parameters. Prefer coroutines over do_with for new code--they eliminate this entire class of lifetime bugs."
+**PROMPT GUARD:** "Prefer coroutines over do_with for new code — they eliminate this class of lifetime bugs entirely. When do_with is unavoidable, always use auto& in the lambda. Move-only types turn missing-& into a compile error rather than runtime UAF."
+
+*Corrected 2026-05-05: previous wording presented `do_with` and coroutines as roughly co-equal options. C++20 coroutines remove the need for `do_with` in nearly all cases. Also added the move-only-type defense, which converts silent runtime UAF into a compile error.*
 
 ---
 

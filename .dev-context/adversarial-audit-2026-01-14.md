@@ -66,25 +66,13 @@ The codebase demonstrates solid architectural discipline with proper Seastar pat
 
 ### 12. The Blocking-ifstream-in-Coroutine Anti-Pattern
 
-**THE PATTERN:** Using `std::ifstream` or `std::ofstream` inside a coroutine or Seastar method: `std::ifstream file(path); buffer << file.rdbuf();`
-
-**THE CONSEQUENCE:** `std::ifstream` performs blocking I/O. In Seastar, this stalls the reactor thread--stopping all network I/O, timer callbacks, and request processing on that shard. A 10ms disk read becomes 10ms of zero throughput.
-
-**THE LESSON:** *Hard Rule: Use Seastar file I/O APIs.* Use `seastar::open_file_dma()` + `seastar::make_file_input_stream()` for async file reads. For small files during startup only, document the blocking nature explicitly.
-
-**PROMPT GUARD:** "Never use std::ifstream/ofstream in Seastar code--use seastar::open_file_dma and seastar::make_file_input_stream for async file I/O."
+See canonical wording in `.dev-context/claude-context.md` §12. (This audit originally proposed Rule 12; the canonical version was corrected 2026-05-05 to also cover the `seastar::async`/`seastar::thread` false-fix and the dedicated-OS-thread + alien-API pattern for blocking C libraries.)
 
 ---
 
 ### 13. The Thread-Local-Raw-New Anti-Pattern
 
-**THE PATTERN:** Using `thread_local T* g_ptr = nullptr;` with `g_ptr = new T();` for per-shard state.
-
-**THE CONSEQUENCE:** No corresponding `delete` call exists. Thread-local variables aren't destroyed by unique_ptr RAII. Memory leaks accumulate over the process lifetime. Tools like valgrind report leaks at exit.
-
-**THE LESSON:** *Hard Rule: Use `thread_local std::unique_ptr<T>` or add explicit destroy function.* Alternatively, use Seastar's `seastar::sharded<T>` service pattern which handles per-shard lifecycle correctly.
-
-**PROMPT GUARD:** "Never use raw 'new' with thread_local pointers--use unique_ptr or add an explicit destroy/cleanup function called during shutdown."
+See canonical wording in `.dev-context/claude-context.md` §13. (Corrected 2026-05-05: `thread_local std::unique_ptr<T>` is only safe when `~T()` is trivial — its destructor runs at thread-exit, after reactor teardown.)
 
 ---
 

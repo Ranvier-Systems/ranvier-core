@@ -1,0 +1,38 @@
+# Rule #12 lint — guards against re-introducing the seastar::async()
+# anti-pattern that the §17 P0 audit removed from production code.
+#
+# seastar::async() does NOT offload to a thread pool; it runs in a
+# seastar::thread (stackful coroutine) ON the reactor. Wrapping a
+# blocking call in it stalls the shard exactly as a direct call would.
+# See .dev-context/claude-context.md Hard Rule #12 for the full
+# rationale and the BACKLOG.md §17 audit notes.
+#
+# Legitimate call sites carry an inline `// rule12-allow: <reason>`
+# marker that the lint script recognises; everything else fails CI.
+#
+# This job is intentionally tiny (pure shell, no Docker) so it can run
+# on every push and PR without delaying the heavier builds.
+name: Rule 12 Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint-seastar-async:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Rule #12 lint
+        run: ./scripts/lint-seastar-async.sh

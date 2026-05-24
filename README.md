@@ -295,6 +295,7 @@ See [Kubernetes Deployment Guide](docs/deployment/kubernetes.md) for detailed co
   - [Gossip Protocol](docs/internals/gossip-protocol.md)
   - [Radix Tree](docs/internals/radix-tree.md)
   - [Prefix Affinity Routing](docs/internals/prefix-affinity-routing.md)
+  - [Per-API-Key Attribution](docs/internals/per-api-key-attribution.md)
 - [Changelog](CHANGELOG.md)
 
 ---

@@ -11,7 +11,30 @@
 
 ## Executive Summary
 
-Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 80% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes. Validated stable over 30-minute sustained load at both moderate (20 users) and high (30 users) concurrency on 8 GPUs. A previous 30u miss-tail blowout (d6b97a6) is fully resolved on the current architecture (08e5a93) — see [High-Concurrency Results](#high-concurrency-results-30-users-08e5a93--march-5-2026).
+Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 80% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes at 10-user concurrency. Headline aggregate gains at 20 and 30 users have shown intermittent reproducibility on the current architecture — see [Known Issue](#known-issue-13b30u-prefix-aware-miss-tail-with-default-load-aware-thresholds) below before quoting 20u/30u improvements as steady-state.
+
+### Known Issue: 13B/30u prefix-aware miss-tail with default load-aware thresholds
+
+A 13B/30-minute reproduction on `5079f9f` (May 22, 2026) at 10/20/30-user concurrency reproduced the affinity-thrashing failure mode predicted in
+[investigation #289](../../.dev-context/investigation-289-routing-regression.md) (and followed up in
+[investigation-may22-affinity-thrashing-reproduction](../../.dev-context/investigation-may22-affinity-thrashing-reproduction.md)).
+
+- **30u/30m on `5079f9f`:** Cache hit rate 61.5% (healthy), but vs round-robin baseline:
+  P99 TTFT **+44%**, Cache Miss P99 **+69%**, Large Miss P99 **+123%**, XLarge Miss P99 **+62%**.
+  Throughput +2%, zero incompletes. Prefix-aware is a clear regression on tail latency, not an improvement.
+- **20u/30m on `5079f9f`:** Reported P99 TTFT -57% **but** with 639 incomplete requests (6.0% of the
+  prefix-aware run vs 0 for round-robin). Incompletes are excluded from the TTFT P99 calculation, so
+  the green headline hides the failure mode. Treat the 20u headline as unreproduced until a clean run.
+- **10u/30m on `5079f9f`:** Healthy. Cache hit 58.3%, P99 TTFT -22%, throughput +3.6%, 0 incompletes.
+
+**Status of previously-reported headline results:**
+- The Feb 28 `b63c165` 20-user result (P99 -78.2%, 0/0 timeouts) has **not** reproduced on `5079f9f`.
+- The Mar 5 `08e5a93` 30-user result (P99 -79.6%, +13.2% throughput) has **not** reproduced on `5079f9f`.
+
+The May 22 numbers match investigation #289's prediction at lines 196-227 to the letter (10u quiet,
+20u flapping → timeouts, 30u load-aware fires constantly → every divert is a cold-cache miss). The
+fix path (revert vs hysteresis vs threshold tuning) requires further benchmark data; see
+[next-benchmark-checklist](../../.dev-context/next-benchmark-checklist.md).
 
 ### Validated 30-Minute Run (February 28, 2026 — b63c165)
 
@@ -41,9 +64,10 @@ vLLM v0.15.1. Routing overhead: 10.62ms (tokenization: 10.61ms, ART lookup: 0.01
 Instance 3 (Feb 10-14) and Instance 8 (March 5). All on 8xA100 with vLLM v0.15.1.
 70B on 80GB A100s (TP=2, 4 backends). 13B/8B on 40GB A100s (8 backends).*
 
-### High-Concurrency Results (30 users, 08e5a93 — March 5, 2026)
+<details>
+<summary>High-Concurrency Results (30 users, 08e5a93 — March 5, 2026) — superseded</summary>
 
-At 30 concurrent users, the current architecture (08e5a93) now passes cleanly:
+At 30 concurrent users, the current architecture (08e5a93) was reported to pass cleanly:
 
 | Metric | Round-Robin | Prefix-Aware | Change |
 |--------|-------------|--------------|--------|
@@ -52,8 +76,14 @@ At 30 concurrent users, the current architecture (08e5a93) now passes cleanly:
 | **Throughput** | 47.8 req/s | **54.1 req/s** | **+13.2%** |
 | **Errors / Timeouts** | 0 | 0 | — |
 
-*CodeLlama-13b, 30 users, 30m duration, 8x GPU, `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default).
-The miss-tail blowout observed on d6b97a6 (P99 +84.6%) did not reproduce on 08e5a93.*
+*CodeLlama-13b, 30 users, 30m duration, 8x GPU, `RANVIER_LOAD_IMBALANCE_FACTOR=2.0` (default).*
+
+**Not reproduced on `5079f9f` (May 22, 2026).** A repeat 30u/30m run on the same configuration showed
+P99 TTFT +44% vs round-robin and Cache Miss P99 +69% — the miss-tail pathology investigation #289
+predicted. See the [Known Issue](#known-issue-13b30u-prefix-aware-miss-tail-with-default-load-aware-thresholds)
+section above. This block is preserved for historical accuracy but should not be cited as
+steady-state behavior.
+</details>
 
 <details>
 <summary>Previous result (d6b97a6, Instance 7 — superseded)</summary>
@@ -233,7 +263,11 @@ This header is invaluable for debugging configuration mismatches between client 
 
 2. **13B is the sweet spot for aggregate metrics** — Queue buildup under moderate load makes routing dramatically effective: P99 -78% to -85% at 10-20 users. Throughput improves +10% to +22%.
 
-3. **Scales to 30 concurrent users** — At 20 users / 8 GPUs, P99 improves -67% to -80% (clean runs). At 30 users / 30m, P99 improves -80% with +13% throughput (08e5a93). A previous miss-tail blowout at 30u (d6b97a6) did not reproduce on the current architecture.
+3. **Scales to 30 concurrent users** — At 20 users / 8 GPUs, P99 improvements of -67% to -80% were
+   observed in clean runs (Feb 14 — Mar 5, 2026). A May 22, 2026 reproduction on `5079f9f` did not
+   confirm steady-state behavior at 20u or 30u with default thresholds; see the
+   [Known Issue](#known-issue-13b30u-prefix-aware-miss-tail-with-default-load-aware-thresholds)
+   section. Treat 20u/30u as "depends on `load_aware_routing` tuning" rather than universally green.
 
 4. **8B is routing-neutral** — Inference too fast (~1400ms) for cache savings to affect aggregate TTFT. No harm, but no benefit.
 

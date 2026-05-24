@@ -1,8 +1,13 @@
 // Ranvier Core - Configuration Loader Implementation
 //
 // YAML parsing, environment variable overrides, and validation logic.
-// Note: This file uses std::ifstream which is blocking I/O.
-// Config loading happens before Seastar reactor starts, so this is acceptable.
+// The blocking sync entry point `RanvierConfig::load(path)` uses std::ifstream
+// and is intended for the pre-reactor startup path in `main()`. After the
+// Seastar reactor is running (e.g. SIGHUP-driven hot-reload), callers must use
+// `load_config_async()` from `config_loader_async.hpp`, which performs the
+// file read via `seastar::open_file_dma` + `dma_read_bulk` and then calls into
+// `RanvierConfig::load_from_string()` to share the YAML parsing logic with the
+// sync path.
 
 #include "config_loader.hpp"
 
@@ -14,6 +19,8 @@
 #include <stdexcept>
 
 #include <yaml-cpp/yaml.h>
+
+#include <unordered_set>
 
 namespace ranvier {
 
@@ -773,6 +780,23 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env("RANVIER_DASHBOARD_CORS")) {
         dashboard.enable_cors = (*v == "1" || *v == "true" || *v == "yes");
     }
+
+    // Attribution overrides
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_MAX_LABEL_CARDINALITY")) {
+        attribution.max_label_cardinality = *v;
+    }
+    if (auto v = get_env("RANVIER_ATTRIBUTION_PERSISTENCE_ENABLED")) {
+        attribution.persistence_enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_MAX_REQUEST_ROWS")) {
+        attribution.max_request_rows = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_WINDOW_HOURS")) {
+        attribution.admin_query_max_window_hours = *v;
+    }
+    if (auto v = get_env_as<uint32_t>("RANVIER_ATTRIBUTION_ADMIN_QUERY_MAX_ROWS")) {
+        attribution.admin_query_max_rows = *v;
+    }
 }
 
 // =============================================================================
@@ -790,17 +814,22 @@ RanvierConfig RanvierConfig::defaults() {
 // =============================================================================
 
 RanvierConfig RanvierConfig::load(const std::string& config_path) {
-    RanvierConfig config;
-
     std::ifstream file(config_path);
     if (!file.is_open()) {
         // File not found - use defaults with env overrides
-        config.apply_env_overrides();
-        return config;
+        return RanvierConfig::defaults();
     }
 
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return load_from_string(buffer.str());
+}
+
+RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
+    RanvierConfig config;
+
     try {
-        YAML::Node yaml = YAML::Load(file);
+        YAML::Node yaml = YAML::Load(yaml_text);
 
         // Server section
         if (yaml["server"]) {
@@ -1548,6 +1577,73 @@ RanvierConfig RanvierConfig::load(const std::string& config_path) {
             if (db["enable_cors"]) config.dashboard.enable_cors = db["enable_cors"].as<bool>();
         }
 
+        // Attribution section (per-API-key observability)
+        if (yaml["attribution"]) {
+            YAML::Node at = yaml["attribution"];
+            if (at["max_label_cardinality"]) {
+                config.attribution.max_label_cardinality = at["max_label_cardinality"].as<uint32_t>();
+            }
+            if (at["persistence_enabled"]) {
+                config.attribution.persistence_enabled = at["persistence_enabled"].as<bool>();
+            }
+            if (at["max_request_rows"]) {
+                config.attribution.max_request_rows = at["max_request_rows"].as<uint32_t>();
+            }
+            if (at["admin_query_max_window_hours"]) {
+                config.attribution.admin_query_max_window_hours = at["admin_query_max_window_hours"].as<uint32_t>();
+            }
+            if (at["admin_query_max_rows"]) {
+                config.attribution.admin_query_max_rows = at["admin_query_max_rows"].as<uint32_t>();
+            }
+        }
+
+        // Static backend declarations. Top-level `backends:` array; parsed
+        // verbatim into config.backends.entries. Env-var
+        // resolution and address resolution happen later, in
+        // application.cpp at startup (post-reactor) — we hold only the env
+        // var *name* in the config, not the resolved secret.
+        if (yaml["backends"]) {
+            YAML::Node bs = yaml["backends"];
+            if (!bs.IsSequence()) {
+                throw std::runtime_error("'backends' must be a YAML sequence");
+            }
+            config.backends.entries.clear();
+            for (const auto& entry : bs) {
+                if (config.backends.entries.size() >= StaticBackendsConfig::MAX_STATIC_BACKENDS) {
+                    std::cerr << "[WARN] 'backends' has more than "
+                              << StaticBackendsConfig::MAX_STATIC_BACKENDS
+                              << " entries, truncating (Rule #4)\n";
+                    break;
+                }
+                StaticBackendConfig sb;
+                if (!entry["id"] || !entry["host"]) {
+                    throw std::runtime_error("'backends' entry missing required field 'id' or 'host'");
+                }
+                sb.id = entry["id"].as<BackendId>();
+                sb.host = entry["host"].as<std::string>();
+                if (entry["port"]) sb.port = entry["port"].as<uint16_t>();
+                if (entry["weight"]) sb.weight = entry["weight"].as<uint32_t>();
+                if (entry["priority"]) sb.priority = entry["priority"].as<uint32_t>();
+                if (entry["compression_ratio"]) {
+                    sb.compression_ratio = entry["compression_ratio"].as<double>();
+                }
+                if (entry["type"]) {
+                    auto type_str = entry["type"].as<std::string>();
+                    auto t = parse_backend_type(type_str);
+                    if (!t) {
+                        throw std::runtime_error(
+                            "'backends' entry has unknown type '" + type_str
+                            + "' (expected one of vllm/sglang/trt_llm/ollama/lm_studio/cerebras/openai_compatible)");
+                    }
+                    sb.type = *t;
+                }
+                if (entry["api_key_env"]) {
+                    sb.api_key_env = entry["api_key_env"].as<std::string>();
+                }
+                config.backends.entries.push_back(std::move(sb));
+            }
+        }
+
     } catch (const YAML::Exception& e) {
         // Log error and fall back to defaults
         // Note: Can't use Seastar logger here since config loads before Seastar init
@@ -1822,6 +1918,36 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         return "local_mode.discovery_ports exceeds maximum of 64 entries (Rule #4)";
     }
 
+    // Validate static backend declarations. Caught at config load time so
+    // an operator typo doesn't get past startup.
+    if (config.backends.entries.size() > StaticBackendsConfig::MAX_STATIC_BACKENDS) {
+        return "backends exceeds maximum of 64 entries (Rule #4)";
+    }
+    {
+        std::unordered_set<BackendId> seen_ids;
+        seen_ids.reserve(config.backends.entries.size());
+        for (const auto& sb : config.backends.entries) {
+            if (sb.id <= 0) {
+                return "backends entry has invalid id (must be > 0; id=0 is reserved for cluster.self_backend_id)";
+            }
+            if (sb.host.empty()) {
+                return "backends entry id=" + std::to_string(sb.id) + " has empty host";
+            }
+            if (sb.port == 0) {
+                return "backends entry id=" + std::to_string(sb.id) + " has invalid port 0";
+            }
+            if (sb.weight == 0) {
+                return "backends entry id=" + std::to_string(sb.id) + " has weight 0 (would never receive traffic)";
+            }
+            if (sb.compression_ratio < 1.0) {
+                return "backends entry id=" + std::to_string(sb.id) + " has compression_ratio < 1.0 (1.0 = no compression)";
+            }
+            if (!seen_ids.insert(sb.id).second) {
+                return "backends has duplicate id=" + std::to_string(sb.id);
+            }
+        }
+    }
+
     // Validate compression-aware load scoring
     if (config.routing.default_compression_ratio < 1.0) {
         return "default_compression_ratio must be >= 1.0 (1.0 = no compression)";
@@ -1844,6 +1970,22 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.cache_events.max_event_age_seconds == 0) {
         return "cache_events.max_event_age_seconds must be positive";
+    }
+
+    // Validate attribution settings
+    if (config.attribution.max_label_cardinality < 4) {
+        // Must leave room for the three sentinels (_unauthenticated, _invalid,
+        // _overflow) plus at least one real key.
+        return "attribution.max_label_cardinality must be at least 4";
+    }
+    if (config.attribution.max_request_rows == 0) {
+        return "attribution.max_request_rows must be positive";
+    }
+    if (config.attribution.admin_query_max_window_hours == 0) {
+        return "attribution.admin_query_max_window_hours must be positive";
+    }
+    if (config.attribution.admin_query_max_rows == 0) {
+        return "attribution.admin_query_max_rows must be positive";
     }
 
     return std::nullopt;  // Valid

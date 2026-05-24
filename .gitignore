@@ -1,4 +1,6 @@
 build/
+build-fuzz/
+tests/fuzz/corpus/
 .vscode/
 .cache/
 compile_commands.json

@@ -1,6 +1,11 @@
 # End-to-end integration tests for Ranvier Core
-# Runs the full pytest integration suite against a 3-node Docker Compose cluster
-# with mock backends, producing JUnit XML results for the Actions test summary.
+# Runs a curated set of pytest integration suites against a 3-node Docker
+# Compose cluster with mock backends, producing JUnit XML results for the
+# Actions test summary. The default set covers the multi-node behaviour suites
+# plus the metrics / persistence / attribution suites (see the TEST_FILES list
+# in the "Run integration tests" step); use the test_filter input to run a
+# specific subset, or pass other suite filenames to run ones not in the default
+# set.
 #
 # Triggers:
 #   - After Docker Publish workflow completes (tests the newly-pushed image)
@@ -123,7 +128,10 @@ jobs:
               tests/integration/test_graceful_shutdown.py \
               tests/integration/test_negative_paths.py \
               tests/integration/test_load_aware_routing.py \
-              tests/integration/test_intelligence_layer.py"
+              tests/integration/test_intelligence_layer.py \
+              tests/integration/test_metrics.py \
+              tests/integration/test_persistence_recovery.py \
+              tests/integration/test_attribution_cardinality.py"
             echo "Running all integration tests"
           fi
 

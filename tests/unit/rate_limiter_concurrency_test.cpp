@@ -38,6 +38,12 @@ protected:
 TEST_F(RateLimiterConcurrencyTest, IndependentLimitersNoInterference) {
     // Each thread creates and uses its own rate limiter.
     // Validates no global static state causes cross-instance interference.
+    //
+    // Uses TestClock frozen at epoch — no thread advances time — so the
+    // token-bucket refill never runs during the 100-request burst. With
+    // the default steady_clock the 1ms refill window can race the burst
+    // under sanitiser slowdown and the assertion flakes.
+    TestClock::reset();
     std::latch start_latch(kNumThreads);
     std::atomic<int> success_count{0};
     std::vector<std::thread> threads;
@@ -51,7 +57,7 @@ TEST_F(RateLimiterConcurrencyTest, IndependentLimitersNoInterference) {
             config.requests_per_second = 1000;
             config.burst_size = 100;
 
-            BasicRateLimiter<> limiter(config);
+            BasicRateLimiter<TestClock> limiter(config);
 
             // Each limiter should behave independently
             std::string client = "client_" + std::to_string(t);

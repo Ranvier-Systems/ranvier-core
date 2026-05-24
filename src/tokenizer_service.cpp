@@ -1,6 +1,8 @@
 #include "tokenizer_service.hpp"
+#include "request_timeout.hpp"
 #include "shard_load_balancer.hpp"
 
+#include <optional>
 #include <stdexcept>
 
 #include <seastar/util/defer.hh>
@@ -209,7 +211,16 @@ uint32_t TokenizerService::select_tokenization_shard() const {
 }
 
 seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::string_view text) {
-    // Rule 22: coroutine converts any pre-future throw into a failed future
+    // Rule 22: coroutine converts any pre-future throw into a failed future.
+    //
+    // LIFETIME INVARIANT (audit M3): `text` is a non-owning view; the caller's
+    // backing buffer must remain valid until the synchronous prelude has copied
+    // it into an owned string. In particular, do NOT insert any `co_await`
+    // before the `std::string text_copy(text)` below (cross-shard branch) or
+    // the `std::string text_for_cache(text)` after the cross-shard await — both
+    // currently re-materialise the bytes from the view while the caller's
+    // buffer is still live. Refactors that move the first suspension earlier
+    // must take `std::string&&` / copy first instead.
     uint32_t local_shard = seastar::this_shard_id();
 
     // Fast path: check local cache first (no async overhead for hits)
@@ -340,24 +351,48 @@ seastar::future<TokenizationResult> TokenizerService::encode_threaded_async(std:
                 // Successfully submitted to thread pool
                 ++_thread_pool_dispatches;
 
-                // Convert ThreadPoolTokenizationResult to TokenizationResult
-                auto pool_result = co_await std::move(*future_opt);
-                TokenizationResult result;
-                result.tokens = std::move(pool_result.tokens);
-                result.cache_hit = pool_result.cache_hit;
-                result.cross_shard = false;  // Thread pool is shard-local
-                result.source_shard = local_shard;
-
-                // Cache locally for future lookups
-                std::string text_copy(text);
-                if (!result.tokens.empty()) {
-                    _cache.insert(text_copy, result.tokens);
+                // Bound the wait so a wedged worker can't strand the request
+                // forever. On timeout, fall through to cross-shard / local
+                // just like the queue-full path.
+                constexpr auto kThreadPoolTokenizeTimeout =
+                    std::chrono::seconds(3);
+                std::optional<ThreadPoolTokenizationResult> pool_result_opt;
+                try {
+                    pool_result_opt = co_await with_request_timeout(
+                        kThreadPoolTokenizeTimeout,
+                        std::move(*future_opt),
+                        "tokenize_thread_pool");
+                } catch (const request_timeout_error&) {
+                    ++_thread_pool_fallbacks;
+                    log_tokenizer.warn("Thread pool tokenization timed out on "
+                                       "shard {} after {}s, falling through to "
+                                       "other priorities",
+                                       local_shard,
+                                       kThreadPoolTokenizeTimeout.count());
                 }
 
-                co_return result;
+                if (pool_result_opt) {
+                    // Convert ThreadPoolTokenizationResult to TokenizationResult
+                    auto& pool_result = *pool_result_opt;
+                    TokenizationResult result;
+                    result.tokens = std::move(pool_result.tokens);
+                    result.cache_hit = pool_result.cache_hit;
+                    result.cross_shard = false;  // Thread pool is shard-local
+                    result.source_shard = local_shard;
+
+                    // Cache locally for future lookups
+                    std::string text_copy(text);
+                    if (!result.tokens.empty()) {
+                        _cache.insert(text_copy, result.tokens);
+                    }
+
+                    co_return result;
+                }
+                // Timeout: fall through to cross-shard / local below.
+            } else {
+                // Queue full - fall through to other methods
+                ++_thread_pool_fallbacks;
             }
-            // Queue full - fall through to other methods
-            ++_thread_pool_fallbacks;
         }
     }
 

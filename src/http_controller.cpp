@@ -5,6 +5,7 @@
 #include "logging.hpp"
 #include "parse_utils.hpp"
 #include "request_rewriter.hpp"
+#include "request_timeout.hpp"
 #include "shard_load_metrics.hpp"
 #include "text_validator.hpp"
 #include "tracing_service.hpp"
@@ -183,6 +184,71 @@ bool HttpController::check_admin_auth(const seastar::http::request& req) const {
     return authorized;
 }
 
+// Sanitise an api_key_id into a Prometheus-safe label value.
+// Cheap string ops (no allocation beyond the result string). See
+// docs/architecture/per-api-key-attribution.md §6.3.
+std::string HttpController::sanitise_api_key_label(std::string_view name) {
+    constexpr size_t kMaxLen = 64;
+    std::string out;
+    out.reserve(std::min(name.size(), kMaxLen));
+    for (char c : name) {
+        if (out.size() >= kMaxLen) break;
+        if (c >= 'A' && c <= 'Z') {
+            out.push_back(static_cast<char>(c - 'A' + 'a'));
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) {
+        return "_unnamed";
+    }
+    return out;
+}
+
+// Per-API-key attribution: parse-only resolution from the Authorization header.
+// Does NOT reject unauthenticated requests on the data plane (see memo §5
+// Option A). Pure computation — no I/O, no futures, no throws.
+HttpController::ApiKeyAttribution
+HttpController::resolve_api_key(const seastar::http::request& req) const {
+    static constexpr std::string_view kBearerPrefix = "Bearer ";
+
+    // No keys configured → all requests are "_unauthenticated" (correct: there
+    // is nothing to attribute against).
+    auto auth_it = req._headers.find("Authorization");
+    if (auth_it == req._headers.end()) {
+        return {"", "_unauthenticated"};
+    }
+
+    std::string_view auth_header(auth_it->second);
+    if (auth_header.size() <= kBearerPrefix.size() ||
+        auth_header.substr(0, kBearerPrefix.size()) != kBearerPrefix) {
+        return {"", "_invalid"};
+    }
+
+    std::string_view token_view = auth_header.substr(kBearerPrefix.size());
+    if (token_view.empty()) {
+        return {"", "_invalid"};
+    }
+
+    if (!_config.auth.is_enabled()) {
+        // A header was sent but no keys are configured. Treat as unauthenticated
+        // for attribution; there is no key to attribute to.
+        return {"", "_unauthenticated"};
+    }
+
+    // validate_token returns (valid, key_name_for_audit). On valid, the second
+    // element is the operator-chosen ApiKey::name (or "legacy-key").
+    std::string token(token_view);
+    auto [valid, key_name] = _config.auth.validate_token(token);
+    if (!valid) {
+        return {"", "_invalid"};
+    }
+    auto label = sanitise_api_key_label(key_name);
+    return {std::move(key_name), std::move(label)};
+}
+
 // Get client IP from request, checking X-Forwarded-For for proxied requests
 // Uses string_view internally to minimize copies during header inspection
 std::string HttpController::get_client_ip(const seastar::http::request& req) {
@@ -297,7 +363,16 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
         }));
 
     // Define the check once as a local lambda to keep the calls clean.
-    auto rate_limit_check = [this](const auto& req) { return this->check_rate_limit(req); };
+    auto rate_limit_check = [this](const auto& req) -> bool {
+        if (this->check_rate_limit(req)) {
+            return true;
+        }
+        // Rate-limited: attribute to the per-API-key counter before the
+        // wrapper records the unlabelled metric and returns 503. Memo §6.1.
+        auto attr = this->resolve_api_key(req);
+        metrics().record_api_key_rate_limited(attr.label);
+        return false;
+    };
 
     // 1. DATA PLANE (rate limited)
     r.add(operation_type::POST, url("/v1/chat/completions"), make_rate_limited_handler(rate_limit_check, [this](auto req, auto rep) {
@@ -322,7 +397,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
                 std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
                 [](auto /*req*/, auto rep) {
                     add_cors_headers(*rep);
-                    rep->set_status(seastar::http::reply::status_type{204});
+                    rep->set_status(seastar::http::reply::status_type::no_content);
                     rep->done();
                     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
                 });
@@ -357,6 +432,9 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
     }, cors));
 
     // 4. API KEY MANAGEMENT
+    r.add(operation_type::GET, url("/admin/keys/usage"), make_admin_handler(auth_check, [this](auto req, auto rep) {
+        return this->handle_keys_usage(std::move(req), std::move(rep));
+    }, cors));
     r.add(operation_type::POST, url("/admin/keys/reload"), make_admin_handler(auth_check, [this](auto req, auto rep) {
         return this->handle_keys_reload(std::move(req), std::move(rep));
     }, cors));
@@ -659,6 +737,16 @@ void HttpController::record_proxy_completion_metrics(
     metrics().record_request_latency(total_latency);
     // Record in new advanced histogram with optimized buckets
     metrics().record_router_total_latency(total_latency);
+
+    // Per-API-key attribution: record latency histograms + token/cost sums
+    // for this request's api_key label. Memo §6.1.
+    metrics().record_api_key_completion(
+        ctx.api_key_label,
+        total_latency,
+        total_latency,
+        ctx.estimated_input_tokens,
+        ctx.estimated_output_tokens,
+        ctx.estimated_cost_units);
 }
 
 // Establish connection to backend with retry and fallback logic
@@ -751,10 +839,14 @@ future<ConnectionBundle> HttpController::establish_backend_connection(ProxyConte
             // Wait with exponential backoff before retry
             co_await seastar::sleep(ctx->current_backoff);
 
-            // Increase backoff for next attempt (with cap)
-            auto next_backoff = std::chrono::milliseconds(
-                static_cast<int64_t>(ctx->current_backoff.count() * ctx->retry_config.backoff_multiplier));
-            ctx->current_backoff = std::min(next_backoff, ctx->retry_config.max_backoff);
+            // Increase backoff for next attempt (with cap).
+            // Compute in double and clamp to max_backoff before casting to int64_t,
+            // since a raw double->int64_t cast on overflow is UB (audit H9, Hard Rule #11).
+            const double next_ms = std::min(
+                static_cast<double>(ctx->current_backoff.count()) *
+                    ctx->retry_config.backoff_multiplier,
+                static_cast<double>(ctx->retry_config.max_backoff.count()));
+            ctx->current_backoff = std::chrono::milliseconds(static_cast<int64_t>(next_ms));
         } else {
             log_proxy.warn("[{}] Connection failed after {} retries and {} fallbacks",
                 ctx->request_id, ctx->retry_config.max_retries + 1, ctx->fallback_attempts);
@@ -789,6 +881,16 @@ future<bool> HttpController::send_backend_request(ProxyContext* ctx, ConnectionB
         "Content-Type: application/json\r\n"
         "Content-Length: " + to_sstring(ctx->forwarded_body.size()) + "\r\n"
         "X-Request-ID: " + safe_request_id + "\r\n";
+
+    // Forward the configured API key as `Authorization: Bearer <key>` when
+    // the chosen backend has one. Sanitized to strip CR/LF so a malformed
+    // env-var value can't inject additional headers. The key itself is never
+    // logged — only its presence/absence is observable via metrics.
+    auto api_key = _router.get_backend_api_key(ctx->current_backend);
+    if (!api_key.empty()) {
+        http_headers += "Authorization: Bearer "
+                      + sstring(sanitize_header_value(api_key)) + "\r\n";
+    }
 
     // Add traceparent header if tracing is enabled (sanitize to prevent injection)
     if (!ctx->backend_traceparent.empty()) {
@@ -869,7 +971,8 @@ future<> HttpController::stream_backend_response(
         temporary_buffer<char> chunk;
 
         try {
-            auto read_future = with_timeout(read_deadline, bundle->in.read());
+            auto read_future = with_request_timeout(
+                read_deadline, bundle->in.read(), "stream_chunk");
             chunk = co_await std::move(read_future).handle_exception([&](auto ep) {
                 // Check for connection errors first
                 auto err_type = classify_connection_error(ep);
@@ -948,6 +1051,15 @@ future<> HttpController::stream_backend_response(
             bundle->is_valid = false;
         }
 
+        // Capture the backend's real status code the first time the status
+        // line is parsed (non-zero means headers were seen this push). Used
+        // for per-API-key attribution — see the LogRequestOp enqueue in
+        // handle_proxy. Captured for ALL responses, not just 200, so backend
+        // errors (429/500/etc.) are recorded accurately.
+        if (res.backend_status_code != 0 && ctx->backend_status_code == 0) {
+            ctx->backend_status_code = res.backend_status_code;
+        }
+
         // Snooping Logic - record success and learn route
         if (res.header_snoop_success) {
             // Backend responded successfully - record for circuit breaker
@@ -972,7 +1084,8 @@ future<> HttpController::stream_backend_response(
             // the ART converges on the consistent-hash assignment rather than
             // transient load/cost diversions; 0 means skip learning entirely.
             if (ctx->learn_target_backend != 0 &&
-                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length) {
+                _config.should_learn_routes() && ctx->tokens.size() >= _config.min_token_length &&
+                _router.should_cache_routes_for(ctx->learn_target_backend)) {
                 BackendId learn_backend = ctx->learn_target_backend;
                 // Route learning is best-effort; don't fail the request if it fails
                 if (!ctx->prefix_boundaries.empty() && _config.enable_multi_depth_routing) {
@@ -988,8 +1101,15 @@ future<> HttpController::stream_backend_response(
                 } else {
                     // Single-depth routing: use prefix_boundary or default
                     // Skip persistence if route was deduplicated (§21.7)
+                    //
+                    // Lifetime: this `.then()` captures `this` to reach `_persistence`,
+                    // but the future is fire-and-forget — the surrounding coroutine's
+                    // gate::holder is released before the chain resolves. Capture an
+                    // extra gate::holder so `_request_gate.close()` blocks on this tail
+                    // and `this` stays valid. See shutdown contract on HttpController.
                     (void)_router.learn_route_global(ctx->tokens, learn_backend, ctx->request_id, ctx->prefix_boundary)
-                        .then([this, tokens = ctx->tokens, backend = learn_backend](bool is_new_route) {
+                        .then([this, tokens = ctx->tokens, backend = learn_backend,
+                               holder = _request_gate.hold()](bool is_new_route) {
                             if (is_new_route && _persistence) {
                                 _persistence->queue_save_route(tokens, backend);
                             }
@@ -1056,6 +1176,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     if (request_id.empty()) {
         request_id = generate_request_id();
     }
+
+    // Per-API-key attribution: resolve once at entry, before any routing
+    // decisions. Parse-only (Option A) — does NOT reject unauthenticated
+    // requests on the data plane. See
+    // docs/architecture/per-api-key-attribution.md §5.
+    ApiKeyAttribution api_key_attr = resolve_api_key(*req);
 
     // Extract W3C Trace Context for distributed tracing
     std::string traceparent_header = extract_traceparent(req->_headers);
@@ -1134,6 +1260,9 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Track request start time for latency metrics (ingress timestamp)
     auto request_start = std::chrono::steady_clock::now();
     metrics().record_request();
+    // Per-API-key attribution: bump the labelled requests_total at ingress.
+    // Memo §6.1 — this is the ranvier_http_requests_total{api_key=...} signal.
+    metrics().record_api_key_request_received(api_key_attr.label);
 
     // Track shard load metrics for P2C load balancing
     // Use a flag to track if we need to decrement on exit (for streaming lambda handoff)
@@ -1153,12 +1282,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
     // Request body size limit check — before any body processing to prevent memory exhaustion (§4.4)
     if (_config.max_request_body_bytes > 0) {
-        size_t body_size = get_request_body_size(*req);
+        size_t body_size = get_request_body_size(*req, _config.max_request_body_bytes);
         if (body_size > _config.max_request_body_bytes) {
             ++_requests_rejected_body_size;
             metrics().record_body_size_rejection();
             log_proxy.warn("[{}] Request rejected - body size {} exceeds limit {}",
                            request_id, body_size, _config.max_request_body_bytes);
+            // 413 Payload Too Large. Kept as a numeric cast rather than a
+            // named enum value: the Seastar enumerator was renamed across
+            // versions (request_entity_too_large -> payload_too_large), so the
+            // numeric form is the version-portable choice here.
             rep->set_status(static_cast<seastar::http::reply::status_type>(413));
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"Request body too large\", \"max_bytes\": " +
@@ -1315,7 +1448,16 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     //   2. Thread pool (if enabled): offloads FFI to worker thread
                     //   3. Cross-shard dispatch: P2C to least-loaded shard
                     //   4. Local fallback: blocks reactor (last resort)
-                    auto tok_result = co_await _tokenizer.local().encode_threaded_async(text_to_tokenize);
+                    //
+                    // Path 4 runs the Rust BPE call on the reactor; without a
+                    // hard ceiling a wedged tokenizer would block the entire
+                    // shard. Wrap with a deadline so the worst case is a
+                    // request-scoped timeout, not a permanent shard stall.
+                    constexpr auto kTokenizeTimeout = std::chrono::seconds(5);
+                    auto tok_result = co_await with_request_timeout(
+                        kTokenizeTimeout,
+                        _tokenizer.local().encode_threaded_async(text_to_tokenize),
+                        "tokenize");
                     tokens = std::move(tok_result.tokens);
 
                     // Set tracing attributes based on tokenization source
@@ -1339,6 +1481,15 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                             metrics().record_tokenization_cross_shard();
                         }
                     }
+                } catch (const request_timeout_error& e) {
+                    // Tokenizer exceeded its deadline (likely wedged FFI or
+                    // saturated thread pool) - fall back to round-robin so the
+                    // request can still make progress.
+                    log_proxy.warn("[{}] Tokenization timed out ({}), falling back to round-robin routing",
+                                   request_id, e.label());
+                    tokenize_span.set_error(std::string("tokenization_timeout: ") + e.label());
+                    metrics().record_tokenizer_error();
+                    tokens.clear();
                 } catch (const std::exception& e) {
                     // Tokenizer failed - log and continue without tokens (fall back to round-robin)
                     log_proxy.warn("[{}] Tokenization failed, falling back to round-robin routing: {}",
@@ -1927,6 +2078,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->estimated_cost_units = cost.cost_units;
     ctx->priority = priority;
     ctx->intent = intent;
+    ctx->api_key_id = std::move(api_key_attr.id);
+    ctx->api_key_label = std::move(api_key_attr.label);
 
     // Detect whether client expects streaming (SSE) or non-streaming (JSON) response.
     // OpenAI-compatible APIs use "stream":true/false in the request body.
@@ -1983,7 +2136,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // BackendRequestGuard destructor decrements active_requests; CostBudgetGuard destructor releases cost budget.
     // Use SSE content type for streaming requests, JSON for non-streaming (e.g. Ollama non-stream)
     auto response_content_type = ctx->client_expects_streaming ? "text/event-stream" : "json";
-    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(*slot.units), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
+    rep->write_body(response_content_type, [this, ctx = std::move(ctx), gate_holder = std::move(gate_holder), semaphore_units = std::move(slot.units.value()), backend_guard = std::move(backend_guard), cost_guard = std::move(cost_guard)](output_stream<char> client_out) mutable -> future<> {
 
         // Phase 1: Establish backend connection with retry and fallback
         ConnectionBundle bundle = co_await establish_backend_connection(ctx.get());
@@ -2117,6 +2270,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     ctx->timed_out = false;
                     ctx->stream_closed = false;
                     ctx->chunks_received = 0;
+                    ctx->backend_status_code = 0;  // re-parsed from the retry response
                     ctx->connect_start = std::chrono::steady_clock::now();
 
                     // Re-send the HTTP request on fresh connection
@@ -2163,27 +2317,80 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // Phase 4: Handle completion status and send appropriate client response
         if (ctx->client_disconnected) {
             log_proxy.info("[{}] Client disconnected mid-stream", ctx->request_id);
+            // Client-disconnect is not a success or a timeout; attribute as a
+            // failure for the per-key counter so it shows up in usage reports.
+            metrics().record_api_key_failure(ctx->api_key_label);
         } else if (ctx->timed_out) {
             log_proxy.warn("[{}] Request timed out", ctx->request_id);
             _circuit_breaker.record_failure(ctx->current_backend);
             metrics().record_timeout();
+            metrics().record_api_key_timeout(ctx->api_key_label);
             co_await write_client_error(&client_out, "Request timed out", ctx->client_expects_streaming);
         } else if (ctx->connection_error) {
             log_proxy.warn("[{}] Backend connection error occurred", ctx->request_id);
             metrics().record_connection_error();
+            metrics().record_api_key_failure(ctx->api_key_label);
             co_await write_client_error(&client_out, "Backend connection lost", ctx->client_expects_streaming);
         } else if (ctx->connection_failed) {
             log_proxy.warn("[{}] Backend connection failed during stale retry", ctx->request_id);
             metrics().record_failure();
+            metrics().record_api_key_failure(ctx->api_key_label);
             co_await write_client_error(&client_out, "Backend connection failed", ctx->client_expects_streaming);
         } else {
             log_proxy.info("[{}] Request completed successfully", ctx->request_id);
             metrics().record_success();
+            metrics().record_api_key_success(ctx->api_key_label);
         }
 
         // Phase 5: Record metrics and cleanup
         auto backend_end = std::chrono::steady_clock::now();
         record_proxy_completion_metrics(*ctx, backend_end);
+
+        // Per-API-key attribution: enqueue one request_attribution row from
+        // the terminal phase. Single enqueue per request, regardless of which
+        // outcome branch above fired. Memo §7.4. Silently dropped when
+        // _persistence is null or attribution_persistence_enabled is false.
+        if (_persistence != nullptr) {
+            LogRequestOp op;
+            op.request_id   = ctx->request_id;
+            op.api_key_id   = ctx->api_key_id;
+            op.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            op.endpoint     = ctx->endpoint;
+            // Backend may not have been chosen on early failures.
+            if (ctx->current_backend != 0) {
+                op.backend_id = ctx->current_backend;
+            }
+            // Status code: prefer the backend's real HTTP status (parsed from
+            // the upstream status line) so backend errors (429/500/etc.) are
+            // recorded accurately. Proxy-level failures that happen before any
+            // backend response (timeout, connection failure, mid-stream client
+            // disconnect) never see a backend status, so fall back to a
+            // synthesized proxy-outcome code. Client disconnect is checked
+            // first because it can occur after a successful backend response
+            // began streaming, and operators want to distinguish it.
+            if (ctx->client_disconnected) {
+                op.status_code = 499;  // Nginx convention
+            } else if (ctx->timed_out) {
+                op.status_code = 504;
+            } else if (ctx->connection_error || ctx->connection_failed) {
+                op.status_code = 502;
+            } else if (ctx->backend_status_code != 0) {
+                op.status_code = ctx->backend_status_code;
+            } else {
+                // No backend status and no proxy-level failure flag — e.g. an
+                // empty response that didn't trip stale-retry. Default to 200
+                // (consistent with the success branch in phase 4).
+                op.status_code = 200;
+            }
+            op.latency_ms = static_cast<int32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    backend_end - ctx->request_start).count());
+            op.input_tokens  = static_cast<int64_t>(ctx->estimated_input_tokens);
+            op.output_tokens = static_cast<int64_t>(ctx->estimated_output_tokens);
+            op.cost_units    = ctx->estimated_cost_units;
+            _persistence->queue_log_request(std::move(op));
+        }
 
         // Cost budget release is handled by CostBudgetGuard destructor (RAII).
 
@@ -2309,7 +2516,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_r
 }
 
 future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_backend(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) {
-    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true
+    // Usage: POST /admin/backends?id=1&ip=192.168.4.51&port=11434&weight=100&priority=0&supports_token_ids=true&type=vllm
     // Also supports hostnames: POST /admin/backends?id=1&ip=host.docker.internal&port=11434
     sstring id_str = req->get_query_param("id");
     sstring ip_str = req->get_query_param("ip");
@@ -2318,6 +2525,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     sstring priority_str = req->get_query_param("priority");
     sstring supports_token_ids_str = req->get_query_param("supports_token_ids");
     sstring compression_ratio_str = req->get_query_param("compression_ratio");
+    sstring type_str = req->get_query_param("type");
 
     // Check for required parameters
     if (id_str.empty() || port_str.empty() || ip_str.empty()) {
@@ -2397,6 +2605,21 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         compression_ratio = *cr_opt;
     }
 
+    // type: backend engine class (vllm, sglang, trt_llm, ollama, lm_studio,
+    // cerebras, openai_compatible). Default vllm for backward compatibility.
+    // Invalid values are rejected (400), mirroring the supports_token_ids path.
+    BackendType backend_type = BackendType::VLLM;
+    if (!type_str.empty()) {
+        auto type_opt = parse_backend_type(std::string_view(type_str));
+        if (!type_opt) {
+            log_control.warn("POST /admin/backends: invalid type '{}'", type_str);
+            rep->set_status(seastar::http::reply::status_type::bad_request);
+            rep->write_body("json", "{\"error\": \"Invalid type: must be one of vllm, sglang, trt_llm, ollama, lm_studio, cerebras, openai_compatible\"}");
+            co_return std::move(rep);
+        }
+        backend_type = *type_opt;
+    }
+
     // Resolve address: supports both direct IP addresses and hostnames
     socket_address addr;
     std::string resolved_ip;
@@ -2463,10 +2686,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
     // Queue backend for async persistence (fire-and-forget, non-blocking)
     // Store the resolved IP, not the hostname, for persistence
     if (_persistence) {
-        _persistence->queue_save_backend(id, resolved_ip, port, weight, priority);
+        _persistence->queue_save_backend(id, resolved_ip, port, weight, priority,
+            std::string(backend_type_to_string(backend_type)));
     }
 
-    co_await _router.register_backend_global(id, addr, weight, priority, supports_token_ids, compression_ratio);
+    co_await _router.register_backend_global(id, addr, weight, priority,
+        supports_token_ids, compression_ratio, backend_type);
 
     // Notify HealthService of compression ratio for compression-aware load scoring.
     // HealthService state lives on shard 0 — must submit_to(0) to avoid cross-shard
@@ -2477,12 +2702,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_broadcast_b
         });
     }
 
-    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={})",
-        id, ip_str, port, weight, priority, supports_token_ids, compression_ratio);
+    log_control.info("Registered Backend {} -> {}:{} (weight={}, priority={}, supports_token_ids={}, compression_ratio={}, type={})",
+        id, ip_str, port, weight, priority, supports_token_ids, compression_ratio,
+        backend_type_to_string(backend_type));
     rep->write_body("json", "{\"status\": \"ok\", \"weight\": " + std::to_string(weight) +
         ", \"priority\": " + std::to_string(priority) +
         ", \"supports_token_ids\": " + (supports_token_ids ? "true" : "false") +
-        ", \"compression_ratio\": " + std::to_string(compression_ratio) + "}");
+        ", \"compression_ratio\": " + std::to_string(compression_ratio) +
+        ", \"type\": \"" + std::string(backend_type_to_string(backend_type)) + "\"}");
     co_return std::move(rep);
 }
 
@@ -2731,7 +2958,8 @@ bool HttpController::is_persistence_backpressured() const {
     return fill_ratio >= _config.backpressure.persistence_queue_threshold;
 }
 
-size_t HttpController::get_request_body_size(const seastar::http::request& req) {
+size_t HttpController::get_request_body_size(const seastar::http::request& req,
+                                             size_t max_request_body_bytes) {
     auto content_length_it = req._headers.find("Content-Length");
     if (content_length_it != req._headers.end()) {
         // Content-Length header present — parse with from_chars (Rule #10)
@@ -2739,6 +2967,13 @@ size_t HttpController::get_request_body_size(const seastar::http::request& req) 
         uint64_t cl_value = 0;
         auto [ptr, ec] = std::from_chars(cl_str.data(), cl_str.data() + cl_str.size(), cl_value);
         if (ec == std::errc{} && ptr == cl_str.data() + cl_str.size()) {
+            // Validate against limits BEFORE the size_t cast so a Content-Length
+            // larger than size_t (32-bit hosts) cannot silently truncate past the
+            // body-size check (audit H2). On 64-bit hosts the size_t guard is a no-op.
+            if (cl_value > std::numeric_limits<size_t>::max() ||
+                (max_request_body_bytes > 0 && cl_value > max_request_body_bytes)) {
+                return std::numeric_limits<size_t>::max();
+            }
             return static_cast<size_t>(cl_value);
         }
     }
@@ -2825,7 +3060,7 @@ static std::string dump_node_to_json(const RadixTree::DumpNode& node, int indent
         for (size_t i = 0; i < node.children.size(); ++i) {
             if (i > 0) ss << ",\n";
             ss << inner_indent << "  {\"edge\": " << static_cast<unsigned>(node.children[i].first) << ", \"node\": ";
-            ss << dump_node_to_json(node.children[i].second, indent_level + 2, remaining_depth - 1);
+            ss << dump_node_to_json(*node.children[i].second, indent_level + 2, remaining_depth - 1);
             ss << "}";
         }
         ss << "\n" << inner_indent;
@@ -2998,7 +3233,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_dump_backen
         oss << "      \"is_draining\": " << (b.is_draining ? "true" : "false") << ",\n";
         oss << "      \"is_dead\": " << (b.is_dead ? "true" : "false") << ",\n";
         oss << "      \"supports_token_ids\": " << (b.supports_token_ids ? "true" : "false") << ",\n";
-        oss << "      \"compression_ratio\": " << b.compression_ratio;
+        oss << "      \"compression_ratio\": " << b.compression_ratio << ",\n";
+        oss << "      \"type\": \"" << backend_type_to_string(b.type) << "\"";
         if (b.drain_start_ms > 0) {
             oss << ",\n      \"drain_start_ms\": " << b.drain_start_ms << "\n";
         } else {
@@ -3401,14 +3637,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
@@ -3449,26 +3685,26 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_pause_agent
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
 
     if (!info->allow_pause) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_pause_not_allowed"})");
         co_return std::move(rep);
     }
 
     if (info->paused) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_already_paused"})");
         co_return std::move(rep);
     }
@@ -3490,20 +3726,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
 
     if (!info->paused) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_not_paused"})");
         co_return std::move(rep);
     }
@@ -3562,6 +3798,111 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_scheduler_s
 }
 
 // ============================================================================
+// Per-API-Key Usage Endpoint (GET /admin/keys/usage)
+// ============================================================================
+//
+// Returns per-API-key historical aggregates over a query window. Reads from
+// the request_attribution SQLite table via the persistence worker. The window
+// is bounded by AttributionConfig::admin_query_max_window_hours and the
+// row count by ::admin_query_max_rows.
+//
+// Memo §8. Hard Rule #16 (lambda coroutine): the handler is a coroutine
+// top-to-bottom; the SQLite read runs in seastar::async on the persistence
+// worker thread, returning to the caller's shard via the future plumbing.
+//
+future<std::unique_ptr<seastar::http::reply>> HttpController::handle_keys_usage(
+    std::unique_ptr<seastar::http::request> req,
+    std::unique_ptr<seastar::http::reply> rep) {
+
+    // Parse query parameters. All parsing happens up front so we never hit a
+    // partial-parse / partial-IO state.
+    auto parse_int64 = [](std::string_view s) -> std::optional<int64_t> {
+        if (s.empty()) return std::nullopt;
+        int64_t v = 0;
+        auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+        if (ec != std::errc{} || ptr != s.data() + s.size()) return std::nullopt;
+        return v;
+    };
+
+    sstring from_str  = req->get_query_param("from");
+    sstring to_str    = req->get_query_param("to");
+    sstring key_str   = req->get_query_param("key");
+    sstring limit_str = req->get_query_param("limit");
+
+    auto from_opt = parse_int64(std::string_view(from_str.c_str(), from_str.size()));
+    auto to_opt   = parse_int64(std::string_view(to_str.c_str(),   to_str.size()));
+    if (!from_opt || !to_opt) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json",
+            "{\"error\": \"required query params: from, to (unix milliseconds)\"}");
+        co_return std::move(rep);
+    }
+    int64_t from_ms = *from_opt;
+    int64_t to_ms   = *to_opt;
+    if (to_ms <= from_ms) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json", "{\"error\": \"to must be greater than from\"}");
+        co_return std::move(rep);
+    }
+
+    const auto& acfg = _config.attribution;
+    const int64_t max_window_ms =
+        static_cast<int64_t>(acfg.admin_query_max_window_hours) * 3600LL * 1000LL;
+    if (to_ms - from_ms > max_window_ms) {
+        rep->set_status(seastar::http::reply::status_type::bad_request);
+        rep->write_body("json",
+            "{\"error\": \"query window exceeds admin_query_max_window_hours="
+            + std::to_string(acfg.admin_query_max_window_hours) + "\"}");
+        co_return std::move(rep);
+    }
+
+    size_t row_limit = acfg.admin_query_max_rows;
+    if (!limit_str.empty()) {
+        if (auto v = parse_int64(std::string_view(limit_str.c_str(), limit_str.size())); v) {
+            if (*v > 0) {
+                row_limit = std::min<size_t>(static_cast<size_t>(*v), acfg.admin_query_max_rows);
+            }
+        }
+    }
+
+    if (_persistence == nullptr) {
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->write_body("json", "{\"error\": \"persistence not enabled\"}");
+        co_return std::move(rep);
+    }
+
+    bool truncated = false;
+    auto rows = co_await _persistence->query_attribution_summary(
+        from_ms, to_ms,
+        std::string(key_str.c_str(), key_str.size()),
+        row_limit, &truncated);
+
+    // Build the JSON response. Stream directly to ostringstream.
+    std::ostringstream oss;
+    oss << "{\"window\": {\"from_ms\": " << from_ms
+        << ", \"to_ms\": " << to_ms << "}, \"rows\": [";
+    bool first = true;
+    for (const auto& r : rows) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << "{\"api_key_id\": \"" << escape_json_string(r.api_key_id) << "\""
+            << ", \"request_count\":  " << r.request_count
+            << ", \"success_count\":  " << r.success_count
+            << ", \"error_count\":    " << r.error_count
+            << ", \"latency_ms_p50\": " << r.latency_ms_p50
+            << ", \"latency_ms_p95\": " << r.latency_ms_p95
+            << ", \"latency_ms_p99\": " << r.latency_ms_p99
+            << ", \"input_tokens_sum\":  " << r.input_tokens_sum
+            << ", \"output_tokens_sum\": " << r.output_tokens_sum
+            << ", \"cost_units_sum\":    " << r.cost_units_sum
+            << "}";
+    }
+    oss << "], \"truncated\": " << (truncated ? "true" : "false") << "}";
+    rep->write_body("json", oss.str());
+    co_return std::move(rep);
+}
+
+// ============================================================================
 // Cache Event Handler (Push-Based Cache Eviction Notifications)
 // ============================================================================
 //
@@ -3592,7 +3933,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         if (!authorized) {
             metrics().record_cache_event_auth_failure();
             RouterService::record_cache_event_auth_failure();
-            rep->set_status(seastar::http::reply::status_type{401});
+            rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->write_body("json", sstring("{\"error\": \"Unauthorized\"}"));
             co_return std::move(rep);
         }
@@ -3619,7 +3960,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         if (!parsed.error.empty()) {
             log_proxy.warn("Cache event parse error: {}", parsed.error);
         }
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", sstring("{\"error\": \"" + parsed.error + "\"}"));
         co_return std::move(rep);
     }

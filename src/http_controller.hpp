@@ -123,6 +123,12 @@ struct ProxyContext {
     RetrySettings retry_config;
     bool fallback_enabled;
 
+    // Backend HTTP status code parsed from the upstream response status line
+    // (e.g. 200, 429, 500). 0 until the backend's headers are seen — remains
+    // 0 if the request fails before any response (timeout, connection failure).
+    // Used for per-API-key attribution (request_attribution.status_code).
+    int backend_status_code = 0;
+
     // State flags
     bool shard_metrics_active = false;
     bool timed_out = false;
@@ -159,6 +165,15 @@ struct ProxyContext {
     // CHAT → use normal prefix/cost routing
     // Actual intent-based route selection is not yet implemented.
     RequestIntent intent = RequestIntent::CHAT;
+
+    // Per-API-key attribution (populated by resolve_api_key() on entry to
+    // handle_proxy(), before any routing decisions). Empty api_key_id means the
+    // request arrived without authentication on the data plane — see
+    // docs/architecture/per-api-key-attribution.md §5 (Option A).
+    std::string api_key_id;       // ApiKey::name, or "" if unauthenticated/invalid
+    std::string api_key_label;    // sanitised label for metrics; one of:
+                                  //   sanitise(api_key_id) | "_unauthenticated"
+                                  //   | "_invalid" | "_overflow"
 
     // Agent identification for fair scheduling (User-Agent header value)
     std::string user_agent;
@@ -252,6 +267,10 @@ struct HttpControllerConfig {
     // Cache events configuration (push-based cache eviction notifications)
     CacheEventsConfig cache_events;
 
+    // Per-API-key attribution configuration (memo §6, §7, §8). Copied from
+    // AttributionConfig at init.
+    AttributionConfig attribution;
+
     // Prefix token length for X-Ranvier-Prefix-Hash header injection
     size_t prefix_token_length = 128;
 
@@ -272,6 +291,32 @@ struct HttpControllerConfig {
     bool should_learn_routes() const { return routing_mode == RoutingConfig::RoutingMode::PREFIX; }
 };
 
+// ============================================================================
+// SHUTDOWN CONTRACT (cross-cutting; see audits/request-lifecycle-crash-audit.md
+// "Lifetime contract for shutdown")
+// ----------------------------------------------------------------------------
+// Three invariants MUST hold for clean shutdown. They are enforced by
+// Application::stop() and by gate-holder discipline at request callsites:
+//
+//   (a) `_request_gate` is awaited (closed) before ~HttpController. Application
+//       calls _controller.stop(), which co_awaits _request_gate.close()
+//       (http_controller.cpp HttpController::stop), so all in-flight request
+//       coroutines complete before the controller is destroyed.
+//
+//   (b) TokenizerThreadPool workers are joined (stop_worker()) before the
+//       seastar::alien::instance owned by app_template goes away. Worker
+//       threads capture the alien by reference and call alien::run_on() on
+//       completion; see TokenizerThreadPool's class comment.
+//
+//   (c) Every fire-and-forget future spawned during a request MUST be
+//       tracked by `_request_gate`. The standard pattern is to capture
+//       `_request_gate.hold()` into the lambda (or .finally) so that
+//       _request_gate.close() blocks on the tail. Raw `[this]` capture in a
+//       discarded `.then()` is a use-after-free hazard — the surrounding
+//       coroutine's holder is released before the chain resolves. See the
+//       single-depth route-learning chain in stream_backend_response for an
+//       example.
+// ============================================================================
 class HttpController {
 public:
     // Takes sharded<TokenizerService> to access the local shard's tokenizer (thread-safe)
@@ -439,7 +484,11 @@ private:
 
     // Extract request body size from Content-Length header or actual content.
     // Returns 0 if Content-Length is missing/unparseable and content is empty.
-    static size_t get_request_body_size(const seastar::http::request& req);
+    // max_request_body_bytes is the configured limit (0 = unlimited); a parsed
+    // Content-Length above the limit or above SIZE_MAX returns SIZE_MAX so the
+    // caller's body-size check fires (audit H2).
+    static size_t get_request_body_size(const seastar::http::request& req,
+                                        size_t max_request_body_bytes);
 
     // Select target shard for request processing using P2C algorithm
     // Returns local shard if load balancing disabled or not beneficial
@@ -458,6 +507,14 @@ private:
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_delete_routes(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_clear_all(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_reload(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
+
+    // GET /admin/keys/usage — per-API-key historical usage (memo §8).
+    // Reads from the request_attribution SQLite table via the persistence
+    // worker. Bounded by AttributionConfig::admin_query_max_window_hours and
+    // ::admin_query_max_rows.
+    seastar::future<std::unique_ptr<seastar::http::reply>> handle_keys_usage(
+        std::unique_ptr<seastar::http::request> req,
+        std::unique_ptr<seastar::http::reply> rep);
 
     // State inspection handlers (for rvctl CLI)
     seastar::future<std::unique_ptr<seastar::http::reply>> handle_dump_tree(std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep);
@@ -520,6 +577,21 @@ private:
 
     // Auth helper with detailed info - returns pair<authorized, error_or_key_name>
     std::pair<bool, std::string> check_admin_auth_with_info(const seastar::http::request& req) const;
+
+    // Per-API-key attribution: parse the Authorization header and return
+    // (api_key_id, api_key_label). Does NOT enforce auth on the data plane —
+    // requests without a valid key still proceed; their label is one of the
+    // sentinels ("_unauthenticated", "_invalid"). See
+    // docs/architecture/per-api-key-attribution.md §5 (Option A).
+    struct ApiKeyAttribution {
+        std::string id;
+        std::string label;
+    };
+    ApiKeyAttribution resolve_api_key(const seastar::http::request& req) const;
+
+    // Sanitise an api_key_id into a Prometheus-safe label value.
+    // Lowercase, [^a-z0-9_] → '_', truncated to 64 chars, "_unnamed" if empty.
+    static std::string sanitise_api_key_label(std::string_view name);
 
     // Get client IP from request (checks X-Forwarded-For header)
     static std::string get_client_ip(const seastar::http::request& req);

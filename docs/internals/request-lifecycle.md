@@ -65,15 +65,15 @@ Every data-plane request passes through a rate-limit wrapper before reaching
 503 with `Retry-After: 1` on rejection.
 
 **`HttpController::handle_proxy()`** is the main coroutine. It runs the
-following admission checks in order, each returning 503 on failure:
+following admission checks in order:
 
-| Check | Mechanism | Rejection reason |
-|-------|-----------|------------------|
-| Draining | `_draining` bool | Server shutting down |
-| Gate | `_request_gate.hold()` | Gate closed during shutdown |
-| Concurrency | `try_get_units(_request_semaphore, 1)` | Too many concurrent requests |
-| Persistence | `is_persistence_backpressured()` | SQLite write queue > 80% full |
-| Tokenizer | `_tokenizer.local().is_loaded()` | Tokenizer not initialized |
+| Check | Mechanism | Rejection reason | Status |
+|-------|-----------|------------------|--------|
+| Draining | `_draining` bool | Server shutting down | 503 |
+| Gate | `_request_gate.hold()` | Gate closed during shutdown | 503 |
+| Concurrency | `try_get_units(_request_semaphore, 1)` | Too many concurrent requests | 503 |
+| Persistence | `is_persistence_backpressured()` | SQLite write queue > 80% full | 503 |
+| Tokenizer | `_tokenizer.local().is_loaded()` | Tokenizer not initialized | 200 (error body) |
 
 All guards (gate holder, semaphore units, `ActiveRequestGuard`) are RAII and
 release automatically on any exit path.
@@ -335,7 +335,7 @@ After streaming completes:
 1. **Metrics** — `record_proxy_completion_metrics()` records backend total
    latency and end-to-end request latency in histograms.
 2. **Connection** — if `bundle.is_valid`, return to pool via
-   `ConnectionPool::release()`. Otherwise close.
+   `ConnectionPool::put()`. Otherwise close.
 3. **RAII destructors** release (in reverse capture order):
    - `BackendRequestGuard` — decrements per-backend active request counter
    - Semaphore units — frees concurrency slot

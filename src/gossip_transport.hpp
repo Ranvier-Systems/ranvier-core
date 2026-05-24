@@ -26,6 +26,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/socket_defs.hh>
@@ -118,6 +119,7 @@ public:
     uint64_t crypto_batch_broadcasts() const { return _crypto_batch_broadcasts; }
     uint64_t crypto_stalls_avoided() const { return _crypto_stalls_avoided; }
     uint64_t crypto_handshakes_offloaded() const { return _crypto_handshakes_offloaded; }
+    uint64_t crypto_broadcasts_waited() const { return _crypto_broadcasts_waited; }
 
     // Register metrics with Seastar metrics system
     void register_metrics(seastar::metrics::metric_groups& metrics);
@@ -158,11 +160,31 @@ private:
     uint64_t _crypto_batch_broadcasts = 0;
     uint64_t _crypto_stalls_avoided = 0;
     uint64_t _crypto_handshakes_offloaded = 0;
+    uint64_t _crypto_broadcasts_waited = 0;
 
     // Thresholds
     static constexpr size_t CRYPTO_OFFLOAD_PEER_THRESHOLD = 10;
     static constexpr size_t CRYPTO_OFFLOAD_BYTES_THRESHOLD = 1024;
     static constexpr uint64_t CRYPTO_STALL_WARNING_US = 100;
+
+    // Maximum concurrent in-flight large-fanout DTLS broadcast batches.
+    // Each in-flight batch wraps its encrypt+send loop in seastar::async,
+    // which allocates a seastar::thread with a 128 kB virtual stack.
+    // Per-request callers (broadcast_cache_eviction via http_controller,
+    // broadcast_route via the route-announcement path) can otherwise
+    // stack arbitrarily many of these under sustained gossip load.
+    // Cap of 4 = max ~512 kB virtual stack reservation at peak, large
+    // enough to absorb normal eviction-burst behaviour, small enough to
+    // bound the worst case. Excess concurrent broadcasts wait via the
+    // semaphore — broadcasts are background work (eviction propagation,
+    // route announcement), not on the request critical path, so bounded
+    // await latency is acceptable.
+    static constexpr size_t BROADCAST_CONCURRENCY_CAP = 4;
+
+    // Bounds in-flight large-fanout DTLS broadcast batches. Acquired via
+    // seastar::get_units in broadcast() before the seastar::async branch;
+    // RAII released when the units leave scope after co_await.
+    seastar::semaphore _broadcast_sem{BROADCAST_CONCURRENCY_CAP};
 
     // DTLS record layer constants (RFC 6347)
     static constexpr uint8_t DTLS_CONTENT_CHANGE_CIPHER_SPEC = 20;

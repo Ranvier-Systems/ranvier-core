@@ -33,7 +33,8 @@ public:
         register_backend_global(BackendId id, seastar::socket_address addr,
                                 uint32_t weight = 100, uint32_t priority = 0,
                                 bool supports_token_ids = true,
-                                double compression_ratio = 1.0) = 0;
+                                double compression_ratio = 1.0,
+                                BackendType type = BackendType::VLLM) = 0;
 
     virtual seastar::future<>
         unregister_backend_global(BackendId id) = 0;
@@ -45,6 +46,14 @@ public:
     // Not pure-virtual — default implementation returns 0.0 so existing
     // implementations don't break.
     virtual double get_backend_load_score(BackendId /*id*/) const { return 0.0; }
+
+    // Engine class for the given backend. Used by HealthService to skip the
+    // vLLM-shaped /metrics scrape on non-vLLM backends (proactive suppression).
+    // Default returns BackendType::VLLM — matches the historical assumption
+    // baked into the learning/scrape paths and keeps test mocks compiling.
+    virtual BackendType backend_type(BackendId /*id*/) const {
+        return BackendType::VLLM;
+    }
 };
 
 }  // namespace ranvier
