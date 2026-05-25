@@ -431,6 +431,9 @@ class ClusterIntegrationTest(ClusterTestCase):
         """
         print("\nTest: CACHE_STATE gossip + rolling-upgrade safety")
 
+        if not self._mock_backend_has_metrics():
+            self.skipTest(self._STALE_MOCK_MSG)
+
         # Poll for CACHE_STATE traffic. The mock backends now expose
         # vLLM-style /metrics, so the node(s) that scrape them (node1 holds the
         # registered backends) emit CACHE_STATE and peers receive it. Substring
@@ -478,6 +481,31 @@ class ClusterIntegrationTest(ClusterTestCase):
 
         print("  PASSED: CACHE_STATE propagates; peers healthy; no unknown types")
 
+    _STALE_MOCK_MSG = (
+        "mock backend image predates the /metrics + /admin/cache-usage endpoints. "
+        "The harness reuses a cached image, so force a rebuild first:\n"
+        "  docker compose -f docker-compose.test.yml build backend1 backend2\n"
+        "then re-run this test."
+    )
+
+    def _mock_backend_has_metrics(self):
+        """True if the running mock image serves the vLLM /metrics endpoint.
+
+        Guards against a stale ``ranvier-mock-backend`` image: the harness skips
+        the build whenever an image already exists, so a mock predating the
+        ``/metrics`` + ``/admin/cache-usage`` endpoints would otherwise surface
+        as a cryptic 'no CACHE_STATE emitted' / 404 failure.
+        """
+        for host_port in MOCK_BACKEND_PORTS.values():
+            try:
+                resp = requests.get(
+                    f"http://{DOCKER_HOST}:{host_port}/metrics", timeout=5)
+                if resp.status_code == 200 and "vllm:gpu_cache_usage_perc" in resp.text:
+                    return True
+            except requests.exceptions.RequestException:
+                pass
+        return False
+
     def _set_backend_cache_usage(self, perc):
         """Set reported KV-cache usage on every mock backend (direct admin POST)."""
         ok = True
@@ -503,6 +531,9 @@ class ClusterIntegrationTest(ClusterTestCase):
         and diverts — incrementing router_residency_route_downgrades_total.
         """
         print("\nTest: residency-driven route downgrade (end-to-end)")
+
+        if not self._mock_backend_has_metrics():
+            self.skipTest(self._STALE_MOCK_MSG)
 
         node1 = NODES["node1"]
         baseline = sum_metric_by_substring(
