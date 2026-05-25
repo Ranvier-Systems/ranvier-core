@@ -187,6 +187,10 @@ void RanvierConfig::apply_env_overrides() {
     if (auto v = get_env_as<double>("RANVIER_CAPACITY_HEADROOM_WEIGHT")) {
         routing.capacity_headroom_weight = *v;
     }
+    // Cache-residency-aware routing
+    if (auto v = get_env_as<double>("RANVIER_CACHE_RESIDENCY_THRESHOLD")) {
+        routing.cache_residency_threshold = *v;
+    }
     // Compression-aware route TTL
     if (auto v = get_env_as<double>("RANVIER_MAX_TTL_MULTIPLIER")) {
         routing.max_ttl_multiplier = *v;
@@ -1021,6 +1025,10 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
             if (r["capacity_headroom_weight"]) {
                 config.routing.capacity_headroom_weight = r["capacity_headroom_weight"].as<double>();
             }
+            // Cache-residency-aware routing
+            if (r["cache_residency_threshold"]) {
+                config.routing.cache_residency_threshold = r["cache_residency_threshold"].as<double>();
+            }
             // Compression-aware route TTL
             if (r["max_ttl_multiplier"]) {
                 config.routing.max_ttl_multiplier = r["max_ttl_multiplier"].as<double>();
@@ -1705,6 +1713,9 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
     }
     if (config.routing.capacity_headroom_weight < 0.0 || config.routing.capacity_headroom_weight > 100.0) {
         return "routing.capacity_headroom_weight must be between 0.0 and 100.0";
+    }
+    if (config.routing.cache_residency_threshold < 0.0 || config.routing.cache_residency_threshold > 1.0) {
+        return "routing.cache_residency_threshold must be between 0.0 and 1.0";
     }
     if (config.routing.max_ttl_multiplier < 1.0 || config.routing.max_ttl_multiplier > 10.0) {
         return "routing.max_ttl_multiplier must be between 1.0 and 10.0";

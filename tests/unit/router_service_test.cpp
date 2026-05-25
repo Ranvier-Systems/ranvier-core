@@ -167,6 +167,114 @@ TEST_F(RouterServiceTest, RouteOverwritesSamePrefix) {
 }
 
 // =============================================================================
+// 1b. Cache-Residency-Aware Routing
+// =============================================================================
+// An ART prefix hit is downgraded to load-based selection when the owning
+// backend's reported cache residency falls below cache_residency_threshold
+// (default 0.2): the backend likely evicted the prefix, so the "hit" is stale.
+
+TEST_F(RouterServiceTest, HighResidencyHonorsArtHit) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {10, 20, 30, 40};
+    RouterService::insert_route_for_testing(tokens, 1);
+    // Backend 1 reports plenty of residency — route should be honored.
+    RouterService::set_residency_for_testing(1, 0.9);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, LowResidencyDowngradesAndSkipsColdBackend) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {11, 22, 33, 44};
+    RouterService::insert_route_for_testing(tokens, 1);
+    // Backend 1's cache is nearly full → residency below the 0.2 default.
+    RouterService::set_residency_for_testing(1, 0.05);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Must be treated as a miss and routed to the OTHER backend (cold one skipped).
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 2);
+}
+
+TEST_F(RouterServiceTest, LowResidencySkipsColdBackendWithThreeBackends) {
+    register_three_backends();
+    std::vector<int32_t> tokens = {12, 23, 34, 45};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.01);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    // The cache-cold backend (1) must be excluded from the fallback candidates.
+    EXPECT_NE(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, NoResidencyDataHonorsArtHit) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {13, 24, 35, 46};
+    RouterService::insert_route_for_testing(tokens, 1);
+    // No residency reported for backend 1 → no signal → honor the route.
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, ResidencyThresholdZeroDisablesDowngrade) {
+    cfg_.cache_residency_threshold = 0.0;  // disabled
+    recreate_router(cfg_);
+    register_two_backends();
+    std::vector<int32_t> tokens = {14, 25, 36, 47};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.0);  // as cold as possible
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Threshold 0.0 means "never downgrade" → ART hit is honored.
+    EXPECT_EQ(result.backend_id.value(), 1);
+    EXPECT_TRUE(result.cache_hit);
+}
+
+TEST_F(RouterServiceTest, ResidencyCacheEvictsUnderChurnSoNewBackendsTracked) {
+    // Drive the residency cache past capacity with many distinct (churned)
+    // backend ids, then set residency for a live backend. Eviction must make
+    // room so the live backend's value still takes effect — without it the
+    // upsert-only cache would silently drop the new entry once full, and the
+    // downgrade below would never fire.
+    register_two_backends();
+    for (int id = 1000; id < 1400; ++id) {  // 400 > MAX_ENTRIES (256)
+        RouterService::set_residency_for_testing(id, 0.9);
+    }
+
+    std::vector<int32_t> tokens = {61, 62, 63, 64};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.01);  // cache-cold, set after full
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 2);
+}
+
+TEST_F(RouterServiceTest, LowResidencySingleBackendKeepsRoute) {
+    // Only one backend: there is nowhere to divert, so even a cache-cold ART
+    // hit still routes to that backend (downgrade path requires an alternative).
+    RouterService::register_backend_for_testing(1, make_addr("10.0.0.1", 8080));
+    std::vector<int32_t> tokens = {15, 26, 37, 48};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.0);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+// =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================
 // TTL cleanup requires the Seastar reactor (run_ttl_cleanup uses smp::submit_to).

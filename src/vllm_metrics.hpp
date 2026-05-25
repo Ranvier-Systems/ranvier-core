@@ -45,6 +45,21 @@ struct VLLMMetrics {
         return gpu_cache_usage_percent / ratio;
     }
 
+    // Estimate the probability that a previously-cached prefix still resides in
+    // this backend's KV cache, as a [0.0, 1.0] residency weight. The model is
+    // deliberately simple and monotonic: residency = 1 - effective_cache_pressure.
+    // A backend with abundant effective headroom (low pressure) is unlikely to
+    // have evicted an old prefix; one near saturation has almost certainly
+    // recycled those blocks. compression_ratio feeds through effective_cache_pressure
+    // so a compressed backend retains prefixes longer at the same raw usage.
+    double estimated_prefix_retention(double compression_ratio = 1.0) const {
+        double pressure = effective_cache_pressure(compression_ratio);
+        double retention = 1.0 - pressure;
+        if (retention < 0.0) return 0.0;
+        if (retention > 1.0) return 1.0;
+        return retention;
+    }
+
     // Compute a 0.0–1.0 load score for routing decisions.
     // Composite of request queue depth and KV cache pressure.
     // compression_ratio adjusts cache pressure for backends with KV-cache

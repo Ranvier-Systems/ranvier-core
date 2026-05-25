@@ -120,6 +120,16 @@ void GossipService::register_metrics() {
         seastar::metrics::make_counter("gossip_cache_evictions_received_total",
             [this] { return _protocol->cache_evictions_received(); },
             seastar::metrics::description("Total number of cache eviction packets received from cluster peers")),
+        seastar::metrics::make_counter("gossip_cache_states_sent_total",
+            [this] { return _protocol->cache_states_sent(); },
+            seastar::metrics::description("Total number of cache-residency state packets sent to cluster peers")),
+        seastar::metrics::make_counter("gossip_cache_states_received_total",
+            [this] { return _protocol->cache_states_received(); },
+            seastar::metrics::description("Total number of cache-residency state packets received from cluster peers")),
+        seastar::metrics::make_counter("cluster_unknown_packet_types",
+            [this] { return _protocol->unknown_packet_types(); },
+            seastar::metrics::description("Total number of gossip packets ignored due to an unrecognized type tag "
+                                          "(rolling-upgrade safety; peer stays healthy)")),
 
         // Transport metrics (DTLS)
         seastar::metrics::make_counter("cluster_dtls_handshakes_started",
@@ -365,6 +375,35 @@ seastar::future<> GossipService::broadcast_cache_eviction(uint64_t prefix_hash, 
 void GossipService::set_cache_eviction_callback(CacheEvictionCallback callback) {
     if (_protocol) {
         _protocol->set_cache_eviction_callback(std::move(callback));
+    }
+}
+
+seastar::future<> GossipService::broadcast_cache_state(BackendId backend_id, double cache_usage,
+                                                       double residency_weight) {
+    if (!_config.enabled || !_protocol || _peer_addresses.empty()) {
+        return seastar::make_ready_future<>();
+    }
+
+    if (!is_accepting_tasks()) {
+        log_gossip.debug("Cache state broadcast rejected: gossip service not accepting tasks");
+        return seastar::make_ready_future<>();
+    }
+
+    seastar::gate::holder gate_holder;
+    try {
+        gate_holder = _gossip_task_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        log_gossip.debug("Cache state broadcast rejected: gossip gate closed");
+        return seastar::make_ready_future<>();
+    }
+
+    return _protocol->broadcast_cache_state(backend_id, cache_usage, residency_weight)
+        .finally([gate_holder = std::move(gate_holder)] {});
+}
+
+void GossipService::set_cache_state_callback(CacheStateCallback callback) {
+    if (_protocol) {
+        _protocol->set_cache_state_callback(std::move(callback));
     }
 }
 
