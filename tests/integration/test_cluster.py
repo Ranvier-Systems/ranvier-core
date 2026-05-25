@@ -43,6 +43,8 @@ from conftest import (
     get_all_metrics,
     get_compose_cmd,
     get_metric_value,
+    metric_is_registered,
+    register_backends,
     run_compose,
     send_chat_request,
     sum_metric_by_substring,
@@ -431,8 +433,7 @@ class ClusterIntegrationTest(ClusterTestCase):
         """
         print("\nTest: CACHE_STATE gossip + rolling-upgrade safety")
 
-        if not self._mock_backend_has_metrics():
-            self.skipTest(self._STALE_MOCK_MSG)
+        self._require_residency_preconditions()
 
         # Poll for CACHE_STATE traffic. The mock backends now expose
         # vLLM-style /metrics, so the node(s) that scrape them (node1 holds the
@@ -488,6 +489,33 @@ class ClusterIntegrationTest(ClusterTestCase):
         "then re-run this test."
     )
 
+    def _require_residency_preconditions(self):
+        """Skip-or-fail-fast guard shared by the cache-residency tests.
+
+        These tests must work standalone (``pytest -k``) as well as inside the
+        ordered full suite, so they can't rely on ``test_02`` having registered
+        backends. This:
+          1. skips if the mock image predates the /metrics endpoint,
+          2. skips if the Ranvier image predates the feature (the cache-state
+             counters aren't even registered — a stale ``ranvier:latest``),
+          3. registers the mock backends on node1 so there is something to
+             scrape (idempotent — safe when the full suite already did it).
+        """
+        if not self._mock_backend_has_metrics():
+            self.skipTest(self._STALE_MOCK_MSG)
+
+        node1 = NODES["node1"]
+        if not metric_is_registered(node1["metrics"], "gossip_cache_states_sent_total"):
+            self.skipTest(
+                "Ranvier image predates the cache-residency feature "
+                "(gossip_cache_states_sent_total is not registered). Rebuild it:\n"
+                "  docker compose -f docker-compose.test.yml build ranvier1\n"
+                "then re-run this test.")
+
+        self.assertTrue(
+            register_backends(node1["api"]),
+            "failed to register mock backends on node1")
+
     def _mock_backend_has_metrics(self):
         """True if the running mock image serves the vLLM /metrics endpoint.
 
@@ -532,8 +560,7 @@ class ClusterIntegrationTest(ClusterTestCase):
         """
         print("\nTest: residency-driven route downgrade (end-to-end)")
 
-        if not self._mock_backend_has_metrics():
-            self.skipTest(self._STALE_MOCK_MSG)
+        self._require_residency_preconditions()
 
         node1 = NODES["node1"]
         baseline = sum_metric_by_substring(
