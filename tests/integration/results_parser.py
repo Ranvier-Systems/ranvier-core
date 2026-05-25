@@ -538,9 +538,16 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
 #   - "backend_active_requests"            : per-backend gauge labelled by backend_id
 #                                            (metrics_service.hpp:999, label backend_id=...)
 # Both are exposed in the "ranvier" metric group; Prometheus serializes the group
-# name as a prefix, so the exposition lines look like
-#   ranvier_routing_load_aware_fallbacks_total 1234
-#   ranvier_backend_active_requests{backend_id="3"} 5
+# name as a prefix.
+#
+# IMPORTANT — Seastar is shard-per-core, and its Prometheus protocol emits one
+# series PER SHARD with a `shard="N"` label, e.g.:
+#   ranvier_routing_load_aware_fallbacks_total{shard="0"} 1234
+#   ranvier_routing_load_aware_fallbacks_total{shard="1"} 1190
+#   ranvier_backend_active_requests{shard="0",backend_id="3"} 5
+# so we must (a) tolerate an optional label block after the metric name and
+# (b) SUM across shards (counters) / aggregate per backend_id (gauges). The
+# label order is not guaranteed, hence the permissive `{...}` matching.
 #
 # A per-backend `requests_routed_total` counter does NOT currently exist; the
 # closest signal is `ranvier_backend_active_requests` (instantaneous in-flight
@@ -549,7 +556,7 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
 # a cheap approximation of "requests dispatched per backend." Mark these as
 # verified-via-source if the user asks.
 _PROM_FALLBACK_RE = re.compile(
-    r"^ranvier_routing_load_aware_fallbacks_total\s+([0-9.eE+-]+)"
+    r"^ranvier_routing_load_aware_fallbacks_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 )
 _PROM_BACKEND_ACTIVE_RE = re.compile(
     r'^ranvier_backend_active_requests\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
@@ -566,6 +573,9 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     captured at end-of-run. See bench.sh for the curl invocation. Missing file
     is non-fatal — returns an empty dict and the caller leaves the fields as
     None so the comparison output makes the absence visible.
+
+    Seastar emits per-shard series; counters are summed across shards and
+    per-backend gauges are summed per backend_id.
     """
     out: Dict[str, Any] = {}
     try:
@@ -574,8 +584,8 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     except (FileNotFoundError, IsADirectoryError, PermissionError):
         return out
 
-    fallbacks = None
-    active: Dict[str, float] = {}
+    fallbacks: Optional[float] = None  # summed across shards
+    active: Dict[str, float] = {}      # summed per backend_id across shards
     routed_total: Dict[str, float] = {}
     for line in content.splitlines():
         if not line or line.startswith("#"):
@@ -583,27 +593,27 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
         m = _PROM_FALLBACK_RE.match(line)
         if m:
             try:
-                fallbacks = int(float(m.group(1)))
+                fallbacks = (fallbacks or 0.0) + float(m.group(1))
             except ValueError:
                 pass
             continue
         m = _PROM_BACKEND_ACTIVE_RE.match(line)
         if m:
             try:
-                active[m.group(1)] = float(m.group(2))
+                active[m.group(1)] = active.get(m.group(1), 0.0) + float(m.group(2))
             except ValueError:
                 pass
             continue
         m = _PROM_BACKEND_HIST_COUNT_RE.match(line)
         if m:
             try:
-                routed_total[m.group(1)] = float(m.group(2))
+                routed_total[m.group(1)] = routed_total.get(m.group(1), 0.0) + float(m.group(2))
             except ValueError:
                 pass
             continue
 
     if fallbacks is not None:
-        out["load_aware_fallbacks_total"] = fallbacks
+        out["load_aware_fallbacks_total"] = int(fallbacks)
     if active:
         out["backend_active_requests"] = active
     if routed_total:

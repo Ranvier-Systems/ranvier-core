@@ -1591,8 +1591,10 @@ run_benchmark() {
     # routing_load_aware_fallbacks_total and per-backend distribution. The
     # parser reads $REPORT_DIR/prometheus_metrics.txt as a sibling of
     # benchmark.log. Best-effort: missing file just leaves the counters blank.
-    if command -v curl &> /dev/null; then
-        for node in ranvier-1 ranvier-2 ranvier-3; do
+    # Container names must match docker-compose.benchmark-real.yml
+    # (container_name: ranvier-bench1..3).
+    if command -v docker &> /dev/null; then
+        for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
             if docker exec "$node" curl -sf http://localhost:9180/metrics \
                     > "$REPORT_DIR/prometheus_metrics.txt" 2>/dev/null; then
                 break
