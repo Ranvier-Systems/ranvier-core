@@ -144,6 +144,11 @@ class BenchmarkResults:
     # distinguishes affinity-thrashing from other routing regressions; see
     # .dev-context/investigation-289-routing-regression.md.
     load_aware_fallbacks_total: Optional[int] = None
+    # Cache-residency downgrades (#527): ART hits abandoned because the owning
+    # backend's gossiped KV-cache residency fell below threshold. This is a
+    # SECOND diversion mechanism distinct from load-aware fallbacks; a high
+    # value here means residency routing (not load-aware) is breaking affinity.
+    residency_route_downgrades_total: Optional[int] = None
     # Per-backend in-flight request gauge — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
     backend_active_requests: Optional[Dict[str, float]] = None
@@ -538,9 +543,16 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
 #   - "backend_active_requests"            : per-backend gauge labelled by backend_id
 #                                            (metrics_service.hpp:999, label backend_id=...)
 # Both are exposed in the "ranvier" metric group; Prometheus serializes the group
-# name as a prefix, so the exposition lines look like
-#   ranvier_routing_load_aware_fallbacks_total 1234
-#   ranvier_backend_active_requests{backend_id="3"} 5
+# name as a prefix.
+#
+# IMPORTANT — Seastar is shard-per-core, and its Prometheus protocol emits one
+# series PER SHARD with a `shard="N"` label, e.g.:
+#   ranvier_routing_load_aware_fallbacks_total{shard="0"} 1234
+#   ranvier_routing_load_aware_fallbacks_total{shard="1"} 1190
+#   ranvier_backend_active_requests{shard="0",backend_id="3"} 5
+# so we must (a) tolerate an optional label block after the metric name and
+# (b) SUM across shards (counters) / aggregate per backend_id (gauges). The
+# label order is not guaranteed, hence the permissive `{...}` matching.
 #
 # A per-backend `requests_routed_total` counter does NOT currently exist; the
 # closest signal is `ranvier_backend_active_requests` (instantaneous in-flight
@@ -549,7 +561,12 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
 # a cheap approximation of "requests dispatched per backend." Mark these as
 # verified-via-source if the user asks.
 _PROM_FALLBACK_RE = re.compile(
-    r"^ranvier_routing_load_aware_fallbacks_total\s+([0-9.eE+-]+)"
+    r"^ranvier_routing_load_aware_fallbacks_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
+)
+# Cache-residency downgrade counter (#527), verified at router_service.cpp:1742
+# (make_counter "router_residency_route_downgrades_total", "ranvier" group).
+_PROM_RESIDENCY_RE = re.compile(
+    r"^ranvier_router_residency_route_downgrades_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 )
 _PROM_BACKEND_ACTIVE_RE = re.compile(
     r'^ranvier_backend_active_requests\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
@@ -566,6 +583,9 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     captured at end-of-run. See bench.sh for the curl invocation. Missing file
     is non-fatal — returns an empty dict and the caller leaves the fields as
     None so the comparison output makes the absence visible.
+
+    Seastar emits per-shard series; counters are summed across shards and
+    per-backend gauges are summed per backend_id.
     """
     out: Dict[str, Any] = {}
     try:
@@ -574,8 +594,9 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
     except (FileNotFoundError, IsADirectoryError, PermissionError):
         return out
 
-    fallbacks = None
-    active: Dict[str, float] = {}
+    fallbacks: Optional[float] = None  # summed across shards
+    residency: Optional[float] = None  # summed across shards
+    active: Dict[str, float] = {}      # summed per backend_id across shards
     routed_total: Dict[str, float] = {}
     for line in content.splitlines():
         if not line or line.startswith("#"):
@@ -583,27 +604,36 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
         m = _PROM_FALLBACK_RE.match(line)
         if m:
             try:
-                fallbacks = int(float(m.group(1)))
+                fallbacks = (fallbacks or 0.0) + float(m.group(1))
+            except ValueError:
+                pass
+            continue
+        m = _PROM_RESIDENCY_RE.match(line)
+        if m:
+            try:
+                residency = (residency or 0.0) + float(m.group(1))
             except ValueError:
                 pass
             continue
         m = _PROM_BACKEND_ACTIVE_RE.match(line)
         if m:
             try:
-                active[m.group(1)] = float(m.group(2))
+                active[m.group(1)] = active.get(m.group(1), 0.0) + float(m.group(2))
             except ValueError:
                 pass
             continue
         m = _PROM_BACKEND_HIST_COUNT_RE.match(line)
         if m:
             try:
-                routed_total[m.group(1)] = float(m.group(2))
+                routed_total[m.group(1)] = routed_total.get(m.group(1), 0.0) + float(m.group(2))
             except ValueError:
                 pass
             continue
 
     if fallbacks is not None:
-        out["load_aware_fallbacks_total"] = fallbacks
+        out["load_aware_fallbacks_total"] = int(fallbacks)
+    if residency is not None:
+        out["residency_route_downgrades_total"] = int(residency)
     if active:
         out["backend_active_requests"] = active
     if routed_total:
@@ -792,6 +822,8 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
     prom = parse_prometheus_dump(str(prom_path))
     if "load_aware_fallbacks_total" in prom:
         results.load_aware_fallbacks_total = prom["load_aware_fallbacks_total"]
+    if "residency_route_downgrades_total" in prom:
+        results.residency_route_downgrades_total = prom["residency_route_downgrades_total"]
     # Prefer per-backend histogram counts (cumulative dispatched requests) if
     # available; fall back to the active-requests gauge (instantaneous in-flight)
     # otherwise. Either is usable for spotting hot-spotting.
@@ -1408,6 +1440,8 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
     has_routing_counters = (
         baseline.load_aware_fallbacks_total is not None
         or new.load_aware_fallbacks_total is not None
+        or baseline.residency_route_downgrades_total is not None
+        or new.residency_route_downgrades_total is not None
         or baseline.backend_active_requests
         or new.backend_active_requests
     )
@@ -1430,8 +1464,22 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
         n_fb_pct = (n_fb / new.total_requests * 100.0) if (n_fb and new.total_requests) else None
         b_fb_str = f"{_fmt_count(b_fb)}" + (f" ({b_fb_pct:.1f}%)" if b_fb_pct is not None else "")
         n_fb_str = f"{_fmt_count(n_fb)}" + (f" ({n_fb_pct:.1f}%)" if n_fb_pct is not None else "")
-        lines.append(f"  load_aware_fallbacks_total:  baseline={b_fb_str}  new={n_fb_str}")
-        lines.append("  (percent = fallbacks / total_requests; high % suggests affinity thrashing)")
+        lines.append(f"  load_aware_fallbacks_total:        baseline={b_fb_str}  new={n_fb_str}")
+        lines.append("  (percent = fallbacks / total_requests; high % suggests load-aware affinity thrashing)")
+
+        # Cache-residency downgrade counter (#527) — the OTHER diversion source.
+        # If this is high while load_aware_fallbacks is low, residency routing
+        # (not load-aware) is breaking prefix affinity. Both must be considered
+        # when reading a 30u miss-tail regression.
+        b_rd = baseline.residency_route_downgrades_total
+        n_rd = new.residency_route_downgrades_total
+        if b_rd is not None or n_rd is not None:
+            b_rd_pct = (b_rd / baseline.total_requests * 100.0) if (b_rd and baseline.total_requests) else None
+            n_rd_pct = (n_rd / new.total_requests * 100.0) if (n_rd and new.total_requests) else None
+            b_rd_str = f"{_fmt_count(b_rd)}" + (f" ({b_rd_pct:.1f}%)" if b_rd_pct is not None else "")
+            n_rd_str = f"{_fmt_count(n_rd)}" + (f" ({n_rd_pct:.1f}%)" if n_rd_pct is not None else "")
+            lines.append(f"  residency_route_downgrades_total: baseline={b_rd_str}  new={n_rd_str}")
+            lines.append("  (percent = downgrades / total_requests; high % means residency routing is diverting ART hits)")
 
         # Per-backend request distribution. Print as sorted list with min/max
         # and a Gini coefficient — hot-spotting from prefix concentration

@@ -141,6 +141,49 @@ Picking among these requires the smoking-gun A/B in
 
 **Per the task brief, this investigation does NOT write a revert patch.**
 
+## Addendum (2026-05-25): `#527 f1c70ee` cache-residency routing changes the picture
+
+After this investigation was written, commit `f1c70ee` (#527, "Route by where a
+prefix still resides, not just where it was last served") merged to main. It is
+directly relevant and **must be accounted for in any benchmark run on `f1c70ee`+,
+including the May 25 Exp A attempt** (which ran on `f1c70ee` with residency
+routing active at its default).
+
+What it does (`src/router_service.cpp` ~2455-2520, `docs/internals/cache-residency-routing.md`):
+on an ART hit, if the owning backend's gossiped KV-cache residency is below
+`cache_residency_threshold` (default `0.2` → cache >80% full), the hit is
+**downgraded to a miss** and re-routed through the hash strategy with the
+cache-cold backend excluded. New env var `RANVIER_CACHE_RESIDENCY_THRESHOLD`
+(0.0 disables). New counter `ranvier_router_residency_route_downgrades_total`.
+
+Two consequences for this investigation:
+
+1. **It is a second, independent diversion mechanism.** The #442 analysis above
+   assumed load-aware (Step 3) was the only thing breaking ART affinity. On
+   `f1c70ee`+, residency downgrades (Step 1→2) break it too, *even with
+   `--no-load-aware`*. At 30u/13B cache pressure is high, so residency
+   downgrades may fire heavily. The miss-tail regression on `f1c70ee` could be
+   driven by residency routing, load-aware, or both — they must be separated
+   (see Experiment A vs A2 in the checklist).
+
+2. **It partially mitigates the #442 "no escape valve" problem — but only on the
+   residency path.** A residency downgrade sets `art_hit=false` and re-runs the
+   hash strategy, so `original_selected` becomes the *new* backend and the ART
+   re-learns `P → new` (self-healing). The load-aware divert (Step 3) still does
+   NOT do this — `art_hit` stays true and `original_selected` is the pre-divert
+   ART target, so #442's persistent misalignment is unchanged on the load-aware
+   path. So #527 is not a fix for the load-aware pathology; it's a parallel
+   mechanism with better learning hygiene.
+
+**Benchmark comparability caveat:** the May 22 `5079f9f` data predates #527, so
+comparing a `f1c70ee`+ prefix-aware run against the May 22 numbers mixes two
+routing algorithms. To reproduce the `5079f9f` behavior on `f1c70ee`, set
+`RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0`.
+
+The parser now scrapes `residency_route_downgrades_total` alongside
+`load_aware_fallbacks_total`, so both diversion sources are visible in the
+comparison output.
+
 ## Open questions for the next session
 
 1. **Is `load_aware_fallbacks_total` at 30u high relative to total_requests?**
@@ -154,6 +197,10 @@ Picking among these requires the smoking-gun A/B in
    per-backend distribution block surfaces this.
 3. **Does raising `load_imbalance_factor` to 3.0 close the gap without
    touching code?** This is Experiment B in the next-benchmark checklist.
+4. **(New, post-#527) Which diversion mechanism dominates at 30u — load-aware
+   or residency downgrades?** Experiment A disables both; A2 isolates residency.
+   Compare `load_aware_fallbacks_total` vs `residency_route_downgrades_total` in
+   the parser's ROUTING COUNTERS block.
 
 ## Files examined
 

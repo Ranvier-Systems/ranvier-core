@@ -1370,6 +1370,21 @@ if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
 
+# Effective routing config the server is about to launch with. Printed at
+# second 0 so a misconfigured load-aware experiment is caught immediately
+# rather than after a 30-minute run. NOTE: these flags (--no-load-aware,
+# --load-imbalance-factor/floor) are the ONLY supported way to override
+# load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
+# env prefix is overwritten by the export above and has no effect.
+log_header "Effective Routing Config"
+log_info "RANVIER_ROUTING_MODE        = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
+log_info "RANVIER_LOAD_AWARE_ROUTING  = ${RANVIER_LOAD_AWARE_ROUTING}"
+log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
+log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
+if [[ "$LOAD_AWARE" = true ]]; then
+    log_warn "Load-aware routing is ON. For the Experiment A smoking-gun A/B, pass --no-load-aware."
+fi
+
 # Export compression ratio for docker-compose
 if [[ -n "$COMPRESSION_RATIO" ]]; then
     export RANVIER_DEFAULT_COMPRESSION_RATIO="$COMPRESSION_RATIO"
@@ -1673,8 +1688,10 @@ run_benchmark() {
     # routing_load_aware_fallbacks_total and per-backend distribution. The
     # parser reads $REPORT_DIR/prometheus_metrics.txt as a sibling of
     # benchmark.log. Best-effort: missing file just leaves the counters blank.
-    if command -v curl &> /dev/null; then
-        for node in ranvier-1 ranvier-2 ranvier-3; do
+    # Container names must match docker-compose.benchmark-real.yml
+    # (container_name: ranvier-bench1..3).
+    if command -v docker &> /dev/null; then
+        for node in ranvier-bench1 ranvier-bench2 ranvier-bench3; do
             if docker exec "$node" curl -sf http://localhost:9180/metrics \
                     > "$REPORT_DIR/prometheus_metrics.txt" 2>/dev/null; then
                 break
