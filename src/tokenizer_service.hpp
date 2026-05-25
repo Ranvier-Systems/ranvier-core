@@ -41,12 +41,12 @@ struct TokenizationCacheConfig {
  * Configuration for cross-shard tokenization offloading.
  *
  * On cache miss, instead of blocking the local reactor for 5-13ms during FFI,
- * dispatch to the least-loaded shard via P2C. The calling shard's reactor is
- * freed to handle other requests while waiting.
+ * dispatch to another shard (round-robin to the next shard). The calling
+ * shard's reactor is freed to handle other requests while waiting.
  *
  * Trade-offs:
  * - Pro: Unblocks reactor on calling shard during tokenization
- * - Pro: Uses existing P2C infrastructure, no thread-safety issues
+ * - Pro: Uses existing cross-shard (submit_to) infrastructure, no thread-safety issues
  * - Con: Cross-shard latency (~1-10μs) + string copy overhead
  * - Con: Cache locality reduced (each shard builds own cache)
  */
@@ -167,7 +167,7 @@ struct TokenizationResult {
  * System messages have 80-90% cache hit rates, dramatically reducing tokenization overhead.
  *
  * ASYNC OPTIMIZATION: Use encode_cached_async() with cross-shard dispatch enabled
- * to offload cache-miss tokenization to the least-loaded shard via P2C. This frees
+ * to offload cache-miss tokenization to another shard (round-robin). This frees
  * the calling shard's reactor during the 5-13ms FFI call.
  */
 class TokenizerService {
@@ -185,7 +185,8 @@ public:
     void configure_cross_shard(CrossShardTokenizationConfig config);
 
     // Set references for cross-shard dispatch (call after services are started)
-    // load_balancer: P2C load balancer for shard selection
+    // load_balancer: load balancer ref; its presence gates cross-shard dispatch
+    //   (P2C selection is reserved for future use — see select_tokenization_shard)
     // tokenizer: sharded tokenizer service (self-reference for cross-shard calls)
     void set_cross_shard_refs(
         seastar::sharded<ShardLoadBalancer>* load_balancer,
@@ -257,8 +258,9 @@ public:
 
     // ASYNC OPTIMIZED API: Text -> Integers with caching + cross-shard dispatch
     // On cache hit: returns immediately (no async overhead)
-    // On cache miss with cross-shard enabled: dispatches to least-loaded shard,
-    //   freeing the calling reactor to handle other requests during FFI.
+    // On cache miss with cross-shard enabled: dispatches to another shard
+    //   (round-robin), freeing the calling reactor to handle other requests
+    //   during FFI.
     // On cache miss with cross-shard disabled: tokenizes locally (blocks reactor).
     //
     // The result includes metadata about where tokenization occurred for metrics.
@@ -270,7 +272,7 @@ public:
     // Priority order:
     // 1. Local cache hit → immediate return
     // 2. Thread pool available → submit to worker thread (non-blocking)
-    // 3. Cross-shard dispatch available → dispatch via P2C (frees local reactor)
+    // 3. Cross-shard dispatch available → dispatch round-robin (frees local reactor)
     // 4. Fallback → local tokenization (blocks reactor)
     //
     // Requires set_thread_pool_ref() to be called after thread pool is started.
@@ -344,8 +346,9 @@ private:
     // Prometheus metrics for this service (Rule #6: deregister in stop())
     seastar::metrics::metric_groups _metrics;
 
-    // Select target shard for cross-shard dispatch using P2C
-    // Returns local shard ID if cross-shard is disabled or not beneficial
+    // Select target shard for cross-shard dispatch (round-robin to next shard).
+    // A load-aware P2C balancer is wired up via set_cross_shard_refs() but is
+    // not yet used here. Returns local shard ID if cross-shard is disabled.
     uint32_t select_tokenization_shard() const;
 
     // Check if text qualifies for cross-shard dispatch
