@@ -185,6 +185,29 @@ future<> HealthService::run_loop() {
                         if (!pressure_map.empty()) {
                             co_await RouterService::broadcast_cache_headroom(std::move(pressure_map));
                         }
+
+                        // Distribute cache-residency state: update every local
+                        // shard's residency cache (so this node discounts its own
+                        // stale prefix routes) AND gossip each backend's state to
+                        // cluster peers (so they discount routes pointing here).
+                        // Beneficial even single-node — gossip send is a no-op
+                        // when clustering is disabled.
+                        absl::flat_hash_map<BackendId, RouterService::CacheStateSample> cache_state;
+                        for (const auto& [id, m] : _backend_vllm_metrics) {
+                            if (m.valid) {
+                                double cr = 1.0;
+                                auto cr_it = _backend_compression_ratios.find(id);
+                                if (cr_it != _backend_compression_ratios.end()) {
+                                    cr = cr_it->second;
+                                }
+                                cache_state[id] = RouterService::CacheStateSample{
+                                    m.gpu_cache_usage_percent,
+                                    m.estimated_prefix_retention(cr)};
+                            }
+                        }
+                        if (!cache_state.empty()) {
+                            co_await RouterService::broadcast_cache_state_global(std::move(cache_state));
+                        }
                     } catch (const std::exception& e) {
                         // Rule #9: Log at warn level
                         log_health.warn("GPU load broadcast failed: {}", e.what());

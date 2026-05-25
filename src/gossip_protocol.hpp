@@ -47,7 +47,27 @@ enum class GossipPacketType : uint8_t {
     ROUTE_ACK = 0x03,
     NODE_STATE = 0x04,
     CACHE_EVICTION = 0x05,
+    CACHE_STATE = 0x06,
 };
+
+// Rolling-upgrade safety contract: a node that receives a type tag it does not
+// recognize (e.g. a newer peer emitting a packet type this binary predates)
+// MUST ignore it cleanly rather than treating it as a malformed/invalid packet
+// or marking the peer unhealthy. This predicate is the single source of truth
+// for "do I understand this tag"; any tag not listed here is funnelled to the
+// unknown-packet-type counter in handle_packet().
+inline constexpr bool is_known_packet_type(GossipPacketType type) {
+    switch (type) {
+        case GossipPacketType::ROUTE_ANNOUNCEMENT:
+        case GossipPacketType::HEARTBEAT:
+        case GossipPacketType::ROUTE_ACK:
+        case GossipPacketType::NODE_STATE:
+        case GossipPacketType::CACHE_EVICTION:
+        case GossipPacketType::CACHE_STATE:
+            return true;
+    }
+    return false;
+}
 
 // Node state values
 enum class NodeState : uint8_t {
@@ -59,6 +79,9 @@ enum class NodeState : uint8_t {
 using RouteLearnCallback = std::function<seastar::future<>(std::vector<TokenId>, BackendId)>;
 using NodeStateCallback = std::function<seastar::future<>(BackendId, NodeState)>;
 using CacheEvictionCallback = std::function<seastar::future<>(uint64_t prefix_hash, BackendId backend_id)>;
+// cache_usage and residency_weight are both normalized to [0.0, 1.0].
+using CacheStateCallback =
+    std::function<seastar::future<>(BackendId backend_id, double cache_usage, double residency_weight)>;
 
 // Wire format for route announcements (v2 with sequence numbers)
 struct RouteAnnouncementPacket {
@@ -121,6 +144,40 @@ struct CacheEvictionPacket {
     static std::optional<CacheEvictionPacket> deserialize(const uint8_t* data, size_t len);
 };
 
+// Wire format for cache-residency state notifications.
+//
+// Carries one backend's KV-cache state so peers can discount stale prefix
+// routes (a backend may still be the *last server* of a prefix while having
+// already *evicted* it under cache pressure). The two payload signals are
+// normalized to [0.0, 1.0] and quantized to uint16 fixed-point (value * 65535).
+//
+// Format: [type:1][version:1][backend_id:4][cache_usage:2][residency_weight:2] = 10 bytes
+//
+// FORWARD COMPATIBILITY: deserialize() accepts len >= PACKET_SIZE (not ==) and
+// reads only the fields it knows, ignoring any trailing bytes. This lets a
+// future protocol version append additional per-node aggregate signals without
+// a breaking format change — older nodes transparently skip the new tail.
+// For the same reason the version field is recorded but not used to reject the
+// packet; an unrecognized *type* is the rejection boundary (see
+// is_known_packet_type), not a higher minor version of a known type.
+//
+// This packet is broadcast unreliably (no ACK / seq_num): it is periodic,
+// idempotent, latest-value-wins state, so a dropped update is corrected by the
+// next scrape cycle rather than retried.
+struct CacheStatePacket {
+    static constexpr uint8_t PROTOCOL_VERSION = 1;
+    static constexpr size_t PACKET_SIZE = 10;
+
+    GossipPacketType type = GossipPacketType::CACHE_STATE;
+    uint8_t version = PROTOCOL_VERSION;
+    BackendId backend_id = 0;
+    double cache_usage = 0.0;        // [0.0, 1.0] KV-cache fullness
+    double residency_weight = 0.0;   // [0.0, 1.0] estimated prefix retention
+
+    std::vector<uint8_t> serialize() const;
+    static std::optional<CacheStatePacket> deserialize(const uint8_t* data, size_t len);
+};
+
 // GossipProtocol: Manages message handling and reliable delivery
 //
 // This class handles the protocol logic:
@@ -155,11 +212,15 @@ public:
     void set_cache_eviction_callback(CacheEvictionCallback callback) {
         _cache_eviction_callback = std::move(callback);
     }
+    void set_cache_state_callback(CacheStateCallback callback) {
+        _cache_state_callback = std::move(callback);
+    }
 
     // Broadcast methods
     seastar::future<> broadcast_route(const std::vector<TokenId>& tokens, BackendId backend);
     seastar::future<> broadcast_node_state(NodeState state, BackendId local_backend_id);
     seastar::future<> broadcast_cache_eviction(uint64_t prefix_hash, BackendId backend_id);
+    seastar::future<> broadcast_cache_state(BackendId backend_id, double cache_usage, double residency_weight);
     seastar::future<> broadcast_heartbeat();
 
     // Handle incoming packet (called from receive loop)
@@ -187,6 +248,9 @@ public:
     uint64_t node_state_received() const { return _node_state_received; }
     uint64_t cache_evictions_sent() const { return _cache_evictions_sent; }
     uint64_t cache_evictions_received() const { return _cache_evictions_received; }
+    uint64_t cache_states_sent() const { return _cache_states_sent; }
+    uint64_t cache_states_received() const { return _cache_states_received; }
+    uint64_t unknown_packet_types() const { return _unknown_packet_types; }
 
     // Clear reliable delivery state (used during resync/shutdown)
     void clear_pending_acks();
@@ -208,6 +272,7 @@ private:
     RouteLearnCallback _route_learn_callback;
     NodeStateCallback _node_state_callback;
     CacheEvictionCallback _cache_eviction_callback;
+    CacheStateCallback _cache_state_callback;
 
     // Timers
     seastar::timer<> _heartbeat_timer;
@@ -255,6 +320,9 @@ private:
     uint64_t _node_state_received = 0;
     uint64_t _cache_evictions_sent = 0;
     uint64_t _cache_evictions_received = 0;
+    uint64_t _cache_states_sent = 0;
+    uint64_t _cache_states_received = 0;
+    uint64_t _unknown_packet_types = 0;
 
     // Internal methods
     seastar::future<> send_ack(const seastar::socket_address& peer, uint32_t seq_num);

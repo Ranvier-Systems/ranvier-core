@@ -397,7 +397,7 @@ void HttpController::register_routes(seastar::httpd::routes& r) {
                 std::unique_ptr<seastar::http::request>, std::unique_ptr<seastar::http::reply>)>>(
                 [](auto /*req*/, auto rep) {
                     add_cors_headers(*rep);
-                    rep->set_status(seastar::http::reply::status_type{204});
+                    rep->set_status(seastar::http::reply::status_type::no_content);
                     rep->done();
                     return make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
                 });
@@ -1051,6 +1051,15 @@ future<> HttpController::stream_backend_response(
             bundle->is_valid = false;
         }
 
+        // Capture the backend's real status code the first time the status
+        // line is parsed (non-zero means headers were seen this push). Used
+        // for per-API-key attribution — see the LogRequestOp enqueue in
+        // handle_proxy. Captured for ALL responses, not just 200, so backend
+        // errors (429/500/etc.) are recorded accurately.
+        if (res.backend_status_code != 0 && ctx->backend_status_code == 0) {
+            ctx->backend_status_code = res.backend_status_code;
+        }
+
         // Snooping Logic - record success and learn route
         if (res.header_snoop_success) {
             // Backend responded successfully - record for circuit breaker
@@ -1279,6 +1288,10 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             metrics().record_body_size_rejection();
             log_proxy.warn("[{}] Request rejected - body size {} exceeds limit {}",
                            request_id, body_size, _config.max_request_body_bytes);
+            // 413 Payload Too Large. Kept as a numeric cast rather than a
+            // named enum value: the Seastar enumerator was renamed across
+            // versions (request_entity_too_large -> payload_too_large), so the
+            // numeric form is the version-portable choice here.
             rep->set_status(static_cast<seastar::http::reply::status_type>(413));
             rep->add_header("X-Request-ID", request_id);
             rep->write_body("json", "{\"error\": \"Request body too large\", \"max_bytes\": " +
@@ -2257,6 +2270,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                     ctx->timed_out = false;
                     ctx->stream_closed = false;
                     ctx->chunks_received = 0;
+                    ctx->backend_status_code = 0;  // re-parsed from the retry response
                     ctx->connect_start = std::chrono::steady_clock::now();
 
                     // Re-send the HTTP request on fresh connection
@@ -2347,16 +2361,26 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
             if (ctx->current_backend != 0) {
                 op.backend_id = ctx->current_backend;
             }
-            // Status code derived from the outcome flags. We don't track HTTP
-            // status explicitly on the proxy path; this is a best-effort
-            // mapping for downstream reporting.
+            // Status code: prefer the backend's real HTTP status (parsed from
+            // the upstream status line) so backend errors (429/500/etc.) are
+            // recorded accurately. Proxy-level failures that happen before any
+            // backend response (timeout, connection failure, mid-stream client
+            // disconnect) never see a backend status, so fall back to a
+            // synthesized proxy-outcome code. Client disconnect is checked
+            // first because it can occur after a successful backend response
+            // began streaming, and operators want to distinguish it.
             if (ctx->client_disconnected) {
                 op.status_code = 499;  // Nginx convention
             } else if (ctx->timed_out) {
                 op.status_code = 504;
             } else if (ctx->connection_error || ctx->connection_failed) {
                 op.status_code = 502;
+            } else if (ctx->backend_status_code != 0) {
+                op.status_code = ctx->backend_status_code;
             } else {
+                // No backend status and no proxy-level failure flag — e.g. an
+                // empty response that didn't trip stale-retry. Default to 200
+                // (consistent with the success branch in phase 4).
                 op.status_code = 200;
             }
             op.latency_ms = static_cast<int32_t>(
@@ -3613,14 +3637,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_agent_stats
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
@@ -3661,26 +3685,26 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_pause_agent
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
 
     if (!info->allow_pause) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_pause_not_allowed"})");
         co_return std::move(rep);
     }
 
     if (info->paused) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_already_paused"})");
         co_return std::move(rep);
     }
@@ -3702,20 +3726,20 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_resume_agen
 
     auto agent_id_param = req->get_query_param("agent_id");
     if (agent_id_param.empty()) {
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", R"({"error":"missing agent_id query parameter"})");
         co_return std::move(rep);
     }
 
     auto info = _agent_registry->get_agent(agent_id_param);
     if (!info) {
-        rep->set_status(seastar::http::reply::status_type{404});
+        rep->set_status(seastar::http::reply::status_type::not_found);
         rep->write_body("json", R"({"error":"agent_not_found"})");
         co_return std::move(rep);
     }
 
     if (!info->paused) {
-        rep->set_status(seastar::http::reply::status_type{409});
+        rep->set_status(seastar::http::reply::status_type::conflict);
         rep->write_body("json", R"({"error":"agent_not_paused"})");
         co_return std::move(rep);
     }
@@ -3909,7 +3933,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         if (!authorized) {
             metrics().record_cache_event_auth_failure();
             RouterService::record_cache_event_auth_failure();
-            rep->set_status(seastar::http::reply::status_type{401});
+            rep->set_status(seastar::http::reply::status_type::unauthorized);
             rep->write_body("json", sstring("{\"error\": \"Unauthorized\"}"));
             co_return std::move(rep);
         }
@@ -3936,7 +3960,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_cache_event
         if (!parsed.error.empty()) {
             log_proxy.warn("Cache event parse error: {}", parsed.error);
         }
-        rep->set_status(seastar::http::reply::status_type{400});
+        rep->set_status(seastar::http::reply::status_type::bad_request);
         rep->write_body("json", sstring("{\"error\": \"" + parsed.error + "\"}"));
         co_return std::move(rep);
     }

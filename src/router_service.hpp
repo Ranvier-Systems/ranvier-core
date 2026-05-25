@@ -504,6 +504,31 @@ public:
     static seastar::future<> broadcast_cache_headroom(
         absl::flat_hash_map<BackendId, double> pressure_map);
 
+    // ---- Cache-Residency State (vLLM scrape → local shards + cluster peers) ----
+
+    // One backend's cache-residency sample. cache_usage and residency_weight are
+    // both normalized to [0.0, 1.0]; residency_weight is the estimated prefix
+    // retention (see VLLMMetrics::estimated_prefix_retention()).
+    struct CacheStateSample {
+        double cache_usage = 0.0;
+        double residency_weight = 0.0;
+    };
+
+    // Distribute locally-scraped cache state: upsert residency into every shard's
+    // residency cache (so routing on every shard sees it) AND gossip each
+    // backend's CACHE_STATE to cluster peers. Called by HealthService::run_loop()
+    // on shard 0 after scraping vLLM /metrics.
+    // Takes map by value (Rule #22: coroutine params by value).
+    static seastar::future<> broadcast_cache_state_global(
+        absl::flat_hash_map<BackendId, CacheStateSample> samples);
+
+    // Apply a peer-reported cache-residency sample received via gossip: upsert
+    // the residency weight into every shard's residency cache. Called from the
+    // gossip CACHE_STATE callback (shard 0). Does NOT re-gossip (no echo).
+    // Takes params by value (Rule #22: coroutine params by value).
+    static seastar::future<> apply_peer_cache_state(
+        BackendId backend_id, double cache_usage, double residency_weight);
+
     // Flush locally-buffered routes to all shards (runs on calling shard)
     // Deduplicates within the batch, broadcasts via parallel_for_each,
     // and submits gossip batch to shard 0
@@ -626,6 +651,10 @@ public:
     // Set cache headroom (effective cache pressure) for a backend in shard-local state.
     // pressure: 0.0 (empty cache, full headroom) to 1.0 (full cache, no headroom).
     static void set_cache_headroom_for_testing(BackendId id, double pressure);
+
+    // Set cache residency weight for a backend in shard-local state.
+    // residency: 0.0 (prefix almost certainly evicted) to 1.0 (almost certainly resident).
+    static void set_residency_for_testing(BackendId id, double residency);
 
     // Remove a backend from shard-local state (bypasses async cross-shard broadcast).
     static void unregister_backend_for_testing(BackendId id);

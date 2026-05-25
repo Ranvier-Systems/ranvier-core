@@ -275,8 +275,10 @@ BENCHMARK OPTIONS:
                         Threshold = median * factor + floor.
     --vllm-version VER  Pin vLLM to a specific version (default: ${DEFAULT_VLLM_VERSION}).
                         Ensures reproducible benchmarks across instances.
-    --max-model-len N   Max sequence length for vLLM (reduces memory for large models)
-                        Example: --max-model-len 8192 for CodeLlama-13b on 40GB GPUs
+    --max-model-len N   Max sequence length for vLLM (reduces memory for large models).
+                        Auto-clamped to fit the KV cache when omitted, so models with a
+                        large native context (e.g. CodeLlama-13b @ 16384) start instead
+                        of OOMing on smaller GPUs. Pass a value to override the estimate.
     --tp N              Tensor parallelism size per vLLM instance (default: auto).
                         Auto-detected from GPU VRAM for large models (70B, 65B, 34B).
                         Override: --tp 4 for 70B on 40GB GPUs (2 backends).
@@ -608,24 +610,28 @@ fi
 # Tensor parallelism: compute number of vLLM instances (backends)
 TOTAL_GPUS=$GPUS
 
+# Detect GPU VRAM (in MiB) from nvidia-smi. Used for both tensor-parallel
+# sizing and the max-model-len autosizing further down.
+GPU_VRAM_MIB=""
+if command -v nvidia-smi &> /dev/null; then
+    GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+fi
+
+# Estimate model size (billions of params) from the model name (FP16 = 2 bytes/param).
+# Ordered longest-digit-first so e.g. 13B is not swallowed by the 3B rule and
+# 70B is not swallowed by the 7B rule.
+MODEL_PARAMS_B=""
+if   echo "$MODEL" | grep -qiP '(^|[-/._])70[bB]'; then MODEL_PARAMS_B=70
+elif echo "$MODEL" | grep -qiP '(^|[-/._])65[bB]'; then MODEL_PARAMS_B=65
+elif echo "$MODEL" | grep -qiP '(^|[-/._])34[bB]'; then MODEL_PARAMS_B=34
+elif echo "$MODEL" | grep -qiP '(^|[-/._])13[bB]'; then MODEL_PARAMS_B=13
+elif echo "$MODEL" | grep -qiP '(^|[-/._])8[bB]';  then MODEL_PARAMS_B=8
+elif echo "$MODEL" | grep -qiP '(^|[-/._])7[bB]';  then MODEL_PARAMS_B=7
+elif echo "$MODEL" | grep -qiP '(^|[-/._])3[bB]';  then MODEL_PARAMS_B=3
+fi
+
 # Auto-detect TP if not explicitly set and model appears to need it
 if [[ "$TP_SIZE" -eq 1 ]]; then
-    # Detect GPU VRAM (in MiB) from nvidia-smi
-    GPU_VRAM_MIB=""
-    if command -v nvidia-smi &> /dev/null; then
-        GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-    fi
-
-    # Estimate model weights from model name (FP16 = 2 bytes/param)
-    MODEL_PARAMS_B=""
-    if echo "$MODEL" | grep -qiP '(^|[-/])70[bB]'; then
-        MODEL_PARAMS_B=70
-    elif echo "$MODEL" | grep -qiP '(^|[-/])65[bB]'; then
-        MODEL_PARAMS_B=65
-    elif echo "$MODEL" | grep -qiP '(^|[-/])34[bB]'; then
-        MODEL_PARAMS_B=34
-    fi
-
     if [[ -n "$MODEL_PARAMS_B" && -n "$GPU_VRAM_MIB" && "$GPU_VRAM_MIB" -gt 0 ]]; then
         # Model weight size in MiB (FP16: params * 2 bytes, convert to MiB)
         MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))  # rough: 70B * 2B = 140GB ≈ 140000 MiB
@@ -687,6 +693,82 @@ if [[ "$TP_SIZE" -eq 1 ]]; then
                     log_info "Auto-set --max-model-len $MAX_MODEL_LEN (${KV_HEADROOM}MiB KV headroom)"
                 fi
             fi
+        fi
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Auto-size --max-model-len to fit the KV cache (when the user didn't pass it).
+#
+# Models such as CodeLlama-13b ship with a large native context (16384) whose
+# KV cache will not fit alongside the weights on smaller GPUs (e.g. 40GB A100),
+# so vLLM aborts at startup: "KV cache memory ... is larger than available".
+# We read the model's real attention config (so GQA / head_dim are exact),
+# estimate KV headroom for the chosen TP, and clamp ONLY when the native context
+# genuinely will not fit -- larger GPUs keep their full context untouched.
+# -----------------------------------------------------------------------------
+if [[ -z "$MAX_MODEL_LEN" && "$SKIP_VLLM" = false && "$DRY_RUN" = false \
+      && -n "$MODEL_PARAMS_B" && -n "$GPU_VRAM_MIB" && "$GPU_VRAM_MIB" -gt 0 ]]; then
+
+    # KV bytes/token and native context length, derived from the model config.
+    # Prints "<kv_bytes_per_token> <native_ctx>"; stays empty on any failure
+    # (missing transformers, gated model, network) so we simply skip the clamp.
+    KV_INFO=$(HF_TOKEN="${HF_TOKEN:-}" python3 -c '
+import sys
+try:
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(sys.argv[1])
+    def pick(*names, default=None):
+        for n in names:
+            v = getattr(cfg, n, None)
+            if v:
+                return v
+        return default
+    layers   = pick("num_hidden_layers", "n_layer")
+    heads    = pick("num_attention_heads", "n_head")
+    hidden   = pick("hidden_size", "n_embd")
+    kv_heads = pick("num_key_value_heads", default=heads)
+    head_dim = pick("head_dim", default=(hidden // heads if hidden and heads else None))
+    native   = pick("max_position_embeddings", "n_positions", default=0)
+    if not (layers and kv_heads and head_dim):
+        raise ValueError("missing attention dims")
+    # fp16/bf16: 2 bytes * 2 (K and V) * layers * kv_heads * head_dim
+    print("%d %d" % (2 * 2 * int(layers) * int(kv_heads) * int(head_dim), int(native or 0)))
+except Exception:
+    pass
+' "$MODEL" 2>/dev/null || true)
+
+    KV_BYTES_PER_TOK="${KV_INFO%% *}"
+    NATIVE_CTX="${KV_INFO##* }"
+
+    if [[ -n "$KV_INFO" && "$KV_BYTES_PER_TOK" =~ ^[0-9]+$ && "$KV_BYTES_PER_TOK" -gt 0 ]]; then
+        # KV headroom (MiB) = VRAM*util - weights/TP - activation/graph reserve.
+        MODEL_WEIGHT_MIB=$(( MODEL_PARAMS_B * 2 * 1000 ))
+        WEIGHT_PER_GPU=$(( MODEL_WEIGHT_MIB / TP_SIZE ))
+        if command -v bc &> /dev/null; then
+            BUDGET_MIB=$(echo "$GPU_VRAM_MIB * $GPU_MEM_UTIL" | bc | cut -d. -f1)
+        else
+            BUDGET_MIB=$(( GPU_VRAM_MIB * 85 / 100 ))
+        fi
+        KV_HEADROOM_MIB=$(( BUDGET_MIB - WEIGHT_PER_GPU - 1024 ))
+
+        if [[ $KV_HEADROOM_MIB -gt 0 ]]; then
+            # Tokens whose KV cache fits in the headroom.
+            FIT_TOKENS=$(( KV_HEADROOM_MIB * 1024 * 1024 / KV_BYTES_PER_TOK ))
+            if [[ "$NATIVE_CTX" =~ ^[0-9]+$ && "$NATIVE_CTX" -gt 0 && "$FIT_TOKENS" -ge "$NATIVE_CTX" ]]; then
+                : # native context already fits -- let vLLM use the model default
+            else
+                # Apply a 10% safety margin and round down to a multiple of 256.
+                SAFE_LEN=$(( (FIT_TOKENS * 9 / 10 / 256) * 256 ))
+                if [[ $SAFE_LEN -ge 2048 ]]; then
+                    MAX_MODEL_LEN=$SAFE_LEN
+                    log_ok "Auto-set --max-model-len $MAX_MODEL_LEN (${MODEL_PARAMS_B}B model, ${KV_HEADROOM_MIB}MiB KV headroom on ${GPU_VRAM_MIB}MiB GPUs, native ctx ${NATIVE_CTX})"
+                else
+                    log_warn "KV headroom (${KV_HEADROOM_MIB}MiB) too low for ${MODEL_PARAMS_B}B weights; consider --tp 2 or a smaller model"
+                fi
+            fi
+        else
+            log_warn "Weights leave no KV headroom at --gpu-mem-util $GPU_MEM_UTIL; consider --tp 2"
         fi
     fi
 fi

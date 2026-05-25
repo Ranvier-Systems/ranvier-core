@@ -43,9 +43,14 @@ from conftest import (
     get_all_metrics,
     get_compose_cmd,
     get_metric_value,
+    metric_is_registered,
+    register_backends,
     run_compose,
+    send_chat_request,
+    sum_metric_by_substring,
     wait_for_healthy,
     DOCKER_HOST,
+    MOCK_BACKEND_PORTS,
 )
 
 
@@ -412,6 +417,191 @@ class ClusterIntegrationTest(ClusterTestCase):
             )
 
         print("  PASSED: Cluster recovered successfully")
+
+    def test_08_cache_state_gossip_and_rolling_upgrade_safety(self):
+        """CACHE_STATE gossip propagates and never harms peer health.
+
+        Validates the cache-residency feature's cluster behavior:
+          - CACHE_STATE packets flow between nodes (informational counts).
+          - No node accounts a peer's traffic as an *unknown packet type*
+            (all nodes in this homogeneous cluster understand 0x06). The
+            unknown-type counter is the rolling-upgrade safety signal: an
+            old node receiving a type it predates increments it and stays
+            healthy. Here it must stay at 0 — there are no unknown types.
+          - cluster_peers_alive is unchanged: residency traffic never marks
+            a peer unhealthy.
+        """
+        print("\nTest: CACHE_STATE gossip + rolling-upgrade safety")
+
+        self._require_residency_preconditions()
+
+        # Poll for CACHE_STATE traffic. The mock backends now expose
+        # vLLM-style /metrics, so the node(s) that scrape them (node1 holds the
+        # registered backends) emit CACHE_STATE and peers receive it. Substring
+        # sums tolerate the Prometheus/Seastar name prefix and per-shard series.
+        deadline = time.time() + PROPAGATION_TIMEOUT + 20
+        total_sent = total_recv = 0.0
+        while time.time() < deadline:
+            total_sent = sum(
+                sum_metric_by_substring(ep["metrics"], "gossip_cache_states_sent_total")
+                for ep in NODES.values())
+            total_recv = sum(
+                sum_metric_by_substring(ep["metrics"], "gossip_cache_states_received_total")
+                for ep in NODES.values())
+            if total_sent > 0 and total_recv > 0:
+                break
+            time.sleep(2)
+
+        print(f"  cluster totals: cache_states_sent={total_sent}, "
+              f"cache_states_received={total_recv}")
+        self.assertGreater(
+            total_sent, 0.0,
+            "no node emitted CACHE_STATE — is vLLM /metrics scraping reaching the "
+            "mock backends? (check health.enable_vllm_metrics + backend registration)")
+        self.assertGreater(
+            total_recv, 0.0,
+            "no node received CACHE_STATE from a peer — gossip propagation failed")
+
+        for name, endpoints in NODES.items():
+            url = endpoints["metrics"]
+            # Rolling-upgrade safety: in a homogeneous cluster every node
+            # understands CACHE_STATE (0x06), so the unknown-type counter — the
+            # signal an older node would bump when ignoring a type it predates —
+            # must total zero across all shards.
+            unknown_total = sum_metric_by_substring(url, "cluster_unknown_packet_types")
+            print(f"  {name}: cluster_unknown_packet_types(total)={unknown_total}")
+            self.assertEqual(
+                unknown_total, 0.0,
+                f"{name} accounted {unknown_total} unknown packet types; all nodes "
+                f"in this cluster understand CACHE_STATE (0x06)")
+
+            # Residency traffic must not affect peer liveness.
+            peers_alive = get_metric_value(url, "cluster_peers_alive")
+            self.assertEqual(peers_alive, 2.0,
+                             f"{name} should still have 2 peers after cache-state gossip")
+
+        print("  PASSED: CACHE_STATE propagates; peers healthy; no unknown types")
+
+    _STALE_MOCK_MSG = (
+        "mock backend image predates the /metrics + /admin/cache-usage endpoints. "
+        "The harness reuses a cached image, so force a rebuild first:\n"
+        "  docker compose -f docker-compose.test.yml build backend1 backend2\n"
+        "then re-run this test."
+    )
+
+    def _require_residency_preconditions(self):
+        """Skip-or-fail-fast guard shared by the cache-residency tests.
+
+        These tests must work standalone (``pytest -k``) as well as inside the
+        ordered full suite, so they can't rely on ``test_02`` having registered
+        backends. This:
+          1. skips if the mock image predates the /metrics endpoint,
+          2. skips if the Ranvier image predates the feature (the cache-state
+             counters aren't even registered — a stale ``ranvier:latest``),
+          3. registers the mock backends on node1 so there is something to
+             scrape (idempotent — safe when the full suite already did it).
+        """
+        if not self._mock_backend_has_metrics():
+            self.skipTest(self._STALE_MOCK_MSG)
+
+        node1 = NODES["node1"]
+        if not metric_is_registered(node1["metrics"], "gossip_cache_states_sent_total"):
+            self.skipTest(
+                "Ranvier image predates the cache-residency feature "
+                "(gossip_cache_states_sent_total is not registered). Rebuild it:\n"
+                "  docker compose -f docker-compose.test.yml build ranvier1\n"
+                "then re-run this test.")
+
+        self.assertTrue(
+            register_backends(node1["api"]),
+            "failed to register mock backends on node1")
+
+    def _mock_backend_has_metrics(self):
+        """True if the running mock image serves the vLLM /metrics endpoint.
+
+        Guards against a stale ``ranvier-mock-backend`` image: the harness skips
+        the build whenever an image already exists, so a mock predating the
+        ``/metrics`` + ``/admin/cache-usage`` endpoints would otherwise surface
+        as a cryptic 'no CACHE_STATE emitted' / 404 failure.
+        """
+        for host_port in MOCK_BACKEND_PORTS.values():
+            try:
+                resp = requests.get(
+                    f"http://{DOCKER_HOST}:{host_port}/metrics", timeout=5)
+                if resp.status_code == 200 and "vllm:gpu_cache_usage_perc" in resp.text:
+                    return True
+            except requests.exceptions.RequestException:
+                pass
+        return False
+
+    def _set_backend_cache_usage(self, perc):
+        """Set reported KV-cache usage on every mock backend (direct admin POST)."""
+        ok = True
+        for backend_id, host_port in MOCK_BACKEND_PORTS.items():
+            url = f"http://{DOCKER_HOST}:{host_port}/admin/cache-usage"
+            try:
+                resp = requests.post(url, params={"perc": perc}, timeout=5)
+                if resp.status_code != 200:
+                    print(f"    backend {backend_id}: cache-usage set failed "
+                          f"({resp.status_code})")
+                    ok = False
+            except requests.exceptions.RequestException as e:
+                print(f"    backend {backend_id}: cache-usage set error: {e}")
+                ok = False
+        return ok
+
+    def test_09_residency_downgrade_end_to_end(self):
+        """Driving backends cache-cold downgrades ART prefix hits to load-based.
+
+        With every backend reporting high KV-cache usage, residency = 1 - usage
+        falls below the default threshold (0.2). A learned prefix route then
+        ART-hits a cache-cold backend, so the router treats it as a likely miss
+        and diverts — incrementing router_residency_route_downgrades_total.
+        """
+        print("\nTest: residency-driven route downgrade (end-to-end)")
+
+        self._require_residency_preconditions()
+
+        node1 = NODES["node1"]
+        baseline = sum_metric_by_substring(
+            node1["metrics"], "router_residency_route_downgrades_total")
+        print(f"  baseline downgrades on node1: {baseline}")
+
+        # Make every backend look cache-cold (residency ~= 0.01).
+        self.assertTrue(self._set_backend_cache_usage(0.99),
+                        "failed to set cache usage on mock backends")
+        try:
+            # Let node1 scrape the new usage and refresh its residency cache
+            # (check_interval is ~2s; allow a couple of cycles).
+            time.sleep(6)
+
+            # Send the SAME prompt repeatedly: the first learns a route, later
+            # ones ART-hit the (now cache-cold) backend and get downgraded.
+            messages = [{
+                "role": "user",
+                "content": "Residency downgrade probe: a stable shared prefix "
+                           "used to learn and then re-hit the same ART route.",
+            }]
+            downgrades = baseline
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                send_chat_request(node1["api"], messages, timeout=30, retries=1)
+                time.sleep(1)
+                downgrades = sum_metric_by_substring(
+                    node1["metrics"], "router_residency_route_downgrades_total")
+                if downgrades > baseline:
+                    break
+
+            print(f"  downgrades after probing: {downgrades}")
+            self.assertGreater(
+                downgrades, baseline,
+                "expected at least one residency-driven downgrade once backends "
+                "were cache-cold and a prefix route had been learned")
+        finally:
+            # Restore empty-cache state so later/other suites aren't affected.
+            self._set_backend_cache_usage(0.0)
+
+        print("  PASSED: cache-cold ART hits downgraded to load-based selection")
 
 
 def main():

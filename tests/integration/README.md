@@ -12,6 +12,11 @@ The integration tests use Docker Compose to spin up a 3-node Ranvier cluster wit
 4. **Gossip Propagation**: Learned routes are propagated to other nodes via UDP gossip
 5. **Peer Failure Detection**: When a node goes down, others detect it and prune routes
 6. **Cluster Recovery**: When a node rejoins, the cluster recovers
+7. **Cache-Residency Routing**: Backends' KV-cache state is gossiped (CACHE_STATE)
+   and a cache-cold backend's learned prefix routes are downgraded to load-based
+   selection (`test_08`/`test_09` in `test_cluster.py`). The mock backend exposes
+   a vLLM-style `GET /metrics` whose `vllm:gpu_cache_usage_perc` is settable at
+   runtime via `POST /admin/cache-usage?perc=N`.
 
 ## Architecture
 

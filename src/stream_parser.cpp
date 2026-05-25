@@ -12,6 +12,16 @@
 
 namespace ranvier {
 
+// HTTP status-code constants for status-line parsing. The codebase has no
+// shared HTTP-status header, and Seastar's status_type enum (used elsewhere
+// only for set_status) has no notion of the valid-range bounds, so these are
+// defined locally.
+namespace {
+constexpr int kHttpStatusOk = 200;        // 200 OK — drives header_snoop_success
+constexpr int kMinValidHttpStatus = 100;  // lowest well-formed HTTP status
+constexpr int kMaxValidHttpStatus = 599;  // highest well-formed HTTP status
+}  // namespace
+
 StreamParser::Result StreamParser::push(seastar::temporary_buffer<char> chunk) {
     Result res;
 
@@ -151,10 +161,33 @@ ssize_t StreamParser::parse_headers(Result& res) {
     // Extract headers for status snoop
     auto headers = view.substr(0, header_end);
 
-    // Check for HTTP 200 OK status
-    // Format: "HTTP/1.1 200 OK" or "HTTP/1.0 200 ..."
-    // We look for " 200 " which handles various HTTP versions
-    res.header_snoop_success = (headers.find(" 200 ") != std::string_view::npos);
+    // Parse the numeric status code from the status line.
+    // Format: "HTTP/1.1 200 OK" or "HTTP/1.0 503 Service Unavailable".
+    // The status line is the first line of the header block; the code is the
+    // token after the first space. Parsing the actual code (rather than a
+    // " 200 " substring search) lets the proxy record the backend's real
+    // status for per-request attribution, and is robust against a "200"
+    // appearing inside a later header value.
+    {
+        auto status_line = headers.substr(0, headers.find("\r\n"));
+        auto sp = status_line.find(' ');
+        if (sp != std::string_view::npos && sp + 1 < status_line.size()) {
+            auto rest = status_line.substr(sp + 1);
+            int code = 0;
+            auto first = rest.data();
+            auto last = rest.data() + rest.size();
+            auto [ptr, ec] = std::from_chars(first, last, code);
+            // Accept only a well-formed status code in the valid HTTP range.
+            if (ec == std::errc{} && ptr != first &&
+                code >= kMinValidHttpStatus && code <= kMaxValidHttpStatus) {
+                res.backend_status_code = code;
+            }
+        }
+    }
+
+    // header_snoop_success preserves the prior semantics: true iff the backend
+    // returned 200 OK (drives circuit-breaker success + route learning).
+    res.header_snoop_success = (res.backend_status_code == kHttpStatusOk);
 
     // Determine transfer encoding: chunked vs Content-Length.
     // Ollama (and some other backends) send non-chunked responses with Content-Length.

@@ -39,6 +39,14 @@ Test-only knobs (all default to off so the happy path is unchanged):
       (header), the first SSE chunk's ``delta.content`` is the first 32
       characters of the last user message instead of the canned text. The
       remaining chunks and the ``[DONE]`` sentinel are unchanged.
+
+* vLLM metrics / KV-cache usage
+    - ``GET /metrics`` serves a minimal vLLM-style Prometheus page exposing
+      ``vllm:gpu_cache_usage_perc`` so Ranvier's HealthService scrape and
+      cache-residency routing have real data to act on.
+    - ``MOCK_GPU_CACHE_USAGE`` env var: initial usage fraction (0.0-1.0).
+    - ``POST /admin/cache-usage?perc=N``: update the reported usage at runtime
+      (residency = 1 - usage; high usage makes this backend look cache-cold).
 """
 
 import json
@@ -74,6 +82,25 @@ _latency_ms = max(0, int(os.environ.get("MOCK_LATENCY_MS", "0") or "0"))
 _failure_mode = "none"  # one of VALID_FAILURE_MODES
 _prefix_echo_enabled = os.environ.get("MOCK_PREFIX_ECHO", "0") == "1"
 
+
+def _clamp_unit(value: float) -> float:
+    """Clamp a value to the [0.0, 1.0] range used by KV-cache usage."""
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+# KV-cache usage fraction reported on GET /metrics as
+# ``vllm:gpu_cache_usage_perc``. Drives Ranvier's cache-residency routing
+# (residency = 1 - usage). Default 0.0 (empty cache, full residency); set per
+# backend via ``MOCK_GPU_CACHE_USAGE`` or at runtime via
+# ``POST /admin/cache-usage?perc=N``.
+_gpu_cache_usage = _clamp_unit(
+    float(os.environ.get("MOCK_GPU_CACHE_USAGE", "0") or "0")
+)
+
 VALID_FAILURE_MODES = frozenset(
     {"none", "status_500", "status_503", "timeout", "reset"}
 )
@@ -99,6 +126,7 @@ def _snapshot_state():
             "latency_ms": _latency_ms,
             "failure_mode": _failure_mode,
             "prefix_echo": _prefix_echo_enabled,
+            "gpu_cache_usage": _gpu_cache_usage,
         }
 
 
@@ -167,6 +195,8 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         elif parsed.path == "/debug/requests":
             self._handle_debug_requests_get()
+        elif parsed.path == "/metrics":
+            self._handle_metrics()
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -197,6 +227,8 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             self._handle_admin_failure_mode()
         elif parsed.path == "/admin/prefix-echo":
             self._handle_admin_prefix_echo()
+        elif parsed.path == "/admin/cache-usage":
+            self._handle_admin_cache_usage()
         else:
             print(f"[Backend {BACKEND_ID}] Unknown path: {parsed.path}", flush=True)
             self.send_response(404)
@@ -261,6 +293,57 @@ class MockBackendHandler(BaseHTTPRequestHandler):
             _prefix_echo_enabled = enabled
         print(f"[Backend {BACKEND_ID}] Prefix echo set to: {enabled}", flush=True)
         self._send_json(200, {"prefix_echo": enabled})
+
+    def _handle_admin_cache_usage(self):
+        """Set reported KV-cache usage. POST /admin/cache-usage?perc=N (0.0-1.0)
+
+        Drives Ranvier's cache-residency routing: residency = 1 - usage, so a
+        high value makes this backend look cache-cold and its learned prefix
+        routes get downgraded to load-based selection.
+        """
+        global _gpu_cache_usage
+        params = parse_qs(urlparse(self.path).query)
+        raw = params.get("perc", ["0"])[0]
+        try:
+            perc = _clamp_unit(float(raw))
+        except ValueError:
+            self._send_json(400, {"error": f"invalid perc: {raw!r}"})
+            return
+        with _state_lock:
+            _gpu_cache_usage = perc
+        print(f"[Backend {BACKEND_ID}] GPU cache usage set to: {perc}", flush=True)
+        self._send_json(200, {"gpu_cache_usage": perc})
+
+    # ---- /metrics (vLLM-style Prometheus exposition) -------------------------
+
+    def _handle_metrics(self):
+        """Serve a minimal vLLM-style Prometheus metrics page.
+
+        Ranvier's HealthService scrapes GET /metrics and parses
+        ``vllm:gpu_cache_usage_perc`` (plus request-load gauges). Only the
+        fields Ranvier reads are emitted; the value is the admin-controlled
+        ``_gpu_cache_usage``.
+        """
+        with _state_lock:
+            usage = _gpu_cache_usage
+        body = (
+            "# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage fraction\n"
+            "# TYPE vllm:gpu_cache_usage_perc gauge\n"
+            f"vllm:gpu_cache_usage_perc {usage:.4f}\n"
+            "# HELP vllm:num_requests_running Running requests\n"
+            "# TYPE vllm:num_requests_running gauge\n"
+            "vllm:num_requests_running 0\n"
+            "# HELP vllm:num_requests_waiting Waiting requests\n"
+            "# TYPE vllm:num_requests_waiting gauge\n"
+            "vllm:num_requests_waiting 0\n"
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
 
     # ---- /debug/requests -----------------------------------------------------
 

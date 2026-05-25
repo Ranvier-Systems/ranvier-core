@@ -90,6 +90,15 @@ public:
     // Set callback for handling received cache eviction notifications from peers
     void set_cache_eviction_callback(CacheEvictionCallback callback);
 
+    // Broadcast a backend's cache-residency state to all peers.
+    // Called from HealthService (shard 0) after scraping vLLM /metrics so peers
+    // can discount stale prefix routes pointing at a now cache-cold backend.
+    seastar::future<> broadcast_cache_state(BackendId backend_id, double cache_usage,
+                                            double residency_weight);
+
+    // Set callback for handling received cache-state notifications from peers
+    void set_cache_state_callback(CacheStateCallback callback);
+
     // Check if gossip is enabled
     bool is_enabled() const { return _config.enabled; }
 

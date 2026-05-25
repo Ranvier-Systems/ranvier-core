@@ -244,7 +244,8 @@ seastar::future<TokenizationResult> TokenizerService::encode_cached_async(std::s
         co_return tokenize_locally(text);
     }
 
-    // Select target shard via P2C
+    // Round-robin to the next shard. A load-aware P2C balancer is wired up via
+    // set_cross_shard_refs() but is not yet used for selection here.
     uint32_t target_shard = select_tokenization_shard();
 
     if (target_shard == local_shard) {
