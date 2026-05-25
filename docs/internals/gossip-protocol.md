@@ -21,6 +21,16 @@ Ranvier uses a custom UDP-based gossip protocol to propagate route announcements
 | `ROUTE_ACK` | `0x03` | Acknowledgment for route announcement |
 | `NODE_STATE` | `0x04` | Backend lifecycle change (e.g. `ACTIVE` → `DRAINING`) |
 | `CACHE_EVICTION` | `0x05` | Cluster-wide cache eviction notification |
+| `CACHE_STATE` | `0x06` | Per-backend KV-cache residency state (residency-aware routing) |
+
+**Unknown packet types (rolling-upgrade safety).** A node that receives a type
+tag it does not recognize — e.g. a newer peer emitting a packet type this binary
+predates — ignores it cleanly: peer liveness is still updated (the peer stays
+healthy / counted in `cluster_peers_alive`), the packet is dropped, and the
+`cluster_unknown_packet_types` counter is incremented. This is kept distinct from
+`router_cluster_sync_invalid`, which counts *malformed* packets of a *known*
+type. The single source of truth for "do I understand this tag" is
+`is_known_packet_type()` in `gossip_protocol.hpp`.
 
 ## Wire Formats
 
@@ -147,6 +157,53 @@ routing pool before in-flight requests complete.
 
 Sent by `HttpController` when a local KV-cache eviction is observed and
 `cache_events.propagate_via_gossip` is enabled.
+
+### Cache State
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |    Version    |          Backend ID           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Backend ID (cont)         |  Cache Usage  |  Residency     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| Field | Offset | Size | Description |
+|-------|--------|------|-------------|
+| Type | 0 | 1 byte | `0x06` (CACHE_STATE) |
+| Version | 1 | 1 byte | Protocol version (`0x01`) |
+| Backend ID | 2 | 4 bytes | Backend this state describes |
+| Cache Usage | 6 | 2 bytes | KV-cache fullness `[0,1]`, uint16 fixed-point (`value * 65535`) |
+| Residency Weight | 8 | 2 bytes | Estimated prefix retention `[0,1]`, uint16 fixed-point |
+
+**Packet size**: 10 bytes minimum.
+
+**Extensibility.** `deserialize()` accepts `len >= 10` (not `== 10`) and reads
+only the fields it knows, ignoring any trailing bytes. A future protocol version
+may append additional per-node aggregate signals (bumping `Version`) without a
+breaking format change — older nodes transparently skip the new tail. For the
+same reason `Version` is recorded but not used to reject the packet; the
+*type tag* is the rejection boundary (see unknown-packet-type handling above).
+
+**Reliability.** Broadcast unreliably (no sequence number, no ACK). Cache state
+is periodic, idempotent, latest-value-wins state — a dropped update is corrected
+by the next scrape cycle rather than retried, which keeps the pending-ACK table
+and per-tick payload bounded.
+
+Sent by `HealthService` (shard 0) once per health-scrape cycle for each backend
+with valid vLLM metrics. `cache_usage` is `vllm:gpu_cache_usage_perc`;
+`residency_weight` is `1 - effective_cache_pressure` (compression-adjusted).
+Receivers upsert the residency weight into every shard's residency cache; the
+router consults it on an ART prefix hit to discount stale routes (see
+`docs/internals/cache-residency-routing.md`).
+
+**Payload budget.** With `B` locally-scraped backends, steady-state per scrape
+cycle adds `B` CACHE_STATE packets (10 bytes payload each, plus DTLS framing
+when enabled) per peer. For a typical node (`B ≤ 16`) at the default 5 s health
+interval this is well under 200 bytes/peer/cycle — negligible against the
+heartbeat and route-announcement traffic already on the wire.
 
 ## DTLS Encryption
 
@@ -692,6 +749,14 @@ for development; they are marked **(debug-only)** in the tables below.
 | `ranvier_cluster_node_state_received` | Counter | NODE_STATE packets received from peers |
 | `ranvier_gossip_cache_evictions_sent_total` | Counter | CACHE_EVICTION packets broadcast |
 | `ranvier_gossip_cache_evictions_received_total` | Counter | CACHE_EVICTION packets received from peers |
+| `ranvier_gossip_cache_states_sent_total` | Counter | CACHE_STATE packets broadcast |
+| `ranvier_gossip_cache_states_received_total` | Counter | CACHE_STATE packets received from peers |
+| `ranvier_cluster_unknown_packet_types` | Counter | Packets ignored due to an unrecognized type tag (rolling-upgrade safety; peer stays healthy) |
+
+The router-side counter `ranvier_router_residency_route_downgrades_total` (on
+port 9180 under the `ranvier_router` group) tracks how often a CACHE_STATE
+signal caused an ART prefix hit to be downgraded to load-based selection. See
+`docs/internals/cache-residency-routing.md`.
 
 ### Peer Health
 

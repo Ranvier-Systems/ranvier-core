@@ -413,6 +413,48 @@ class ClusterIntegrationTest(ClusterTestCase):
 
         print("  PASSED: Cluster recovered successfully")
 
+    def test_08_cache_state_gossip_and_rolling_upgrade_safety(self):
+        """CACHE_STATE gossip propagates and never harms peer health.
+
+        Validates the cache-residency feature's cluster behavior:
+          - CACHE_STATE packets flow between nodes (informational counts).
+          - No node accounts a peer's traffic as an *unknown packet type*
+            (all nodes in this homogeneous cluster understand 0x06). The
+            unknown-type counter is the rolling-upgrade safety signal: an
+            old node receiving a type it predates increments it and stays
+            healthy. Here it must stay at 0 — there are no unknown types.
+          - cluster_peers_alive is unchanged: residency traffic never marks
+            a peer unhealthy.
+        """
+        print("\nTest: CACHE_STATE gossip + rolling-upgrade safety")
+
+        # Allow at least one health-scrape cycle to emit CACHE_STATE packets.
+        print(f"  Waiting {PROPAGATION_TIMEOUT}s for cache-state gossip...")
+        time.sleep(PROPAGATION_TIMEOUT)
+
+        for name, endpoints in NODES.items():
+            metrics = get_all_metrics(endpoints["metrics"])
+            cs_sent = metrics.get("gossip_cache_states_sent_total", [0])[0]
+            cs_recv = metrics.get("gossip_cache_states_received_total", [0])[0]
+            print(f"  {name}: cache_states_sent={cs_sent}, cache_states_received={cs_recv}")
+
+            # Rolling-upgrade safety: no spurious unknown-type accounting in a
+            # homogeneous cluster. If the metric is absent we skip (older build).
+            unknown = get_metric_value(endpoints["metrics"], "cluster_unknown_packet_types")
+            if unknown is not None:
+                print(f"  {name}: cluster_unknown_packet_types={unknown}")
+                self.assertEqual(
+                    unknown, 0.0,
+                    f"{name} accounted {unknown} unknown packet types; all nodes "
+                    f"in this cluster understand CACHE_STATE (0x06)")
+
+            # Residency traffic must not affect peer liveness.
+            peers_alive = get_metric_value(endpoints["metrics"], "cluster_peers_alive")
+            self.assertEqual(peers_alive, 2.0,
+                             f"{name} should still have 2 peers after cache-state gossip")
+
+        print("  PASSED: cache-state gossip healthy, peers unaffected")
+
 
 def main():
     """Run the integration tests."""

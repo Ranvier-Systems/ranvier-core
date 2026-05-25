@@ -207,6 +207,28 @@ struct RoutingConfig {
     double capacity_headroom_weight = 5.0;  // Env: RANVIER_CAPACITY_HEADROOM_WEIGHT
 
     // =========================================================================
+    // Cache-Residency-Aware Routing
+    // =========================================================================
+    // An ART prefix route records the backend that last *served* a prefix, but
+    // not whether that backend still *holds* it in KV cache. Under cache
+    // pressure the backend may have evicted the prefix, so honoring the route
+    // pays a cache miss while believing we got a hit. When cluster peers gossip
+    // their cache-residency state (CACHE_STATE packets), the router consults the
+    // candidate backend's residency weight on an ART hit: if it falls below this
+    // threshold, the route is treated as a likely miss and the request falls
+    // back to load-based selection, skipping the cache-cold backend.
+    //
+    // residency_weight is 1 - effective_cache_pressure, so the threshold reads
+    // as "minimum estimated probability the prefix still resides". Default 0.2
+    // means: only downgrade when the backend's effective cache is >~80% full —
+    // a strong, conservative signal that the learned prefix was likely evicted.
+    // Set to 0.0 to disable residency-aware downgrades entirely (routes are
+    // always honored on an ART hit, the pre-feature behavior). Backends with no
+    // residency data reported (e.g. peers running an older build, or non-vLLM
+    // backends) are never downgraded. Valid range: 0.0–1.0.
+    double cache_residency_threshold = 0.2;  // Env: RANVIER_CACHE_RESIDENCY_THRESHOLD
+
+    // =========================================================================
     // Compression-Aware Route TTL
     // =========================================================================
     // Routes to compressed backends survive longer in the ART because their

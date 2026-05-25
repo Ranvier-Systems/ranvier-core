@@ -179,6 +179,8 @@ struct ShardLocalState {
         uint64_t cost_released_total = 0;           // Total cost releases made
         // Capacity-aware hash fallback stats
         uint64_t headroom_redirects = 0;            // Times cache headroom changed backend selection
+        // Cache-residency-aware routing stats
+        uint64_t residency_downgrades = 0;          // ART hits downgraded due to low gossiped residency
 
         void reset() {
             cache_hits = 0;
@@ -209,6 +211,7 @@ struct ShardLocalState {
             cost_reserved_total = 0;
             cost_released_total = 0;
             headroom_redirects = 0;
+            residency_downgrades = 0;
         }
     } stats;
 
@@ -247,6 +250,9 @@ struct ShardLocalState {
         double capacity_headroom_weight = 5.0;
         // Compression-aware route TTL
         double max_ttl_multiplier = 4.0;
+        // Cache-residency-aware routing: minimum gossiped residency below which
+        // an ART prefix hit is treated as a likely miss. 0.0 disables.
+        double cache_residency_threshold = 0.2;
     } config;
 
     // ========================================================================
@@ -306,6 +312,47 @@ struct ShardLocalState {
         std::chrono::steady_clock::time_point updated_at;
         static constexpr size_t MAX_ENTRIES = 256;         // Hard Rule #4
     } cache_headroom_cache;
+
+    // ========================================================================
+    // Cache Residency Cache (per-shard; sourced from gossiped CACHE_STATE)
+    // ========================================================================
+    // Per-backend estimated prefix retention (0.0–1.0): the probability that a
+    // previously-cached prefix still resides in that backend's KV cache. Higher
+    // means more likely resident. Populated from CACHE_STATE gossip packets
+    // (peer-reported) and from the local node's own vLLM scrape, distributed to
+    // all shards by broadcast_cache_state_global(). Read on the routing hot path
+    // to decide whether an ART prefix hit is still worth honoring.
+    //
+    // Freshness is tracked PER ENTRY (not map-global like the GPU/headroom
+    // caches): residency is fed by multiple independent sources — this node's
+    // own scrape and any number of gossiping peers — each touching a different
+    // subset of backends. A map-global timestamp with wholesale clear would let
+    // the local scrape wipe peer-reported backends (and vice versa). Per-entry
+    // upsert with per-entry staleness keeps every source's latest value alive
+    // until it ages out on its own. Hot-path reads are shard-local (Rule #1).
+    // Transient — never persisted.
+    struct ResidencyEntry {
+        double residency = 0.0;                            // residency_weight (0.0–1.0)
+        std::chrono::steady_clock::time_point updated_at;
+    };
+    struct ResidencyCache {
+        absl::flat_hash_map<BackendId, ResidencyEntry> entries;
+        static constexpr size_t MAX_ENTRIES = 256;         // Hard Rule #4
+    } residency_cache;
+
+    // Upsert one backend's residency on THIS shard (shard-local, lock-free).
+    // Bounded by MAX_ENTRIES; an update to an already-tracked backend always
+    // succeeds (refreshes value + timestamp) even at capacity.
+    void apply_residency(BackendId id, double residency_weight) {
+        auto& cache = residency_cache;
+        auto it = cache.entries.find(id);
+        if (it == cache.entries.end()) {
+            if (cache.entries.size() >= ResidencyCache::MAX_ENTRIES) return;
+            it = cache.entries.emplace(id, ResidencyEntry{}).first;
+        }
+        it->second.residency = residency_weight;
+        it->second.updated_at = std::chrono::steady_clock::now();
+    }
 
     // ========================================================================
     // Cross-Shard Load Synchronization
@@ -439,6 +486,8 @@ struct ShardLocalState {
         config.capacity_headroom_weight = cfg.capacity_headroom_weight;
         // Compression-aware route TTL
         config.max_ttl_multiplier = cfg.max_ttl_multiplier;
+        // Cache-residency-aware routing
+        config.cache_residency_threshold = cfg.cache_residency_threshold;
 
         // Pre-allocate cross-shard load snapshot storage (one entry per shard)
         // Resized to smp::count so we can index by shard_id without bounds checks.
@@ -487,6 +536,8 @@ struct ShardLocalState {
         config.capacity_headroom_weight = cfg.capacity_headroom_weight;
         // Compression-aware route TTL
         config.max_ttl_multiplier = cfg.max_ttl_multiplier;
+        // Cache-residency-aware routing
+        config.cache_residency_threshold = cfg.cache_residency_threshold;
     }
 
     // Reset all state (for testing or reconfiguration)
@@ -511,6 +562,9 @@ struct ShardLocalState {
 
         // Clear cache headroom cache
         cache_headroom_cache.pressure.clear();
+
+        // Clear cache residency cache
+        residency_cache.entries.clear();
 
         // Clear cross-shard load sync state
         for (auto& snapshot : shard_load_snapshots) {
@@ -819,6 +873,29 @@ static double get_cached_cache_pressure(BackendId id) {
     auto it = cache.pressure.find(id);
     if (it == cache.pressure.end()) return -1.0;
     return it->second;
+}
+
+// Get cached cache-residency weight (0.0–1.0) for a backend from the per-shard
+// residency cache, sourced from gossiped CACHE_STATE packets and the local
+// node's own scrape. Returns -1.0 when no usable value is available (no data,
+// stale cache, or backend not tracked) — callers treat -1.0 as "no signal,
+// honor the route as before". Reuses the GPU-load cache TTL for staleness since
+// both are refreshed on the same health-scrape cadence.
+//
+// Rule #1: Lock-free — shard-local read only, no cross-shard access.
+static double get_cached_residency(BackendId id) {
+    if (!g_shard_state) return -1.0;
+    auto& cache = g_shard_state->residency_cache;
+
+    auto it = cache.entries.find(id);
+    if (it == cache.entries.end()) return -1.0;
+
+    // Per-entry staleness: a residency value we haven't refreshed within the
+    // cache TTL is no longer trustworthy (the source node may be gone).
+    auto age = std::chrono::steady_clock::now() - it->second.updated_at;
+    if (age > g_shard_state->config.gpu_load_cache_ttl) return -1.0;
+
+    return it->second.residency;
 }
 
 // Compute capacity-adjusted load for a backend, blending composite load with
@@ -1417,6 +1494,15 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
                     prefix_hash, backend_id, now_ms).discard_result();
             });
 
+        // Set up callback to handle incoming cache-residency state from peers.
+        // Updates every shard's residency cache so routing can discount stale
+        // prefix routes pointing at a now cache-cold backend.
+        // NOTE: No `this` capture — apply_peer_cache_state is static.
+        _gossip->set_cache_state_callback(
+            [](BackendId backend_id, double cache_usage, double residency_weight) {
+                return RouterService::apply_peer_cache_state(backend_id, cache_usage, residency_weight);
+            });
+
         // Pre-allocate buffer for route batching to avoid reallocations during operation
         _pending_remote_routes.reserve(RouteBatchConfig::MAX_BATCH_SIZE);
 
@@ -1636,6 +1722,21 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         seastar::metrics::make_counter("router_gpu_load_redirects_total",
             [] { return g_shard_state ? g_shard_state->stats.gpu_load_redirects : 0UL; },
             seastar::metrics::description("Total GPU-load-driven routing redirects (vLLM metrics influenced decision)")),
+
+        // Counter: ART prefix hits downgraded to load-based selection because the
+        // owning backend's gossiped cache residency fell below the threshold.
+        seastar::metrics::make_counter("router_residency_route_downgrades_total",
+            [] { return g_shard_state ? g_shard_state->stats.residency_downgrades : 0UL; },
+            seastar::metrics::description("Total ART prefix hits downgraded due to low gossiped cache residency "
+                                         "(backend likely evicted the prefix from KV cache)")),
+
+        // Gauge: number of entries in per-shard cache-residency cache
+        seastar::metrics::make_gauge("router_residency_cache_size",
+            seastar::metrics::description("Number of backends tracked in the per-shard cache-residency cache"),
+            [] {
+                if (!g_shard_state) return static_cast<double>(0);
+                return static_cast<double>(g_shard_state->residency_cache.entries.size());
+            }),
 
         // Gauge: GPU load cache staleness in seconds
         seastar::metrics::make_gauge("router_gpu_load_cache_age_seconds",
@@ -2321,6 +2422,10 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
     // Hash values only computed in the hash fallback path; declared here for debug logging
     uint64_t prefix_hash = 0;
     int32_t hash_index = 0;
+    // Cache-residency downgrade: when an ART hit points at a backend whose
+    // gossiped residency is below threshold, we treat it as a likely miss and
+    // exclude that (cache-cold) backend from the load-based fallback. 0 = none.
+    BackendId residency_cold_backend = 0;
 
     // Step 1: Try ART lookup for longest prefix match
     RadixTree* tree = state.tree.get();
@@ -2333,20 +2438,49 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
 
             // Verify the backend is still live
             if (std::find(live_backends.begin(), live_backends.end(), art_backend) != live_backends.end()) {
-                // ART cache hit - route to learned backend
-                state.stats.cache_hits++;
-                state.stats.prefix_affinity_routes++;
-                if (g_metrics) {
-                    metrics().record_cache_hit();
-                    // Record prefix hit by compression tier
-                    auto bi = state.backends.find(art_backend);
-                    double cr = (bi != state.backends.end()) ? bi->second.compression_ratio : 1.0;
-                    metrics().record_prefix_hit_by_compression_tier(cr);
+                // Cache-residency check: the ART route records where the prefix
+                // was last *served*, not whether the backend still *holds* it in
+                // KV cache. If a cluster peer (or our own scrape) reports the
+                // backend's residency below the configured threshold, the prefix
+                // has likely been evicted under cache pressure — honoring the
+                // route would pay a cache miss while believing we hit. Treat it
+                // as a miss and fall through to load-based selection, skipping
+                // this cache-cold backend (only when an alternative exists).
+                double residency = -1.0;
+                if (state.config.cache_residency_threshold > 0.0) {
+                    residency = get_cached_residency(art_backend);
                 }
+                bool cache_cold = (residency >= 0.0 &&
+                                   residency < state.config.cache_residency_threshold);
 
-                selected = art_backend;
-                art_hit = true;
-                source = "ART";
+                if (cache_cold && live_backends.size() > 1) {
+                    // Likely-stale route: downgrade to the hash/load fallback.
+                    residency_cold_backend = art_backend;
+                    state.stats.residency_downgrades++;
+                    if (g_metrics) {
+                        metrics().record_residency_downgrade();
+                    }
+                    log_router.debug("[{}] ART backend {} cache-cold (residency={:.2f} < {:.2f}); "
+                                     "downgrading prefix hit to load-based selection",
+                                     request_id, art_backend, residency,
+                                     state.config.cache_residency_threshold);
+                    // Leave art_hit=false so Step 2 runs the load-based fallback.
+                } else {
+                    // ART cache hit - route to learned backend
+                    state.stats.cache_hits++;
+                    state.stats.prefix_affinity_routes++;
+                    if (g_metrics) {
+                        metrics().record_cache_hit();
+                        // Record prefix hit by compression tier
+                        auto bi = state.backends.find(art_backend);
+                        double cr = (bi != state.backends.end()) ? bi->second.compression_ratio : 1.0;
+                        metrics().record_prefix_hit_by_compression_tier(cr);
+                    }
+
+                    selected = art_backend;
+                    art_hit = true;
+                    source = "ART";
+                }
             } else {
                 // Backend is dead/draining, fall through to hash-based selection
                 log_router.debug("[{}] ART backend {} is unavailable, using hash fallback",
@@ -2355,16 +2489,30 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
         }
     }
 
-    // Step 2: No ART match (or backend unavailable) — hash fallback.
-    // Dispatch to configured hash strategy.
+    // Step 2: No ART match (or backend unavailable, or residency-downgraded) —
+    // hash fallback. Dispatch to configured hash strategy.
     if (!art_hit) {
         prefix_hash = hash_prefix(tokens.data(), prefix_len, state.config.block_alignment);
+
+        // When the ART hit was downgraded for low residency, drop the cache-cold
+        // backend from the candidate set so the load-based fallback routes
+        // elsewhere. The downgrade path above only fires when live_backends.size()
+        // > 1, so the filtered list is always non-empty here.
+        const std::vector<BackendId>* candidates = &live_backends;
+        std::vector<BackendId> filtered;
+        if (residency_cold_backend != 0 && live_backends.size() > 1) {
+            filtered.reserve(live_backends.size() - 1);
+            for (BackendId id : live_backends) {
+                if (id != residency_cold_backend) filtered.push_back(id);
+            }
+            candidates = &filtered;
+        }
 
         switch (state.config.hash_strategy) {
         case RoutingConfig::HashStrategy::BOUNDED_LOAD:
             // Bounded-load has built-in load awareness — no separate step 3 needed.
             // estimated_cost enables capacity-aware fallback when headroom data is available.
-            selected = bounded_load_select(prefix_hash, live_backends,
+            selected = bounded_load_select(prefix_hash, *candidates,
                                            state.config.bounded_load_epsilon, request_id,
                                            estimated_cost);
             break;
@@ -2379,7 +2527,7 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                     salt *= FNV_PRIME;
                 }
             }
-            selected = p2c_select(prefix_hash, salt, live_backends,
+            selected = p2c_select(prefix_hash, salt, *candidates,
                                   state.config.p2c_load_bias, request_id,
                                   estimated_cost);
             break;
@@ -2387,15 +2535,15 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
 
         case RoutingConfig::HashStrategy::MODULAR:
             // Simple modular hash — for benchmarking baseline only
-            selected = live_backends[static_cast<int32_t>(prefix_hash %
-                           static_cast<uint64_t>(live_backends.size()))];
+            selected = (*candidates)[static_cast<int32_t>(prefix_hash %
+                           static_cast<uint64_t>(candidates->size()))];
             break;
 
         case RoutingConfig::HashStrategy::JUMP:
         default:
             // Original jump consistent hash
-            hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(live_backends.size()));
-            selected = live_backends[hash_index];
+            hash_index = jump_consistent_hash(prefix_hash, static_cast<int32_t>(candidates->size()));
+            selected = (*candidates)[hash_index];
             break;
         }
 
@@ -3603,6 +3751,61 @@ seastar::future<> RouterService::broadcast_cache_headroom(
         });
 }
 
+seastar::future<> RouterService::broadcast_cache_state_global(
+        absl::flat_hash_map<BackendId, CacheStateSample> samples) {
+    // Rule #0/#14: transfer the shared map across shards via foreign_ptr; each
+    // shard reads it and updates its own (local-allocator) residency cache.
+    auto shared = seastar::make_foreign(
+        std::make_unique<absl::flat_hash_map<BackendId, CacheStateSample>>(std::move(samples)));
+
+    // 1. Upsert residency into every shard's cache so routing on each shard sees
+    //    this node's freshly-scraped values. Per-entry upsert (no wholesale
+    //    clear) preserves residency for peer-reported backends this node doesn't
+    //    scrape. Rule #20: the coroutine frame keeps `shared` alive across the
+    //    co_await — no do_with anchor needed.
+    co_await seastar::smp::invoke_on_all(
+        [&shared] {
+            if (!g_shard_state) return;
+            for (const auto& [id, s] : *shared) {
+                g_shard_state->apply_residency(id, s.residency_weight);
+            }
+        });
+
+    // 2. Gossip each backend's cache state to cluster peers. invoke_on_all
+    //    resumed us on the calling shard (shard 0), where gossip_ptr is set.
+    //    Receiving peers update their own residency caches via apply_peer_cache_state.
+    if (g_shard_state && g_shard_state->gossip_ptr) {
+        auto* gossip = g_shard_state->gossip_ptr;
+        // Rule #16: pass a plain future-returning lambda (NOT a coroutine lambda)
+        // to parallel_for_each. Reading *shared on its home shard (0) is safe.
+        co_await seastar::parallel_for_each(*shared,
+            [gossip](const std::pair<const BackendId, CacheStateSample>& kv) {
+                return gossip->broadcast_cache_state(kv.first, kv.second.cache_usage,
+                                                     kv.second.residency_weight)
+                    .handle_exception([id = kv.first](std::exception_ptr ep) {
+                        try {
+                            std::rethrow_exception(ep);
+                        } catch (const std::exception& e) {
+                            log_router.debug("cache_state gossip for backend {} failed: {}", id, e.what());
+                        }
+                    });
+            });
+    }
+}
+
+seastar::future<> RouterService::apply_peer_cache_state(
+        BackendId backend_id, double /*cache_usage*/, double residency_weight) {
+    // Peer-reported residency arrives on shard 0 (gossip receive loop). Upsert it
+    // into every shard's residency cache. We intentionally do NOT re-gossip — the
+    // originating node already broadcast to all peers, so relaying would echo.
+    // cache_usage is carried on the wire for completeness/future signals; routing
+    // keys off residency_weight, so only that is stored.
+    co_await seastar::smp::invoke_on_all([backend_id, residency_weight] {
+        if (!g_shard_state) return;
+        g_shard_state->apply_residency(backend_id, residency_weight);
+    });
+}
+
 seastar::future<> RouterService::register_backend_global(BackendId id, seastar::socket_address addr,
                                                           uint32_t weight, uint32_t priority,
                                                           bool supports_token_ids,
@@ -4351,6 +4554,11 @@ void RouterService::set_cache_headroom_for_testing(BackendId id, double pressure
     if (cache.pressure.size() >= ShardLocalState::CacheHeadroomCache::MAX_ENTRIES) return;
     cache.pressure[id] = pressure;
     cache.updated_at = std::chrono::steady_clock::now();
+}
+
+void RouterService::set_residency_for_testing(BackendId id, double residency) {
+    if (!g_shard_state) return;
+    g_shard_state->apply_residency(id, residency);
 }
 
 } // namespace ranvier

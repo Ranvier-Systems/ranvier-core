@@ -179,6 +179,61 @@ std::optional<CacheEvictionPacket> CacheEvictionPacket::deserialize(const uint8_
     return pkt;
 }
 
+namespace {
+// Quantize a [0.0, 1.0] signal to uint16 fixed-point. Values outside the range
+// are clamped so a misbehaving source can't produce garbage on the wire.
+uint16_t quantize_unit(double v) {
+    if (v <= 0.0) return 0;
+    if (v >= 1.0) return 65535;
+    return static_cast<uint16_t>(v * 65535.0 + 0.5);
+}
+
+double dequantize_unit(uint16_t v) {
+    return static_cast<double>(v) / 65535.0;
+}
+}  // namespace
+
+std::vector<uint8_t> CacheStatePacket::serialize() const {
+    std::vector<uint8_t> buffer;
+    buffer.reserve(PACKET_SIZE);
+
+    buffer.push_back(static_cast<uint8_t>(type));
+    buffer.push_back(version);
+
+    be_write_u32(buffer, static_cast<uint32_t>(backend_id));
+    be_write_u16(buffer, quantize_unit(cache_usage));
+    be_write_u16(buffer, quantize_unit(residency_weight));
+
+    return buffer;
+}
+
+std::optional<CacheStatePacket> CacheStatePacket::deserialize(const uint8_t* data, size_t len) {
+    // Forward compatibility: accept >= PACKET_SIZE (not ==) so a future version
+    // that appends additional per-node signals stays readable here — we parse
+    // the fields we know and ignore the trailing bytes.
+    if (len < PACKET_SIZE) {
+        return std::nullopt;
+    }
+
+    CacheStatePacket pkt;
+    pkt.type = static_cast<GossipPacketType>(data[0]);
+    pkt.version = data[1];
+
+    if (pkt.type != GossipPacketType::CACHE_STATE) {
+        return std::nullopt;
+    }
+    // NOTE: version is intentionally not range-checked. A newer minor version of
+    // this same type only ever appends fields (guarded by the len>= check above),
+    // so an older parser remains correct. Type — not version — is the rejection
+    // boundary; unknown types are handled in handle_packet().
+
+    pkt.backend_id = static_cast<BackendId>(be_read_u32(data + 2));
+    pkt.cache_usage = dequantize_unit(be_read_u16(data + 6));
+    pkt.residency_weight = dequantize_unit(be_read_u16(data + 8));
+
+    return pkt;
+}
+
 //------------------------------------------------------------------------------
 // GossipProtocol Implementation
 //------------------------------------------------------------------------------
@@ -492,6 +547,33 @@ seastar::future<> GossipProtocol::broadcast_cache_eviction(uint64_t prefix_hash,
     ++_cache_evictions_sent;
 }
 
+seastar::future<> GossipProtocol::broadcast_cache_state(BackendId backend_id, double cache_usage,
+                                                        double residency_weight) {
+    // Rule 22: coroutine converts any pre-future throw into a failed future
+    if (!_config.enabled || !_transport || !_transport->is_ready() || !_peer_addresses || _peer_addresses->empty()) {
+        co_return;
+    }
+
+    // Gossip protection: reject during shutdown or re-sync
+    if (_consensus && !_consensus->is_accepting_tasks()) {
+        co_return;
+    }
+
+    CacheStatePacket pkt;
+    pkt.backend_id = backend_id;
+    pkt.cache_usage = cache_usage;
+    pkt.residency_weight = residency_weight;
+    auto serialized = pkt.serialize();
+
+    log_gossip_protocol().trace("Broadcasting cache state: backend={}, usage={:.2f}, residency={:.2f} to {} peers",
+                                backend_id, cache_usage, residency_weight, _peer_addresses->size());
+
+    // Unreliable broadcast (no ACK / pending-ack tracking): periodic, idempotent,
+    // latest-value-wins state. A dropped update self-heals on the next scrape.
+    co_await _transport->broadcast(*_peer_addresses, serialized);
+    ++_cache_states_sent;
+}
+
 seastar::future<> GossipProtocol::broadcast_heartbeat() {
     // Rule 22: coroutine converts any pre-future throw into a failed future
     // RAII Timer Safety: Holder must outlive the work — coroutine frame keeps it alive
@@ -567,8 +649,38 @@ seastar::future<> GossipProtocol::handle_packet(seastar::net::udp_datagram&& dgr
 
     GossipPacketType type = static_cast<GossipPacketType>(ptr[0]);
 
+    // Rolling-upgrade safety contract: a type tag this binary doesn't recognize
+    // (e.g. a newer peer emitting a packet type we predate) is ignored cleanly.
+    // Peer liveness was already updated above via update_peer_seen(), so the peer
+    // stays healthy — we just count the unknown type for observability. This is
+    // kept distinct from _packets_invalid, which is for *malformed* known packets.
+    if (!is_known_packet_type(type)) {
+        ++_unknown_packet_types;
+        log_gossip_protocol().debug("Ignoring unknown gossip packet type {:#x} from {}",
+                                    static_cast<unsigned>(ptr[0]), src_addr);
+        return seastar::make_ready_future<>();
+    }
+
     if (type == GossipPacketType::HEARTBEAT) {
         log_gossip_protocol().debug("Received heartbeat from {}", src_addr);
+        return seastar::make_ready_future<>();
+    }
+
+    // Handle cache-residency state packets (unreliable, latest-value-wins)
+    if (type == GossipPacketType::CACHE_STATE) {
+        auto cs_pkt = CacheStatePacket::deserialize(ptr, len);
+        if (!cs_pkt) {
+            ++_packets_invalid;
+            return seastar::make_ready_future<>();
+        }
+
+        ++_cache_states_received;
+        log_gossip_protocol().trace("Received CACHE_STATE from {}: backend={}, usage={:.2f}, residency={:.2f}",
+                                    src_addr, cs_pkt->backend_id, cs_pkt->cache_usage, cs_pkt->residency_weight);
+
+        if (_cache_state_callback) {
+            return _cache_state_callback(cs_pkt->backend_id, cs_pkt->cache_usage, cs_pkt->residency_weight);
+        }
         return seastar::make_ready_future<>();
     }
 

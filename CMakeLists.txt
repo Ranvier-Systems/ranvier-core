@@ -637,6 +637,18 @@ target_link_libraries(gossip_cache_eviction_test
 )
 gtest_discover_tests(gossip_cache_eviction_test)
 
+# Gossip Cache-State Packet Tests (Pure C++, no Seastar dependency)
+# Tests for CacheStatePacket wire format + forward-compat (cache-residency routing)
+add_executable(gossip_cache_state_test
+  tests/unit/gossip_cache_state_test.cpp
+)
+target_include_directories(gossip_cache_state_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(gossip_cache_state_test
+  PRIVATE
+  GTest::gtest_main
+)
+gtest_discover_tests(gossip_cache_state_test)
+
 # Gossip Transport Ownership Pattern Tests (Pure C++, no Seastar dependency)
 # Tests verifying shard-local ownership patterns (Rule #0: no std::shared_ptr)
 add_executable(gossip_transport_ownership_test
