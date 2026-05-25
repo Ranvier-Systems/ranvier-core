@@ -2469,11 +2469,10 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
 
                 if (cache_cold && live_backends.size() > 1) {
                     // Likely-stale route: downgrade to the hash/load fallback.
+                    // The router_residency_route_downgrades_total metric reads
+                    // this stat directly (registered in RouterService metrics).
                     residency_cold_backend = art_backend;
                     state.stats.residency_downgrades++;
-                    if (g_metrics) {
-                        metrics().record_residency_downgrade();
-                    }
                     log_router.debug("[{}] ART backend {} cache-cold (residency={:.2f} < {:.2f}); "
                                      "downgrading prefix hit to load-based selection",
                                      request_id, art_backend, residency,

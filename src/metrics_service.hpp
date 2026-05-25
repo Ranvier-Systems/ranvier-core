@@ -126,10 +126,6 @@ public:
             seastar::metrics::make_counter("routing_headroom_redirects_total", _headroom_redirects,
                 seastar::metrics::description("Total number of requests where cache headroom influenced hash fallback backend selection")),
 
-            seastar::metrics::make_counter("router_residency_route_downgrades_total", _residency_downgrades,
-                seastar::metrics::description("Total number of ART prefix hits downgraded to load-based selection because the "
-                                             "owning backend's gossiped cache residency fell below the configured threshold")),
-
             // Legacy latency histograms (for backwards compatibility)
             seastar::metrics::make_histogram("http_request_duration_seconds",
                 seastar::metrics::description("HTTP request duration in seconds"),
@@ -439,14 +435,6 @@ public:
         _headroom_redirects++;
     }
     uint64_t get_headroom_redirects() const { return _headroom_redirects; }
-
-    // Cache-residency-aware routing: records when an ART prefix hit was treated
-    // as a likely miss (and diverted to load-based selection) because the owning
-    // backend's gossiped residency weight fell below cache_residency_threshold.
-    void record_residency_downgrade() {
-        _residency_downgrades++;
-    }
-    uint64_t get_residency_downgrades() const { return _residency_downgrades; }
 
     // Record a prefix cache hit bucketed by backend compression tier.
     // compression_ratio: the selected backend's KV-cache compression ratio (>= 1.0).
@@ -900,7 +888,6 @@ private:
     // Load-aware routing counters
     uint64_t _load_aware_fallbacks = 0;  // Requests diverted due to backend load
     uint64_t _headroom_redirects = 0;    // Requests where cache headroom influenced selection
-    uint64_t _residency_downgrades = 0;  // ART hits downgraded due to low gossiped cache residency
 
     // Prefix hit counters by compression tier (shard-local, no atomics — Rule #1)
     uint64_t _prefix_hits_tier_none = 0;      // compression_ratio == 1.0
