@@ -44,9 +44,11 @@ from conftest import (
     get_compose_cmd,
     get_metric_value,
     run_compose,
+    send_chat_request,
     sum_metric_by_substring,
     wait_for_healthy,
     DOCKER_HOST,
+    MOCK_BACKEND_PORTS,
 )
 
 
@@ -429,18 +431,35 @@ class ClusterIntegrationTest(ClusterTestCase):
         """
         print("\nTest: CACHE_STATE gossip + rolling-upgrade safety")
 
-        # Allow at least one health-scrape cycle to emit CACHE_STATE packets.
-        print(f"  Waiting {PROPAGATION_TIMEOUT}s for cache-state gossip...")
-        time.sleep(PROPAGATION_TIMEOUT)
+        # Poll for CACHE_STATE traffic. The mock backends now expose
+        # vLLM-style /metrics, so the node(s) that scrape them (node1 holds the
+        # registered backends) emit CACHE_STATE and peers receive it. Substring
+        # sums tolerate the Prometheus/Seastar name prefix and per-shard series.
+        deadline = time.time() + PROPAGATION_TIMEOUT + 20
+        total_sent = total_recv = 0.0
+        while time.time() < deadline:
+            total_sent = sum(
+                sum_metric_by_substring(ep["metrics"], "gossip_cache_states_sent_total")
+                for ep in NODES.values())
+            total_recv = sum(
+                sum_metric_by_substring(ep["metrics"], "gossip_cache_states_received_total")
+                for ep in NODES.values())
+            if total_sent > 0 and total_recv > 0:
+                break
+            time.sleep(2)
+
+        print(f"  cluster totals: cache_states_sent={total_sent}, "
+              f"cache_states_received={total_recv}")
+        self.assertGreater(
+            total_sent, 0.0,
+            "no node emitted CACHE_STATE — is vLLM /metrics scraping reaching the "
+            "mock backends? (check health.enable_vllm_metrics + backend registration)")
+        self.assertGreater(
+            total_recv, 0.0,
+            "no node received CACHE_STATE from a peer — gossip propagation failed")
 
         for name, endpoints in NODES.items():
             url = endpoints["metrics"]
-            # Substring sums tolerate the Prometheus/Seastar name prefix and
-            # per-shard series (one counter line per shard).
-            cs_sent = sum_metric_by_substring(url, "gossip_cache_states_sent_total")
-            cs_recv = sum_metric_by_substring(url, "gossip_cache_states_received_total")
-            print(f"  {name}: cache_states_sent={cs_sent}, cache_states_received={cs_recv}")
-
             # Rolling-upgrade safety: in a homogeneous cluster every node
             # understands CACHE_STATE (0x06), so the unknown-type counter — the
             # signal an older node would bump when ignoring a type it predates —
@@ -457,7 +476,74 @@ class ClusterIntegrationTest(ClusterTestCase):
             self.assertEqual(peers_alive, 2.0,
                              f"{name} should still have 2 peers after cache-state gossip")
 
-        print("  PASSED: cache-state gossip healthy, peers unaffected")
+        print("  PASSED: CACHE_STATE propagates; peers healthy; no unknown types")
+
+    def _set_backend_cache_usage(self, perc):
+        """Set reported KV-cache usage on every mock backend (direct admin POST)."""
+        ok = True
+        for backend_id, host_port in MOCK_BACKEND_PORTS.items():
+            url = f"http://{DOCKER_HOST}:{host_port}/admin/cache-usage"
+            try:
+                resp = requests.post(url, params={"perc": perc}, timeout=5)
+                if resp.status_code != 200:
+                    print(f"    backend {backend_id}: cache-usage set failed "
+                          f"({resp.status_code})")
+                    ok = False
+            except requests.exceptions.RequestException as e:
+                print(f"    backend {backend_id}: cache-usage set error: {e}")
+                ok = False
+        return ok
+
+    def test_09_residency_downgrade_end_to_end(self):
+        """Driving backends cache-cold downgrades ART prefix hits to load-based.
+
+        With every backend reporting high KV-cache usage, residency = 1 - usage
+        falls below the default threshold (0.2). A learned prefix route then
+        ART-hits a cache-cold backend, so the router treats it as a likely miss
+        and diverts — incrementing router_residency_route_downgrades_total.
+        """
+        print("\nTest: residency-driven route downgrade (end-to-end)")
+
+        node1 = NODES["node1"]
+        baseline = sum_metric_by_substring(
+            node1["metrics"], "router_residency_route_downgrades_total")
+        print(f"  baseline downgrades on node1: {baseline}")
+
+        # Make every backend look cache-cold (residency ~= 0.01).
+        self.assertTrue(self._set_backend_cache_usage(0.99),
+                        "failed to set cache usage on mock backends")
+        try:
+            # Let node1 scrape the new usage and refresh its residency cache
+            # (check_interval is ~2s; allow a couple of cycles).
+            time.sleep(6)
+
+            # Send the SAME prompt repeatedly: the first learns a route, later
+            # ones ART-hit the (now cache-cold) backend and get downgraded.
+            messages = [{
+                "role": "user",
+                "content": "Residency downgrade probe: a stable shared prefix "
+                           "used to learn and then re-hit the same ART route.",
+            }]
+            downgrades = baseline
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                send_chat_request(node1["api"], messages, timeout=30, retries=1)
+                time.sleep(1)
+                downgrades = sum_metric_by_substring(
+                    node1["metrics"], "router_residency_route_downgrades_total")
+                if downgrades > baseline:
+                    break
+
+            print(f"  downgrades after probing: {downgrades}")
+            self.assertGreater(
+                downgrades, baseline,
+                "expected at least one residency-driven downgrade once backends "
+                "were cache-cold and a prefix route had been learned")
+        finally:
+            # Restore empty-cache state so later/other suites aren't affected.
+            self._set_backend_cache_usage(0.0)
+
+        print("  PASSED: cache-cold ART hits downgraded to load-based selection")
 
 
 def main():
