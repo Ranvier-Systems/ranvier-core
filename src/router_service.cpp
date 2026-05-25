@@ -342,12 +342,26 @@ struct ShardLocalState {
 
     // Upsert one backend's residency on THIS shard (shard-local, lock-free).
     // Bounded by MAX_ENTRIES; an update to an already-tracked backend always
-    // succeeds (refreshes value + timestamp) even at capacity.
+    // succeeds (refreshes value + timestamp) even at capacity. When inserting a
+    // NEW backend at capacity, evict the stalest entry (oldest updated_at) to
+    // make room — without this, residency is upsert-only (no wholesale clear
+    // like the GPU/headroom caches), so dead-backend entries would accumulate
+    // under churn and permanently block new backends from being tracked.
     void apply_residency(BackendId id, double residency_weight) {
         auto& cache = residency_cache;
         auto it = cache.entries.find(id);
         if (it == cache.entries.end()) {
-            if (cache.entries.size() >= ResidencyCache::MAX_ENTRIES) return;
+            if (cache.entries.size() >= ResidencyCache::MAX_ENTRIES) {
+                // Capacity-hit path only (rare). O(n), n <= 256 — well under the
+                // reactor-stall threshold, no yield needed.
+                auto stalest = cache.entries.begin();
+                for (auto cur = cache.entries.begin(); cur != cache.entries.end(); ++cur) {
+                    if (cur->second.updated_at < stalest->second.updated_at) {
+                        stalest = cur;
+                    }
+                }
+                cache.entries.erase(stalest);
+            }
             it = cache.entries.emplace(id, ResidencyEntry{}).first;
         }
         it->second.residency = residency_weight;

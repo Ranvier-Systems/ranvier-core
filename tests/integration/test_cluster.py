@@ -44,6 +44,7 @@ from conftest import (
     get_compose_cmd,
     get_metric_value,
     run_compose,
+    sum_metric_by_substring,
     wait_for_healthy,
     DOCKER_HOST,
 )
@@ -433,23 +434,26 @@ class ClusterIntegrationTest(ClusterTestCase):
         time.sleep(PROPAGATION_TIMEOUT)
 
         for name, endpoints in NODES.items():
-            metrics = get_all_metrics(endpoints["metrics"])
-            cs_sent = metrics.get("gossip_cache_states_sent_total", [0])[0]
-            cs_recv = metrics.get("gossip_cache_states_received_total", [0])[0]
+            url = endpoints["metrics"]
+            # Substring sums tolerate the Prometheus/Seastar name prefix and
+            # per-shard series (one counter line per shard).
+            cs_sent = sum_metric_by_substring(url, "gossip_cache_states_sent_total")
+            cs_recv = sum_metric_by_substring(url, "gossip_cache_states_received_total")
             print(f"  {name}: cache_states_sent={cs_sent}, cache_states_received={cs_recv}")
 
-            # Rolling-upgrade safety: no spurious unknown-type accounting in a
-            # homogeneous cluster. If the metric is absent we skip (older build).
-            unknown = get_metric_value(endpoints["metrics"], "cluster_unknown_packet_types")
-            if unknown is not None:
-                print(f"  {name}: cluster_unknown_packet_types={unknown}")
-                self.assertEqual(
-                    unknown, 0.0,
-                    f"{name} accounted {unknown} unknown packet types; all nodes "
-                    f"in this cluster understand CACHE_STATE (0x06)")
+            # Rolling-upgrade safety: in a homogeneous cluster every node
+            # understands CACHE_STATE (0x06), so the unknown-type counter — the
+            # signal an older node would bump when ignoring a type it predates —
+            # must total zero across all shards.
+            unknown_total = sum_metric_by_substring(url, "cluster_unknown_packet_types")
+            print(f"  {name}: cluster_unknown_packet_types(total)={unknown_total}")
+            self.assertEqual(
+                unknown_total, 0.0,
+                f"{name} accounted {unknown_total} unknown packet types; all nodes "
+                f"in this cluster understand CACHE_STATE (0x06)")
 
             # Residency traffic must not affect peer liveness.
-            peers_alive = get_metric_value(endpoints["metrics"], "cluster_peers_alive")
+            peers_alive = get_metric_value(url, "cluster_peers_alive")
             self.assertEqual(peers_alive, 2.0,
                              f"{name} should still have 2 peers after cache-state gossip")
 

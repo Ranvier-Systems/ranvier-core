@@ -240,6 +240,27 @@ TEST_F(RouterServiceTest, ResidencyThresholdZeroDisablesDowngrade) {
     EXPECT_TRUE(result.cache_hit);
 }
 
+TEST_F(RouterServiceTest, ResidencyCacheEvictsUnderChurnSoNewBackendsTracked) {
+    // Drive the residency cache past capacity with many distinct (churned)
+    // backend ids, then set residency for a live backend. Eviction must make
+    // room so the live backend's value still takes effect — without it the
+    // upsert-only cache would silently drop the new entry once full, and the
+    // downgrade below would never fire.
+    register_two_backends();
+    for (int id = 1000; id < 1400; ++id) {  // 400 > MAX_ENTRIES (256)
+        RouterService::set_residency_for_testing(id, 0.9);
+    }
+
+    std::vector<int32_t> tokens = {61, 62, 63, 64};
+    RouterService::insert_route_for_testing(tokens, 1);
+    RouterService::set_residency_for_testing(1, 0.01);  // cache-cold, set after full
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 2);
+}
+
 TEST_F(RouterServiceTest, LowResidencySingleBackendKeepsRoute) {
     // Only one backend: there is nowhere to divert, so even a cache-cold ART
     // hit still routes to that backend (downgrade path requires an alternative).
