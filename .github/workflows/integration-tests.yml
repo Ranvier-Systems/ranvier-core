@@ -131,7 +131,8 @@ jobs:
               tests/integration/test_intelligence_layer.py \
               tests/integration/test_metrics.py \
               tests/integration/test_persistence_recovery.py \
-              tests/integration/test_attribution_cardinality.py"
+              tests/integration/test_attribution_cardinality.py \
+              tests/integration/test_admin_keys_usage.py"
             echo "Running all integration tests"
           fi
 
