@@ -1377,12 +1377,20 @@ fi
 # load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
 # env prefix is overwritten by the export above and has no effect.
 log_header "Effective Routing Config"
-log_info "RANVIER_ROUTING_MODE        = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
-log_info "RANVIER_LOAD_AWARE_ROUTING  = ${RANVIER_LOAD_AWARE_ROUTING}"
+log_info "RANVIER_ROUTING_MODE          = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
+log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
+# Residency routing (#527) is a SECOND diversion mechanism, on by default
+# (threshold 0.2). It is NOT controlled by --no-load-aware — only by this env
+# var (0.0 disables). Surfaced here because a silently-on residency threshold
+# confounds any load-aware A/B.
+log_info "RANVIER_CACHE_RESIDENCY_THRESHOLD = ${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2 (compose default — residency routing ON)}"
 if [[ "$LOAD_AWARE" = true ]]; then
-    log_warn "Load-aware routing is ON. For the Experiment A smoking-gun A/B, pass --no-load-aware."
+    log_warn "Load-aware routing is ON. For a no-diversion A/B, pass --no-load-aware AND set RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0."
+fi
+if [[ "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}" != "0.0" ]]; then
+    log_warn "Residency routing is ON (threshold=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}). It diverts ART hits independently of load-aware."
 fi
 
 # Export compression ratio for docker-compose

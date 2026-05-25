@@ -560,19 +560,27 @@ def parse_aggregated_stats(content: str) -> Dict[str, Any]:
 # (`ranvier_backend_latency_seconds_count{backend_id=...}`), which we scrape as
 # a cheap approximation of "requests dispatched per backend." Mark these as
 # verified-via-source if the user asks.
+#
+# Seastar's Prometheus exposition prepends "seastar_" to the group name, so the
+# wire names are actually "seastar_ranvier_<metric>". We match an OPTIONAL
+# "seastar_" prefix so the parser works against both the raw /metrics dump and
+# any pre-stripped variant.
 _PROM_FALLBACK_RE = re.compile(
-    r"^ranvier_routing_load_aware_fallbacks_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
+    r"^(?:seastar_)?ranvier_routing_load_aware_fallbacks_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 )
 # Cache-residency downgrade counter (#527), verified at router_service.cpp:1742
 # (make_counter "router_residency_route_downgrades_total", "ranvier" group).
 _PROM_RESIDENCY_RE = re.compile(
-    r"^ranvier_router_residency_route_downgrades_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
+    r"^(?:seastar_)?ranvier_router_residency_route_downgrades_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 )
+# NOTE: backend_active_requests is an instantaneous gauge — it reads ~0 when
+# scraped after traffic has drained at end-of-run, so it is a poor distribution
+# signal. The cumulative histogram count below is preferred (see caller).
 _PROM_BACKEND_ACTIVE_RE = re.compile(
-    r'^ranvier_backend_active_requests\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
+    r'^(?:seastar_)?ranvier_backend_active_requests\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
 )
 _PROM_BACKEND_HIST_COUNT_RE = re.compile(
-    r'^ranvier_backend_latency_seconds_count\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
+    r'^(?:seastar_)?ranvier_backend_latency_seconds_count\{[^}]*backend_id="([^"]+)"[^}]*\}\s+([0-9.eE+-]+)'
 )
 
 
