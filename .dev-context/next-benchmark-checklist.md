@@ -66,11 +66,29 @@ At 30u/13B under cache pressure it can fire constantly. Consequences:
 - Always pair each prefix-aware run with a round-robin baseline of the same
   duration on the same instance — no cross-instance comparisons.
 
+## Status (2026-05-26)
+
+- **Experiment A — DONE** (`f2066e6`, 13B 30u 30m). Result: P99 -76% but **9.4%
+  incompletes**; per-backend Gini **0.534** (2 of 8 backends idle); both
+  diversion counters 0. Pure affinity over-concentrates with 5 prefixes.
+- **Experiment B — DONE** (`f2066e6`). Result: 0 incompletes but **P99 +167%,
+  Cache Miss P99 +219%**; `load_aware_fallbacks_total` 10.7%,
+  `residency_route_downgrades_total` **0**. Load-aware diversion is the
+  miss-tail driver; residency routing ruled out.
+- **Verdict so far:** both threshold extremes lose to round-robin at 30u; the
+  fix is structural (#442 cold-divert / hysteresis), flagged for human
+  decision. Full write-up in
+  [investigation-may22](investigation-may22-affinity-thrashing-reproduction.md)
+  § "Empirical results".
+- **Still open:** Experiment C (20u repeats) and Experiment D (prefix-count
+  sensitivity) below.
+
 ## Experiments
 
-Run in this order. Stop early only if Experiment A is conclusive.
+Experiments A and B are DONE (see Status above); their specs are retained below
+for reproducibility. C and D are the remaining runs.
 
-### Experiment A — Disable ALL diversion (smoking gun)
+### Experiment A — Disable ALL diversion (smoking gun) [DONE]
 
 **Hypothesis:** If diversion-breaking-affinity is the root cause, turning off
 *both* load-aware routing and residency downgrades collapses P99 back to
@@ -107,11 +125,18 @@ investigation.
 > clobber — bench.sh doesn't export it), so the prefix form works for it. Only
 > `RANVIER_LOAD_AWARE_ROUTING` / imbalance vars are flag-controlled.
 
-### Experiment A2 — Isolate residency routing (load-aware off, residency ON)
+### Experiment A2 — Isolate residency routing (load-aware off, residency ON) [LIKELY MOOT]
 
-**Why:** Experiment A turns off both mechanisms, so it can't tell you which one
-mattered. A2 keeps residency routing at its default to measure its solo
-contribution. Run only if A recovers P99 and you need to attribute the cause.
+**Status:** probably unnecessary. Exp B already measured
+`residency_route_downgrades_total = 0` with residency at its default 0.2, so
+residency routing is inert in this topology (signal never crosses threshold /
+not populated). A2 would almost certainly just confirm residency does nothing.
+Only run it if you specifically need to prove residency's null effect with
+load-aware also off.
+
+**Why (original rationale):** Experiment A turns off both mechanisms, so it
+can't tell you which one mattered. A2 keeps residency routing at its default to
+measure its solo contribution.
 
 ```bash
 # 30u/30m, load-aware OFF, residency routing at default (0.2)
@@ -132,7 +157,7 @@ Flags verified: `--no-load-aware` (scripts/bench.sh arg parse → `LOAD_AWARE=fa
 → exports `RANVIER_LOAD_AWARE_ROUTING=false`). Toggle honored uniformly across
 hash strategies (`src/router_service.cpp` load_aware_routing gates).
 
-### Experiment B — Raise the median-comparison threshold (production-shaped fix)
+### Experiment B — Raise the median-comparison threshold (production-shaped fix) [DONE]
 
 **Hypothesis:** Investigation #289 Fix 1 was right in spirit but the parameter
 names are stale; today's equivalents are `load_imbalance_factor` (default 2.0)
@@ -204,6 +229,57 @@ RANVIER_ROUTING_MODE=prefix \
 **Expected:** incomplete count goes to 0 in both. If only A clears the timeouts
 and B doesn't, the flapping zone is wider than #289 modeled and threshold
 tuning alone isn't enough — hysteresis becomes the next experiment.
+
+### Experiment D — Prefix-count sensitivity (is the timeout an artifact of 5 prefixes?)
+
+**Why:** Experiments A and B both ran the default `NUM_LARGE_PREFIXES=5` against 8
+backends. Under pure affinity that is a pigeonhole — at most 5 of 8 backends can
+serve a prefix, so 3 sit idle and the hot ones overload (Exp A measured Gini
+0.534, 9.4% timeouts). That concentration may be a property of the *workload*,
+not the router. Raising the prefix count relaxes the pigeonhole: with 50
+prefixes spread by consistent hash, all 8 backends get work even under pure
+affinity.
+
+```bash
+# D1: 30u/30m, all diversion OFF, 50 prefixes (mirror of Exp A but un-pigeonholed)
+NUM_LARGE_PREFIXES=50 \
+RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0 RANVIER_ROUTING_MODE=prefix \
+./scripts/bench.sh --compare --warmup --duration 30m --users 30 \
+  --no-load-aware \
+  --model meta-llama/CodeLlama-13b-Instruct-hf \
+  --prompt-dist stress --prefix-ratio 0.9 --max-model-len 8192 \
+  --output-dir benchmark-reports/expD1-noDivert-50prefix
+
+# D2 (optional): same but load-aware ON (mirror of Exp B at 50 prefixes)
+NUM_LARGE_PREFIXES=50 \
+RANVIER_ROUTING_MODE=prefix \
+./scripts/bench.sh --compare --warmup --duration 30m --users 30 \
+  --load-imbalance-factor 3.0 --load-imbalance-floor 4 \
+  --model meta-llama/CodeLlama-13b-Instruct-hf \
+  --prompt-dist stress --prefix-ratio 0.9 --max-model-len 8192 \
+  --output-dir benchmark-reports/expD2-la-50prefix
+```
+
+`NUM_LARGE_PREFIXES` is forwarded to the locust container by bench.sh and echoed
+in the "Effective Routing Config" banner (with a pigeonhole warning when it is
+≤ backend count). It is a workload knob, not a routing config — verify it shows
+`50` in the banner.
+
+**Expected if the timeouts are workload concentration (most likely):**
+- D1 (no diversion, 50 prefixes): per-backend Gini drops from ~0.53 toward
+  ~0.1, **incompletes fall toward 0**, and P99 stays strongly negative — i.e.
+  pure affinity *works* once the prefix set can fill all backends.
+- This would localize the Exp A timeout failure to the artificial 5-prefix
+  pigeonhole, and reframe the 30u "regression" as: diversion is only needed
+  when the prefix set is smaller than the backend count, and #442 makes that
+  diversion cold. Real workloads with many prefixes may not need diversion at
+  all at this concurrency.
+
+**Expected if timeouts persist at 50 prefixes:** the over-concentration is not
+purely a pigeonhole — some prefixes are hotter than others (Zipfian), and a few
+backends still overload. That strengthens the case that *some* load-aware
+diversion is genuinely needed, which puts the #442 cold-divert fix back on the
+critical path.
 
 ## Methodology notes
 
