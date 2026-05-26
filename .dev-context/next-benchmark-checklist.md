@@ -66,22 +66,46 @@ At 30u/13B under cache pressure it can fire constantly. Consequences:
 - Always pair each prefix-aware run with a round-robin baseline of the same
   duration on the same instance — no cross-instance comparisons.
 
-## Status (2026-05-26)
+## Status (2026-05-26) — INVESTIGATION COMPLETE
 
-- **Experiment A — DONE** (`f2066e6`, 13B 30u 30m). Result: P99 -76% but **9.4%
-  incompletes**; per-backend Gini **0.534** (2 of 8 backends idle); both
-  diversion counters 0. Pure affinity over-concentrates with 5 prefixes.
-- **Experiment B — DONE** (`f2066e6`). Result: 0 incompletes but **P99 +167%,
-  Cache Miss P99 +219%**; `load_aware_fallbacks_total` 10.7%,
-  `residency_route_downgrades_total` **0**. Load-aware diversion is the
-  miss-tail driver; residency routing ruled out.
-- **Verdict so far:** both threshold extremes lose to round-robin at 30u; the
-  fix is structural (#442 cold-divert / hysteresis), flagged for human
-  decision. Full write-up in
+The full 2×2 (diversion on/off × 5/50 prefixes) is done. **Verdict: the 30u
+"regression" is dominated by the 5-prefix benchmark workload, not the router.**
+
+| | 5 prefixes | 50 prefixes |
+|---|---|---|
+| No diversion (A / D1) | P99 -76% but **9.4% timeouts**, Gini 0.534 | P99 +19%, 2.2% timeouts (≈base), Gini 0.197 |
+| Load-aware (B / D2) | **P99 +167%**, miss-tail +219% | **P99 -6%**, 1.9% timeouts (<base), hit 60%, fallbacks 7.8% |
+
+- **A — DONE** (`f2066e6`): pure affinity, 5 prefixes. P99 -76% but 9.4% timeouts
+  (pigeonhole over-concentration). Both diversion counters 0.
+- **B — DONE** (`f2066e6`): load-aware, 5 prefixes. P99 +167%, miss-tail +219%.
+- **D1 — DONE** (`f708de5`): pure affinity, 50 prefixes. Timeouts fall to 2.2%
+  (≈ round-robin 2.1%), Gini 0.197 — the 9.4% was a 5-prefix pigeonhole.
+- **D2 — DONE** (`f708de5`): load-aware, 50 prefixes. **P99 -6% (net win)**,
+  incompletes below baseline. The +167% in B was *also* largely a 5-prefix
+  artifact.
+- **Final verdict:** at realistic prefix counts the routing system works as
+  designed; load-aware diversion earns its keep (D2). `#442`'s cold-divert is
+  reclassified from correctness bug to a cache-efficiency optimization
+  (~30 pp hit-rate left on the table by cold diverts). #441 and residency (#527)
+  ruled out. Full write-up:
   [investigation-may22](investigation-may22-affinity-thrashing-reproduction.md)
-  § "Empirical results".
-- **Still open:** Experiment C (20u repeats) and Experiment D (prefix-count
-  sensitivity) below.
+  § "Empirical results — Experiments D1 & D2".
+- **Superseded:** Experiment C (20u repeats) is now low-value — the 5-prefix
+  timeout it was meant to investigate is a known pigeonhole artifact. Run only
+  if a 20u-specific question arises. Experiment A2 remains moot (residency inert).
+
+### Action taken from this investigation
+
+- **bench.sh default changed: `NUM_LARGE_PREFIXES` now defaults to 50** (was the
+  locust default of 5). 5 prefixes against 8 backends manufactures the false
+  regression; 50 is representative. Pass `NUM_LARGE_PREFIXES=5` explicitly only
+  to stress-test prefix concentration. Banner warns when count ≤ backend count.
+- **No routing-config default change** is justified by this data: D2 used raised
+  thresholds (`factor=3.0, floor=4`); the shipped defaults (`2.0`/`2`) were never
+  tested at 50 prefixes. If a routing-default change is ever considered, run a
+  default-threshold leg at ≥50 prefixes first.
+- **`#442` warm-diversion fix:** optional optimization, human decision; not urgent.
 
 ## Experiments
 
@@ -202,7 +226,7 @@ Investigation #289's `queue_depth_threshold` / `queue_diff_threshold` names
 **do not exist** in the current code — it uses a multiplicative-factor-on-median
 scheme. Above is the current equivalent. No YAML overlay or code change needed.
 
-### Experiment C — 20u repeats of A and B (zombie-timeout test)
+### Experiment C — 20u repeats of A and B (zombie-timeout test) [SUPERSEDED — see Status]
 
 The 20u/30m run on `5079f9f` had 639 incompletes (6.0%) — the "diverted
 request never completes" failure mode predicted at lines 200-220 of
@@ -230,7 +254,7 @@ RANVIER_ROUTING_MODE=prefix \
 and B doesn't, the flapping zone is wider than #289 modeled and threshold
 tuning alone isn't enough — hysteresis becomes the next experiment.
 
-### Experiment D — Prefix-count sensitivity (is the timeout an artifact of 5 prefixes?)
+### Experiment D — Prefix-count sensitivity (is the timeout an artifact of 5 prefixes?) [DONE — YES, see Status]
 
 **Why:** Experiments A and B both ran the default `NUM_LARGE_PREFIXES=5` against 8
 backends. Under pure affinity that is a pigeonhole — at most 5 of 8 backends can
