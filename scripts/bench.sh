@@ -1396,9 +1396,9 @@ fi
 # pins all prefixes to <=5 backends under pure affinity (forced concentration,
 # Gini ~0.5). Raise (e.g. 50) to relax that. Auditable here because it changes
 # how to read the per-backend distribution.
-log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-5 (locust default)}  [workload, not routing]"
-if [[ "${NUM_LARGE_PREFIXES:-5}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
-    log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-5}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration)."
+log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (bench default)}  [workload, not routing]"
+if [[ "${NUM_LARGE_PREFIXES:-50}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
+    log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-50}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration; intentional only for a stress test)."
 fi
 
 # Export compression ratio for docker-compose
@@ -1618,10 +1618,12 @@ run_benchmark() {
     [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
 
     # Forward NUM_LARGE_PREFIXES so the workload's unique-prefix count is
-    # controllable (and auditable in the banner). Locust defaults to 5; with 8
-    # backends that pins all prefixes to <=5 backends under pure affinity. Pass
-    # a higher value (e.g. 50) to relax that concentration. Honors an env prefix.
-    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-5}"
+    # controllable (and auditable in the banner). We default to 50, NOT locust's
+    # default of 5: with 8 backends, 5 prefixes pins all prefixes to <=5 backends
+    # under pure affinity (pigeonhole), which manufactured a false "regression"
+    # in the May 2026 investigation. 50 (>= backend count) is representative.
+    # Pass NUM_LARGE_PREFIXES=5 explicitly only to stress prefix concentration.
+    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
 
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
@@ -1781,8 +1783,9 @@ if [[ "$WARMUP" = true ]]; then
     PREFIX_MAX_ARGS=""
     [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
 
-    # Match the main run's prefix count so warm-up primes the same prefix set.
-    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-5}"
+    # Match the main run's prefix count so warm-up primes the same prefix set
+    # (default 50, see the main run block for rationale).
+    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
 
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \

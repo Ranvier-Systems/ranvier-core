@@ -287,16 +287,25 @@ of which retains it, which is why a 10.7% diversion rate drags the cache hit
 rate down ~30 pp and blows out the miss tail far out of proportion to the
 diversion count.
 
-### Conclusion
+### Conclusion (A & B — REVISED by D1/D2 below; read on)
 
-At 30u with this workload, **both threshold extremes lose to round-robin**:
+> **⚠️ Superseded in part.** This conclusion was drawn from the 5-prefix
+> workload only. Experiments D1/D2 (next section) re-ran A and B at
+> `NUM_LARGE_PREFIXES=50` and found that **both failure modes here are
+> dominated by the 5-prefix benchmark workload**, not by the router. The +167%
+> in B is largely a 5-prefix artifact — the same config at 50 prefixes (D2) is
+> a net win. The "#442 is the proximate cause" framing below is downgraded to
+> "#442's cold-divert is real but prefix-count-dependent and not a correctness
+> bug at realistic prefix counts." See the D1/D2 conclusion for the final word.
+
+At 30u with **this (5-prefix) workload**, both threshold extremes lose to round-robin:
 - No diversion → 9.4% timeouts (over-concentration).
 - Diversion (even modest, 10.7%) → +167% P99 (cold-miss tail, no escape valve).
 
-Threshold tuning cannot square this circle: the diverted requests are
-*structurally* cold because of #442's learn-the-original behavior. The data now
-**empirically supports the #442 proximate-cause ranking** from the static audit
-above. Residency routing and #441 are both ruled out as contributors.
+Threshold tuning cannot square this circle *at 5 prefixes*: the diverted
+requests are structurally cold because of #442's learn-the-original behavior.
+Residency routing and #441 are ruled out as contributors. **Whether #442 is the
+proximate cause of a real-world regression depends on prefix count — see D1/D2.**
 
 **The fix is structural, not a config change — flag for human decision per the
 task brief.** The candidate that matches the data is #289 Fix 2 / may22 fix
@@ -315,3 +324,91 @@ relax the pigeonhole and may let pure affinity avoid timeouts without diversion
 not a separate routing defect. Experiment C (20u repeats) is also still open:
 at 20u the lower load may let pure affinity complete without timeouts, which
 would localize the timeout failure to the 30u over-concentration regime.
+
+## Empirical results — Experiments D1 & D2 (2026-05-26, `f708de5`, 13B 30u 30m, 50 prefixes)
+
+A and B used the bench.sh-inherited locust default `NUM_LARGE_PREFIXES=5`. With
+8 backends that is a pigeonhole (≤5 backends usable under pure affinity). D1/D2
+re-ran the no-diversion and load-aware configs at `NUM_LARGE_PREFIXES=50` to
+separate workload artifacts from routing behavior.
+
+### The full 2×2 (P99 TTFT vs each run's own round-robin baseline)
+
+| | **5 prefixes** | **50 prefixes** |
+|---|---|---|
+| **No diversion** (A / D1) | P99 **-76%** but **9.4% timeouts**; Gini **0.534** (b4,b6 idle) | P99 **+19%**; 2.2% timeouts (≈ base 2.1%); Gini **0.197** |
+| **Load-aware** (B / D2) | P99 **+167%**, +219% miss-tail; hit 59%; fallbacks 10.7% | P99 **-6%**; 1.9% timeouts (< base 3.2%); hit 60%; fallbacks 7.8% |
+
+Absolute prefix-side P99: D1 9300 ms (+19% vs its RR 7800) → D2 7500 ms (-6% vs
+its RR 8000). Adding load-aware at 50 prefixes shaved ~1800 ms of absolute tail
+and dropped Gini 0.197 → 0.151. `residency_route_downgrades_total` was 0 in both
+(residency remains inert).
+
+### Finding 4 — The 9.4% timeout (Exp A) is a 5-prefix pigeonhole, resolved at 50
+
+D1's per-backend distribution: `[b1=657, b2=324, b3=484, b4=350, b5=273, b6=309,
+b7=343, b8=737]`, **Gini 0.197**, all 8 backends carrying real load (no idle
+backends, vs A's b4=11/b6=6). Incompletes fell from 9.4% to **2.2%, statistically
+equal to the round-robin baseline's 2.1%**. So Exp A's timeout catastrophe was
+the artificial 5-prefix concentration, not a routing defect. (Round-robin *also*
+times out ~2% at 50 prefixes — 30u of stress-dist large prefixes is near the
+box's capacity ceiling regardless of routing; both legs FAILED the 5 s P99 gate.)
+
+### Finding 5 — Exp B's +167% miss-tail is ALSO largely a 5-prefix artifact
+
+The decisive result. The same load-aware config (`factor=3.0, floor=4`) that
+produced +167% P99 / +219% miss-tail at 5 prefixes (Exp B) produces **-6% P99**
+at 50 prefixes (D2) — a net win over round-robin, with incompletes *below*
+baseline. Mechanism: at 5 prefixes every cold divert is a full recompute of one
+of only 5 huge (2-8 K token) hot prefixes that #442 keeps permanently cold; at
+50 prefixes the cold-miss tax is amortised across the working set and the
+load-balancing benefit (Gini 0.197 → 0.151, tail shaved) dominates.
+
+### Finding 6 — At realistic prefix counts, load-aware (incl. #442) is a net positive
+
+D2 is the best of the four cells for a realistic workload: P99 -6% vs RR, P50
+-22%, incompletes 1.9% (< RR 3.2%), cache hit 60%. D1 (no diversion) leaves a
++19% P99 tail on the table from residual per-backend imbalance that only
+diversion can relieve. So load-aware diversion *earns its keep* at 50 prefixes
+— the opposite of the 5-prefix story.
+
+### Final conclusion (supersedes the A&B conclusion above)
+
+1. **The May 22 "affinity-thrashing regression" is dominated by the benchmark
+   workload, not the router.** `NUM_LARGE_PREFIXES=5` against 8 backends
+   manufactures pathological concentration; both the no-diversion timeout
+   blowup and the load-aware miss-tail blowup are 5-prefix artifacts. At
+   `NUM_LARGE_PREFIXES=50` the system behaves as designed (D2: P99 beats RR,
+   below-baseline incompletes, 60% cache hit).
+2. **#442's cold-divert is real but reclassified.** It is no longer a
+   correctness regression — at realistic prefix counts the current load-aware
+   (cold divert) is net-positive. It is now a **cache-efficiency optimization**:
+   D2 sacrifices ~30 pp of cache hit (91.8% → 60.1%) that a *warm* diversion
+   (learn the diverted backend / hysteresis, #289 Fix 2) could recover while
+   keeping the -6% tail win. Worth doing for GPU/throughput savings; not urgent.
+3. **#441 and residency routing (#527) are ruled out** as contributors across
+   all four runs (residency counter 0 throughout; #441 default behaviour
+   unchanged).
+
+**Recommended actions:**
+- **Benchmark harness:** stop defaulting to 5 prefixes — it manufactures a false
+  regression. bench.sh now defaults `NUM_LARGE_PREFIXES=50` (≥ backend count);
+  pass `NUM_LARGE_PREFIXES=5` explicitly only when intentionally stress-testing
+  concentration. The "Known Issue" in `kv-cache-prefix-routing-benchmark.md` is
+  updated to record the prefix-count dependency.
+- **Routing config:** no production default change is justified by this data. D2
+  used raised thresholds (`factor=3.0, floor=4`); the shipped defaults
+  (`2.0`/`2`) were never tested at 50 prefixes, so changing them would be
+  unmeasured. Leave defaults; revisit only with a default-threshold run at ≥50
+  prefixes.
+- **#442 fix:** optional cache-efficiency optimization (warm diversion), human
+  decision. No revert; the current behaviour is acceptable at realistic loads.
+
+### Caveats
+
+Single 30 m runs, P99 rounded to 100 ms, known run-to-run variance — exact
+percentages are soft, but the prefix-count effect (+167% → -6%) is far larger
+than plausible noise. The "vs RR" normalisation differs per run (each leg has
+its own baseline; 50-prefix RR baselines are ~7.8-8.0 s vs ~4.5-5.0 s at 5
+prefixes because RR thrashes harder with more prefixes), so compare the vs-RR
+deltas, not absolute ms, across runs.

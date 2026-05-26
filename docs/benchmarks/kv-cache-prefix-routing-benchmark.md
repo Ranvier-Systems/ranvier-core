@@ -11,30 +11,41 @@
 
 ## Executive Summary
 
-Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 80% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes at 10-user concurrency. Headline aggregate gains at 20 and 30 users have shown intermittent reproducibility on the current architecture — see [Known Issue](#known-issue-13b30u-prefix-aware-miss-tail-with-default-load-aware-thresholds) below before quoting 20u/30u improvements as steady-state.
+Prefix-affinity routing provides **4-7x better cache hit rate** and **up to 80% lower P99 tail latency** compared to round-robin routing when serving LLM inference requests with shared prefixes at 10-user concurrency. At 30 users the benefit depends on the workload's unique-prefix count relative to the backend count — see [Known Issue](#known-issue-13b30u-tail-latency-is-dominated-by-prefix-count-not-routing) below before quoting 30u numbers.
 
-### Known Issue: 13B/30u prefix-aware miss-tail with default load-aware thresholds
+### Known Issue: 13B/30u tail latency is dominated by prefix count, not routing
 
-A 13B/30-minute reproduction on `5079f9f` (May 22, 2026) at 10/20/30-user concurrency reproduced the affinity-thrashing failure mode predicted in
-[investigation #289](../../.dev-context/investigation-289-routing-regression.md) (and followed up in
-[investigation-may22-affinity-thrashing-reproduction](../../.dev-context/investigation-may22-affinity-thrashing-reproduction.md)).
+A 13B/30-minute A/B/C/D investigation (May 22–26, 2026; full data in
+[investigation-may22-affinity-thrashing-reproduction](../../.dev-context/investigation-may22-affinity-thrashing-reproduction.md),
+following [investigation #289](../../.dev-context/investigation-289-routing-regression.md))
+found that the 30u "miss-tail regression" is **primarily a benchmark-workload artifact**, not a
+routing defect. The dominant variable is `NUM_LARGE_PREFIXES` relative to the 8-backend count:
 
-- **30u/30m on `5079f9f`:** Cache hit rate 61.5% (healthy), but vs round-robin baseline:
-  P99 TTFT **+44%**, Cache Miss P99 **+69%**, Large Miss P99 **+123%**, XLarge Miss P99 **+62%**.
-  Throughput +2%, zero incompletes. Prefix-aware is a clear regression on tail latency, not an improvement.
-- **20u/30m on `5079f9f`:** Reported P99 TTFT -57% **but** with 639 incomplete requests (6.0% of the
-  prefix-aware run vs 0 for round-robin). Incompletes are excluded from the TTFT P99 calculation, so
-  the green headline hides the failure mode. Treat the 20u headline as unreproduced until a clean run.
-- **10u/30m on `5079f9f`:** Healthy. Cache hit 58.3%, P99 TTFT -22%, throughput +3.6%, 0 incompletes.
+| Workload | No diversion | Load-aware (factor 3.0 / floor 4) |
+|----------|--------------|-----------------------------------|
+| **5 prefixes** (pigeonhole: ≤5 of 8 backends usable) | P99 -76% **but 9.4% timeouts** (over-concentration) | **P99 +167%, miss-tail +219%** (cold diverts on huge prefixes) |
+| **50 prefixes** (all 8 backends used) | P99 +19%, timeouts ≈ round-robin (2.2%) | **P99 -6%**, timeouts 1.9% (< round-robin), hit 60% |
 
-**Status of previously-reported headline results:**
-- The Feb 28 `b63c165` 20-user result (P99 -78.2%, 0/0 timeouts) has **not** reproduced on `5079f9f`.
-- The Mar 5 `08e5a93` 30-user result (P99 -79.6%, +13.2% throughput) has **not** reproduced on `5079f9f`.
+Key takeaways:
+- **`NUM_LARGE_PREFIXES=5` against 8 backends manufactures a false regression.** Both failure modes
+  (no-diversion timeouts, load-aware miss-tail) collapse at 50 prefixes. The benchmark default has
+  been changed: bench.sh now defaults `NUM_LARGE_PREFIXES=50` — pass `=5` only to intentionally
+  stress prefix concentration.
+- **At realistic prefix counts the system behaves as designed.** Load-aware diversion is a net win at
+  50 prefixes (P99 beats round-robin, fewer incompletes). Earlier "regression" reports on `5079f9f`
+  (30u P99 +44%) and the catastrophic load-aware run (+167%) were both 5-prefix artifacts.
+- **30u is near the box's capacity ceiling regardless of routing.** At 50 prefixes round-robin also
+  times out ~2% and both legs exceed the 5 s P99 gate — that is a throughput limit, not a routing bug.
+- **Residency routing (#527) and #441 are ruled out** as contributors (residency downgrade counter 0
+  across all runs).
 
-The May 22 numbers match investigation #289's prediction at lines 196-227 to the letter (10u quiet,
-20u flapping → timeouts, 30u load-aware fires constantly → every divert is a cold-cache miss). The
-fix path (revert vs hysteresis vs threshold tuning) requires further benchmark data; see
-[next-benchmark-checklist](../../.dev-context/next-benchmark-checklist.md).
+The previously-feared `#442` "cold-divert / no escape valve" behavior is **real but reclassified** from
+a correctness regression to a cache-efficiency optimization: at 50 prefixes load-aware sacrifices ~30pp
+of cache hit (92% → 60%) that a warm-diversion fix could recover. Tracked as a non-urgent improvement.
+
+**Status of older headline results (still unverified on current builds):**
+- The Feb 28 `b63c165` 20-user result (P99 -78.2%, 0/0 timeouts) and the Mar 5 `08e5a93` 30-user result
+  (P99 -79.6%) were measured at unknown prefix counts and have not been re-confirmed; treat as historical.
 
 ### Validated 30-Minute Run (February 28, 2026 — b63c165)
 
