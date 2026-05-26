@@ -305,6 +305,84 @@ backends still overload. That strengthens the case that *some* load-aware
 diversion is genuinely needed, which puts the #442 cold-divert fix back on the
 critical path.
 
+### Experiment E — Cache-residency-aware routing (#527) under cache pressure [OPEN]
+
+**Prerequisite finding (2026-05-26):** residency routing was confirmed LIVE but
+INERT in every A/B/C/D run — `residency_route_downgrades_total = 0` while
+`cache_states_received_total ≈ 5776` and `residency_cache_size = 8`. The signal
+flows end-to-end; the KV cache simply never crossed the 80%-full threshold
+(`residency_weight < 0.2`), so the downgrade never triggered. **A residency
+benchmark is meaningless until the downgrade counter is > 0.** The parser now
+prints the residency-signal health line and flags "LIVE but never fired."
+
+**Goal:** create real cache pressure so residency fires, then A/B residency-on
+vs residency-off under identical pressure.
+
+**Step 1 — make it fire (verification, not yet an A/B).** Shrink the KV cache so
+`vllm:gpu_cache_usage_perc` exceeds 0.8 on the hot backends. Primary knob is
+`--gpu-mem-util` (default 0.85 → drives vLLM `--gpu-memory-utilization`); lower
+it so less memory is left for KV cache after weights. For 13B on 40GB A100,
+weights are ~26GB (~0.65 of card), so stay above ~0.70 or vLLM won't start.
+
+```bash
+# E0: confirm residency fires. Watch the banner + the parser's residency-signal
+# line; success = residency_route_downgrades_total > 0.
+NUM_LARGE_PREFIXES=50 \
+RANVIER_CACHE_RESIDENCY_THRESHOLD=0.2 RANVIER_ROUTING_MODE=prefix \
+./scripts/bench.sh --compare --warmup --duration 30m --users 30 \
+  --gpu-mem-util 0.72 \
+  --model meta-llama/CodeLlama-13b-Instruct-hf \
+  --prompt-dist stress --prefix-ratio 0.9 --max-model-len 8192 \
+  --output-dir benchmark-reports/expE0-residency-pressure-probe
+```
+
+If downgrades stay 0 at `--gpu-mem-util 0.72`, push pressure harder: lower toward
+0.70, raise `--users` (40–50), and/or raise `--prefix-max-tokens`. As a last
+resort raise `RANVIER_CACHE_RESIDENCY_THRESHOLD` toward 0.5 (fires at 50% full)
+— but that changes what you're testing, so prefer real pressure.
+
+**Step 2 — the A/B (only once Step 1 shows downgrades > 0).** Same pressured
+config, residency ON vs OFF, compare the two prefix-aware legs:
+
+```bash
+# E_on: residency ON (0.2)
+NUM_LARGE_PREFIXES=50 RANVIER_CACHE_RESIDENCY_THRESHOLD=0.2 RANVIER_ROUTING_MODE=prefix \
+./scripts/bench.sh --compare --warmup --duration 30m --users 30 --gpu-mem-util 0.72 \
+  --model meta-llama/CodeLlama-13b-Instruct-hf --prompt-dist stress --prefix-ratio 0.9 \
+  --max-model-len 8192 --output-dir benchmark-reports/expE-on
+
+# E_off: residency OFF (0.0), identical otherwise
+NUM_LARGE_PREFIXES=50 RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0 RANVIER_ROUTING_MODE=prefix \
+./scripts/bench.sh --compare --warmup --duration 30m --users 30 --gpu-mem-util 0.72 \
+  --model meta-llama/CodeLlama-13b-Instruct-hf --prompt-dist stress --prefix-ratio 0.9 \
+  --max-model-len 8192 --output-dir benchmark-reports/expE-off
+
+# Compare the two PREFIX legs directly (off = baseline, on = new):
+./tests/integration/results_parser.py compare \
+  benchmark-reports/expE-off/*_prefix/benchmark.log \
+  benchmark-reports/expE-on/*_prefix/benchmark.log
+```
+
+**What residency-on is supposed to do** (per `docs/internals/cache-residency-routing.md`):
+honor an ART hit only when the backend likely still holds the prefix; when the
+owning backend's cache is full (prefix likely evicted), treat as a miss and
+divert. So under pressure, residency-on should **reduce the stale-hit penalty** —
+fewer "believed hits" that are actually cold — improving Cache Hit P99 / the gap
+between believed-hit and actual-hit latency.
+
+**The confound to watch:** a residency downgrade diverts to the load-based
+fallback, i.e. it is itself a (cold) diversion — the same #442 family cost. So
+residency-on trades stale-hit-misses for cold-divert-misses. The benchmark
+measures the *net*. Read both `residency_route_downgrades_total` (did it fire,
+and how much) and Cache Miss P99 (did the diverts pay off or just add cold cost).
+
+**Success criteria:**
+- Step 1: `residency_route_downgrades_total > 0` (ideally a few % of requests).
+- Step 2: residency-on improves Cache Hit P99 / overall P99 vs residency-off
+  *without* a worse net Cache Miss tail. If on ≈ off on every metric, residency
+  routing is neutral at this pressure; if on is worse, the cold-divert cost
+  dominates (same lesson as #442) and the threshold/eviction model needs work.
+
 ## Methodology notes
 
 - **Minimum duration:** 30m at 20u+. 10m runs at 20u-30u are not long enough
