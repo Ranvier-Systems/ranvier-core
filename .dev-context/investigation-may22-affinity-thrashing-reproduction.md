@@ -235,3 +235,83 @@ investigation's absolute-threshold framing maps onto the floor parameter only;
 the factor is conceptually different. The next-benchmark checklist uses the
 current parameter names; the spirit of #289 Fix 1 ("raise the threshold")
 translates to raising one or both of these.
+
+## Empirical results — Experiments A & B (2026-05-25, `f2066e6`, 13B 30u 30m)
+
+Ran the smoking-gun A/B on a fresh 8×A100 instance. Both prefix-aware legs
+paired with a same-instance round-robin baseline. Prometheus counters captured
+(scrape fixed: Seastar exposes metrics as `seastar_ranvier_*`). Workload:
+stress dist, prefix-ratio 0.9, **5 large prefixes across 8 backends**.
+
+| Run | Diversion config | P99 TTFT vs RR | Cache Miss P99 | Cache hit | Incompletes | load_aware_fallbacks | residency_downgrades | backend Gini |
+|-----|------------------|---------------:|---------------:|----------:|------------:|---------------------:|---------------------:|-------------:|
+| **A** | load-aware OFF + residency OFF (0.0) | **-76%** | **-76%** | 89.3% | **9.4%** (1528) | 0 | 0 | **0.534** |
+| **B** | load-aware ON (f=3.0, fl=4) + residency default (0.2) | **+167%** | **+219%** | 59.5% | 0 | **1535 (10.7%)** | **0** | 0.248 |
+
+### Finding 1 — Residency routing (#527) is INERT in this environment
+
+`residency_route_downgrades_total = 0` in **both** runs, including B where the
+threshold was at its default 0.2. The pre-run worry that #527 was a confound is
+**refuted**. Likely cause: the gossiped residency signal never dropped below
+0.2 (cache pressure never crossed ~80% as measured) or the CACHE_STATE signal
+isn't populated in this benchmark topology, so `get_cached_residency()` returns
+the no-signal sentinel and the downgrade never fires. Either way, residency
+routing did not influence these results and can be set aside for the 30u
+miss-tail analysis.
+
+### Finding 2 — Pure affinity over-concentrates (the 9.4% timeouts are real)
+
+Exp A's per-backend distribution (cumulative `backend_latency_seconds_count`):
+`[b1=1697, b2=303, b3=298, b4=11, b5=290, b6=6, b7=472, b8=1123]`, **Gini
+0.534**. Two backends (b1, b8) absorb the load; two (b4, b6) are essentially
+idle. With 5 hot prefixes pinned by consistent hash across 8 backends, pure
+affinity *cannot* use more than 5 backends (pigeonhole) — the 2 hottest
+overload at 30u and shed 9.4% of requests past the 300 s stream timeout. The
+completed requests are fast cache hits (P99 -76%, hit rate 89.3%), so the
+aggregate P99 looks like a win while ~1 in 11 requests silently fails. This is
+the metric-blindness the RUN STATUS banner now catches.
+
+### Finding 3 — Load-aware diversions are the miss-tail driver, and they are cold (confirms #442)
+
+Exp B fired load-aware on **10.7%** of requests (1535 fallbacks). That
+diversion *worked* as load balancing — Gini fell to 0.248, no idle backends,
+**0 timeouts**. But it was catastrophic for latency: **P99 +167%, Cache Miss
+P99 +219%, XLarge Miss P99 +213%**, and cache hit fell from A's 89.3% to 59.5%.
+
+This is the #442 mechanism, now observed rather than predicted: each diverted
+request is served by a backend that is cold for that prefix, and because the
+ART keeps learning the *original* (overloaded) consistent-hash target, the
+diversion target never warms up — every divert is a fresh cold miss. A single
+hot prefix gets sprayed across the rotating set of least-loaded backends, none
+of which retains it, which is why a 10.7% diversion rate drags the cache hit
+rate down ~30 pp and blows out the miss tail far out of proportion to the
+diversion count.
+
+### Conclusion
+
+At 30u with this workload, **both threshold extremes lose to round-robin**:
+- No diversion → 9.4% timeouts (over-concentration).
+- Diversion (even modest, 10.7%) → +167% P99 (cold-miss tail, no escape valve).
+
+Threshold tuning cannot square this circle: the diverted requests are
+*structurally* cold because of #442's learn-the-original behavior. The data now
+**empirically supports the #442 proximate-cause ranking** from the static audit
+above. Residency routing and #441 are both ruled out as contributors.
+
+**The fix is structural, not a config change — flag for human decision per the
+task brief.** The candidate that matches the data is #289 Fix 2 / may22 fix
+options 2–3: when load-aware diverts a prefix to backend B persistently, learn
+`P → B` (hysteresis / sticky diversion) so B warms up and subsequent requests
+are real hits. This requires touching the learn-target logic
+(`http_controller.cpp:1898`) and/or `apply_load_aware_selection`
+(`router_service.cpp`), so it is out of scope for this benchmark session.
+
+### Caveat / open question
+
+The 5-prefix workload forces extreme concentration (only 5 of 8 backends usable
+under pure affinity). A higher prefix count (e.g. `NUM_LARGE_PREFIXES=50`) would
+relax the pigeonhole and may let pure affinity avoid timeouts without diversion
+— worth one run to confirm the timeouts are workload-concentration-driven and
+not a separate routing defect. Experiment C (20u repeats) is also still open:
+at 20u the lower load may let pure affinity complete without timeouts, which
+would localize the timeout failure to the 30u over-concentration regime.

@@ -1377,12 +1377,28 @@ fi
 # load-aware behavior — a bare `RANVIER_LOAD_AWARE_ROUTING=... ./bench.sh`
 # env prefix is overwritten by the export above and has no effect.
 log_header "Effective Routing Config"
-log_info "RANVIER_ROUTING_MODE        = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
-log_info "RANVIER_LOAD_AWARE_ROUTING  = ${RANVIER_LOAD_AWARE_ROUTING}"
+log_info "RANVIER_ROUTING_MODE          = ${RANVIER_ROUTING_MODE:-prefix} (default prefix)"
+log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
+# Residency routing (#527) is a SECOND diversion mechanism, on by default
+# (threshold 0.2). It is NOT controlled by --no-load-aware — only by this env
+# var (0.0 disables). Surfaced here because a silently-on residency threshold
+# confounds any load-aware A/B.
+log_info "RANVIER_CACHE_RESIDENCY_THRESHOLD = ${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2 (compose default — residency routing ON)}"
 if [[ "$LOAD_AWARE" = true ]]; then
-    log_warn "Load-aware routing is ON. For the Experiment A smoking-gun A/B, pass --no-load-aware."
+    log_warn "Load-aware routing is ON. For a no-diversion A/B, pass --no-load-aware AND set RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0."
+fi
+if [[ "${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}" != "0.0" ]]; then
+    log_warn "Residency routing is ON (threshold=${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2}). It diverts ART hits independently of load-aware."
+fi
+# Workload knob: unique large-prefix count. With 8 backends, the default 5
+# pins all prefixes to <=5 backends under pure affinity (forced concentration,
+# Gini ~0.5). Raise (e.g. 50) to relax that. Auditable here because it changes
+# how to read the per-backend distribution.
+log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-5 (locust default)}  [workload, not routing]"
+if [[ "${NUM_LARGE_PREFIXES:-5}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
+    log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-5}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration)."
 fi
 
 # Export compression ratio for docker-compose
@@ -1601,6 +1617,12 @@ run_benchmark() {
     PREFIX_MAX_ARGS=""
     [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
 
+    # Forward NUM_LARGE_PREFIXES so the workload's unique-prefix count is
+    # controllable (and auditable in the banner). Locust defaults to 5; with 8
+    # backends that pins all prefixes to <=5 backends under pure affinity. Pass
+    # a higher value (e.g. 50) to relax that concentration. Honors an env prefix.
+    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-5}"
+
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
@@ -1649,6 +1671,7 @@ run_benchmark() {
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
+        $NUM_PREFIXES_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -1758,6 +1781,9 @@ if [[ "$WARMUP" = true ]]; then
     PREFIX_MAX_ARGS=""
     [[ -n "$PREFIX_MAX_TOKENS" ]] && PREFIX_MAX_ARGS="-e LARGE_PREFIX_MAX_TOKENS=$PREFIX_MAX_TOKENS"
 
+    # Match the main run's prefix count so warm-up primes the same prefix set.
+    NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-5}"
+
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1774,6 +1800,7 @@ if [[ "$WARMUP" = true ]]; then
         $BACKEND_ARGS \
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
+        $NUM_PREFIXES_ARGS \
         locust \
         --headless \
         --users "$USERS" \
