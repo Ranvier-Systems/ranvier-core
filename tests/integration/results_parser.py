@@ -149,6 +149,16 @@ class BenchmarkResults:
     # SECOND diversion mechanism distinct from load-aware fallbacks; a high
     # value here means residency routing (not load-aware) is breaking affinity.
     residency_route_downgrades_total: Optional[int] = None
+    # Residency-signal health (#527): proves the feature is *live* vs merely
+    # not-firing. A residency benchmark that shows 0 downgrades is meaningless
+    # unless these confirm the signal is flowing. cache_states_received_total>0
+    # and residency_cache_size>0 mean gossip + per-shard cache are populated; a
+    # 0-downgrade run with healthy signal just means cache never crossed the
+    # residency threshold (i.e. no cache pressure). Names verified at
+    # gossip_service.cpp:123-126 and router_service.cpp:1748.
+    cache_states_sent_total: Optional[int] = None
+    cache_states_received_total: Optional[int] = None
+    residency_cache_size: Optional[int] = None
     # Per-backend in-flight request gauge — printed as a sorted list so prefix-
     # concentration hot-spotting shows up directly in the comparison output.
     backend_active_requests: Optional[Dict[str, float]] = None
@@ -573,6 +583,17 @@ _PROM_FALLBACK_RE = re.compile(
 _PROM_RESIDENCY_RE = re.compile(
     r"^(?:seastar_)?ranvier_router_residency_route_downgrades_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
 )
+# Residency-signal health (#527): proves the feature is live even when downgrades=0.
+# gossip counters verified at gossip_service.cpp:123-126; gauge at router_service.cpp:1748.
+_PROM_CACHE_STATES_SENT_RE = re.compile(
+    r"^(?:seastar_)?ranvier_gossip_cache_states_sent_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
+)
+_PROM_CACHE_STATES_RECV_RE = re.compile(
+    r"^(?:seastar_)?ranvier_gossip_cache_states_received_total(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
+)
+_PROM_RESIDENCY_CACHE_SIZE_RE = re.compile(
+    r"^(?:seastar_)?ranvier_router_residency_cache_size(?:\{[^}]*\})?\s+([0-9.eE+-]+)"
+)
 # NOTE: backend_active_requests is an instantaneous gauge — it reads ~0 when
 # scraped after traffic has drained at end-of-run, so it is a poor distribution
 # signal. The cumulative histogram count below is preferred (see caller).
@@ -604,6 +625,9 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
 
     fallbacks: Optional[float] = None  # summed across shards
     residency: Optional[float] = None  # summed across shards
+    cs_sent: Optional[float] = None    # summed across shards
+    cs_recv: Optional[float] = None    # summed across shards
+    res_cache_size: Optional[float] = None  # max across shards (per-shard gauge)
     active: Dict[str, float] = {}      # summed per backend_id across shards
     routed_total: Dict[str, float] = {}
     for line in content.splitlines():
@@ -620,6 +644,30 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
         if m:
             try:
                 residency = (residency or 0.0) + float(m.group(1))
+            except ValueError:
+                pass
+            continue
+        m = _PROM_CACHE_STATES_SENT_RE.match(line)
+        if m:
+            try:
+                cs_sent = (cs_sent or 0.0) + float(m.group(1))
+            except ValueError:
+                pass
+            continue
+        m = _PROM_CACHE_STATES_RECV_RE.match(line)
+        if m:
+            try:
+                cs_recv = (cs_recv or 0.0) + float(m.group(1))
+            except ValueError:
+                pass
+            continue
+        m = _PROM_RESIDENCY_CACHE_SIZE_RE.match(line)
+        if m:
+            try:
+                # Per-shard gauge ("backends tracked"); take the max as the
+                # representative coverage rather than summing across shards.
+                v = float(m.group(1))
+                res_cache_size = v if res_cache_size is None else max(res_cache_size, v)
             except ValueError:
                 pass
             continue
@@ -642,6 +690,12 @@ def parse_prometheus_dump(prom_path: str) -> Dict[str, Any]:
         out["load_aware_fallbacks_total"] = int(fallbacks)
     if residency is not None:
         out["residency_route_downgrades_total"] = int(residency)
+    if cs_sent is not None:
+        out["cache_states_sent_total"] = int(cs_sent)
+    if cs_recv is not None:
+        out["cache_states_received_total"] = int(cs_recv)
+    if res_cache_size is not None:
+        out["residency_cache_size"] = int(res_cache_size)
     if active:
         out["backend_active_requests"] = active
     if routed_total:
@@ -832,6 +886,12 @@ def parse_benchmark_log(filepath: str, benchmark_type: Optional[str] = None) -> 
         results.load_aware_fallbacks_total = prom["load_aware_fallbacks_total"]
     if "residency_route_downgrades_total" in prom:
         results.residency_route_downgrades_total = prom["residency_route_downgrades_total"]
+    if "cache_states_sent_total" in prom:
+        results.cache_states_sent_total = prom["cache_states_sent_total"]
+    if "cache_states_received_total" in prom:
+        results.cache_states_received_total = prom["cache_states_received_total"]
+    if "residency_cache_size" in prom:
+        results.residency_cache_size = prom["residency_cache_size"]
     # Prefer per-backend histogram counts (cumulative dispatched requests) if
     # available; fall back to the active-requests gauge (instantaneous in-flight)
     # otherwise. Either is usable for spotting hot-spotting.
@@ -1488,6 +1548,30 @@ def compare_results(baseline: BenchmarkResults, new: BenchmarkResults) -> str:
             n_rd_str = f"{_fmt_count(n_rd)}" + (f" ({n_rd_pct:.1f}%)" if n_rd_pct is not None else "")
             lines.append(f"  residency_route_downgrades_total: baseline={b_rd_str}  new={n_rd_str}")
             lines.append("  (percent = downgrades / total_requests; high % means residency routing is diverting ART hits)")
+
+        # Residency-signal health — distinguishes "feature inert because no cache
+        # pressure" from "feature off / signal broken". If downgrades=0 but
+        # received>0 and cache_size>0, the feature is LIVE and just never crossed
+        # the residency threshold (need more cache pressure to exercise it).
+        n_recv = new.cache_states_received_total
+        n_sent = new.cache_states_sent_total
+        n_size = new.residency_cache_size
+        if n_recv is not None or n_sent is not None or n_size is not None:
+            lines.append(
+                f"  residency signal (new): cache_states sent={_fmt_count(n_sent)} "
+                f"received={_fmt_count(n_recv)}, residency_cache_size={_fmt_count(n_size)}"
+            )
+            n_rd_v = new.residency_route_downgrades_total
+            if (n_rd_v == 0) and ((n_recv or 0) > 0) and ((n_size or 0) > 0):
+                lines.append(
+                    "  -> residency LIVE but never fired: cache never crossed the threshold "
+                    "(no cache pressure). Lower --gpu-mem-util or raise load to exercise it."
+                )
+            elif (n_recv == 0 or n_size == 0):
+                lines.append(
+                    "  -> residency signal NOT flowing (received/cache_size 0): check gossip / vLLM scrape "
+                    "before trusting a residency A/B."
+                )
 
         # Per-backend request distribution. Print as sorted list with min/max
         # and a Gini coefficient — hot-spotting from prefix concentration
