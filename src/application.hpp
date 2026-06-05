@@ -22,6 +22,8 @@
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
 #include "sharded_config.hpp"
+#include "telemetry_service.hpp"
+#include "telemetry_sink.hpp"
 #include "tokenizer_service.hpp"
 #include "tokenizer_thread_pool.hpp"
 
@@ -188,6 +190,14 @@ private:
     // Health monitoring
     std::unique_ptr<HealthService> _health_checker;
 
+    // Telemetry sink (per-shard counters + shard-0 periodic emitter).
+    // Off by default; the recording entry point in HttpController is a single
+    // null-check branch when the sink pointer is unset. See
+    // src/telemetry_sink.hpp for the sink contract and forward-compat
+    // discipline.
+    seastar::sharded<TelemetryService> _telemetry;
+    bool _telemetry_started = false;
+
     // Persistence layer (AsyncPersistenceManager owns the underlying SQLite store)
     std::unique_ptr<AsyncPersistenceManager> _async_persistence;
 
@@ -218,6 +228,19 @@ private:
 
     // Initialize health checker service
     void init_health_checker();
+
+    // Initialize per-shard telemetry counters + (on shard 0) the periodic
+    // window emitter that drives map_reduce → build report → hand to sink.
+    // Wires HttpController on every shard to its local TelemetryService.
+    // Safe to call even when telemetry_sink.enabled=false — the emitter
+    // simply doesn't arm and the recording call compiles to one branch.
+    seastar::future<> init_telemetry_service();
+
+    // Build a snapshot of the routing-strategy parameters currently in effect.
+    // Used by the telemetry emitter to attach a strategy view to each window
+    // report (so operators correlating outcome shifts with config changes
+    // see which knobs were live during the window).
+    RoutingStrategyParams make_strategy_snapshot() const;
 
     // Initialize K8s discovery service (if enabled)
     void init_k8s_discovery();

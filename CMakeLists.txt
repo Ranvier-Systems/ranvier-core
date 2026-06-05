@@ -278,6 +278,7 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/node_slab.cpp
       src/router_service.cpp
       src/stream_parser.cpp
+      src/telemetry_service.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
       src/sqlite_persistence.cpp
@@ -502,6 +503,26 @@ target_link_libraries(metrics_service_test
   absl::flat_hash_map
 )
 gtest_discover_tests(metrics_service_test)
+
+# Telemetry Sink Unit Tests (Pure C++, uses stubs for Seastar future + metrics)
+# Tests the wire-stable HardwareTier / WorkloadPattern ordinals (forward-compat
+# contract — see src/telemetry_schema.hpp), TelemetryBucketKey hash/equality,
+# AggregateRecord merge semantics, WindowReport defaults, and NoopSink factory.
+# Reactor-free by construction: never calls .then()/.finally() on the stubbed
+# futures, so it cannot trip the reactor-deref segfault.
+add_executable(telemetry_sink_test
+  tests/unit/telemetry_sink_test.cpp
+)
+target_include_directories(telemetry_sink_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/stubs
+  ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(telemetry_sink_test
+  PRIVATE
+  GTest::gtest_main
+  absl::flat_hash_map
+)
+gtest_discover_tests(telemetry_sink_test)
 
 # NodeSlab Unit Tests (Pure C++, no Seastar dependency)
 # Tests slab allocator: allocate/free round-trips, free-list integrity,
@@ -995,6 +1016,7 @@ if(Seastar_FOUND)
       src/sqlite_persistence.cpp
       src/stream_parser.cpp
       src/dtls_context.cpp
+      src/telemetry_service.cpp
       src/tokenizer_service.cpp
       src/tokenizer_thread_pool.cpp
       src/tracing_service.cpp

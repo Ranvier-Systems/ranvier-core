@@ -97,6 +97,14 @@ struct RouteResult {
     // of pinning prefixes to load-driven targets. Zero when no backend was
     // selected.
     BackendId original_selected = 0;
+
+    // Number of tokens of the input prefix that were matched (cache_hit
+    // path) or 0 (cache_miss). Populated by route_request() so the
+    // telemetry sink can plot a prefix-reuse-depth histogram per bucket.
+    // This is the effective lookup length (prefix_boundary if > 0, else
+    // min(tokens.size(), config.prefix_token_length)) — not the ART's
+    // internal path-compressed depth.
+    uint32_t matched_prefix_depth = 0;
 };
 
 // Result from get_backend_for_prefix(), distinguishing ART hits from hash fallback.
@@ -117,6 +125,10 @@ struct PrefixRouteResult {
     // and P2C this is the post-probe / post-secondary result — internal probing
     // is part of the strategy itself, not a transient divert.
     BackendId original_selected = 0;
+
+    // See RouteResult::matched_prefix_depth. Mirrored here so route_request()
+    // can propagate the value out to its caller.
+    uint32_t matched_prefix_depth = 0;
 };
 
 // ============================================================================
@@ -358,6 +370,36 @@ public:
     // Keys live in memory only — never written to SQLite, never logged.
     seastar::future<> set_backend_api_key_global(BackendId id, std::string api_key);
     std::string get_backend_api_key(BackendId id) const;
+
+    // Telemetry-sink label side-map. Per-backend, operator-set, broadcast to
+    // every shard at registration time. Distinct from BackendInfo so the
+    // abstract BackendRegistry interface stays minimal (callers that don't
+    // care about telemetry don't need to thread the labels through).
+    //
+    // `hardware_tier` is a closed enum (types.hpp); `model_family` is a coarse
+    // operator label, empty normalises to "unspecified" at recording time.
+    // NEITHER is parsed from client input — both are operator-controlled so
+    // cardinality stays bounded and the dimensions stay content-free. See
+    // src/telemetry_schema.hpp.
+    //
+    // `set_backend_labels_global` mirrors set_backend_api_key_global's
+    // parallel_for_each shape. `telemetry_labels` is synchronous and shard-
+    // local — http_controller calls it on the request-completion path to
+    // build the bucket key passed to TelemetryService::record_outcome.
+    seastar::future<> set_backend_labels_global(BackendId id,
+                                                HardwareTier hardware_tier,
+                                                std::string model_family);
+    struct BackendTelemetryLabels {
+        HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
+        std::string  model_family;   // "" → caller treats as "unspecified"
+    };
+    BackendTelemetryLabels telemetry_labels(BackendId id) const;
+
+    // Per-shard cumulative ART route-eviction count. Static accessor reads
+    // the calling shard's thread_local ShardLocalState; used by the
+    // telemetry emitter (via a captured std::function) to compute per-window
+    // eviction churn deltas. Returns 0 when shard state is not initialised.
+    static uint64_t get_local_routes_evicted();
 
     // Start draining a backend (stops new requests, allows existing cache hits)
     // After backend_drain_timeout, the backend will be fully removed

@@ -519,6 +519,14 @@ struct StaticBackendConfig {
     // never logged, never persisted. The env-var name itself (not the
     // value) is what lives in this struct.
     std::string api_key_env;
+
+    // Telemetry-sink bucket labels (operator-set; both default to
+    // "unspecified" so the dimension degrades gracefully when unlabelled).
+    // Read by `TelemetryService::record_outcome` at request completion to
+    // bucket aggregate routing/cache metrics. NOT content — both are coarse
+    // operator-controlled labels. See `src/telemetry_schema.hpp`.
+    HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
+    std::string  model_family;   // empty → "unspecified" at recording time
 };
 
 struct StaticBackendsConfig {
@@ -587,6 +595,11 @@ struct RanvierConfig {
     ClusterConfig cluster;
     K8sDiscoveryConfig k8s_discovery;
     TelemetryConfig telemetry;
+    // Pluggable telemetry sink for aggregate routing/cache metrics export.
+    // DISTINCT from `telemetry` above (which is OpenTelemetry tracing). Off
+    // by default. See config_infra.hpp for the struct and src/telemetry_sink.hpp
+    // for the sink contract.
+    TelemetrySinkConfig telemetry_sink;
     LoadBalancingConfig load_balancing;
     CostEstimationConfig cost_estimation;
     PriorityTierConfig priority_tier;

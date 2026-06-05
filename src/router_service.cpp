@@ -93,6 +93,13 @@ struct BackendInfo {
     // See BACKLOG §19 for the heterogeneous-fleet design.
     BackendType type = BackendType::VLLM;
 
+    // Telemetry-sink labels (operator-set; default to UNSPECIFIED / "").
+    // Written via set_backend_labels_global; read shard-locally by
+    // telemetry_labels(). NOT content — both are coarse operator-controlled
+    // labels. See src/telemetry_schema.hpp.
+    HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
+    std::string  model_family;
+
     BackendInfo() = default;
 
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
@@ -2194,6 +2201,15 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
     auto routing_mode = g_shard_state ? shard_state().config.routing_mode
                                       : RoutingConfig::RoutingMode::PREFIX;
 
+    // Effective prefix length used for the lookup (in tokens). Used to
+    // populate matched_prefix_depth on cache_hit so the telemetry sink can
+    // plot a prefix-reuse-depth histogram per bucket. NOT the ART's
+    // internal path-compressed depth — that lives behind get_backend_for_prefix.
+    const size_t effective_prefix_len = (prefix_boundary > 0)
+        ? prefix_boundary
+        : std::min(tokens.size(),
+                   g_shard_state ? shard_state().config.prefix_token_length : tokens.size());
+
     if (routing_mode == RoutingConfig::RoutingMode::PREFIX) {
         // PREFIX mode: ART lookup + consistent hash fallback (learns routes)
         result.routing_mode = "prefix";
@@ -2208,6 +2224,9 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
             result.was_fast_lane = prefix_result.was_fast_lane;
             result.backend_cost_at_decision = prefix_result.backend_cost_at_decision;
             result.original_selected = prefix_result.original_selected;
+            if (prefix_result.art_hit) {
+                result.matched_prefix_depth = static_cast<uint32_t>(effective_prefix_len);
+            }
         } else {
             result.error_message = "No backends registered";
         }
@@ -2221,6 +2240,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
             result.backend_id = hash_backend.value();
             result.cache_hit = true;  // Hash always provides affinity
             result.original_selected = hash_backend.value();
+            result.matched_prefix_depth = static_cast<uint32_t>(effective_prefix_len);
         } else {
             result.error_message = "No backends registered";
         }
@@ -2233,6 +2253,7 @@ RouteResult RouterService::route_request(const std::vector<int32_t>& tokens,
             result.backend_id = random_id.value();
             result.cache_hit = false;  // Random never uses cache
             result.original_selected = random_id.value();
+            // matched_prefix_depth stays 0 — random routing has no affinity.
         } else {
             result.error_message = "No backends registered";
         }
@@ -3966,6 +3987,64 @@ std::string RouterService::get_backend_api_key(BackendId id) const {
     auto it = state.backend_api_keys.find(id);
     if (it != state.backend_api_keys.end()) return it->second;
     return {};
+}
+
+// Broadcast telemetry-sink labels to every shard. Mirrors
+// set_backend_api_key_global's shape: foreign_ptr for the cross-shard
+// hop, local reallocation on each target shard (Rule #14). No-op silently
+// when the backend isn't (yet) registered on a shard — labels can land
+// either before or after the registration broadcast; whichever arrives
+// second wins, since both flows take the per-shard reactor in serial.
+seastar::future<> RouterService::set_backend_labels_global(
+    BackendId id, HardwareTier hardware_tier, std::string model_family) {
+
+    return seastar::do_with(std::move(model_family),
+        [id, hardware_tier](std::string& shared_family) {
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+                [id, hardware_tier, &shared_family](unsigned shard_id) {
+                    auto clone = std::make_unique<std::string>(shared_family);
+                    auto foreign = seastar::make_foreign(std::move(clone));
+                    return seastar::smp::submit_to(shard_id,
+                        [id, hardware_tier, foreign = std::move(foreign)]() mutable {
+                            if (!g_shard_state) return seastar::make_ready_future<>();
+                            auto& state = shard_state();
+                            auto it = state.backends.find(id);
+                            if (it == state.backends.end()) {
+                                // Backend not registered on this shard yet.
+                                // Operators call set_backend_labels_global
+                                // immediately after register_backend_global,
+                                // so on the common path the entry exists.
+                                // Silent no-op (Rule #9: no log spam for a
+                                // benign race; the labels stay UNSPECIFIED/""
+                                // and degrade gracefully — see
+                                // telemetry_labels()).
+                                return seastar::make_ready_future<>();
+                            }
+                            it->second.hardware_tier = hardware_tier;
+                            // Reallocate the string locally so the map
+                            // entry's heap lives on this shard (Rule #14).
+                            it->second.model_family = std::string(foreign->data(), foreign->size());
+                            return seastar::make_ready_future<>();
+                        });
+                });
+        });
+}
+
+RouterService::BackendTelemetryLabels
+RouterService::telemetry_labels(BackendId id) const {
+    BackendTelemetryLabels out;
+    if (!g_shard_state) return out;
+    const auto& state = shard_state();
+    auto it = state.backends.find(id);
+    if (it == state.backends.end()) return out;
+    out.hardware_tier = it->second.hardware_tier;
+    out.model_family  = it->second.model_family;
+    return out;
+}
+
+uint64_t RouterService::get_local_routes_evicted() {
+    if (!g_shard_state) return 0;
+    return g_shard_state->stats.routes_evicted;
 }
 
 std::vector<RouterService::BackendState> RouterService::get_all_backend_states() const {

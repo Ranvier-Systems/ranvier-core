@@ -592,6 +592,18 @@ void RanvierConfig::apply_env_overrides() {
         telemetry.max_export_batch_size = *v;
     }
 
+    // Telemetry-sink overrides (aggregate metrics export — distinct from
+    // OpenTelemetry tracing above)
+    if (auto v = get_env("RANVIER_TELEMETRY_SINK_ENABLED")) {
+        telemetry_sink.enabled = (*v == "1" || *v == "true" || *v == "yes");
+    }
+    if (auto v = get_env_as<int>("RANVIER_TELEMETRY_SINK_WINDOW_SECONDS")) {
+        if (*v > 0) telemetry_sink.window = std::chrono::seconds(*v);
+    }
+    if (auto v = get_env_as<size_t>("RANVIER_TELEMETRY_SINK_MAX_BUCKETS")) {
+        if (*v > 0) telemetry_sink.max_buckets = *v;
+    }
+
     // Cost estimation overrides
     if (auto v = get_env("RANVIER_COST_ESTIMATION_ENABLED")) {
         cost_estimation.enabled = (*v == "1" || *v == "true" || *v == "yes");
@@ -1382,6 +1394,20 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 config.telemetry.max_export_batch_size = t["max_export_batch_size"].as<size_t>();
             }
         }
+        // Telemetry-sink section (aggregate metrics export — distinct from
+        // the OpenTelemetry tracing block above)
+        if (yaml["telemetry_sink"]) {
+            YAML::Node ts = yaml["telemetry_sink"];
+            if (ts["enabled"]) config.telemetry_sink.enabled = ts["enabled"].as<bool>();
+            if (ts["window_seconds"]) {
+                int w = ts["window_seconds"].as<int>();
+                if (w > 0) config.telemetry_sink.window = std::chrono::seconds(w);
+            }
+            if (ts["max_buckets"]) {
+                size_t mb = ts["max_buckets"].as<size_t>();
+                if (mb > 0) config.telemetry_sink.max_buckets = mb;
+            }
+        }
         // Cost estimation section
         if (yaml["cost_estimation"]) {
             YAML::Node ce = yaml["cost_estimation"];
@@ -1648,6 +1674,20 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 if (entry["api_key_env"]) {
                     sb.api_key_env = entry["api_key_env"].as<std::string>();
                 }
+                if (entry["hardware_tier"]) {
+                    auto hw_str = entry["hardware_tier"].as<std::string>();
+                    auto hw = parse_hardware_tier(hw_str);
+                    if (!hw) {
+                        throw std::runtime_error(
+                            "'backends' entry id=" + std::to_string(sb.id)
+                            + " has unknown hardware_tier '" + hw_str
+                            + "' (expected one of: unspecified/gpu_small/gpu_large)");
+                    }
+                    sb.hardware_tier = *hw;
+                }
+                if (entry["model_family"]) {
+                    sb.model_family = entry["model_family"].as<std::string>();
+                }
                 config.backends.entries.push_back(std::move(sb));
             }
         }
@@ -1876,6 +1916,23 @@ std::optional<std::string> RanvierConfig::validate(const RanvierConfig& config) 
         }
         if (config.telemetry.max_export_batch_size == 0) {
             return "telemetry.max_export_batch_size must be positive";
+        }
+    }
+
+    // Validate telemetry-sink settings (if enabled)
+    if (config.telemetry_sink.enabled) {
+        if (config.telemetry_sink.window.count() <= 0) {
+            return "telemetry_sink.window_seconds must be positive";
+        }
+        if (config.telemetry_sink.max_buckets == 0) {
+            return "telemetry_sink.max_buckets must be positive";
+        }
+        // Defence-in-depth upper bound to avoid pathological per-shard memory
+        // when an operator misconfigures (e.g. drops in 1<<30). Per-shard cost
+        // scales roughly linearly with this cap; 65536 buckets * sizeof(record)
+        // is well under any reasonable per-shard budget.
+        if (config.telemetry_sink.max_buckets > 65536) {
+            return "telemetry_sink.max_buckets must not exceed 65536 (Rule #4)";
         }
     }
 

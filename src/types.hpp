@@ -62,4 +62,55 @@ inline std::optional<BackendType> parse_backend_type(std::string_view s) {
     return std::nullopt;
 }
 
+// Per-backend hardware regime tier. Operator-set at backend registration;
+// defaults to UNSPECIFIED so the dimension degrades gracefully when the
+// operator hasn't labelled their fleet. Used by the telemetry sink to bucket
+// aggregate routing/cache outcomes by a physical-regime axis (HBM capacity /
+// compute class) — chosen over market tiers like "flagship/mainstream" because
+// a card's market tier drifts year-over-year while its physical regime does
+// not, which keeps cross-deployment and cross-time comparability honest.
+//
+// WIRE CONTRACT (read carefully before editing):
+//
+//   - These ordinals are part of the telemetry window-report wire format and
+//     MUST be stable across releases. Never renumber an existing tier. Add
+//     new tiers only at the end (append-only). Renaming the C++ symbol is
+//     fine (consumers key on the integer); redefining what an existing tier
+//     MEANS (e.g. moving the small/large boundary) is NOT — that silently
+//     breaks comparability of everything already aggregated under the old
+//     meaning, and the catalog can't tell the two cohorts apart.
+//
+//   - UNSPECIFIED = 0 is the default-when-unset sentinel. It is permanent.
+//
+// Same forward-compat discipline as CacheStatePacket — see gossip_protocol.hpp.
+enum class HardwareTier : uint8_t {
+    UNSPECIFIED = 0,
+    GPU_SMALL   = 1,
+    GPU_LARGE   = 2,
+    // Append only. Add GPU_MEDIUM=3 (etc.) when fleet data warrants a finer
+    // split. CPU=N is the obvious next addition once Ranvier formally
+    // supports local CPU-LLM backends as a first-class bucket.
+};
+
+// Stable string label for HardwareTier. Used as a Prometheus-safe label value
+// and as the operator-facing identifier in YAML / admin APIs. Lower-case,
+// snake-case; matches parse_hardware_tier() round-trip.
+inline std::string_view hardware_tier_to_string(HardwareTier t) {
+    switch (t) {
+        case HardwareTier::UNSPECIFIED: return "unspecified";
+        case HardwareTier::GPU_SMALL:   return "gpu_small";
+        case HardwareTier::GPU_LARGE:   return "gpu_large";
+    }
+    return "unspecified";
+}
+
+// Inverse of hardware_tier_to_string(). Returns std::nullopt for unknown
+// strings; service layer logs and defaults to UNSPECIFIED (Rule #7).
+inline std::optional<HardwareTier> parse_hardware_tier(std::string_view s) {
+    if (s == "unspecified") return HardwareTier::UNSPECIFIED;
+    if (s == "gpu_small")   return HardwareTier::GPU_SMALL;
+    if (s == "gpu_large")   return HardwareTier::GPU_LARGE;
+    return std::nullopt;
+}
+
 }  // namespace ranvier
