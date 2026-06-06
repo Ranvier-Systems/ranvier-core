@@ -237,8 +237,8 @@ TEST(WindowReport, DefaultsCarryCurrentFormatVersion) {
 
 // The forward-compatibility contract says: a consumer reading a WindowReport
 // at a HIGHER format_version must still be able to read the fields it knows.
-// We can't simulate a newer producer in C++ directly (no wire form is emitted
-// in this PR), but we can assert the contract holds for the in-memory struct:
+// We can't simulate a newer producer in C++ directly (no wire form is emitted),
+// but we can assert the contract holds for the in-memory struct:
 // reading known fields when the version field has been overwritten still works.
 TEST(WindowReport, FieldsRemainReadableWhenVersionBumped) {
     WindowReport report;
