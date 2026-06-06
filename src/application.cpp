@@ -358,6 +358,20 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
     if (new_config.telemetry.enabled != _config.telemetry.enabled) {
         log_main.warn("Config reload: telemetry.enabled changes require restart to take effect");
     }
+
+    // Telemetry-sink (aggregate metrics export) start-up is one-time:
+    // start_shard caps and start_emitter window/sink are captured at startup
+    // by TelemetryService, not re-read on each window. Operators changing any
+    // of these via SIGHUP must restart for the change to apply.
+    if (new_config.telemetry_sink.enabled != _config.telemetry_sink.enabled) {
+        log_main.warn("Config reload: telemetry_sink.enabled changes require restart to take effect");
+    }
+    if (new_config.telemetry_sink.window != _config.telemetry_sink.window) {
+        log_main.warn("Config reload: telemetry_sink.window_seconds changes require restart to take effect");
+    }
+    if (new_config.telemetry_sink.max_buckets != _config.telemetry_sink.max_buckets) {
+        log_main.warn("Config reload: telemetry_sink.max_buckets changes require restart to take effect");
+    }
 }
 
 seastar::future<> Application::apply_vocab_size_config() {
@@ -657,6 +671,62 @@ void Application::init_health_checker() {
     });
 }
 
+RoutingStrategyParams Application::make_strategy_snapshot() const {
+    RoutingStrategyParams p;
+    const auto& r = _config.routing;
+    switch (r.routing_mode) {
+        case RoutingConfig::RoutingMode::PREFIX: p.routing_mode = "prefix"; break;
+        case RoutingConfig::RoutingMode::HASH:   p.routing_mode = "hash";   break;
+        case RoutingConfig::RoutingMode::RANDOM: p.routing_mode = "random"; break;
+    }
+    switch (r.hash_strategy) {
+        case RoutingConfig::HashStrategy::JUMP:         p.hash_strategy = "jump";         break;
+        case RoutingConfig::HashStrategy::BOUNDED_LOAD: p.hash_strategy = "bounded_load"; break;
+        case RoutingConfig::HashStrategy::P2C:          p.hash_strategy = "p2c";          break;
+        case RoutingConfig::HashStrategy::MODULAR:      p.hash_strategy = "modular";      break;
+    }
+    p.bounded_load_epsilon       = r.bounded_load_epsilon;
+    p.p2c_load_bias              = r.p2c_load_bias;
+    p.load_aware_routing         = r.load_aware_routing;
+    p.load_imbalance_factor      = r.load_imbalance_factor;
+    p.load_imbalance_floor       = r.load_imbalance_floor;
+    p.cost_routing_enabled       = r.cost_routing.enabled;
+    p.cache_residency_threshold  = r.cache_residency_threshold;
+    return p;
+}
+
+seastar::future<> Application::init_telemetry_service() {
+    co_await _telemetry.start();
+    _telemetry_started = true;
+
+    // start_shard always runs, even when disabled, so per-shard state is in
+    // a known shape (overflow sentinel pre-inserted) and the recording
+    // entry point stays a single branch.
+    auto cfg = _config.telemetry_sink;
+    co_await _telemetry.invoke_on_all([cfg](TelemetryService& s) {
+        return s.start_shard(cfg, [] { return RouterService::get_local_routes_evicted(); });
+    });
+
+    co_await _telemetry.invoke_on(0,
+        [&container = _telemetry, strategy_fn = [this] { return make_strategy_snapshot(); }]
+        (TelemetryService& s) mutable {
+            return s.start_emitter(&container,
+                                   make_default_telemetry_sink(),
+                                   std::move(strategy_fn));
+        });
+
+    // Each controller talks to its LOCAL telemetry instance — no cross-shard
+    // hop on the request path.
+    co_await _controller.invoke_on_all([this](HttpController& c) {
+        c.set_telemetry_service(&_telemetry.local());
+    });
+
+    log_main.info("Telemetry sink initialised (enabled={}, window={}s, max_buckets={})",
+                  _config.telemetry_sink.enabled,
+                  _config.telemetry_sink.window.count(),
+                  _config.telemetry_sink.max_buckets);
+}
+
 void Application::init_k8s_discovery() {
     if (!_config.k8s_discovery.enabled) {
         return;
@@ -914,6 +984,11 @@ seastar::future<> Application::startup() {
             return seastar::smp::invoke_on_all([this] {
                 metrics().set_health_service(_health_checker.get());
             });
+        }).then([this] {
+            // Initialise telemetry sink: per-shard counters + (on shard 0)
+            // the periodic window emitter. Off by default — the recording
+            // path is a single null-check branch when the sink is disabled.
+            return init_telemetry_service();
         }).then([this] {
             // Initialise per-API-key attribution on every shard. This
             // pre-registers the three sentinel labels and any pre-configured
@@ -1553,6 +1628,21 @@ seastar::future<> Application::stop_services() {
             }
             return _async_persistence->stop().then([] {
                 log_main.debug("  Async persistence stopped (queue flushed)");
+            });
+        })
+        .then([this] {
+            // -------------------------------------------------------------------------
+            // Step 5b: Stop telemetry sink. HttpController was stopped in
+            // Step 4 so no recording calls can race the teardown.
+            // -------------------------------------------------------------------------
+            if (!_telemetry_started) {
+                return seastar::make_ready_future<>();
+            }
+            return _telemetry.stop().then([this] {
+                _telemetry_started = false;
+                log_main.debug("  Telemetry sink stopped");
+            }).handle_exception([](auto) {
+                log_main.warn("  Telemetry sink stop error (ignored)");
             });
         })
         .then([this] {

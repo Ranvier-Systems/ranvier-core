@@ -492,6 +492,42 @@ telemetry:
   #   View traces at: http://localhost:16686
 
 # =============================================================================
+# Telemetry Sink Configuration (aggregate routing/cache metrics export)
+# =============================================================================
+# Pluggable export of aggregate routing/cache metrics — periodic window reports
+# bucketed by (model_family, hardware_tier, workload_pattern). DISTINCT from
+# the `telemetry:` block above (which is OpenTelemetry distributed tracing).
+#
+# Off by default. With enabled=false, the recording entry point compiles to a
+# single predictable branch and the routing path behaves exactly as today.
+#
+# Per-backend bucket dimensions are operator-set in the `backends:` block
+# below (hardware_tier, model_family). The third dimension, workload_pattern,
+# is derived from request intent classification.
+#
+# This stock build wires the NoopSink (discards every report). Operators can
+# plug in their own export sink without recompiling consumers — the wire
+# format is forward-compatible (consumers tolerate unknown trailing fields;
+# see src/telemetry_sink.hpp).
+telemetry_sink:
+  # Master switch (RANVIER_TELEMETRY_SINK_ENABLED)
+  enabled: false
+
+  # Window length in seconds — how often the emitter on shard 0 builds a
+  # report and hands it to the sink. Lower values give finer time resolution
+  # at the cost of more cross-shard map_reduce work.
+  # (RANVIER_TELEMETRY_SINK_WINDOW_SECONDS)
+  window_seconds: 60
+
+  # Per-shard hard cap on distinct (model_family, hardware_tier, workload)
+  # buckets (Hard Rule #4). Both label dimensions are operator-set so
+  # cardinality is naturally small; this cap is defence in depth. Buckets
+  # beyond the cap are attributed to the `_overflow` sentinel and counted
+  # in the report's `buckets_overflowed` field.
+  # (RANVIER_TELEMETRY_SINK_MAX_BUCKETS)
+  max_buckets: 256
+
+# =============================================================================
 # =============================================================================
 # Per-API-Key Attribution Configuration
 # =============================================================================
@@ -558,6 +594,16 @@ attribution:
 # Maximum 64 entries (Rule #4). Hand-curate this list; auto-discovered
 # fleets belong under k8s_discovery: or local_mode:.
 #
+# Optional telemetry-sink labels (only consumed when telemetry_sink.enabled):
+#   `hardware_tier` — closed enum: unspecified (default) / gpu_small / gpu_large.
+#     Physical-regime classifier; defaults to UNSPECIFIED so the dimension
+#     degrades gracefully when unlabelled. These ordinals are wire-stable;
+#     see src/types.hpp for the contract.
+#   `model_family` — coarse operator label (e.g. "llama3", "qwen2"). Empty
+#     normalises to "unspecified" at recording time. NOT parsed from client
+#     request bodies — the dimension is intentionally operator-controlled so
+#     cardinality stays bounded and the label stays content-free.
+#
 # backends:
 #   - id: 101
 #     host: api.cerebras.ai
@@ -572,6 +618,8 @@ attribution:
 #     weight: 200
 #     priority: 0
 #     compression_ratio: 6.0
+#     hardware_tier: gpu_large
+#     model_family: llama3
 #
 #   - id: 103
 #     host: api.openai.com

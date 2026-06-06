@@ -97,6 +97,14 @@ struct RouteResult {
     // of pinning prefixes to load-driven targets. Zero when no backend was
     // selected.
     BackendId original_selected = 0;
+
+    // Number of tokens of the input prefix that were matched (cache_hit
+    // path) or 0 (cache_miss). Populated by route_request() so the
+    // telemetry sink can plot a prefix-reuse-depth histogram per bucket.
+    // This is the effective lookup length (prefix_boundary if > 0, else
+    // min(tokens.size(), config.prefix_token_length)) — not the ART's
+    // internal path-compressed depth.
+    uint32_t matched_prefix_depth = 0;
 };
 
 // Result from get_backend_for_prefix(), distinguishing ART hits from hash fallback.
@@ -117,6 +125,10 @@ struct PrefixRouteResult {
     // and P2C this is the post-probe / post-secondary result — internal probing
     // is part of the strategy itself, not a transient divert.
     BackendId original_selected = 0;
+
+    // See RouteResult::matched_prefix_depth. Mirrored here so route_request()
+    // can propagate the value out to its caller.
+    uint32_t matched_prefix_depth = 0;
 };
 
 // ============================================================================
@@ -358,6 +370,25 @@ public:
     // Keys live in memory only — never written to SQLite, never logged.
     seastar::future<> set_backend_api_key_global(BackendId id, std::string api_key);
     std::string get_backend_api_key(BackendId id) const;
+
+    // Per-backend telemetry-sink labels (operator-set, broadcast to every
+    // shard). Kept as a side-map rather than on BackendInfo's abstract
+    // interface so callers that don't care about telemetry don't have to
+    // thread them through. Neither label is parsed from client input —
+    // both are operator-controlled so cardinality stays bounded and the
+    // dimensions stay content-free. See src/telemetry_schema.hpp.
+    seastar::future<> set_backend_labels_global(BackendId id,
+                                                HardwareTier hardware_tier,
+                                                std::string model_family);
+    struct BackendTelemetryLabels {
+        HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
+        std::string  model_family;   // "" → caller treats as "unspecified"
+    };
+    BackendTelemetryLabels telemetry_labels(BackendId id) const;
+
+    // Calling shard's cumulative ART route-eviction count. Returns 0 when
+    // shard state is not initialised.
+    static uint64_t get_local_routes_evicted();
 
     // Start draining a backend (stops new requests, allows existing cache hits)
     // After backend_drain_timeout, the backend will be fully removed

@@ -16,6 +16,7 @@
 #include "router_service.hpp"
 #include "shard_load_balancer.hpp"
 #include "shard_load_metrics.hpp"
+#include "telemetry_service.hpp"
 #include "tokenizer_service.hpp"
 
 #include <array>
@@ -165,6 +166,21 @@ struct ProxyContext {
     // CHAT → use normal prefix/cost routing
     // Actual intent-based route selection is not yet implemented.
     RequestIntent intent = RequestIntent::CHAT;
+
+    // Retained outcome signals for the optional telemetry sink (zero when
+    // telemetry is disabled — fields are set unconditionally because the
+    // cost is a memcpy and the disabled hot-path branch in
+    // TelemetryService::record_outcome skips the recording anyway).
+    // Captured from RouteResult at routing time.
+    bool     telemetry_cache_hit         = false;
+    bool     telemetry_was_load_redirect = false;
+    bool     telemetry_was_cost_redirect = false;
+    bool     telemetry_was_fast_lane     = false;
+    uint32_t telemetry_matched_prefix_depth = 0;
+    // Captured at the TTFT recording site so the completion site can read
+    // the seconds value (the existing record_first_byte_latency_by_id only
+    // pushed it into a histogram and dropped it).
+    double   telemetry_first_byte_latency_seconds = 0.0;
 
     // Per-API-key attribution (populated by resolve_api_key() on entry to
     // handle_proxy(), before any routing decisions). Empty api_key_id means the
@@ -373,6 +389,13 @@ public:
     // Set optional HealthService pointer (for /admin/backends/metrics endpoint)
     void set_health_service(HealthService* hs) { _health_service = hs; }
 
+    // Set optional TelemetryService pointer (nullable, not owned). When set,
+    // the proxy completion path records a per-request outcome to the per-
+    // shard counter map that backs the periodic window report. When null,
+    // the recording call is skipped (the disabled cost is one null check).
+    // See src/telemetry_sink.hpp for the sink contract.
+    void set_telemetry_service(TelemetryService* ts) { _telemetry_service = ts; }
+
     // Set config reload callback (for /admin/keys/reload endpoint)
     // Callback returns true on success, false on failure
     // The callback is synchronous as it should just trigger the reload process
@@ -447,6 +470,13 @@ private:
 
     // HealthService pointer for admin metrics endpoint (nullable, not owned)
     HealthService* _health_service = nullptr;
+
+    // TelemetryService pointer for aggregate metrics export (nullable, not
+    // owned). Each shard's HttpController is wired to its LOCAL shard's
+    // TelemetryService instance via set_telemetry_service() during startup
+    // (Application::init_telemetry_service). When null, the proxy
+    // completion path's record_outcome call is skipped — zero cost.
+    TelemetryService* _telemetry_service = nullptr;
 
     // Graceful shutdown state
     // Plain bool: set/read only from this shard's reactor via invoke_on_all/local handler

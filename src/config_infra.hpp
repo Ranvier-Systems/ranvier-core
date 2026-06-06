@@ -435,6 +435,39 @@ struct TelemetryConfig {
 };
 
 // =============================================================================
+// Telemetry Sink Configuration (aggregate metrics export)
+// =============================================================================
+
+// Pluggable telemetry sink for exporting aggregate routing/cache metrics to an
+// operator-chosen backend. DISTINCT from `TelemetryConfig` above (which is
+// OpenTelemetry distributed tracing) — this controls the periodic window-
+// report emitter and the per-shard counters that feed it.
+//
+// Off by default. With `enabled=false`, the recording entry point compiles to
+// a single predictable branch with no allocation, no map lookup, no histogram
+// work — the routing path behaves exactly as today.
+//
+// See `src/telemetry_sink.hpp` for the sink contract and forward-compat
+// discipline that bind concrete sink implementations.
+struct TelemetrySinkConfig {
+    // Master switch. Off by default — stock build behaves exactly as today.
+    bool enabled = false;
+
+    // Window length: how often the emitter on shard 0 builds a report and
+    // hands it to the sink. Lower values give finer time resolution at the
+    // cost of more cross-shard map_reduce work; the typical operator value
+    // is 60s.
+    std::chrono::seconds window{60};
+
+    // Per-shard hard cap on distinct (model_family, hardware_tier, workload)
+    // buckets (Hard Rule #4). Both label dimensions are operator-set, so
+    // cardinality is naturally small; this cap is defence in depth. New
+    // buckets beyond the cap are attributed to the `_overflow` sentinel and
+    // counted in `WindowReport::buckets_overflowed`.
+    size_t max_buckets = 256;
+};
+
+// =============================================================================
 // Load Balancing Configuration
 // =============================================================================
 

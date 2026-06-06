@@ -1,0 +1,360 @@
+// Ranvier Core - Telemetry Service Implementation
+//
+// See telemetry_service.hpp for the contract and Hard-Rules summary.
+
+#include "telemetry_service.hpp"
+
+#include "types.hpp"
+
+#include <boost/range/irange.hpp>
+
+#include <chrono>
+#include <utility>
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/loop.hh>           // parallel_for_each
+#include <seastar/core/sharded.hh>        // also provides foreign_ptr / make_foreign
+#include <seastar/core/smp.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/util/log.hh>
+
+namespace ranvier {
+
+namespace {
+
+seastar::logger& log_telemetry() {
+    static seastar::logger l("telemetry_sink");
+    return l;
+}
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+// =============================================================================
+// Per-shard configuration
+// =============================================================================
+
+seastar::future<> TelemetryService::start_shard(
+    TelemetrySinkConfig config,
+    std::function<uint64_t()> eviction_counter_getter) {
+    _enabled                 = config.enabled;
+    _max_buckets             = config.max_buckets;
+    _window                  = config.window;
+    _eviction_counter_getter = std::move(eviction_counter_getter);
+
+    // Baseline so the first window's eviction delta is from start-time,
+    // not from process start.
+    _eviction_last_seen = _eviction_counter_getter ? _eviction_counter_getter() : 0;
+
+    // Sentinel occupies one of _max_buckets slots, so effective user-visible
+    // cardinality is _max_buckets - 1 — fine at the default of 256.
+    ensure_overflow_sentinel();
+
+    return seastar::make_ready_future<>();
+}
+
+void TelemetryService::ensure_overflow_sentinel() {
+    auto key = overflow_key();
+    if (_buckets.find(key) == _buckets.end()) {
+        _buckets.emplace(std::move(key), AggregateRecord{});
+    }
+}
+
+// =============================================================================
+// Shard-0 emitter
+// =============================================================================
+
+seastar::future<> TelemetryService::start_emitter(
+    seastar::sharded<TelemetryService>* container,
+    std::unique_ptr<TelemetrySink> sink,
+    std::function<RoutingStrategyParams()> strategy_snapshot) {
+
+    if (seastar::this_shard_id() != 0) {
+        return seastar::make_exception_future<>(
+            std::runtime_error("TelemetryService::start_emitter must run on shard 0"));
+    }
+
+    // Idempotent: clear prior timer + metrics group so a second call doesn't
+    // double-register the Prometheus counters.
+    if (_emitter_started) {
+        _emit_timer.cancel();
+    }
+    _emitter_metrics.clear();
+
+    _container          = container;
+    _sink               = std::move(sink);
+    _strategy_snapshot  = std::move(strategy_snapshot);
+    _window_start_ms    = now_ms();
+
+    if (!_enabled) {
+        log_telemetry().info("telemetry sink disabled; emitter not armed");
+        _emitter_started = true;
+        return seastar::make_ready_future<>();
+    }
+
+    // _window was set by start_shard from the same config; validation
+    // rejects window <= 0 when enabled.
+    _emit_timer.set_callback([this] { on_emit_timer(); });
+    _emit_timer.arm(_window);
+
+    // Rule #6: deregistered first in stop().
+    namespace sm = seastar::metrics;
+    _emitter_metrics.add_group("ranvier_telemetry_sink", {
+        sm::make_counter("reports_emitted_total", _reports_emitted,
+            sm::description("Periodic window reports successfully handed to the telemetry sink")),
+        sm::make_counter("reports_dropped_backpressure_total", _reports_dropped_backpressure,
+            sm::description("Window reports dropped because the prior consume() future had not "
+                            "resolved by the next window tick (sink slow / down)")),
+    });
+
+    _emitter_started = true;
+    log_telemetry().info("telemetry sink emitter armed (window={}s, max_buckets={})",
+                         _window.count(), _max_buckets);
+    return seastar::make_ready_future<>();
+}
+
+// =============================================================================
+// Recording entry (hot path)
+// =============================================================================
+
+void TelemetryService::record_outcome(const TelemetryBucketKey& key,
+                                      const TelemetryOutcome& outcome) {
+    // Disabled cost: single predictable branch.
+    if (!_enabled) {
+        return;
+    }
+
+    AggregateRecord& slot = *get_or_overflow_slot(key);
+
+    ++slot.request_count;
+    if (outcome.cache_hit) {
+        ++slot.cache_hit_count;
+    } else {
+        ++slot.cache_miss_count;
+    }
+    if (outcome.was_load_redirect) ++slot.load_redirect_count;
+    if (outcome.was_cost_redirect) ++slot.cost_redirect_count;
+    if (outcome.was_fast_lane)     ++slot.fast_lane_count;
+
+    switch (outcome.kind) {
+        case TelemetryOutcome::Kind::SUCCESS:          ++slot.success_count; break;
+        case TelemetryOutcome::Kind::FAILURE:          ++slot.failure_count; break;
+        case TelemetryOutcome::Kind::TIMEOUT:          ++slot.timeout_count; break;
+        case TelemetryOutcome::Kind::CONNECTION_ERROR: ++slot.connection_error_count; break;
+    }
+
+    // ttft is 0 when the request failed before any backend byte was seen;
+    // recording it would skew the distribution.
+    if (outcome.ttft_seconds > 0.0) {
+        slot.ttft_seconds.record(outcome.ttft_seconds);
+    }
+    if (outcome.total_latency_seconds > 0.0) {
+        slot.total_latency_seconds.record(outcome.total_latency_seconds);
+    }
+    // Depth 0 is the "no prefix hit" bucket — meaningful, always record.
+    slot.prefix_reuse_depth.record(static_cast<double>(outcome.matched_prefix_depth));
+}
+
+AggregateRecord* TelemetryService::get_or_overflow_slot(const TelemetryBucketKey& key) {
+    auto it = _buckets.find(key);
+    if (it != _buckets.end()) {
+        return &it->second;
+    }
+    if (_buckets.size() < _max_buckets) {
+        auto [new_it, _] = _buckets.emplace(key, AggregateRecord{});
+        return &new_it->second;
+    }
+    ++_buckets_overflowed;
+    // Sentinel was pre-inserted by start_shard and re-inserted by
+    // snapshot_and_reset; reactor-serial access means it is always present
+    // here.
+    return &_buckets.find(overflow_key())->second;
+}
+
+// =============================================================================
+// Window snapshot
+// =============================================================================
+
+ShardSnapshot TelemetryService::snapshot_and_reset() {
+    ShardSnapshot snap;
+    snap.records.reserve(_buckets.size());
+
+    for (auto& [key, rec] : _buckets) {
+        // Skip empty records (typical for the pre-inserted overflow sentinel
+        // when no overflow occurred). Reduces report noise.
+        if (rec.request_count == 0
+            && rec.cache_hit_count == 0
+            && rec.cache_miss_count == 0) {
+            continue;
+        }
+        rec.key = key;
+        snap.records.push_back(std::move(rec));
+    }
+
+    // Reset per-window state. Keep the pre-inserted overflow sentinel so the
+    // next window starts ready.
+    _buckets.clear();
+    ensure_overflow_sentinel();
+
+    snap.buckets_overflowed = _buckets_overflowed;
+    _buckets_overflowed = 0;
+
+    if (_eviction_counter_getter) {
+        uint64_t current = _eviction_counter_getter();
+        snap.eviction_delta = current - _eviction_last_seen;
+        _eviction_last_seen = current;
+    }
+
+    return snap;
+}
+
+// =============================================================================
+// Emitter timer callback + async chain
+// =============================================================================
+
+void TelemetryService::on_emit_timer() {
+    // Rule #5: bail out cleanly if stop() has closed the gate.
+    seastar::gate::holder holder;
+    try {
+        holder = _emit_gate.hold();
+    } catch (const seastar::gate_closed_exception&) {
+        return;
+    }
+
+    // Re-arm BEFORE deciding to drop, so window cadence is preserved even
+    // when the prior consume() future is still in flight.
+    _emit_timer.arm(_window);
+
+    // Sole backpressure throttle: the routing path is never awaited on the
+    // sink, so a slow sink drops windows here.
+    if (_consume_in_flight) {
+        ++_reports_dropped_backpressure;
+        return;
+    }
+
+    _consume_in_flight = true;
+
+    // Rule #18: discarded future has its own handle_exception. Rule #5:
+    // holder moved into .finally() so stop()'s gate.close() blocks on the
+    // entire chain including consume().
+    (void)emit_async()
+        .handle_exception([](std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::exception& e) {
+                log_telemetry().warn("emit_async failed: {}", e.what());
+            } catch (...) {
+                log_telemetry().warn("emit_async failed with unknown exception");
+            }
+        })
+        .finally([this, holder = std::move(holder)] {
+            _consume_in_flight = false;
+        });
+}
+
+seastar::future<> TelemetryService::emit_async() {
+    if (!_container || !_sink) {
+        co_return;
+    }
+
+    // Rule #14: each shard wraps its snapshot in a foreign_ptr; reading
+    // through fp-> is a safe cross-shard read, and the merge below copies
+    // into shard-0-local storage. The foreign_ptrs' destructors at scope
+    // end return their unique_ptrs to the home shards for free.
+    using ForeignSnap = seastar::foreign_ptr<std::unique_ptr<ShardSnapshot>>;
+    std::vector<ForeignSnap> per_shard(seastar::smp::count);
+
+    co_await seastar::parallel_for_each(
+        boost::irange(0u, seastar::smp::count),
+        [this, &per_shard](unsigned shard_id) {
+            return _container->invoke_on(shard_id, [](TelemetryService& s) {
+                return seastar::make_foreign(
+                    std::make_unique<ShardSnapshot>(s.snapshot_and_reset()));
+            }).then([&per_shard, shard_id](ForeignSnap fp) {
+                per_shard[shard_id] = std::move(fp);
+            });
+        });
+
+    absl::flat_hash_map<TelemetryBucketKey, AggregateRecord, TelemetryBucketKeyHash> merged;
+    uint64_t window_eviction      = 0;
+    uint64_t window_overflowed    = 0;
+    uint32_t contributing_shards  = 0;
+    size_t   merged_steps         = 0;
+
+    for (auto& fp : per_shard) {
+        if (!fp) continue;
+        ++contributing_shards;
+        window_eviction   += fp->eviction_delta;
+        window_overflowed += fp->buckets_overflowed;
+        for (const auto& rec : fp->records) {
+            auto it = merged.find(rec.key);
+            if (it == merged.end()) {
+                merged.emplace(rec.key, rec);  // shard-0-local copy
+            } else {
+                it->second.merge_from(rec);
+            }
+            // Rule #17: bounded buckets but yielding stays robust if the cap
+            // is ever raised.
+            if (++merged_steps % kYieldInterval == 0) {
+                co_await seastar::coroutine::maybe_yield();
+            }
+        }
+    }
+
+    WindowReport report;
+    report.format_version              = kTelemetryReportFormatVersion;
+    report.window_start_ms             = _window_start_ms;
+    report.window_end_ms               = now_ms();
+    report.shard_count                 = contributing_shards;
+    report.window_eviction_churn       = window_eviction;
+    report.buckets_overflowed          = window_overflowed;
+    report.reports_dropped_backpressure = _reports_dropped_backpressure;
+    if (_strategy_snapshot) {
+        report.strategy = _strategy_snapshot();
+    }
+
+    report.records.reserve(merged.size());
+    for (auto& [k, v] : merged) {
+        v.key = k;
+        report.records.push_back(std::move(v));
+    }
+
+    _window_start_ms = report.window_end_ms;
+
+    // Hand to sink. consume() must not block per the sink contract; the
+    // drop-on-backpressure guard upstream protects against a slow sink.
+    co_await _sink->consume(report);
+    ++_reports_emitted;
+}
+
+// =============================================================================
+// Lifecycle
+// =============================================================================
+
+seastar::future<> TelemetryService::stop() {
+    // Rule #6: dereg first.
+    _emitter_metrics.clear();
+
+    if (seastar::this_shard_id() == 0 && _emitter_started) {
+        _emit_timer.cancel();
+        // gate.close() blocks on the in-flight emit_async chain (holder is
+        // moved into its .finally()).
+        return _emit_gate.close().then([this] {
+            _sink.reset();
+            _strategy_snapshot = nullptr;
+            _container = nullptr;
+            _emitter_started = false;
+            _buckets.clear();
+        });
+    }
+
+    _buckets.clear();
+    return seastar::make_ready_future<>();
+}
+
+}  // namespace ranvier

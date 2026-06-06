@@ -1074,6 +1074,7 @@ future<> HttpController::stream_backend_response(
                 // Record in per-backend histogram for GPU model comparison
                 metrics().record_first_byte_latency_by_id(ctx->current_backend, first_byte_latency);
                 ctx->response_latency_recorded = true;
+                ctx->telemetry_first_byte_latency_seconds = first_byte_latency;
                 log_proxy.info("[{}] First byte received from backend {} (latency: {:.3f}s)",
                                 ctx->request_id, ctx->current_backend, first_byte_latency);
             }
@@ -1882,6 +1883,14 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // mutates it. See ProxyContext::learn_target_backend for the policy.
     BackendId learn_target = 0;
 
+    // Hoisted: RouteResult is local to the route_span block but the values
+    // need to flow into ProxyContext for the telemetry sink at completion.
+    bool     captured_telemetry_cache_hit         = false;
+    bool     captured_telemetry_was_load_redirect = false;
+    bool     captured_telemetry_was_cost_redirect = false;
+    bool     captured_telemetry_was_fast_lane     = false;
+    uint32_t captured_telemetry_matched_prefix_depth = 0;
+
     // Start route lookup span
     {
         auto route_span = TracingService::start_child_span("ranvier.route_lookup");
@@ -1923,6 +1932,12 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
                         request_id, route_result.routing_mode, route_result.cache_hit, target_id);
 
         route_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
+
+        captured_telemetry_cache_hit         = route_result.cache_hit;
+        captured_telemetry_was_load_redirect = route_result.was_load_redirect;
+        captured_telemetry_was_cost_redirect = route_result.was_cost_redirect;
+        captured_telemetry_was_fast_lane     = route_result.was_fast_lane;
+        captured_telemetry_matched_prefix_depth = route_result.matched_prefix_depth;
     } // route_span ends here
 
     // Speculative load increment: create BackendRequestGuard immediately after routing
@@ -2080,6 +2095,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->intent = intent;
     ctx->api_key_id = std::move(api_key_attr.id);
     ctx->api_key_label = std::move(api_key_attr.label);
+    ctx->telemetry_cache_hit              = captured_telemetry_cache_hit;
+    ctx->telemetry_was_load_redirect      = captured_telemetry_was_load_redirect;
+    ctx->telemetry_was_cost_redirect      = captured_telemetry_was_cost_redirect;
+    ctx->telemetry_was_fast_lane          = captured_telemetry_was_fast_lane;
+    ctx->telemetry_matched_prefix_depth   = captured_telemetry_matched_prefix_depth;
 
     // Detect whether client expects streaming (SSE) or non-streaming (JSON) response.
     // OpenAI-compatible APIs use "stream":true/false in the request body.
@@ -2345,6 +2365,36 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         // Phase 5: Record metrics and cleanup
         auto backend_end = std::chrono::steady_clock::now();
         record_proxy_completion_metrics(*ctx, backend_end);
+
+        // Bucket labels come from the SELECTED backend's operator-set side-map
+        // (not the client request body — see telemetry_schema.hpp).
+        if (_telemetry_service != nullptr) {
+            auto labels = _router.telemetry_labels(ctx->current_backend);
+            TelemetryBucketKey bucket;
+            bucket.model_family  = labels.model_family.empty()
+                ? std::string("unspecified") : labels.model_family;
+            bucket.hardware_tier = labels.hardware_tier;
+            bucket.workload      = workload_pattern_from_intent(ctx->intent);
+
+            TelemetryOutcome outcome;
+            outcome.cache_hit             = ctx->telemetry_cache_hit;
+            outcome.was_load_redirect     = ctx->telemetry_was_load_redirect;
+            outcome.was_cost_redirect     = ctx->telemetry_was_cost_redirect;
+            outcome.was_fast_lane         = ctx->telemetry_was_fast_lane;
+            outcome.matched_prefix_depth  = ctx->telemetry_matched_prefix_depth;
+            outcome.ttft_seconds          = ctx->telemetry_first_byte_latency_seconds;
+            outcome.total_latency_seconds = MetricsService::to_seconds(backend_end - ctx->request_start);
+            if (ctx->client_disconnected) {
+                outcome.kind = TelemetryOutcome::Kind::FAILURE;
+            } else if (ctx->timed_out) {
+                outcome.kind = TelemetryOutcome::Kind::TIMEOUT;
+            } else if (ctx->connection_error || ctx->connection_failed) {
+                outcome.kind = TelemetryOutcome::Kind::CONNECTION_ERROR;
+            } else {
+                outcome.kind = TelemetryOutcome::Kind::SUCCESS;
+            }
+            _telemetry_service->record_outcome(bucket, outcome);
+        }
 
         // Per-API-key attribution: enqueue one request_attribution row from
         // the terminal phase. Single enqueue per request, regardless of which
