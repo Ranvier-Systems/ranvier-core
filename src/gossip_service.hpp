@@ -38,10 +38,6 @@ namespace ranvier {
 // Gossip logger
 inline seastar::logger log_gossip("ranvier.gossip");
 
-// Re-export types from modules for backward compatibility with existing code
-// These were previously defined in this file but are now in gossip_protocol.hpp
-// and gossip_consensus.hpp
-
 // GossipService: Thread-local UDP gossip for cluster state sync
 // Runs on shard 0 only (broadcasts received routes to all shards via RouterService)
 //
