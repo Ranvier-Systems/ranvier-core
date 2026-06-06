@@ -96,9 +96,10 @@ struct BackendInfo {
     // Telemetry-sink labels (operator-set; default to UNSPECIFIED / "").
     // Written via set_backend_labels_global; read shard-locally by
     // telemetry_labels(). NOT content — both are coarse operator-controlled
-    // labels. See src/telemetry_schema.hpp.
-    HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
-    std::string  model_family;
+    // labels. See src/telemetry_schema.hpp. (The engine-class bucket dimension
+    // is read straight from `type` above, not stored here.)
+    HardwareLabel hardware_label = HardwareLabel::UNSPECIFIED;
+    std::string   model_family;
 
     BackendInfo() = default;
 
@@ -3996,16 +3997,16 @@ std::string RouterService::get_backend_api_key(BackendId id) const {
 // either before or after the registration broadcast; whichever arrives
 // second wins, since both flows take the per-shard reactor in serial.
 seastar::future<> RouterService::set_backend_labels_global(
-    BackendId id, HardwareTier hardware_tier, std::string model_family) {
+    BackendId id, HardwareLabel hardware_label, std::string model_family) {
 
     return seastar::do_with(std::move(model_family),
-        [id, hardware_tier](std::string& shared_family) {
+        [id, hardware_label](std::string& shared_family) {
             return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
-                [id, hardware_tier, &shared_family](unsigned shard_id) {
+                [id, hardware_label, &shared_family](unsigned shard_id) {
                     auto clone = std::make_unique<std::string>(shared_family);
                     auto foreign = seastar::make_foreign(std::move(clone));
                     return seastar::smp::submit_to(shard_id,
-                        [id, hardware_tier, foreign = std::move(foreign)]() mutable {
+                        [id, hardware_label, foreign = std::move(foreign)]() mutable {
                             if (!g_shard_state) return seastar::make_ready_future<>();
                             auto& state = shard_state();
                             auto it = state.backends.find(id);
@@ -4015,7 +4016,7 @@ seastar::future<> RouterService::set_backend_labels_global(
                                 // gracefully via telemetry_labels().
                                 return seastar::make_ready_future<>();
                             }
-                            it->second.hardware_tier = hardware_tier;
+                            it->second.hardware_label = hardware_label;
                             // Rule #14: reallocate locally so the map entry's
                             // heap lives on this shard.
                             it->second.model_family = std::string(foreign->data(), foreign->size());
@@ -4032,8 +4033,10 @@ RouterService::telemetry_labels(BackendId id) const {
     const auto& state = shard_state();
     auto it = state.backends.find(id);
     if (it == state.backends.end()) return out;
-    out.hardware_tier = it->second.hardware_tier;
-    out.model_family  = it->second.model_family;
+    // All backend-derived dimensions come from this one lookup.
+    out.backend_type   = it->second.type;
+    out.hardware_label = it->second.hardware_label;
+    out.model_family   = it->second.model_family;
     return out;
 }
 

@@ -1,8 +1,8 @@
 // Ranvier Core - Telemetry Sink Unit Tests
 //
 // Reactor-free tests over the telemetry-sink data contract: bucket key
-// hash/equality, AggregateRecord merge semantics, wire-stable HardwareTier /
-// WorkloadPattern ordinals (the wire-format invariant — see
+// hash/equality, AggregateRecord merge semantics, wire-stable BackendType /
+// HardwareLabel / WorkloadPattern ordinals (the wire-format invariant — see
 // src/telemetry_schema.hpp §"FORWARD-COMPATIBILITY CONTRACT"), and the
 // NoopSink default. Uses the seastar stubs in tests/stubs so this test
 // does NOT need a running reactor.
@@ -28,40 +28,72 @@
 using namespace ranvier;
 
 // =============================================================================
-// HardwareTier wire-stable ordinals
+// HardwareLabel wire-stable ordinals
 // =============================================================================
 //
 // These ordinals are part of the telemetry-sink wire contract. They MUST NOT
-// be renumbered (renaming the C++ symbol is fine). Adding a new tier is
+// be renumbered (renaming the C++ symbol is fine). Adding a new label is
 // append-only at a strictly-greater integer. See src/types.hpp.
 
-TEST(HardwareTier, UnspecifiedIsZero) {
-    EXPECT_EQ(static_cast<uint8_t>(HardwareTier::UNSPECIFIED), 0);
+TEST(HardwareLabel, UnspecifiedIsZero) {
+    EXPECT_EQ(static_cast<uint8_t>(HardwareLabel::UNSPECIFIED), 0);
 }
 
-TEST(HardwareTier, OrdinalsArePinned) {
+TEST(HardwareLabel, OrdinalsArePinned) {
     // If this fails, someone re-numbered the enum — that silently breaks
     // comparability of every WindowReport already aggregated by a downstream
     // catalog. Bump the format version and migrate readers FIRST.
-    EXPECT_EQ(static_cast<uint8_t>(HardwareTier::GPU_SMALL), 1);
-    EXPECT_EQ(static_cast<uint8_t>(HardwareTier::GPU_LARGE), 2);
+    EXPECT_EQ(static_cast<uint8_t>(HardwareLabel::GPU_SMALL), 1);
+    EXPECT_EQ(static_cast<uint8_t>(HardwareLabel::GPU_LARGE), 2);
 }
 
-TEST(HardwareTier, StringRoundTrip) {
-    for (auto t : {HardwareTier::UNSPECIFIED,
-                   HardwareTier::GPU_SMALL,
-                   HardwareTier::GPU_LARGE}) {
-        auto s = hardware_tier_to_string(t);
-        auto parsed = parse_hardware_tier(s);
+TEST(HardwareLabel, StringRoundTrip) {
+    for (auto t : {HardwareLabel::UNSPECIFIED,
+                   HardwareLabel::GPU_SMALL,
+                   HardwareLabel::GPU_LARGE}) {
+        auto s = hardware_label_to_string(t);
+        auto parsed = parse_hardware_label(s);
         ASSERT_TRUE(parsed.has_value()) << "round-trip lost: " << s;
         EXPECT_EQ(*parsed, t);
     }
 }
 
-TEST(HardwareTier, UnknownStringParsesToNullopt) {
-    EXPECT_FALSE(parse_hardware_tier("h100").has_value());
-    EXPECT_FALSE(parse_hardware_tier("").has_value());
-    EXPECT_FALSE(parse_hardware_tier("GPU_SMALL").has_value());  // case-sensitive
+TEST(HardwareLabel, UnknownStringParsesToNullopt) {
+    EXPECT_FALSE(parse_hardware_label("h100").has_value());
+    EXPECT_FALSE(parse_hardware_label("").has_value());
+    EXPECT_FALSE(parse_hardware_label("GPU_SMALL").has_value());  // case-sensitive
+}
+
+// =============================================================================
+// BackendType wire-stable ordinals
+// =============================================================================
+//
+// BackendType is a telemetry bucket-key dimension (engine class), so its
+// ordinals are part of the wire contract: pinned, append-only, never
+// renumbered. The persisted/admin form is the string; these ordinals serve
+// only the telemetry wire. No UNSPECIFIED sentinel — every backend has a real
+// engine class.
+
+TEST(BackendType, OrdinalsArePinned) {
+    // If this fails, someone re-numbered the enum — that silently breaks
+    // comparability of every WindowReport already aggregated by engine class.
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::VLLM),              0);
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::SGLANG),           1);
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::TRT_LLM),          2);
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::OLLAMA),           3);
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::LM_STUDIO),        4);
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::CEREBRAS),         5);
+    EXPECT_EQ(static_cast<uint8_t>(BackendType::OPENAI_COMPATIBLE), 6);
+}
+
+TEST(BackendType, StringRoundTrip) {
+    for (auto t : {BackendType::VLLM, BackendType::SGLANG, BackendType::TRT_LLM,
+                   BackendType::OLLAMA, BackendType::LM_STUDIO,
+                   BackendType::CEREBRAS, BackendType::OPENAI_COMPATIBLE}) {
+        auto parsed = parse_backend_type(backend_type_to_string(t));
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ(*parsed, t);
+    }
 }
 
 // =============================================================================
@@ -92,23 +124,25 @@ TEST(WorkloadPattern, FromIntentMapsAllValues) {
 // =============================================================================
 
 TEST(TelemetryBucketKey, EqualityIsFieldwise) {
-    TelemetryBucketKey a{"llama3", HardwareTier::GPU_LARGE, WorkloadPattern::CHAT};
-    TelemetryBucketKey b{"llama3", HardwareTier::GPU_LARGE, WorkloadPattern::CHAT};
+    TelemetryBucketKey a{"llama3", BackendType::VLLM, HardwareLabel::GPU_LARGE, WorkloadPattern::CHAT};
+    TelemetryBucketKey b{"llama3", BackendType::VLLM, HardwareLabel::GPU_LARGE, WorkloadPattern::CHAT};
     EXPECT_TRUE(a == b);
 
     // Each field independently distinguishes:
-    TelemetryBucketKey diff_model{"qwen2", HardwareTier::GPU_LARGE, WorkloadPattern::CHAT};
-    TelemetryBucketKey diff_hw{"llama3",   HardwareTier::GPU_SMALL, WorkloadPattern::CHAT};
-    TelemetryBucketKey diff_wl{"llama3",   HardwareTier::GPU_LARGE, WorkloadPattern::EDIT};
+    TelemetryBucketKey diff_model{"qwen2", BackendType::VLLM,   HardwareLabel::GPU_LARGE, WorkloadPattern::CHAT};
+    TelemetryBucketKey diff_bt{"llama3",   BackendType::SGLANG, HardwareLabel::GPU_LARGE, WorkloadPattern::CHAT};
+    TelemetryBucketKey diff_hw{"llama3",   BackendType::VLLM,   HardwareLabel::GPU_SMALL, WorkloadPattern::CHAT};
+    TelemetryBucketKey diff_wl{"llama3",   BackendType::VLLM,   HardwareLabel::GPU_LARGE, WorkloadPattern::EDIT};
     EXPECT_FALSE(a == diff_model);
+    EXPECT_FALSE(a == diff_bt);
     EXPECT_FALSE(a == diff_hw);
     EXPECT_FALSE(a == diff_wl);
 }
 
 TEST(TelemetryBucketKey, InsertableIntoFlatHashMap) {
     absl::flat_hash_map<TelemetryBucketKey, int, TelemetryBucketKeyHash> m;
-    TelemetryBucketKey k1{"llama3", HardwareTier::GPU_LARGE, WorkloadPattern::CHAT};
-    TelemetryBucketKey k2{"qwen2",  HardwareTier::GPU_SMALL, WorkloadPattern::EDIT};
+    TelemetryBucketKey k1{"llama3", BackendType::VLLM,   HardwareLabel::GPU_LARGE, WorkloadPattern::CHAT};
+    TelemetryBucketKey k2{"qwen2",  BackendType::SGLANG, HardwareLabel::GPU_SMALL, WorkloadPattern::EDIT};
     m[k1] = 7;
     m[k2] = 11;
     ASSERT_EQ(m.size(), 2u);
@@ -127,21 +161,23 @@ TEST(TelemetryBucketKey, HashIsDistributionalNotIdentity) {
     // returns the same value for every input.
     std::unordered_set<size_t> hashes;
     TelemetryBucketKeyHash h;
-    for (auto hw : {HardwareTier::UNSPECIFIED,
-                    HardwareTier::GPU_SMALL,
-                    HardwareTier::GPU_LARGE}) {
-        for (auto wl : {WorkloadPattern::UNKNOWN,
-                        WorkloadPattern::AUTOCOMPLETE,
-                        WorkloadPattern::CHAT,
-                        WorkloadPattern::EDIT}) {
-            for (const auto* family : {"llama3", "qwen2", "mistral", "unspecified"}) {
-                TelemetryBucketKey k{family, hw, wl};
-                hashes.insert(h(k));
+    for (auto bt : {BackendType::VLLM, BackendType::SGLANG, BackendType::CEREBRAS}) {
+        for (auto hw : {HardwareLabel::UNSPECIFIED,
+                        HardwareLabel::GPU_SMALL,
+                        HardwareLabel::GPU_LARGE}) {
+            for (auto wl : {WorkloadPattern::UNKNOWN,
+                            WorkloadPattern::AUTOCOMPLETE,
+                            WorkloadPattern::CHAT,
+                            WorkloadPattern::EDIT}) {
+                for (const auto* family : {"llama3", "qwen2", "mistral", "unspecified"}) {
+                    TelemetryBucketKey k{family, bt, hw, wl};
+                    hashes.insert(h(k));
+                }
             }
         }
     }
-    // 3 * 4 * 4 = 48 inputs; expect at least 40 distinct hashes (loose bound).
-    EXPECT_GE(hashes.size(), 40u);
+    // 3 * 3 * 4 * 4 = 144 inputs; expect at least 130 distinct hashes (loose bound).
+    EXPECT_GE(hashes.size(), 130u);
 }
 
 // =============================================================================
@@ -228,7 +264,7 @@ TEST(AggregateRecord, MergeFromPrefixReuseDepthAccumulates) {
 TEST(WindowReport, DefaultsCarryCurrentFormatVersion) {
     WindowReport report;
     EXPECT_EQ(report.format_version, kTelemetryReportFormatVersion);
-    EXPECT_EQ(report.format_version, 1u);  // tighten the expected version
+    EXPECT_EQ(report.format_version, 2u);  // v2: backend_type added to the bucket key
     EXPECT_TRUE(report.records.empty());
     EXPECT_EQ(report.shard_count, 0u);
     EXPECT_EQ(report.window_eviction_churn, 0u);
@@ -248,7 +284,7 @@ TEST(WindowReport, FieldsRemainReadableWhenVersionBumped) {
     report.shard_count = 8;
 
     AggregateRecord rec;
-    rec.key = TelemetryBucketKey{"llama3", HardwareTier::GPU_LARGE, WorkloadPattern::CHAT};
+    rec.key = TelemetryBucketKey{"llama3", BackendType::VLLM, HardwareLabel::GPU_LARGE, WorkloadPattern::CHAT};
     rec.request_count = 42;
     report.records.push_back(std::move(rec));
 
@@ -256,7 +292,8 @@ TEST(WindowReport, FieldsRemainReadableWhenVersionBumped) {
     EXPECT_EQ(report.shard_count, 8u);
     ASSERT_EQ(report.records.size(), 1u);
     EXPECT_EQ(report.records[0].request_count, 42u);
-    EXPECT_EQ(report.records[0].key.hardware_tier, HardwareTier::GPU_LARGE);
+    EXPECT_EQ(report.records[0].key.backend_type, BackendType::VLLM);
+    EXPECT_EQ(report.records[0].key.hardware_label, HardwareLabel::GPU_LARGE);
 }
 
 // =============================================================================

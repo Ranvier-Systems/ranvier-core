@@ -52,7 +52,7 @@ seastar::future<> TelemetryService::start_shard(
     _eviction_last_seen = _eviction_counter_getter ? _eviction_counter_getter() : 0;
 
     // Sentinel occupies one of _max_buckets slots, so effective user-visible
-    // cardinality is _max_buckets - 1 — fine at the default of 256.
+    // cardinality is _max_buckets - 1 (negligible at the configured cap).
     ensure_overflow_sentinel();
 
     return seastar::make_ready_future<>();

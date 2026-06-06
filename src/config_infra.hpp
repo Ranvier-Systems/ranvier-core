@@ -459,12 +459,14 @@ struct TelemetrySinkConfig {
     // is 60s.
     std::chrono::seconds window{60};
 
-    // Per-shard hard cap on distinct (model_family, hardware_tier, workload)
-    // buckets (Hard Rule #4). Both label dimensions are operator-set, so
-    // cardinality is naturally small; this cap is defence in depth. New
-    // buckets beyond the cap are attributed to the `_overflow` sentinel and
-    // counted in `WindowReport::buckets_overflowed`.
-    size_t max_buckets = 256;
+    // Per-shard hard cap on distinct bucket keys (Hard Rule #4). The key's
+    // backend-derived dimensions all come from operator config / the
+    // registered backend, so real cardinality is small; this cap is defence
+    // in depth. Keys beyond it fold into the `_overflow` sentinel (counted in
+    // `WindowReport::buckets_overflowed`). The default carries headroom for the
+    // product of the key's dimensions across a mixed fleet; memory is bounded
+    // at any value, and the loader rejects values above its ceiling.
+    size_t max_buckets = 512;
 };
 
 // =============================================================================

@@ -505,9 +505,10 @@ target_link_libraries(metrics_service_test
 gtest_discover_tests(metrics_service_test)
 
 # Telemetry Sink Unit Tests (Pure C++, uses stubs for Seastar future + metrics)
-# Tests the wire-stable HardwareTier / WorkloadPattern ordinals (forward-compat
-# contract — see src/telemetry_schema.hpp), TelemetryBucketKey hash/equality,
-# AggregateRecord merge semantics, WindowReport defaults, and NoopSink factory.
+# Tests the wire-stable BackendType / HardwareLabel / WorkloadPattern ordinals
+# (forward-compat contract — see src/telemetry_schema.hpp), TelemetryBucketKey
+# hash/equality, AggregateRecord merge semantics, WindowReport defaults, and
+# NoopSink factory.
 # Reactor-free by construction: never calls .then()/.finally() on the stubbed
 # futures, so it cannot trip the reactor-deref segfault.
 add_executable(telemetry_sink_test

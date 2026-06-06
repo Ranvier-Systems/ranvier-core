@@ -1674,16 +1674,16 @@ RanvierConfig RanvierConfig::load_from_string(const std::string& yaml_text) {
                 if (entry["api_key_env"]) {
                     sb.api_key_env = entry["api_key_env"].as<std::string>();
                 }
-                if (entry["hardware_tier"]) {
-                    auto hw_str = entry["hardware_tier"].as<std::string>();
-                    auto hw = parse_hardware_tier(hw_str);
+                if (entry["hardware_label"]) {
+                    auto hw_str = entry["hardware_label"].as<std::string>();
+                    auto hw = parse_hardware_label(hw_str);
                     if (!hw) {
                         throw std::runtime_error(
                             "'backends' entry id=" + std::to_string(sb.id)
-                            + " has unknown hardware_tier '" + hw_str
+                            + " has unknown hardware_label '" + hw_str
                             + "' (expected one of: unspecified/gpu_small/gpu_large)");
                     }
-                    sb.hardware_tier = *hw;
+                    sb.hardware_label = *hw;
                 }
                 if (entry["model_family"]) {
                     sb.model_family = entry["model_family"].as<std::string>();

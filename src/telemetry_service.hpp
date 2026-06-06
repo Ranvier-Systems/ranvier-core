@@ -101,9 +101,11 @@ public:
     size_t bucket_count_for_testing() const { return _buckets.size(); }
     uint64_t reports_dropped_for_testing() const { return _reports_dropped_backpressure; }
 
-    // Sentinel that the overflow path attributes to.
+    // Sentinel that the overflow path attributes to. The "_overflow"
+    // model_family is the marker; the other dimensions are inert filler.
     static TelemetryBucketKey overflow_key() {
-        return TelemetryBucketKey{"_overflow", HardwareTier::UNSPECIFIED, WorkloadPattern::UNKNOWN};
+        return TelemetryBucketKey{"_overflow", BackendType::VLLM,
+                                  HardwareLabel::UNSPECIFIED, WorkloadPattern::UNKNOWN};
     }
 
 private:

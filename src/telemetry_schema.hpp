@@ -6,9 +6,8 @@
 // SCOPE: aggregate routing/cache outcomes only. NO prompt or response content,
 // NO token IDs, NO per-request identifiers. Every field here is a structural
 // statistic — counters, histograms, and a snapshot of the routing-strategy
-// parameters in effect for the window. The bucket dimensions are operator-
-// labelled (model_family, hardware_tier) and request-derived (workload), all
-// content-free.
+// parameters in effect for the window. The bucket dimensions are operator- and
+// backend-derived plus a request-derived workload — all content-free.
 //
 // =============================================================================
 // FORWARD-COMPATIBILITY CONTRACT
@@ -22,8 +21,8 @@
 //      boundary — consumers read fields they know and ignore the rest.
 //
 //   2. New fields are appended only. Never re-purpose an existing field, never
-//      shrink a field's semantic range, never renumber HardwareTier ordinals
-//      (see types.hpp).
+//      shrink a field's semantic range, never renumber HardwareLabel or
+//      BackendType ordinals (see types.hpp).
 //
 //   3. `AggregateRecord` adds optional new histograms / counters at the end.
 //      A consumer reading an older record sees zero-valued defaults for new
@@ -40,7 +39,7 @@
 
 #include "intent_classifier.hpp"   // RequestIntent
 #include "metrics_helpers.hpp"     // MetricHistogram, latency bucket helpers
-#include "types.hpp"               // BackendId, HardwareTier
+#include "types.hpp"               // BackendId, BackendType, HardwareLabel
 
 #include <absl/container/flat_hash_map.h>
 
@@ -60,7 +59,12 @@ namespace ranvier {
 
 // Current wire format version of WindowReport. See the FORWARD-COMPATIBILITY
 // CONTRACT comment at the top of this file before bumping.
-inline constexpr uint16_t kTelemetryReportFormatVersion = 1;
+//
+//   v2: added `backend_type` (engine class) to the bucket key. A v1 reader
+//       collapses engine classes into the other dimensions; the bump signals
+//       the wider key.
+//   v1: initial telemetry window-report schema.
+inline constexpr uint16_t kTelemetryReportFormatVersion = 2;
 
 // =============================================================================
 // WorkloadPattern (stable wire-mirror of RequestIntent)
@@ -103,35 +107,43 @@ inline WorkloadPattern workload_pattern_from_intent(RequestIntent intent) {
 // TelemetryBucketKey
 // =============================================================================
 //
-// All three dimensions are content-free:
+// Every dimension is content-free:
 //   - model_family: operator-set label attached to a backend at registration
 //     (NOT parsed from the client `model` field — that's untrusted input).
 //     Empty string is normalised to "unspecified".
-//   - hardware_tier: closed enum, operator-set per backend.
+//   - backend_type: engine class (vllm / sglang / …), read from the selected
+//     backend — already resolved there, so it costs nothing extra on the hot
+//     path. Its own dimension so the catalog can group by engine class.
+//   - hardware_label: closed enum, operator-set per backend.
 //   - workload: derived from RequestIntent at the request site.
 //
-// Cardinality is operator-bounded by construction (both labels come from
-// operator config), and the per-shard bucket map enforces a hard cap with an
-// _overflow sentinel (see TelemetryService).
+// Cardinality is operator-bounded by construction (the backend-derived
+// dimensions all come from operator config / the registered backend), and the
+// per-shard bucket map enforces a hard cap with an _overflow sentinel (see
+// TelemetryService).
 struct TelemetryBucketKey {
-    std::string    model_family;     // e.g. "llama3", "qwen2", or "unspecified"
-    HardwareTier   hardware_tier = HardwareTier::UNSPECIFIED;
-    WorkloadPattern workload     = WorkloadPattern::UNKNOWN;
+    std::string     model_family;     // e.g. "llama3", "qwen2", or "unspecified"
+    BackendType     backend_type   = BackendType::VLLM;   // engine class
+    HardwareLabel   hardware_label = HardwareLabel::UNSPECIFIED;
+    WorkloadPattern workload       = WorkloadPattern::UNKNOWN;
 
     bool operator==(const TelemetryBucketKey& other) const {
-        return hardware_tier == other.hardware_tier
-            && workload      == other.workload
-            && model_family  == other.model_family;
+        return backend_type   == other.backend_type
+            && hardware_label == other.hardware_label
+            && workload       == other.workload
+            && model_family   == other.model_family;
     }
 };
 
-// Hash for absl::flat_hash_map. Combines the three dimensions with a standard
+// Hash for absl::flat_hash_map. Combines the key's dimensions with a standard
 // boost-style mixer. No correctness dependency on the specific mix — purely
 // distributional.
 struct TelemetryBucketKeyHash {
     size_t operator()(const TelemetryBucketKey& k) const noexcept {
         size_t h = std::hash<std::string>{}(k.model_family);
-        h ^= std::hash<uint8_t>{}(static_cast<uint8_t>(k.hardware_tier))
+        h ^= std::hash<uint8_t>{}(static_cast<uint8_t>(k.backend_type))
+             + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::hash<uint8_t>{}(static_cast<uint8_t>(k.hardware_label))
              + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= std::hash<uint8_t>{}(static_cast<uint8_t>(k.workload))
              + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);

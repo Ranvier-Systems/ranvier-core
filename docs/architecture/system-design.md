@@ -134,7 +134,7 @@ The `Application` class (`src/application.hpp/cpp`) orchestrates the lifecycle o
 - **TokenizerService**: GPT-2 tokenization for request content. Tokenizer vocabulary is loaded asynchronously at startup using Seastar's DMA file I/O (`open_file_dma`) to avoid blocking the reactor thread.
 - **HealthService**: Periodic health checks on backends
 - **ConnectionPool**: Reusable connections with LRU eviction
-- **TelemetryService** (optional): Per-shard outcome counters bucketed by `(model_family, hardware_tier, workload_pattern)`, plus a shard-0 periodic emitter that gathers across shards and hands a window report to a pluggable sink. Off by default; stock build wires `NoopSink`. See `src/telemetry_sink.hpp`.
+- **TelemetryService** (optional): Per-shard outcome counters bucketed by `(model_family, backend_type, hardware_label, workload_pattern)`, plus a shard-0 periodic emitter that gathers across shards and hands a window report to a pluggable sink. Off by default; stock build wires `NoopSink`. See `src/telemetry_sink.hpp`.
 
 ### Persistence Layer
 - **AsyncPersistenceManager**: Fire-and-forget queue that decouples SQLite writes from the reactor thread. See [Async Persistence Internals](../internals/async-persistence.md).

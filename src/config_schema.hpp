@@ -524,9 +524,10 @@ struct StaticBackendConfig {
     // "unspecified" so the dimension degrades gracefully when unlabelled).
     // Read by `TelemetryService::record_outcome` at request completion to
     // bucket aggregate routing/cache metrics. NOT content — both are coarse
-    // operator-controlled labels. See `src/telemetry_schema.hpp`.
-    HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
-    std::string  model_family;   // empty → "unspecified" at recording time
+    // operator-controlled labels. See `src/telemetry_schema.hpp`. (The
+    // engine-class bucket dimension is taken from `type` above, not here.)
+    HardwareLabel hardware_label = HardwareLabel::UNSPECIFIED;
+    std::string   model_family;   // empty → "unspecified" at recording time
 };
 
 struct StaticBackendsConfig {

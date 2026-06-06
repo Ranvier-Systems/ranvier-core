@@ -378,11 +378,16 @@ public:
     // both are operator-controlled so cardinality stays bounded and the
     // dimensions stay content-free. See src/telemetry_schema.hpp.
     seastar::future<> set_backend_labels_global(BackendId id,
-                                                HardwareTier hardware_tier,
+                                                HardwareLabel hardware_label,
                                                 std::string model_family);
+    // Telemetry bucket dimensions for a backend, resolved in one shard-local
+    // lookup. `backend_type` is the engine class already on the backend (not an
+    // operator-set label); returning it here lets the request site build the
+    // bucket key from a single lookup, with no extra hot-path work.
     struct BackendTelemetryLabels {
-        HardwareTier hardware_tier = HardwareTier::UNSPECIFIED;
-        std::string  model_family;   // "" → caller treats as "unspecified"
+        BackendType   backend_type   = BackendType::VLLM;
+        HardwareLabel hardware_label = HardwareLabel::UNSPECIFIED;
+        std::string   model_family;   // "" → caller treats as "unspecified"
     };
     BackendTelemetryLabels telemetry_labels(BackendId id) const;
 
