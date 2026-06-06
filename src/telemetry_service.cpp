@@ -12,10 +12,9 @@
 #include <utility>
 
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/foreign_ptr.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/loop.hh>           // parallel_for_each
-#include <seastar/core/sharded.hh>
+#include <seastar/core/sharded.hh>        // also provides foreign_ptr / make_foreign
 #include <seastar/core/smp.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/log.hh>
