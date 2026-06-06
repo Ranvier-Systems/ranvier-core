@@ -233,7 +233,7 @@ private:
     // window emitter that drives map_reduce → build report → hand to sink.
     // Wires HttpController on every shard to its local TelemetryService.
     // Safe to call even when telemetry_sink.enabled=false — the emitter
-    // simply doesn't arm and the recording call compiles to one branch.
+    // simply doesn't arm.
     seastar::future<> init_telemetry_service();
 
     // Build a snapshot of the routing-strategy parameters currently in effect.
