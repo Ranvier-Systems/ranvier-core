@@ -30,6 +30,7 @@ Before writing any code, verify:
 - [ ] Any coroutine parameters? Take by value, not by reference
 - [ ] Any function that might throw before returning a future? Wrap with `futurize_invoke()` or use coroutine
 - [ ] Any `temporary_buffer::share()` stored beyond current request? Must `clone()` instead
+- [ ] Any new comment or name? States *why*/an invariant — not *what*; names tell the truth; no PR-time / caller / `file:line` refs (see Comment Hygiene)
 
 ## Architecture Reference
 
@@ -225,6 +226,25 @@ Service start order: `TokenizerService` -> `RouterService` -> `HttpController` -
 - **Type aliases:** `PascalCase` (`TokenId`, `BackendId`, `NodePtr`)
 - **Constants:** `kPascalCase` or `SCREAMING_SNAKE_CASE`
 - **Namespace:** `ranvier`
+
+### Comment Hygiene
+
+Default to **no comment**. The code shows *what*; a comment earns its place only by adding the non-obvious *why*, an invariant, or a consequence the types don't express. Match the comment density and voice of the surrounding code.
+
+**Cut — rots or restates the code:**
+- **WHAT-narration:** `// returns early when disabled` over `if (!_enabled) return;`.
+- **PR-/fix-time language:** "Hoisted out of…", "this PR", "previously", "collapsed into", "no longer required since…". State the *present* invariant, not the edit that produced it.
+- **Caller name-checking & `file:line` locators:** "Called by `X::handle()` at line 2347", `local_discovery.hpp:81`. They rot on the next move — name the stable *symbol* instead.
+- **Dead-defence / impossible-scenario guards:** `if (!ptr) return;` when the callee can't return null; `try/catch` around code that can't throw; "shouldn't happen but be safe". Real teardown/lifecycle nulls, untrusted input, and C-API nulls (Rule #3) are *not* this — keep those.
+- **Duplicated Hard-Rule summaries:** when call-sites carry `Rule #N:` annotations, don't also enumerate the rules in a file-header block.
+
+**Keep — load-bearing; never strip in a cleanup:**
+- **Hard-Rule call-site annotations:** `// Rule #5: holder moved into .finally() so stop()'s gate.close() blocks on the chain`. The rule number + the action it gates tells the reader where the rule bites.
+- **Wire-format / forward-compat invariants:** packet field order, enum ordinals (append-only, never renumber), version handling.
+- **Operational consequences the signature can't express:** drop/queue semantics, cardinality bounds, lifetime/teardown ordering, cross-shard memory ownership.
+- **The genuine non-obvious *why*:** why an unusual cast, why a copy is deliberate, why an order matters.
+
+Trim multi-paragraph reasoning on a private helper to the one line that states the invariant. And make **names tell the truth**: in `auto [it, inserted] = m.try_emplace(...)`, `inserted` is the bool, not the iterator; a local named `result` is the value returned.
 
 ### File Organization
 
