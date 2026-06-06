@@ -216,6 +216,10 @@ ranvier_api_key_label_overflow_total)
 Subsequent overflows are silent (counted in
 `ranvier_api_key_label_overflow_total`) to avoid log flooding.
 
+**See also:** the telemetry sink (`src/telemetry_service.hpp`) mirrors this
+bounded-cardinality + `_overflow` sentinel pattern for its per-shard
+`(model_family, hardware_tier, workload_pattern)` bucket map.
+
 ### Hot-path cost
 
 Each request adds two lookups in a per-shard

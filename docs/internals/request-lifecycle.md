@@ -334,13 +334,20 @@ After streaming completes:
 
 1. **Metrics** — `record_proxy_completion_metrics()` records backend total
    latency and end-to-end request latency in histograms.
-2. **Connection** — if `bundle.is_valid`, return to pool via
+2. **Telemetry sink** (optional) — if `telemetry_sink.enabled`, the controller
+   resolves the selected backend's operator-set labels via
+   `RouterService::telemetry_labels()` and calls
+   `TelemetryService::record_outcome()`. Shard-local, off the request future;
+   when disabled, a single null-check branch. See
+   [`src/telemetry_sink.hpp`](../../src/telemetry_sink.hpp) for the sink
+   contract.
+3. **Connection** — if `bundle.is_valid`, return to pool via
    `ConnectionPool::put()`. Otherwise close.
-3. **RAII destructors** release (in reverse capture order):
+4. **RAII destructors** release (in reverse capture order):
    - `BackendRequestGuard` — decrements per-backend active request counter
    - Semaphore units — frees concurrency slot
    - Gate holder — allows shutdown to proceed
-4. **Shard metrics** — decrement active request count for P2C load balancing
+5. **Shard metrics** — decrement active request count for P2C load balancing
 
 ---
 
