@@ -2366,10 +2366,11 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         if (_telemetry_service != nullptr) {
             auto labels = _router.telemetry_labels(ctx->current_backend);
             TelemetryBucketKey bucket;
-            bucket.model_family  = labels.model_family.empty()
+            bucket.model_family   = labels.model_family.empty()
                 ? std::string("unspecified") : labels.model_family;
-            bucket.hardware_tier = labels.hardware_tier;
-            bucket.workload      = workload_pattern_from_intent(ctx->intent);
+            bucket.backend_type   = labels.backend_type;   // engine class — free, same lookup
+            bucket.hardware_label = labels.hardware_label;
+            bucket.workload       = workload_pattern_from_intent(ctx->intent);
 
             TelemetryOutcome outcome;
             outcome.cache_hit             = ctx->telemetry_cache_hit;

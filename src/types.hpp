@@ -23,14 +23,25 @@ inline constexpr size_t kYieldInterval = 128;
 // GPU-class backends benefit from prefix-affinity routing; non-GPU classes
 // (CEREBRAS, OPENAI_COMPATIBLE) still use Ranvier's L7 plumbing but skip
 // prefix learning and the vLLM-shaped metrics scrape.
-enum class BackendType {
-    VLLM,
-    SGLANG,
-    TRT_LLM,
-    OLLAMA,
-    LM_STUDIO,
-    CEREBRAS,
-    OPENAI_COMPATIBLE,
+//
+// WIRE CONTRACT: this enum is also a telemetry window-report bucket-key
+// dimension (engine class — see telemetry_schema.hpp). Its ordinals are
+// therefore part of that wire format: pinned explicitly, append-only, never
+// renumbered, with the underlying type fixed to uint8_t to lock the wire
+// width. The persisted/admin form is the STRING (backend_type_to_string);
+// the integer was never persisted, which is why pinning the current implicit
+// values now is free. There is deliberately NO UNSPECIFIED sentinel — every
+// backend that emits telemetry has a real engine class, so an "unset" state
+// would be a dead value.
+enum class BackendType : uint8_t {
+    VLLM              = 0,
+    SGLANG            = 1,
+    TRT_LLM           = 2,
+    OLLAMA            = 3,
+    LM_STUDIO         = 4,
+    CEREBRAS          = 5,
+    OPENAI_COMPATIBLE = 6,
+    // Append only — add a new engine class at the next integer.
 };
 
 // Persisted/wire string for BackendType. Stable across releases; used by
@@ -62,20 +73,25 @@ inline std::optional<BackendType> parse_backend_type(std::string_view s) {
     return std::nullopt;
 }
 
-// Per-backend hardware regime tier. Operator-set at backend registration;
-// defaults to UNSPECIFIED so the dimension degrades gracefully when the
-// operator hasn't labelled their fleet. Used by the telemetry sink to bucket
-// aggregate routing/cache outcomes by a physical-regime axis (HBM capacity /
-// compute class) — chosen over market tiers like "flagship/mainstream" because
-// a card's market tier drifts year-over-year while its physical regime does
-// not, which keeps cross-deployment and cross-time comparability honest.
+// Per-backend hardware label. An operator-applied tag resolved at backend
+// registration — NOT inferred by the data plane (nothing in routing derives a
+// hardware regime). Defaults to UNSPECIFIED so the dimension degrades
+// gracefully when the operator hasn't labelled their fleet. Used by the
+// telemetry sink to bucket aggregate routing/cache outcomes by a physical
+// axis (HBM capacity / compute class) — chosen over market tiers like
+// "flagship/mainstream" because a card's market tier drifts year-over-year
+// while its physical regime does not, which keeps cross-deployment and
+// cross-time comparability honest.
+//
+// (Renamed from HardwareTier: "tier" implied a routing-derived value, but the
+//  code only ever stores an operator-supplied per-backend label.)
 //
 // WIRE CONTRACT (read carefully before editing):
 //
 //   - These ordinals are part of the telemetry window-report wire format and
-//     MUST be stable across releases. Never renumber an existing tier. Add
-//     new tiers only at the end (append-only). Renaming the C++ symbol is
-//     fine (consumers key on the integer); redefining what an existing tier
+//     MUST be stable across releases. Never renumber an existing label. Add
+//     new labels only at the end (append-only). Renaming the C++ symbol is
+//     fine (consumers key on the integer); redefining what an existing label
 //     MEANS (e.g. moving the small/large boundary) is NOT — that silently
 //     breaks comparability of everything already aggregated under the old
 //     meaning, and the catalog can't tell the two cohorts apart.
@@ -83,7 +99,7 @@ inline std::optional<BackendType> parse_backend_type(std::string_view s) {
 //   - UNSPECIFIED = 0 is the default-when-unset sentinel. It is permanent.
 //
 // Same forward-compat discipline as CacheStatePacket — see gossip_protocol.hpp.
-enum class HardwareTier : uint8_t {
+enum class HardwareLabel : uint8_t {
     UNSPECIFIED = 0,
     GPU_SMALL   = 1,
     GPU_LARGE   = 2,
@@ -92,24 +108,24 @@ enum class HardwareTier : uint8_t {
     // supports local CPU-LLM backends as a first-class bucket.
 };
 
-// Stable string label for HardwareTier. Used as a Prometheus-safe label value
+// Stable string label for HardwareLabel. Used as a Prometheus-safe label value
 // and as the operator-facing identifier in YAML / admin APIs. Lower-case,
-// snake-case; matches parse_hardware_tier() round-trip.
-inline std::string_view hardware_tier_to_string(HardwareTier t) {
+// snake-case; matches parse_hardware_label() round-trip.
+inline std::string_view hardware_label_to_string(HardwareLabel t) {
     switch (t) {
-        case HardwareTier::UNSPECIFIED: return "unspecified";
-        case HardwareTier::GPU_SMALL:   return "gpu_small";
-        case HardwareTier::GPU_LARGE:   return "gpu_large";
+        case HardwareLabel::UNSPECIFIED: return "unspecified";
+        case HardwareLabel::GPU_SMALL:   return "gpu_small";
+        case HardwareLabel::GPU_LARGE:   return "gpu_large";
     }
     return "unspecified";
 }
 
-// Inverse of hardware_tier_to_string(). Returns std::nullopt for unknown
+// Inverse of hardware_label_to_string(). Returns std::nullopt for unknown
 // strings; service layer logs and defaults to UNSPECIFIED (Rule #7).
-inline std::optional<HardwareTier> parse_hardware_tier(std::string_view s) {
-    if (s == "unspecified") return HardwareTier::UNSPECIFIED;
-    if (s == "gpu_small")   return HardwareTier::GPU_SMALL;
-    if (s == "gpu_large")   return HardwareTier::GPU_LARGE;
+inline std::optional<HardwareLabel> parse_hardware_label(std::string_view s) {
+    if (s == "unspecified") return HardwareLabel::UNSPECIFIED;
+    if (s == "gpu_small")   return HardwareLabel::GPU_SMALL;
+    if (s == "gpu_large")   return HardwareLabel::GPU_LARGE;
     return std::nullopt;
 }
 

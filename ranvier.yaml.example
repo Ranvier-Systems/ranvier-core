@@ -495,15 +495,16 @@ telemetry:
 # Telemetry Sink Configuration (aggregate routing/cache metrics export)
 # =============================================================================
 # Pluggable export of aggregate routing/cache metrics — periodic window reports
-# bucketed by (model_family, hardware_tier, workload_pattern). DISTINCT from
-# the `telemetry:` block above (which is OpenTelemetry distributed tracing).
+# bucketed by (model_family, backend_type, hardware_label, workload_pattern).
+# DISTINCT from the `telemetry:` block above (OpenTelemetry distributed tracing).
 #
 # Off by default. With enabled=false, the recording entry point compiles to a
 # single predictable branch and the routing path behaves exactly as today.
 #
-# Per-backend bucket dimensions are operator-set in the `backends:` block
-# below (hardware_tier, model_family). The third dimension, workload_pattern,
-# is derived from request intent classification.
+# Bucket dimensions: `model_family` and `hardware_label` are operator-set labels
+# in the `backends:` block below; `backend_type` is each backend's engine class
+# (its `type:` field); `workload_pattern` is derived from request intent
+# classification.
 #
 # This stock build wires the NoopSink (discards every report). Operators can
 # plug in their own export sink without recompiling consumers — the wire
@@ -519,13 +520,16 @@ telemetry_sink:
   # (RANVIER_TELEMETRY_SINK_WINDOW_SECONDS)
   window_seconds: 60
 
-  # Per-shard hard cap on distinct (model_family, hardware_tier, workload)
-  # buckets (Hard Rule #4). Both label dimensions are operator-set so
+  # Per-shard hard cap on distinct
+  # (model_family, backend_type, hardware_label, workload) buckets (Hard
+  # Rule #4). The backend-derived dimensions come from operator config so
   # cardinality is naturally small; this cap is defence in depth. Buckets
   # beyond the cap are attributed to the `_overflow` sentinel and counted
-  # in the report's `buckets_overflowed` field.
+  # in the report's `buckets_overflowed` field. Default is 512 (raised from
+  # 256 when the engine-class dimension was added, which multiplies worst-
+  # case cardinality); memory stays bounded at any value by the cap.
   # (RANVIER_TELEMETRY_SINK_MAX_BUCKETS)
-  max_buckets: 256
+  max_buckets: 512
 
 # =============================================================================
 # =============================================================================
@@ -595,14 +599,16 @@ attribution:
 # fleets belong under k8s_discovery: or local_mode:.
 #
 # Optional telemetry-sink labels (only consumed when telemetry_sink.enabled):
-#   `hardware_tier` — closed enum: unspecified (default) / gpu_small / gpu_large.
-#     Physical-regime classifier; defaults to UNSPECIFIED so the dimension
-#     degrades gracefully when unlabelled. These ordinals are wire-stable;
-#     see src/types.hpp for the contract.
+#   `hardware_label` — closed enum: unspecified (default) / gpu_small / gpu_large.
+#     Operator-applied physical-regime label; defaults to UNSPECIFIED so the
+#     dimension degrades gracefully when unlabelled. These ordinals are
+#     wire-stable; see src/types.hpp for the contract.
 #   `model_family` — coarse operator label (e.g. "llama3", "qwen2"). Empty
 #     normalises to "unspecified" at recording time. NOT parsed from client
 #     request bodies — the dimension is intentionally operator-controlled so
 #     cardinality stays bounded and the label stays content-free.
+# The engine-class bucket dimension (`backend_type`) is taken from each
+# backend's `type:` field above — no separate label needed.
 #
 # backends:
 #   - id: 101
@@ -618,7 +624,7 @@ attribution:
 #     weight: 200
 #     priority: 0
 #     compression_ratio: 6.0
-#     hardware_tier: gpu_large
+#     hardware_label: gpu_large
 #     model_family: llama3
 #
 #   - id: 103

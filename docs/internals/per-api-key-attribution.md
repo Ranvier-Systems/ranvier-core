@@ -218,7 +218,7 @@ Subsequent overflows are silent (counted in
 
 **See also:** the telemetry sink (`src/telemetry_service.hpp`) mirrors this
 bounded-cardinality + `_overflow` sentinel pattern for its per-shard
-`(model_family, hardware_tier, workload_pattern)` bucket map.
+`(model_family, backend_type, hardware_label, workload_pattern)` bucket map.
 
 ### Hot-path cost
 
