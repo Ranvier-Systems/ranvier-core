@@ -1377,7 +1377,19 @@ if(RANVIER_BUILD_FUZZERS)
           Seastar::seastar
           absl::flat_hash_map
         )
-        target_compile_options(stream_parser_fuzz PRIVATE ${_fuzz_flags})
+        # Seastar's cacheline.hh uses std::hardware_destructive_interference_size,
+        # which libstdc++ only defines when __GCC_DESTRUCTIVE_SIZE is set. GCC
+        # predefines that macro; clang (which the fuzz build requires for
+        # libFuzzer) does not, so the Seastar-linked harness fails to compile
+        # under clang with "no member named hardware_destructive_interference_size
+        # in namespace std". Supply the values GCC would on the x86_64 CI runner
+        # (64-byte cache line) so libstdc++ exposes the constant. The pure-C++
+        # harnesses above don't pull in Seastar headers, so they're unaffected.
+        target_compile_options(stream_parser_fuzz PRIVATE
+          ${_fuzz_flags}
+          -D__GCC_DESTRUCTIVE_SIZE=64
+          -D__GCC_CONSTRUCTIVE_SIZE=64
+        )
         target_link_options(stream_parser_fuzz PRIVATE ${_fuzz_flags})
     else()
         message(STATUS "Seastar not found — skipping stream_parser_fuzz")
