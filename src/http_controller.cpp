@@ -1341,8 +1341,7 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // Partial tokenization state (BACKLOG §1.4): `was_truncated` is set
     // when the tokenization block below truncates the input for routing,
     // and is read by the forwarded-body prep block to decide whether the
-    // deferred full-tokenization path must run. Hoisted here so both
-    // blocks share the same flag and the endpoint check is computed once.
+    // deferred full-tokenization path must run.
     // See RoutingConfig::enable_partial_tokenization for the full rationale.
     const bool is_completions_endpoint = (endpoint == "/v1/completions");
     bool was_truncated = false;
@@ -1879,12 +1878,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
     BackendId target_id;
     std::string routing_mode_str;
-    // Hoisted out of the route_span block: the circuit-breaker fallback below
-    // mutates it. See ProxyContext::learn_target_backend for the policy.
     BackendId learn_target = 0;
 
-    // Hoisted: RouteResult is local to the route_span block but the values
-    // need to flow into ProxyContext for the telemetry sink at completion.
     bool     captured_telemetry_cache_hit         = false;
     bool     captured_telemetry_was_load_redirect = false;
     bool     captured_telemetry_was_cost_redirect = false;
