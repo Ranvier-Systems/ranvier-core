@@ -358,6 +358,20 @@ void Application::log_non_reloadable_changes(const RanvierConfig& new_config) co
     if (new_config.telemetry.enabled != _config.telemetry.enabled) {
         log_main.warn("Config reload: telemetry.enabled changes require restart to take effect");
     }
+
+    // Telemetry-sink (aggregate metrics export) start-up is one-time:
+    // start_shard caps and start_emitter window/sink are captured at startup
+    // by TelemetryService, not re-read on each window. Operators changing any
+    // of these via SIGHUP must restart for the change to apply.
+    if (new_config.telemetry_sink.enabled != _config.telemetry_sink.enabled) {
+        log_main.warn("Config reload: telemetry_sink.enabled changes require restart to take effect");
+    }
+    if (new_config.telemetry_sink.window != _config.telemetry_sink.window) {
+        log_main.warn("Config reload: telemetry_sink.window_seconds changes require restart to take effect");
+    }
+    if (new_config.telemetry_sink.max_buckets != _config.telemetry_sink.max_buckets) {
+        log_main.warn("Config reload: telemetry_sink.max_buckets changes require restart to take effect");
+    }
 }
 
 seastar::future<> Application::apply_vocab_size_config() {

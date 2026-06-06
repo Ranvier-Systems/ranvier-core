@@ -52,8 +52,11 @@ seastar::future<> TelemetryService::start_shard(
     _eviction_last_seen = _eviction_counter_getter ? _eviction_counter_getter() : 0;
 
     // Pre-insert the overflow sentinel so the cap-reached fast path doesn't
-    // need to allocate. The sentinel does NOT count toward _max_buckets
-    // (it's always present); see get_or_overflow_slot().
+    // need to allocate. The sentinel occupies one of the _max_buckets slots,
+    // so effective user-visible cardinality is _max_buckets - 1. With the
+    // default cap of 256 this leaves 255 distinct user buckets — well above
+    // the realistic count of operator-set (model_family, hardware_tier,
+    // workload) combinations a single fleet exposes.
     ensure_overflow_sentinel();
 
     return seastar::make_ready_future<>();
@@ -84,10 +87,15 @@ seastar::future<> TelemetryService::start_emitter(
             std::runtime_error("TelemetryService::start_emitter must run on shard 0"));
     }
 
-    // If start_emitter has already run, replace sink and re-arm timer.
+    // If start_emitter has already run, cancel the prior timer AND clear the
+    // prior metrics group. The second-call path is not exercised by current
+    // callers (init_telemetry_service runs once at startup), but the public
+    // contract is idempotent and the metric registration would otherwise
+    // double-register the counters on a second call.
     if (_emitter_started) {
         _emit_timer.cancel();
     }
+    _emitter_metrics.clear();
 
     _container          = container;
     _sink               = std::move(sink);
