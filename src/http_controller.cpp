@@ -1074,8 +1074,6 @@ future<> HttpController::stream_backend_response(
                 // Record in per-backend histogram for GPU model comparison
                 metrics().record_first_byte_latency_by_id(ctx->current_backend, first_byte_latency);
                 ctx->response_latency_recorded = true;
-                // Retain for the telemetry-sink completion record (zero-cost
-                // when telemetry disabled — the sink record-call is skipped).
                 ctx->telemetry_first_byte_latency_seconds = first_byte_latency;
                 log_proxy.info("[{}] First byte received from backend {} (latency: {:.3f}s)",
                                 ctx->request_id, ctx->current_backend, first_byte_latency);
@@ -1885,9 +1883,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     // mutates it. See ProxyContext::learn_target_backend for the policy.
     BackendId learn_target = 0;
 
-    // Hoisted out of the route_span block: copied into ProxyContext below so
-    // the request-completion path can hand them to the telemetry sink.
-    // Cheap memcpy; zero behavioural impact when telemetry is disabled.
+    // Hoisted: RouteResult is local to the route_span block but the values
+    // need to flow into ProxyContext for the telemetry sink at completion.
     bool     captured_telemetry_cache_hit         = false;
     bool     captured_telemetry_was_load_redirect = false;
     bool     captured_telemetry_was_cost_redirect = false;
@@ -1936,10 +1933,6 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
 
         route_span.set_attribute("ranvier.backend_id", static_cast<int64_t>(target_id));
 
-        // Retain telemetry-sink outcome signals on the ProxyContext below.
-        // Captured here (not at completion) because RouteResult is local to
-        // this scope. Cheap memcpy; the disabled-telemetry hot-path branch
-        // lives in TelemetryService::record_outcome.
         captured_telemetry_cache_hit         = route_result.cache_hit;
         captured_telemetry_was_load_redirect = route_result.was_load_redirect;
         captured_telemetry_was_cost_redirect = route_result.was_cost_redirect;
@@ -2102,8 +2095,6 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
     ctx->intent = intent;
     ctx->api_key_id = std::move(api_key_attr.id);
     ctx->api_key_label = std::move(api_key_attr.label);
-    // Telemetry-sink outcome signals (read by record_proxy_completion_metrics
-    // and the trailing record_outcome call when _telemetry_service is wired).
     ctx->telemetry_cache_hit              = captured_telemetry_cache_hit;
     ctx->telemetry_was_load_redirect      = captured_telemetry_was_load_redirect;
     ctx->telemetry_was_cost_redirect      = captured_telemetry_was_cost_redirect;
@@ -2375,12 +2366,8 @@ future<std::unique_ptr<seastar::http::reply>> HttpController::handle_proxy(
         auto backend_end = std::chrono::steady_clock::now();
         record_proxy_completion_metrics(*ctx, backend_end);
 
-        // Telemetry sink: per-request outcome (off by default — null when
-        // disabled, so this is one branch + a single direct shard-local call
-        // when enabled). Bucket key is resolved from the SELECTED backend's
-        // operator-set labels (model_family, hardware_tier) plus the
-        // request's classified intent — no client-input parsing. See
-        // src/telemetry_sink.hpp for the export contract.
+        // Bucket labels come from the SELECTED backend's operator-set side-map
+        // (not the client request body — see telemetry_schema.hpp).
         if (_telemetry_service != nullptr) {
             auto labels = _router.telemetry_labels(ctx->current_backend);
             TelemetryBucketKey bucket;

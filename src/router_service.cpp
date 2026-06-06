@@ -4010,19 +4010,14 @@ seastar::future<> RouterService::set_backend_labels_global(
                             auto& state = shard_state();
                             auto it = state.backends.find(id);
                             if (it == state.backends.end()) {
-                                // Backend not registered on this shard yet.
-                                // Operators call set_backend_labels_global
-                                // immediately after register_backend_global,
-                                // so on the common path the entry exists.
-                                // Silent no-op (Rule #9: no log spam for a
-                                // benign race; the labels stay UNSPECIFIED/""
-                                // and degrade gracefully — see
-                                // telemetry_labels()).
+                                // Benign race against register_backend_global;
+                                // labels stay UNSPECIFIED/"" and degrade
+                                // gracefully via telemetry_labels().
                                 return seastar::make_ready_future<>();
                             }
                             it->second.hardware_tier = hardware_tier;
-                            // Reallocate the string locally so the map
-                            // entry's heap lives on this shard (Rule #14).
+                            // Rule #14: reallocate locally so the map entry's
+                            // heap lives on this shard.
                             it->second.model_family = std::string(foreign->data(), foreign->size());
                             return seastar::make_ready_future<>();
                         });

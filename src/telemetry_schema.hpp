@@ -19,9 +19,7 @@
 // remain correct when fed a report at format version N+M:
 //
 //   1. `WindowReport::format_version` is recorded but is NOT a rejection
-//      boundary — consumers read fields they know and ignore everything else.
-//      The identity of the message (it is a window report) is the rejection
-//      boundary, not the minor version.
+//      boundary — consumers read fields they know and ignore the rest.
 //
 //   2. New fields are appended only. Never re-purpose an existing field, never
 //      shrink a field's semantic range, never renumber HardwareTier ordinals
@@ -193,9 +191,8 @@ struct AggregateRecord {
         , total_latency_seconds(total_request_latency_buckets())
         , prefix_reuse_depth(prefix_reuse_depth_buckets()) {}
 
-    // Merge another shard's record into this one. Used by the cross-shard
-    // map_reduce reducer. Both records share the same key by construction
-    // (the reducer keys on TelemetryBucketKey before merging).
+    // Merge another shard's record into this one. INVARIANT: both records
+    // share the same key (the caller keys on TelemetryBucketKey first).
     void merge_from(const AggregateRecord& other) {
         request_count          += other.request_count;
         cache_hit_count        += other.cache_hit_count;

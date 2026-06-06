@@ -371,21 +371,12 @@ public:
     seastar::future<> set_backend_api_key_global(BackendId id, std::string api_key);
     std::string get_backend_api_key(BackendId id) const;
 
-    // Telemetry-sink label side-map. Per-backend, operator-set, broadcast to
-    // every shard at registration time. Distinct from BackendInfo so the
-    // abstract BackendRegistry interface stays minimal (callers that don't
-    // care about telemetry don't need to thread the labels through).
-    //
-    // `hardware_tier` is a closed enum (types.hpp); `model_family` is a coarse
-    // operator label, empty normalises to "unspecified" at recording time.
-    // NEITHER is parsed from client input — both are operator-controlled so
-    // cardinality stays bounded and the dimensions stay content-free. See
-    // src/telemetry_schema.hpp.
-    //
-    // `set_backend_labels_global` mirrors set_backend_api_key_global's
-    // parallel_for_each shape. `telemetry_labels` is synchronous and shard-
-    // local — http_controller calls it on the request-completion path to
-    // build the bucket key passed to TelemetryService::record_outcome.
+    // Per-backend telemetry-sink labels (operator-set, broadcast to every
+    // shard). Kept as a side-map rather than on BackendInfo's abstract
+    // interface so callers that don't care about telemetry don't have to
+    // thread them through. Neither label is parsed from client input —
+    // both are operator-controlled so cardinality stays bounded and the
+    // dimensions stay content-free. See src/telemetry_schema.hpp.
     seastar::future<> set_backend_labels_global(BackendId id,
                                                 HardwareTier hardware_tier,
                                                 std::string model_family);
@@ -395,10 +386,8 @@ public:
     };
     BackendTelemetryLabels telemetry_labels(BackendId id) const;
 
-    // Per-shard cumulative ART route-eviction count. Static accessor reads
-    // the calling shard's thread_local ShardLocalState; used by the
-    // telemetry emitter (via a captured std::function) to compute per-window
-    // eviction churn deltas. Returns 0 when shard state is not initialised.
+    // Calling shard's cumulative ART route-eviction count. Returns 0 when
+    // shard state is not initialised.
     static uint64_t get_local_routes_evicted();
 
     // Start draining a backend (stops new requests, allows existing cache hits)

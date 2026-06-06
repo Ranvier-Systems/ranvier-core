@@ -1,37 +1,26 @@
 // Ranvier Core - Telemetry Sink Interface
 //
-// Pluggable export target for per-window aggregate routing/cache reports. One
-// virtual entry point; concrete sinks live in their own translation units and
-// are wired in at startup by the operator (default is NoopSink, which is what
-// the stock build ships).
+// Pluggable export target for per-window aggregate routing/cache reports.
+// One virtual entry point; the default is NoopSink.
 //
 // =============================================================================
 // CONTRACT (binding on all implementations)
 // =============================================================================
 //
-//   - consume() MUST NOT block the reactor. The emitter calls it from the
-//     periodic-export timer on shard 0, not from the request hot path, but
-//     any reactor stall here still freezes that shard. If real work is
-//     needed (network export, serialisation), the implementation must
-//     offload (e.g. MPSC ring → dedicated OS worker, mirroring
-//     async_persistence) and return promptly.
+//   - consume() MUST NOT block the reactor. It is called from the periodic
+//     emitter on shard 0; a stall here freezes that shard. Real work
+//     (network export, serialisation) must be offloaded — e.g. MPSC ring →
+//     dedicated OS worker, mirroring async_persistence.
 //
-//   - consume() MUST tolerate WindowReports at any format_version. Read the
-//     fields you know, ignore the rest. This is the same forward-compat
-//     discipline used by CacheStatePacket::deserialize (see
-//     gossip_protocol.hpp §"FORWARD COMPATIBILITY") and is the contract
-//     that lets the catalog accumulate comparable data across releases.
+//   - consume() MUST tolerate WindowReports at any format_version. Read
+//     the fields you know, ignore the rest. Same forward-compat discipline
+//     as CacheStatePacket::deserialize (see gossip_protocol.hpp).
 //
-//   - The emitter NEVER awaits consume() on the request path. If the
-//     returned future has not resolved by the next window tick, the new
-//     report is DROPPED and a counter incremented — there is no queue and
-//     no backpressure propagation to routing decisions. Implementations
-//     that need durability across sink-side outages must provide their own
-//     internal buffering with a bounded discard policy.
-//
-//   - This PR ships only the interface and NoopSink. Remote transports,
-//     managed backends, and any aggregation service are out of scope —
-//     plug them in behind this same interface in a follow-up.
+//   - The emitter NEVER awaits consume() on the request path. If the prior
+//     future has not resolved by the next window tick, the new report is
+//     dropped and a counter incremented — no queue, no backpressure into
+//     routing decisions. Sinks needing durability across outages must
+//     bound their own internal buffer.
 
 #pragma once
 
@@ -55,11 +44,9 @@ public:
     virtual seastar::future<> consume(const WindowReport& report) = 0;
 };
 
-// Default sink: discards every report. The stock build wires this in so that
-// telemetry being "off" is genuinely zero cost on the export path (the
-// emitter still doesn't run at all when the config switch is disabled; this
-// sink is the safe default for when the switch is on but no real sink is
-// configured).
+// Discards every report. Default when telemetry_sink.enabled=true but no
+// real sink has been wired (and the emitter is not armed at all when the
+// config switch is off).
 class NoopSink final : public TelemetrySink {
 public:
     seastar::future<> consume(const WindowReport& /*report*/) override {
@@ -67,8 +54,6 @@ public:
     }
 };
 
-// Factory for the default sink. Returns a NoopSink. Operators wire real
-// sinks in directly via Application::set_telemetry_sink() (see application.cpp).
 inline std::unique_ptr<TelemetrySink> make_default_telemetry_sink() {
     return std::make_unique<NoopSink>();
 }

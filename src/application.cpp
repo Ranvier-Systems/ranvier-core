@@ -696,22 +696,17 @@ RoutingStrategyParams Application::make_strategy_snapshot() const {
 }
 
 seastar::future<> Application::init_telemetry_service() {
-    // Start the sharded container on every shard.
     co_await _telemetry.start();
     _telemetry_started = true;
 
-    // Per-shard config + eviction-source wiring. Always run — even when the
-    // sink is disabled — so the per-shard state is in a known shape (the
-    // overflow sentinel is pre-inserted, the disabled hot-path branch is
-    // a single load+branch). Rule #14: capture cfg by value.
+    // start_shard always runs, even when disabled, so per-shard state is in
+    // a known shape (overflow sentinel pre-inserted) and the recording
+    // entry point stays a single branch.
     auto cfg = _config.telemetry_sink;
     co_await _telemetry.invoke_on_all([cfg](TelemetryService& s) {
         return s.start_shard(cfg, [] { return RouterService::get_local_routes_evicted(); });
     });
 
-    // Shard-0 emitter. The shard-0 instance owns the timer, the sink, and
-    // the strategy-snapshot lambda; the sharded container ref lets it
-    // map_reduce per-shard snapshots when the timer fires.
     co_await _telemetry.invoke_on(0,
         [&container = _telemetry, strategy_fn = [this] { return make_strategy_snapshot(); }]
         (TelemetryService& s) mutable {
@@ -720,9 +715,8 @@ seastar::future<> Application::init_telemetry_service() {
                                    std::move(strategy_fn));
         });
 
-    // Wire HttpController on every shard to its LOCAL telemetry instance.
-    // Each controller calls its local _telemetry_service->record_outcome()
-    // — no cross-shard hop on the request path.
+    // Each controller talks to its LOCAL telemetry instance — no cross-shard
+    // hop on the request path.
     co_await _controller.invoke_on_all([this](HttpController& c) {
         c.set_telemetry_service(&_telemetry.local());
     });
@@ -1638,11 +1632,8 @@ seastar::future<> Application::stop_services() {
         })
         .then([this] {
             // -------------------------------------------------------------------------
-            // Step 5b: Stop telemetry sink (shard-0 emitter gate close +
-            // metrics dereg first per Rule #6; per-shard counter cleanup).
-            // After this, HttpController shards still hold the pointer but
-            // the controllers were already stopped in Step 4, so no
-            // recording call can race the teardown.
+            // Step 5b: Stop telemetry sink. HttpController was stopped in
+            // Step 4 so no recording calls can race the teardown.
             // -------------------------------------------------------------------------
             if (!_telemetry_started) {
                 return seastar::make_ready_future<>();
