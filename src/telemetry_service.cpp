@@ -124,7 +124,6 @@ seastar::future<> TelemetryService::start_emitter(
 
 void TelemetryService::record_outcome(const TelemetryBucketKey& key,
                                       const TelemetryOutcome& outcome) {
-    // Disabled cost: single predictable branch.
     if (!_enabled) {
         return;
     }
