@@ -102,8 +102,7 @@ public:
     uint64_t reports_dropped_for_testing() const { return _reports_dropped_backpressure; }
 
     // Sentinel that the overflow path attributes to. The "_overflow"
-    // model_family is the identifying marker; the other dimensions are inert
-    // filler (backend_type=VLLM is the codebase-wide not-found default).
+    // model_family is the marker; the other dimensions are inert filler.
     static TelemetryBucketKey overflow_key() {
         return TelemetryBucketKey{"_overflow", BackendType::VLLM,
                                   HardwareLabel::UNSPECIFIED, WorkloadPattern::UNKNOWN};

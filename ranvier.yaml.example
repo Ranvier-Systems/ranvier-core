@@ -520,14 +520,11 @@ telemetry_sink:
   # (RANVIER_TELEMETRY_SINK_WINDOW_SECONDS)
   window_seconds: 60
 
-  # Per-shard hard cap on distinct
-  # (model_family, backend_type, hardware_label, workload) buckets (Hard
-  # Rule #4). The backend-derived dimensions come from operator config so
-  # cardinality is naturally small; this cap is defence in depth. Buckets
-  # beyond the cap are attributed to the `_overflow` sentinel and counted
-  # in the report's `buckets_overflowed` field. Default is 512 (raised from
-  # 256 when the engine-class dimension was added, which multiplies worst-
-  # case cardinality); memory stays bounded at any value by the cap.
+  # Per-shard hard cap on distinct bucket keys (Hard Rule #4). The
+  # backend-derived dimensions come from operator config so cardinality is
+  # naturally small; this cap is defence in depth. Buckets beyond the cap fold
+  # into the `_overflow` sentinel and are counted in the report's
+  # `buckets_overflowed` field.
   # (RANVIER_TELEMETRY_SINK_MAX_BUCKETS)
   max_buckets: 512
 

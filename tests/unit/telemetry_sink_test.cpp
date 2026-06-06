@@ -68,11 +68,11 @@ TEST(HardwareLabel, UnknownStringParsesToNullopt) {
 // BackendType wire-stable ordinals
 // =============================================================================
 //
-// BackendType became a telemetry bucket-key dimension (engine class), so its
-// integer ordinals are now part of the wire contract: pinned, append-only,
-// never renumbered. The persisted/admin form is the string; the integer was
-// never persisted, which is why pinning the current values was free. There is
-// deliberately no UNSPECIFIED sentinel — every backend has a real engine class.
+// BackendType is a telemetry bucket-key dimension (engine class), so its
+// ordinals are part of the wire contract: pinned, append-only, never
+// renumbered. The persisted/admin form is the string; these ordinals serve
+// only the telemetry wire. No UNSPECIFIED sentinel — every backend has a real
+// engine class.
 
 TEST(BackendType, OrdinalsArePinned) {
     // If this fails, someone re-numbered the enum — that silently breaks

@@ -381,10 +381,9 @@ public:
                                                 HardwareLabel hardware_label,
                                                 std::string model_family);
     // Telemetry bucket dimensions for a backend, resolved in one shard-local
-    // lookup. `backend_type` is the engine class already stored on the backend
-    // at registration (not an operator-set label) — returned here so the
-    // request site gets all three backend-derived bucket dimensions from a
-    // single lookup, with no extra hot-path work.
+    // lookup. `backend_type` is the engine class already on the backend (not an
+    // operator-set label); returning it here lets the request site build the
+    // bucket key from a single lookup, with no extra hot-path work.
     struct BackendTelemetryLabels {
         BackendType   backend_type   = BackendType::VLLM;
         HardwareLabel hardware_label = HardwareLabel::UNSPECIFIED;

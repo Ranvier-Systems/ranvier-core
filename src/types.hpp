@@ -25,14 +25,11 @@ inline constexpr size_t kYieldInterval = 128;
 // prefix learning and the vLLM-shaped metrics scrape.
 //
 // WIRE CONTRACT: this enum is also a telemetry window-report bucket-key
-// dimension (engine class — see telemetry_schema.hpp). Its ordinals are
-// therefore part of that wire format: pinned explicitly, append-only, never
-// renumbered, with the underlying type fixed to uint8_t to lock the wire
-// width. The persisted/admin form is the STRING (backend_type_to_string);
-// the integer was never persisted, which is why pinning the current implicit
-// values now is free. There is deliberately NO UNSPECIFIED sentinel — every
-// backend that emits telemetry has a real engine class, so an "unset" state
-// would be a dead value.
+// dimension (engine class — see telemetry_schema.hpp), so its ordinals are
+// part of that wire format: pinned, append-only, never renumbered, fixed to
+// uint8_t. The persisted/admin form is the string (backend_type_to_string);
+// these ordinals serve only the telemetry wire. No UNSPECIFIED sentinel —
+// every backend has a real engine class.
 enum class BackendType : uint8_t {
     VLLM              = 0,
     SGLANG            = 1,
@@ -82,9 +79,6 @@ inline std::optional<BackendType> parse_backend_type(std::string_view s) {
 // "flagship/mainstream" because a card's market tier drifts year-over-year
 // while its physical regime does not, which keeps cross-deployment and
 // cross-time comparability honest.
-//
-// (Renamed from HardwareTier: "tier" implied a routing-derived value, but the
-//  code only ever stores an operator-supplied per-backend label.)
 //
 // WIRE CONTRACT (read carefully before editing):
 //

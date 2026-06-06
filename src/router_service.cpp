@@ -4033,7 +4033,7 @@ RouterService::telemetry_labels(BackendId id) const {
     const auto& state = shard_state();
     auto it = state.backends.find(id);
     if (it == state.backends.end()) return out;
-    // All three backend-derived dimensions come from this one lookup.
+    // All backend-derived dimensions come from this one lookup.
     out.backend_type   = it->second.type;
     out.hardware_label = it->second.hardware_label;
     out.model_family   = it->second.model_family;

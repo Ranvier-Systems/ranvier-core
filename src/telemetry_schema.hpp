@@ -6,9 +6,8 @@
 // SCOPE: aggregate routing/cache outcomes only. NO prompt or response content,
 // NO token IDs, NO per-request identifiers. Every field here is a structural
 // statistic — counters, histograms, and a snapshot of the routing-strategy
-// parameters in effect for the window. The bucket dimensions are operator-
-// labelled (model_family, backend_type, hardware_label) and request-derived
-// (workload), all content-free.
+// parameters in effect for the window. The bucket dimensions are operator- and
+// backend-derived plus a request-derived workload — all content-free.
 //
 // =============================================================================
 // FORWARD-COMPATIBILITY CONTRACT
@@ -61,11 +60,9 @@ namespace ranvier {
 // Current wire format version of WindowReport. See the FORWARD-COMPATIBILITY
 // CONTRACT comment at the top of this file before bumping.
 //
-//   v2: added `backend_type` (engine class) as a bucket-key dimension — the
-//       key is now (model_family, backend_type, hardware_label, workload). A
-//       v1 reader would have silently collapsed engine classes into the other
-//       dimensions; the bump signals the wider key. Introduced before any
-//       consumer attached to the wire format, so the bump is free.
+//   v2: added `backend_type` (engine class) to the bucket key. A v1 reader
+//       collapses engine classes into the other dimensions; the bump signals
+//       the wider key.
 //   v1: initial telemetry window-report schema.
 inline constexpr uint16_t kTelemetryReportFormatVersion = 2;
 
@@ -110,22 +107,20 @@ inline WorkloadPattern workload_pattern_from_intent(RequestIntent intent) {
 // TelemetryBucketKey
 // =============================================================================
 //
-// All four dimensions are content-free:
+// Every dimension is content-free:
 //   - model_family: operator-set label attached to a backend at registration
 //     (NOT parsed from the client `model` field — that's untrusted input).
 //     Empty string is normalised to "unspecified".
 //   - backend_type: engine class (vllm / sglang / …), read from the selected
-//     backend at the request site. It is already resolved on that backend, so
-//     it costs nothing extra on the hot path. Promoting it to its own
-//     dimension lets the catalog group outcomes by engine class instead of
-//     silently collapsing it into the other dimensions.
+//     backend — already resolved there, so it costs nothing extra on the hot
+//     path. Its own dimension so the catalog can group by engine class.
 //   - hardware_label: closed enum, operator-set per backend.
 //   - workload: derived from RequestIntent at the request site.
 //
-// Cardinality is operator-bounded by construction (model_family, backend_type
-// and hardware_label all come from operator config / the registered backend),
-// and the per-shard bucket map enforces a hard cap with an _overflow sentinel
-// (see TelemetryService).
+// Cardinality is operator-bounded by construction (the backend-derived
+// dimensions all come from operator config / the registered backend), and the
+// per-shard bucket map enforces a hard cap with an _overflow sentinel (see
+// TelemetryService).
 struct TelemetryBucketKey {
     std::string     model_family;     // e.g. "llama3", "qwen2", or "unspecified"
     BackendType     backend_type   = BackendType::VLLM;   // engine class
@@ -140,7 +135,7 @@ struct TelemetryBucketKey {
     }
 };
 
-// Hash for absl::flat_hash_map. Combines the four dimensions with a standard
+// Hash for absl::flat_hash_map. Combines the key's dimensions with a standard
 // boost-style mixer. No correctness dependency on the specific mix — purely
 // distributional.
 struct TelemetryBucketKeyHash {
