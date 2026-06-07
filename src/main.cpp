@@ -394,7 +394,9 @@ For more information, see: https://github.com/ranvier-systems/ranvier-core
 )";
 }
 
-int main(int argc, char** argv) {
+namespace ranvier {
+
+int run_application(int argc, char** argv) {
     // Snapshot the process-wide CPU affinity before Seastar pins the reactor
     // threads. Used later by worker_affinity::pin_worker_to_non_reactor_core
     // to place foreign std::thread workers off the reactor cores. Must run
@@ -533,4 +535,10 @@ int main(int argc, char** argv) {
             });
         });
     });
+}
+
+}  // namespace ranvier
+
+int main(int argc, char** argv) {
+    return ranvier::run_application(argc, argv);
 }
