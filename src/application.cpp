@@ -711,7 +711,7 @@ seastar::future<> Application::init_telemetry_service() {
         [&container = _telemetry, strategy_fn = [this] { return make_strategy_snapshot(); }]
         (TelemetryService& s) mutable {
             return s.start_emitter(&container,
-                                   make_default_telemetry_sink(),
+                                   get_telemetry_sink_factory()(),
                                    std::move(strategy_fn));
         });
 

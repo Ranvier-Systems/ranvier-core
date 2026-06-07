@@ -26,7 +26,9 @@
 
 #include "telemetry_schema.hpp"
 
+#include <functional>
 #include <memory>
+#include <utility>
 
 #include <seastar/core/future.hh>
 
@@ -56,6 +58,36 @@ public:
 
 inline std::unique_ptr<TelemetrySink> make_default_telemetry_sink() {
     return std::make_unique<NoopSink>();
+}
+
+// Process-wide seam for choosing which sink the shard-0 emitter installs at
+// start-up. OSS leaves it unset and falls back to make_default_telemetry_sink()
+// (NoopSink); a downstream build installs a real exporter via
+// set_telemetry_sink_factory() during its own start-up, BEFORE
+// Application::init_telemetry_service() arms the emitter. An empty factory
+// resets to the default.
+//
+// Not racy runtime state (cf. Hard Rule #11): the slot is written once and read
+// once, both on shard 0 during the single-threaded start-up sequence, and is
+// never touched afterwards — not on the hot path, not from other shards. The
+// function-local static supplies the standard thread-safe one-time init of the
+// slot itself.
+using TelemetrySinkFactory = std::function<std::unique_ptr<TelemetrySink>()>;
+
+// Shared storage for the factory seam; prefer the set/get accessors below.
+inline TelemetrySinkFactory& telemetry_sink_factory_slot() {
+    static TelemetrySinkFactory slot;  // empty until a build installs one
+    return slot;
+}
+
+inline void set_telemetry_sink_factory(TelemetrySinkFactory factory) {
+    telemetry_sink_factory_slot() = std::move(factory);
+}
+
+// The installed factory, or make_default_telemetry_sink (NoopSink) when unset.
+inline TelemetrySinkFactory get_telemetry_sink_factory() {
+    const TelemetrySinkFactory& slot = telemetry_sink_factory_slot();
+    return slot ? slot : TelemetrySinkFactory{&make_default_telemetry_sink};
 }
 
 }  // namespace ranvier

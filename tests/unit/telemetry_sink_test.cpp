@@ -322,6 +322,44 @@ TEST(NoopSink, FactoryReturnsNoopSink) {
 }
 
 // =============================================================================
+// TelemetrySinkFactory: sink injection seam
+// =============================================================================
+//
+// OSS leaves the factory unset, so get_telemetry_sink_factory() yields the
+// NoopSink default; a downstream build calls set_telemetry_sink_factory() at
+// start-up to install a real exporter. These pin both ends of that seam.
+
+namespace {
+// Test double, distinguishable from NoopSink, to prove the installed factory
+// (not the default) produced the sink.
+struct FakeExportSink final : TelemetrySink {
+    seastar::future<> consume(const WindowReport& /*report*/) override {
+        return seastar::make_ready_future<>();
+    }
+};
+}  // namespace
+
+TEST(TelemetrySinkFactory, DefaultsToNoopWhenUnset) {
+    auto sink = get_telemetry_sink_factory()();
+    ASSERT_NE(sink.get(), nullptr);
+    EXPECT_NE(dynamic_cast<NoopSink*>(sink.get()), nullptr);
+}
+
+TEST(TelemetrySinkFactory, InstalledFactoryOverridesDefault) {
+    set_telemetry_sink_factory([]() -> std::unique_ptr<TelemetrySink> {
+        return std::make_unique<FakeExportSink>();
+    });
+
+    auto sink = get_telemetry_sink_factory()();
+    EXPECT_NE(dynamic_cast<FakeExportSink*>(sink.get()), nullptr);
+    EXPECT_EQ(dynamic_cast<NoopSink*>(sink.get()), nullptr);
+
+    // The slot is process-wide; reset so it can't leak into other tests.
+    set_telemetry_sink_factory(nullptr);
+    EXPECT_NE(dynamic_cast<NoopSink*>(get_telemetry_sink_factory()().get()), nullptr);
+}
+
+// =============================================================================
 // TelemetryOutcome::Kind: pinned ordinals
 // =============================================================================
 //
