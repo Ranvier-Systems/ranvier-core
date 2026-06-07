@@ -241,14 +241,14 @@ static GLOBAL: Jemalloc = Jemalloc;
     add_custom_command(
         OUTPUT ${CMAKE_BINARY_DIR}/generated/dashboard_resource.hpp
         COMMAND ${CMAKE_COMMAND}
-            -DDASHBOARD_IN=${CMAKE_SOURCE_DIR}/src/dashboard/dashboard_resource.hpp.in
-            -DDASHBOARD_HTML=${CMAKE_SOURCE_DIR}/src/dashboard/index.html
+            -DDASHBOARD_IN=${CMAKE_CURRENT_SOURCE_DIR}/src/dashboard/dashboard_resource.hpp.in
+            -DDASHBOARD_HTML=${CMAKE_CURRENT_SOURCE_DIR}/src/dashboard/index.html
             -DDASHBOARD_OUT=${CMAKE_BINARY_DIR}/generated/dashboard_resource.hpp
-            -P ${CMAKE_SOURCE_DIR}/cmake/embed_dashboard.cmake
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_dashboard.cmake
         DEPENDS
-            ${CMAKE_SOURCE_DIR}/src/dashboard/index.html
-            ${CMAKE_SOURCE_DIR}/src/dashboard/dashboard_resource.hpp.in
-            ${CMAKE_SOURCE_DIR}/cmake/embed_dashboard.cmake
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/dashboard/index.html
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/dashboard/dashboard_resource.hpp.in
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_dashboard.cmake
         COMMENT "Embedding dashboard HTML into dashboard_resource.hpp"
     )
     # Custom target so the header is generated before compilation
@@ -332,7 +332,7 @@ static GLOBAL: Jemalloc = Jemalloc;
     )
 
     # Copy the assets folder to the build directory automatically
-    file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
+    file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
 
     # Install targets for `make install` / packaging
     install(TARGETS ranvier_server DESTINATION bin)
@@ -357,7 +357,7 @@ add_executable(radix_tree_test
   tests/unit/radix_tree_test.cpp
   src/node_slab.cpp
 )
-target_include_directories(radix_tree_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(radix_tree_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(radix_tree_test
   PRIVATE
   GTest::gtest_main
@@ -369,7 +369,7 @@ gtest_discover_tests(radix_tree_test)
 add_executable(chat_template_test
   tests/unit/chat_template_test.cpp
 )
-target_include_directories(chat_template_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(chat_template_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(chat_template_test
   PRIVATE
   GTest::gtest_main
@@ -380,7 +380,7 @@ gtest_discover_tests(chat_template_test)
 add_executable(boundary_detector_test
   tests/unit/boundary_detector_test.cpp
 )
-target_include_directories(boundary_detector_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(boundary_detector_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(boundary_detector_test
   PRIVATE
   GTest::gtest_main
@@ -392,7 +392,7 @@ add_executable(intent_classifier_test
   tests/unit/intent_classifier_test.cpp
   src/intent_classifier.cpp
 )
-target_include_directories(intent_classifier_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(intent_classifier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(intent_classifier_test
   PRIVATE
   GTest::gtest_main
@@ -403,7 +403,7 @@ gtest_discover_tests(intent_classifier_test)
 add_executable(text_validator_test
   tests/unit/text_validator_test.cpp
 )
-target_include_directories(text_validator_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(text_validator_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(text_validator_test
   PRIVATE
   GTest::gtest_main
@@ -415,7 +415,7 @@ gtest_discover_tests(text_validator_test)
 add_executable(parse_utils_test
   tests/unit/parse_utils_test.cpp
 )
-target_include_directories(parse_utils_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(parse_utils_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(parse_utils_test
   PRIVATE
   GTest::gtest_main
@@ -427,7 +427,7 @@ gtest_discover_tests(parse_utils_test)
 add_executable(prometheus_parser_test
   tests/unit/prometheus_parser_test.cpp
 )
-target_include_directories(prometheus_parser_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(prometheus_parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(prometheus_parser_test
   PRIVATE
   GTest::gtest_main
@@ -438,7 +438,7 @@ gtest_discover_tests(prometheus_parser_test)
 add_executable(vllm_metrics_test
   tests/unit/vllm_metrics_test.cpp
 )
-target_include_directories(vllm_metrics_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(vllm_metrics_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(vllm_metrics_test
   PRIVATE
   GTest::gtest_main
@@ -449,7 +449,7 @@ gtest_discover_tests(vllm_metrics_test)
 add_executable(health_service_test
   tests/unit/health_service_test.cpp
 )
-target_include_directories(health_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(health_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(health_service_test
   PRIVATE
   GTest::gtest_main
@@ -463,8 +463,8 @@ add_executable(logging_test
   tests/unit/logging_test.cpp
 )
 target_include_directories(logging_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/stubs
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(logging_test
   PRIVATE
@@ -478,8 +478,8 @@ add_executable(shard_load_metrics_test
   tests/unit/shard_load_metrics_test.cpp
 )
 target_include_directories(shard_load_metrics_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/stubs
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(shard_load_metrics_test
   PRIVATE
@@ -494,8 +494,8 @@ add_executable(metrics_service_test
   tests/unit/metrics_service_test.cpp
 )
 target_include_directories(metrics_service_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/stubs
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(metrics_service_test
   PRIVATE
@@ -515,8 +515,8 @@ add_executable(telemetry_sink_test
   tests/unit/telemetry_sink_test.cpp
 )
 target_include_directories(telemetry_sink_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/stubs
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(telemetry_sink_test
   PRIVATE
@@ -532,7 +532,7 @@ add_executable(node_slab_test
   tests/unit/node_slab_test.cpp
   src/node_slab.cpp
 )
-target_include_directories(node_slab_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(node_slab_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(node_slab_test
   PRIVATE
   GTest::gtest_main
@@ -546,7 +546,7 @@ gtest_discover_tests(node_slab_test)
 add_executable(mpsc_ring_buffer_test
   tests/unit/mpsc_ring_buffer_test.cpp
 )
-target_include_directories(mpsc_ring_buffer_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(mpsc_ring_buffer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(mpsc_ring_buffer_test
   PRIVATE
   GTest::gtest_main
@@ -559,8 +559,8 @@ add_executable(cross_shard_request_test
   tests/unit/cross_shard_request_test.cpp
 )
 target_include_directories(cross_shard_request_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/stubs
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(cross_shard_request_test
   PRIVATE
@@ -574,7 +574,7 @@ add_executable(tracing_service_test
   tests/unit/tracing_service_test.cpp
 )
 target_compile_definitions(tracing_service_test PRIVATE RANVIER_NO_TELEMETRY)
-target_include_directories(tracing_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(tracing_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tracing_service_test
   PRIVATE
   GTest::gtest_main
@@ -586,7 +586,7 @@ add_executable(persistence_test
   tests/unit/persistence_test.cpp
   src/sqlite_persistence.cpp
 )
-target_include_directories(persistence_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
+target_include_directories(persistence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${SQLITE3_INCLUDE_DIRS})
 target_link_libraries(persistence_test
   PRIVATE
   GTest::gtest_main
@@ -599,7 +599,7 @@ add_executable(config_test
   tests/unit/config_test.cpp
   src/config_loader.cpp
 )
-target_include_directories(config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(config_test
   PRIVATE
   GTest::gtest_main
@@ -613,7 +613,7 @@ add_executable(priority_tier_test
   tests/unit/priority_tier_test.cpp
 )
 target_include_directories(priority_tier_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(priority_tier_test
   PRIVATE
@@ -626,7 +626,7 @@ add_executable(request_scheduler_test
   tests/unit/request_scheduler_test.cpp
 )
 target_include_directories(request_scheduler_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(request_scheduler_test
   PRIVATE
@@ -640,7 +640,7 @@ gtest_discover_tests(request_scheduler_test)
 add_executable(gossip_protocol_test
   tests/unit/gossip_protocol_test.cpp
 )
-target_include_directories(gossip_protocol_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(gossip_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gossip_protocol_test
   PRIVATE
   GTest::gtest_main
@@ -652,7 +652,7 @@ gtest_discover_tests(gossip_protocol_test)
 add_executable(gossip_cache_eviction_test
   tests/unit/gossip_cache_eviction_test.cpp
 )
-target_include_directories(gossip_cache_eviction_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(gossip_cache_eviction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gossip_cache_eviction_test
   PRIVATE
   GTest::gtest_main
@@ -664,7 +664,7 @@ gtest_discover_tests(gossip_cache_eviction_test)
 add_executable(gossip_cache_state_test
   tests/unit/gossip_cache_state_test.cpp
 )
-target_include_directories(gossip_cache_state_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(gossip_cache_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gossip_cache_state_test
   PRIVATE
   GTest::gtest_main
@@ -676,7 +676,7 @@ gtest_discover_tests(gossip_cache_state_test)
 add_executable(gossip_transport_ownership_test
   tests/unit/gossip_transport_ownership_test.cpp
 )
-target_include_directories(gossip_transport_ownership_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(gossip_transport_ownership_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gossip_transport_ownership_test
   PRIVATE
   GTest::gtest_main
@@ -688,7 +688,7 @@ gtest_discover_tests(gossip_transport_ownership_test)
 add_executable(route_batching_test
   tests/unit/route_batching_test.cpp
 )
-target_include_directories(route_batching_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(route_batching_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(route_batching_test
   PRIVATE
   GTest::gtest_main
@@ -700,7 +700,7 @@ gtest_discover_tests(route_batching_test)
 add_executable(k8s_discovery_test
   tests/unit/k8s_discovery_test.cpp
 )
-target_include_directories(k8s_discovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(k8s_discovery_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(k8s_discovery_test
   PRIVATE
   GTest::gtest_main
@@ -714,7 +714,7 @@ gtest_discover_tests(k8s_discovery_test)
 add_executable(local_discovery_test
   tests/unit/local_discovery_test.cpp
 )
-target_include_directories(local_discovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(local_discovery_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(local_discovery_test
   PRIVATE
   GTest::gtest_main
@@ -727,7 +727,7 @@ gtest_discover_tests(local_discovery_test)
 add_executable(request_rewriter_test
   tests/unit/request_rewriter_test.cpp
 )
-target_include_directories(request_rewriter_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(request_rewriter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(request_rewriter_test
   PRIVATE
   GTest::gtest_main
@@ -740,7 +740,7 @@ gtest_discover_tests(request_rewriter_test)
 add_executable(prefix_affinity_test
   tests/unit/prefix_affinity_test.cpp
 )
-target_include_directories(prefix_affinity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(prefix_affinity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(prefix_affinity_test
   PRIVATE
   GTest::gtest_main
@@ -752,7 +752,7 @@ gtest_discover_tests(prefix_affinity_test)
 add_executable(load_aware_routing_test
   tests/unit/load_aware_routing_test.cpp
 )
-target_include_directories(load_aware_routing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(load_aware_routing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(load_aware_routing_test
   PRIVATE
   GTest::gtest_main
@@ -764,7 +764,7 @@ gtest_discover_tests(load_aware_routing_test)
 add_executable(gpu_load_routing_test
   tests/unit/gpu_load_routing_test.cpp
 )
-target_include_directories(gpu_load_routing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(gpu_load_routing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(gpu_load_routing_test
   PRIVATE
   GTest::gtest_main
@@ -777,8 +777,8 @@ add_executable(quorum_test
   tests/unit/quorum_test.cpp
 )
 target_include_directories(quorum_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_SOURCE_DIR}/tests/unit
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(quorum_test
   PRIVATE
@@ -792,8 +792,8 @@ add_executable(circuit_breaker_test
   tests/unit/circuit_breaker_test.cpp
 )
 target_include_directories(circuit_breaker_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_SOURCE_DIR}/tests/unit
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(circuit_breaker_test
   PRIVATE
@@ -807,8 +807,8 @@ add_executable(rate_limiter_test
   tests/unit/rate_limiter_test.cpp
 )
 target_include_directories(rate_limiter_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_SOURCE_DIR}/tests/unit
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(rate_limiter_test
   PRIVATE
@@ -823,8 +823,8 @@ add_executable(proxy_retry_policy_test
   tests/unit/proxy_retry_policy_test.cpp
 )
 target_include_directories(proxy_retry_policy_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_SOURCE_DIR}/tests/unit
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(proxy_retry_policy_test
   PRIVATE
@@ -838,8 +838,8 @@ add_executable(shard_load_metrics_concurrency_test
   tests/unit/shard_load_metrics_concurrency_test.cpp
 )
 target_include_directories(shard_load_metrics_concurrency_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/tests/stubs
-  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(shard_load_metrics_concurrency_test
   PRIVATE
@@ -854,8 +854,8 @@ add_executable(rate_limiter_concurrency_test
   tests/unit/rate_limiter_concurrency_test.cpp
 )
 target_include_directories(rate_limiter_concurrency_test PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_SOURCE_DIR}/tests/unit
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
 )
 target_link_libraries(rate_limiter_concurrency_test
   PRIVATE
@@ -870,7 +870,7 @@ if(Seastar_FOUND)
       tests/unit/sharded_config_test.cpp
       src/config_loader.cpp
     )
-    target_include_directories(sharded_config_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(sharded_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(sharded_config_test
       PRIVATE
       Seastar::seastar
@@ -885,7 +885,7 @@ if(Seastar_FOUND)
     add_executable(request_timeout_test
       tests/unit/request_timeout_test.cpp
     )
-    target_include_directories(request_timeout_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(request_timeout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(request_timeout_test
       PRIVATE
       Seastar::seastar
@@ -899,7 +899,7 @@ if(Seastar_FOUND)
       tests/unit/crypto_offloader_test.cpp
       src/crypto_offloader.cpp
     )
-    target_include_directories(crypto_offloader_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(crypto_offloader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(crypto_offloader_test
       PRIVATE
       Seastar::seastar
@@ -913,7 +913,7 @@ if(Seastar_FOUND)
       tests/unit/agent_registry_test.cpp
       src/agent_registry.cpp
     )
-    target_include_directories(agent_registry_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(agent_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(agent_registry_test
       PRIVATE
       Seastar::seastar
@@ -928,7 +928,7 @@ if(Seastar_FOUND)
       tests/unit/dtls_context_test.cpp
       src/dtls_context.cpp
     )
-    target_include_directories(dtls_context_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(dtls_context_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(dtls_context_test
       PRIVATE
       Seastar::seastar
@@ -945,8 +945,8 @@ if(Seastar_FOUND)
       tests/unit/connection_pool_test.cpp
     )
     target_include_directories(connection_pool_test PRIVATE
-      ${CMAKE_SOURCE_DIR}/src
-      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
     )
     target_link_libraries(connection_pool_test
       PRIVATE
@@ -961,7 +961,7 @@ if(Seastar_FOUND)
       tests/unit/stream_parser_test.cpp
       src/stream_parser.cpp
     )
-    target_include_directories(stream_parser_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(stream_parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(stream_parser_test
       PRIVATE
       Seastar::seastar
@@ -980,8 +980,8 @@ if(Seastar_FOUND)
       src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_test PRIVATE
-      ${CMAKE_SOURCE_DIR}/src
-      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
       ${SQLITE3_INCLUDE_DIRS}
     )
     target_link_libraries(async_persistence_test
@@ -1024,7 +1024,7 @@ if(Seastar_FOUND)
       src/worker_affinity.cpp
     )
     target_include_directories(application_test PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${SQLITE3_INCLUDE_DIRS}
         ${CMAKE_BINARY_DIR}/generated
     )
@@ -1060,7 +1060,7 @@ if(Seastar_FOUND)
       src/tokenizer_thread_pool.cpp
       src/worker_affinity.cpp
     )
-    target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(tokenization_cache_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(tokenization_cache_test
       PRIVATE
       Seastar::seastar
@@ -1077,7 +1077,7 @@ if(Seastar_FOUND)
       src/tokenizer_thread_pool.cpp
       src/worker_affinity.cpp
     )
-    target_include_directories(tokenizer_thread_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(tokenizer_thread_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_test
       PRIVATE
       Seastar::seastar
@@ -1095,7 +1095,7 @@ if(Seastar_FOUND)
       src/tokenizer_thread_pool.cpp
       src/worker_affinity.cpp
     )
-    target_include_directories(tokenizer_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(tokenizer_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_service_test
       PRIVATE
       Seastar::seastar
@@ -1119,7 +1119,7 @@ if(Seastar_FOUND)
       src/crypto_offloader.cpp
       src/dtls_context.cpp
     )
-    target_include_directories(router_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(router_service_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(router_service_test
       PRIVATE
       Seastar::seastar
@@ -1146,7 +1146,7 @@ if(Seastar_FOUND)
       src/crypto_offloader.cpp
       src/dtls_context.cpp
     )
-    target_include_directories(cache_eviction_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(cache_eviction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(cache_eviction_test
       PRIVATE
       Seastar::seastar
@@ -1169,8 +1169,8 @@ if(Seastar_FOUND)
       src/worker_affinity.cpp
     )
     target_include_directories(async_persistence_concurrency_test PRIVATE
-      ${CMAKE_SOURCE_DIR}/src
-      ${CMAKE_SOURCE_DIR}/tests/unit
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit
       ${SQLITE3_INCLUDE_DIRS}
     )
     target_link_libraries(async_persistence_concurrency_test
@@ -1190,7 +1190,7 @@ if(Seastar_FOUND)
       src/tokenizer_thread_pool.cpp
       src/worker_affinity.cpp
     )
-    target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(tokenizer_thread_pool_concurrency_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(tokenizer_thread_pool_concurrency_test
       PRIVATE
       Seastar::seastar
@@ -1213,7 +1213,7 @@ if(Seastar_FOUND)
     add_executable(cross_shard_exception_propagation_test
       tests/unit/cross_shard_exception_propagation_test.cpp
     )
-    target_include_directories(cross_shard_exception_propagation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(cross_shard_exception_propagation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(cross_shard_exception_propagation_test
       PRIVATE
       Seastar::seastar
@@ -1235,7 +1235,7 @@ if(Seastar_FOUND)
       tests/unit/worker_affinity_test.cpp
       src/worker_affinity.cpp
     )
-    target_include_directories(worker_affinity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(worker_affinity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(worker_affinity_test
       PRIVATE
       Seastar::seastar
@@ -1341,7 +1341,7 @@ if(RANVIER_BUILD_FUZZERS)
       tests/fuzz/radix_tree_fuzz.cpp
       src/node_slab.cpp
     )
-    target_include_directories(radix_tree_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(radix_tree_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(radix_tree_fuzz
       PRIVATE
       absl::inlined_vector
@@ -1357,7 +1357,7 @@ if(RANVIER_BUILD_FUZZERS)
     add_executable(request_rewriter_fuzz
       tests/fuzz/request_rewriter_fuzz.cpp
     )
-    target_include_directories(request_rewriter_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(request_rewriter_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(request_rewriter_fuzz
       PRIVATE
       rapidjson_interface
@@ -1371,7 +1371,7 @@ if(RANVIER_BUILD_FUZZERS)
           tests/fuzz/stream_parser_fuzz.cpp
           src/stream_parser.cpp
         )
-        target_include_directories(stream_parser_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        target_include_directories(stream_parser_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(stream_parser_fuzz
           PRIVATE
           Seastar::seastar

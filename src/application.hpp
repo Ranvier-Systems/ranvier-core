@@ -321,4 +321,16 @@ private:
                             std::chrono::steady_clock::time_point phase_start) const;
 };
 
+// Library entrypoint: parse CLI args, load config, and run the Seastar
+// application to completion (returns a process exit code). main() forwards
+// to this in one line. A downstream binary that needs to own main() — e.g.
+// to install a real TelemetrySink via set_telemetry_sink_factory() before
+// startup — wires its custom services first, then calls this:
+//
+//     int main(int argc, char** argv) {
+//         ranvier::set_telemetry_sink_factory(...);
+//         return ranvier::run_application(argc, argv);
+//     }
+int run_application(int argc, char** argv);
+
 }  // namespace ranvier
