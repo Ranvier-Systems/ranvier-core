@@ -256,9 +256,21 @@ static GLOBAL: Jemalloc = Jemalloc;
         DEPENDS ${CMAKE_BINARY_DIR}/generated/dashboard_resource.hpp
     )
 
-    # Define the Main Server Executable
-    add_executable(ranvier_server
-      src/main.cpp
+    # =========================================================================
+    # ranvier_core library (the server, minus main())
+    # =========================================================================
+    # ranvier_core holds the entire server except main(): run_application.cpp
+    # carries ranvier::run_application() and the rest are the service .cpp
+    # files. ranvier_server below is just a main() that links this library.
+    # Exposing the bring-up as a library lets a downstream build pull this
+    # project in via add_subdirectory() and own main() itself (e.g. to register
+    # custom services before startup) by linking ranvier_core in place of the
+    # bundled ranvier_server.
+    #
+    # Same source list as ranvier_server, with src/run_application.cpp standing
+    # in for src/main.cpp (it holds run_application() but defines no main()).
+    add_library(ranvier_core STATIC
+      src/run_application.cpp
       src/agent_registry.cpp
       src/application.cpp
       src/async_persistence.cpp
@@ -285,17 +297,22 @@ static GLOBAL: Jemalloc = Jemalloc;
       src/tracing_service.cpp
       src/worker_affinity.cpp
     )
-    add_dependencies(ranvier_server dashboard_resource)
+    add_dependencies(ranvier_core dashboard_resource)
 
-    target_include_directories(ranvier_server PRIVATE
-        ${SQLITE3_INCLUDE_DIRS}
+    # Usage requirements are PUBLIC so they propagate to ranvier_server and to
+    # any downstream target that links ranvier_core. The src/ include lets a
+    # downstream main() reach "application.hpp" (run_application() and the
+    # service seams); generated/ carries the build-time dashboard_resource.hpp.
+    target_include_directories(ranvier_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_BINARY_DIR}/generated
+        ${SQLITE3_INCLUDE_DIRS}
     )
 
     # Debug metrics configuration (optional)
     # Enables 8 additional gossip metrics for crypto offload debugging
     if(RANVIER_DEBUG_METRICS)
-        target_compile_definitions(ranvier_server PRIVATE RANVIER_DEBUG_METRICS)
+        target_compile_definitions(ranvier_core PUBLIC RANVIER_DEBUG_METRICS)
         message(STATUS "Gossip debug metrics enabled")
     endif()
 
@@ -312,12 +329,12 @@ static GLOBAL: Jemalloc = Jemalloc;
         )
         message(STATUS "OpenTelemetry: Using Zipkin exporter (OTLP disabled due to protobuf static init issues)")
     else()
-        target_compile_definitions(ranvier_server PRIVATE RANVIER_NO_TELEMETRY)
+        target_compile_definitions(ranvier_core PUBLIC RANVIER_NO_TELEMETRY)
         set(OTEL_LIBS "")
     endif()
 
-    target_link_libraries(ranvier_server
-      PRIVATE
+    target_link_libraries(ranvier_core
+      PUBLIC
       Seastar::seastar
       tokenizers_cpp
       ${SQLITE3_LIBRARIES}
@@ -330,6 +347,10 @@ static GLOBAL: Jemalloc = Jemalloc;
       OpenSSL::Crypto
       ${OTEL_LIBS}
     )
+
+    # The OSS server binary: just main(), linked against the library above.
+    add_executable(ranvier_server src/main.cpp)
+    target_link_libraries(ranvier_server PRIVATE ranvier_core)
 
     # Copy the assets folder to the build directory automatically
     file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})
