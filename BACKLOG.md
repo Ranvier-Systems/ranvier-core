@@ -30,7 +30,7 @@ Completed items have been archived in [BACKLOG-ARCHIVE.md](BACKLOG-ARCHIVE.md).
 17. [Hard Rules Audit Follow-ups (2026-05-05)](#17-hard-rules-audit-follow-ups-2026-05-05)
 18. [Request Lifecycle Crash-Risk Audit Follow-ups (2026-05-08)](#18-request-lifecycle-crash-risk-audit-follow-ups-2026-05-08)
 19. [Heterogeneous Backend Support (2026-05-16)](#19-heterogeneous-backend-support-2026-05-16)
-20. [Competitive Parity (2026-06-07)](#20-competitive-parity-2026-06-07)
+20. [Routing Parity & Ecosystem Alignment](#20-routing-parity--ecosystem-alignment-2026-06-07)
 
 ---
 
@@ -863,49 +863,48 @@ The section heading and anchor (`#19-heterogeneous-backend-support-2026-05-16`) 
 
 ---
 
-## 20. Competitive Parity (2026-06-07)
+## 20. Routing Parity & Ecosystem Alignment (2026-06-07)
 
-Parity work derived from the mid-2026 competitive scan in
-[`docs/architecture/competitive-landscape-2026.md`](docs/architecture/competitive-landscape-2026.md)
-(field positioning, open-core boundary, and rationale for each item below). The field
-(llm-d, NVIDIA Dynamo, AIBrix, GKE Inference Gateway) converged on live block-level
-KV-event routing + a single weighted prefix/load/KV score + prefill/decode disaggregation,
-and standardized on the Kubernetes Gateway API Inference Extension (GIE) / Endpoint Picker.
-Ranvier already has the harder-to-build half (eviction events, residency weighting, load/cost
-routing); these items close the remaining gaps. **Open-core:** P0 + P1.4 + P1.6 are
-`ranvier-core` (Apache-2.0); P1.5 governance is `ranvier-internal` (proprietary).
+Routing-quality and ecosystem-alignment work derived from the mid-2026 routing scan in
+[`docs/architecture/routing-direction-2026.md`](docs/architecture/routing-direction-2026.md)
+(routing direction, ecosystem context, and rationale for each item below). The ecosystem
+converged on live block-level KV-event routing + a single weighted prefix/load/KV score +
+prefill/decode disaggregation, and standardized on the Kubernetes Gateway API Inference
+Extension (GIE) / Endpoint Picker (EPP). Ranvier already has the harder-to-build half
+(eviction events, residency weighting, load/cost routing); these items close the remaining gaps.
 
 ### 20.1 P0 — KV-aware routing parity (OSS)
 
 - [ ] **Precise, native KV-event mode** (P0.1)
   _Justification:_ Today residency is probabilistic (`VLLMMetrics::estimated_prefix_retention`)
-  and the eviction signal rides a bespoke `POST /v1/cache/events` protocol. The field feeds
-  routing from the engine's *native* KV-event stream at block-hash granularity (Dynamo
-  `KVPublisher`, AIBrix ZMQ, llm-d `kvcache.Index`), giving exact residency and letting "loaded"
-  events create routes (ours can't — the wire format carries no tokens; see `load_route_global`).
-  Feed the existing `prefix_hash_index` from the native stream. Realizes Phase 3 of the
-  push-eviction design, aligned to the ecosystem wire format. Keep the ART history path as the
-  engine-agnostic fallback (SGLang/Ollama/TRT).
+  and the eviction signal rides a bespoke `POST /v1/cache/events` protocol. The ecosystem
+  standard is to feed routing from the engine's *native* KV-event stream (vLLM, block-hash
+  granularity), giving exact residency and letting "loaded" events create routes (ours can't —
+  the wire format carries no tokens; see `load_route_global`). Feed the existing
+  `prefix_hash_index` from the native stream. Realizes Phase 3 of the push-eviction design,
+  aligned to the ecosystem wire format. Keep the ART history path as the engine-agnostic
+  fallback (SGLang/Ollama/TRT).
   _Design:_ [`docs/architecture/push-cache-eviction-notifications.md`](docs/architecture/push-cache-eviction-notifications.md)
   _Location:_ `src/router_service.hpp` (cache-event API), `src/vllm_metrics.hpp`, `src/health_service.cpp`
   _Complexity:_ High
 
 - [ ] **Unified weighted scorer** (P0.2)
   _Justification:_ Routing currently layers ART → load redirect → cost redirect as sequential
-  *overrides* (`PrefixRouteResult.was_load_redirect`, `was_cost_redirect`). The field uses one
-  tunable weighted score blending prefix overlap + queue + KV utilization (GKE publishes
-  `prefix:queue:kv = 3:3:2`; Dynamo uses `w·prefill_blocks + decode_blocks`). All inputs already
-  exist (`get_composite_backend_load`, residency weight, cost budget); fuse them into a single
-  composable scorer with configurable weights, leaving room for a future SLO term.
+  *overrides* (`PrefixRouteResult.was_load_redirect`, `was_cost_redirect`). The state of the art
+  uses one tunable weighted score blending prefix overlap + queue depth + KV utilization
+  (published heuristics use a `prefix:queue:kv`-style weighting; disaggregated scorers add a
+  `w·prefill_blocks + decode_blocks` term). All inputs already exist (`get_composite_backend_load`,
+  residency weight, cost budget); fuse them into a single composable scorer with configurable
+  weights, leaving room for a future SLO term.
   _Location:_ `src/router_service.cpp` (`get_backend_for_prefix`, `route_request`), `src/config_schema.hpp` (`RoutingConfig`)
   _Complexity:_ Medium
 
 - [ ] **Disaggregated prefill/decode awareness** (P0.3)
   _Justification:_ `BackendType` is engine class, not pool role. Disaggregated (P/D) serving is
-  now table-stakes for frontier models (Dynamo conditional disagg, llm-d, Mooncake, SGLang).
-  A topology-blind router silently misroutes and forfeits the gains. Add a `pool_role`
-  (`prefill`/`decode`/`unified`) dimension to backend registration + routing; route new turns to
-  prefill, preserve decode affinity. We need not own KV transfer (NIXL/LMCache do that).
+  now table-stakes for frontier-model serving (cf. Mooncake). A topology-blind router silently
+  misroutes and forfeits the gains. Add a `pool_role` (`prefill`/`decode`/`unified`) dimension
+  to backend registration + routing; route new turns to prefill, preserve decode affinity. We
+  need not own KV transfer (NIXL/LMCache do that).
   _Location:_ `src/backend_registry.hpp`, `src/router_service.cpp` (`register_backend_global`), `src/types.hpp`, `src/config_schema.hpp`
   _Complexity:_ Medium–High
 
@@ -913,21 +912,21 @@ routing); these items close the remaining gaps. **Open-core:** P0 + P1.4 + P1.6 
 
 - [ ] **GIE Endpoint-Picker (EPP) compatibility mode** (P1.4, OSS)
   _Justification:_ The Kubernetes Gateway API Inference Extension (GA 2026) standardized
-  endpoint selection on an ext_proc EPP protocol (Istio/Envoy/GKE/agentgateway all conform).
+  endpoint selection on an ext_proc EPP protocol that GIE-conformant gateways implement.
   Exposing the routing core as a GIE-conformant ext_proc endpoint picker lets any conformant
   gateway delegate to Ranvier — riding the standard's distribution without giving up the
-  standalone inline data plane. Pair with a published head-to-head benchmark (inline Ranvier vs.
-  Istio/Envoy + EPP) measuring the absolute per-request routing-overhead delta — a number no
-  Camp-A project publishes.
+  standalone inline data plane. Pair with a published benchmark of inline routing vs. a sidecar
+  ext_proc EPP hop, measuring the absolute per-request routing-overhead delta — a number not
+  currently published anywhere.
   _Location:_ new ext_proc gRPC server surface; reuse `router_service` decision core
   _Complexity:_ High
 
-- [ ] **Per-tenant token budgets, quotas & audit log** (P1.5, ENTERPRISE → `ranvier-internal`)
-  _Justification:_ Builds on OSS per-API-key attribution + SQLite. Enforcement, spend ledger,
-  and tamper-evident audit are the paid governance layer (see §3.3 audit logging, §4.3 RBAC).
-  The OSS side ships only the usage-ledger *sink* seam (mirroring `TelemetrySinkConfig`); the
-  enterprise repo implements the ledger, quotas, and audit store.
-  _Location:_ OSS seam in `src/` (sink interface); implementation in `ranvier-internal`
+- [ ] **Usage-ledger sink seam** (P1.5, OSS)
+  _Justification:_ Ship a pluggable usage-ledger *sink* interface (no-op default + registration
+  point, mirroring `TelemetrySinkConfig`) on top of the existing per-API-key attribution +
+  SQLite, so external metering / attribution / billing backends can consume per-key usage events
+  without core hard-depending on any concrete implementation.
+  _Location:_ OSS sink interface in `src/`
   _Complexity:_ Medium
 
 - [ ] **OpenTelemetry GenAI semantic conventions** (P1.6, OSS)
@@ -943,10 +942,10 @@ routing); these items close the remaining gaps. **Open-core:** P0 + P1.4 + P1.6 
   awareness; drags in an embedding dependency. Useful for RAG/support bots. _Complexity:_ Medium
 - [ ] **KV-offload awareness (LMCache/Mooncake)** — be compatible now; later factor shared-store
   hits into the P0.2 score. _Complexity:_ Medium
-- [ ] **Guardrails (PII/prompt-injection)** — OSS exposes a filter hook; connectors are
-  enterprise. Never build classifiers in core. _Complexity:_ Medium (hook only)
+- [ ] **Guardrails (PII/prompt-injection)** — core exposes a filter hook; connectors live outside
+  core. Never build classifiers in core. _Complexity:_ Medium (hook only)
 - [ ] _Out of scope:_ multi-provider shims and cost/quality model routing (RouteLLM-style) —
-  Python/TS gateways own provider breadth; no model-router dominates all domains.
+  general-purpose gateways own provider breadth; no model-router dominates all domains.
 
 ---
 
