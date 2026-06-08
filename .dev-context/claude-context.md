@@ -78,7 +78,9 @@ HTTP Request (:8080)
 
 ```
 src/
-  main.cpp                    # Seastar reactor entry point (startup-only blocking I/O OK)
+  main.cpp                    # Thin main() forwarder into ranvier::run_application()
+  run_application.cpp         # Server bring-up: CLI parse, config load, reactor run loop
+                              #   (startup-only blocking I/O OK); built into ranvier_core lib
   application.{hpp,cpp}       # Service lifecycle (CREATED -> STARTING -> RUNNING ->
                               #                    DRAINING -> STOPPING -> STOPPED)
 

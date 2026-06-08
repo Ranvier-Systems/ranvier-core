@@ -6,7 +6,8 @@ This guide maps source files to logical modules, helping contributors navigate t
 
 | File | Description |
 |------|-------------|
-| `main.cpp` | Entry point, Seastar reactor loop, signal setup |
+| `main.cpp` | Thin `main()` forwarder into `ranvier::run_application()` |
+| `run_application.cpp` | Server bring-up: CLI parsing, config load, Seastar reactor loop, signal setup; compiled into the `ranvier_core` library |
 | `application.*` | Service lifecycle management, startup/shutdown orchestration |
 | `config.hpp` | Backward-compatible facade (includes schema + loader) |
 | `config_schema.hpp` | Ranvier-specific configuration data structures (all `*Config` structs) |
