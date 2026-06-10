@@ -528,6 +528,17 @@ struct StaticBackendConfig {
     // engine-class bucket dimension is taken from `type` above, not here.)
     HardwareLabel hardware_label = HardwareLabel::UNSPECIFIED;
     std::string   model_family;   // empty → "unspecified" at recording time
+
+    // Hardware-tier / cost-aware routing (both optional; unset keeps today's
+    // routing exactly). `gpu_tier` is a coarse informational label (e.g.
+    // "h100", "a10g") surfaced in routing logs; `cost_per_hour` is the
+    // operator's hourly price for the backend, in whatever currency unit the
+    // fleet uses consistently. When two or more live backends carry
+    // cost_per_hour > 0, cache-MISS traffic prefers the cheapest priced one;
+    // cache-HIT traffic stays on the cache-warm backend regardless of cost
+    // (recompute cost dominates the hardware saving).
+    std::string gpu_tier;
+    double cost_per_hour = 0.0;   // 0.0 = unset (backend never priced-compared)
 };
 
 struct StaticBackendsConfig {

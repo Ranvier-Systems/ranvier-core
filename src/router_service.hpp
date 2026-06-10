@@ -380,6 +380,20 @@ public:
     seastar::future<> set_backend_labels_global(BackendId id,
                                                 HardwareLabel hardware_label,
                                                 std::string model_family);
+
+    // Per-backend hardware-tier / cost fields (operator-set, broadcast to
+    // every shard; same side-broadcast shape as the telemetry labels above so
+    // BackendRegistry's abstract interface stays unchanged). `gpu_tier` is a
+    // coarse informational label (e.g. "h100", "a10g"); `cost_per_hour` is
+    // the operator's hourly price and, when > 0, opts the backend into the
+    // cache-miss hardware-cost preference: misses prefer the cheapest priced
+    // live backend, while ART hits stay on the cache-warm backend regardless
+    // of cost. Both default to unset (""/0.0) = pre-feature behavior.
+    // Call after register_backend_global resolves — registration overwrites
+    // BackendInfo wholesale, resetting both fields to their defaults.
+    seastar::future<> set_backend_hardware_cost_global(BackendId id,
+                                                       std::string gpu_tier,
+                                                       double cost_per_hour);
     // Telemetry bucket dimensions for a backend, resolved in one shard-local
     // lookup. `backend_type` is the engine class already on the backend (not an
     // operator-set label); returning it here lets the request site build the
@@ -691,6 +705,12 @@ public:
     // Set cache residency weight for a backend in shard-local state.
     // residency: 0.0 (prefix almost certainly evicted) to 1.0 (almost certainly resident).
     static void set_residency_for_testing(BackendId id, double residency);
+
+    // Write hardware-tier / cost fields directly into shard-local BackendInfo.
+    // Bypasses set_backend_hardware_cost_global's broadcast so the cache-miss
+    // cost preference can be unit-tested without a running reactor.
+    static void set_backend_hardware_cost_for_testing(BackendId id, std::string gpu_tier,
+                                                      double cost_per_hour);
 
     // Remove a backend from shard-local state (bypasses async cross-shard broadcast).
     static void unregister_backend_for_testing(BackendId id);

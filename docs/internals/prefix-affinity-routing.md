@@ -74,6 +74,16 @@ Request arrives with tokens
         │
         ▼
 ┌─────────────────────────────────────────┐
+│  2b. Hardware-Cost Preference (Optional)│
+│     Cache miss + priced backends →      │
+│     prefer cheapest cost_per_hour.      │
+│     Replaces the miss-path selection,   │
+│     so it feeds route learning (unlike  │
+│     the transient overrides in 3/4).    │
+└─────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────┐
 │  3. Load-Aware Override (Optional)      │
 │     Divert to less-loaded backend if    │
 │     preferred is overloaded             │
@@ -90,10 +100,12 @@ Request arrives with tokens
 ┌─────────────────────────────────────────┐
 │  5. Learn Prefix (After Success)        │
 │     Store the originally-selected ART/  │
-│     hash backend (not the load/cost     │
-│     diversion target) so cache affinity │
-│     survives transient load spikes.     │
-│     Future requests get ART hit.        │
+│     hash backend (not the load/cost-    │
+│     budget diversion target) so cache   │
+│     affinity survives transient load    │
+│     spikes. The 2b hardware-cost choice │
+│     IS the original selection, so it is │
+│     learned. Future requests get ART hit│
 └─────────────────────────────────────────┘
 ```
 
@@ -108,6 +120,23 @@ Each component serves a specific purpose:
 | **Prefix Learning** | Store only first N tokens, so requests with same system prompt share one route |
 
 The ART enables **partial prefix matching**: if request B shares a prefix with previously-seen request A, it routes to the same backend even if B is longer. Simple hashing alone cannot do this.
+
+## Hardware-Cost-Aware Cache-Miss Placement
+
+Clusters often mix GPU types with very different hourly cost (e.g. H100 next to A10G capacity). Operators can price each backend via two optional static-config fields (`backends:` array in YAML):
+
+- `gpu_tier` — coarse informational hardware label (`"h100"`, `"a10g"`, …), surfaced in routing logs.
+- `cost_per_hour` — the operator's hourly price for the backend. `0` (the default) means *unpriced*.
+
+When a request **misses** the ART (step 2 above), the prefix must be recomputed wherever it lands — the hash choice has no cache advantage. If both the hash-selected backend and a cheaper live backend are priced, the selection is diverted to the cheapest priced candidate (`apply_hardware_cost_preference()` in `router_service.cpp`). When a request **hits** the ART, cost is ignored entirely: recomputing a warm prefix on a cold cheaper box costs more GPU-seconds than the hardware saving, so cache-warm traffic always stays on the warm backend.
+
+Three properties bound the behavior:
+
+- **Unpriced = untouched.** Backends with `cost_per_hour` unset are never preferred and never diverted from. A fleet with no priced backends routes exactly as before; a partially priced fleet only re-routes among priced backends. Equal prices never divert (the deterministic hash spread is preserved within a tier).
+- **Overload guard.** A cheaper backend is skipped when its composite load exceeds `median · load_imbalance_factor + load_imbalance_floor` — the same "overloaded" definition the median-threshold override uses — so the preference cannot pile unbounded load onto the cheapest box. Cost ties break toward lower load.
+- **The divert feeds route learning.** Unlike the transient load/cost-budget overrides (steps 3/4, excluded from learning), the hardware-cost preference replaces the miss-path selection *before* `original_selected` is captured. The learned route therefore pins the prefix to the backend that actually computed it, and follow-up requests ART-hit warm on the cheap hardware. Since `cost_per_hour` is static operator config, this is a stable placement policy rather than a flapping redirect.
+
+Observability: `router_hardware_cost_diverts_total` counts misses diverted to cheaper hardware; the per-divert debug log includes both backends' `gpu_tier` and price.
 
 ## Prefix Boundary Detection
 
@@ -368,6 +397,7 @@ Content-Type: text/event-stream
 | `router_prefix_affinity_routes` | Counter of prefix-affinity routing decisions |
 | `router_cache_hits` | ART cache hits (known prefix) |
 | `router_cache_misses` | Hash fallback (new prefix) |
+| `router_hardware_cost_diverts_total` | Cache misses diverted to a backend with lower `cost_per_hour` |
 
 ## Comparison with Legacy Routing
 

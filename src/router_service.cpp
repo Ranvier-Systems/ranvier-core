@@ -101,6 +101,16 @@ struct BackendInfo {
     HardwareLabel hardware_label = HardwareLabel::UNSPECIFIED;
     std::string   model_family;
 
+    // Hardware-tier / cost fields (operator-set; default unset). gpu_tier is
+    // a coarse informational label ("h100", "a10g") surfaced in routing logs;
+    // cost_per_hour > 0 opts the backend into the cache-miss hardware-cost
+    // preference (apply_hardware_cost_preference). 0.0 means unpriced: never
+    // preferred, never diverted from. Written via
+    // set_backend_hardware_cost_global; like the telemetry labels above,
+    // re-registration resets both to defaults.
+    std::string gpu_tier;
+    double      cost_per_hour = 0.0;
+
     BackendInfo() = default;
 
     BackendInfo(seastar::socket_address addr_, uint32_t weight_, uint32_t priority_,
@@ -189,6 +199,8 @@ struct ShardLocalState {
         uint64_t headroom_redirects = 0;            // Times cache headroom changed backend selection
         // Cache-residency-aware routing stats
         uint64_t residency_downgrades = 0;          // ART hits downgraded due to low gossiped residency
+        // Hardware-cost-aware routing stats
+        uint64_t hardware_cost_diverts = 0;         // Cache misses diverted to cheaper cost_per_hour backend
 
         void reset() {
             cache_hits = 0;
@@ -220,6 +232,7 @@ struct ShardLocalState {
             cost_released_total = 0;
             headroom_redirects = 0;
             residency_downgrades = 0;
+            hardware_cost_diverts = 0;
         }
     } stats;
 
@@ -1204,6 +1217,107 @@ static BackendId apply_load_aware_selection(
 }
 
 // ============================================================================
+// Hardware-Cost Preference (cache-miss path only)
+// ============================================================================
+// Operators running mixed GPU types price backends via the per-backend
+// cost_per_hour field; cache-miss requests then prefer cheaper hardware. A
+// miss recomputes the prefix wherever it lands, so the KV cache gives no
+// reason to keep the hash-selected backend. ART hits never reach this
+// function: recomputing a warm prefix on a cheaper cold backend costs more
+// than the hardware saving, so cache-warm requests stay put regardless of
+// cost.
+//
+// Selection contract:
+//   - Fires only between PRICED backends: both the hash-selected backend and
+//     the alternative need cost_per_hour > 0. Unpriced (0.0) backends are
+//     never preferred and never diverted from, so an unpriced fleet keeps
+//     pre-feature behavior exactly and a partially priced fleet only
+//     re-routes among priced backends.
+//   - The alternative must be strictly cheaper; equal cost keeps the hash
+//     choice (preserves deterministic spread within a tier).
+//   - Overload guard: candidates whose composite load exceeds
+//     median * load_imbalance_factor + load_imbalance_floor are skipped —
+//     the same "overloaded" definition apply_load_aware_selection uses —
+//     bounding the load imbalance the preference can create. Cost ties among
+//     eligible candidates break toward lower load.
+//
+// Unlike the Step 3/4 overrides, this runs BEFORE original_selected is
+// captured: the divert IS the miss-path selection, so the learned route pins
+// the prefix to the cheap backend and subsequent requests ART-hit warm on
+// the hardware that actually computed it. cost_per_hour is static operator
+// config, so this is a stable placement policy, not a transient divert.
+//
+// Rule #1: Lock-free — shard-local reads only.
+// Rule #4: vectors bounded by candidates.size() (≤ live backend count).
+static BackendId apply_hardware_cost_preference(
+    BackendId selected,
+    const std::vector<BackendId>& candidates,
+    const std::string& request_id)
+{
+    if (!g_shard_state || candidates.size() < 2) {
+        return selected;
+    }
+    auto& state = *g_shard_state;
+
+    auto sel_it = state.backends.find(selected);
+    if (sel_it == state.backends.end()) {
+        return selected;
+    }
+    const double selected_cost = sel_it->second.cost_per_hour;
+    if (selected_cost <= 0.0) {
+        return selected;  // Selected backend is unpriced — no comparison possible
+    }
+
+    // Composite loads, index-aligned with candidates; reused by the median
+    // computation (nth_element mutates, hence the copy) and the per-candidate
+    // guard below.
+    std::vector<uint64_t> loads;
+    loads.reserve(candidates.size());
+    for (BackendId id : candidates) {
+        loads.push_back(get_composite_backend_load(id));
+    }
+    std::vector<uint64_t> sorted_loads = loads;
+    size_t mid = sorted_loads.size() / 2;
+    std::nth_element(sorted_loads.begin(), sorted_loads.begin() + static_cast<ptrdiff_t>(mid),
+                     sorted_loads.end());
+    const uint64_t threshold = static_cast<uint64_t>(
+        static_cast<double>(sorted_loads[mid]) * state.config.load_imbalance_factor)
+        + state.config.load_imbalance_floor;
+
+    // Cheapest strictly-cheaper priced candidate under the overload guard.
+    BackendId best_id = 0;
+    const BackendInfo* best_info = nullptr;
+    double best_cost = selected_cost;
+    uint64_t best_load = std::numeric_limits<uint64_t>::max();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const BackendId id = candidates[i];
+        if (id == selected) continue;
+        auto it = state.backends.find(id);
+        if (it == state.backends.end()) continue;
+        const double cost = it->second.cost_per_hour;
+        if (cost <= 0.0 || cost >= selected_cost) continue;
+        if (loads[i] > threshold) continue;
+        if (cost < best_cost || (cost == best_cost && loads[i] < best_load)) {
+            best_id = id;
+            best_info = &it->second;
+            best_cost = cost;
+            best_load = loads[i];
+        }
+    }
+    if (best_id == 0) {
+        return selected;
+    }
+
+    state.stats.hardware_cost_diverts++;
+    log_router.debug("[{}] Hardware-cost preference: cache miss diverted from backend {} "
+                     "(gpu_tier='{}', cost={:.2f}/h) to backend {} (gpu_tier='{}', "
+                     "cost={:.2f}/h, load={})",
+                     request_id, selected, sel_it->second.gpu_tier, selected_cost,
+                     best_id, best_info->gpu_tier, best_cost, best_load);
+    return best_id;
+}
+
+// ============================================================================
 // Route Batching Helpers
 // ============================================================================
 
@@ -1806,7 +1920,17 @@ RouterService::RouterService(const RoutingConfig& routing_config, const ClusterC
         // Counter: total cost released across all backends
         seastar::metrics::make_counter("router_cost_released_total",
             [] { return g_shard_state ? g_shard_state->stats.cost_released_total : 0UL; },
-            seastar::metrics::description("Total cost budget releases made"))
+            seastar::metrics::description("Total cost budget releases made")),
+
+        // ====================================================================
+        // Hardware-Cost-Aware Routing Metrics
+        // ====================================================================
+
+        // Counter: cache misses diverted to a cheaper-priced backend
+        seastar::metrics::make_counter("router_hardware_cost_diverts_total",
+            [] { return g_shard_state ? g_shard_state->stats.hardware_cost_diverts : 0UL; },
+            seastar::metrics::description("Total cache-miss requests diverted to a live backend "
+                                         "with lower operator-set cost_per_hour"))
 
         // Note: radix_tree_average_prefix_skip_length gauge is registered in MetricsService
         // since it aggregates path compression data across all lookups via record_prefix_skip()
@@ -2595,6 +2719,13 @@ PrefixRouteResult RouterService::get_backend_for_prefix(const std::vector<int32_
                 }
             }
         }
+
+        // Hardware-cost preference: a miss recomputes the prefix wherever it
+        // lands, so prefer cheaper priced hardware (contract on the helper).
+        // Mutates `selected` — not final_backend — BEFORE original_selected
+        // is captured: the divert is the placement decision the route-learning
+        // policy should pin, unlike the transient Step 3/4 overrides.
+        selected = apply_hardware_cost_preference(selected, *candidates, request_id);
 
         // This is a cache miss — the route will be learned after successful response
         state.stats.cache_misses++;
@@ -4026,6 +4157,38 @@ seastar::future<> RouterService::set_backend_labels_global(
         });
 }
 
+// Broadcast hardware-tier / cost fields to every shard. Mirrors
+// set_backend_labels_global's shape: foreign_ptr for the cross-shard hop,
+// local reallocation on each target shard (Rule #14). No-op silently when
+// the backend isn't registered on a shard; register_backend_global resets
+// both fields, so callers broadcast this after registration resolves.
+seastar::future<> RouterService::set_backend_hardware_cost_global(
+    BackendId id, std::string gpu_tier, double cost_per_hour) {
+
+    return seastar::do_with(std::move(gpu_tier),
+        [id, cost_per_hour](std::string& shared_tier) {
+            return seastar::parallel_for_each(boost::irange(0u, seastar::smp::count),
+                [id, cost_per_hour, &shared_tier](unsigned shard_id) {
+                    auto clone = std::make_unique<std::string>(shared_tier);
+                    auto foreign = seastar::make_foreign(std::move(clone));
+                    return seastar::smp::submit_to(shard_id,
+                        [id, cost_per_hour, foreign = std::move(foreign)]() mutable {
+                            if (!g_shard_state) return seastar::make_ready_future<>();
+                            auto& state = shard_state();
+                            auto it = state.backends.find(id);
+                            if (it == state.backends.end()) {
+                                return seastar::make_ready_future<>();
+                            }
+                            it->second.cost_per_hour = cost_per_hour;
+                            // Rule #14: reallocate locally so the map entry's
+                            // heap lives on this shard.
+                            it->second.gpu_tier = std::string(foreign->data(), foreign->size());
+                            return seastar::make_ready_future<>();
+                        });
+                });
+        });
+}
+
 RouterService::BackendTelemetryLabels
 RouterService::telemetry_labels(BackendId id) const {
     BackendTelemetryLabels out;
@@ -4649,6 +4812,15 @@ void RouterService::set_cache_headroom_for_testing(BackendId id, double pressure
 void RouterService::set_residency_for_testing(BackendId id, double residency) {
     if (!g_shard_state) return;
     g_shard_state->apply_residency(id, residency);
+}
+
+void RouterService::set_backend_hardware_cost_for_testing(BackendId id, std::string gpu_tier,
+                                                           double cost_per_hour) {
+    if (!g_shard_state) return;
+    auto it = g_shard_state->backends.find(id);
+    if (it == g_shard_state->backends.end()) return;
+    it->second.gpu_tier = std::move(gpu_tier);
+    it->second.cost_per_hour = cost_per_hour;
 }
 
 } // namespace ranvier

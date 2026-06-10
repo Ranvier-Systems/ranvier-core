@@ -607,6 +607,20 @@ attribution:
 # The engine-class bucket dimension (`backend_type`) is taken from each
 # backend's `type:` field above — no separate label needed.
 #
+# Optional hardware-tier / cost-aware routing fields (both default unset):
+#   `gpu_tier` — coarse informational label for the backend's hardware
+#     (e.g. "h100", "a10g", "l4"). Free-form; surfaced in routing logs.
+#   `cost_per_hour` — operator's hourly price for the backend (any currency
+#     unit, applied consistently across the fleet). When two or more live
+#     backends carry cost_per_hour > 0, cache-MISS traffic prefers the
+#     cheapest priced one (bounded by an overload guard that reuses
+#     load_imbalance_factor / load_imbalance_floor). Cache-HIT traffic
+#     always stays on the cache-warm backend regardless of cost —
+#     recomputing a warm prefix on cheaper hardware costs more than the
+#     hardware saving. Unpriced backends (0, the default) are never
+#     preferred and never diverted from, so pricing only part of the
+#     fleet only re-routes among the priced backends.
+#
 # backends:
 #   - id: 101
 #     host: api.cerebras.ai
@@ -623,9 +637,18 @@ attribution:
 #     compression_ratio: 6.0
 #     hardware_label: gpu_large
 #     model_family: llama3
+#     gpu_tier: h100
+#     cost_per_hour: 4.50
 #
 #   - id: 103
 #     host: api.openai.com
 #     port: 443
 #     type: openai_compatible
 #     api_key_env: OPENAI_API_KEY
+#
+#   - id: 104
+#     host: 10.0.0.43
+#     port: 8080
+#     type: vllm
+#     gpu_tier: a10g
+#     cost_per_hour: 1.20
