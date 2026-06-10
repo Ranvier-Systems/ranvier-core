@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 
 using namespace ranvier;
 
@@ -2520,6 +2521,32 @@ backends:
     EXPECT_EQ(e.priority, 0u);
     EXPECT_DOUBLE_EQ(e.compression_ratio, 1.0);
     EXPECT_TRUE(e.api_key_env.empty());
+    EXPECT_TRUE(e.gpu_tier.empty());            // unset: no tier label
+    EXPECT_DOUBLE_EQ(e.cost_per_hour, 0.0);     // unset: no cost preference
+}
+
+TEST_F(ConfigTest, StaticBackendsParseHardwareCostFields) {
+    const std::string yaml = R"(
+backends:
+  - id: 7
+    host: 10.0.0.7
+    port: 8080
+    type: vllm
+    gpu_tier: h100
+    cost_per_hour: 4.5
+  - id: 8
+    host: 10.0.0.8
+    port: 8080
+    type: vllm
+    gpu_tier: a10g
+    cost_per_hour: 1.2
+)";
+    auto config = RanvierConfig::load_from_string(yaml);
+    ASSERT_EQ(config.backends.entries.size(), 2u);
+    EXPECT_EQ(config.backends.entries[0].gpu_tier, "h100");
+    EXPECT_DOUBLE_EQ(config.backends.entries[0].cost_per_hour, 4.5);
+    EXPECT_EQ(config.backends.entries[1].gpu_tier, "a10g");
+    EXPECT_DOUBLE_EQ(config.backends.entries[1].cost_per_hour, 1.2);
 }
 
 TEST_F(ConfigTest, StaticBackendsParseMultipleEntries) {
@@ -2637,6 +2664,36 @@ TEST_F(ConfigTest, ValidateRejectsStaticBackendCompressionBelowOne) {
     auto error = RanvierConfig::validate(config);
     ASSERT_TRUE(error.has_value());
     EXPECT_NE(error->find("compression_ratio"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendNegativeCostPerHour) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1"; sb.cost_per_hour = -1.0;
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("cost_per_hour"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateRejectsStaticBackendNonFiniteCostPerHour) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1";
+    sb.cost_per_hour = std::numeric_limits<double>::quiet_NaN();
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    ASSERT_TRUE(error.has_value());
+    EXPECT_NE(error->find("cost_per_hour"), std::string::npos);
+}
+
+TEST_F(ConfigTest, ValidateAcceptsStaticBackendUnsetCostPerHour) {
+    RanvierConfig config;
+    StaticBackendConfig sb;
+    sb.id = 1; sb.host = "10.0.0.1";  // cost_per_hour stays 0.0 (unset)
+    config.backends.entries.push_back(sb);
+    auto error = RanvierConfig::validate(config);
+    EXPECT_FALSE(error.has_value()) << "Unexpected error: " << error.value_or("");
 }
 
 int main(int argc, char** argv) {

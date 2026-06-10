@@ -275,6 +275,250 @@ TEST_F(RouterServiceTest, LowResidencySingleBackendKeepsRoute) {
 }
 
 // =============================================================================
+// 1c. Hardware-Cost-Aware Cache-Miss Routing
+// =============================================================================
+// Operators price backends via cost_per_hour. Cache-MISS requests prefer the
+// cheapest priced live backend — the prefix must be recomputed anyway, so the
+// hash choice has no cache advantage. Cache HITS stay on the warm backend
+// regardless of cost. Unpriced backends (cost_per_hour == 0, the default) are
+// never preferred and never diverted from.
+
+TEST_F(RouterServiceTest, CacheMissPrefersCheaperBackend) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {71, 72, 73, 74};
+
+    // Establish the deterministic hash choice with no costs set.
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    EXPECT_FALSE(baseline.cache_hit);
+    BackendId hash_choice = baseline.backend_id.value();
+    BackendId other = (hash_choice == 1) ? 2 : 1;
+
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(other, "a10g", 1.20);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), other);
+    // The divert IS the miss-path selection, not a transient redirect:
+    // original_selected must follow it so route learning pins the prefix to
+    // the backend that actually computes it.
+    EXPECT_EQ(result.original_selected, other);
+}
+
+TEST_F(RouterServiceTest, CacheMissKeepsHashChoiceWhenAlreadyCheapest) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {75, 76, 77, 78};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    BackendId other = (hash_choice == 1) ? 2 : 1;
+
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "a10g", 1.20);
+    RouterService::set_backend_hardware_cost_for_testing(other, "h100", 4.50);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+}
+
+TEST_F(RouterServiceTest, CacheHitStaysOnWarmBackendRegardlessOfCost) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {81, 82, 83, 84};
+    // Backend 1 is the expensive tier; backend 2 is far cheaper.
+    RouterService::set_backend_hardware_cost_for_testing(1, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(2, "a10g", 1.20);
+    // The prefix is warm on the EXPENSIVE backend.
+    RouterService::insert_route_for_testing(tokens, 1);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // Recompute cost dominates the hardware saving: the warm backend wins.
+    EXPECT_TRUE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 1);
+}
+
+TEST_F(RouterServiceTest, UnpricedSelectedBackendIsNeverDiverted) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {85, 86, 87, 88};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    BackendId other = (hash_choice == 1) ? 2 : 1;
+
+    // Only the alternative is priced. The hash choice has unknown cost, so
+    // there is nothing to compare — selection must be unchanged.
+    RouterService::set_backend_hardware_cost_for_testing(other, "a10g", 1.20);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+    EXPECT_EQ(result.original_selected, hash_choice);
+}
+
+TEST_F(RouterServiceTest, UnpricedAlternativeIsNeverPreferred) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {91, 92, 93, 94};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+
+    // Only the hash choice is priced; the alternative's cost is unknown and
+    // must not be treated as "cheaper than 4.50".
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+}
+
+TEST_F(RouterServiceTest, EqualCostKeepsHashChoice) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {95, 96, 97, 98};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+
+    // Same tier, same price: the deterministic hash spread must be preserved.
+    RouterService::set_backend_hardware_cost_for_testing(1, "a10g", 2.00);
+    RouterService::set_backend_hardware_cost_for_testing(2, "a10g", 2.00);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+}
+
+TEST_F(RouterServiceTest, CostDivertSkipsOverloadedCheapBackend) {
+    register_three_backends();
+    std::vector<int32_t> tokens = {101, 102, 103, 104};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    std::vector<BackendId> others;
+    for (BackendId id : {1, 2, 3}) {
+        if (id != hash_choice) others.push_back(id);
+    }
+
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(others[0], "a10g", 1.00);
+    // others[1] stays unpriced — not an eligible divert target.
+
+    // Overload the cheap backend past median * factor + floor (= 0*2 + 2):
+    // five in-flight requests make it a load outlier the guard must skip.
+    std::vector<BackendRequestGuard> guards;
+    guards.reserve(5);
+    for (int i = 0; i < 5; ++i) {
+        guards.emplace_back(others[0]);
+    }
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+
+    // Once the in-flight requests drain, the cheap backend is eligible again.
+    guards.clear();
+    auto after_drain = router_->route_request(tokens);
+    ASSERT_TRUE(after_drain.backend_id.has_value());
+    EXPECT_EQ(after_drain.backend_id.value(), others[0]);
+}
+
+TEST_F(RouterServiceTest, CostDivertFallsBackToNextCheapestUnderLoad) {
+    register_three_backends();
+    std::vector<int32_t> tokens = {105, 106, 107, 108};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    std::vector<BackendId> others;
+    for (BackendId id : {1, 2, 3}) {
+        if (id != hash_choice) others.push_back(id);
+    }
+
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(others[0], "a10g", 1.00);
+    RouterService::set_backend_hardware_cost_for_testing(others[1], "l4", 2.00);
+
+    // Cheapest is overloaded; the mid-priced idle backend must win instead.
+    std::vector<BackendRequestGuard> guards;
+    guards.reserve(5);
+    for (int i = 0; i < 5; ++i) {
+        guards.emplace_back(others[0]);
+    }
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), others[1]);
+}
+
+TEST_F(RouterServiceTest, EqualCostDivertTieBreaksTowardLowerLoad) {
+    register_three_backends();
+    std::vector<int32_t> tokens = {111, 112, 113, 114};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    std::vector<BackendId> others;
+    for (BackendId id : {1, 2, 3}) {
+        if (id != hash_choice) others.push_back(id);
+    }
+
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(others[0], "a10g", 1.00);
+    RouterService::set_backend_hardware_cost_for_testing(others[1], "a10g", 1.00);
+
+    // One in-flight request on others[0] (still under the overload threshold
+    // of 2): the equally-priced idle backend must win the tie.
+    BackendRequestGuard guard(others[0]);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_EQ(result.backend_id.value(), others[1]);
+}
+
+TEST_F(RouterServiceTest, CostDivertNeverTargetsDrainingBackend) {
+    register_two_backends();
+    std::vector<int32_t> tokens = {115, 116, 117, 118};
+
+    auto baseline = router_->route_request(tokens);
+    ASSERT_TRUE(baseline.backend_id.has_value());
+    BackendId hash_choice = baseline.backend_id.value();
+    BackendId other = (hash_choice == 1) ? 2 : 1;
+
+    RouterService::set_backend_hardware_cost_for_testing(hash_choice, "h100", 4.50);
+    RouterService::set_backend_hardware_cost_for_testing(other, "a10g", 0.50);
+    RouterService::set_backend_draining_for_testing(other);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    // The cheap backend is draining (not live) — no divert target exists.
+    EXPECT_EQ(result.backend_id.value(), hash_choice);
+}
+
+TEST_F(RouterServiceTest, ResidencyDowngradedMissPrefersCheapestEligible) {
+    register_three_backends();
+    std::vector<int32_t> tokens = {121, 122, 123, 124};
+    RouterService::insert_route_for_testing(tokens, 1);
+    // Backend 1 is the CHEAPEST but cache-cold: the residency downgrade
+    // excludes it from the fallback candidates, so the cost preference must
+    // pick the cheapest of the REMAINING backends, never the excluded one.
+    RouterService::set_residency_for_testing(1, 0.01);
+    RouterService::set_backend_hardware_cost_for_testing(1, "a10g", 0.50);
+    RouterService::set_backend_hardware_cost_for_testing(2, "h100", 3.00);
+    RouterService::set_backend_hardware_cost_for_testing(3, "l4", 1.00);
+
+    auto result = router_->route_request(tokens);
+    ASSERT_TRUE(result.backend_id.has_value());
+    EXPECT_FALSE(result.cache_hit);
+    EXPECT_EQ(result.backend_id.value(), 3);
+}
+
+// =============================================================================
 // 2. Route TTL Expiration and Cleanup
 // =============================================================================
 // TTL cleanup requires the Seastar reactor (run_ttl_cleanup uses smp::submit_to).
