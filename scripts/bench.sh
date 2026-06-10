@@ -242,11 +242,23 @@ BENCHMARK OPTIONS:
                         this is applied to EACH benchmark, doubling total runtime.
     --users N           Concurrent users (default: 10)
     --spawn-rate N      Users spawned per second (default: 2)
-    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress (default: stress)
+    --prompt-dist DIST  Prompt distribution: short|medium|long|mixed|stress|churn (default: stress)
+                        "churn" rotates the active prefix working set over a large
+                        universe so backends genuinely evict prefixes (for cache-
+                        pressure / residency benchmarks). Knobs (env vars, defaults
+                        in parens): CHURN_PREFIX_UNIVERSE (200), CHURN_ACTIVE_PREFIXES
+                        (24), CHURN_ROTATION_SECONDS (20), CHURN_ROTATION_STEP (8),
+                        CHURN_SEED (42).
     --prompt-file FILE  Path to JSONL prompt file (ShareGPT/OpenAI format)
                         See tests/integration/data/prompts/ for examples
     --prefix-ratio R    Shared prefix ratio 0.0-1.0 (default: 0.9)
     --prefix-max-tokens N  Maximum prefix size in tokens (default: 8000)
+    --cache-residency-threshold F
+                        Cache-residency downgrade threshold (#527). ART hits whose
+                        backend reports residency < F are diverted. 0.0 disables
+                        residency routing entirely; server default is 0.2. This is
+                        the toggle for residency on/off A/B benchmarks (see
+                        scripts/bench-residency-ab.sh).
     --compare           Run A/B comparison (prefix vs round-robin). Restarts Ranvier
                         with the correct routing mode for each run and resets Prometheus
                         histograms. Total runtime is ~2x duration + ~90s (restarts).
@@ -455,6 +467,7 @@ MULTI_DEPTH=false
 LOAD_AWARE=true
 LOAD_IMBALANCE_FACTOR=""
 LOAD_IMBALANCE_FLOOR=""
+CACHE_RESIDENCY_THRESHOLD=""
 COMPRESSION_RATIO=""
 PRIORITY_QUEUE=false
 PROMPT_FILE=""
@@ -494,6 +507,7 @@ while [[ $# -gt 0 ]]; do
         --compression-ratio) COMPRESSION_RATIO="$2"; shift 2 ;;
         --load-imbalance-factor) LOAD_IMBALANCE_FACTOR="$2"; shift 2 ;;
         --load-imbalance-floor)  LOAD_IMBALANCE_FLOOR="$2"; shift 2 ;;
+        --cache-residency-threshold) CACHE_RESIDENCY_THRESHOLD="$2"; shift 2 ;;
         --max-model-len)  MAX_MODEL_LEN="$2"; shift 2 ;;
         --tp)             TP_SIZE="$2"; shift 2 ;;
         --gpu-mem-util)   GPU_MEM_UTIL="$2"; shift 2 ;;
@@ -1050,6 +1064,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Load-Aware:      $LOAD_AWARE"
     [[ -n "$LOAD_IMBALANCE_FACTOR" ]] && echo "  Imbalance Factor: $LOAD_IMBALANCE_FACTOR"
     [[ -n "$LOAD_IMBALANCE_FLOOR" ]] && echo "  Imbalance Floor:  $LOAD_IMBALANCE_FLOOR"
+    [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]] && echo "  Residency Thresh: $CACHE_RESIDENCY_THRESHOLD"
     echo "  Max Tokens:      $MAX_TOKENS"
     echo "  Stop Timeout:    ${STOP_TIMEOUT}s"
     echo "  vLLM Version:    $VLLM_VERSION"
@@ -1341,12 +1356,12 @@ elif ! docker image inspect ranvier:latest &> /dev/null; then
     fi
 fi
 
-# Build locust image if needed
-if ! docker image inspect ranvier-locust:latest &> /dev/null; then
-    log_info "Building Locust image..."
-    docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1
-    log_ok "Locust image built"
-fi
+# Build locust image unconditionally: the locustfiles are baked into the image
+# (Dockerfile.locust COPY), so reusing a stale image silently runs an outdated
+# workload. With layer caching this is a no-op when nothing changed.
+log_info "Building Locust image..."
+docker build -t ranvier-locust:latest -f tests/integration/Dockerfile.locust tests/integration/ > /dev/null 2>&1
+log_ok "Locust image ready"
 
 # Export multi-depth routing setting for docker-compose
 if [[ "$MULTI_DEPTH" = true ]]; then
@@ -1369,6 +1384,13 @@ if [[ -n "$LOAD_IMBALANCE_FLOOR" ]]; then
     export RANVIER_LOAD_IMBALANCE_FLOOR="$LOAD_IMBALANCE_FLOOR"
     log_info "Load imbalance floor: $LOAD_IMBALANCE_FLOOR"
 fi
+# Residency routing toggle (#527). The flag takes precedence over a bare
+# RANVIER_CACHE_RESIDENCY_THRESHOLD=... env prefix; both reach the servers now
+# that docker-compose.benchmark-real.yml passes the variable through.
+if [[ -n "$CACHE_RESIDENCY_THRESHOLD" ]]; then
+    export RANVIER_CACHE_RESIDENCY_THRESHOLD="$CACHE_RESIDENCY_THRESHOLD"
+    log_info "Cache-residency threshold: $CACHE_RESIDENCY_THRESHOLD"
+fi
 
 # Effective routing config the server is about to launch with. Printed at
 # second 0 so a misconfigured load-aware experiment is caught immediately
@@ -1382,9 +1404,9 @@ log_info "RANVIER_LOAD_AWARE_ROUTING    = ${RANVIER_LOAD_AWARE_ROUTING}"
 log_info "RANVIER_LOAD_IMBALANCE_FACTOR = ${RANVIER_LOAD_IMBALANCE_FACTOR:-2.0 (compose default)}"
 log_info "RANVIER_LOAD_IMBALANCE_FLOOR  = ${RANVIER_LOAD_IMBALANCE_FLOOR:-2 (compose default)}"
 # Residency routing (#527) is a SECOND diversion mechanism, on by default
-# (threshold 0.2). It is NOT controlled by --no-load-aware — only by this env
-# var (0.0 disables). Surfaced here because a silently-on residency threshold
-# confounds any load-aware A/B.
+# (threshold 0.2). It is NOT controlled by --no-load-aware — only by
+# --cache-residency-threshold (or the env var; 0.0 disables). Surfaced here
+# because a silently-on residency threshold confounds any load-aware A/B.
 log_info "RANVIER_CACHE_RESIDENCY_THRESHOLD = ${RANVIER_CACHE_RESIDENCY_THRESHOLD:-0.2 (compose default — residency routing ON)}"
 if [[ "$LOAD_AWARE" = true ]]; then
     log_warn "Load-aware routing is ON. For a no-diversion A/B, pass --no-load-aware AND set RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0."
@@ -1399,6 +1421,9 @@ fi
 log_info "NUM_LARGE_PREFIXES            = ${NUM_LARGE_PREFIXES:-50 (bench default)}  [workload, not routing]"
 if [[ "${NUM_LARGE_PREFIXES:-50}" -le "${NUM_BACKENDS:-0}" ]] 2>/dev/null; then
     log_warn "NUM_LARGE_PREFIXES (${NUM_LARGE_PREFIXES:-50}) <= backends (${NUM_BACKENDS:-?}): pure affinity cannot use all backends (pigeonhole concentration; intentional only for a stress test)."
+fi
+if [[ "$PROMPT_DIST" == "churn" ]]; then
+    log_info "CHURN workload                = universe=${CHURN_PREFIX_UNIVERSE:-200} active=${CHURN_ACTIVE_PREFIXES:-24} step=${CHURN_ROTATION_STEP:-8}/${CHURN_ROTATION_SECONDS:-20}s seed=${CHURN_SEED:-42}  [workload, not routing]"
 fi
 
 # Export compression ratio for docker-compose
@@ -1625,6 +1650,10 @@ run_benchmark() {
     # Pass NUM_LARGE_PREFIXES=5 explicitly only to stress prefix concentration.
     NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
 
+    # Forward churn-workload knobs (read by locustfile_real.py; only meaningful
+    # with --prompt-dist churn). Defaults mirror the locustfile's.
+    CHURN_ARGS="-e CHURN_PREFIX_UNIVERSE=${CHURN_PREFIX_UNIVERSE:-200} -e CHURN_ACTIVE_PREFIXES=${CHURN_ACTIVE_PREFIXES:-24} -e CHURN_ROTATION_SECONDS=${CHURN_ROTATION_SECONDS:-20} -e CHURN_ROTATION_STEP=${CHURN_ROTATION_STEP:-8} -e CHURN_SEED=${CHURN_SEED:-42}"
+
     # Run locust via docker compose
     # Mount report dir as volume so files persist after container exits
     LOCUST_RUN_TIME_SECS=$(parse_duration "$DURATION")
@@ -1674,6 +1703,7 @@ run_benchmark() {
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
         $NUM_PREFIXES_ARGS \
+        $CHURN_ARGS \
         locust \
         --headless \
         --users "$USERS" \
@@ -1787,6 +1817,10 @@ if [[ "$WARMUP" = true ]]; then
     # (default 50, see the main run block for rationale).
     NUM_PREFIXES_ARGS="-e NUM_LARGE_PREFIXES=${NUM_LARGE_PREFIXES:-50}"
 
+    # Match the main run's churn knobs so warm-up exercises the same universe
+    # (CHURN_SEED makes the prefix content identical).
+    CHURN_ARGS="-e CHURN_PREFIX_UNIVERSE=${CHURN_PREFIX_UNIVERSE:-200} -e CHURN_ACTIVE_PREFIXES=${CHURN_ACTIVE_PREFIXES:-24} -e CHURN_ROTATION_SECONDS=${CHURN_ROTATION_SECONDS:-20} -e CHURN_ROTATION_STEP=${CHURN_ROTATION_STEP:-8} -e CHURN_SEED=${CHURN_SEED:-42}"
+
     # Run warm-up benchmark
     $DOCKER_COMPOSE -f docker-compose.benchmark-real.yml -p ranvier-benchmark-real \
         --profile benchmark run --rm \
@@ -1804,6 +1838,7 @@ if [[ "$WARMUP" = true ]]; then
         $PROMPT_FILE_ARGS \
         $PREFIX_MAX_ARGS \
         $NUM_PREFIXES_ARGS \
+        $CHURN_ARGS \
         locust \
         --headless \
         --users "$USERS" \

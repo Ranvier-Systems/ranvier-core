@@ -127,3 +127,14 @@ disables downgrades entirely (pre-feature behavior).
 
 Residency is transient and never persisted — it is a live, seconds-fresh signal
 with its own staleness TTL.
+
+## Benchmarking
+
+The before/after methodology (residency on vs off under real cache pressure),
+the `churn` load-test workload that makes eviction actually happen, and the
+orchestration script live in
+[docs/benchmarks/cache-residency-ab-benchmark.md](../benchmarks/cache-residency-ab-benchmark.md)
+/ `scripts/bench-residency-ab.sh`. The A/B toggle is
+`--cache-residency-threshold` (0.0 = off). A run is only meaningful when
+`ranvier_router_residency_route_downgrades_total > 0` — the wrapper's probe
+step gates on that.

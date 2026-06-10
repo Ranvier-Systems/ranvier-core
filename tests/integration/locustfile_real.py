@@ -591,6 +591,36 @@ LARGE_PREFIX_MIN_TOKENS = int(os.environ.get("LARGE_PREFIX_MIN_TOKENS", "2000"))
 LARGE_PREFIX_MAX_TOKENS = int(os.environ.get("LARGE_PREFIX_MAX_TOKENS", "8000"))
 NUM_LARGE_PREFIXES = int(os.environ.get("NUM_LARGE_PREFIXES", "5"))
 
+# Cache-churn workload configuration (PROMPT_DISTRIBUTION=churn)
+#
+# Unlike "stress" (a STATIC prefix pool that stays permanently hot, so backends
+# rarely evict the working set), "churn" rotates a sliding window of active
+# prefixes over a much larger universe. At any instant only
+# CHURN_ACTIVE_PREFIXES of CHURN_PREFIX_UNIVERSE prefixes receive traffic; the
+# window advances by CHURN_ROTATION_STEP prefixes every CHURN_ROTATION_SECONDS.
+#
+#   hot duration      = (ACTIVE / STEP) * ROTATION_SECONDS      (default 60s)
+#   dormant duration  = ((UNIVERSE - ACTIVE) / STEP) * ROTATION (default 440s)
+#   full cycle        = (UNIVERSE / STEP) * ROTATION            (default 500s)
+#
+# A prefix that returns from dormancy has likely been EVICTED from the
+# backend's KV cache (under a deliberately small --gpu-mem-util), while the
+# router's ART still remembers the route (route TTL 1h >> dormancy). That
+# stale-route re-use is the exact case cache-residency routing (#527) exists
+# to handle, so this is the workload for residency A/B benchmarks.
+#
+# All users derive the window position from the wall clock, so every user (and
+# every locust worker) sees the same active set without coordination. Prefix
+# CONTENT is generated from CHURN_SEED, so the ON and OFF legs of an A/B see a
+# byte-identical prompt universe.
+# Clamped to sane minimums: step/seconds of 0 would freeze the window (or
+# divide by zero); these are workload knobs, not validated server config.
+CHURN_PREFIX_UNIVERSE = max(1, int(os.environ.get("CHURN_PREFIX_UNIVERSE", "200")))
+CHURN_ACTIVE_PREFIXES = max(1, int(os.environ.get("CHURN_ACTIVE_PREFIXES", "24")))
+CHURN_ROTATION_SECONDS = max(1.0, float(os.environ.get("CHURN_ROTATION_SECONDS", "20")))
+CHURN_ROTATION_STEP = max(1, int(os.environ.get("CHURN_ROTATION_STEP", "8")))
+CHURN_SEED = int(os.environ.get("CHURN_SEED", "42"))
+
 # Prefix size buckets for metrics (in tokens)
 PREFIX_SIZE_BUCKETS = [
     ("tiny", 0, 100),
@@ -2321,7 +2351,8 @@ def estimate_tokens(text: str) -> int:
 def generate_large_prefix(
     target_tokens: int,
     prefix_type: str = "mixed",
-    prefix_id: int = 0
+    prefix_id: int = 0,
+    rng=random,
 ) -> str:
     """Generate a large prefix of approximately target_tokens size.
 
@@ -2329,6 +2360,9 @@ def generate_large_prefix(
         target_tokens: Target number of tokens (2000-8000)
         prefix_type: Type of prefix content: "rag", "fewshot", "system", "mixed"
         prefix_id: Unique identifier for this prefix (for variation)
+        rng: Random source. Pass a seeded random.Random for deterministic
+             content (the churn workload does this so A/B legs see identical
+             prompt bytes); defaults to the global random module.
 
     Returns:
         Large prefix text of approximately target_tokens
@@ -2339,7 +2373,7 @@ def generate_large_prefix(
     if prefix_type == "rag" or prefix_type == "mixed":
         # Add RAG document chunks
         chunks = RAG_DOCUMENT_CHUNKS.copy()
-        random.shuffle(chunks)
+        rng.shuffle(chunks)
 
         for chunk in chunks:
             if current_tokens >= target_tokens:
@@ -2417,6 +2451,67 @@ def get_prefix_size_bucket(token_count: int) -> str:
         if min_tokens <= token_count < max_tokens:
             return bucket_name
     return "xlarge"
+
+
+# ============================================================================
+# Churn Prefix Universe (for PROMPT_DISTRIBUTION=churn)
+# ============================================================================
+
+# Pre-generated churn prefix universe: (prefix_text, estimated_tokens).
+# Built once at test start; indexed by prefix id 0..CHURN_PREFIX_UNIVERSE-1.
+_churn_prefixes: List[Tuple[str, int]] = []
+
+
+def initialize_churn_universe():
+    """Build the deterministic churn prefix universe.
+
+    Each prefix gets its own random.Random seeded from CHURN_SEED + its id, so
+    both size and content are reproducible across runs and across A/B legs.
+    The unique "[Context ID: N]" header generate_large_prefix() prepends sits
+    at token position 0, which makes every prefix a distinct ART key AND a
+    distinct vLLM prefix-cache entry (positional block hashing) even where
+    bodies share chunks.
+    """
+    global _churn_prefixes
+
+    if _churn_prefixes:
+        return
+
+    logger.info(
+        f"Generating churn prefix universe: {CHURN_PREFIX_UNIVERSE} prefixes "
+        f"({LARGE_PREFIX_MIN_TOKENS}-{LARGE_PREFIX_MAX_TOKENS} tokens, seed={CHURN_SEED})..."
+    )
+
+    # Build into a local list and assign atomically: under gevent another
+    # greenlet may run while we log, and must never observe a partial universe.
+    universe: List[Tuple[str, int]] = []
+    prefix_types = ["rag", "fewshot", "system", "mixed"]
+    for i in range(CHURN_PREFIX_UNIVERSE):
+        rng = random.Random(CHURN_SEED * 1_000_003 + i)
+        target_tokens = rng.randint(LARGE_PREFIX_MIN_TOKENS, LARGE_PREFIX_MAX_TOKENS)
+        text = generate_large_prefix(target_tokens, prefix_types[i % len(prefix_types)], i, rng=rng)
+        universe.append((text, estimate_tokens(text)))
+    _churn_prefixes = universe
+
+    total_tokens = sum(t for _, t in _churn_prefixes)
+    logger.info(
+        f"Churn universe ready: {len(_churn_prefixes)} prefixes, "
+        f"~{total_tokens} total tokens "
+        f"(avg ~{total_tokens // max(1, len(_churn_prefixes))} tokens/prefix)"
+    )
+
+
+def churn_window_indices(now: float) -> List[int]:
+    """Active prefix ids at wall-clock time `now`.
+
+    The window start is a pure function of absolute time, so all users and all
+    locust workers agree on the active set without shared state. The window
+    wraps modulo the universe; a wrapped-around prefix is a RETURN from
+    dormancy — its ART route still exists but its KV blocks likely don't.
+    """
+    step_index = int(now // CHURN_ROTATION_SECONDS)
+    start = (step_index * CHURN_ROTATION_STEP) % CHURN_PREFIX_UNIVERSE
+    return [(start + k) % CHURN_PREFIX_UNIVERSE for k in range(CHURN_ACTIVE_PREFIXES)]
 
 # ============================================================================
 # Metrics Collection
@@ -3247,6 +3342,10 @@ def generate_prompt() -> Tuple[List[dict], str, int]:
     elif distribution == "stress":
         # Stress mode with mixed sizes biased toward large prefixes
         return _generate_stress_prompt()
+    elif distribution == "churn":
+        # Rotating working set over a large prefix universe (cache pressure
+        # with real evictions; for residency A/B benchmarks)
+        return _generate_churn_prompt()
     else:  # mixed
         # If PROMPT_FILE is set, mix file prompts with generated ones
         if PROMPT_FILE and _file_prompts:
@@ -3400,6 +3499,70 @@ def _generate_stress_prompt() -> Tuple[List[dict], str, int]:
         return _generate_large_prefix_prompt()
 
 
+# User queries appended to a churn prefix. Varying the suffix keeps requests
+# realistic (same prefix, different question) without touching the routed
+# prefix tokens.
+_CHURN_USER_QUERIES = [
+    "Based on the context above, summarize the key points.",
+    "What are the main technical requirements described?",
+    "Identify any potential issues or risks mentioned.",
+    "How would you improve the implementation described?",
+    "What are the dependencies between components?",
+    "Provide a step-by-step implementation plan.",
+    "What testing strategy would you recommend?",
+    "How would you scale this architecture?",
+]
+
+
+def _generate_churn_filler() -> Tuple[List[dict], str, int]:
+    """One-shot unique prompt that is never repeated.
+
+    The unique header at position 0 guarantees no prefix sharing, so these
+    requests always pay full prefill — background pressure that ages out
+    dormant prefixes' KV blocks faster, plus realistic non-prefix traffic mix.
+    """
+    unique_id = random.randint(0, 999_999_999)
+    chunk = random.choice(RAG_DOCUMENT_CHUNKS)
+    target_chars = int(random.randint(600, 1200) * 3.5)
+    body = (chunk * 3)[:target_chars]
+    content = (
+        f"[One-shot session {unique_id}]\n\n{body}\n\n"
+        "Summarize the above for a new team member."
+    )
+    messages = [{"role": "user", "content": content}]
+    return messages, hash_prompt_prefix(messages), estimate_tokens(content)
+
+
+def _generate_churn_prompt() -> Tuple[List[dict], str, int]:
+    """Generate a prompt from the rotating churn working set.
+
+    SHARED_PREFIX_RATIO of requests use a prefix from the currently-active
+    window; the rest are unique one-shot fillers. See the CHURN_* knobs for
+    the rotation math.
+
+    Returns:
+        Tuple of (messages, prefix_hash, estimated_token_count)
+    """
+    initialize_churn_universe()
+
+    if not _churn_prefixes:
+        # Generation failed — degrade to the static large-prefix pool
+        logger.warning("Churn universe empty, falling back to large-prefix mode")
+        return _generate_large_prefix_prompt()
+
+    if random.random() >= SHARED_PREFIX_RATIO:
+        return _generate_churn_filler()
+
+    idx = random.choice(churn_window_indices(time.time()))
+    prefix_text, token_count = _churn_prefixes[idx]
+
+    messages = [
+        {"role": "system", "content": prefix_text},
+        {"role": "user", "content": random.choice(_CHURN_USER_QUERIES)},
+    ]
+    return messages, hash_prompt_prefix(messages), token_count
+
+
 # ============================================================================
 # Event Handlers
 # ============================================================================
@@ -3434,6 +3597,7 @@ def on_test_start(environment, **kwargs):
         "mixed": "30% short, 50% medium, 20% long -> 'tiny' and 'small' buckets only",
         "large_prefix": "100% large prefixes -> 'large' and 'xlarge' buckets (2000-8000 tokens)",
         "stress": "10% small, 20% medium, 30% large, 40% xlarge -> biased toward large prefixes",
+        "churn": "rotating working set over a large prefix universe -> real KV-cache evictions + stale-route returns",
     }
     if dist in dist_explanations:
         logger.info(f"Distribution '{dist}': {dist_explanations[dist]}")
@@ -3444,6 +3608,23 @@ def on_test_start(environment, **kwargs):
         logger.info(f"  Min Tokens: {LARGE_PREFIX_MIN_TOKENS}")
         logger.info(f"  Max Tokens: {LARGE_PREFIX_MAX_TOKENS}")
         logger.info(f"  Num Prefixes: {NUM_LARGE_PREFIXES}")
+
+    # Log churn configuration (the rotation math determines hot/dormant periods)
+    if dist == "churn":
+        hot_s = (CHURN_ACTIVE_PREFIXES / CHURN_ROTATION_STEP) * CHURN_ROTATION_SECONDS
+        dormant_s = ((CHURN_PREFIX_UNIVERSE - CHURN_ACTIVE_PREFIXES) / CHURN_ROTATION_STEP) * CHURN_ROTATION_SECONDS
+        cycle_s = (CHURN_PREFIX_UNIVERSE / CHURN_ROTATION_STEP) * CHURN_ROTATION_SECONDS
+        logger.info(f"Churn Workload Config:")
+        logger.info(f"  Universe: {CHURN_PREFIX_UNIVERSE} prefixes ({LARGE_PREFIX_MIN_TOKENS}-{LARGE_PREFIX_MAX_TOKENS} tokens each)")
+        logger.info(f"  Active window: {CHURN_ACTIVE_PREFIXES} prefixes, advancing {CHURN_ROTATION_STEP} every {CHURN_ROTATION_SECONDS}s")
+        logger.info(f"  Prefix lifecycle: hot ~{hot_s:.0f}s -> dormant ~{dormant_s:.0f}s -> returns (cycle ~{cycle_s:.0f}s)")
+        logger.info(f"  Shared-prefix ratio: {SHARED_PREFIX_RATIO} (rest are unique one-shot fillers)")
+        logger.info(f"  Seed: {CHURN_SEED} (deterministic universe across A/B legs)")
+        if dormant_s < 120:
+            logger.warning(
+                "  Dormancy < 2 minutes — backends may not evict prefixes before they return. "
+                "Raise CHURN_PREFIX_UNIVERSE or lower CHURN_ROTATION_STEP for real churn."
+            )
 
     # Log generation and timeout configuration
     logger.info(f"Max Output Tokens: {MAX_OUTPUT_TOKENS}")
@@ -3496,6 +3677,10 @@ def on_test_start(environment, **kwargs):
     if dist in ["large_prefix", "stress"]:
         logger.info("Pre-generating large prefixes for stress testing...")
         initialize_large_prefixes()
+
+    # Pre-generate the churn universe so first requests don't pay generation cost
+    if dist == "churn":
+        initialize_churn_universe()
 
     # Register backends
     register_backends_on_all_nodes()

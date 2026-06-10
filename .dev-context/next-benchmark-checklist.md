@@ -148,6 +148,12 @@ investigation.
 > Note: `RANVIER_CACHE_RESIDENCY_THRESHOLD` is a plain env var (no bench.sh
 > clobber — bench.sh doesn't export it), so the prefix form works for it. Only
 > `RANVIER_LOAD_AWARE_ROUTING` / imbalance vars are flag-controlled.
+>
+> **CORRECTION (2026-06-10):** the above was only half-true — bench.sh didn't
+> clobber it, but docker-compose didn't pass it into the containers either, so
+> the env prefix was a silent no-op on every run before the compose fix.
+> On current builds use `--cache-residency-threshold 0.0` (or the env prefix,
+> which now genuinely reaches the servers).
 
 ### Experiment A2 — Isolate residency routing (load-aware off, residency ON) [LIKELY MOOT]
 
@@ -305,7 +311,34 @@ backends still overload. That strengthens the case that *some* load-aware
 diversion is genuinely needed, which puts the #442 cold-divert fix back on the
 critical path.
 
-### Experiment E — Cache-residency-aware routing (#527) under cache pressure [OPEN]
+### Experiment E — Cache-residency-aware routing (#527) under cache pressure [HARNESS READY — see 2026-06-10 update]
+
+**⚠️ 2026-06-10 harness update (supersedes the E0/E_on/E_off commands below):**
+
+1. **The env-prefix claim below was WRONG until now.**
+   `docker-compose.benchmark-real.yml` did not list
+   `RANVIER_CACHE_RESIDENCY_THRESHOLD` in the ranvier services' `environment:`
+   blocks, so `RANVIER_CACHE_RESIDENCY_THRESHOLD=0.0 ./scripts/bench.sh` set
+   the var on the HOST (where the banner reads it) but it never reached the
+   servers — they silently ran the 0.2 default. Every prior "residency off"
+   leg (Exp A, C1, D1) actually ran residency ON at 0.2. Conclusions are
+   unaffected (downgrades were 0 everywhere, so on ≡ off), but the
+   verification note further down was wrong. Fixed: compose now passes the
+   variable through, and bench.sh grew a first-class
+   `--cache-residency-threshold <F>` flag (preferred; shows in the banner).
+2. **New `churn` workload** (`--prompt-dist churn`): the static `stress` pool
+   keeps every prefix permanently hot, which is exactly why residency stayed
+   inert. Churn rotates the active working set over a 200-prefix universe
+   (knobs: `CHURN_PREFIX_UNIVERSE/ACTIVE_PREFIXES/ROTATION_SECONDS/
+   ROTATION_STEP/SEED`), so prefixes go dormant, get evicted, and RETURN as
+   stale ART hits — the event residency exists to intercept.
+3. **One-command orchestration:** `scripts/bench-residency-ab.sh` runs the
+   pressure probe (gates on `residency_route_downgrades_total > 0`), then the
+   paired OFF/ON legs, validity checks, parser compare, and a REPORT.md
+   skeleton. Methodology + sizing guide:
+   `docs/benchmarks/cache-residency-ab-benchmark.md`.
+4. bench.sh now rebuilds the locust image unconditionally (locustfiles are
+   baked in; a stale image used to silently run the old workload).
 
 **Prerequisite finding (2026-05-26):** residency routing was confirmed LIVE but
 INERT in every A/B/C/D run — `residency_route_downgrades_total = 0` while
