@@ -644,6 +644,19 @@ seastar::future<> Application::register_static_backends() {
                 /*supports_token_ids=*/true,
                 sb.compression_ratio, sb.type);
 
+            // Hardware-tier / cost fields ride a separate broadcast (same
+            // posture as the API-key side-map) so BackendRegistry's abstract
+            // interface stays free of optional metadata. Registration was
+            // co_awaited above, so every shard already has the BackendInfo
+            // this setter writes into.
+            if (sb.cost_per_hour > 0.0 || !sb.gpu_tier.empty()) {
+                co_await _router->set_backend_hardware_cost_global(
+                    sb.id, sb.gpu_tier, sb.cost_per_hour);
+                log_main.info("Static backend {}: gpu_tier='{}', cost_per_hour={:.2f} "
+                              "(cache-miss traffic prefers cheaper priced backends)",
+                              sb.id, sb.gpu_tier, sb.cost_per_hour);
+            }
+
             // Log without the key. api_key_env name is fine — it's not the secret.
             log_main.info("Static backend {} ({}) -> {} (weight={}, priority={}, api_key_env={})",
                           sb.id, backend_type_to_string(sb.type),
