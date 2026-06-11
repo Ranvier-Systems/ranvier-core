@@ -129,6 +129,19 @@ Consequences for this benchmark:
 - The gauge is instantaneous and the health scrape samples it every 5s, so
   the router sees a noisy series that dips to ~0 between batches. Expect the
   downgrade to fire stochastically during pressure bursts, not continuously.
+- **Spiky pressure does not fire** (measured: probe peak 88.6% with mean 7.8%
+  and zero downgrades). Prefill holds blocks for an instant; a residency
+  entry stays "cold" only ~5s until the next scrape rewrites it, so a
+  transient spike must coincide with a scrape AND an ART hit on that backend.
+  Two harness mitigations: the wrapper reports the **pressure shape**
+  (samples over the firing line + longest streak) so spike-vs-sustained is
+  visible, and the benchmark compose sets
+  `RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=1000` — the shipped 200ms scrape
+  timeout is exceeded by vLLM's Python `/metrics` endpoint exactly at busy
+  instants, censoring the signal when it matters (watch the
+  `vllm_scrapes failed` line in the leg counters). The cure for spikiness is
+  **sustained decode load**: `--users 60 --max-tokens 400` — decode holds KV
+  blocks for seconds, so usage plateaus instead of pulsing.
 - **Feature-level open question (flagged for human decision, not changed
   here):** if the intent is "divert when the *prefix* was likely evicted", a
   better signal source than v1 usage would be the prefix-cache hit counters
@@ -164,12 +177,15 @@ wrapper's default of 0.50.
 
 Levers, in order of preference:
 
-1. **`--gpu-mem-util`** (default 0.50): the primary lever. Keep enough KV for
-   one `--max-model-len` sequence or vLLM refuses to start (8192 tokens of 8B
-   GQA = 1.0 GiB; 13B MHA = 6.4 GiB — 13B needs much gentler clamping).
-2. **`--users`**: more in-flight tokens holding blocks.
-3. **`--max-tokens`** (bench.sh): longer decode holds blocks longer.
-4. **Prefix sizes** (`LARGE_PREFIX_MIN_TOKENS`, `--prefix-max-tokens`).
+1. **`--users` + `--max-tokens` together** (e.g. `--users 60 --max-tokens
+   400`): the *sustained*-pressure recipe. Decode holds blocks for seconds —
+   long decodes overlapping across many users produce a usage plateau; short
+   outputs produce only prefill spikes that the 5s scrape misses.
+2. **`--gpu-mem-util`** (default 0.50): sizes capacity toward demand. Keep
+   enough KV for one `--max-model-len` sequence or vLLM refuses to start
+   (8192 tokens of 8B GQA = 1.0 GiB; 13B MHA = 6.4 GiB — 13B needs much
+   gentler clamping).
+3. **Prefix sizes** (`LARGE_PREFIX_MIN_TOKENS`, `--prefix-max-tokens`).
 
 `--churn-active` / universe stay workload-shape knobs: keep them for eviction
 realism, don't use them to force firing. And avoid raising the threshold
@@ -268,6 +284,7 @@ A run is quotable only if **all** of these hold:
 | `ranvier_gossip_cache_states_sent_total` / `received_total` | `prometheus_metrics.txt` | signal plumbing health |
 | `ranvier_router_residency_cache_size` | `prometheus_metrics.txt` | residency cache populated |
 | `ranvier_routing_load_aware_fallbacks_total` | `prometheus_metrics.txt` | must be 0 with `--no-load-aware` (confound check) |
+| `ranvier_health_vllm_scrapes_{success,failed,suppressed}` | `prometheus_metrics.txt` (printed in leg counters) | failed ≫ 0 = the /metrics fetch timed out at busy instants — the signal was censored |
 | Incompletes / timeouts, per-backend distribution | parser report | validity gate 7, concentration effects |
 | `vllm:gpu_cache_usage_perc` over the run | sampled automatically into `<leg>/vllm_usage_samples.csv` by the wrapper | proof the pressure regime held (vLLM v1: gauge = running-request blocks only) |
 

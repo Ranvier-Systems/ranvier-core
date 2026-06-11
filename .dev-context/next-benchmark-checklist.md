@@ -313,6 +313,28 @@ critical path.
 
 ### Experiment E — Cache-residency-aware routing (#527) under cache pressure [HARNESS READY — see 2026-06-10/11 updates]
 
+**⚠️ 2026-06-11 third hardware probe (post parser fix) — finding 4: the gauge
+parses (sampler peak 88.6%!) but pressure is SPIKY, and spiky doesn't fire.**
+
+4. With the dual-name parser + `--build-image`, the sampler finally read real
+   values — peak 88.6%, mean 7.8%, most samples 0.0 (one backend touched 0.34
+   then back to 0.0 within 5s). Downgrades still 0 because two mechanisms
+   compound against transient prefill spikes: (a) a residency entry stays
+   "cold" only ~5s until the next scrape rewrites it, and a spike must
+   coincide with a scrape AND an ART hit on that backend; (b) the shipped
+   `vllm_metrics_timeout` of **200ms** is exceeded by vLLM's Python /metrics
+   endpoint precisely at busy instants, censoring the pressured samples (the
+   wrapper's own sampler allows 2s — likely why it saw the spike the router
+   missed). Harness response: leg counters now print
+   `health_vllm_scrapes_success/failed/suppressed`; probe prints the pressure
+   shape (samples ≥ firing line + longest streak); benchmark compose sets
+   `RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=1000` (env-only, no rebuild);
+   wrapper gained `--max-tokens`. **Sustained-pressure recipe: `--users 60
+   --max-tokens 400`** — decode holds KV blocks for seconds, prefill for an
+   instant, so long overlapping decodes plateau the gauge instead of pulsing
+   it. Product-default question (200ms scrape timeout vs busy-engine reality)
+   flagged for human decision alongside the signal-source question.
+
 **⚠️ 2026-06-11 second hardware probe — ROOT CAUSE FOUND (finding 3 below):
 the residency signal has been parse-blind against vLLM 0.15.1 all along.**
 

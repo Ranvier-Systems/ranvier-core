@@ -69,6 +69,7 @@ ORDER="off-first"
 MAX_MODEL_LEN="8192"
 TP_SIZE=""
 PREFIX_MAX_TOKENS=""
+MAX_TOKENS_OPT=""            # bench.sh --max-tokens (default 100 there)
 BUILD_IMAGE=false
 EXTRA_BENCH_ARGS=""
 
@@ -110,6 +111,11 @@ OPTIONS:
     --max-model-len N      vLLM max sequence length (default: 8192 — covers the
                            workload's 8k max prefix; prevents vLLM refusing to
                            start when the native context can't fit in a small KV)
+    --max-tokens N         Output tokens per request (bench.sh default: 100).
+                           THE lever for SUSTAINED pressure: decode holds KV
+                           blocks for seconds while prefill spikes last an
+                           instant. Use 400 with more --users when the probe
+                           shows a high peak but a near-zero mean.
     --tp N                 Forwarded to bench.sh
     --prefix-max-tokens N  Forwarded to bench.sh
     --build-image          Rebuild ranvier:latest from this checkout before the
@@ -175,6 +181,7 @@ while [[ $# -gt 0 ]]; do
         --with-load-aware)  WITH_LOAD_AWARE=true; shift ;;
         --with-rr-baseline) WITH_RR_BASELINE=true; shift ;;
         --max-model-len)    MAX_MODEL_LEN="$2"; shift 2 ;;
+        --max-tokens)       MAX_TOKENS_OPT="$2"; shift 2 ;;
         --tp)               TP_SIZE="$2"; shift 2 ;;
         --prefix-max-tokens) PREFIX_MAX_TOKENS="$2"; shift 2 ;;
         --churn-universe)   CHURN_UNIVERSE="$2"; shift 2 ;;
@@ -313,6 +320,7 @@ build_bench_args() {
         args+=(--compare)
     fi
     [[ -n "$MAX_MODEL_LEN" ]] && args+=(--max-model-len "$MAX_MODEL_LEN")
+    [[ -n "$MAX_TOKENS_OPT" ]] && args+=(--max-tokens "$MAX_TOKENS_OPT")
     [[ -n "$TP_SIZE" ]] && args+=(--tp "$TP_SIZE")
     [[ -n "$PREFIX_MAX_TOKENS" ]] && args+=(--prefix-max-tokens "$PREFIX_MAX_TOKENS")
     if [[ "$BUILD_IMAGE" = true ]]; then
@@ -366,6 +374,31 @@ leg_counters() {
     echo "  cache_states_received: $(sum_metric "$prom" "gossip_cache_states_received_total")"
     echo "  residency_cache_size: $(sum_metric "$prom" "router_residency_cache_size")"
     echo "  load_aware_fallbacks: $(sum_metric "$prom" "routing_load_aware_fallbacks_total")"
+    # Scrape health: failed >> 0 means the vLLM /metrics fetch timed out —
+    # typically at peak engine load, censoring exactly the pressured instants.
+    echo "  vllm_scrapes success/failed/suppressed: $(sum_metric "$prom" "health_vllm_scrapes_success") / $(sum_metric "$prom" "health_vllm_scrapes_failed") / $(sum_metric "$prom" "health_vllm_scrapes_suppressed")"
+}
+
+# Pressure shape from a sampler CSV: prints "<n_over> <n_total> <ports_over>
+# <max_streak_secs>" for samples at/above $2 percent. A large peak with a tiny
+# n_over/max_streak means spiky transient prefill waves — the 5s health scrape
+# will rarely land inside one, so residency won't fire even though the peak
+# crossed the line. Sustained pressure shows long streaks.
+usage_pressure_stats() {
+    local csv="$1" fire_pct="$2"
+    if [[ ! -f "$csv" ]]; then echo "0 0 0 0"; return; fi
+    awk -F, -v f="$fire_pct" '
+        NR > 1 && $3 ~ /^[0-9.eE+-]+$/ {
+            total++
+            if ($3 * 100 >= f) {
+                over++; port_over[$2] = 1
+                cur[$2]++; if (cur[$2] > maxs) maxs = cur[$2]
+            } else {
+                cur[$2] = 0
+            }
+        }
+        END { printf "%d %d %d %d", over+0, total+0, length(port_over), (maxs+0)*5 }
+    ' "$csv"
 }
 
 # -----------------------------------------------------------------------------
@@ -382,6 +415,7 @@ log_info "Load-aware:      $( [[ "$WITH_LOAD_AWARE" = true ]] && echo "ON in bot
 log_info "RR baseline:     $( [[ "$WITH_RR_BASELINE" = true ]] && echo "yes (--compare per leg)" || echo "no (prefix legs only)" )"
 log_info "Leg order:       $ORDER"
 log_info "Churn workload:  universe=$CHURN_UNIVERSE active=$CHURN_ACTIVE step=$CHURN_STEP/${CHURN_ROT_SECS}s seed=$CHURN_SEED_VAL"
+[[ -n "$MAX_TOKENS_OPT" ]] && log_info "Max out tokens:  $MAX_TOKENS_OPT  (decode duration = sustained KV hold)"
 log_info "Output:          $OUTPUT_ROOT"
 echo ""
 log_warn "Each leg cold-starts vLLM (model load adds minutes per leg). Expect"
@@ -407,7 +441,9 @@ if [[ "$SKIP_PROBE" = false ]]; then
     log_info "Report dir: ${PROBE_LEG:-<missing>}"
     leg_counters "$PROBE_LEG"
     read -r PROBE_PEAK PROBE_MEAN PROBE_NOMATCH <<< "$(usage_summary "$PROBE_DIR/vllm_usage_samples.csv")"
+    read -r P_OVER P_TOTAL P_PORTS P_STREAK <<< "$(usage_pressure_stats "$PROBE_DIR/vllm_usage_samples.csv" "$FIRE_PCT")"
     log_info "Sampled KV usage: peak ${PROBE_PEAK}%, mean ${PROBE_MEAN}% (residency fires above ${FIRE_PCT}% at threshold $THRESHOLD_ON)"
+    log_info "Pressure shape: ${P_OVER}/${P_TOTAL} samples ≥${FIRE_PCT}% across ${P_PORTS} backend(s); longest streak ~${P_STREAK}s"
 
     if [[ "$PROBE_DOWNGRADES" == "NA" ]]; then
         log_error "Could not read $PROBE_PROM — probe inconclusive. Check the run logs."
@@ -448,12 +484,20 @@ if [[ "$SKIP_PROBE" = false ]]; then
 
         if awk -v p="$PROBE_PEAK" -v f="$FIRE_PCT" 'BEGIN{exit !(p >= f)}'; then
             # Gauge crossed the line at some sampled instant yet the router never
-            # downgraded: the pressured windows were likely too brief for the 5s
-            # health scrape, or ART hits aren't landing on pressured backends.
-            log_warn "Sampled peak (${PROBE_PEAK}%) DID cross ${FIRE_PCT}% — but the router never saw it"
-            log_warn "at scrape time, or no ART hit targeted a pressured backend. Lengthen the"
-            log_warn "probe (--probe-duration 15m), raise --users for sustained pressure, and check"
-            log_warn "the cache hit rate in the probe report before re-running."
+            # downgraded — pressure is spiky, not sustained. A residency entry
+            # only stays "cold" for the ~5s until the next scrape rewrites it, so
+            # transient prefill waves rarely line up with a scrape AND an ART hit.
+            log_warn "Sampled peak (${PROBE_PEAK}%) DID cross ${FIRE_PCT}%, but only ${P_OVER}/${P_TOTAL} samples did"
+            log_warn "(longest streak ~${P_STREAK}s): transient prefill spikes, not sustained pressure."
+            log_warn "The router's 5s scrape rarely lands inside a spike — and check the"
+            log_warn "'vllm_scrapes failed' line above: a high count means the /metrics fetch was"
+            log_warn "timing out at busy instants (benchmark compose now sets"
+            log_warn "RANVIER_HEALTH_VLLM_METRICS_TIMEOUT_MS=1000; env-only, applies on next run)."
+            echo ""
+            log_info "Make the pressure SUSTAINED — decode holds KV blocks for seconds, prefill"
+            log_info "only for an instant:"
+            log_info "  --users $((USERS * 2)) --max-tokens 400"
+            log_info "(more in-flight requests, each holding blocks ~4x longer)"
         else
             echo ""
             # vLLM v1: the usage gauge counts only blocks held by RUNNING requests,
